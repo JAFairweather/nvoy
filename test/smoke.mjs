@@ -7,11 +7,11 @@
 //   node test/smoke.mjs --live   # live relays, protocol subset
 
 import { generateSecretKey, getPublicKey, nip19 } from 'nostr-tools'
-import { newScopeKey, publishScope, loadGrantIndex, saveGrantIndex, toIssuedEntry, fromIssuedEntry } from '../lib/nipxx.mjs'
+import { newScopeKey, publishScope, rotateScope, loadGrantIndex, saveGrantIndex, toIssuedEntry, fromIssuedEntry } from '../lib/nipxx.mjs'
 import { Relay } from '../lib/relay.mjs'
 import { LiveRelay, LocalRelay } from '../lib/liverelay.mjs'
-import { grantWithTerms, opaqueScopeId, TRAVEL_PREFERENCES } from './nvoygrant.mjs'
-import { receiveGrants, latestGrants, grantStatus, GrantStore } from '../mcp/dist/grants.js'
+import { grantWithTerms, sendRevocationNotice, opaqueScopeId, TRAVEL_PREFERENCES } from './nvoygrant.mjs'
+import { receiveGrants, latestGrants, grantStatus, findRevocationNotice, GrantStore } from '../mcp/dist/grants.js'
 import { ScopeCache } from '../mcp/dist/scopes.js'
 import { parseTerms } from '../mcp/dist/terms.js'
 
@@ -158,6 +158,65 @@ if (!LIVE) {
 const store = new GrantStore(relay, agentSk)
 const found = await store.find(delegatorPub, scopeId)
 check('GrantStore.find resolves grant for scope_read path', !!found && found.generation === 1)
+
+// ----------------------------------------- 9. revocation detection (M2 §6.3)
+
+// Delegator revokes: rotate the key past the agent (survivors = []) and send
+// the optional kind-441 courtesy notice, gift-wrapped.
+const reason = 'delegation ended: itinerary confirmed'
+const rot = await rotateScope(relay, delegatorSk, {
+  scopeId, generation: 1, payload: updated, scopeName: 'travel-preferences', survivors: [],
+})
+await sendRevocationNotice(relay, delegatorSk, agentPub, { scopeId, reason })
+await settle()
+
+const readRevoked = await cache.read(found, { maxAgeSec: 0 })
+check('rotation detected: fresh read reports stale (v superseded)', readRevoked.status === 'stale')
+
+const notice = await findRevocationNotice(relay, agentSk, delegatorPub, scopeId)
+check('441 notice found, seal-authenticated, reason surfaced', notice?.content?.reason === reason)
+check('no 441 notice invented for an unrevoked scope',
+  (await findRevocationNotice(relay, agentSk, delegatorPub, vanillaScopeId)) === null)
+
+store.markRevoked(delegatorPub, scopeId, found.generation, notice?.content ?? null)
+cache.zeroize(delegatorPub, scopeId)
+check('grant marked revoked-detected', grantStatus(found) === 'revoked-detected')
+check('scope key zeroized on revocation (all 32 bytes zero)', found.scopeKey.every(b => b === 0))
+const listedRevoked = (await store.list()).find(g => g.scopeId === scopeId)
+check('grants_list view carries revoked-detected + notice',
+  listedRevoked && grantStatus(listedRevoked) === 'revoked-detected' && listedRevoked.revoked?.notice?.reason === reason)
+
+const qBeforeZ = queries
+await cache.read(found)
+check('cached plaintext scrubbed: next read must hit the relay', queries === qBeforeZ + 1)
+
+// Re-grant heals: a fresh grant with a higher v supersedes the revocation.
+await grantWithTerms(relay, delegatorSk, agentPub, {
+  scopeId, generation: 2, scopeKey: rot.scopeKey, scopeName: 'travel-preferences', terms,
+})
+await settle()
+const healed = (await store.list({ maxAgeMs: 0 })).find(g => g.scopeId === scopeId)
+check('re-grant with higher v supersedes the revocation (active again)',
+  healed?.generation === 2 && grantStatus(healed) === 'active')
+const readHealed = await cache.read(healed, { maxAgeSec: 0 })
+check('healed grant decrypts the rotated data set', readHealed.status === 'ok' && readHealed.data?.fields?.seat === 'window')
+
+// ------------------------------------ 10. adversarial observer, revocation
+
+if (!LIVE) {
+  const view = inMem.observerView()
+  check('observer: no naked kind-441 ever hits the relay', !view.some(e => e.kind === 441))
+  check('observer: revocation reason invisible in ALL stored events',
+    !JSON.stringify(inMem.events).includes(reason) && !JSON.stringify(inMem.events).includes('itinerary'))
+  const wraps441 = inMem.query({ kinds: [1059] })
+  check('observer: notice wrap sender is ephemeral (delegator never linked to agent)',
+    wraps441.every(w => w.pubkey !== delegatorPub && w.pubkey !== agentPub))
+} else {
+  const [ev] = await relay.query({ kinds: [30440], authors: [delegatorPub], '#d': [scopeId] })
+  const v = Number(ev?.tags.find(t => t[0] === 'v')?.[1])
+  check('observer(live): rotation replaced the 30440 (v=2), still ciphertext only',
+    v === 2 && !ev.content.includes('window') && !ev.content.includes(reason))
+}
 
 relay.close?.()
 console.log(failed ? `\n${LIVE ? 'LIVE ' : ''}SMOKE: FAIL` : `\n${LIVE ? 'LIVE ' : ''}SMOKE: ALL ${n} PASS`)

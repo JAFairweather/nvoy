@@ -74,8 +74,9 @@ export function parseTerms(content: unknown): NvoyTerms | null {
   return terms
 }
 
-/** Grant status per expires_at. 'revoked-detected' is added in M2. */
-export type GrantStatus = 'active' | 'expired'
+/** Grant status: active | expired (per expires_at, soft — runtime honors it)
+ *  | revoked-detected (v-supersession verified against a fresh 30440, §6.3). */
+export type GrantStatus = 'active' | 'expired' | 'revoked-detected'
 
 export function termsStatus(terms: NvoyTerms | null, nowSec = Math.floor(Date.now() / 1000)): GrantStatus {
   if (terms?.expires_at !== undefined && terms.expires_at <= nowSec) return 'expired'

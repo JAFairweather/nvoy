@@ -39,6 +39,26 @@ export async function grantWithTerms(relay, delegatorSecret, granteePubkey,
   return { wrap, ...receipt }
 }
 
+/**
+ * Send a kind-441 revocation notice (NIP-DA optional courtesy), gift-wrapped
+ * to the revoked party. Carries the `a` tag of the affected scope; `reason`
+ * (optional) travels as JSON content. Publishers who prefer silent
+ * revocation simply never call this.
+ */
+export async function sendRevocationNotice(relay, delegatorSecret, granteePubkey, { scopeId, reason }) {
+  const pub = getPublicKey(delegatorSecret)
+  const rumor = {
+    pubkey: pub,
+    kind: 441, // KIND_REVOCATION — placeholder pending assignment, like its siblings
+    created_at: Math.floor(Date.now() / 1000),
+    tags: [['a', `${KIND_DATA_SET}:${pub}:${scopeId}`]],
+    content: reason ? JSON.stringify({ reason }) : '',
+  }
+  const wrap = wrapEvent(rumor, delegatorSecret, granteePubkey)
+  const receipt = await relay.publish(wrap)
+  return { wrap, ...receipt }
+}
+
 // Demo payload only — never real personal data in tests.
 export const TRAVEL_PREFERENCES = {
   name: 'Travel preferences',

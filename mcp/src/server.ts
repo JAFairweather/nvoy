@@ -1,10 +1,16 @@
 #!/usr/bin/env node
-// server.ts — the Nvoy MCP server (stdio transport, M1 read path).
+// server.ts — the Nvoy MCP server (stdio transport, M1 read path + M2
+// revocation/terms enforcement).
 //
 // Tools:   nvoy_whoami, nvoy_grants_list, nvoy_scope_read
 // Resources: nvoy://{author_npub}/{d} — one per active held grant
 //
 // stdout is the MCP protocol channel; ALL diagnostics go to stderr.
+// no_persist audit (spec §5): scope plaintext exists ONLY in ScopeCache's
+// in-memory Map and in MCP tool/resource results on stdout (the model
+// context — the whole point). Nothing here writes scope data to disk, and
+// log() must never be handed scope payloads. Cache is scrubbed on TTL
+// expiry (sweeper), on revocation, and on shutdown (below).
 
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
@@ -12,7 +18,7 @@ import { z } from 'zod'
 import { nip19 } from 'nostr-tools'
 import { LiveRelay } from '../../lib/liverelay.mjs'
 import { loadIdentity, loadRelays } from './identity.js'
-import { GrantStore, grantStatus, toHexPubkey, type HeldGrant } from './grants.js'
+import { GrantStore, findRevocationNotice, grantStatus, toHexPubkey, type HeldGrant } from './grants.js'
 import { ScopeCache } from './scopes.js'
 
 const log = (...args: unknown[]) => console.error('[nvoy]', ...args)
@@ -43,7 +49,36 @@ function grantSummary(g: HeldGrant) {
     terms: g.terms,
     v: g.generation,
     status: grantStatus(g),
+    ...(g.revoked ? { revocation: { detected_at: g.revoked.detected_at, notice: g.revoked.notice } } : {}),
   }
+}
+
+/** The §6.3 error: verified rotation past this grant. Nothing leaks about why
+ *  beyond what the publisher chose to say in the (optional) 441 notice. */
+function revokedError(g: HeldGrant, notice: unknown) {
+  return jsonError({
+    code: 'NVOY_GRANT_REVOKED',
+    d: g.scopeId,
+    author_npub: nip19.npubEncode(g.publisher),
+    notice: notice ?? null,
+    message:
+      'the delegator rotated this scope key past your grant — access is revoked; cached data and key material have been destroyed',
+  })
+}
+
+/**
+ * Detect-and-seal a revocation (§6.3): look for a gift-wrapped kind-441
+ * notice, mark the grant revoked-detected, and zeroize the scope key and any
+ * cached plaintext. The failed read that got us here was itself a fresh
+ * 30440 fetch (failed reads are never cached), so the supersession is
+ * already verified against the live event.
+ */
+async function detectRevocation(g: HeldGrant) {
+  const found = await findRevocationNotice(relay, identity.secretKey, g.publisher, g.scopeId).catch(() => null)
+  const record = grantStore.markRevoked(g.publisher, g.scopeId, g.generation, found?.content ?? null)
+  scopeCache.zeroize(g.publisher, g.scopeId)
+  log(`grant revoked-detected: scope ${g.scopeId} (v${g.generation} superseded) — key + cache zeroized`)
+  return record
 }
 
 // -------------------------------------------------------------------- tools
@@ -74,7 +109,7 @@ server.registerTool(
   {
     title: 'List held grants',
     description:
-      'All data grants this agent holds: scope id (d), author, purpose, terms, key generation (v), and status (active | expired per expires_at).',
+      'All data grants this agent holds: scope id (d), author, purpose, terms, key generation (v), and status (active | expired per expires_at | revoked-detected after a verified key rotation).',
   },
   async () => {
     const grants = await grantStore.list()
@@ -114,19 +149,41 @@ server.registerTool(
         author_npub,
       })
     }
+    const status = grantStatus(grant)
+    if (status === 'revoked-detected') return revokedError(grant, grant.revoked?.notice ?? null)
+    if (status === 'expired') {
+      // Soft expiry (§4): the runtime honors expires_at mechanically; hard
+      // expiry is the delegator's TTL rotation, never agent cooperation.
+      return jsonError({
+        code: 'NVOY_GRANT_EXPIRED',
+        d,
+        author_npub,
+        expires_at: grant.terms?.expires_at ?? grant.expiration ?? null,
+        message: 'this grant has expired per its terms; ask the delegator to renew',
+      })
+    }
     const result = await scopeCache.read(grant, { maxAgeSec: max_age })
+    if (result.status === 'stale') {
+      // v-supersession or MAC failure on a previously-readable scope,
+      // observed on a fresh 30440 fetch → the key was rotated past us (§6.3).
+      const record = await detectRevocation(grant)
+      return revokedError(grant, record.notice)
+    }
     if (result.status !== 'ok') {
-      // M2 turns the stale case into the full NVOY_GRANT_REVOKED flow
-      // (fresh-fetch verification, kind-441 lookup, cache zeroization).
+      // 'missing' is ambiguous: scope deleted (NIP-09 after tombstone) or
+      // relay flake. A 441 notice disambiguates to revocation; otherwise
+      // stay honest with UNAVAILABLE.
+      const found = await findRevocationNotice(relay, identity.secretKey, grant.publisher, d).catch(() => null)
+      if (found) {
+        const record = await detectRevocation(grant)
+        return revokedError(grant, record.notice)
+      }
       return jsonError({
         code: 'NVOY_SCOPE_UNAVAILABLE',
         status: result.status,
         d,
         author_npub,
-        message:
-          result.status === 'stale'
-            ? 'scope key superseded (v rotated past this grant) — access to updates may have been revoked'
-            : 'no scoped data set found on the configured relays',
+        message: 'no scoped data set found on the configured relays',
       })
     }
     return json({
@@ -134,6 +191,8 @@ server.registerTool(
       v: result.generation,
       fetched_at: result.fetched_at,
       terms: grant.terms,
+      // handling hint for downstream frameworks (§5); attests honored terms
+      ...(grant.terms?.no_persist ? { nvoy_no_persist: true } : {}),
     })
   },
 )
@@ -166,15 +225,28 @@ server.registerResource(
     const author = toHexPubkey(String(variables.author_npub))
     const d = String(variables.d)
     const grant = await grantStore.find(author, d)
-    if (!grant) throw new Error(`no grant held for ${uri.href}`)
+    if (!grant) throw new Error(`NVOY_NO_GRANT: no grant held for ${uri.href}`)
+    const status = grantStatus(grant)
+    if (status === 'revoked-detected') throw new Error(`NVOY_GRANT_REVOKED: ${uri.href}`)
+    if (status === 'expired') throw new Error(`NVOY_GRANT_EXPIRED: ${uri.href}`)
     const result = await scopeCache.read(grant)
-    if (result.status !== 'ok') throw new Error(`scope unavailable (${result.status}) for ${uri.href}`)
+    if (result.status === 'stale') {
+      await detectRevocation(grant)
+      throw new Error(`NVOY_GRANT_REVOKED: ${uri.href}`)
+    }
+    if (result.status !== 'ok') throw new Error(`NVOY_SCOPE_UNAVAILABLE (${result.status}): ${uri.href}`)
     return {
       contents: [
         {
           uri: uri.href,
           mimeType: 'application/json',
-          text: JSON.stringify({ data: result.data, v: result.generation, fetched_at: result.fetched_at, terms: grant.terms }),
+          text: JSON.stringify({
+            data: result.data,
+            v: result.generation,
+            fetched_at: result.fetched_at,
+            terms: grant.terms,
+            ...(grant.terms?.no_persist ? { nvoy_no_persist: true } : {}),
+          }),
         },
       ],
     }
@@ -182,6 +254,26 @@ server.registerResource(
 )
 
 // --------------------------------------------------------------------- main
+
+// no_persist (§5): zeroize cached plaintext + all held scope keys on ANY
+// exit path — signals and normal termination alike. The 'exit' handler is
+// the sync backstop (double-run guarded); signal handlers log the fact so
+// the conformance test can observe it.
+let downed = false
+function teardown(): void {
+  if (downed) return
+  downed = true
+  scopeCache.destroy()
+  grantStore.zeroizeAll()
+  log('cache zeroized (shutdown)')
+}
+process.on('exit', teardown)
+for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+  process.on(sig, () => {
+    teardown()
+    process.exit(0)
+  })
+}
 
 const transport = new StdioServerTransport()
 await server.connect(transport)
