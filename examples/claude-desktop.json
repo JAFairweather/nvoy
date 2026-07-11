@@ -1,0 +1,13 @@
+{
+  "//": "Claude Desktop MCP config snippet — merge into claude_desktop_config.json (Settings > Developer > Edit Config). Replace the placeholders: the absolute path to your nvoy checkout and the agent's nsec (this key IS the agent's identity — a delegator grants scopes to its npub, shown on the server's boot line).",
+  "mcpServers": {
+    "nvoy": {
+      "command": "node",
+      "args": ["/ABSOLUTE/PATH/TO/nvoy/mcp/dist/server.js"],
+      "env": {
+        "NVOY_NSEC": "nsec1REPLACE_WITH_AGENT_SECRET_KEY",
+        "NVOY_RELAYS": "wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net"
+      }
+    }
+  }
+}
