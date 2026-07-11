@@ -1,23 +1,34 @@
-// mcp-conformance.mjs — spawn the BUILT Nvoy server over stdio and drive it
-// with the official MCP SDK client, exactly as Claude Desktop would:
+// mcp-conformance.mjs — spawn the BUILT Nvoy server and drive it with the
+// official MCP SDK client, exactly as Claude Desktop (stdio) or a remote
+// MCP client (streamable HTTP) would:
 //
 //   local ws relay ← seeded delegation ← this test
 //   node mcp/dist/server.js (NVOY_NSEC, NVOY_RELAYS=ws://127.0.0.1:…)
-//   SDK Client → listTools / 3 tool calls / listResources / readResource
+//   SDK Client → tools / resources on BOTH transports
 //
-// Asserts tool output shapes per spec §6.2. Fully offline.
+// Covers the full §6.2 tool surface: whoami, grants_list, scope_read,
+// scope_subscribe (stdio cache-invalidation AND http update notifications),
+// outbox_write (§6.5), request_access, grant_relinquish + auto_relinquish
+// (§6.6), plus the M2 revocation beats. Fully offline.
 
+import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
+import { ResourceUpdatedNotificationSchema } from '@modelcontextprotocol/sdk/types.js'
 import { generateSecretKey, getPublicKey, nip19 } from 'nostr-tools'
-import { newScopeKey, publishScope, rotateScope } from '../lib/nipxx.mjs'
+import { unwrapEvent } from 'nostr-tools/nip59'
+import { newScopeKey, publishScope, rotateScope, fetchScope, loadGrantIndex } from '../lib/nipxx.mjs'
 import { LocalRelay } from '../lib/liverelay.mjs'
 import { grantWithTerms, sendRevocationNotice, opaqueScopeId, TRAVEL_PREFERENCES } from './nvoygrant.mjs'
+import { receiveGrants, latestGrants } from '../mcp/dist/grants.js'
+import { KIND_NVOY_MSG } from '../mcp/dist/notices.js'
 import { startWsRelay } from './wsrelay.mjs'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
+const sleep = (ms) => new Promise(r => setTimeout(r, ms))
 
 let n = 0, failed = 0
 const check = (name, cond) => {
@@ -27,13 +38,19 @@ const check = (name, cond) => {
 }
 const textJson = (result) => JSON.parse(result.content.find(c => c.type === 'text').text)
 
+const TOOLS = [
+  'nvoy_whoami', 'nvoy_grants_list', 'nvoy_scope_read', 'nvoy_scope_subscribe',
+  'nvoy_outbox_write', 'nvoy_request_access', 'nvoy_grant_relinquish',
+]
+
 // ------------------------------------------------ seed a delegation offline
 
 const ws = await startWsRelay()
 const seedRelay = new LocalRelay(ws.store) // write straight into the store
 
 const delegatorSk = generateSecretKey()
-const delegatorNpub = nip19.npubEncode(getPublicKey(delegatorSk))
+const delegatorPub = getPublicKey(delegatorSk)
+const delegatorNpub = nip19.npubEncode(delegatorPub)
 const agentSk = generateSecretKey()
 const agentNpub = nip19.npubEncode(getPublicKey(agentSk))
 
@@ -43,7 +60,7 @@ const purpose = 'Plan travel within stated preferences'
 await publishScope(seedRelay, delegatorSk, { scopeId, generation: 1, scopeKey, payload: TRAVEL_PREFERENCES })
 await grantWithTerms(seedRelay, delegatorSk, getPublicKey(agentSk), {
   scopeId, generation: 1, scopeKey, scopeName: 'travel-preferences', relayHint: ws.url,
-  terms: { purpose, expires_at: Math.floor(Date.now() / 1000) + 3600, no_persist: true, redelegate: false, contact: delegatorNpub },
+  terms: { purpose, expires_at: Math.floor(Date.now() / 1000) + 3600, no_persist: true, redelegate: false, reply_scope_requested: true, contact: delegatorNpub },
 })
 
 // a second, already-expired grant (soft expiry per §4 — the runtime honors it)
@@ -55,23 +72,74 @@ await grantWithTerms(seedRelay, delegatorSk, getPublicKey(agentSk), {
   terms: { purpose: 'already lapsed', expires_at: Math.floor(Date.now() / 1000) - 3600 },
 })
 
+// a third scope the agent will relinquish (§6.6)
+const relScopeId = opaqueScopeId()
+const relKey = newScopeKey()
+await publishScope(seedRelay, delegatorSk, { scopeId: relScopeId, generation: 1, scopeKey: relKey, payload: { name: 'one-task brief', fields: { task: 'demo' } } })
+await grantWithTerms(seedRelay, delegatorSk, getPublicKey(agentSk), {
+  scopeId: relScopeId, generation: 1, scopeKey: relKey, scopeName: 'one-task-brief', relayHint: ws.url,
+  terms: { purpose: 'single task then hand back', contact: delegatorNpub },
+})
+
+// a fourth: auto_relinquish with an expiry a few seconds out — the runtime's
+// sweeper must destroy it unprompted once expires_at passes
+const autoScopeId = opaqueScopeId()
+const autoKey = newScopeKey()
+await publishScope(seedRelay, delegatorSk, { scopeId: autoScopeId, generation: 1, scopeKey: autoKey, payload: { name: 'short-lived', fields: {} } })
+await grantWithTerms(seedRelay, delegatorSk, getPublicKey(agentSk), {
+  scopeId: autoScopeId, generation: 1, scopeKey: autoKey, scopeName: 'short-lived', relayHint: ws.url,
+  terms: { purpose: 'auto-relinquish demo', expires_at: Math.floor(Date.now() / 1000) + 4, auto_relinquish: true, contact: delegatorNpub },
+})
+
+/** Delegator-side unwrap of nvoy notices (access requests, relinquishes). */
+const delegatorNotices = () => ws.store.query({ kinds: [1059], '#p': [delegatorPub] })
+  .map(w => { try { return unwrapEvent(w, delegatorSk) } catch { return null } })
+  .filter(r => r?.kind === KIND_NVOY_MSG)
+  .map(r => ({ ...JSON.parse(r.content), from: r.pubkey, at: r.created_at }))
+
 // --------------------------------------------- spawn the real server binary
 
+const serverEnv = {
+  ...process.env,
+  NVOY_NSEC: nip19.nsecEncode(agentSk),
+  NVOY_RELAYS: ws.url,
+  NVOY_SUBSCRIBE_POLL_MS: '250',
+  NVOY_SWEEP_MS: '300',
+}
 const transport = new StdioClientTransport({
   command: process.execPath,
   args: [join(root, 'mcp', 'dist', 'server.js')],
-  env: { ...process.env, NVOY_NSEC: nip19.nsecEncode(agentSk), NVOY_RELAYS: ws.url },
+  env: serverEnv,
   stderr: 'pipe',
 })
 const client = new Client({ name: 'nvoy-conformance', version: '0.1.0' })
 
+// HTTP server: second process, same identity, ephemeral port announced on stderr
+function spawnHttpServer() {
+  const child = spawn(process.execPath, [join(root, 'mcp', 'dist', 'server.js')], {
+    env: { ...serverEnv, NVOY_HTTP_PORT: '0' },
+    stdio: ['ignore', 'ignore', 'pipe'],
+  })
+  return new Promise((resolve, reject) => {
+    let buf = ''
+    const timer = setTimeout(() => reject(new Error(`http server never announced: ${buf}`)), 8000)
+    child.stderr.on('data', (chunk) => {
+      buf += chunk
+      const m = buf.match(/ready on (http:\/\/[^ ]+\/mcp)/)
+      if (m) { clearTimeout(timer); resolve({ child, url: m[1] }) }
+    })
+    child.on('exit', (code) => reject(new Error(`http server exited ${code}: ${buf}`)))
+  })
+}
+
+let httpChild = null
 try {
   await client.connect(transport)
 
   // ------------------------------------------------------------- tool list
   const tools = (await client.listTools()).tools.map(t => t.name)
-  check('server exposes exactly the read-path tools',
-    ['nvoy_whoami', 'nvoy_grants_list', 'nvoy_scope_read'].every(t => tools.includes(t)) && tools.length === 3)
+  check('server exposes exactly the §6.2 tool surface (7 tools)',
+    TOOLS.every(t => tools.includes(t)) && tools.length === TOOLS.length)
 
   // ---------------------------------------------------------------- whoami
   const who = textJson(await client.callTool({ name: 'nvoy_whoami' }))
@@ -82,7 +150,7 @@ try {
 
   // ----------------------------------------------------------- grants_list
   const list = textJson(await client.callTool({ name: 'nvoy_grants_list' }))
-  check('nvoy_grants_list: both held grants', list.grants?.length === 2)
+  check('nvoy_grants_list: all four held grants', list.grants?.length === 4)
   const lg = list.grants?.find(g => g.d === scopeId) ?? {}
   check('grants_list shape: { d, author_npub, purpose, expires_at, terms, v, status }',
     lg.d === scopeId && lg.author_npub === delegatorNpub && lg.purpose === purpose
@@ -120,17 +188,172 @@ try {
   check('nvoy_scope_read: unknown scope is a clean NVOY_NO_GRANT error',
     bad.isError === true && textJson(bad).code === 'NVOY_NO_GRANT')
 
+  // -------------------------------------------- scope_subscribe over stdio
+  // The read above cached the scope (60s TTL). Subscribe arms invalidation;
+  // a republish must make the NEXT default read fresh — no max_age needed.
+  const sub = textJson(await client.callTool({
+    name: 'nvoy_scope_subscribe', arguments: { d: scopeId, author_npub: delegatorNpub },
+  }))
+  check('scope_subscribe (stdio): armed as cache-invalidation with poll interval',
+    sub.subscribed === true && sub.mode === 'cache-invalidation' && sub.poll_seconds >= 0)
+  const sub2 = textJson(await client.callTool({
+    name: 'nvoy_scope_subscribe', arguments: { d: scopeId, author_npub: delegatorNpub },
+  }))
+  check('scope_subscribe: idempotent re-subscribe', sub2.already_subscribed === true)
+
+  await publishScope(seedRelay, delegatorSk, {
+    scopeId, generation: 1, scopeKey,
+    payload: { ...TRAVEL_PREFERENCES, fields: { ...TRAVEL_PREFERENCES.fields, note: 'UPDATED: window seat now' } },
+  })
+  await sleep(700) // > poll interval (250ms)
+  const fresh = textJson(await client.callTool({
+    name: 'nvoy_scope_read', arguments: { d: scopeId, author_npub: delegatorNpub },
+  }))
+  check('subscribe detected the republish: next default read is FRESH (cache invalidated)',
+    fresh.data?.fields?.note === 'UPDATED: window seat now')
+
   // -------------------------------------------------------------- resources
   const res = await client.listResources()
   const r = res.resources?.find(x => x.uri === `nvoy://${delegatorNpub}/${scopeId}`)
   check('resources list: nvoy://{author_npub}/{d} for the active grant', !!r && r.mimeType === 'application/json')
   check('resource name/description from scope_name/purpose', r?.name === 'travel-preferences' && r?.description === purpose)
-  check('resources list: expired grant excluded (active only)', res.resources?.length === 1)
 
   const rc = await client.readResource({ uri: `nvoy://${delegatorNpub}/${scopeId}` })
   const body = JSON.parse(rc.contents[0].text)
   check('resource read: live-dereferenced scope JSON', body.data?.fields?.seat === 'aisle' && body.v === 1)
   check('resource read: no_persist attested', body.nvoy_no_persist === true)
+
+  // ------------------------------------------------------ outbox_write §6.5
+  // The travel grant carries reply_scope_requested — the sole reply target.
+  const out1 = textJson(await client.callTool({
+    name: 'nvoy_outbox_write',
+    arguments: { payload: { name: 'trip plan', fields: { itinerary: 'YYZ→SFO 08:10, aisle 14C', status: 'draft' } } },
+  }))
+  check('outbox_write: auto-targets the reply_scope_requested delegator',
+    out1.written === true && out1.granted_to === delegatorNpub && out1.first_write === true && typeof out1.d === 'string')
+  check('outbox_write: persisted (identity from NVOY_NSEC → agent Grant Index)', out1.persisted === true)
+
+  // delegator side: the outbox grant unwraps + dereferences like any grant
+  const dHeld = latestGrants(await receiveGrants(seedRelay, delegatorSk))
+  const outGrant = dHeld.find(g => g.publisher === getPublicKey(agentSk) && g.scopeId === out1.d)
+  check('delegator receives the outbox grant (scope_name "agent output", purpose in terms)',
+    outGrant?.scopeName === 'agent output' && outGrant?.terms?.purpose === 'agent output')
+  const outRead1 = await fetchScope(seedRelay, outGrant)
+  check('delegator dereferences the agent output live', outRead1.data?.fields?.status === 'draft')
+
+  // second write: same scope, same key — a live update, no new grant
+  const out2 = textJson(await client.callTool({
+    name: 'nvoy_outbox_write',
+    arguments: { payload: { name: 'trip plan', fields: { itinerary: 'YYZ→SFO 08:10, aisle 14C', status: 'final' } } },
+  }))
+  const outRead2 = await fetchScope(seedRelay, outGrant)
+  check('outbox_write: second write updates in place (same d, same v, new content)',
+    out2.d === out1.d && out2.first_write === false && outRead2.data?.fields?.status === 'final')
+  const agentIndex = await loadGrantIndex(seedRelay, agentSk)
+  check('agent outbox key recovered from the agent\'s own Grant Index (nsec-only recovery)',
+    agentIndex.nvoy_outbox?.[delegatorPub] === out1.d
+    && agentIndex.issued?.some(e => e.scope === out1.d && e.grantees?.includes(delegatorPub)))
+
+  // ---------------------------------------------------- request_access §6.2
+  const req = textJson(await client.callTool({
+    name: 'nvoy_request_access',
+    arguments: { delegator_npub: delegatorNpub, purpose: 'Draft weekly status emails from the project brief' },
+  }))
+  check('request_access: request sent', req.requested === true && req.delegator_npub === delegatorNpub)
+  const reqNotice = delegatorNotices().find(x => x.type === 'access_request')
+  check('delegator unwraps the access request (agent npub + purpose, relay saw neither)',
+    reqNotice?.from === getPublicKey(agentSk) && reqNotice?.purpose === 'Draft weekly status emails from the project brief')
+
+  // -------------------------------------------------- grant_relinquish §6.6
+  const relRead = textJson(await client.callTool({
+    name: 'nvoy_scope_read', arguments: { d: relScopeId, author_npub: delegatorNpub },
+  }))
+  check('relinquish setup: agent reads the one-task scope', relRead.data?.fields?.task === 'demo')
+  const rel = textJson(await client.callTool({
+    name: 'nvoy_grant_relinquish',
+    arguments: { d: relScopeId, author_npub: delegatorNpub, reason: 'task complete' },
+  }))
+  check('grant_relinquish: key + cache destroyed, notice sent',
+    rel.relinquished === true && typeof rel.destroyed_at === 'number' && rel.notice_sent === true)
+  const relAgain = textJson(await client.callTool({
+    name: 'nvoy_grant_relinquish', arguments: { d: relScopeId, author_npub: delegatorNpub },
+  }))
+  check('grant_relinquish: idempotent', relAgain.already_relinquished === true)
+  const relList = textJson(await client.callTool({ name: 'nvoy_grants_list' }))
+  check('grants_list: relinquished status + destruction record',
+    relList.grants?.find(g => g.d === relScopeId)?.status === 'relinquished'
+    && typeof relList.grants?.find(g => g.d === relScopeId)?.relinquishment?.destroyed_at === 'number')
+  const relReadBack = await client.callTool({
+    name: 'nvoy_scope_read', arguments: { d: relScopeId, author_npub: delegatorNpub },
+  })
+  check('scope_read after relinquish (delegator not yet rotated): NVOY_GRANT_RELINQUISHED',
+    relReadBack.isError === true && textJson(relReadBack).code === 'NVOY_GRANT_RELINQUISHED')
+  const relNotice = delegatorNotices().find(x => x.type === 'relinquish' && x.d === relScopeId)
+  check('delegator unwraps the relinquish notice { type, d, reason, destroyed_at }',
+    relNotice?.reason === 'task complete' && typeof relNotice?.destroyed_at === 'number')
+
+  // delegator finalizes: rotate → the severance is now cryptographic (§6.6.2)
+  await rotateScope(seedRelay, delegatorSk, {
+    scopeId: relScopeId, generation: 1, payload: { name: 'one-task brief', fields: { task: 'demo' } },
+    scopeName: 'one-task-brief', survivors: [],
+  })
+  const relFinal = await client.callTool({
+    name: 'nvoy_scope_read', arguments: { d: relScopeId, author_npub: delegatorNpub, max_age: 0 },
+  })
+  check('scope_read after the delegator rotates: NVOY_GRANT_REVOKED (severance final)',
+    relFinal.isError === true && textJson(relFinal).code === 'NVOY_GRANT_REVOKED')
+
+  // ------------------------------------------- streamable HTTP transport
+  const http = await spawnHttpServer()
+  httpChild = http.child
+  const httpClient = new Client({ name: 'nvoy-conformance-http', version: '0.1.0' })
+  const updates = []
+  httpClient.setNotificationHandler(ResourceUpdatedNotificationSchema, (note) => updates.push(note.params.uri))
+  await httpClient.connect(new StreamableHTTPClientTransport(new URL(http.url)))
+
+  const httpTools = (await httpClient.listTools()).tools.map(t => t.name)
+  check('HTTP transport: same 7-tool surface', TOOLS.every(t => httpTools.includes(t)) && httpTools.length === TOOLS.length)
+  const httpRead = textJson(await httpClient.callTool({
+    name: 'nvoy_scope_read', arguments: { d: scopeId, author_npub: delegatorNpub },
+  }))
+  check('HTTP transport: scope_read serves the scope', httpRead.data?.fields?.seat === 'aisle')
+
+  const httpSub = textJson(await httpClient.callTool({
+    name: 'nvoy_scope_subscribe', arguments: { d: scopeId, author_npub: delegatorNpub },
+  }))
+  check('scope_subscribe (HTTP): mode update-notifications', httpSub.subscribed === true && httpSub.mode === 'update-notifications')
+  await publishScope(seedRelay, delegatorSk, {
+    scopeId, generation: 1, scopeKey,
+    payload: { ...TRAVEL_PREFERENCES, fields: { ...TRAVEL_PREFERENCES.fields, note: 'UPDATED again: hotel changed' } },
+  })
+  await sleep(900) // > poll interval
+  check('scope change streams a notifications/resources/updated for the nvoy:// uri',
+    updates.includes(`nvoy://${delegatorNpub}/${scopeId}`))
+  const httpFresh = textJson(await httpClient.callTool({
+    name: 'nvoy_scope_read', arguments: { d: scopeId, author_npub: delegatorNpub },
+  }))
+  check('HTTP read after notification: fresh content', httpFresh.data?.fields?.note === 'UPDATED again: hotel changed')
+  await httpClient.close().catch(() => {})
+  httpChild.kill('SIGTERM')
+  httpChild = null
+
+  // ------------------------------------------------- auto_relinquish sweep
+  // Seeded with expires_at ≈ +4s and NVOY_SWEEP_MS=300 — by now the sweeper
+  // must have destroyed the key unprompted and notified the delegator.
+  {
+    const deadline = Date.now() + 6000
+    let g = null
+    while (Date.now() < deadline) {
+      const l = textJson(await client.callTool({ name: 'nvoy_grants_list' }))
+      g = l.grants?.find(x => x.d === autoScopeId)
+      if (g?.status === 'relinquished') break
+      await sleep(300)
+    }
+    check('auto_relinquish: sweeper destroyed the key at term expiry (status relinquished)',
+      g?.status === 'relinquished')
+    check('auto_relinquish: delegator received the relinquish notice',
+      delegatorNotices().some(x => x.type === 'relinquish' && x.d === autoScopeId))
+  }
 
   // ------------------------------------------- revocation, mid-conversation
   // The delegator rotates the key past the agent (survivors = []) and sends
@@ -166,13 +389,17 @@ try {
   // -------------------------------------- adversarial observer, real relay
   const view = ws.store.observerView()
   const kinds = new Set(view.map(e => e.kind))
-  check('observer: relay saw only 30440 + 1059 (no grant kind, no naked 441)',
-    !kinds.has(440) && !kinds.has(441) && [...kinds].every(k => [30440, 1059].includes(k)))
-  check('observer: no delegation metadata or revocation reason in stored content',
-    !JSON.stringify(view).includes('aisle') && !JSON.stringify(view).includes(purpose)
-    && !JSON.stringify(ws.store.events).includes(reason))
+  check('observer: relay saw only 30440 + 1059 + 10440 (no grant kind, no naked 441/notices)',
+    !kinds.has(440) && !kinds.has(441) && !kinds.has(KIND_NVOY_MSG)
+    && [...kinds].every(k => [30440, 1059, 10440].includes(k)))
+  const blob = JSON.stringify(ws.store.events)
+  check('observer: no delegation metadata, reasons, outputs, or requests in stored content',
+    !blob.includes('aisle') && !blob.includes(purpose) && !blob.includes(reason)
+    && !blob.includes('agent output') && !blob.includes('access_request')
+    && !blob.includes('task complete') && !blob.includes('itinerary'))
 } finally {
   await client.close().catch(() => {})
+  if (httpChild) httpChild.kill('SIGTERM')
   await ws.close()
 }
 

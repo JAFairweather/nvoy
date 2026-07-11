@@ -28,6 +28,15 @@ export interface RevocationRecord {
   detected_at: number // unix seconds
 }
 
+/** A relinquishment this agent performed (§6.6 phase 1): the key material
+ *  for (publisher, scope) at or below `generation` was destroyed locally.
+ *  Runtime state, like revocations; a re-grant with higher v supersedes. */
+export interface RelinquishRecord {
+  generation: number
+  destroyed_at: number // unix seconds
+  reason?: string
+}
+
 export interface HeldGrant {
   publisher: string // hex pubkey of the delegator
   scopeId: string // the 30440 `d` tag
@@ -43,6 +52,9 @@ export interface HeldGrant {
   /** Set when this grant's scope key was rotated past it (§6.3). The
    *  scopeKey is zeroized the moment this is set. */
   revoked?: RevocationRecord
+  /** Set when this agent relinquished the grant (§6.6). The scopeKey is
+   *  zeroized the moment this is set. */
+  relinquished?: RelinquishRecord
 }
 
 const b64decode = (s: string) => Uint8Array.from(atob(s), c => c.charCodeAt(0))
@@ -134,11 +146,14 @@ export async function findRevocationNotice(
 export { latestGrants }
 
 /**
- * revoked-detected | expired | active. Revocation is a verified fact about
- * the key material and outranks the soft expiry terms.
+ * revoked-detected | relinquished | expired | active. Revocation is a
+ * verified fact about the key material and outranks everything; a
+ * relinquishment is this runtime's own destruction record and outranks the
+ * soft expiry terms.
  */
 export function grantStatus(g: HeldGrant, nowSec = Math.floor(Date.now() / 1000)): GrantStatus {
   if (g.revoked) return 'revoked-detected'
+  if (g.relinquished) return 'relinquished'
   if (g.terms?.expires_at !== undefined) return termsStatus(g.terms, nowSec)
   if (g.expiration !== undefined && g.expiration <= nowSec) return 'expired'
   return 'active'
@@ -156,6 +171,7 @@ export class GrantStore {
   private cache: HeldGrant[] | null = null
   private fetchedAt = 0
   private revocations = new Map<string, RevocationRecord>()
+  private relinquishments = new Map<string, RelinquishRecord>()
 
   constructor(
     private relay: RelayLike,
@@ -198,6 +214,25 @@ export class GrantStore {
     return record
   }
 
+  /**
+   * Record a relinquishment (§6.6 phase 1) and zeroize the key material held
+   * right now. Like revocations, runtime-only and re-applied on every refresh
+   * (the wrap on the relay still yields the key during unwrap — we drop it
+   * the same tick). A re-grant with generation > `generation` comes back
+   * active: the delegator re-delegating IS the renewal path.
+   */
+  markRelinquished(publisher: string, scopeId: string, generation: number, destroyedAt: number, reason?: string): RelinquishRecord {
+    const key = `${publisher}:${scopeId}`
+    const prev = this.relinquishments.get(key)
+    const record: RelinquishRecord =
+      prev && prev.generation >= generation
+        ? prev
+        : { generation, destroyed_at: destroyedAt, ...(reason ? { reason } : {}) }
+    this.relinquishments.set(key, record)
+    for (const g of this.cache ?? []) this.applyRevocation(g)
+    return record
+  }
+
   /** Zeroize every held scope key (shutdown path — spec §5). */
   zeroizeAll(): void {
     for (const g of this.cache ?? []) g.scopeKey.fill(0)
@@ -205,10 +240,16 @@ export class GrantStore {
   }
 
   private applyRevocation(g: HeldGrant): void {
-    const rec = this.revocations.get(`${g.publisher}:${g.scopeId}`)
+    const key = `${g.publisher}:${g.scopeId}`
+    const rec = this.revocations.get(key)
     if (rec && g.generation <= rec.generation) {
       g.revoked = rec
       g.scopeKey.fill(0) // real zeroization — it's bytes, not a JS string
+    }
+    const rel = this.relinquishments.get(key)
+    if (rel && g.generation <= rel.generation) {
+      g.relinquished = rel
+      g.scopeKey.fill(0)
     }
   }
 }

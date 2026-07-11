@@ -75,8 +75,9 @@ export function parseTerms(content: unknown): NvoyTerms | null {
 }
 
 /** Grant status: active | expired (per expires_at, soft — runtime honors it)
- *  | revoked-detected (v-supersession verified against a fresh 30440, §6.3). */
-export type GrantStatus = 'active' | 'expired' | 'revoked-detected'
+ *  | revoked-detected (v-supersession verified against a fresh 30440, §6.3)
+ *  | relinquished (this agent destroyed its own key material, §6.6). */
+export type GrantStatus = 'active' | 'expired' | 'revoked-detected' | 'relinquished'
 
 export function termsStatus(terms: NvoyTerms | null, nowSec = Math.floor(Date.now() / 1000)): GrantStatus {
   if (terms?.expires_at !== undefined && terms.expires_at <= nowSec) return 'expired'
