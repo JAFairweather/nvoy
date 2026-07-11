@@ -1,0 +1,24 @@
+{
+  "name": "nvoy",
+  "version": "0.1.0",
+  "description": "Scoped, revocable data delegation to agentic workflows over nostr. Agent side mounts as an MCP server. Built on NIP-DA Scoped Data Grants.",
+  "type": "module",
+  "scripts": {
+    "build": "npm --prefix mcp run build",
+    "delegate": "node test/delegate.mjs",
+    "smoke": "node test/smoke.mjs",
+    "smoke:local": "node test/smoke.mjs",
+    "smoke:live": "node test/smoke.mjs --live",
+    "conformance": "node test/mcp-conformance.mjs",
+    "test": "npm run build && npm run smoke && npm run conformance",
+    "sync-lib": "for f in nipxx.mjs liverelay.mjs relay.mjs; do { echo \"// vendored from JAFairweather/nostr-scoped-data-grants @ $(git -C ../nip-demo rev-parse --short HEAD) — do not edit; npm run sync-lib\"; cat ../nip-demo/$f; } > lib/$f; done"
+  },
+  "dependencies": {
+    "nostr-tools": "^2.23.9",
+    "ws": "^8.0.0"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  },
+  "license": "MIT"
+}
