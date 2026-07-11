@@ -10,7 +10,10 @@
     "smoke:local": "node test/smoke.mjs",
     "smoke:live": "node test/smoke.mjs --live",
     "conformance": "node test/mcp-conformance.mjs",
-    "test": "npm run build && npm run smoke && npm run conformance",
+    "nopersist": "node test/nopersist.mjs",
+    "demo": "node examples/demo-trip-planner/demo.mjs",
+    "demo:live": "node examples/demo-trip-planner/demo.mjs --live",
+    "test": "npm run build && npm run smoke && npm run conformance && npm run nopersist",
     "sync-lib": "for f in nipxx.mjs liverelay.mjs relay.mjs; do { echo \"// vendored from JAFairweather/nostr-scoped-data-grants @ $(git -C ../nip-demo rev-parse --short HEAD) — do not edit; npm run sync-lib\"; cat ../nip-demo/$f; } > lib/$f; done"
   },
   "dependencies": {

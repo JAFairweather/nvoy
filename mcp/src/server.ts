@@ -12,6 +12,7 @@
 // log() must never be handed scope payloads. Cache is scrubbed on TTL
 // expiry (sweeper), on revocation, and on shutdown (below).
 
+import { writeSync } from 'node:fs'
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
@@ -265,7 +266,14 @@ function teardown(): void {
   downed = true
   scopeCache.destroy()
   grantStore.zeroizeAll()
-  log('cache zeroized (shutdown)')
+  // fs.writeSync, not console.error: pipe writes are async on POSIX and a
+  // process.exit right after would drop the line the no_persist conformance
+  // test watches for.
+  try {
+    writeSync(2, '[nvoy] cache zeroized (shutdown)\n')
+  } catch {
+    /* stderr already gone */
+  }
 }
 process.on('exit', teardown)
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
