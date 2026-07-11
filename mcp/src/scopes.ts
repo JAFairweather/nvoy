@@ -36,7 +36,7 @@ export class ScopeCache {
     const key = `${grant.publisher}:${grant.scopeId}`
     const maxAgeMs = opts.maxAgeSec !== undefined ? opts.maxAgeSec * 1000 : this.ttlMs
     const hit = this.entries.get(key)
-    if (hit && Date.now() - hit.at <= Math.min(maxAgeMs, this.ttlMs)) return hit.result
+    if (maxAgeMs > 0 && hit && Date.now() - hit.at < Math.min(maxAgeMs, this.ttlMs)) return hit.result
 
     const result: ScopeReadResult = {
       ...(await fetchScope(this.relay, grant)),
