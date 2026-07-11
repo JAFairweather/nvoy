@@ -8,7 +8,8 @@
 
 import { nip19 } from 'nostr-tools'
 import { saveGrantIndex } from '../lib/nipxx.mjs'
-import { state, $, esc, short, load, parsePub, agentsOf, agentName } from './main.mjs'
+import { state, $, esc, short, fmtWhen, load, parsePub, agentsOf, agentName, dismissRequest, showTab } from './main.mjs'
+import { prefillDelegate } from './delegate.mjs'
 
 const statusChip = (d) =>
   `<span class="chip scope-${d.status}" title="${esc(d.purpose ?? '')}">${esc(d.scopeName)} · ${d.status}</span>`
@@ -39,9 +40,33 @@ function agentCard(a, i) {
   </div>`
 }
 
+/** Pending access requests (§6.2): gift-wrapped nvoy_request_access rumors.
+ *  Approve = register the agent (if new) + open the delegate form pre-filled;
+ *  deny = dismiss locally — nothing was granted, so nothing goes on the wire. */
+function requestCard(r, i) {
+  return `<div class="reqrow" data-i="${i}">
+    <div class="reqbody">
+      <b>${esc(agentName(r.from))}</b> <span class="meta">${esc(short(r.from))}</span>
+      <span class="meta">· ${fmtWhen(r.at)}</span>
+      <div class="purpose">“${esc(r.purpose)}”</div>
+    </div>
+    <div class="reqacts">
+      <button class="primary req-approve">Approve…</button>
+      <button class="req-deny" title="dismiss on this device — the agent is not notified">Deny</button>
+    </div>
+  </div>`
+}
+
 export function renderAgents() {
   const agents = agentsOf()
   $('agents').innerHTML = `
+    ${state.requests.length ? `<div class="card requests">
+      <div class="name">Pending access requests</div>
+      <div class="note" style="margin:2px 0 8px">Agents asking for a delegation. Approving opens the
+        delegate form pre-filled — you still choose the data and the terms. Denying dismisses the
+        request on this device only; the agent learns nothing.</div>
+      ${state.requests.map(requestCard).join('')}
+    </div>` : ''}
     <div class="newbar">
       <input id="ag-npub" placeholder="agent npub1… (from the Nvoy MCP server boot line, or its operator)" autocomplete="off" spellcheck="false">
       <button class="primary" id="ag-add">+ Add agent</button>
@@ -51,6 +76,22 @@ export function renderAgents() {
       No agents yet. An agent is a keypair held by an Nvoy MCP server —
       boot one with <code>node mcp/dist/server.js --ephemeral</code> and paste its npub above.<br>
       You delegate scopes of data to it; it dereferences them live and loses access when you revoke.</div>`}`
+
+  for (const row of document.querySelectorAll('#agents .reqrow')) {
+    const r = state.requests[Number(row.dataset.i)]
+    if (!r) continue
+    row.querySelector('.req-approve').onclick = async () => {
+      if (!agentsOf().some(a => a.pub === r.from)) {
+        state.index.nvoy_agents = [...agentsOf(), { pub: r.from, added_at: Math.floor(Date.now() / 1000) }]
+        try { await saveGrantIndex(state.relay, state.signer, state.index) }
+        catch (err) { $('ag-msg').textContent = err.message; return }
+      }
+      dismissRequest(r.id)
+      prefillDelegate({ agent: r.from, purpose: r.purpose })
+      showTab('delegate')
+    }
+    row.querySelector('.req-deny').onclick = () => { dismissRequest(r.id); renderAgents() }
+  }
 
   const msg = $('ag-msg')
   $('ag-add').onclick = async () => {

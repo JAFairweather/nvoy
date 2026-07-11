@@ -11,14 +11,21 @@ import { appendLedger, grantedEvent } from './ledgerlog.mjs'
 import { state, $, esc, agentsOf, agentName, load, RELAYS } from './main.mjs'
 
 let draft = {                       // survives tab switches until issued
-  tpl: null, json: '', name: '', purpose: '', expires: '',
+  tpl: null, agent: '', json: '', name: '', purpose: '', expires: '',
   no_persist: true, redelegate: false, reply_scope_requested: false, auto_relinquish: false,
+}
+
+/** Approve flow for access requests (§6.2): agents.mjs pre-fills the form
+ *  with the requesting agent + its stated purpose, then switches here. */
+export function prefillDelegate({ agent, purpose }) {
+  draft.agent = agent || draft.agent
+  if (purpose) draft.purpose = purpose
 }
 
 export function renderDelegate() {
   const agents = agentsOf()
   const options = agents.map(a =>
-    `<option value="${a.pub}">${esc(agentName(a.pub))} — ${esc(nip19.npubEncode(a.pub).slice(0, 16))}…</option>`).join('')
+    `<option value="${a.pub}"${a.pub === draft.agent ? ' selected' : ''}>${esc(agentName(a.pub))} — ${esc(nip19.npubEncode(a.pub).slice(0, 16))}…</option>`).join('')
   $('delegate').innerHTML = `
     <div class="card">
       <div class="name">New delegation</div>
@@ -80,6 +87,7 @@ export function renderDelegate() {
     </div>`
 
   const pull = () => {
+    draft.agent = $('dg-agent')?.value ?? draft.agent
     draft.name = $('dg-name').value
     draft.json = $('dg-json').value
     draft.purpose = $('dg-purpose').value
@@ -154,7 +162,7 @@ export function renderDelegate() {
       state.index.nvoy_ledger = appendLedger(state.index,
         grantedEvent({ scope: scopeId, agent, v: 1, terms: { nvoy: 1, ...terms }, name: scopeName }))
       await saveGrantIndex(state.relay, state.signer, state.index)
-      draft = { tpl: null, json: '', name: '', purpose: '', expires: '',
+      draft = { tpl: null, agent: '', json: '', name: '', purpose: '', expires: '',
         no_persist: true, redelegate: false, reply_scope_requested: false, auto_relinquish: false }
       msg.textContent = `delegated — scope ${scopeId} to ${agentName(agent)}. See the Ledger.`
       await load()

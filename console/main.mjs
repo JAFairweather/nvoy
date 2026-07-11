@@ -6,9 +6,11 @@
 import { generateSecretKey, getPublicKey, nip19 } from 'nostr-tools'
 import * as nip49 from 'nostr-tools/nip49'
 import { LiveRelay } from '../lib/liverelay.mjs'
-import { localSigner, loadGrantIndex } from '../lib/nipxx.mjs'
+import { localSigner, loadGrantIndex, latestGrants } from '../lib/nipxx.mjs'
 import { loadConfig } from './config.mjs'
 import { deriveDelegations } from './ledgerlog.mjs'
+import { receiveGrantsWithTerms, receiveNotices } from './nvoygrant.mjs'
+import { expiryRotationPlan, nextExpiry, runExpiryRotation, relinquishPlan, runRelinquishRotation } from './ttl.mjs'
 import { renderAgents } from './agents.mjs'
 import { renderDelegate } from './delegate.mjs'
 import { renderLedger } from './ledger.mjs'
@@ -28,6 +30,9 @@ export const state = {
   index: { issued: [], received: [] },   // the Grant Index — the whole record
   delegations: [],                       // derived rows: deriveDelegations(index)
   profiles: new Map(),                   // pubkey → kind-0 metadata
+  received: [],                          // grants TO me (agent outboxes, §6.5)
+  requests: [],                          // pending access requests (§6.2)
+  pendingRelinquish: [],                 // relinquish notices awaiting one-tap confirm (§6.6)
 }
 
 export const agentsOf = () => state.index.nvoy_agents ?? []
@@ -64,7 +69,7 @@ function nip07Signer() {
 
 const TABS = { agents: renderAgents, delegate: renderDelegate, ledger: renderLedger, settings: renderSettings }
 let current = 'agents'
-function showTab(t) {
+export function showTab(t) {
   current = t
   for (const b of document.querySelectorAll('.tab')) b.classList.toggle('active', b.dataset.tab === t)
   for (const id of Object.keys(TABS)) $(id).style.display = t === id ? '' : 'none'
@@ -143,16 +148,77 @@ function showUnlock(ncryptsec) {
   }
 }
 
+// --- dismissed access requests: a local-only judgment (deny = "not now"),
+// deliberately NOT in the Grant Index — nothing was granted or revoked.
+const DISMISS_KEY = 'nvoy-dismissed-requests'
+const dismissedIds = () => { try { return JSON.parse(localStorage.getItem(DISMISS_KEY)) ?? [] } catch { return [] } }
+export function dismissRequest(id) {
+  localStorage.setItem(DISMISS_KEY, JSON.stringify([...dismissedIds(), id].slice(-300)))
+  state.requests = state.requests.filter(r => r.id !== id)
+}
+
+// --- TTL scheduler (§6.4.3): sweep overdue expiries, then arm a timer for
+// the next deadline while the console stays open. Honesty: this is
+// client-side cron — the ledger banner says so.
+let ttlTimer = null
+async function sweepExpiries() {
+  let rotated = 0
+  for (const item of expiryRotationPlan(state.index)) {
+    try {
+      await runExpiryRotation(state.relay, state.signer, state.index, item, { relayHint: RELAYS[0] })
+      rotated++
+    } catch (err) { console.warn(`TTL rotation of ${item.scope} skipped: ${err.message}`) }
+  }
+  return rotated
+}
+function armTtlTimer() {
+  clearTimeout(ttlTimer)
+  const next = nextExpiry(state.index)
+  if (next === null) return
+  const ms = (next - Math.floor(Date.now() / 1000)) * 1000 + 1500
+  if (ms > 2 ** 31 - 1) return // > ~24 days out; every load() re-arms anyway
+  ttlTimer = setTimeout(() => { load() }, Math.max(ms, 1000))
+}
+
 /** Reload everything from the Grant Index — the single authoritative record.
  *  Agents, delegations, and history all derive from it; kind-0 profiles are
- *  presentation only, fetched fresh per load. */
+ *  presentation only, fetched fresh per load. Also the scheduler beat: every
+ *  load sweeps overdue TTLs, applies the relinquish policy (decision 6), and
+ *  re-arms the expiry timer. */
 export async function load() {
   const { relay, signer } = state
   $('status').textContent = 'loading your Grant Index from relays…'
   try {
     state.index = await loadGrantIndex(relay, signer)
+
+    // hard expiry (§6.4.3): rotate anything already past deadline, arm the rest
+    const expired = await sweepExpiries()
+    armTtlTimer()
+
+    // inbound gift wraps: agent outboxes (§6.5) + notices (§6.2, §6.6)
+    const [grants, notices] = await Promise.all([
+      receiveGrantsWithTerms(relay, signer).catch(() => []),
+      receiveNotices(relay, signer).catch(() => ({ accessRequests: [], relinquishes: [] })),
+    ])
+    state.received = latestGrants(grants)
+    const dismissed = new Set(dismissedIds())
+    state.requests = notices.accessRequests.filter(r => !dismissed.has(r.id))
+
+    // relinquish policy (§6.6, decision 6): sole grantee → rotate NOW;
+    // otherwise queue the one-tap confirm on the ledger card
+    const plan = relinquishPlan(state.index, notices.relinquishes)
+    for (const item of plan.auto) {
+      try { await runRelinquishRotation(relay, signer, state.index, item, { relayHint: RELAYS[0] }) }
+      catch (err) { console.warn(`relinquish rotation of ${item.scope} skipped: ${err.message}`) }
+    }
+    state.pendingRelinquish = plan.confirm
+
     state.delegations = deriveDelegations(state.index)
-    const pubs = [...new Set([...agentsOf().map(a => a.pub), ...state.delegations.map(d => d.agent)])]
+    const pubs = [...new Set([
+      ...agentsOf().map(a => a.pub),
+      ...state.delegations.map(d => d.agent),
+      ...state.requests.map(r => r.from),
+    ])]
     state.profiles = new Map()
     if (pubs.length)
       for (const ev of await relay.query({ kinds: [0], authors: pubs, limit: pubs.length * 3 }))
@@ -162,8 +228,11 @@ export async function load() {
     const active = state.delegations.filter(d => d.status === 'active').length
     $('status').textContent =
       `${agentsOf().length} agent${agentsOf().length === 1 ? '' : 's'} · ` +
-      `${active} active delegation${active === 1 ? '' : 's'}. ` +
-      `Everything below derives from your encrypted Grant Index — sign in with this key anywhere and it reconstitutes.`
+      `${active} active delegation${active === 1 ? '' : 's'}` +
+      (state.requests.length ? ` · ${state.requests.length} pending access request${state.requests.length === 1 ? '' : 's'}` : '') +
+      (state.pendingRelinquish.length ? ` · ${state.pendingRelinquish.length} relinquish to confirm` : '') +
+      (expired ? ` · ${expired} expired scope${expired === 1 ? '' : 's'} rotated` : '') +
+      `. Everything below derives from your encrypted Grant Index — sign in with this key anywhere and it reconstitutes.`
     rerender()
   } catch (err) { $('status').textContent = `relay error: ${err.message}` }
 }

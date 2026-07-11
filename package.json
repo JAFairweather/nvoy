@@ -12,11 +12,13 @@
     "conformance": "node test/mcp-conformance.mjs",
     "nopersist": "node test/nopersist.mjs",
     "ledger": "node test/ledger.mjs",
+    "accept": "node test/m4accept.mjs",
+    "ttl-daemon": "node bin/nvoy-ttl.mjs",
     "console": "node console/serve.mjs",
     "wsrelay": "node test/wsrelay.mjs 4460",
     "demo": "node examples/demo-trip-planner/demo.mjs",
     "demo:live": "node examples/demo-trip-planner/demo.mjs --live",
-    "test": "npm run build && npm run smoke && npm run ledger && npm run conformance && npm run nopersist",
+    "test": "npm run build && npm run smoke && npm run ledger && npm run conformance && npm run nopersist && npm run accept",
     "sync-lib": "for f in nipxx.mjs liverelay.mjs relay.mjs; do { echo \"// vendored from JAFairweather/nostr-scoped-data-grants @ $(git -C ../nip-demo rev-parse --short HEAD) — do not edit; npm run sync-lib\"; cat ../nip-demo/$f; } > lib/$f; done"
   },
   "dependencies": {
