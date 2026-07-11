@@ -1,12 +1,35 @@
 {
-  "//": "Claude Desktop MCP config snippet — merge into claude_desktop_config.json (Settings > Developer > Edit Config). Replace the placeholders: the absolute path to your nvoy checkout and the agent's nsec (this key IS the agent's identity — a delegator grants scopes to its npub, shown on the server's boot line).",
+  "//": "Claude Desktop MCP config for the Nvoy agent server. Merge the chosen server block into claude_desktop_config.json (Settings > Developer > Edit Config), keep only ONE, and replace the placeholders. The agent's key IS its identity — a delegator grants scopes to its npub, printed on the server's first stderr boot line. Build the server first: `cd nvoy/mcp && npm install` (the prepare script runs tsc).",
+
+  "//recommended": "Standing agent — key on disk only as a NIP-49 ncryptsec, decrypted at boot. Create the file with the console's Print/Protect flow or any NIP-49 tool.",
   "mcpServers": {
     "nvoy": {
       "command": "node",
       "args": ["/ABSOLUTE/PATH/TO/nvoy/mcp/dist/server.js"],
       "env": {
+        "NVOY_NCRYPTSEC_FILE": "/ABSOLUTE/PATH/TO/agent.ncryptsec",
+        "NVOY_NCRYPTSEC_PASSPHRASE": "REPLACE_WITH_YOUR_PASSPHRASE",
+        "NVOY_RELAYS": "wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net"
+      }
+    },
+
+    "//alt-nsec": "Convenient but leaves a raw key in the config/environment — see SECURITY.md. Fine for a throwaway demo agent.",
+    "nvoy-nsec-variant": {
+      "command": "node",
+      "args": ["/ABSOLUTE/PATH/TO/nvoy/mcp/dist/server.js"],
+      "env": {
         "NVOY_NSEC": "nsec1REPLACE_WITH_AGENT_SECRET_KEY",
         "NVOY_RELAYS": "wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net"
+      }
+    },
+
+    "//alt-npx": "If you built and installed the tarball globally (`cd nvoy/mcp && npm pack && npm i -g ./nvoy-mcp-0.1.0.tgz`), the bin `nvoy-mcp` replaces the node+path command.",
+    "nvoy-bin-variant": {
+      "command": "nvoy-mcp",
+      "args": [],
+      "env": {
+        "NVOY_NCRYPTSEC_FILE": "/ABSOLUTE/PATH/TO/agent.ncryptsec",
+        "NVOY_NCRYPTSEC_PASSPHRASE": "REPLACE_WITH_YOUR_PASSPHRASE"
       }
     }
   }

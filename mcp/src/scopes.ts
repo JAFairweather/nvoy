@@ -13,7 +13,7 @@
 // reclaim it — the 32-byte scope keys (in grants.ts) are genuinely
 // overwritten. Disclosed here per family convention.
 
-import { fetchScope, type RelayLike, type ScopeFetchResult } from '../../lib/nipxx.mjs'
+import { fetchScope, type RelayLike, type ScopeFetchResult } from '../lib/nipxx.mjs'
 import type { HeldGrant } from './grants.js'
 
 export interface ScopeReadResult extends ScopeFetchResult {

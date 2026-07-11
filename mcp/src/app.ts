@@ -17,7 +17,7 @@
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import { nip19 } from 'nostr-tools'
-import { KIND_DATA_SET, type RelayLike } from '../../lib/nipxx.mjs'
+import { KIND_DATA_SET, type RelayLike } from '../lib/nipxx.mjs'
 import type { Identity } from './identity.js'
 import { GrantStore, findRevocationNotice, grantStatus, toHexPubkey, type HeldGrant } from './grants.js'
 import { ScopeCache } from './scopes.js'

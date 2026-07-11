@@ -11,7 +11,7 @@
 // (latestGrants) stays the vendored lib's.
 
 import { getPublicKey, nip19, nip44, verifyEvent } from 'nostr-tools'
-import { KIND_DATA_SET, KIND_GRANT, latestGrants, type RelayLike } from '../../lib/nipxx.mjs'
+import { KIND_DATA_SET, KIND_GRANT, latestGrants, type RelayLike } from '../lib/nipxx.mjs'
 import { parseTerms, termsStatus, type GrantStatus, type NvoyTerms } from './terms.js'
 
 /** Grant Revocation notice (NIP-DA optional courtesy rumor, gift-wrapped). */

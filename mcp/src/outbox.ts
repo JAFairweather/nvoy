@@ -17,7 +17,7 @@ import {
   KIND_DATA_SET, KIND_GRANT, newScopeKey, publishScope,
   loadGrantIndex, saveGrantIndex, toIssuedEntry, fromIssuedEntry,
   type RelayLike,
-} from '../../lib/nipxx.mjs'
+} from '../lib/nipxx.mjs'
 import type { Identity } from './identity.js'
 
 interface OutboxRecord {

@@ -16,7 +16,7 @@
 //                                            tags: [['a', 30440:pub:d]]
 
 import { wrapEvent } from 'nostr-tools/nip59'
-import { KIND_DATA_SET, type RelayLike } from '../../lib/nipxx.mjs'
+import { KIND_DATA_SET, type RelayLike } from '../lib/nipxx.mjs'
 
 /** App-level rumor kind for Nvoy notices — only ever inside 1059 gift wraps. */
 export const KIND_NVOY_MSG = 24440

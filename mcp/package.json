@@ -4,9 +4,34 @@
   "description": "Nvoy MCP server — serves NIP-DA scoped data grants to any MCP client. The agent side of scoped, revocable data delegation over nostr.",
   "type": "module",
   "main": "dist/server.js",
+  "bin": {
+    "nvoy-mcp": "dist/server.js"
+  },
+  "files": [
+    "dist",
+    "lib",
+    "README.md"
+  ],
   "scripts": {
-    "build": "tsc",
-    "start": "node dist/server.js"
+    "vendor-lib": "mkdir -p lib && cp ../lib/nipxx.mjs ../lib/liverelay.mjs ../lib/nipxx.d.mts ../lib/liverelay.d.mts lib/",
+    "build": "npm run vendor-lib && tsc",
+    "start": "node dist/server.js",
+    "prepare": "npm run build"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "mcp",
+    "nostr",
+    "nip-da",
+    "agent",
+    "delegation"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/JAFairweather/nvoy.git",
+    "directory": "mcp"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
