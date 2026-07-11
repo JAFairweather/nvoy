@@ -49,7 +49,7 @@ function delegationCard(d, i) {
       <span class="meta">${esc(short(d.agent))}</span></div>
     ${d.purpose ? `<div class="purpose">“${esc(d.purpose)}”</div>` : ''}
     <div class="chips">${termChips(d.terms)}
-      <span class="chip ${d.status === 'expired' || soon ? 'warn' : ''}" title="soft expiry — the runtime honors it; hard expiry is the M4 TTL rotation">${fmtCountdown(d.expiresAt)}</span>
+      ${d.status !== 'revoked' ? `<span class="chip ${d.status === 'expired' || soon ? 'warn' : ''}" title="soft expiry — the runtime honors it; hard expiry is the M4 TTL rotation">${fmtCountdown(d.expiresAt)}</span>` : ''}
     </div>
     ${events.length ? `<div class="history">${events.map(hRow).join('')}</div>` : ''}
     <div class="actions" style="margin-top:6px"><span class="msg lg-msg"></span></div>
