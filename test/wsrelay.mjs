@@ -48,3 +48,12 @@ export function startWsRelay(port = 0) {
     }))
   })
 }
+
+// Standalone mode for browser E2E: `node test/wsrelay.mjs 4460` keeps a
+// relay up on that port so the console (Settings → ws://127.0.0.1:4460) and
+// the MCP server share one offline, deterministic relay.
+import { pathToFileURL } from 'node:url'
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href && process.argv[2]) {
+  const { url } = await startWsRelay(Number(process.argv[2]))
+  console.log(`wsrelay listening on ${url} (ctrl-c to stop)`)
+}
