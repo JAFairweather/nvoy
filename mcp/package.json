@@ -1,0 +1,22 @@
+{
+  "name": "nvoy-mcp",
+  "version": "0.1.0",
+  "description": "Nvoy MCP server — serves NIP-DA scoped data grants to any MCP client. The agent side of scoped, revocable data delegation over nostr.",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "nostr-tools": "^2.23.9",
+    "ws": "^8.0.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  },
+  "license": "MIT"
+}
