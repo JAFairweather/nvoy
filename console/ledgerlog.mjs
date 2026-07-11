@@ -8,6 +8,10 @@
 //   { t: 'granted', at, scope, agent, v, terms, name }    terms = full §4 object or null
 //   { t: 'rotated', at, scope, from_v, to_v, survivors }  survivors = count
 //   { t: 'revoked', at, scope, agent, v, reason, notice } notice = whether a 441 was sent
+//   { t: 'relinquished', at, scope, agent, v, reason, destroyed_at }
+//       agent-initiated (§6.6): the runtime destroyed its key and told us
+//   { t: 'expired-rotated', at, scope, from_v, to_v, expired, survivors }
+//       the TTL scheduler's hard expiry (§6.4.3): expired = count dropped
 // Append-only, capped at LEDGER_CAP (oldest trimmed) to keep the 10440 sane.
 //
 // DOM-free on purpose — test/ledger.mjs drives this module in Node.
@@ -34,14 +38,23 @@ export const rotatedEvent = ({ scope, from_v, to_v, survivors, at = nowSec() }) 
 export const revokedEvent = ({ scope, agent, v, reason, notice, at = nowSec() }) =>
   ({ t: 'revoked', at, scope, agent, v, reason: reason || null, notice: !!notice })
 
+export const relinquishedEvent = ({ scope, agent, v, reason, destroyed_at, at = nowSec() }) =>
+  ({ t: 'relinquished', at, scope, agent, v, reason: reason || null, destroyed_at })
+
+export const expiredRotatedEvent = ({ scope, from_v, to_v, expired, survivors, at = nowSec() }) =>
+  ({ t: 'expired-rotated', at, scope, from_v, to_v, expired, survivors })
+
 /**
  * Derive the delegation list the ledger renders: one row per (scope, agent)
  * pair ever granted. Status comes from the CURRENT issued entries — the
  * authoritative record — with the ledger supplying history and terms:
- *   active   agent holds the current generation, not expired
- *   expired  agent holds the current generation but terms.expires_at passed
- *            (soft — hard expiry is the M4 TTL rotation)
- *   revoked  agent no longer in the scope's grantees (or scope gone)
+ *   active       agent holds the current generation, not expired
+ *   expired      agent holds the current generation but terms.expires_at
+ *                passed (soft — the TTL scheduler rotates it), OR was
+ *                dropped by an expired-rotation (hard expiry landed)
+ *   relinquished agent handed the delegation back (§6.6) and was rotated out
+ *   revoked      agent no longer in the scope's grantees for any other
+ *                reason (revoke-now, scope gone)
  */
 export function deriveDelegations(index, now = nowSec()) {
   const issued = new Map((index.issued ?? []).map(e => [e.scope, e]))
@@ -63,12 +76,28 @@ export function deriveDelegations(index, now = nowSec()) {
       if (!pairs.has(`${scope}:${pub}`))
         pairs.set(`${scope}:${pub}`, { scope, agent: pub, grantedAt: null, terms: null, name: e.scope_name })
 
+  // A dropped pair's terminal state comes from its newest terminal event:
+  // relinquished (agent handed it back) beats revoked beats aged-out.
+  const droppedStatus = (log, p) => {
+    for (let i = log.length - 1; i >= 0; i--) {
+      const ev = log[i]
+      if (ev.scope !== p.scope) continue
+      if (ev.t === 'relinquished' && ev.agent === p.agent) return 'relinquished'
+      if (ev.t === 'revoked' && ev.agent === p.agent) return 'revoked'
+      if (ev.t === 'expired-rotated' && p.terms?.expires_at !== undefined && p.terms.expires_at <= ev.at) return 'expired'
+    }
+    return 'revoked'
+  }
+
+  const log = ledgerOf(index)
   const rows = []
   for (const p of pairs.values()) {
     const e = issued.get(p.scope)
     const held = !!e?.grantees?.includes(p.agent)
     const expiresAt = p.terms?.expires_at ?? null
-    const status = !held ? 'revoked' : (expiresAt !== null && expiresAt <= now ? 'expired' : 'active')
+    const status = !held
+      ? droppedStatus(log, p)
+      : (expiresAt !== null && expiresAt <= now ? 'expired' : 'active')
     rows.push({
       scope: p.scope,
       scopeName: e?.scope_name ?? p.name ?? p.scope,
@@ -81,15 +110,15 @@ export function deriveDelegations(index, now = nowSec()) {
       expiresAt,
     })
   }
-  const rank = { active: 0, expired: 1, revoked: 2 }
+  const rank = { active: 0, expired: 1, relinquished: 2, revoked: 3 }
   return rows.sort((a, b) => rank[a.status] - rank[b.status] || (b.grantedAt ?? 0) - (a.grantedAt ?? 0))
 }
 
-/** Event history for one delegation: its own granted/revoked events plus
- *  every scope-wide rotation, oldest first. */
+/** Event history for one delegation: its own granted/revoked/relinquished
+ *  events plus every scope-wide rotation (manual or TTL), oldest first. */
 export const eventsFor = (index, scope, agent) =>
   ledgerOf(index)
-    .filter(ev => ev.scope === scope && (ev.t === 'rotated' || ev.agent === agent))
+    .filter(ev => ev.scope === scope && (ev.t === 'rotated' || ev.t === 'expired-rotated' || ev.agent === agent))
     .sort((a, b) => a.at - b.at)
 
 /** The totals line: "N active delegations to M agents, K revoked this month." */

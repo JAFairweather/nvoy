@@ -10,13 +10,18 @@ import { generateSecretKey, getPublicKey } from 'nostr-tools'
 import { localSigner, newScopeKey, publishScope, fetchScope, saveGrantIndex, loadGrantIndex, toIssuedEntry, fromIssuedEntry } from '../lib/nipxx.mjs'
 import { Relay } from '../lib/relay.mjs'
 import { LocalRelay } from '../lib/liverelay.mjs'
-import { grantWithTerms, sendRevocationNotice, rotateWithTerms, opaqueScopeId, TEMPLATES } from '../console/nvoygrant.mjs'
+import {
+  grantWithTerms, sendRevocationNotice, rotateWithTerms, opaqueScopeId, TEMPLATES,
+  receiveGrantsWithTerms, receiveNotices,
+} from '../console/nvoygrant.mjs'
 import {
   appendLedger, grantedEvent, rotatedEvent, revokedEvent,
   deriveDelegations, eventsFor, computeTotals, fmtCountdown, LEDGER_CAP,
 } from '../console/ledgerlog.mjs'
+import { expiryRotationPlan, nextExpiry, runExpiryRotation, relinquishPlan, runRelinquishRotation } from '../console/ttl.mjs'
 import { sanitizeConfig, DEFAULT_RELAYS } from '../console/config.mjs'
 import { receiveGrants, latestGrants, findRevocationNotice, grantStatus } from '../mcp/dist/grants.js'
+import { sendAccessRequest, sendRelinquishNotice } from '../mcp/dist/notices.js'
 
 let n = 0, failed = 0
 const check = (name, cond) => {
@@ -156,7 +161,122 @@ check('config: ws:// kept for local relay, junk falls back to defaults',
   && sanitizeConfig({ relays: ['http://nope', 42] }).relays.join() === DEFAULT_RELAYS.join()
   && sanitizeConfig(null).relays.length === 3)
 
-// ------------------------------------------------ 7. adversarial observer
+// ------------------- 7. §6.5 outputs: agent grants its outbox back (console
+// receives terms-aware — the read side of the Ledger "outputs" surface)
+
+const outScope = opaqueScopeId()
+const outKey = newScopeKey()
+await publishScope(relay, agentB, { scopeId: outScope, generation: 1, scopeKey: outKey,
+  payload: { name: 'agent output', fields: { status: 'itinerary drafted', updated: 'now' } } })
+await grantWithTerms(relay, agentB, delegatorPub, {
+  scopeId: outScope, generation: 1, scopeKey: outKey, scopeName: 'agent output',
+  terms: { purpose: 'agent output' },
+})
+const rxGrants = await receiveGrantsWithTerms(relay, signer)
+const outRec = rxGrants.find(g => g.publisher === agentBPub && g.scopeId === outScope)
+check('console receives the agent outbox grant WITH terms (signer-based unwrap)',
+  outRec?.terms?.purpose === 'agent output' && outRec?.scopeName === 'agent output' && outRec?.generation === 1)
+check('console dereferences the agent output live',
+  (await fetchScope(relay, outRec)).data?.fields?.status === 'itinerary drafted')
+
+// --------------- 8. nvoy notices cross-impl: MCP runtime sends, console reads
+
+await sendAccessRequest(relay, agentA, delegatorPub, 'Draft weekly status emails from the project brief')
+await sendRelinquishNotice(relay, agentB, delegatorPub,
+  { publisher: delegatorPub, scopeId, reason: 'trip planned — handing the data back', destroyed_at: now })
+const notices = await receiveNotices(relay, signer)
+check('access request unwraps: agent pubkey + purpose intact',
+  notices.accessRequests.some(r => r.from === agentAPub && r.purpose === 'Draft weekly status emails from the project brief'))
+check('relinquish notice unwraps: { from, scope, reason, destroyed_at }', (() => {
+  const rel = notices.relinquishes.find(x => x.scope === scopeId)
+  return rel?.from === agentBPub && rel?.reason === 'trip planned — handing the data back' && rel?.destroyed_at === now
+})())
+
+// ------------- 9. relinquish policy (§6.6 + decision 6): sole grantee → auto
+
+let plan = relinquishPlan(index, notices.relinquishes)
+check('relinquish plan: sole grantee (B on the travel scope) queued for AUTO-rotation',
+  plan.auto.length === 1 && plan.auto[0].scope === scopeId && plan.auto[0].agent === agentBPub
+  && plan.auto[0].others === 0 && plan.confirm.length === 0)
+const heldB2 = latestGrants(await receiveGrants(relay, agentB)).find(x => x.scopeId === scopeId)
+await runRelinquishRotation(relay, signer, index, plan.auto[0])
+check('relinquish finalized: agent dropped from grantees, next dereference stale',
+  !index.issued.find(e => e.scope === scopeId).grantees.includes(agentBPub)
+  && (await fetchScope(relay, heldB2)).status === 'stale')
+check('ledger arc for B: granted → rotated → relinquished → rotated', (() => {
+  const ts = eventsFor(index, scopeId, agentBPub).map(e => e.t)
+  return ts.join(',') === 'granted,rotated,relinquished,rotated'
+})())
+check('delegation status: relinquished (agent-initiated, distinct from revoked)',
+  deriveDelegations(index, now + 1).find(d => d.scope === scopeId && d.agent === agentBPub)?.status === 'relinquished')
+plan = relinquishPlan(index, (await receiveNotices(relay, signer)).relinquishes)
+check('plan self-heals: already-rotated relinquishment no longer queued',
+  !plan.auto.some(x => x.scope === scopeId) && !plan.confirm.some(x => x.scope === scopeId))
+
+// multi-grantee case: notice queues a one-tap confirm instead of auto-rotating
+const scope2 = opaqueScopeId()
+const key2 = newScopeKey()
+await publishScope(relay, signer, { scopeId: scope2, generation: 1, scopeKey: key2, payload: { name: 'shared brief', fields: { x: 1 } } })
+await grantWithTerms(relay, signer, agentAPub, { scopeId: scope2, generation: 1, scopeKey: key2, scopeName: 'shared brief', terms: { purpose: 'A work' } })
+await grantWithTerms(relay, signer, agentBPub, { scopeId: scope2, generation: 1, scopeKey: key2, scopeName: 'shared brief', terms: { purpose: 'B work' } })
+index.issued.push(toIssuedEntry({ scopeId: scope2, scopeName: 'shared brief', generation: 1, scopeKey: key2 }, [agentAPub, agentBPub]))
+index.nvoy_ledger = appendLedger(index, grantedEvent({ scope: scope2, agent: agentAPub, v: 1, terms: { nvoy: 1, purpose: 'A work' }, name: 'shared brief' }))
+index.nvoy_ledger = appendLedger(index, grantedEvent({ scope: scope2, agent: agentBPub, v: 1, terms: { nvoy: 1, purpose: 'B work' }, name: 'shared brief' }))
+await saveGrantIndex(relay, signer, index)
+await sendRelinquishNotice(relay, agentA, delegatorPub, { publisher: delegatorPub, scopeId: scope2, destroyed_at: now + 1 })
+plan = relinquishPlan(index, (await receiveNotices(relay, signer)).relinquishes)
+check('relinquish plan: other grantees exist → one-tap CONFIRM queue, not auto',
+  plan.confirm.some(x => x.scope === scope2 && x.agent === agentAPub && x.others === 1)
+  && !plan.auto.some(x => x.scope === scope2))
+await runRelinquishRotation(relay, signer, index, plan.confirm.find(x => x.scope === scope2))
+const heldB3 = latestGrants(await receiveGrants(relay, agentB)).find(x => x.scopeId === scope2)
+check('confirmed relinquish: survivor re-granted at v2 under ORIGINAL terms',
+  heldB3?.generation === 2 && heldB3?.terms?.purpose === 'B work'
+  && (await fetchScope(relay, heldB3)).data?.fields?.x === 1)
+
+// --------------------------- 10. TTL hard expiry (§6.4.3): plan + rotation
+
+const ttlScope = opaqueScopeId()
+const ttlKey = newScopeKey()
+await publishScope(relay, signer, { scopeId: ttlScope, generation: 1, scopeKey: ttlKey, payload: { name: 'short-lived', fields: { secret: 'until friday' } } })
+await grantWithTerms(relay, signer, agentAPub, { scopeId: ttlScope, generation: 1, scopeKey: ttlKey, scopeName: 'short-lived', terms: { purpose: 'lapses', expires_at: now - 60 } })
+await grantWithTerms(relay, signer, agentBPub, { scopeId: ttlScope, generation: 1, scopeKey: ttlKey, scopeName: 'short-lived', terms: { purpose: 'stands', expires_at: now + 7200 } })
+index.issued.push(toIssuedEntry({ scopeId: ttlScope, scopeName: 'short-lived', generation: 1, scopeKey: ttlKey }, [agentAPub, agentBPub]))
+index.nvoy_ledger = appendLedger(index, grantedEvent({ scope: ttlScope, agent: agentAPub, v: 1, terms: { nvoy: 1, purpose: 'lapses', expires_at: now - 60 }, name: 'short-lived' }))
+index.nvoy_ledger = appendLedger(index, grantedEvent({ scope: ttlScope, agent: agentBPub, v: 1, terms: { nvoy: 1, purpose: 'stands', expires_at: now + 7200 }, name: 'short-lived' }))
+await saveGrantIndex(relay, signer, index)
+
+const ttlPlan = expiryRotationPlan(index, now)
+check('expiry plan: one item per scope, listing only the lapsed grantees',
+  ttlPlan.length >= 1 && (() => {
+    const item = ttlPlan.find(x => x.scope === ttlScope)
+    return item?.expired.join() === agentAPub && item.scopeName === 'short-lived'
+  })())
+check('nextExpiry: soonest FUTURE deadline among active delegations',
+  nextExpiry(index, now) === now + 7200)
+
+const heldAttl = latestGrants(await receiveGrants(relay, agentA)).find(x => x.scopeId === ttlScope)
+const rot2 = await runExpiryRotation(relay, signer, index, ttlPlan.find(x => x.scope === ttlScope))
+check('TTL rotation: expired grantee dropped, key rotated (v2), survivor kept',
+  rot2.to_v === 2 && rot2.survivors.join() === agentBPub
+  && index.issued.find(e => e.scope === ttlScope).grantees.join() === agentBPub)
+check('expired agent: fresh dereference is stale — hard expiry needed no cooperation',
+  (await fetchScope(relay, heldAttl)).status === 'stale')
+const heldBttl = latestGrants(await receiveGrants(relay, agentB)).find(x => x.scopeId === ttlScope)
+check('unexpired survivor re-granted at v2 under original terms',
+  heldBttl?.generation === 2 && heldBttl?.terms?.expires_at === now + 7200
+  && (await fetchScope(relay, heldBttl)).data?.fields?.secret === 'until friday')
+check('ledger: expired-rotated event { from_v, to_v, expired, survivors }', (() => {
+  const ev = (index.nvoy_ledger ?? []).find(e => e.t === 'expired-rotated' && e.scope === ttlScope)
+  return ev?.from_v === 1 && ev?.to_v === 2 && ev?.expired === 1 && ev?.survivors === 1
+})())
+check('dropped-by-expiry status reads "expired", and it is in the survivor\'s history too',
+  deriveDelegations(index, now + 10).find(d => d.scope === ttlScope && d.agent === agentAPub)?.status === 'expired'
+  && eventsFor(index, ttlScope, agentBPub).some(e => e.t === 'expired-rotated'))
+check('plan clears after rotation (idempotent sweep)',
+  !expiryRotationPlan(index, now).some(x => x.scope === ttlScope))
+
+// ------------------------------------------------ 11. adversarial observer
 
 const view = inMem.observerView()
 const kinds = new Set(view.map(e => e.kind))
@@ -166,6 +286,10 @@ const blob = JSON.stringify(inMem.events)
 check('observer: no terms, purposes, reasons, or agent registry in stored content',
   !blob.includes('no_persist') && !blob.includes('Plan travel') && !blob.includes('B purpose')
   && !blob.includes('trip planned') && !blob.includes('nvoy_agents') && !blob.includes('nvoy_ledger'))
+check('observer: no access requests, relinquishes, or agent output in stored content',
+  !blob.includes('access_request') && !blob.includes('relinquish')
+  && !blob.includes('agent output') && !blob.includes('itinerary drafted')
+  && !blob.includes('until friday') && !blob.includes('expired-rotated'))
 check('observer: wrap senders are ephemeral (delegator never linked to agents)',
   inMem.query({ kinds: [1059] }).every(w => ![delegatorPub, agentAPub, agentBPub].includes(w.pubkey)))
 

@@ -12,11 +12,16 @@
 // DOM-free on purpose — test/ledger.mjs drives this exact module in Node
 // and cross-checks it against the compiled MCP server modules.
 
-import { finalizeEvent, generateSecretKey, getEventHash, nip44 } from 'nostr-tools'
+import { finalizeEvent, generateSecretKey, getEventHash, nip44, verifyEvent } from 'nostr-tools'
 import { KIND_DATA_SET, KIND_GRANT, newScopeKey, publishScope, localSigner } from '../lib/nipxx.mjs'
 
 /** Grant Revocation notice — placeholder pending assignment, like its siblings. */
 export const KIND_REVOCATION = 441
+
+/** App-level rumor kind for Nvoy notices (access requests, relinquishes) —
+ *  only ever inside 1059 gift wraps, never naked on a relay. Must match
+ *  mcp/src/notices.ts. */
+export const KIND_NVOY_MSG = 24440
 
 const b64 = (bytes) => btoa(String.fromCharCode(...bytes))
 const now = () => Math.floor(Date.now() / 1000)
@@ -106,6 +111,108 @@ export async function rotateWithTerms(relay, delegator, { scopeId, generation, p
 /** Opaque scope id — semantic names in `d` tags leak disclosure structure. */
 export const opaqueScopeId = () =>
   [...crypto.getRandomValues(new Uint8Array(6))].map(b => 'abcdefghijklmnopqrstuvwxyz234567'[b % 32]).join('')
+
+// ------------------------------------------------------------ receiving side
+//
+// The console is a grantee too: agents grant their outbox scopes back (§6.5)
+// and send access requests / relinquish notices (§6.2, §6.6) — all inside
+// gift wraps addressed to the delegator. Signer-based unwrap, mirroring the
+// lib's giftUnwrap checks exactly (kind-13 seal, verifyEvent, rumor.pubkey
+// === seal.pubkey — nostr-tools' own nip59.unwrapEvent skips both).
+
+/** Unwrap every gift wrap addressed to this signer; keep authenticated
+ *  rumors of the wanted kinds. Malformed wraps are skipped, never fatal. */
+export async function unwrapRumors(relay, signer, kinds) {
+  const me = await signer.getPublicKey()
+  const wraps = await relay.query({ kinds: [1059], '#p': [me] })
+  const rumors = []
+  for (const wrap of wraps) {
+    try {
+      const seal = JSON.parse(await signer.nip44Decrypt(wrap.pubkey, wrap.content))
+      if (seal.kind !== 13 || !verifyEvent(seal)) continue          // unauthenticated seal
+      const rumor = JSON.parse(await signer.nip44Decrypt(seal.pubkey, seal.content))
+      if (rumor.pubkey !== seal.pubkey) continue                    // sender impersonation
+      if (kinds.includes(rumor.kind)) rumors.push(rumor)
+    } catch { continue }
+  }
+  return rumors
+}
+
+/** Tolerant §4 terms reader — the JS mirror of mcp/src/terms.ts parseTerms.
+ *  Absent/malformed terms degrade to null (a vanilla grant), never an error. */
+export function parseTerms(content) {
+  if (typeof content !== 'object' || content === null || Array.isArray(content)) return null
+  let carrier
+  if (typeof content.nvoy === 'object' && content.nvoy !== null && !Array.isArray(content.nvoy)) carrier = content.nvoy
+  else if (typeof content.nvoy === 'number') carrier = content
+  else return null
+  const take = (key, type) => (typeof carrier[key] === type ? carrier[key] : undefined)
+  const terms = {
+    nvoy: typeof carrier.nvoy === 'number' ? carrier.nvoy : 1,
+    purpose: take('purpose', 'string'),
+    expires_at: take('expires_at', 'number'),
+    no_persist: take('no_persist', 'boolean'),
+    redelegate: take('redelegate', 'boolean'),
+    reply_scope_requested: take('reply_scope_requested', 'boolean'),
+    contact: take('contact', 'string'),
+    auto_relinquish: take('auto_relinquish', 'boolean'),
+  }
+  for (const k of Object.keys(terms)) if (terms[k] === undefined) delete terms[k]
+  return terms
+}
+
+const unb64 = (s) => Uint8Array.from(atob(s), c => c.charCodeAt(0))
+
+/** Grants received by this signer, terms-aware (the lib's receiveGrants
+ *  predates terms and drops them). Used for agent outbox scopes (§6.5). */
+export async function receiveGrantsWithTerms(relay, signer) {
+  const rumors = await unwrapRumors(relay, signer, [KIND_GRANT])
+  const grants = []
+  for (const rumor of rumors) {
+    try {
+      const aTag = rumor.tags.find(t => t[0] === 'a')
+      const [kind, publisher, scopeId] = String(aTag[1]).split(':')
+      if (Number(kind) !== KIND_DATA_SET || publisher !== rumor.pubkey) continue
+      const content = JSON.parse(rumor.content)
+      grants.push({
+        publisher, scopeId,
+        scopeName: typeof content.scope_name === 'string' ? content.scope_name : undefined,
+        relayHint: aTag[2] || undefined,
+        generation: Number(rumor.tags.find(t => t[0] === 'v')?.[1] ?? 0),
+        scopeKey: unb64(content.scope_key),
+        issuedAt: rumor.created_at,
+        terms: parseTerms(content),
+      })
+    } catch { continue }
+  }
+  return grants
+}
+
+/** Nvoy notices addressed to this signer, split by type:
+ *  { accessRequests: [{ id, from, purpose, at }],
+ *    relinquishes:   [{ id, from, scope, reason, destroyed_at, at }] }.
+ *  Newest first within each list; malformed notices are skipped. */
+export async function receiveNotices(relay, signer) {
+  const rumors = await unwrapRumors(relay, signer, [KIND_NVOY_MSG])
+  const accessRequests = [], relinquishes = []
+  for (const rumor of rumors) {
+    try {
+      const body = JSON.parse(rumor.content)
+      if (body.type === 'access_request' && typeof body.purpose === 'string') {
+        accessRequests.push({ id: rumor.id, from: rumor.pubkey, purpose: body.purpose, at: rumor.created_at })
+      } else if (body.type === 'relinquish' && typeof body.d === 'string') {
+        relinquishes.push({
+          id: rumor.id, from: rumor.pubkey, scope: body.d,
+          reason: typeof body.reason === 'string' ? body.reason : null,
+          destroyed_at: typeof body.destroyed_at === 'number' ? body.destroyed_at : rumor.created_at,
+          at: rumor.created_at,
+        })
+      }
+    } catch { continue }
+  }
+  const newest = (a, b) => b.at - a.at
+  return { accessRequests: accessRequests.sort(newest), relinquishes: relinquishes.sort(newest) }
+}
 
 // ------------------------------------------------------------- templates
 //
