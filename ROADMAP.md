@@ -1,7 +1,7 @@
 # Nvoy — where the primitive grows
 
 Two directions the delegation primitive wants to grow, recorded so we build
-toward them deliberately. Both are cross-cutting with [nact](https://github.com/JAFairweather/nact)
+toward them deliberately. Both are cross-cutting with [Nact](https://github.com/JAFairweather/nact)
 (the action-out half of scoped autonomy); its `DESIGN.md` holds the fuller
 treatment.
 
@@ -27,7 +27,7 @@ delegates it to the agent *as an Nvoy grant*:
 Net effect: an agent gets *use* of a credential for a bounded flow without that
 credential entering its long-term storage, its logs, or its model context.
 Because a credential is higher-value than ordinary data, this pairs naturally
-with a **nact** approval tap (a human enacts the granting of a credential) and
+with a **Nact** approval tap (a human enacts the granting of a credential) and
 short TTLs.
 
 ## Requests that are grants *and* enacts
@@ -42,9 +42,9 @@ things at once:
    decide whether to approve, and return it.
 
 The provider, on approval, returns the result as **another scope** — a grant
-back to the agent. So Nvoy and nact turn out to be one primitive seen from two
+back to the agent. So Nvoy and Nact turn out to be one primitive seen from two
 sides: *a data request is an action*, and *fulfilling it produces a grant*. The
-provider's approval is exactly a nact **enact**; because the reply is a scope,
+provider's approval is exactly a Nact **enact**; because the reply is a scope,
 the provider keeps revocation power over what it returned.
 
 This makes **providers first-class** — named, discoverable over NIP-05,
