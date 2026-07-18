@@ -29,26 +29,56 @@ function scopeKind(d) {
 const TYPES = ['credentials', 'data', 'approvals']
 const STATUSES = ['active', 'expired', 'revoked', 'relinquished']
 const STATUS_RANK = { active: 0, expired: 1, relinquished: 2, revoked: 3 }
+// The primary grouping axis. 'scope' groups all grantees of one credential under
+// it — the clearest view of a delegation's fan-out (re-grants chained to a root).
+const GROUP_OPTS = [['agent', 'Grantee'], ['scope', 'Credential'], ['type', 'Type'], ['status', 'Status']]
 
 const LEDGER_STYLE = `<style>
+/* controls */
 #ledger .lg-lbl{font-size:12px;color:var(--dim);display:inline-flex;align-items:center;gap:6px}
 #ledger .lg-lbl select{font-family:var(--mono);font-size:12px}
-#ledger .lg-facets{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin:10px 0 16px}
+#ledger .lg-facets{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin:10px 0 18px}
 #ledger .lg-facet-lbl{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)}
 #ledger .lg-facet-sep{width:1px;height:15px;background:var(--line);margin:0 5px}
 #ledger .lg-chip{font-family:var(--mono);font-size:12px;padding:3px 10px;border-radius:999px;border:1px solid var(--line);background:transparent;color:var(--dim);cursor:pointer}
 #ledger .lg-chip:hover{color:var(--text);border-color:var(--dim)}
 #ledger .lg-chip.on{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:600}
-#ledger .lg-group{margin:0 0 14px;border:1px solid var(--line);border-radius:10px;overflow:hidden}
-#ledger .lg-group>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:10px;padding:11px 14px;background:rgba(255,255,255,.02);user-select:none}
+/* group = a lineage container */
+#ledger .lg-group{margin:0 0 16px;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:color-mix(in srgb,var(--panel) 55%,transparent)}
+#ledger .lg-group>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:10px;padding:12px 16px;background:color-mix(in srgb,var(--panel2) 65%,transparent);user-select:none;border-bottom:1px solid transparent}
+#ledger .lg-group[open]>summary{border-bottom-color:var(--line)}
 #ledger .lg-group>summary::-webkit-details-marker{display:none}
-#ledger .lg-group>summary::before{content:'▸';color:var(--dim);font-size:11px;transition:transform .12s}
+#ledger .lg-group>summary::before{content:'▸';color:var(--dim);font-size:12px;transition:transform .12s;flex:none;width:10px}
 #ledger .lg-group[open]>summary::before{transform:rotate(90deg)}
-#ledger .lg-gname{font-family:var(--sans);font-weight:600;color:var(--text)}
+#ledger .lg-gname{font-family:var(--serif);font-weight:600;font-size:16px;color:var(--text)}
 #ledger .lg-gcount{font-family:var(--mono);font-size:11.5px;color:var(--dim)}
-#ledger .lg-group .card{border-radius:0;border-left:none;border-right:none;margin:0}
-#ledger .lg-group .card + .card{border-top:1px solid var(--line)}
-#ledger .lg-group>.card:first-of-type{border-top:1px solid var(--line)}
+#ledger .lg-pips{display:inline-flex;gap:3px;margin-left:auto}
+#ledger .lg-pip{width:7px;height:7px;border-radius:50%;flex:none}
+#ledger .lg-pip.active{background:var(--ok)}
+#ledger .lg-pip.expired{background:var(--warn)}
+#ledger .lg-pip.revoked{background:var(--danger)}
+#ledger .lg-pip.relinquished{background:var(--accent)}
+/* the chain: a rail with status nodes, one per grant */
+#ledger .lg-chain{position:relative;padding:12px 14px 12px 34px}
+#ledger .lg-chain::before{content:'';position:absolute;left:15px;top:6px;bottom:14px;width:2px;background:linear-gradient(to bottom,var(--line),color-mix(in srgb,var(--line) 20%,transparent));border-radius:2px}
+#ledger .lg-chain .card{position:relative;margin:0 0 10px;border-radius:10px;border:1px solid var(--line);border-left-width:3px}
+#ledger .lg-chain .card:last-child{margin-bottom:0}
+#ledger .lg-chain .card::before{content:'';position:absolute;left:-24px;top:16px;width:12px;height:12px;border-radius:50%;background:var(--bg);border:2px solid var(--dim);z-index:1}
+#ledger .lg-chain .card::after{content:'';position:absolute;left:-13px;top:21px;width:13px;height:2px;background:var(--line)}
+/* status colour: left stripe + node */
+#ledger .card.st-active{border-left-color:var(--ok)}
+#ledger .card.st-active::before{border-color:var(--ok);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 20%,transparent)}
+#ledger .card.st-expired{border-left-color:var(--warn)}
+#ledger .card.st-expired::before{border-color:var(--warn);box-shadow:0 0 0 3px color-mix(in srgb,var(--warn) 20%,transparent)}
+#ledger .card.st-revoked{border-left-color:var(--danger)}
+#ledger .card.st-revoked::before{border-color:var(--danger)}
+#ledger .card.st-relinquished{border-left-color:var(--accent)}
+#ledger .card.st-relinquished::before{border-color:var(--accent)}
+/* type icon + grantee monogram + the scope→grantee flow */
+#ledger .lg-ic{font-size:14px;margin-right:3px;filter:grayscale(.2)}
+#ledger .lg-flow{display:flex;align-items:center;gap:7px;margin-top:8px}
+#ledger .lg-arrow{color:var(--dim)}
+#ledger .lg-mono{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:50%;background:color-mix(in srgb,var(--gold) 16%,transparent);border:1px solid color-mix(in srgb,var(--gold) 45%,transparent);color:var(--gold-bright);font-family:var(--mono);font-size:11px;font-weight:700;flex:none}
 </style>`
 
 const termChips = (t) => !t ? '<span class="chip warn" title="granted without an nvoy terms object — a vanilla NIP-DA grant">vanilla grant · no terms</span>' : [
@@ -83,9 +113,14 @@ function delegationCard(d, i) {
   // Outputs outlive the input delegation deliberately (§6.5): you can revoke
   // a misbehaving agent's INPUT while retaining its output history.
   const wantsOutput = !!d.terms?.reply_scope_requested || state.received.some(g => g.publisher === d.agent)
-  return `<div class="card" data-i="${i}">
+  const kind = scopeKind(d)
+  const icon = kind === 'credentials' ? '🔑' : kind === 'approvals' ? '✅' : '📄'
+  const gname = agentName(d.agent) || short(d.agent)
+  const mono = esc(((gname || '?').trim()[0] || '?').toUpperCase())
+  return `<div class="card st-${d.status} kind-${kind}" data-i="${i}">
     <div class="head">
       <div>
+        <span class="lg-ic" title="${kind}">${icon}</span>
         <span class="name">${esc(d.scopeName)}</span>
         <span class="badge ${d.status}">${d.status}</span>
         ${d.v !== null ? `<span class="meta" title="scope key generation">v${d.v}</span>` : ''}
@@ -95,7 +130,7 @@ function delegationCard(d, i) {
         ${held ? '<button class="danger revoke">Revoke now</button>' : ''}
       </div>
     </div>
-    <div class="note">→ <b style="color:var(--text)">${esc(agentName(d.agent))}</b>
+    <div class="note lg-flow"><span class="lg-arrow">granted to</span> <span class="lg-mono">${mono}</span> <b style="color:var(--text)">${esc(gname)}</b>
       <span class="meta">${esc(short(d.agent))}</span></div>
     ${d.purpose ? `<div class="purpose">“${esc(d.purpose)}”</div>` : ''}
     <div class="chips">${termChips(d.terms)}
@@ -147,8 +182,10 @@ export function renderLedger() {
     (!fType || scopeKind(d) === fType) &&
     (!fStatus || d.status === fStatus))
 
-  const keyOf = d => groupBy === 'type' ? scopeKind(d) : groupBy === 'status' ? d.status : d.agent
-  const labelOf = k => groupBy === 'agent' ? agentName(k) : cap(k)
+  const keyOf = d => groupBy === 'type' ? scopeKind(d) : groupBy === 'status' ? d.status : groupBy === 'scope' ? d.scope : d.agent
+  const labelOf = k => groupBy === 'agent' ? agentName(k)
+    : groupBy === 'scope' ? (rows.find(d => d.scope === k)?.scopeName || k)
+    : cap(k)
   const groups = new Map()
   rows.forEach((d, i) => {                       // i = flat index into `rows` → card wiring stays valid
     const k = keyOf(d)
@@ -172,7 +209,7 @@ export function renderLedger() {
       <span class="spacer"></span>
       <label class="lg-lbl">group by
         <select id="lg-group" title="primary axis">
-          ${['agent', 'type', 'status'].map(g => `<option value="${g}"${g === groupBy ? ' selected' : ''}>${cap(g)}</option>`).join('')}
+          ${GROUP_OPTS.map(([g, lbl]) => `<option value="${g}"${g === groupBy ? ' selected' : ''}>${lbl}</option>`).join('')}
         </select></label>
     </div>
     <div class="lg-facets">
@@ -191,10 +228,13 @@ export function renderLedger() {
     ${groupKeys.length ? groupKeys.map(k => {
       const items = groups.get(k)
       const activeN = items.filter(x => x.d.status === 'active').length
+      const byStatus = {}; for (const x of items) byStatus[x.d.status] = (byStatus[x.d.status] || 0) + 1
+      const pips = STATUSES.filter(s => byStatus[s]).map(s => `<span class="lg-pip ${s}" title="${byStatus[s]} ${s}"></span>`).join('')
       return `<details class="lg-group" open>
         <summary><span class="lg-gname">${esc(labelOf(k))}</span>
-          <span class="lg-gcount">${items.length}${activeN !== items.length ? ` · ${activeN} active` : ''}</span></summary>
-        ${items.map(({ d, i }) => delegationCard(d, i)).join('')}
+          <span class="lg-gcount">${items.length} grant${items.length === 1 ? '' : 's'}${activeN !== items.length ? ` · ${activeN} active` : ''}</span>
+          <span class="lg-pips">${pips}</span></summary>
+        <div class="lg-chain">${items.map(({ d, i }) => delegationCard(d, i)).join('')}</div>
       </details>`
     }).join('') : `<div class="empty">
       ${filtered
