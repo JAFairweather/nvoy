@@ -48,6 +48,7 @@ function requestCard(r, i) {
     <div class="reqbody">
       <b>${esc(agentName(r.from))}</b> <span class="meta">${esc(short(r.from))}</span>
       <span class="meta">· ${fmtWhen(r.at)}</span>
+      ${r.scope_name ? `<div class="meta">wants <code>${esc(r.scope_name)}</code>${r.enc_value ? ' · value carried, encrypted to you' : ' · you paste the value'}</div>` : ''}
       <div class="purpose">“${esc(r.purpose)}”</div>
     </div>
     <div class="reqacts">
@@ -86,8 +87,22 @@ export function renderAgents() {
         try { await saveGrantIndex(state.relay, state.signer, state.index) }
         catch (err) { $('ag-msg').textContent = err.message; return }
       }
+      // Credential-migration extension: a request may name a credential scope
+      // and carry its current value, NIP-44-encrypted to us. Decrypt it here (it
+      // only ever exists in RAM in this tab) and pre-fill a ready scope. A
+      // request with no scope_name is a vanilla delegation ask — unchanged path.
+      let name, payload
+      if (r.scope_name) {
+        name = r.scope_name
+        if (r.enc_value) {
+          try { payload = { value: await state.signer.nip44Decrypt(r.from, r.enc_value) } }
+          catch (err) { $('ag-msg').textContent = `could not decrypt the carried value: ${err.message}`; return }
+        } else {
+          payload = { value: '' }   // --no-value: you paste the token into the scope JSON before Issue
+        }
+      }
       dismissRequest(r.id)
-      prefillDelegate({ agent: r.from, purpose: r.purpose })
+      prefillDelegate({ agent: r.from, purpose: r.purpose, name, payload })
       showTab('delegate')
     }
     row.querySelector('.req-deny').onclick = () => { dismissRequest(r.id); renderAgents() }

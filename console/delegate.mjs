@@ -10,20 +10,41 @@ import { grantWithTerms, opaqueScopeId, TEMPLATES } from './nvoygrant.mjs'
 import { appendLedger, grantedEvent } from './ledgerlog.mjs'
 import { state, $, esc, agentsOf, agentName, load, RELAYS } from './main.mjs'
 
-let draft = {                       // survives tab switches until issued
+const emptyDraft = () => ({    // survives tab switches until issued
   tpl: null, agent: '', json: '', name: '', purpose: '', expires: '',
+  credValue: '', reveal: false,
   no_persist: true, redelegate: false, reply_scope_requested: false, auto_relinquish: false,
-}
+})
+let draft = emptyDraft()
+
+// A credential scope carries exactly one secret under `value` (the convention
+// Nactor's grant-reader keys on: scope_name `credential:<name>` → payload.value).
+// For these we swap the raw-JSON editor for a dedicated, editable value field
+// so pasting a real key is a first-class edit, never JSON surgery on a secret.
+const isCredName = (n) => (n || '').trim().startsWith('credential:')
 
 /** Approve flow for access requests (§6.2): agents.mjs pre-fills the form
- *  with the requesting agent + its stated purpose, then switches here. */
-export function prefillDelegate({ agent, purpose }) {
+ *  with the requesting agent + its stated purpose, then switches here.
+ *  Credential-migration requests also carry a scope `name` and a `payload`
+ *  ({ value }) — for a credential scope that value fills the editable value
+ *  field (masked); you paste/fix the real key and Issue = approve-what-you-edited.
+ *  Nothing is granted until you Issue. */
+export function prefillDelegate({ agent, purpose, name, payload }) {
   draft.agent = agent || draft.agent
   if (purpose) draft.purpose = purpose
+  if (name) draft.name = name
+  if (payload !== undefined) {
+    if (isCredName(name) && payload && typeof payload === 'object' && 'value' in payload) {
+      draft.credValue = payload.value ?? ''      // editable value field, not raw JSON
+    } else {
+      draft.tpl = 'custom'; draft.json = JSON.stringify(payload, null, 2)
+    }
+  }
 }
 
 export function renderDelegate() {
   const agents = agentsOf()
+  const isCred = isCredName(draft.name)
   const options = agents.map(a =>
     `<option value="${a.pub}"${a.pub === draft.agent ? ' selected' : ''}>${esc(agentName(a.pub))} — ${esc(nip19.npubEncode(a.pub).slice(0, 16))}…</option>`).join('')
   $('delegate').innerHTML = `
@@ -38,21 +59,31 @@ export function renderDelegate() {
           ? `<select id="dg-agent">${options}</select>`
           : '<span class="msg">no agents registered — add one in the Agents tab first</span>'}
       </div>
-      <div class="frow">
+      ${isCred ? '' : `<div class="frow">
         <label>template</label>
         <div class="chips" style="margin:0">
           ${Object.entries(TEMPLATES).map(([k, t]) =>
             `<button class="tpl${draft.tpl === k ? ' sel' : ''}" data-tpl="${k}">${esc(t.label)}</button>`).join('')}
           <button class="tpl${draft.tpl === 'custom' ? ' sel' : ''}" data-tpl="custom">Custom JSON</button>
         </div>
-      </div>
+      </div>`}
       <div class="frow">
         <label>scope name</label>
         <input type="text" id="dg-name" value="${esc(draft.name)}" placeholder="human name, travels inside the ciphertext">
       </div>
-      <textarea id="dg-json" rows="12" spellcheck="false"
+      ${isCred ? `<div class="frow">
+        <label>value</label>
+        <input type="${draft.reveal ? 'text' : 'password'}" id="dg-credvalue" value="${esc(draft.credValue)}"
+          autocomplete="off" spellcheck="false" placeholder="paste the real key here — it lives only inside the encrypted scope"
+          style="flex:1;font-family:var(--mono,monospace)">
+        <button class="tpl" id="dg-reveal" type="button" title="show/hide">${draft.reveal ? 'hide' : 'show'}</button>
+      </div>
+      <div class="note" style="margin:2px 0 8px">The runtime proposed this credential; you set the value it
+        actually receives. Edit it here — the box never sees what you type until you Issue, and only ever
+        dereferences it live from the relay. Change it later by re-issuing; revoke by rotating the scope.</div>`
+      : `<textarea id="dg-json" rows="12" spellcheck="false"
         placeholder='scope payload JSON — pick a template or write your own, e.g. { "name": "…", "fields": { … } }'>${esc(draft.json)}</textarea>
-      <div class="jsonerr" id="dg-jsonerr"></div>
+      <div class="jsonerr" id="dg-jsonerr"></div>`}
 
       <div class="sect2">terms (§4 — honored by compliant runtimes, disclosed honestly as non-cryptographic)</div>
       <div class="frow">
@@ -89,7 +120,8 @@ export function renderDelegate() {
   const pull = () => {
     draft.agent = $('dg-agent')?.value ?? draft.agent
     draft.name = $('dg-name').value
-    draft.json = $('dg-json').value
+    if ($('dg-json')) draft.json = $('dg-json').value
+    if ($('dg-credvalue')) draft.credValue = $('dg-credvalue').value
     draft.purpose = $('dg-purpose').value
     draft.expires = $('dg-expires').value
     draft.no_persist = $('dg-nopersist').checked
@@ -115,6 +147,7 @@ export function renderDelegate() {
 
   const jsonErr = $('dg-jsonerr')
   const validate = () => {
+    if (!jsonErr || !$('dg-json')) return null              // credential mode: no free-form JSON
     if (!$('dg-json').value.trim()) { jsonErr.textContent = ''; return null }
     try {
       const obj = JSON.parse($('dg-json').value)
@@ -123,18 +156,27 @@ export function renderDelegate() {
       return obj
     } catch (err) { jsonErr.textContent = `✗ ${err.message}`; return null }
   }
-  $('dg-json').oninput = validate
-  validate()
+  if ($('dg-json')) { $('dg-json').oninput = validate; validate() }
+  if ($('dg-reveal')) $('dg-reveal').onclick = () => { pull(); draft.reveal = !draft.reveal; renderDelegate() }
 
   const msg = $('dg-msg')
   $('dg-issue').onclick = async () => {
     pull()
     const agent = $('dg-agent')?.value
     if (!agent) { msg.textContent = 'pick an agent'; return }
-    const payload = validate()
-    if (!payload) { msg.textContent = 'fix the payload JSON first'; return }
+    let payload, scopeName
+    if (isCred) {
+      const v = draft.credValue.trim()
+      if (!v) { msg.textContent = 'paste the credential value before issuing'; return }
+      scopeName = draft.name.trim()
+      if (!scopeName) { msg.textContent = 'scope name is required'; return }
+      payload = { value: v }                                // exactly what the grant-reader dereferences
+    } else {
+      payload = validate()
+      if (!payload) { msg.textContent = 'fix the payload JSON first'; return }
+      scopeName = draft.name.trim() || payload.name || 'unnamed scope'
+    }
     if (!draft.purpose.trim()) { msg.textContent = 'purpose is required — it is the line the ledger holds you to'; return }
-    const scopeName = draft.name.trim() || payload.name || 'unnamed scope'
     const terms = {
       purpose: draft.purpose.trim(),
       ...(draft.expires ? { expires_at: Math.floor(new Date(draft.expires).getTime() / 1000) } : {}),
@@ -162,8 +204,7 @@ export function renderDelegate() {
       state.index.nvoy_ledger = appendLedger(state.index,
         grantedEvent({ scope: scopeId, agent, v: 1, terms: { nvoy: 1, ...terms }, name: scopeName }))
       await saveGrantIndex(state.relay, state.signer, state.index)
-      draft = { tpl: null, agent: '', json: '', name: '', purpose: '', expires: '',
-        no_persist: true, redelegate: false, reply_scope_requested: false, auto_relinquish: false }
+      draft = emptyDraft()
       msg.textContent = `delegated — scope ${scopeId} to ${agentName(agent)}. See the Ledger.`
       await load()
       $('dg-msg').textContent = `delegated — scope ${scopeId} to ${agentName(agent)}. See the Ledger.`
