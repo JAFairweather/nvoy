@@ -19,13 +19,26 @@ function agentCard(a, i) {
   const dels = state.delegations.filter(d => d.agent === a.pub)
   const activeCount = dels.filter(d => d.status === 'active').length
   const npub = nip19.npubEncode(a.pub)
+  // Human-readable identity from the agent's kind-0 profile: avatar (icon),
+  // name, and nip05 (its verified name@domain). Falls back to a gold monogram
+  // when a key has published no picture, so an unprofiled key still reads clean.
+  const name = agentName(a.pub)
+  const initial = esc(((name || '?').trim()[0] || '?').toUpperCase())
+  const avatarBox = 'width:34px;height:34px;border-radius:9px;flex:none'
+  const avatar = p?.picture
+    ? `<img class="avatar" src="${esc(p.picture)}" alt="" width="34" height="34" loading="lazy" style="${avatarBox};object-fit:cover;background:#0b0906">`
+    : `<div class="avatar-mono" style="${avatarBox};display:flex;align-items:center;justify-content:center;background:#1a140c;color:#c39a56;font-weight:600">${initial}</div>`
   return `<div class="card" data-i="${i}">
     <div class="head">
-      <div>
-        <span class="name">${esc(agentName(a.pub))}</span>
-        <span class="badge">agent</span>
+      <div style="display:flex;align-items:center;gap:11px;min-width:0">
+        ${avatar}
+        <div style="min-width:0">
+          <span class="name">${esc(name)}</span>
+          <span class="badge">agent</span>
+          ${p?.nip05 ? `<div class="meta" style="margin-top:1px">${esc(p.nip05)}</div>` : ''}
+        </div>
       </div>
-      <div style="display:flex;align-items:center;gap:10px">
+      <div style="display:flex;align-items:center;gap:10px;flex:none">
         <span class="meta copy-npub" title="click to copy npub" style="cursor:pointer">${esc(short(a.pub))}</span>
         <button class="icon del-agent" title="${activeCount
           ? 'this agent holds active delegations — revoke them in the Ledger first'
