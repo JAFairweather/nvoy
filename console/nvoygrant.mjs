@@ -199,7 +199,15 @@ export async function receiveNotices(relay, signer) {
     try {
       const body = JSON.parse(rumor.content)
       if (body.type === 'access_request' && typeof body.purpose === 'string') {
-        accessRequests.push({ id: rumor.id, from: rumor.pubkey, purpose: body.purpose, at: rumor.created_at })
+        // scope_name / enc_value are the credential-migration extension: a
+        // runtime proposing a named credential and carrying its current value,
+        // NIP-44-encrypted to us. Vanilla requests omit both — they stay
+        // undefined and the approve flow behaves exactly as it did before.
+        accessRequests.push({
+          id: rumor.id, from: rumor.pubkey, purpose: body.purpose, at: rumor.created_at,
+          ...(typeof body.scope_name === 'string' ? { scope_name: body.scope_name } : {}),
+          ...(typeof body.enc_value === 'string' ? { enc_value: body.enc_value } : {}),
+        })
       } else if (body.type === 'relinquish' && typeof body.d === 'string') {
         relinquishes.push({
           id: rumor.id, from: rumor.pubkey, scope: body.d,

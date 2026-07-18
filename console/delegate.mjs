@@ -16,10 +16,16 @@ let draft = {                       // survives tab switches until issued
 }
 
 /** Approve flow for access requests (§6.2): agents.mjs pre-fills the form
- *  with the requesting agent + its stated purpose, then switches here. */
-export function prefillDelegate({ agent, purpose }) {
+ *  with the requesting agent + its stated purpose, then switches here.
+ *  Credential-migration requests also carry a scope `name` and a `payload`
+ *  (e.g. { value }) the runtime asked for — we drop those into a custom-JSON
+ *  scope so you land on a ready-to-issue grant. You still review and Issue;
+ *  nothing is granted until you do. */
+export function prefillDelegate({ agent, purpose, name, payload }) {
   draft.agent = agent || draft.agent
   if (purpose) draft.purpose = purpose
+  if (name) draft.name = name
+  if (payload !== undefined) { draft.tpl = 'custom'; draft.json = JSON.stringify(payload, null, 2) }
 }
 
 export function renderDelegate() {
