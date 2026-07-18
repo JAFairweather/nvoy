@@ -7,11 +7,11 @@
 // and the honest TTL banner (§6.4.3 — hard expiry runs while this is open).
 // Revoke-now (§6.4.5) shares the rotation spine in ttl.mjs.
 
-import { fetchScope } from '../lib/nipxx.mjs'
-import { sendRevocationNotice } from './nvoygrant.mjs'
-import { revokedEvent, rotatedEvent, eventsFor, computeTotals, fmtCountdown } from './ledgerlog.mjs'
+import { fetchScope, saveGrantIndex } from '../lib/nipxx.mjs'
+import { sendRevocationNotice, grantWithTerms } from './nvoygrant.mjs'
+import { revokedEvent, rotatedEvent, grantedEvent, appendLedger, eventsFor, computeTotals, fmtCountdown } from './ledgerlog.mjs'
 import { rotateDropping, runRelinquishRotation, nextExpiry } from './ttl.mjs'
-import { state, $, esc, short, fmtWhen, agentName, load, RELAYS } from './main.mjs'
+import { state, $, esc, short, fmtWhen, agentName, agentsOf, load, RELAYS } from './main.mjs'
 
 let filterAgent = ''            // '' = all agents
 
@@ -74,7 +74,11 @@ function delegationCard(d, i) {
     ${wantsOutput ? `<div class="sect2">agent output (§6.5 — dereferenced live, never stored)</div>
       <div class="outbox" data-agent="${d.agent}"><span class="msg">loading output scope…</span></div>` : ''}
     ${events.length ? `<div class="history">${events.map(hRow).join('')}</div>` : ''}
-    <div class="actions" style="margin-top:6px"><span class="msg lg-msg"></span></div>
+    <div class="actions" style="margin-top:6px">
+      <button class="addg" title="grant this exact scope — same key, same value — to another identity (credential sovereignty: the identity that consumes it becomes a grantee, no secret re-entered)">＋ grant to another identity</button>
+      <span class="addg-ui"></span>
+      <span class="msg lg-msg"></span>
+    </div>
   </div>`
 }
 
@@ -137,7 +141,45 @@ export function renderLedger() {
     if (rel) rel.onclick = () => confirmRelinquish(d, msg)
     const out = card.querySelector('.outbox')
     if (out) fillOutput(out, out.dataset.agent)
+    const addg = card.querySelector('.addg')
+    if (addg) addg.onclick = () => {
+      const entry = (state.index.issued ?? []).find(e => e.scope === d.scope)
+      const cands = agentsOf().filter(a => !(entry?.grantees ?? []).includes(a.pub))
+      const ui = card.querySelector('.addg-ui')
+      if (!cands.length) { ui.textContent = ' — every registered identity already holds this scope'; return }
+      ui.innerHTML = ` <select class="addg-sel">${cands.map(a =>
+        `<option value="${a.pub}">${esc(agentName(a.pub))}</option>`).join('')}</select> <button class="addg-go primary">grant</button>`
+      ui.querySelector('.addg-go').onclick = () => addGrantee(d, ui.querySelector('.addg-sel').value, msg)
+    }
   }
+}
+
+/** Add another identity as a grantee to an EXISTING scope — the credential
+ *  sovereignty primitive (nact/docs/credential-sovereignty.md): re-grant a scope
+ *  to the identity that actually consumes it, reusing the SAME scope key and the
+ *  SAME published value. No secret is re-entered, and no duplicate scope is
+ *  created — the new grantee's own grant-reader can decrypt it, while any prior
+ *  grantee (e.g. the Nave Nactor during transition) keeps its grant until you
+ *  revoke it at cutover. This is how a credential moves from being addressed to
+ *  the broker to being addressed to the owning identity, one tap at a time. */
+async function addGrantee(d, newPub, msg) {
+  const entry = (state.index.issued ?? []).find(e => e.scope === d.scope)
+  if (!entry) { msg.textContent = 'scope not in the index — cannot re-grant'; return }
+  if ((entry.grantees ?? []).includes(newPub)) { msg.textContent = `${agentName(newPub)} already holds this scope`; return }
+  const scopeKey = Uint8Array.from(atob(entry.key), c => c.charCodeAt(0))   // reuse the SAME key — same value, no re-entry
+  const scopeName = entry.scope_name ?? d.scopeName
+  const terms = d.terms ? { ...d.terms } : { purpose: d.purpose || scopeName }
+  msg.textContent = `granting “${scopeName}” to ${agentName(newPub)} (v${entry.v}, same value)…`
+  try {
+    await grantWithTerms(state.relay, state.signer, newPub, {
+      scopeId: d.scope, generation: entry.v, scopeKey, scopeName, relayHint: RELAYS[0], terms,
+    })
+    entry.grantees = [...(entry.grantees ?? []), newPub]
+    state.index.nvoy_ledger = appendLedger(state.index,
+      grantedEvent({ scope: d.scope, agent: newPub, v: entry.v, terms: { nvoy: 1, ...terms }, name: scopeName }))
+    await saveGrantIndex(state.relay, state.signer, state.index)
+    await load()
+  } catch (err) { msg.textContent = err.message }
 }
 
 /** One-tap finalization of a queued relinquishment (§6.6 phase 2). */
