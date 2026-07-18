@@ -61,7 +61,7 @@ function requestCard(r, i) {
     <div class="reqbody">
       <b>${esc(agentName(r.from))}</b> <span class="meta">${esc(short(r.from))}</span>
       <span class="meta">· ${fmtWhen(r.at)}</span>
-      ${r.scope_name ? `<div class="meta">wants <code>${esc(r.scope_name)}</code>${r.enc_value ? ' · value carried, encrypted to you' : ' · you paste the value'}</div>` : ''}
+      ${r.scope_name ? `<div class="meta">wants <code>${esc(r.scope_name)}</code>${r.enc_value ? ' · value carried, encrypted to you' : ' · you paste the value'}${r.owner ? ` · <b>grant to ${esc(agentName(r.owner))}</b>` : ''}</div>` : ''}
       <div class="purpose">“${esc(r.purpose)}”</div>
     </div>
     <div class="reqacts">
@@ -95,8 +95,13 @@ export function renderAgents() {
     const r = state.requests[Number(row.dataset.i)]
     if (!r) continue
     row.querySelector('.req-approve').onclick = async () => {
-      if (!agentsOf().some(a => a.pub === r.from)) {
-        state.index.nvoy_agents = [...agentsOf(), { pub: r.from, added_at: Math.floor(Date.now() / 1000) }]
+      // The GRANTEE is the credential's owner (r.owner) when the runtime named one
+      // — it proposes on the owner's behalf, so the grant must land on the owner,
+      // not on the requester (r.from). Falls back to the requester for vanilla
+      // asks that carry no owner.
+      const grantee = r.owner || r.from
+      if (!agentsOf().some(a => a.pub === grantee)) {
+        state.index.nvoy_agents = [...agentsOf(), { pub: grantee, added_at: Math.floor(Date.now() / 1000) }]
         try { await saveGrantIndex(state.relay, state.signer, state.index) }
         catch (err) { $('ag-msg').textContent = err.message; return }
       }
@@ -115,7 +120,7 @@ export function renderAgents() {
         }
       }
       dismissRequest(r.id)
-      prefillDelegate({ agent: r.from, purpose: r.purpose, name, payload })
+      prefillDelegate({ agent: grantee, purpose: r.purpose, name, payload })
       showTab('delegate')
     }
     row.querySelector('.req-deny').onclick = () => { dismissRequest(r.id); renderAgents() }

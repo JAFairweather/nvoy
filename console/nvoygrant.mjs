@@ -12,7 +12,7 @@
 // DOM-free on purpose — test/ledger.mjs drives this exact module in Node
 // and cross-checks it against the compiled MCP server modules.
 
-import { finalizeEvent, generateSecretKey, getEventHash, nip44, verifyEvent } from 'nostr-tools'
+import { finalizeEvent, generateSecretKey, getEventHash, nip19, nip44, verifyEvent } from 'nostr-tools'
 import { KIND_DATA_SET, KIND_GRANT, newScopeKey, publishScope, localSigner } from '../lib/nipxx.mjs'
 
 /** Grant Revocation notice — placeholder pending assignment, like its siblings. */
@@ -203,10 +203,19 @@ export async function receiveNotices(relay, signer) {
         // runtime proposing a named credential and carrying its current value,
         // NIP-44-encrypted to us. Vanilla requests omit both — they stay
         // undefined and the approve flow behaves exactly as it did before.
+        // owner_npub (credential-migration extension): the identity the runtime
+        // proposes as the GRANTEE — the credential's owner — which is NOT the
+        // requester (the runtime raises the request on the owner's behalf). Vanilla
+        // requests omit it and the requester stays the default grantee, as before.
+        let owner
+        if (typeof body.owner_npub === 'string') {
+          try { const d = nip19.decode(body.owner_npub); if (d.type === 'npub') owner = d.data } catch { /* ignore malformed */ }
+        }
         accessRequests.push({
           id: rumor.id, from: rumor.pubkey, purpose: body.purpose, at: rumor.created_at,
           ...(typeof body.scope_name === 'string' ? { scope_name: body.scope_name } : {}),
           ...(typeof body.enc_value === 'string' ? { enc_value: body.enc_value } : {}),
+          ...(owner ? { owner } : {}),
         })
       } else if (body.type === 'relinquish' && typeof body.d === 'string') {
         relinquishes.push({
