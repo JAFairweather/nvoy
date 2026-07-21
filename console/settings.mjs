@@ -4,7 +4,8 @@
 // console offline (test/wsrelay.mjs).
 
 import { CONFIG_KEY, loadConfig, saveConfig, resetConfig } from './config.mjs'
-import { $, esc } from './main.mjs'
+import { $, esc, state, agentsOf } from './main.mjs'
+import { LiveRelay } from '../lib/liverelay.mjs'
 
 let draft = null            // working copy; edits live here until Save
 
@@ -13,8 +14,41 @@ const validRelay = (u) => { try { return /^wss?:$/.test(new URL(u).protocol) } c
 const relayRow = (r, i) => `
   <div class="row cfg">
     <input class="r-url" data-i="${i}" value="${esc(r)}" placeholder="wss://relay.example" spellcheck="false" autocomplete="off">
+    <button class="icon r-mirror" data-u="${esc(r)}" title="mirror my existing events to this relay (rebroadcast — nothing is re-signed)">⇉</button>
     <button class="icon r-del" data-i="${i}" title="remove relay">×</button>
   </div>`
+
+// Mirror = rebroadcast, the durability story made actionable: adding a relay
+// only affects FUTURE publishes, so a new relay holds none of your history
+// until you push it there. Everything mirrored is already end-to-end
+// protected (encrypted scopes, gift-wrapped grants, nip44-to-self index) and
+// already SIGNED — we re-send the same events, the key is never touched.
+async function mirrorTo(url, msgEl) {
+  if (!validRelay(url)) { msgEl.textContent = 'save a valid relay URL first'; return }
+  if (!state.me || !state.relay) { msgEl.textContent = 'sign in first — mirroring gathers YOUR events'; return }
+  msgEl.textContent = 'gathering your events from the configured relays…'
+  const filters = [
+    { kinds: [30440, 10440], authors: [state.me] },            // scopes + index
+    { kinds: [1059], '#p': [state.me] },                        // wraps addressed to me
+    ...agentsOf().map(a => ({ kinds: [1059], '#p': [a.pub] })), // grants delivered to my agents
+  ]
+  const seen = new Map()
+  for (const f of filters) {
+    try { for (const ev of await state.relay.query(f)) seen.set(ev.id, ev) } catch { /* per-filter best effort */ }
+  }
+  const events = [...seen.values()]
+  if (!events.length) { msgEl.textContent = 'nothing to mirror yet'; return }
+  const target = new LiveRelay([url])
+  let ok = 0, rejected = 0
+  try {
+    for (let i = 0; i < events.length; i++) {
+      msgEl.textContent = `mirroring… ${i + 1}/${events.length}`
+      try { await target.publish(events[i]); ok++ } catch { rejected++ }
+    }
+  } finally { target.close() }
+  msgEl.textContent = `mirrored ${ok}/${events.length} event${events.length === 1 ? '' : 's'} to this relay`
+    + (rejected ? ` · ${rejected} rejected — relay policy (write allowlists refuse gift wraps' ephemeral authors)` : '')
+}
 
 export function renderSettings() {
   draft ??= loadConfig()
@@ -44,6 +78,8 @@ export function renderSettings() {
   $('r-add').onclick = () => { pull(); draft.relays.push(''); renderSettings() }
   for (const d of document.querySelectorAll('.r-del'))
     d.onclick = () => { pull(); draft.relays.splice(Number(d.dataset.i), 1); renderSettings() }
+  for (const b of document.querySelectorAll('.r-mirror'))
+    b.onclick = () => mirrorTo(b.dataset.u, msg)
 
   $('cfg-save').onclick = () => {
     pull()
