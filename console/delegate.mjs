@@ -158,14 +158,32 @@ export function renderDelegate() {
   }
   if ($('dg-json')) { $('dg-json').oninput = validate; validate() }
   if ($('dg-reveal')) $('dg-reveal').onclick = () => { pull(); draft.reveal = !draft.reveal; renderDelegate() }
+  // Credential mode follows the NAME field live: typing `credential:…` swaps
+  // the JSON editor for the masked value field (and back). Re-render only on
+  // crossing the boundary, restoring focus + caret so typing never drops.
+  $('dg-name').oninput = () => {
+    const wasCred = isCred
+    const el = $('dg-name'); const pos = el.selectionStart
+    pull()
+    if (isCredName(draft.name) !== wasCred) {
+      renderDelegate()
+      const n2 = $('dg-name')
+      if (n2) { n2.focus(); try { n2.setSelectionRange(pos, pos) } catch {} }
+    }
+  }
 
   const msg = $('dg-msg')
   $('dg-issue').onclick = async () => {
     pull()
     const agent = $('dg-agent')?.value
     if (!agent) { msg.textContent = 'pick an agent'; return }
+    // Recompute at click time — the render-time isCred goes stale if the name
+    // was edited without a re-render, and a credential issued down the JSON
+    // path silently loses the masked-field ergonomics (the payload shape is
+    // caller-controlled either way; the reader keys on `.value`).
+    const credNow = isCredName(draft.name)
     let payload, scopeName
-    if (isCred) {
+    if (credNow) {
       const v = draft.credValue.trim()
       if (!v) { msg.textContent = 'paste the credential value before issuing'; return }
       scopeName = draft.name.trim()
