@@ -9,6 +9,7 @@ import * as nip49 from 'nostr-tools/nip49'
 import { LiveRelay } from '../lib/liverelay.mjs'
 import { localSigner, loadGrantIndex, latestGrants } from '../lib/nipxx.mjs'
 import { nip07Signer, nip46Signer, serializeSession, parseSession, signerFromSession } from '../lib/nave-connect.mjs'
+import { renderTitlebar, updateTitlebar } from '../lib/nave-titlebar.mjs'
 import { loadConfig } from './config.mjs'
 import { deriveDelegations } from './ledgerlog.mjs'
 import { receiveGrantsWithTerms, receiveNotices } from './nvoygrant.mjs'
@@ -83,13 +84,11 @@ export async function login(signer, remember) {
   state.relay ??= new LiveRelay(RELAYS)
   $('login').style.display = 'none'
   $('unlock').style.display = 'none'
-  $('me').style.display = 'flex'
   $('tabs').style.display = 'flex'
-  const npub = nip19.npubEncode(state.me)
-  $('my-npub').textContent = npub.slice(0, 12) + '…' + npub.slice(-4)
-  $('my-npub').onclick = () => navigator.clipboard.writeText(npub)
-  $('me-kind').textContent =
-    { nip07: 'extension', nip46: 'bunker', local: 'local key' }[signer.kind] ?? 'local key'
+  updateTitlebar('#titlebar', {
+    npub: nip19.npubEncode(state.me), kind: signer.kind,
+    onRefresh: () => load(), onLogout: logout,
+  })
   showTab(Object.keys(TABS).includes(location.hash.slice(1)) ? location.hash.slice(1) : 'agents')
   if (remember && parseSession(remember)?.kind === 'local') offerProtect(remember)
   load()
@@ -320,11 +319,19 @@ $('nip07').onclick = () => {
   if (!window.nostr?.nip44) { $('err').textContent = 'No NIP-07 extension found (needs nip44 support — Alby or nos2x).'; return }
   login(nip07Signer(), 'nip07')
 }
-$('refresh').onclick = () => load()
-$('logout').onclick = () => {
+function logout() {
   try { state.signer?.close?.() } catch { /* best effort */ }   // drop a live bunker pairing
   sessionStorage.removeItem('nvoy-login'); location.hash = ''; location.reload()
 }
+
+// The unified Nave title bar (nact#16): boots signed out (brand only — the
+// login card in <main> is the sign-in affordance); login() flips it via
+// updateTitlebar. Refresh / Log out / copy-npub live inside the component.
+const NVOY_SEAL = `<svg viewBox="0 0 32 32" aria-hidden="true">
+  <rect x="1" y="1" width="30" height="30" rx="7" fill="#0b0906" stroke="#6fa8a0" stroke-opacity=".5" stroke-width="1.2"/>
+  <g transform="translate(4 4)" fill="none" stroke="#6fa8a0" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12 H16"/><path d="M12 7 L17 12 L12 17"/><circle cx="20" cy="12" r="1.6" fill="#6fa8a0" stroke="none"/></g>
+</svg>`
+renderTitlebar('#titlebar', { appName: 'Nvoy', tagline: 'delegator console', sealSvg: NVOY_SEAL })
 
 // Boot order: any tab-session sign-in first (nave-connect parses all three
 // kinds — a bare-hex legacy remember still reads as `local`), then a
