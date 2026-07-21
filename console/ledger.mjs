@@ -17,6 +17,7 @@ import { state, $, esc, short, fmtWhen, agentName, agentsOf, load, RELAYS } from
 let groupBy = 'agent'           // 'agent' | 'type' | 'status' — the primary axis
 let fType = ''                  // '' | 'credentials' | 'data' | 'approvals'
 let fStatus = ''                // '' | 'active' | 'expired' | 'revoked' | 'relinquished'
+let fQuery = ''                 // free text over scope name / grantee / purpose / d-tag
 
 const cap = s => s ? s[0].toUpperCase() + s.slice(1) : s
 // The "type" facet: classify a delegation by the nature of what it grants.
@@ -43,6 +44,9 @@ const LEDGER_STYLE = `<style>
 #ledger .lg-chip{font-family:var(--mono);font-size:12px;padding:3px 10px;border-radius:999px;border:1px solid var(--line);background:transparent;color:var(--dim);cursor:pointer}
 #ledger .lg-chip:hover{color:var(--text);border-color:var(--dim)}
 #ledger .lg-chip.on{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:600}
+#ledger .lg-search{font-family:var(--mono);font-size:12px;padding:4px 12px;border-radius:999px;border:1px solid var(--line);background:transparent;color:var(--text);min-width:230px;outline:none}
+#ledger .lg-search:focus{border-color:var(--accent)}
+#ledger .lg-search::placeholder{color:var(--dim)}
 /* group = a lineage container */
 #ledger .lg-group{margin:0 0 16px;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:color-mix(in srgb,var(--panel) 55%,transparent)}
 #ledger .lg-group>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:10px;padding:12px 16px;background:color-mix(in srgb,var(--panel2) 65%,transparent);user-select:none;border-bottom:1px solid transparent}
@@ -177,10 +181,13 @@ export function renderLedger() {
   const t = computeTotals(all, state.index.nvoy_ledger ?? [])
   const next = nextExpiry(state.index)
 
-  // Facet filters (type / status), then group on the chosen axis.
+  // Facet filters (type / status) + free-text search, then group on the axis.
+  const q = fQuery.trim().toLowerCase()
   const rows = all.filter(d =>
     (!fType || scopeKind(d) === fType) &&
-    (!fStatus || d.status === fStatus))
+    (!fStatus || d.status === fStatus) &&
+    (!q || `${d.scopeName || ''} ${agentName(d.agent) || ''} ${d.purpose || ''} ${d.scope || ''} ${d.status || ''}`
+      .toLowerCase().includes(q)))
 
   const keyOf = d => groupBy === 'type' ? scopeKind(d) : groupBy === 'status' ? d.status : groupBy === 'scope' ? d.scope : d.agent
   const labelOf = k => groupBy === 'agent' ? agentName(k)
@@ -199,7 +206,7 @@ export function renderLedger() {
       : groups.get(b).length - groups.get(a).length)    // else biggest group first
 
   const chip = (label, on, attr) => `<button class="lg-chip${on ? ' on' : ''}" ${attr}>${esc(label)}</button>`
-  const filtered = fType || fStatus
+  const filtered = fType || fStatus || q
 
   $('ledger').innerHTML = `${LEDGER_STYLE}
     <div class="lhead">
@@ -218,6 +225,10 @@ export function renderLedger() {
       <span class="lg-facet-sep"></span>
       <span class="lg-facet-lbl">status</span>
       ${chip('all', !fStatus, 'data-status=""')}${STATUSES.map(x => chip(x, fStatus === x, `data-status="${x}"`)).join('')}
+      <span class="lg-facet-sep"></span>
+      <input class="lg-search" id="lg-search" type="search" placeholder="search scope / grantee / purpose / id…"
+        value="${esc(fQuery)}" spellcheck="false" autocomplete="off">
+      ${q ? `<span class="lg-gcount">${rows.length} match${rows.length === 1 ? '' : 'es'}</span>` : ''}
     </div>
     ${all.some(d => d.expiresAt !== null && (d.status === 'active' || d.status === 'expired')) ? `<div class="ttlnote">
       Hard expiry runs <b>while this console is open</b>: at each deadline the scope key is rotated and only
@@ -249,7 +260,18 @@ export function renderLedger() {
     else fStatus = b.getAttribute('data-status')
     renderLedger()
   }
-  const clr = $('lg-clear'); if (clr) clr.onclick = () => { fType = ''; fStatus = ''; renderLedger() }
+  // Live search: the whole tab re-renders per keystroke (house pattern), so
+  // restore focus + caret into the fresh input or typing would drop after one
+  // character.
+  const srch = $('lg-search')
+  if (srch) srch.oninput = () => {
+    fQuery = srch.value
+    const pos = srch.selectionStart
+    renderLedger()
+    const s2 = $('lg-search')
+    if (s2) { s2.focus(); try { s2.setSelectionRange(pos, pos) } catch {} }
+  }
+  const clr = $('lg-clear'); if (clr) clr.onclick = () => { fType = ''; fStatus = ''; fQuery = ''; renderLedger() }
 
   for (const card of document.querySelectorAll('#ledger .card')) {
     const d = rows[Number(card.dataset.i)]
