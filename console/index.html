@@ -12,6 +12,7 @@
   "imports": {
     "nostr-tools": "https://esm.sh/nostr-tools@2.23.9?bundle",
     "nostr-tools/pool": "https://esm.sh/nostr-tools@2.23.9/pool?bundle",
+    "nostr-tools/nip46": "https://esm.sh/nostr-tools@2.23.9/nip46?bundle",
     "nostr-tools/nip49": "https://esm.sh/nostr-tools@2.23.9/nip49?bundle"
   }
 }
@@ -281,6 +282,7 @@
     <div class="tag">delegator console</div>
     <div class="spacer"></div>
     <div id="me">
+      <span class="badge" id="me-kind" title="how this session signs"></span>
       <code id="my-npub" title="click to copy"></code>
       <button id="refresh">Refresh</button>
       <button id="logout">Log out</button>
@@ -303,17 +305,27 @@
     </svg></span> Sign in with Alby</button>
     <div class="alby-sub">works with any NIP-07 signer — Alby · nos2x · Amber</div>
     <div class="row" style="margin-top:18px">
-      <input id="nsec" placeholder="…or paste nsec1… / hex (demo only)" autocomplete="off">
-      <button id="go">Open</button>
+      <input id="bunker-uri" placeholder="bunker://… from your remote signer (iPhone / no extension)"
+        autocomplete="off" spellcheck="false">
+      <button class="primary" id="bunker-go">Connect</button>
     </div>
-    <div class="alt">No key? <a id="gen">Generate one</a> — write it down; it is the only way back in.</div>
-    <div id="newkey" style="display:none">
-      <div class="phrase" id="newkey-nsec"></div>
-      <p class="warn">Write it down — it IS your account. No reset, no server copy.</p>
-      <div class="row">
-        <button id="newkey-copy">Copy</button>
-        <button id="newkey-print" title="print a paper recovery card">Print</button>
-        <button class="primary" id="newkey-continue" style="flex:1">Continue</button>
+    <div class="alby-sub">NIP-46 remote signing — pair once with your bunker; the key never enters this browser</div>
+    <div class="alt" id="bunker-auth" style="display:none"></div>
+    <div class="alt"><a id="advanced-toggle">Advanced: use a local key in this tab (demo / recovery)</a></div>
+    <div id="advanced" style="display:none">
+      <div class="row" style="margin-top:10px">
+        <input id="nsec" placeholder="paste nsec1… / hex (demo only)" autocomplete="off">
+        <button id="go">Open</button>
+      </div>
+      <div class="alt">No key? <a id="gen">Generate one</a> — write it down; it is the only way back in.</div>
+      <div id="newkey" style="display:none">
+        <div class="phrase" id="newkey-nsec"></div>
+        <p class="warn">Write it down — it IS your account. No reset, no server copy.</p>
+        <div class="row">
+          <button id="newkey-copy">Copy</button>
+          <button id="newkey-print" title="print a paper recovery card">Print</button>
+          <button class="primary" id="newkey-continue" style="flex:1">Continue</button>
+        </div>
       </div>
     </div>
     <div class="err" id="err"></div>
