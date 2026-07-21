@@ -62,6 +62,7 @@ export function renderDelegate() {
       ${isCred ? '' : `<div class="frow">
         <label>template</label>
         <div class="chips" style="margin:0">
+          <button class="tpl" data-tpl="credential" title="a scope carrying exactly one secret under {value} — the shape every credential reader dereferences">🔑 Credential value</button>
           ${Object.entries(TEMPLATES).map(([k, t]) =>
             `<button class="tpl${draft.tpl === k ? ' sel' : ''}" data-tpl="${k}">${esc(t.label)}</button>`).join('')}
           <button class="tpl${draft.tpl === 'custom' ? ' sel' : ''}" data-tpl="custom">Custom JSON</button>
@@ -133,6 +134,18 @@ export function renderDelegate() {
   for (const b of document.querySelectorAll('#delegate .tpl'))
     b.onclick = () => {
       pull()
+      // The credential chip isn't a JSON template — it flips the form into
+      // credential mode (masked value field; payload becomes {value}) by
+      // seeding the name with the namespace prefix. Complete the name, paste
+      // the value, Issue.
+      if (b.dataset.tpl === 'credential') {
+        draft.tpl = null
+        if (!isCredName(draft.name)) draft.name = 'credential:'
+        renderDelegate()
+        const n = $('dg-name')
+        if (n) { n.focus(); try { n.setSelectionRange(n.value.length, n.value.length) } catch {} }
+        return
+      }
       draft.tpl = b.dataset.tpl
       const t = TEMPLATES[draft.tpl]
       if (t) {
