@@ -10,6 +10,7 @@
     "smoke:local": "node test/smoke.mjs",
     "smoke:live": "node test/smoke.mjs --live",
     "conformance": "node test/mcp-conformance.mjs",
+    "regrant": "npm run build && node test/regrant.mjs",
     "nopersist": "node test/nopersist.mjs",
     "egress": "npm run build && node test/egress.mjs",
     "ledger": "node test/ledger.mjs",
