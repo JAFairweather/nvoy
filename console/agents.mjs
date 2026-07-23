@@ -10,9 +10,30 @@ import { nip19 } from 'nostr-tools'
 import { saveGrantIndex } from '../lib/nipxx.mjs'
 import { state, $, esc, short, fmtWhen, load, parsePub, agentsOf, agentName, dismissRequest, showTab } from './main.mjs'
 import { prefillDelegate } from './delegate.mjs'
+import { openDelegationInLedger } from './ledger.mjs'
 
+// Copy an npub to the clipboard with visual feedback, degrading gracefully:
+// async clipboard API → execCommand → (both blocked) select nothing and just
+// flash the label. The same robustness as the shared titlebar's npub pill.
+function copyNpub(btn, npub) {
+  const done = () => { const t = btn.textContent; btn.textContent = '✓'; btn.classList.add('ok'); setTimeout(() => { btn.textContent = t; btn.classList.remove('ok') }, 1100) }
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(npub).then(done, () => fallbackCopy(npub, done))
+  } else fallbackCopy(npub, done)
+}
+function fallbackCopy(text, done) {
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0'
+    document.body.appendChild(ta); ta.select()
+    document.execCommand('copy'); ta.remove(); done()
+  } catch { /* clipboard unavailable — nothing more we can do silently */ }
+}
+
+// Clickable (nvoy#17): opens this delegation in the Ledger, focused, where the
+// ＋ grant-to-another-identity action lives. data-scope/data-agent identify it.
 const statusChip = (d) =>
-  `<span class="chip scope-${d.status}" title="${esc(d.purpose ?? '')}">${esc(d.scopeName)} · ${d.status}</span>`
+  `<button type="button" class="chip scope-${d.status} del-chip" data-scope="${esc(d.scope)}" data-agent="${esc(d.agent)}" title="${esc(d.purpose ?? 'open in the Ledger — re-grant to another identity')}">${esc(d.scopeName)} · ${d.status}</button>`
 
 function agentCard(a, i) {
   const p = state.profiles.get(a.pub)
@@ -38,8 +59,9 @@ function agentCard(a, i) {
           ${p?.nip05 ? `<div class="meta" style="margin-top:1px">${esc(p.nip05)}</div>` : ''}
         </div>
       </div>
-      <div style="display:flex;align-items:center;gap:10px;flex:none">
-        <span class="meta copy-npub" title="click to copy npub" style="cursor:pointer">${esc(short(a.pub))}</span>
+      <div style="display:flex;align-items:center;gap:8px;flex:none">
+        <span class="meta" style="font-family:var(--mono,monospace)">${esc(short(a.pub))}</span>
+        <button class="icon copy-npub" title="copy npub" aria-label="copy npub" style="cursor:pointer">⧉</button>
         <button class="icon del-agent" title="${activeCount
           ? 'this agent holds active delegations — revoke them in the Ledger first'
           : 'remove from registry (ledger history is kept)'}"
@@ -147,7 +169,12 @@ export function renderAgents() {
   for (const card of document.querySelectorAll('#agents .card')) {
     const a = agentsOf()[Number(card.dataset.i)]
     if (!a) continue
-    card.querySelector('.copy-npub').onclick = () => navigator.clipboard.writeText(nip19.npubEncode(a.pub))
+    const copyBtn = card.querySelector('.copy-npub')
+    copyBtn.onclick = () => copyNpub(copyBtn, nip19.npubEncode(a.pub))
+    // Delegation chips open the grant in the Ledger, focused on its re-grant UI.
+    for (const chip of card.querySelectorAll('.del-chip')) {
+      chip.onclick = () => openDelegationInLedger(chip.dataset.scope, chip.dataset.agent)
+    }
     const del = card.querySelector('.del-agent')
     if (!del.disabled) del.onclick = async () => {
       if (!confirm(`Remove ${agentName(a.pub)} from the registry?\n\nLedger history is kept; only the registry entry goes.`)) return
