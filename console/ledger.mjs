@@ -42,7 +42,10 @@ const cap = s => s ? s[0].toUpperCase() + s.slice(1) : s
 // A small mark for a grantee that is a registered agent — so agents stand out
 // from other identities (npubs that hold a grant but aren't agents). Inline SVG
 // so it always renders (a bot/agent glyph: a rounded head with two eyes + antenna).
-const AGENT_ICON = '<svg class="lg-agent-ic" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-label="agent"><rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 8V4"/><circle cx="12" cy="3" r="1"/><circle cx="9" cy="14" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="14" r="1" fill="currentColor" stroke="none"/></svg>'
+const AGENT_ICON = '<svg class="lg-grantee-ic" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-label="agent"><rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 8V4"/><circle cx="12" cy="3" r="1"/><circle cx="9" cy="14" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="14" r="1" fill="currentColor" stroke="none"/></svg>'
+// …and a person glyph for an identity that isn't an agent (a real npub that
+// holds a grant — a contact, a peer). Same size, muted colour (see CSS).
+const PERSON_ICON = '<svg class="lg-grantee-ic" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-label="identity"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>'
 // The "type" facet: classify a delegation by the nature of what it grants.
 function scopeKind(d) {
   const n = `${d.scopeName || ''} ${d.scope || ''}`.toLowerCase()
@@ -93,8 +96,10 @@ const LEDGER_STYLE = `<style>
 #ledger .lg-group>summary::before{content:'▸';color:var(--dim);font-size:12px;transition:transform .12s;flex:none;width:10px}
 #ledger .lg-group[open]>summary::before{transform:rotate(90deg)}
 #ledger .lg-gname{font-family:var(--serif);font-weight:600;font-size:16px;color:var(--text);display:inline-flex;align-items:center;gap:7px}
-#ledger .lg-agent-badge{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:6px;flex:none;color:var(--gold-bright,var(--accent));background:color-mix(in srgb,var(--accent) 15%,transparent);border:1px solid color-mix(in srgb,var(--accent) 40%,transparent)}
-#ledger .lg-agent-ic{display:block}
+#ledger .lg-grantee-badge{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:6px;flex:none}
+#ledger .lg-grantee-badge.agent{color:var(--gold-bright,var(--accent));background:color-mix(in srgb,var(--accent) 15%,transparent);border:1px solid color-mix(in srgb,var(--accent) 40%,transparent)}
+#ledger .lg-grantee-badge.identity{color:var(--dim);background:color-mix(in srgb,var(--dim) 12%,transparent);border:1px solid color-mix(in srgb,var(--dim) 35%,transparent)}
+#ledger .lg-grantee-ic{display:block}
 #ledger .lg-gcount{font-family:var(--mono);font-size:11.5px;color:var(--dim)}
 #ledger .lg-pips{display:inline-flex;gap:3px;margin-left:auto}
 #ledger .lg-pip{width:7px;height:7px;border-radius:50%;flex:none}
@@ -316,11 +321,15 @@ export function renderLedger() {
           const activeN = items.filter(x => x.d.status === 'active').length
           const byStatus = {}; for (const x of items) byStatus[x.d.status] = (byStatus[x.d.status] || 0) + 1
           const pips = STATUSES.filter(s => byStatus[s]).map(s => `<span class="lg-pip ${s}" title="${byStatus[s]} ${s}"></span>`).join('')
-          // When grouped by grantee, mark agent groups with the agent icon so
-          // they stand out from other identities.
-          const agentMark = (groupBy === 'agent' && isAgent(k)) ? `<span class="lg-agent-badge" title="registered agent">${AGENT_ICON}</span>` : ''
+          // When grouped by grantee, mark each group by kind: a bot icon for a
+          // registered agent, a person icon for any other identity.
+          const granteeMark = groupBy === 'agent'
+            ? (isAgent(k)
+                ? `<span class="lg-grantee-badge agent" title="registered agent">${AGENT_ICON}</span>`
+                : `<span class="lg-grantee-badge identity" title="identity — holds a grant but is not an agent">${PERSON_ICON}</span>`)
+            : ''
           return `<details class="lg-group" data-gkey="${esc(String(k))}"${openGroups.has(k) ? ' open' : ''}>
-            <summary><span class="lg-gname">${agentMark}${esc(labelOf(k))}</span>
+            <summary><span class="lg-gname">${granteeMark}${esc(labelOf(k))}</span>
               <span class="lg-gcount">${items.length} grant${items.length === 1 ? '' : 's'}${activeN !== items.length ? ` · ${activeN} active` : ''}</span>
               <span class="lg-pips">${pips}</span></summary>
             <div class="lg-chain">${items.map(({ d, i }) => delegationCard(d, i)).join('')}</div>
