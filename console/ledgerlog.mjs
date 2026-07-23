@@ -121,14 +121,20 @@ export const eventsFor = (index, scope, agent) =>
     .filter(ev => ev.scope === scope && (ev.t === 'rotated' || ev.t === 'expired-rotated' || ev.agent === agent))
     .sort((a, b) => a.at - b.at)
 
-/** The totals line: "N active delegations to M agents, K revoked this month." */
-export function computeTotals(delegations, ledger, now = nowSec()) {
+/** The totals line. A grantee is one of two kinds: a registered **agent**
+ *  (in the Nvoy registry) or another **identity** — an npub that holds a grant
+ *  but isn't an agent (e.g. a contact granted their own data). `agentPubs` (a
+ *  Set of registered agent hexes) splits the two; passing null counts every
+ *  grantee as an agent (back-compat). */
+export function computeTotals(delegations, ledger, now = nowSec(), agentPubs = null) {
   const active = delegations.filter(d => d.status === 'active')
+  const grantees = [...new Set(active.map(x => x.agent))]
   const d = new Date(now * 1000)
   const monthStart = Math.floor(new Date(d.getFullYear(), d.getMonth(), 1).getTime() / 1000)
   return {
     active: active.length,
-    agents: new Set(active.map(x => x.agent)).size,
+    agents: agentPubs ? grantees.filter(p => agentPubs.has(p)).length : grantees.length,
+    identities: agentPubs ? grantees.filter(p => !agentPubs.has(p)).length : 0,
     revokedThisMonth: ledger.filter(ev => ev.t === 'revoked' && ev.at >= monthStart).length,
   }
 }

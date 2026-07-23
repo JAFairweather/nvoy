@@ -19,6 +19,7 @@ let groupBy = 'agent'           // primary axis — see GROUP_OPTS
 // one grantee. Left-nav checkmarks toggle the sets (nvoy#20).
 let fTypes = new Set()          // subset of TYPES; empty = all
 let fStatuses = new Set()       // subset of STATUSES; empty = all
+let fKinds = new Set()          // subset of {'agent','identity'}; empty = all (nvoy#20 grantee kind)
 let fAgent = ''                 // '' = all agents, else a grantee hex
 let fQuery = ''                 // free text over scope name / grantee / purpose / d-tag
 // Which groups are expanded. Empty = ALL COLLAPSED (the default the Director
@@ -33,11 +34,15 @@ let pendingFocus = null         // { scope, agent } | null
 export function openDelegationInLedger(scope, agent) {
   pendingFocus = { scope, agent }
   // Clear every filter that could hide the target so it's always in the set.
-  fQuery = ''; fTypes.clear(); fStatuses.clear(); fAgent = ''
+  fQuery = ''; fTypes.clear(); fStatuses.clear(); fKinds.clear(); fAgent = ''
   showTab('ledger')             // renders, then sets location.hash
 }
 
 const cap = s => s ? s[0].toUpperCase() + s.slice(1) : s
+// A small mark for a grantee that is a registered agent — so agents stand out
+// from other identities (npubs that hold a grant but aren't agents). Inline SVG
+// so it always renders (a bot/agent glyph: a rounded head with two eyes + antenna).
+const AGENT_ICON = '<svg class="lg-agent-ic" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-label="agent"><rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 8V4"/><circle cx="12" cy="3" r="1"/><circle cx="9" cy="14" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="14" r="1" fill="currentColor" stroke="none"/></svg>'
 // The "type" facet: classify a delegation by the nature of what it grants.
 function scopeKind(d) {
   const n = `${d.scopeName || ''} ${d.scope || ''}`.toLowerCase()
@@ -87,7 +92,9 @@ const LEDGER_STYLE = `<style>
 #ledger .lg-group>summary::-webkit-details-marker{display:none}
 #ledger .lg-group>summary::before{content:'▸';color:var(--dim);font-size:12px;transition:transform .12s;flex:none;width:10px}
 #ledger .lg-group[open]>summary::before{transform:rotate(90deg)}
-#ledger .lg-gname{font-family:var(--serif);font-weight:600;font-size:16px;color:var(--text)}
+#ledger .lg-gname{font-family:var(--serif);font-weight:600;font-size:16px;color:var(--text);display:inline-flex;align-items:center;gap:7px}
+#ledger .lg-agent-badge{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:6px;flex:none;color:var(--gold-bright,var(--accent));background:color-mix(in srgb,var(--accent) 15%,transparent);border:1px solid color-mix(in srgb,var(--accent) 40%,transparent)}
+#ledger .lg-agent-ic{display:block}
 #ledger .lg-gcount{font-family:var(--mono);font-size:11.5px;color:var(--dim)}
 #ledger .lg-pips{display:inline-flex;gap:3px;margin-left:auto}
 #ledger .lg-pip{width:7px;height:7px;border-radius:50%;flex:none}
@@ -211,7 +218,11 @@ async function fillOutput(el, agentPub) {
 
 export function renderLedger() {
   const all = state.delegations
-  const t = computeTotals(all, state.index.nvoy_ledger ?? [])
+  // Registered agents vs. other identities: a grantee is an "agent" iff it's in
+  // the Nvoy registry; anything else that holds a grant is an "identity".
+  const agentPubs = new Set((state.index.nvoy_agents ?? []).map(a => a.pub))
+  const isAgent = pub => agentPubs.has(pub)
+  const t = computeTotals(all, state.index.nvoy_ledger ?? [], undefined, agentPubs)
   const next = nextExpiry(state.index)
 
   // Multi-select filters (empty set = all) + agent + free-text; then group.
@@ -219,6 +230,7 @@ export function renderLedger() {
   const rows = all.filter(d =>
     (fTypes.size === 0 || fTypes.has(scopeKind(d))) &&
     (fStatuses.size === 0 || fStatuses.has(d.status)) &&
+    (fKinds.size === 0 || fKinds.has(isAgent(d.agent) ? 'agent' : 'identity')) &&
     (!fAgent || d.agent === fAgent) &&
     (!q || `${d.scopeName || ''} ${agentName(d.agent) || ''} ${d.purpose || ''} ${d.scope || ''} ${d.status || ''}`
       .toLowerCase().includes(q)))
@@ -239,11 +251,11 @@ export function renderLedger() {
       ? (STATUS_RANK[a] ?? 9) - (STATUS_RANK[b] ?? 9)   // canonical status order
       : groups.get(b).length - groups.get(a).length)    // else biggest group first
 
-  // Distinct grantees, for the Agent filter — labelled, sorted by name.
+  // Distinct grantees, for the Agent filter — labelled, agents first, then by name.
   const agentList = [...new Set(all.map(d => d.agent))]
-    .map(pub => ({ pub, name: agentName(pub) || short(pub) }))
-    .sort((x, y) => x.name.localeCompare(y.name))
-  const filtered = fTypes.size || fStatuses.size || fAgent || q
+    .map(pub => ({ pub, name: agentName(pub) || short(pub), agent: isAgent(pub) }))
+    .sort((x, y) => (y.agent - x.agent) || x.name.localeCompare(y.name))
+  const filtered = fTypes.size || fStatuses.size || fKinds.size || fAgent || q
 
   // A checkmark row (Type/Status = checkbox multi-select; Group-by = radio).
   const check = (label, on, attr, radio) =>
@@ -271,13 +283,18 @@ export function renderLedger() {
           <div class="lg-nav-h">Status</div>
           ${STATUSES.map(x => check(x, fStatuses.has(x), `data-status="${x}"`)).join('')}
         </div>
+        <div class="lg-nav-sect">
+          <div class="lg-nav-h">Grantee</div>
+          ${check('agents', fKinds.has('agent'), 'data-kind="agent"')}
+          ${check('other identities', fKinds.has('identity'), 'data-kind="identity"')}
+        </div>
         ${filtered ? `<a class="lg-nav-clear" id="lg-clear-nav">clear filters</a>` : ''}
       </aside>
 
       <div class="lg-main">
         <div class="lhead">
           <span class="totals"><b>${t.active}</b> active delegation${t.active === 1 ? '' : 's'}
-            to <b>${t.agents}</b> agent${t.agents === 1 ? '' : 's'},
+            to <b>${t.agents}</b> agent${t.agents === 1 ? '' : 's'}${t.identities ? ` and <b>${t.identities}</b> other identit${t.identities === 1 ? 'y' : 'ies'}` : ''},
             <b>${t.revokedThisMonth}</b> revoked this month</span>
           <input class="lg-search" id="lg-search" type="search" placeholder="search scope / grantee / purpose / id…"
             value="${esc(fQuery)}" spellcheck="false" autocomplete="off">
@@ -294,8 +311,11 @@ export function renderLedger() {
           const activeN = items.filter(x => x.d.status === 'active').length
           const byStatus = {}; for (const x of items) byStatus[x.d.status] = (byStatus[x.d.status] || 0) + 1
           const pips = STATUSES.filter(s => byStatus[s]).map(s => `<span class="lg-pip ${s}" title="${byStatus[s]} ${s}"></span>`).join('')
+          // When grouped by grantee, mark agent groups with the agent icon so
+          // they stand out from other identities.
+          const agentMark = (groupBy === 'agent' && isAgent(k)) ? `<span class="lg-agent-badge" title="registered agent">${AGENT_ICON}</span>` : ''
           return `<details class="lg-group" data-gkey="${esc(String(k))}"${openGroups.has(k) ? ' open' : ''}>
-            <summary><span class="lg-gname">${esc(labelOf(k))}</span>
+            <summary><span class="lg-gname">${agentMark}${esc(labelOf(k))}</span>
               <span class="lg-gcount">${items.length} grant${items.length === 1 ? '' : 's'}${activeN !== items.length ? ` · ${activeN} active` : ''}</span>
               <span class="lg-pips">${pips}</span></summary>
             <div class="lg-chain">${items.map(({ d, i }) => delegationCard(d, i)).join('')}</div>
@@ -316,6 +336,7 @@ export function renderLedger() {
     if (b.dataset.group) { groupBy = b.dataset.group; renderLedger() }
     else if (b.dataset.type) toggle(fTypes, b.dataset.type)
     else if (b.dataset.status) toggle(fStatuses, b.dataset.status)
+    else if (b.dataset.kind) toggle(fKinds, b.dataset.kind)
   }
   const ag = $('lg-agent'); if (ag) ag.onchange = (e) => { fAgent = e.target.value; renderLedger() }
   // Track expand/collapse so a filter change never collapses what you opened.
@@ -334,7 +355,7 @@ export function renderLedger() {
     const s2 = $('lg-search')
     if (s2) { s2.focus(); try { s2.setSelectionRange(pos, pos) } catch {} }
   }
-  const clrAll = () => { fTypes.clear(); fStatuses.clear(); fAgent = ''; fQuery = ''; renderLedger() }
+  const clrAll = () => { fTypes.clear(); fStatuses.clear(); fKinds.clear(); fAgent = ''; fQuery = ''; renderLedger() }
   const clr = $('lg-clear'); if (clr) clr.onclick = clrAll
   const clrNav = $('lg-clear-nav'); if (clrNav) clrNav.onclick = clrAll
 

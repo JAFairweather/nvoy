@@ -79,6 +79,11 @@ check('totals: 2 active to 2 agents, 0 revoked this month', (() => {
   const t = computeTotals(dels, index.nvoy_ledger, now)
   return t.active === 2 && t.agents === 2 && t.revokedThisMonth === 0
 })())
+check('totals split grantees: agents (in registry) vs other identities', (() => {
+  // agentA is a registered agent; agentB is treated as an outside identity here.
+  const t = computeTotals(dels, index.nvoy_ledger, now, new Set([agentAPub]))
+  return t.agents === 1 && t.identities === 1
+})())
 
 // -------------------------------- 3. revoke-now: rotate, preserve B's terms
 
