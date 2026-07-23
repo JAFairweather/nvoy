@@ -193,13 +193,19 @@ export async function load() {
     armTtlTimer()
 
     // inbound gift wraps: agent outboxes (§6.5) + notices (§6.2, §6.6)
+    const noticeStats = {}
     const [grants, notices] = await Promise.all([
       receiveGrantsWithTerms(relay, signer).catch(() => []),
-      receiveNotices(relay, signer).catch(() => ({ accessRequests: [], relinquishes: [] })),
+      receiveNotices(relay, signer, noticeStats).catch(() => ({ accessRequests: [], relinquishes: [] })),
     ])
     state.received = latestGrants(grants)
     const dismissed = new Set(dismissedIds())
     state.requests = notices.accessRequests.filter(r => !dismissed.has(r.id))
+    // nvoy#9 mechanism 2: an inbox that LOOKS empty because the signer refused
+    // bulk decryption must say so — silence here hid real access requests.
+    state.unwrapWarning = noticeStats.undecryptable
+      ? `${noticeStats.undecryptable} of ${noticeStats.wraps} inbox wrap(s) could not be opened — check your signer (it may be rate-limiting or awaiting a decrypt approval), then Refresh.`
+      : null
 
     // relinquish policy (§6.6, decision 6): sole grantee → rotate NOW;
     // otherwise queue the one-tap confirm on the ledger card

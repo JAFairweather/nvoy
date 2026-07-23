@@ -121,10 +121,33 @@ export const opaqueScopeId = () =>
 // === seal.pubkey — nostr-tools' own nip59.unwrapEvent skips both).
 
 /** Unwrap every gift wrap addressed to this signer; keep authenticated
- *  rumors of the wanted kinds. Malformed wraps are skipped, never fatal. */
-export async function unwrapRumors(relay, signer, kinds) {
+ *  rumors of the wanted kinds. Malformed wraps are skipped, never fatal.
+ *
+ *  Paginated (nvoy#9): gift-wrap `created_at` is fuzzed up to two days into
+ *  the past, so a FRESH wrap can sort below dozens of older ones — and a
+ *  single un-limited query gets a relay's default newest-N cap, silently
+ *  dropping it. Walk with `until` until a page yields nothing new (dedup by
+ *  id), under a sane ceiling. No `since`: grants must reach arbitrarily back.
+ *
+ *  `stats` (optional, caller-owned) reports what pagination and decryption
+ *  actually saw: { wraps, undecryptable }. Wraps addressed to us that our
+ *  signer could not open (extension prompt declined, bulk-decrypt rate limit)
+ *  are counted, not hidden — an empty inbox and an unopenable one must not
+ *  look the same (nvoy#9 mechanism 2). */
+export async function unwrapRumors(relay, signer, kinds, stats = {}) {
   const me = await signer.getPublicKey()
-  const wraps = await relay.query({ kinds: [1059], '#p': [me] })
+  const PAGE = 500, MAX_PAGES = 20
+  const wraps = [], seen = new Set()
+  let until
+  for (let i = 0; i < MAX_PAGES; i++) {
+    const page = await relay.query({ kinds: [1059], '#p': [me], limit: PAGE, ...(until ? { until } : {}) })
+    const fresh = page.filter(w => w && w.id && !seen.has(w.id))
+    for (const w of fresh) { seen.add(w.id); wraps.push(w) }
+    if (!fresh.length) break                     // exhausted (or the relay repeated itself)
+    until = Math.min(...fresh.map(w => w.created_at)) - 1
+  }
+  stats.wraps = wraps.length
+  stats.undecryptable = 0
   const rumors = []
   for (const wrap of wraps) {
     try {
@@ -133,7 +156,7 @@ export async function unwrapRumors(relay, signer, kinds) {
       const rumor = JSON.parse(await signer.nip44Decrypt(seal.pubkey, seal.content))
       if (rumor.pubkey !== seal.pubkey) continue                    // sender impersonation
       if (kinds.includes(rumor.kind)) rumors.push(rumor)
-    } catch { continue }
+    } catch { stats.undecryptable++; continue }
   }
   return rumors
 }
@@ -165,8 +188,8 @@ const unb64 = (s) => Uint8Array.from(atob(s), c => c.charCodeAt(0))
 
 /** Grants received by this signer, terms-aware (the lib's receiveGrants
  *  predates terms and drops them). Used for agent outbox scopes (§6.5). */
-export async function receiveGrantsWithTerms(relay, signer) {
-  const rumors = await unwrapRumors(relay, signer, [KIND_GRANT])
+export async function receiveGrantsWithTerms(relay, signer, stats = {}) {
+  const rumors = await unwrapRumors(relay, signer, [KIND_GRANT], stats)
   const grants = []
   for (const rumor of rumors) {
     try {
@@ -192,8 +215,8 @@ export async function receiveGrantsWithTerms(relay, signer) {
  *  { accessRequests: [{ id, from, purpose, at }],
  *    relinquishes:   [{ id, from, scope, reason, destroyed_at, at }] }.
  *  Newest first within each list; malformed notices are skipped. */
-export async function receiveNotices(relay, signer) {
-  const rumors = await unwrapRumors(relay, signer, [KIND_NVOY_MSG])
+export async function receiveNotices(relay, signer, stats = {}) {
+  const rumors = await unwrapRumors(relay, signer, [KIND_NVOY_MSG], stats)
   const accessRequests = [], relinquishes = []
   for (const rumor of rumors) {
     try {
