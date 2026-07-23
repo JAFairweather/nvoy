@@ -15,8 +15,13 @@ import { openDelegationInLedger } from './ledger.mjs'
 // Copy an npub to the clipboard with visual feedback, degrading gracefully:
 // async clipboard API → execCommand → (both blocked) select nothing and just
 // flash the label. The same robustness as the shared titlebar's npub pill.
+// Inline SVGs so the button always renders — a font glyph (⧉) can come up as a
+// blank box in some environments, which reads as "no button" (nvoy#17 follow-up).
+const COPY_SVG = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>'
+const CHECK_SVG = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>'
+
 function copyNpub(btn, npub) {
-  const done = () => { const t = btn.textContent; btn.textContent = '✓'; btn.classList.add('ok'); setTimeout(() => { btn.textContent = t; btn.classList.remove('ok') }, 1100) }
+  const done = () => { btn.innerHTML = CHECK_SVG; btn.classList.add('ok'); setTimeout(() => { btn.innerHTML = COPY_SVG; btn.classList.remove('ok') }, 1100) }
   if (navigator.clipboard?.writeText) {
     navigator.clipboard.writeText(npub).then(done, () => fallbackCopy(npub, done))
   } else fallbackCopy(npub, done)
@@ -61,7 +66,7 @@ function agentCard(a, i) {
       </div>
       <div style="display:flex;align-items:center;gap:8px;flex:none">
         <span class="meta" style="font-family:var(--mono,monospace)">${esc(short(a.pub))}</span>
-        <button class="icon copy-npub" title="copy npub" aria-label="copy npub" style="cursor:pointer">⧉</button>
+        <button class="icon copy-npub" title="copy npub" aria-label="copy npub" style="cursor:pointer">${COPY_SVG}</button>
         <button class="icon del-agent" title="${activeCount
           ? 'this agent holds active delegations — revoke them in the Ledger first'
           : 'remove from registry (ledger history is kept)'}"
