@@ -11,10 +11,22 @@ import { fetchScope, saveGrantIndex } from '../lib/nipxx.mjs'
 import { sendRevocationNotice, grantWithTerms } from './nvoygrant.mjs'
 import { revokedEvent, rotatedEvent, grantedEvent, appendLedger, eventsFor, computeTotals, fmtCountdown } from './ledgerlog.mjs'
 import { rotateDropping, runRelinquishRotation, nextExpiry } from './ttl.mjs'
-import { state, $, esc, short, fmtWhen, agentName, agentsOf, load, RELAYS } from './main.mjs'
+import { state, $, esc, short, fmtWhen, agentName, agentsOf, load, RELAYS, showTab } from './main.mjs'
 
 // Ledger organization (a grant has three axes — who / what / state).
 let groupBy = 'agent'           // 'agent' | 'type' | 'status' — the primary axis
+// A pending "open this delegation" request from another tab (a delegation chip
+// on an agent card). renderLedger consumes it: scroll the card into view,
+// highlight it, and open its re-grant UI — the useful next action on a
+// committed grant. Cleared once handled so it fires exactly once.
+let pendingFocus = null         // { scope, agent } | null
+export function openDelegationInLedger(scope, agent) {
+  pendingFocus = { scope, agent }
+  // A search filter could hide the target card; clear text search so the
+  // focused delegation is always in the rendered set.
+  fQuery = ''
+  showTab('ledger')             // synchronously calls renderLedger → focus runs
+}
 let fType = ''                  // '' | 'credentials' | 'data' | 'approvals'
 let fStatus = ''                // '' | 'active' | 'expired' | 'revoked' | 'relinquished'
 let fQuery = ''                 // free text over scope name / grantee / purpose / d-tag
@@ -46,6 +58,9 @@ const LEDGER_STYLE = `<style>
 #ledger .lg-chip.on{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:600}
 #ledger .lg-search{font-family:var(--mono);font-size:12px;padding:4px 12px;border-radius:999px;border:1px solid var(--line);background:transparent;color:var(--text);min-width:230px;outline:none}
 #ledger .lg-search:focus{border-color:var(--accent)}
+/* focus ring when a delegation is opened from another tab (nvoy#17) */
+#ledger .card.lg-focused{outline:2px solid var(--accent);outline-offset:2px;animation:lgfocus 2.6s ease-out}
+@keyframes lgfocus{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--accent) 55%,transparent)}60%{box-shadow:0 0 0 7px transparent}100%{box-shadow:0 0 0 0 transparent}}
 #ledger .lg-search::placeholder{color:var(--dim)}
 /* group = a lineage container */
 #ledger .lg-group{margin:0 0 16px;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:color-mix(in srgb,var(--panel) 55%,transparent)}
@@ -121,7 +136,7 @@ function delegationCard(d, i) {
   const icon = kind === 'credentials' ? '🔑' : kind === 'approvals' ? '✅' : '📄'
   const gname = agentName(d.agent) || short(d.agent)
   const mono = esc(((gname || '?').trim()[0] || '?').toUpperCase())
-  return `<div class="card st-${d.status} kind-${kind}" data-i="${i}">
+  return `<div class="card st-${d.status} kind-${kind}" data-i="${i}" data-scope="${esc(d.scope)}" data-agent="${esc(d.agent)}">
     <div class="head">
       <div>
         <span class="lg-ic" title="${kind}">${icon}</span>
@@ -291,6 +306,23 @@ export function renderLedger() {
       ui.innerHTML = ` <select class="addg-sel">${cands.map(a =>
         `<option value="${a.pub}">${esc(agentName(a.pub))}</option>`).join('')}</select> <button class="addg-go primary">grant</button>`
       ui.querySelector('.addg-go').onclick = () => addGrantee(d, ui.querySelector('.addg-sel').value, msg)
+    }
+  }
+
+  // Consume a pending "open this delegation" (nvoy#17): scroll the focused
+  // card into view, highlight it, and open its re-grant UI — the useful next
+  // action on an already-committed grant.
+  if (pendingFocus) {
+    const { scope, agent } = pendingFocus
+    pendingFocus = null
+    const card = [...document.querySelectorAll('#ledger .card')]
+      .find(c => c.dataset.scope === scope && c.dataset.agent === agent)
+    if (card) {
+      card.closest('details')?.setAttribute('open', '')
+      card.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      card.classList.add('lg-focused')
+      setTimeout(() => card.classList.remove('lg-focused'), 2600)
+      card.querySelector('.addg')?.click()   // surface ＋ grant to another identity
     }
   }
 }

@@ -154,6 +154,12 @@
   .chip.scope-active { border-color: color-mix(in srgb, var(--ok) 50%, transparent); color: var(--ok); }
   .chip.scope-expired { border-color: color-mix(in srgb, var(--warn) 50%, transparent); color: var(--warn); }
   .chip.scope-revoked { border-color: color-mix(in srgb, var(--danger) 50%, transparent); color: var(--danger); }
+  /* clickable delegation chip (nvoy#17) — keeps its status color, signals hover */
+  button.chip.del-chip { cursor: pointer; font-family: var(--mono); }
+  button.chip.del-chip:hover { background: color-mix(in srgb, currentColor 12%, transparent); filter: brightness(1.12); }
+  /* copy-npub icon button — accent, not the danger red the delete X uses */
+  button.icon.copy-npub:hover { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 55%, transparent); background: none; }
+  button.icon.copy-npub.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 55%, transparent); }
   .chip.scope-relinquished { border-color: color-mix(in srgb, var(--accent) 50%, transparent); color: var(--accent); }
   .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
   .actions input { flex: 1; font-family: var(--mono); font-size: 12px; }
