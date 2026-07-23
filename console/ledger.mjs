@@ -26,6 +26,9 @@ let fQuery = ''                 // free text over scope name / grantee / purpose
 // asked for). Preserved across re-renders so toggling a filter never collapses
 // what you opened.
 let openGroups = new Set()
+// The two grantee super-sections. Agents open by default, Other identities
+// collapsed (the Director's default). Toggles persist across re-renders.
+let openSupers = new Set(['agents'])
 // A pending "open this delegation" request from the Agents tab. renderLedger
 // consumes it: expand its group, scroll it into view (AFTER the tab's hash
 // scroll — deferred to a frame, which is the click-through fix), ring it, and
@@ -96,6 +99,19 @@ const LEDGER_STYLE = `<style>
 #ledger .lg-group>summary::before{content:'▸';color:var(--dim);font-size:12px;transition:transform .12s;flex:none;width:10px}
 #ledger .lg-group[open]>summary::before{transform:rotate(90deg)}
 #ledger .lg-gname{font-family:var(--serif);font-weight:600;font-size:16px;color:var(--text);display:inline-flex;align-items:center;gap:7px}
+/* grantee super-sections (Agents / Other identities) */
+#ledger .lg-super{margin:0 0 18px}
+#ledger .lg-super>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:10px;padding:6px 2px 10px;user-select:none}
+#ledger .lg-super>summary::-webkit-details-marker{display:none}
+#ledger .lg-super>summary::before{content:'▾';color:var(--dim);font-size:12px;transition:transform .12s;flex:none;width:12px}
+#ledger .lg-super:not([open])>summary::before{transform:rotate(-90deg)}
+#ledger .lg-super-name{font-size:11px;text-transform:uppercase;letter-spacing:.11em;color:var(--accent);font-weight:700}
+#ledger .lg-super-count{font-family:var(--mono);font-size:11.5px;color:var(--dim)}
+#ledger .lg-super-body{padding-left:2px}
+#ledger .lg-super-bar{height:1px;background:linear-gradient(to right,var(--line),transparent);margin:2px 0 18px}
+/* grantee avatar in the group header */
+#ledger .lg-avatar{width:22px;height:22px;border-radius:6px;flex:none;object-fit:cover;background:#0b0906}
+#ledger .lg-avatar.mono{display:inline-grid;place-items:center;background:#1a140c;color:#c39a56;font-weight:600;font-size:11px}
 #ledger .lg-grantee-badge{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:6px;flex:none}
 #ledger .lg-grantee-badge.agent{color:var(--gold-bright,var(--accent));background:color-mix(in srgb,var(--accent) 15%,transparent);border:1px solid color-mix(in srgb,var(--accent) 40%,transparent)}
 #ledger .lg-grantee-badge.identity{color:var(--dim);background:color-mix(in srgb,var(--dim) 12%,transparent);border:1px solid color-mix(in srgb,var(--dim) 35%,transparent)}
@@ -266,6 +282,48 @@ export function renderLedger() {
   const check = (label, on, attr, radio) =>
     `<button class="lg-check${on ? ' on' : ''}${radio ? ' radio' : ''}" ${attr}><span class="lg-box"></span>${esc(label)}</button>`
 
+  // Grantee avatar (profile pic → gold monogram) for the group header when
+  // grouped by grantee. loadProfiles already fetches kind-0 for every grantee.
+  const avatarFor = (pub) => {
+    const p = state.profiles.get(pub)
+    const initial = esc(((agentName(pub) || short(pub) || '?').trim()[0] || '?').toUpperCase())
+    return p?.picture
+      ? `<img class="lg-avatar" src="${esc(p.picture)}" alt="" width="22" height="22" loading="lazy">`
+      : `<span class="lg-avatar mono">${initial}</span>`
+  }
+
+  // One grantee group (a collapsible <details>). Header order when grouped by
+  // grantee: [kind icon] [profile pic] [name]. Card wiring keys off the flat
+  // `i`, so nesting these inside super-sections is safe.
+  const groupHtml = (k) => {
+    const items = groups.get(k)
+    const activeN = items.filter(x => x.d.status === 'active').length
+    const byStatus = {}; for (const x of items) byStatus[x.d.status] = (byStatus[x.d.status] || 0) + 1
+    const pips = STATUSES.filter(s => byStatus[s]).map(s => `<span class="lg-pip ${s}" title="${byStatus[s]} ${s}"></span>`).join('')
+    const mark = groupBy === 'agent'
+      ? (isAgent(k)
+          ? `<span class="lg-grantee-badge agent" title="registered agent">${AGENT_ICON}</span>`
+          : `<span class="lg-grantee-badge identity" title="identity — holds a grant but is not an agent">${PERSON_ICON}</span>`)
+        + avatarFor(k)
+      : ''
+    return `<details class="lg-group" data-gkey="${esc(String(k))}"${openGroups.has(k) ? ' open' : ''}>
+      <summary><span class="lg-gname">${mark}${esc(labelOf(k))}</span>
+        <span class="lg-gcount">${items.length} grant${items.length === 1 ? '' : 's'}${activeN !== items.length ? ` · ${activeN} active` : ''}</span>
+        <span class="lg-pips">${pips}</span></summary>
+      <div class="lg-chain">${items.map(({ d, i }) => delegationCard(d, i)).join('')}</div>
+    </details>`
+  }
+
+  // A super-section wrapping the grantee groups of one kind. `id` ∈
+  // {'agents','identities'}; open state persists in openSupers (agents open,
+  // identities collapsed by default — seeded at the module level).
+  const superHtml = (id, label, keys, grantN, gh) =>
+    `<details class="lg-super" data-super="${id}"${openSupers.has(id) ? ' open' : ''}>
+      <summary><span class="lg-super-name">${esc(label)}</span>
+        <span class="lg-super-count">${keys.length} grantee${keys.length === 1 ? '' : 's'} · ${grantN} grant${grantN === 1 ? '' : 's'}</span></summary>
+      <div class="lg-super-body">${keys.map(gh).join('')}</div>
+    </details>`
+
   $('ledger').innerHTML = `${LEDGER_STYLE}
     <div class="lg-wrap">
       <aside class="lg-nav">
@@ -316,25 +374,18 @@ export function renderLedger() {
           Console closed = soft expiry only — compliant runtimes stop serving at the deadline, and the sweep
           completes on your next visit. To cover the gap without the browser, run the operator daemon
           (<code>node bin/nvoy-ttl.mjs</code>, holds your nsec — documented in its header); a hosted scheduler is future work.</div>` : ''}
-        ${groupKeys.length ? groupKeys.map(k => {
-          const items = groups.get(k)
-          const activeN = items.filter(x => x.d.status === 'active').length
-          const byStatus = {}; for (const x of items) byStatus[x.d.status] = (byStatus[x.d.status] || 0) + 1
-          const pips = STATUSES.filter(s => byStatus[s]).map(s => `<span class="lg-pip ${s}" title="${byStatus[s]} ${s}"></span>`).join('')
-          // When grouped by grantee, mark each group by kind: a bot icon for a
-          // registered agent, a person icon for any other identity.
-          const granteeMark = groupBy === 'agent'
-            ? (isAgent(k)
-                ? `<span class="lg-grantee-badge agent" title="registered agent">${AGENT_ICON}</span>`
-                : `<span class="lg-grantee-badge identity" title="identity — holds a grant but is not an agent">${PERSON_ICON}</span>`)
-            : ''
-          return `<details class="lg-group" data-gkey="${esc(String(k))}"${openGroups.has(k) ? ' open' : ''}>
-            <summary><span class="lg-gname">${granteeMark}${esc(labelOf(k))}</span>
-              <span class="lg-gcount">${items.length} grant${items.length === 1 ? '' : 's'}${activeN !== items.length ? ` · ${activeN} active` : ''}</span>
-              <span class="lg-pips">${pips}</span></summary>
-            <div class="lg-chain">${items.map(({ d, i }) => delegationCard(d, i)).join('')}</div>
-          </details>`
-        }).join('') : `<div class="empty">
+        ${groupKeys.length ? (groupBy === 'agent'
+          // Grantee grouping: two collapsible super-sections — Agents (open by
+          // default) above Other identities (collapsed), with a divider between.
+          ? (() => {
+              const agentKeys = groupKeys.filter(isAgent), identityKeys = groupKeys.filter(k => !isAgent(k))
+              const total = ks => ks.reduce((n, k) => n + groups.get(k).length, 0)
+              return (agentKeys.length ? superHtml('agents', 'Agents', agentKeys, total(agentKeys), groupHtml) : '')
+                + (agentKeys.length && identityKeys.length ? `<div class="lg-super-bar"></div>` : '')
+                + (identityKeys.length ? superHtml('identities', 'Other identities', identityKeys, total(identityKeys), groupHtml) : '')
+            })()
+          : groupKeys.map(groupHtml).join('')
+        ) : `<div class="empty">
           ${filtered
             ? `Nothing matches these filters. <a id="lg-clear" style="color:var(--accent);cursor:pointer">Clear</a>`
             : `Nothing delegated yet.<br>
@@ -357,6 +408,9 @@ export function renderLedger() {
   for (const det of document.querySelectorAll('#ledger .lg-group')) det.addEventListener('toggle', () => {
     const k = det.dataset.gkey
     det.open ? openGroups.add(k) : openGroups.delete(k)
+  })
+  for (const det of document.querySelectorAll('#ledger .lg-super')) det.addEventListener('toggle', () => {
+    det.open ? openSupers.add(det.dataset.super) : openSupers.delete(det.dataset.super)
   })
   // Live search: the whole tab re-renders per keystroke (house pattern), so
   // restore focus + caret into the fresh input or typing would drop after one
