@@ -269,10 +269,15 @@ export function renderLedger() {
           ${GROUP_OPTS.map(([g, lbl]) => check(lbl, groupBy === g, `data-group="${g}"`, true)).join('')}
         </div>
         <div class="lg-nav-sect">
-          <div class="lg-nav-h">Agent</div>
-          <select id="lg-agent" title="filter to one grantee">
-            <option value="">all agents</option>
-            ${agentList.map(a => `<option value="${a.pub}"${a.pub === fAgent ? ' selected' : ''}>${esc(a.name)}</option>`).join('')}
+          <div class="lg-nav-h">Grantee</div>
+          <select id="lg-agent" title="filter to one grantee — agents and other identities are separated">
+            <option value="">all grantees</option>
+            ${(() => {
+              const opt = a => `<option value="${a.pub}"${a.pub === fAgent ? ' selected' : ''}>${esc(a.name)}</option>`
+              const agents = agentList.filter(a => a.agent), identities = agentList.filter(a => !a.agent)
+              return (agents.length ? `<optgroup label="Agents">${agents.map(opt).join('')}</optgroup>` : '')
+                + (identities.length ? `<optgroup label="Other identities">${identities.map(opt).join('')}</optgroup>` : '')
+            })()}
           </select>
         </div>
         <div class="lg-nav-sect">
