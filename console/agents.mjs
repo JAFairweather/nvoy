@@ -74,6 +74,7 @@ function requestCard(r, i) {
 export function renderAgents() {
   const agents = agentsOf()
   $('agents').innerHTML = `
+    ${state.unwrapWarning ? `<div class="card requests"><div class="meta">⚠ ${esc(state.unwrapWarning)}</div></div>` : ''}
     ${state.requests.length ? `<div class="card requests">
       <div class="name">Pending access requests</div>
       <div class="note" style="margin:2px 0 8px">Agents asking for a delegation. Approving opens the
