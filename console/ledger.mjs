@@ -14,32 +14,39 @@ import { rotateDropping, runRelinquishRotation, nextExpiry } from './ttl.mjs'
 import { state, $, esc, short, fmtWhen, agentName, agentsOf, load, RELAYS, showTab } from './main.mjs'
 
 // Ledger organization (a grant has three axes — who / what / state).
-let groupBy = 'agent'           // 'agent' | 'type' | 'status' — the primary axis
-// A pending "open this delegation" request from another tab (a delegation chip
-// on an agent card). renderLedger consumes it: scroll the card into view,
-// highlight it, and open its re-grant UI — the useful next action on a
-// committed grant. Cleared once handled so it fires exactly once.
+let groupBy = 'agent'           // primary axis — see GROUP_OPTS
+// Filters: Type and Status are MULTI-select (empty set = all); Agent narrows to
+// one grantee. Left-nav checkmarks toggle the sets (nvoy#20).
+let fTypes = new Set()          // subset of TYPES; empty = all
+let fStatuses = new Set()       // subset of STATUSES; empty = all
+let fAgent = ''                 // '' = all agents, else a grantee hex
+let fQuery = ''                 // free text over scope name / grantee / purpose / d-tag
+// Which groups are expanded. Empty = ALL COLLAPSED (the default the Director
+// asked for). Preserved across re-renders so toggling a filter never collapses
+// what you opened.
+let openGroups = new Set()
+// A pending "open this delegation" request from the Agents tab. renderLedger
+// consumes it: expand its group, scroll it into view (AFTER the tab's hash
+// scroll — deferred to a frame, which is the click-through fix), ring it, and
+// open its re-grant UI. Fires exactly once.
 let pendingFocus = null         // { scope, agent } | null
 export function openDelegationInLedger(scope, agent) {
   pendingFocus = { scope, agent }
-  // A search filter could hide the target card; clear text search so the
-  // focused delegation is always in the rendered set.
-  fQuery = ''
-  showTab('ledger')             // synchronously calls renderLedger → focus runs
+  // Clear every filter that could hide the target so it's always in the set.
+  fQuery = ''; fTypes.clear(); fStatuses.clear(); fAgent = ''
+  showTab('ledger')             // renders, then sets location.hash
 }
-let fType = ''                  // '' | 'credentials' | 'data' | 'approvals'
-let fStatus = ''                // '' | 'active' | 'expired' | 'revoked' | 'relinquished'
-let fQuery = ''                 // free text over scope name / grantee / purpose / d-tag
 
 const cap = s => s ? s[0].toUpperCase() + s.slice(1) : s
 // The "type" facet: classify a delegation by the nature of what it grants.
 function scopeKind(d) {
   const n = `${d.scopeName || ''} ${d.scope || ''}`.toLowerCase()
+  if (n.includes('steer')) return 'steering'
   if (/nactjaf|approval/.test(n)) return 'approvals'
   if (n.includes('credential')) return 'credentials'
   return 'data'
 }
-const TYPES = ['credentials', 'data', 'approvals']
+const TYPES = ['credentials', 'data', 'approvals', 'steering']
 const STATUSES = ['active', 'expired', 'revoked', 'relinquished']
 const STATUS_RANK = { active: 0, expired: 1, relinquished: 2, revoked: 3 }
 // The primary grouping axis. 'scope' groups all grantees of one credential under
@@ -47,16 +54,27 @@ const STATUS_RANK = { active: 0, expired: 1, relinquished: 2, revoked: 3 }
 const GROUP_OPTS = [['agent', 'Grantee'], ['scope', 'Credential'], ['type', 'Type'], ['status', 'Status']]
 
 const LEDGER_STYLE = `<style>
-/* controls */
-#ledger .lg-lbl{font-size:12px;color:var(--dim);display:inline-flex;align-items:center;gap:6px}
-#ledger .lg-lbl select{font-family:var(--mono);font-size:12px}
-#ledger .lg-facets{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin:10px 0 18px}
-#ledger .lg-facet-lbl{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim)}
-#ledger .lg-facet-sep{width:1px;height:15px;background:var(--line);margin:0 5px}
-#ledger .lg-chip{font-family:var(--mono);font-size:12px;padding:3px 10px;border-radius:999px;border:1px solid var(--line);background:transparent;color:var(--dim);cursor:pointer}
-#ledger .lg-chip:hover{color:var(--text);border-color:var(--dim)}
-#ledger .lg-chip.on{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:600}
-#ledger .lg-search{font-family:var(--mono);font-size:12px;padding:4px 12px;border-radius:999px;border:1px solid var(--line);background:transparent;color:var(--text);min-width:230px;outline:none}
+/* two-column: a sticky filter rail on the left, the grouped ledger on the right */
+#ledger .lg-wrap{display:grid;grid-template-columns:184px 1fr;gap:22px;align-items:start}
+@media (max-width:720px){#ledger .lg-wrap{grid-template-columns:1fr}}
+#ledger .lg-nav{position:sticky;top:12px;display:flex;flex-direction:column;gap:16px}
+#ledger .lg-nav-sect{display:flex;flex-direction:column;gap:3px}
+#ledger .lg-nav-h{font-size:10.5px;text-transform:uppercase;letter-spacing:.1em;color:var(--dim);margin:0 0 4px 2px}
+#ledger .lg-nav select{width:100%;font-family:var(--mono);font-size:12px;padding:5px 8px;border-radius:8px;border:1px solid var(--line);background:transparent;color:var(--text)}
+/* a checkmark row — Type / Status / Group-by all use it */
+#ledger .lg-check{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:12.5px;padding:4px 7px;border-radius:7px;border:1px solid transparent;background:transparent;color:var(--dim);cursor:pointer;text-align:left;text-transform:capitalize}
+#ledger .lg-check:hover{color:var(--text);background:color-mix(in srgb,var(--panel2) 60%,transparent)}
+#ledger .lg-check.on{color:var(--text)}
+#ledger .lg-box{flex:none;width:15px;height:15px;border-radius:4px;border:1.5px solid var(--line);display:inline-grid;place-items:center;font-size:11px;line-height:1;color:var(--accent-ink)}
+#ledger .lg-check.on .lg-box{background:var(--accent);border-color:var(--accent)}
+#ledger .lg-check .lg-box::after{content:'';}
+#ledger .lg-check.on .lg-box::after{content:'✓'}
+/* group-by is single-select: a filled dot instead of a check */
+#ledger .lg-check.radio .lg-box{border-radius:50%}
+#ledger .lg-check.radio.on .lg-box::after{content:'';width:7px;height:7px;border-radius:50%;background:var(--accent-ink)}
+#ledger .lg-nav-clear{font-size:11px;color:var(--accent);cursor:pointer;margin-top:2px}
+#ledger .lhead{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+#ledger .lg-search{font-family:var(--mono);font-size:12px;padding:5px 12px;border-radius:999px;border:1px solid var(--line);background:transparent;color:var(--text);min-width:230px;flex:1;outline:none}
 #ledger .lg-search:focus{border-color:var(--accent)}
 /* focus ring when a delegation is opened from another tab (nvoy#17) */
 #ledger .card.lg-focused{outline:2px solid var(--accent);outline-offset:2px;animation:lgfocus 2.6s ease-out}
@@ -196,11 +214,12 @@ export function renderLedger() {
   const t = computeTotals(all, state.index.nvoy_ledger ?? [])
   const next = nextExpiry(state.index)
 
-  // Facet filters (type / status) + free-text search, then group on the axis.
+  // Multi-select filters (empty set = all) + agent + free-text; then group.
   const q = fQuery.trim().toLowerCase()
   const rows = all.filter(d =>
-    (!fType || scopeKind(d) === fType) &&
-    (!fStatus || d.status === fStatus) &&
+    (fTypes.size === 0 || fTypes.has(scopeKind(d))) &&
+    (fStatuses.size === 0 || fStatuses.has(d.status)) &&
+    (!fAgent || d.agent === fAgent) &&
     (!q || `${d.scopeName || ''} ${agentName(d.agent) || ''} ${d.purpose || ''} ${d.scope || ''} ${d.status || ''}`
       .toLowerCase().includes(q)))
 
@@ -220,61 +239,90 @@ export function renderLedger() {
       ? (STATUS_RANK[a] ?? 9) - (STATUS_RANK[b] ?? 9)   // canonical status order
       : groups.get(b).length - groups.get(a).length)    // else biggest group first
 
-  const chip = (label, on, attr) => `<button class="lg-chip${on ? ' on' : ''}" ${attr}>${esc(label)}</button>`
-  const filtered = fType || fStatus || q
+  // Distinct grantees, for the Agent filter — labelled, sorted by name.
+  const agentList = [...new Set(all.map(d => d.agent))]
+    .map(pub => ({ pub, name: agentName(pub) || short(pub) }))
+    .sort((x, y) => x.name.localeCompare(y.name))
+  const filtered = fTypes.size || fStatuses.size || fAgent || q
+
+  // A checkmark row (Type/Status = checkbox multi-select; Group-by = radio).
+  const check = (label, on, attr, radio) =>
+    `<button class="lg-check${on ? ' on' : ''}${radio ? ' radio' : ''}" ${attr}><span class="lg-box"></span>${esc(label)}</button>`
 
   $('ledger').innerHTML = `${LEDGER_STYLE}
-    <div class="lhead">
-      <span class="totals"><b>${t.active}</b> active delegation${t.active === 1 ? '' : 's'}
-        to <b>${t.agents}</b> agent${t.agents === 1 ? '' : 's'},
-        <b>${t.revokedThisMonth}</b> revoked this month</span>
-      <span class="spacer"></span>
-      <label class="lg-lbl">group by
-        <select id="lg-group" title="primary axis">
-          ${GROUP_OPTS.map(([g, lbl]) => `<option value="${g}"${g === groupBy ? ' selected' : ''}>${lbl}</option>`).join('')}
-        </select></label>
-    </div>
-    <div class="lg-facets">
-      <span class="lg-facet-lbl">type</span>
-      ${chip('all', !fType, 'data-type=""')}${TYPES.map(x => chip(x, fType === x, `data-type="${x}"`)).join('')}
-      <span class="lg-facet-sep"></span>
-      <span class="lg-facet-lbl">status</span>
-      ${chip('all', !fStatus, 'data-status=""')}${STATUSES.map(x => chip(x, fStatus === x, `data-status="${x}"`)).join('')}
-      <span class="lg-facet-sep"></span>
-      <input class="lg-search" id="lg-search" type="search" placeholder="search scope / grantee / purpose / id…"
-        value="${esc(fQuery)}" spellcheck="false" autocomplete="off">
-      ${q ? `<span class="lg-gcount">${rows.length} match${rows.length === 1 ? '' : 'es'}</span>` : ''}
-    </div>
-    ${all.some(d => d.expiresAt !== null && (d.status === 'active' || d.status === 'expired')) ? `<div class="ttlnote">
-      Hard expiry runs <b>while this console is open</b>: at each deadline the scope key is rotated and only
-      unexpired grantees are re-granted${next ? ` (next: ${fmtCountdown(next).replace('expires', 'fires')})` : ''}.
-      Console closed = soft expiry only — compliant runtimes stop serving at the deadline, and the sweep
-      completes on your next visit. To cover the gap without the browser, run the operator daemon
-      (<code>node bin/nvoy-ttl.mjs</code>, holds your nsec — documented in its header); a hosted scheduler is future work.</div>` : ''}
-    ${groupKeys.length ? groupKeys.map(k => {
-      const items = groups.get(k)
-      const activeN = items.filter(x => x.d.status === 'active').length
-      const byStatus = {}; for (const x of items) byStatus[x.d.status] = (byStatus[x.d.status] || 0) + 1
-      const pips = STATUSES.filter(s => byStatus[s]).map(s => `<span class="lg-pip ${s}" title="${byStatus[s]} ${s}"></span>`).join('')
-      return `<details class="lg-group" open>
-        <summary><span class="lg-gname">${esc(labelOf(k))}</span>
-          <span class="lg-gcount">${items.length} grant${items.length === 1 ? '' : 's'}${activeN !== items.length ? ` · ${activeN} active` : ''}</span>
-          <span class="lg-pips">${pips}</span></summary>
-        <div class="lg-chain">${items.map(({ d, i }) => delegationCard(d, i)).join('')}</div>
-      </details>`
-    }).join('') : `<div class="empty">
-      ${filtered
-        ? `Nothing matches these filters. <a id="lg-clear" style="color:var(--accent);cursor:pointer">Clear</a>`
-        : `Nothing delegated yet.<br>
-      The ledger is the audit view: every delegation, its terms, every rotation and revocation —
-      a query over your encrypted Grant Index, not archaeology across admin panels.`}</div>`}`
+    <div class="lg-wrap">
+      <aside class="lg-nav">
+        <div class="lg-nav-sect">
+          <div class="lg-nav-h">Group by</div>
+          ${GROUP_OPTS.map(([g, lbl]) => check(lbl, groupBy === g, `data-group="${g}"`, true)).join('')}
+        </div>
+        <div class="lg-nav-sect">
+          <div class="lg-nav-h">Agent</div>
+          <select id="lg-agent" title="filter to one grantee">
+            <option value="">all agents</option>
+            ${agentList.map(a => `<option value="${a.pub}"${a.pub === fAgent ? ' selected' : ''}>${esc(a.name)}</option>`).join('')}
+          </select>
+        </div>
+        <div class="lg-nav-sect">
+          <div class="lg-nav-h">Type</div>
+          ${TYPES.map(x => check(x, fTypes.has(x), `data-type="${x}"`)).join('')}
+        </div>
+        <div class="lg-nav-sect">
+          <div class="lg-nav-h">Status</div>
+          ${STATUSES.map(x => check(x, fStatuses.has(x), `data-status="${x}"`)).join('')}
+        </div>
+        ${filtered ? `<a class="lg-nav-clear" id="lg-clear-nav">clear filters</a>` : ''}
+      </aside>
 
-  $('lg-group').onchange = (e) => { groupBy = e.target.value; renderLedger() }
-  for (const b of document.querySelectorAll('#ledger .lg-chip')) b.onclick = () => {
-    if (b.hasAttribute('data-type')) fType = b.getAttribute('data-type')
-    else fStatus = b.getAttribute('data-status')
-    renderLedger()
+      <div class="lg-main">
+        <div class="lhead">
+          <span class="totals"><b>${t.active}</b> active delegation${t.active === 1 ? '' : 's'}
+            to <b>${t.agents}</b> agent${t.agents === 1 ? '' : 's'},
+            <b>${t.revokedThisMonth}</b> revoked this month</span>
+          <input class="lg-search" id="lg-search" type="search" placeholder="search scope / grantee / purpose / id…"
+            value="${esc(fQuery)}" spellcheck="false" autocomplete="off">
+          ${filtered ? `<span class="lg-gcount">${rows.length} shown</span>` : ''}
+        </div>
+        ${all.some(d => d.expiresAt !== null && (d.status === 'active' || d.status === 'expired')) ? `<div class="ttlnote">
+          Hard expiry runs <b>while this console is open</b>: at each deadline the scope key is rotated and only
+          unexpired grantees are re-granted${next ? ` (next: ${fmtCountdown(next).replace('expires', 'fires')})` : ''}.
+          Console closed = soft expiry only — compliant runtimes stop serving at the deadline, and the sweep
+          completes on your next visit. To cover the gap without the browser, run the operator daemon
+          (<code>node bin/nvoy-ttl.mjs</code>, holds your nsec — documented in its header); a hosted scheduler is future work.</div>` : ''}
+        ${groupKeys.length ? groupKeys.map(k => {
+          const items = groups.get(k)
+          const activeN = items.filter(x => x.d.status === 'active').length
+          const byStatus = {}; for (const x of items) byStatus[x.d.status] = (byStatus[x.d.status] || 0) + 1
+          const pips = STATUSES.filter(s => byStatus[s]).map(s => `<span class="lg-pip ${s}" title="${byStatus[s]} ${s}"></span>`).join('')
+          return `<details class="lg-group" data-gkey="${esc(String(k))}"${openGroups.has(k) ? ' open' : ''}>
+            <summary><span class="lg-gname">${esc(labelOf(k))}</span>
+              <span class="lg-gcount">${items.length} grant${items.length === 1 ? '' : 's'}${activeN !== items.length ? ` · ${activeN} active` : ''}</span>
+              <span class="lg-pips">${pips}</span></summary>
+            <div class="lg-chain">${items.map(({ d, i }) => delegationCard(d, i)).join('')}</div>
+          </details>`
+        }).join('') : `<div class="empty">
+          ${filtered
+            ? `Nothing matches these filters. <a id="lg-clear" style="color:var(--accent);cursor:pointer">Clear</a>`
+            : `Nothing delegated yet.<br>
+          The ledger is the audit view: every delegation, its terms, every rotation and revocation —
+          a query over your encrypted Grant Index, not archaeology across admin panels.`}</div>`}
+      </div>
+    </div>`
+
+  // Left-nav filters. Group-by is single-select (radio); Type/Status toggle in
+  // and out of their Set (multi-select); Agent is a select.
+  const toggle = (set, v) => { set.has(v) ? set.delete(v) : set.add(v); renderLedger() }
+  for (const b of document.querySelectorAll('#ledger .lg-check')) b.onclick = () => {
+    if (b.dataset.group) { groupBy = b.dataset.group; renderLedger() }
+    else if (b.dataset.type) toggle(fTypes, b.dataset.type)
+    else if (b.dataset.status) toggle(fStatuses, b.dataset.status)
   }
+  const ag = $('lg-agent'); if (ag) ag.onchange = (e) => { fAgent = e.target.value; renderLedger() }
+  // Track expand/collapse so a filter change never collapses what you opened.
+  for (const det of document.querySelectorAll('#ledger .lg-group')) det.addEventListener('toggle', () => {
+    const k = det.dataset.gkey
+    det.open ? openGroups.add(k) : openGroups.delete(k)
+  })
   // Live search: the whole tab re-renders per keystroke (house pattern), so
   // restore focus + caret into the fresh input or typing would drop after one
   // character.
@@ -286,7 +334,9 @@ export function renderLedger() {
     const s2 = $('lg-search')
     if (s2) { s2.focus(); try { s2.setSelectionRange(pos, pos) } catch {} }
   }
-  const clr = $('lg-clear'); if (clr) clr.onclick = () => { fType = ''; fStatus = ''; fQuery = ''; renderLedger() }
+  const clrAll = () => { fTypes.clear(); fStatuses.clear(); fAgent = ''; fQuery = ''; renderLedger() }
+  const clr = $('lg-clear'); if (clr) clr.onclick = clrAll
+  const clrNav = $('lg-clear-nav'); if (clrNav) clrNav.onclick = clrAll
 
   for (const card of document.querySelectorAll('#ledger .card')) {
     const d = rows[Number(card.dataset.i)]
@@ -309,20 +359,24 @@ export function renderLedger() {
     }
   }
 
-  // Consume a pending "open this delegation" (nvoy#17): scroll the focused
-  // card into view, highlight it, and open its re-grant UI — the useful next
-  // action on an already-committed grant.
+  // Consume a pending "open this delegation" from the Agents tab (nvoy#17/#20).
+  // The scroll is DEFERRED to a frame: showTab() calls renderLedger() and THEN
+  // sets location.hash='ledger', which the browser scrolls to (the ledger top).
+  // Running our scrollIntoView on the next frame lets it win — that lands us on
+  // the delegation instead of the top of the page (the reported bug).
   if (pendingFocus) {
     const { scope, agent } = pendingFocus
     pendingFocus = null
     const card = [...document.querySelectorAll('#ledger .card')]
       .find(c => c.dataset.scope === scope && c.dataset.agent === agent)
     if (card) {
-      card.closest('details')?.setAttribute('open', '')
-      card.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      const det = card.closest('details')
+      if (det) { det.open = true; openGroups.add(det.dataset.gkey) }   // expand its (default-collapsed) group
+      card.querySelector('.addg')?.click()   // surface ＋ grant to another identity
       card.classList.add('lg-focused')
       setTimeout(() => card.classList.remove('lg-focused'), 2600)
-      card.querySelector('.addg')?.click()   // surface ＋ grant to another identity
+      requestAnimationFrame(() => requestAnimationFrame(() =>
+        card.scrollIntoView({ behavior: 'smooth', block: 'center' })))
     }
   }
 }
