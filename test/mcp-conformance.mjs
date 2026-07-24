@@ -40,7 +40,8 @@ const textJson = (result) => JSON.parse(result.content.find(c => c.type === 'tex
 
 const TOOLS = [
   'nvoy_whoami', 'nvoy_grants_list', 'nvoy_scope_read', 'nvoy_scope_subscribe',
-  'nvoy_outbox_write', 'nvoy_request_access', 'nvoy_grant_relinquish',
+  'nvoy_outbox_write', 'nvoy_draft_publish', 'nvoy_draft_withdraw',
+  'nvoy_request_access', 'nvoy_grant_relinquish',
 ]
 
 // ------------------------------------------------ seed a delegation offline
@@ -253,6 +254,44 @@ try {
   check('agent outbox key recovered from the agent\'s own Grant Index (nsec-only recovery)',
     agentIndex.nvoy_outbox?.[delegatorPub] === out1.d
     && agentIndex.issued?.some(e => e.scope === out1.d && e.grantees?.includes(delegatorPub)))
+
+  // ------------------------------------- draft_publish / draft_withdraw (#28)
+  // The director-path delivery wire (nact#37): a fresh scope per offer,
+  // granted to the Director, withdrawable by tombstone.
+  const draft = textJson(await client.callTool({
+    name: 'nvoy_draft_publish',
+    arguments: {
+      grantee_npub: delegatorNpub,
+      payload: { kind: 'draft:post', text: 'raised through the mcp desk', proposedBy: 'jaf-quill@dequalsf.com', proposedAt: 1 },
+    },
+  }))
+  check('draft_publish: fresh per-offer scope, draft:post/<id8> name, granted to the Director',
+    typeof draft.d === 'string' && draft.v === 1
+    && draft.scope_name === `draft:post/${draft.d.slice(0, 8)}` && draft.granted_to === delegatorNpub)
+
+  // Director side: unwraps + gates exactly like the Ngage desk (draft: namespace,
+  // first-hand publisher = the agent identity), and the payload rides byte-faithful.
+  const held = latestGrants(await receiveGrants(seedRelay, delegatorSk))
+  const draftGrant = held.find(g => g.scopeId === draft.d)
+  check('draft grant: draft: namespace, first-hand from the agent identity',
+    draftGrant?.scopeName === draft.scope_name && draftGrant?.publisher === getPublicKey(agentSk))
+  const draftRead = await fetchScope(seedRelay, draftGrant)
+  check('draft dereferences with the granted key; text byte-identical',
+    draftRead.status === 'ok' && draftRead.data?.text === 'raised through the mcp desk')
+
+  check('draft_publish: non-draft scope_name refused (namespace guard)',
+    textJson(await client.callTool({
+      name: 'nvoy_draft_publish',
+      arguments: { grantee_npub: delegatorNpub, payload: { text: 'x' }, scope_name: 'steer:draft' },
+    })).code === 'NVOY_BAD_INPUT')
+
+  const wd = textJson(await client.callTool({ name: 'nvoy_draft_withdraw', arguments: { d: draft.d } }))
+  const afterWd = await fetchScope(seedRelay, draftGrant)
+  check('draft_withdraw: tombstoned — the granted key no longer opens it',
+    wd.withdrawn === true && wd.v === 2 && afterWd.status !== 'ok')
+  check('draft_withdraw: idempotent; unknown id is a typed error',
+    textJson(await client.callTool({ name: 'nvoy_draft_withdraw', arguments: { d: draft.d } })).v === 2
+    && textJson(await client.callTool({ name: 'nvoy_draft_withdraw', arguments: { d: 'nope' } })).code === 'NVOY_UNKNOWN_DRAFT')
 
   // ---------------------------------------------------- request_access §6.2
   const req = textJson(await client.callTool({

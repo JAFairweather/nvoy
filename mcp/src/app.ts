@@ -22,6 +22,7 @@ import type { Identity } from './identity.js'
 import { GrantStore, findRevocationNotice, grantStatus, toHexPubkey, type HeldGrant } from './grants.js'
 import { ScopeCache } from './scopes.js'
 import { Outbox } from './outbox.js'
+import { DraftDesk } from './drafts.js'
 import { sendAccessRequest, sendRelinquishNotice } from './notices.js'
 
 export interface NvoyContext {
@@ -31,6 +32,7 @@ export interface NvoyContext {
   grantStore: GrantStore
   scopeCache: ScopeCache
   outbox: Outbox
+  drafts: DraftDesk
   /** which transport this server instance speaks (shapes subscribe behavior) */
   transport: 'stdio' | 'http'
   /** subscription poll interval (ms); NVOY_SUBSCRIBE_POLL_MS, default 15s */
@@ -406,6 +408,58 @@ export function createNvoyServer(ctx: NvoyContext): NvoyServerHandle {
         })
       } catch (e) {
         return jsonError({ code: 'NVOY_OUTBOX_FAILED', message: String((e as Error).message) })
+      }
+    },
+  )
+
+  server.registerTool(
+    'nvoy_draft_publish',
+    {
+      title: 'Publish a draft offer',
+      description:
+        'Mint ONE draft offer for a sovereign desk (nvoy#28; the director-path delivery wire of nact#37): a fresh scope under a fresh key, published by this agent identity and gift-wrapped as a grant to the grantee. Per-offer scopes — unlike the outbox, which is one mutable scope per delegator. scope_name must stay in the draft: namespace; this tool mints draft offers, never arbitrary grants. Payload must be a JSON object (the Ngage desk schema: text, image, hashtags, rationale, proposedBy, proposedAt).',
+      inputSchema: {
+        grantee_npub: z.string().describe('who the offer is sealed to (npub or hex) — the Director'),
+        payload: z.record(z.unknown()).describe('the draft document (JSON object)'),
+        scope_name: z.string().optional().describe("grant scope name; defaults draft:post/<id8>; MUST start 'draft:'"),
+      },
+    },
+    async ({ grantee_npub, payload, scope_name }) => {
+      let grantee: string
+      try {
+        grantee = toHexPubkey(grantee_npub)
+      } catch (e) {
+        return jsonError({ code: 'NVOY_BAD_INPUT', message: String((e as Error).message) })
+      }
+      if (scope_name !== undefined && !scope_name.startsWith('draft:')) {
+        return jsonError({ code: 'NVOY_BAD_INPUT', message: `scope_name '${scope_name}' is outside the draft: namespace — this tool mints draft offers only` })
+      }
+      try {
+        const res = await ctx.drafts.publish(grantee, payload, scope_name)
+        return json({ d: res.scopeId, v: res.generation, scope_name: res.scopeName, granted_to: nip19.npubEncode(grantee) })
+      } catch (e) {
+        return jsonError({ code: 'NVOY_DRAFT_FAILED', message: String((e as Error).message) })
+      }
+    },
+  )
+
+  server.registerTool(
+    'nvoy_draft_withdraw',
+    {
+      title: 'Withdraw a draft offer',
+      description:
+        'Take a draft offer back: tombstone its scope (empty payload, a fresh key granted to no one, bumped generation + NIP-09), so the desk shows it withdrawn and nothing remains signable. Only offers minted THIS session are known; idempotent.',
+      inputSchema: {
+        d: z.string().describe('the scope id returned by nvoy_draft_publish'),
+      },
+    },
+    async ({ d }) => {
+      try {
+        const res = await ctx.drafts.withdraw(d)
+        if (!res) return jsonError({ code: 'NVOY_UNKNOWN_DRAFT', message: `no draft '${d}' was published this session` })
+        return json({ withdrawn: true, d: res.scopeId, v: res.generation })
+      } catch (e) {
+        return jsonError({ code: 'NVOY_DRAFT_FAILED', message: String((e as Error).message) })
       }
     },
   )

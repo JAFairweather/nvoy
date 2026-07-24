@@ -27,6 +27,7 @@ import { loadIdentity, loadRelays } from './identity.js'
 import { GrantStore } from './grants.js'
 import { ScopeCache } from './scopes.js'
 import { Outbox } from './outbox.js'
+import { DraftDesk } from './drafts.js'
 import { createNvoyServer, sweepAutoRelinquish, type NvoyContext, type NvoyServerHandle } from './app.js'
 
 const log = (...args: unknown[]) => console.error('[nvoy]', ...args)
@@ -43,6 +44,7 @@ const ctx: NvoyContext = {
   grantStore: new GrantStore(relay, identity.secretKey),
   scopeCache: new ScopeCache(relay),
   outbox: new Outbox(relay, identity),
+  drafts: new DraftDesk(relay, identity),
   transport: httpPort !== undefined ? 'http' : 'stdio',
   pollMs: Math.max(250, Number(process.env.NVOY_SUBSCRIBE_POLL_MS) || 15_000),
   log,
