@@ -83,8 +83,14 @@ export function renderDelegate() {
         actually receives. Edit it here — the box never sees what you type until you Issue, and only ever
         dereferences it live from the relay. Change it later by re-issuing; revoke by rotating the scope.</div>`
       : `<textarea id="dg-json" rows="12" spellcheck="false"
-        placeholder='scope payload JSON — pick a template or write your own, e.g. { "name": "…", "fields": { … } }'>${esc(draft.json)}</textarea>
-      <div class="jsonerr" id="dg-jsonerr"></div>`}
+        placeholder='scope payload JSON — pick a template, upload a file, or write your own, e.g. { "name": "…", "fields": { … } }'>${esc(draft.json)}</textarea>
+      <div class="jsonerr" id="dg-jsonerr"></div>
+      <div class="frow" style="margin-top:2px">
+        <label>upload</label>
+        <input type="file" id="dg-file" accept=".json,application/json" style="display:none">
+        <button class="tpl" id="dg-file-btn" type="button" title="load a scope payload from a .json file (e.g. a voice-profile scope)">📎 Load JSON file</button>
+        <span class="msg" id="dg-file-msg"></span>
+      </div>`}
 
       <div class="sect2">terms (§4 — honored by compliant runtimes, disclosed honestly as non-cryptographic)</div>
       <div class="frow">
@@ -170,6 +176,38 @@ export function renderDelegate() {
     } catch (err) { jsonErr.textContent = `✗ ${err.message}`; return null }
   }
   if ($('dg-json')) { $('dg-json').oninput = validate; validate() }
+
+  // Upload a scope payload from a .json file (e.g. a voice-profile scope) —
+  // read it locally, confirm it's a JSON object, drop it into the payload editor,
+  // and seed the scope name from a recognizable field if one is still empty. No
+  // network: the file never leaves the browser until you Issue.
+  if ($('dg-file-btn')) {
+    const finput = $('dg-file'), fmsg = $('dg-file-msg')
+    $('dg-file-btn').onclick = () => finput.click()
+    finput.onchange = () => {
+      const f = finput.files && finput.files[0]; finput.value = ''   // allow re-selecting the same file
+      if (!f) return
+      // The 30440 scope content is NIP-44 encrypted (64KB plaintext ceiling) —
+      // refuse an oversized payload here rather than fail cryptically at Issue.
+      if (f.size > 60000) { fmsg.textContent = `✗ ${Math.round(f.size / 1024)}KB — too large; a scope payload must fit ~60KB`; return }
+      const rd = new FileReader()
+      rd.onerror = () => { fmsg.textContent = '✗ could not read the file' }
+      rd.onload = () => {
+        let obj
+        try { obj = JSON.parse(String(rd.result || '')) }
+        catch (e) { fmsg.textContent = `✗ not valid JSON: ${e.message}`; return }
+        if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) { fmsg.textContent = '✗ payload must be a JSON object'; return }
+        draft.tpl = 'custom'
+        draft.json = JSON.stringify(obj, null, 2)
+        if ($('dg-json')) $('dg-json').value = draft.json
+        const guess = obj.name || obj.voice || obj.id
+        if (guess && !$('dg-name').value.trim()) { draft.name = String(guess); $('dg-name').value = draft.name }
+        validate()
+        fmsg.textContent = `✓ loaded ${f.name} (${(f.size / 1024).toFixed(1)}KB)`
+      }
+      rd.readAsText(f)
+    }
+  }
   if ($('dg-reveal')) $('dg-reveal').onclick = () => { pull(); draft.reveal = !draft.reveal; renderDelegate() }
   // Credential mode follows the NAME field live: typing `credential:…` swaps
   // the JSON editor for the masked value field (and back). Re-render only on
