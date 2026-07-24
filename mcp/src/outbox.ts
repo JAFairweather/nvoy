@@ -18,7 +18,7 @@ import {
   loadGrantIndex, saveGrantIndex, toIssuedEntry, fromIssuedEntry,
   type RelayLike,
 } from '../lib/nipxx.mjs'
-import type { Identity } from './identity.js'
+import { requireLocalKey, type Identity } from './identity.js'
 
 interface OutboxRecord {
   scopeId: string
@@ -54,7 +54,7 @@ export class Outbox {
       this.index = null
       return
     }
-    const index = (await loadGrantIndex(this.relay, this.identity.secretKey)) as Record<string, unknown>
+    const index = (await loadGrantIndex(this.relay, this.identity.signer)) as Record<string, unknown>
     this.index = index
     const map = (index.nvoy_outbox ?? {}) as Record<string, string>
     const issued = Array.isArray(index.issued) ? index.issued : []
@@ -80,7 +80,7 @@ export class Outbox {
     index.issued = issued
     index.nvoy_outbox = Object.fromEntries([...this.records].map(([delegator, r]) => [delegator, r.scopeId]))
     this.index = index
-    await saveGrantIndex(this.relay, this.identity.secretKey, index as { issued: unknown[]; received: unknown[] })
+    await saveGrantIndex(this.relay, this.identity.signer, index as { issued: unknown[]; received: unknown[] })
   }
 
   /** Grant the outbox scope back to the delegator (§6.5) — the standard 440
@@ -99,7 +99,7 @@ export class Outbox {
         nvoy: { nvoy: 1, purpose: 'agent output' },
       }),
     }
-    const wrap = wrapEvent(rumor, this.identity.secretKey, delegatorPub)
+    const wrap = wrapEvent(rumor, requireLocalKey(this.identity, 'outbox grant-back'), delegatorPub)
     await this.relay.publish(wrap)
   }
 
@@ -119,7 +119,7 @@ export class Outbox {
       rec = { scopeId: opaqueScopeId(), generation: 1, scopeKey: newScopeKey() }
       this.records.set(delegatorPub, rec)
     }
-    await publishScope(this.relay, this.identity.secretKey, {
+    await publishScope(this.relay, this.identity.signer, {
       scopeId: rec.scopeId, generation: rec.generation, scopeKey: rec.scopeKey, payload,
     })
     if (firstWrite) {

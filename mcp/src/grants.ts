@@ -10,8 +10,14 @@
 // nip59.unwrapEvent skips both checks, so it is NOT used). Supersession
 // (latestGrants) stays the vendored lib's.
 
-import { getPublicKey, nip19, nip44, verifyEvent } from 'nostr-tools'
-import { KIND_DATA_SET, KIND_GRANT, latestGrants, type RelayLike } from '../lib/nipxx.mjs'
+import { nip19, verifyEvent } from 'nostr-tools'
+// @ts-ignore — vendored .mjs, no types
+import { KIND_DATA_SET, KIND_GRANT, latestGrants, localSigner, type RelayLike } from '../lib/nipxx.mjs'
+import type { Signer } from './identity.js'
+
+/** Accept a raw key (back-compat) or a signer (nip46). Uint8Array → local. */
+type KeyOrSigner = Uint8Array | Signer
+const toSigner = (k: KeyOrSigner): Signer => (k instanceof Uint8Array ? (localSigner(k) as Signer) : k)
 import { parseTerms, termsStatus, type GrantStatus, type NvoyTerms } from './terms.js'
 
 /** Grant Revocation notice (NIP-DA optional courtesy rumor, gift-wrapped). */
@@ -64,17 +70,20 @@ const b64decode = (s: string) => Uint8Array.from(atob(s), c => c.charCodeAt(0))
  * rumors of the wanted kinds. Malformed or unauthenticated wraps are skipped,
  * never fatal — anyone can address a 1059 to us.
  */
-async function unwrapRumors(relay: RelayLike, secretKey: Uint8Array, kinds: number[]): Promise<any[]> {
-  const pub = getPublicKey(secretKey)
-  const conv = (pk: string) => nip44.v2.utils.getConversationKey(secretKey, pk)
+async function unwrapRumors(relay: RelayLike, key: KeyOrSigner, kinds: number[]): Promise<any[]> {
+  const signer = toSigner(key)
+  const pub = await signer.getPublicKey()
   const wraps = await relay.query({ kinds: [1059], '#p': [pub] })
 
   const rumors: any[] = []
   for (const wrap of wraps) {
     try {
-      const seal = JSON.parse(nip44.v2.decrypt(wrap.content, conv(wrap.pubkey)))
+      // Signer-driven unwrap: nip44Decrypt handles the conversation key (a raw
+      // key locally, a remote NIP-46 call under a bunker signer). Matches the
+      // nipxx giftUnwrap ceremony.
+      const seal = JSON.parse(await signer.nip44Decrypt(wrap.pubkey, wrap.content))
       if (seal.kind !== 13 || !verifyEvent(seal)) continue // unauthenticated seal
-      const rumor = JSON.parse(nip44.v2.decrypt(seal.content, conv(seal.pubkey)))
+      const rumor = JSON.parse(await signer.nip44Decrypt(seal.pubkey, seal.content))
       if (rumor.pubkey !== seal.pubkey) continue // sender impersonation
       if (kinds.includes(rumor.kind)) rumors.push(rumor)
     } catch {
@@ -85,8 +94,8 @@ async function unwrapRumors(relay: RelayLike, secretKey: Uint8Array, kinds: numb
 }
 
 /** Collect, authenticate, and parse all grants gift-wrapped to this key. */
-export async function receiveGrants(relay: RelayLike, secretKey: Uint8Array): Promise<HeldGrant[]> {
-  const rumors = await unwrapRumors(relay, secretKey, [KIND_GRANT])
+export async function receiveGrants(relay: RelayLike, key: KeyOrSigner): Promise<HeldGrant[]> {
+  const rumors = await unwrapRumors(relay, key, [KIND_GRANT])
   const grants: HeldGrant[] = []
   for (const rumor of rumors) {
     try {
@@ -121,12 +130,12 @@ export async function receiveGrants(relay: RelayLike, secretKey: Uint8Array): Pr
  */
 export async function findRevocationNotice(
   relay: RelayLike,
-  secretKey: Uint8Array,
+  key: KeyOrSigner,
   publisher: string,
   scopeId: string,
 ): Promise<{ content: unknown; noticed_at: number } | null> {
   const address = `${KIND_DATA_SET}:${publisher}:${scopeId}`
-  const rumors = await unwrapRumors(relay, secretKey, [KIND_REVOCATION])
+  const rumors = await unwrapRumors(relay, key, [KIND_REVOCATION])
   let best: { content: unknown; noticed_at: number } | null = null
   for (const rumor of rumors) {
     if (rumor.pubkey !== publisher) continue
@@ -175,14 +184,14 @@ export class GrantStore {
 
   constructor(
     private relay: RelayLike,
-    private secretKey: Uint8Array,
+    private key: KeyOrSigner,
     private ttlMs = 60_000,
   ) {}
 
   async list(opts: { maxAgeMs?: number } = {}): Promise<HeldGrant[]> {
     const maxAge = opts.maxAgeMs ?? this.ttlMs
     if (this.cache === null || Date.now() - this.fetchedAt > maxAge) {
-      this.cache = latestGrants(await receiveGrants(this.relay, this.secretKey))
+      this.cache = latestGrants(await receiveGrants(this.relay, this.key))
       this.fetchedAt = Date.now()
       for (const g of this.cache) this.applyRevocation(g)
     }

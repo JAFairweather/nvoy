@@ -18,7 +18,7 @@ import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mc
 import { z } from 'zod'
 import { nip19 } from 'nostr-tools'
 import { KIND_DATA_SET, type RelayLike } from '../lib/nipxx.mjs'
-import type { Identity } from './identity.js'
+import { requireLocalKey, type Identity } from './identity.js'
 import { GrantStore, findRevocationNotice, grantStatus, toHexPubkey, type HeldGrant } from './grants.js'
 import { ScopeCache } from './scopes.js'
 import { Outbox } from './outbox.js'
@@ -90,7 +90,7 @@ const eventGeneration = (ev: { tags: string[][] } | undefined) =>
  * cached plaintext.
  */
 export async function detectRevocation(ctx: NvoyContext, g: HeldGrant) {
-  const found = await findRevocationNotice(ctx.relay, ctx.identity.secretKey, g.publisher, g.scopeId).catch(() => null)
+  const found = await findRevocationNotice(ctx.relay, ctx.identity.signer, g.publisher, g.scopeId).catch(() => null)
   const record = ctx.grantStore.markRevoked(g.publisher, g.scopeId, g.generation, found?.content ?? null)
   ctx.scopeCache.zeroize(g.publisher, g.scopeId)
   ctx.log(`grant revoked-detected: scope ${g.scopeId} (v${g.generation} superseded) — key + cache zeroized`)
@@ -117,7 +117,7 @@ export async function relinquishGrant(
     if (g.terms?.contact) {
       try { recipient = toHexPubkey(g.terms.contact) } catch { /* malformed contact → publisher */ }
     }
-    await sendRelinquishNotice(ctx.relay, ctx.identity.secretKey, recipient, {
+    await sendRelinquishNotice(ctx.relay, requireLocalKey(ctx.identity, 'grant relinquish notice'), recipient, {
       publisher: g.publisher, scopeId: g.scopeId, reason, destroyed_at,
     })
     notice_sent = true
@@ -273,7 +273,7 @@ export function createNvoyServer(ctx: NvoyContext): NvoyServerHandle {
         // 'missing' is ambiguous: scope deleted (NIP-09 after tombstone) or
         // relay flake. A 441 notice disambiguates to revocation; otherwise
         // stay honest with UNAVAILABLE.
-        const found = await findRevocationNotice(ctx.relay, ctx.identity.secretKey, grant.publisher, d).catch(() => null)
+        const found = await findRevocationNotice(ctx.relay, ctx.identity.signer, grant.publisher, d).catch(() => null)
         if (found) {
           const record = await detectRevocation(ctx, grant)
           return revokedError(grant, record.notice)
@@ -484,7 +484,7 @@ export function createNvoyServer(ctx: NvoyContext): NvoyServerHandle {
       }
       if (!purpose.trim()) return jsonError({ code: 'NVOY_BAD_INPUT', message: 'purpose is required — it is the contract line the delegator grants under' })
       try {
-        await sendAccessRequest(ctx.relay, ctx.identity.secretKey, target, purpose.trim())
+        await sendAccessRequest(ctx.relay, requireLocalKey(ctx.identity, 'access request'), target, purpose.trim())
       } catch (e) {
         return jsonError({ code: 'NVOY_REQUEST_FAILED', message: String((e as Error).message) })
       }
