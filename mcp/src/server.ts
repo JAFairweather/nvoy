@@ -41,7 +41,7 @@ const ctx: NvoyContext = {
   identity,
   relays,
   relay,
-  grantStore: new GrantStore(relay, identity.secretKey),
+  grantStore: new GrantStore(relay, identity.signer),
   scopeCache: new ScopeCache(relay),
   outbox: new Outbox(relay, identity),
   drafts: new DraftDesk(relay, identity),

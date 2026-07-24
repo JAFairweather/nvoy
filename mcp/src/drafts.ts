@@ -49,8 +49,8 @@ export class DraftDesk {
     const name = scopeName ?? `draft:post/${scopeId.slice(0, 8)}`
     if (!name.startsWith('draft:')) throw new Error(`scope_name '${name}' is outside the draft: namespace — this desk mints draft offers only`)
     const scopeKey = newScopeKey()
-    await publishScope(this.relay, this.identity.secretKey, { scopeId, generation: 1, scopeKey, payload })
-    await grant(this.relay, this.identity.secretKey, granteePubkey, { scopeId, generation: 1, scopeKey, scopeName: name })
+    await publishScope(this.relay, this.identity.signer, { scopeId, generation: 1, scopeKey, payload })
+    await grant(this.relay, this.identity.signer, granteePubkey, { scopeId, generation: 1, scopeKey, scopeName: name })
     this.records.set(scopeId, { generation: 1, grantee: granteePubkey })
     return { scopeId, generation: 1, scopeName: name }
   }
@@ -66,7 +66,7 @@ export class DraftDesk {
     const rec = this.records.get(scopeId)
     if (!rec) return null
     if (rec.generation > 1) return { scopeId, generation: rec.generation }   // already tombstoned
-    await publishScope(this.relay, this.identity.secretKey,
+    await publishScope(this.relay, this.identity.signer,
       { scopeId, generation: rec.generation + 1, scopeKey: newScopeKey(), payload: {} })
     rec.generation += 1
     return { scopeId, generation: rec.generation }
