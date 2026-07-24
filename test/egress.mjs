@@ -63,6 +63,10 @@ const NETWORK = new Set([
   'https://esm.sh',                                                  // pinned modules (console)
 ])
 const LINK_ONLY = new Set(['https://github.com'])   // <a href> / alpha banner in HTML only
+// The family-nav footer: first-party links to the hub + sibling apps. Link-only
+// and HTML-only, same discipline as LINK_ONLY — one of these origins showing up
+// in a .mjs or as a fetch target must still fail the scan (#26).
+const FIRST_PARTY = (host) => host === 'nave.pub' || host.endsWith('.nave.pub')
 const NAMESPACE = new Set(['http://www.w3.org'])    // svg xmlns in the favicon, never fetched
 const DEV_ONLY = new Set(['http://localhost:4443', 'http://x'])  // console/serve.mjs
 const RESERVED = (host) => host === 'example.com' || host.endsWith('.example')
@@ -91,6 +95,7 @@ function scan(files, { allowServerTemplates = false } = {}) {
       if (NETWORK.has(origin)) continue
       if (RESERVED(host)) continue
       if (LINK_ONLY.has(origin) && rel.endsWith('.html') && src.includes(`href="${origin}`)) continue
+      if (FIRST_PARTY(host) && rel.endsWith('.html') && src.includes(`href="${origin}`)) continue
       if (NAMESPACE.has(origin) && src.includes(`xmlns='${origin}`)) continue
       if (DEV_ONLY.has(origin) && rel.endsWith('serve.mjs')) continue
       offenders.push(`${rel}: ${raw}`)
