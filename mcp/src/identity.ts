@@ -23,10 +23,10 @@
 // under a remote signer (a drafter reads grants + emits drafts; it does not
 // issue). See requireLocalKey().
 
+import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { generateSecretKey, getPublicKey, nip19 } from 'nostr-tools'
+import { finalizeEvent, generateSecretKey, getPublicKey, nip19, nip44 } from 'nostr-tools'
 import { decrypt as nip49Decrypt } from 'nostr-tools/nip49'
-import { BunkerSigner } from 'nostr-tools/nip46'
 import { SimplePool } from 'nostr-tools/pool'
 // The nipxx local-signer wrapper is the shared contract for the local path.
 // @ts-ignore — vendored .mjs, no types
@@ -76,23 +76,75 @@ export function requireLocalKey(identity: Identity, op: string): Uint8Array {
 
 /** Build the remote (NIP-46) signer from a bunker URI. The identity pubkey is
  *  the URI host (read synchronously, so loadIdentity stays sync); the
- *  BunkerSigner is built + connected lazily on first sign/encrypt (fromURI is
- *  async). A fresh client key is the NIP-46 TRANSPORT key (not the signing
- *  identity) — throwaway per boot. */
+ *  connection is made lazily on first RPC.
+ *
+ *  Hand-rolled NIP-46 client (2026-07-24, replacing BunkerSigner) — three
+ *  wire-proven incompatibilities with Bunker46 (see luke#27 for the debug):
+ *    1. the transport key must be STABLE (NVOY_NIP46_CLIENT_NSEC): the bunker
+ *       binds the connection to the client pubkey, so a throwaway-per-boot key
+ *       looks like a stranger with an expired invite and hangs forever;
+ *    2. Bunker46 answers in nip44; nostr-tools' BunkerSigner listens in nip04
+ *       and never hears the replies;
+ *    3. this nostr-tools subscribeMany takes a SINGLE filter object — an
+ *       array of filters silently matches nothing. */
 const BUNKER_PUBKEY = /^bunker:\/\/([0-9a-f]{64})/i
-function makeNip46(bunkerUri: string): { signer: Signer; pubkey: string } {
+function makeNip46(bunkerUri: string, env: NodeJS.ProcessEnv = process.env): { signer: Signer; pubkey: string } {
   const m = BUNKER_PUBKEY.exec(bunkerUri.trim())
   if (!m) throw new Error('NVOY_BUNKER_URI is not a valid bunker://<64-hex-pubkey>?… connection string')
   const pubkey = m[1].toLowerCase()
+  const uri = new URL(bunkerUri.trim())
+  const relays = [...new Set(uri.searchParams.getAll('relay'))]
+  if (!relays.length) throw new Error('NVOY_BUNKER_URI carries no ?relay= — the signer would have nowhere to listen')
+  const secret = uri.searchParams.get('secret') ?? ''
+  const clientKey = env.NVOY_NIP46_CLIENT_NSEC ? decodeNsec(env.NVOY_NIP46_CLIENT_NSEC) : generateSecretKey()
+  const clientPk = getPublicKey(clientKey)
+  const convKey = nip44.v2.utils.getConversationKey(clientKey, pubkey)
   const pool = new SimplePool()
-  const clientKey = generateSecretKey() // transport key — not the signing identity
-  let bunkerP: Promise<any> | null = null
-  const ensure = () => (bunkerP ??= BunkerSigner.fromURI(clientKey, bunkerUri, { pool }))
+  const pending = new Map<string, { resolve: (v: string) => void; reject: (e: Error) => void }>()
+  let subbed = false
+  let connectedP: Promise<string> | null = null
+  const ensureSub = () => {
+    if (subbed) return
+    subbed = true
+    // single filter object, NOT an array — see note above
+    pool.subscribeMany(relays, { kinds: [24133], authors: [pubkey], '#p': [clientPk] }, {
+      onevent(e) {
+        try {
+          const msg = JSON.parse(nip44.v2.decrypt(e.content, convKey))
+          const p = pending.get(msg.id)
+          if (!p) return
+          pending.delete(msg.id)
+          if (msg.error) p.reject(new Error(`bunker: ${msg.error}`))
+          else p.resolve(msg.result)
+        } catch { /* not addressed to this session */ }
+      },
+    })
+  }
+  const rpc = (method: string, params: string[], timeoutMs = 60_000) =>
+    new Promise<string>((resolve, reject) => {
+      ensureSub()
+      const id = randomUUID()
+      pending.set(id, { resolve, reject })
+      const ev = finalizeEvent({
+        kind: 24133,
+        created_at: Math.floor(Date.now() / 1000),
+        tags: [['p', pubkey]],
+        content: nip44.v2.encrypt(JSON.stringify({ id, method, params }), convKey),
+      }, clientKey)
+      void Promise.allSettled(pool.publish(relays, ev))
+      setTimeout(() => {
+        if (pending.delete(id)) reject(new Error(`nip46 ${method} timed out after ${timeoutMs}ms`))
+      }, timeoutMs)
+    })
+  // connect is best-effort: a fresh pairing needs it (the URI secret
+  // auto-creates the connection), an established one answers RPCs without it —
+  // a stale secret must never block an ACTIVE pairing.
+  const ready = () => (connectedP ??= rpc('connect', [pubkey, secret], 15_000).catch(() => 'ack'))
   const signer: Signer = {
-    getPublicKey: async () => (await ensure()).getPublicKey(),
-    signEvent: async (event) => (await ensure()).signEvent(event),
-    nip44Encrypt: async (pk, pt) => (await ensure()).nip44Encrypt(pk, pt),
-    nip44Decrypt: async (pk, ct) => (await ensure()).nip44Decrypt(pk, ct),
+    getPublicKey: async () => { await ready(); return rpc('get_public_key', []) },
+    signEvent: async (event) => { await ready(); return JSON.parse(await rpc('sign_event', [JSON.stringify(event)])) },
+    nip44Encrypt: async (pk, pt) => { await ready(); return rpc('nip44_encrypt', [pk, pt]) },
+    nip44Decrypt: async (pk, ct) => { await ready(); return rpc('nip44_decrypt', [pk, ct]) },
   }
   return { signer, pubkey }
 }
@@ -107,7 +159,7 @@ export function loadIdentity(
     (!!env.NVOY_BUNKER_URI && !env.NVOY_NSEC && !env.NVOY_NCRYPTSEC_FILE && !argv.includes('--ephemeral'))
   if (wantsNip46) {
     if (!env.NVOY_BUNKER_URI) throw new Error('NVOY_SIGNER=nip46 requires NVOY_BUNKER_URI (bunker://…)')
-    const { signer, pubkey } = makeNip46(env.NVOY_BUNKER_URI)
+    const { signer, pubkey } = makeNip46(env.NVOY_BUNKER_URI, env)
     return { signer, pubkey, npub: nip19.npubEncode(pubkey), source: 'nip46' }
   }
 
