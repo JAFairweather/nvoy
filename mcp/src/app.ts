@@ -23,6 +23,7 @@ import { GrantStore, findRevocationNotice, grantStatus, toHexPubkey, type HeldGr
 import { ScopeCache } from './scopes.js'
 import { Outbox } from './outbox.js'
 import { sendAccessRequest, sendRelinquishNotice } from './notices.js'
+import { registerChatTools } from './chat.js'
 
 export interface NvoyContext {
   identity: Identity
@@ -539,6 +540,9 @@ export function createNvoyServer(ctx: NvoyContext): NvoyServerHandle {
       }
     },
   )
+
+  // Conversation surface (chat.ts): public kind:1 + sealed NIP-17 DMs.
+  registerChatTools(server, ctx)
 
   return { server, cleanup }
 }

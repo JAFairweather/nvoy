@@ -16,6 +16,17 @@ The pitch in one line: **OAuth secures what your agent can *do*; Nvoy secures
 what your agent can *see* — and lets you un-see it.** Revocation is a scope-key
 rotation, not a token expiry: the agent's next read simply fails to decrypt.
 
+## Conversation tools (chat module)
+
+Alongside the data plane, the agent has a mouth — four tools mirroring nostr's
+own public/sealed split: `nvoy_chat_post` / `nvoy_chat_read` (public kind:1,
+with NIP-10 threading) and `nvoy_dm_send` / `nvoy_dm_read` (NIP-17 gift-wrapped
+DMs — sealed to the recipient plus a self-copy; only kind-14 chat rumors are
+returned by dm_read, so data-grant wraps never bleed into conversation). Same
+custody discipline as everything else: the agent's own key signs and unwraps
+in-process, nothing touches disk, and read content is flagged untrusted in the
+tool descriptions the model actually sees.
+
 ## Install
 
 This package is **not published to the npm registry** (it depends on a draft
