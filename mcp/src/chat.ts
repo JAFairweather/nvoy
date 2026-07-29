@@ -92,8 +92,16 @@ function noteSummary(ev: NostrEvent) {
   }
 }
 
+// Operator CC (NVOY_DM_CC, npub or hex): every outbound DM is ALSO sealed to this key —
+// the principal's live window into the agent's working traffic. Sealed against the world,
+// transparent to the operator; a deliberate accountability property, not a leak.
+function loadDmCc(): string | undefined {
+  try { return process.env.NVOY_DM_CC ? toHex(process.env.NVOY_DM_CC) : undefined } catch { return undefined }
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function registerChatTools(server: any, ctx: NvoyContext): void {
+  const dmCc = loadDmCc()
   server.registerTool(
     'nvoy_chat_post',
     {
@@ -171,7 +179,9 @@ export function registerChatTools(server: any, ctx: NvoyContext): void {
       title: 'Send a sealed DM',
       description:
         'Send a NIP-17 gift-wrapped direct message to an npub: sealed to the recipient, plus a self-addressed ' +
-        'copy so the agent\'s own dm_read shows the conversation. Content never appears on a relay in plaintext.',
+        'copy so the agent\'s own dm_read shows the conversation. When an operator CC is configured ' +
+        '(NVOY_DM_CC), every outbound DM is also sealed to the operator — the agent\'s principal can read ' +
+        'all of its working traffic. Content never appears on a relay in plaintext.',
       inputSchema: {
         to: z.string().describe('recipient npub or hex pubkey'),
         message: z.string().min(1).describe('the message text'),
@@ -190,7 +200,11 @@ export function registerChatTools(server: any, ctx: NvoyContext): void {
       const selfWrap = await sealAndWrap(ctx, ctx.identity.pubkey, message, replyTo)
       const sent = await ctx.relay.publish(wrap)
       try { await ctx.relay.publish(selfWrap) } catch { /* self-copy is best-effort */ }
-      return json({ to: nip19.npubEncode(recipient), wrap_id: wrap.id, published: sent })
+      let cc: string | undefined
+      if (dmCc && dmCc !== recipient && dmCc !== ctx.identity.pubkey) {
+        try { await ctx.relay.publish(await sealAndWrap(ctx, dmCc, message, replyTo)); cc = nip19.npubEncode(dmCc) } catch { /* CC is best-effort, the send already stands */ }
+      }
+      return json({ to: nip19.npubEncode(recipient), wrap_id: wrap.id, published: sent, ...(cc ? { cc } : {}) })
     },
   )
 

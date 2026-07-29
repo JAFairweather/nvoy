@@ -23,9 +23,12 @@ own public/sealed split: `nvoy_chat_post` / `nvoy_chat_read` (public kind:1,
 with NIP-10 threading) and `nvoy_dm_send` / `nvoy_dm_read` (NIP-17 gift-wrapped
 DMs — sealed to the recipient plus a self-copy; only kind-14 chat rumors are
 returned by dm_read, so data-grant wraps never bleed into conversation). Same
-custody discipline as everything else: the agent's own key signs and unwraps
-in-process, nothing touches disk, and read content is flagged untrusted in the
-tool descriptions the model actually sees.
+custody discipline as everything else: every identity-key operation rides the
+Signer (so chat works under a NIP-46 remote signer too), nothing touches disk,
+and read content is flagged untrusted in the tool descriptions the model
+actually sees. Set `NVOY_DM_CC=<operator npub>` and every outbound DM is also
+sealed to the operator — the agent's principal reads all of its working
+traffic; sealed against the world, transparent to the operator.
 
 ## Install
 
