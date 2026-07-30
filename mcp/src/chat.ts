@@ -229,15 +229,20 @@ export function registerChatTools(server: any, ctx: NvoyContext): void {
       } catch (e) {
         return jsonError({ code: 'NVOY_BAD_INPUT', message: String((e as Error).message) })
       }
+      // NIP-59 backdates WRAP timestamps up to ~48h, so the relay-side window is always
+      // widened by 48h; since_seconds filters on the RUMOR's real timestamp below. A narrow
+      // window can therefore never silently miss fresh mail (learned the hard way, once).
+      const sinceRumor = Math.floor(Date.now() / 1000) - (since_seconds ?? 172800)
       const wraps: NostrEvent[] = await ctx.relay.query({
         kinds: [1059],
         '#p': [ctx.identity.pubkey],
-        since: Math.floor(Date.now() / 1000) - (since_seconds ?? 172800),
+        since: sinceRumor - 172800,
       })
       const messages = []
       for (const wrap of wraps) {
         const rumor = await openWrap(ctx, wrap)
         if (!rumor) continue // not a chat rumor for us (e.g. a grant wrap)
+        if (rumor.created_at < sinceRumor) continue
         if (fromHex && rumor.pubkey !== fromHex) continue
         messages.push({
           from: nip19.npubEncode(rumor.pubkey),
