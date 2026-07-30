@@ -36,6 +36,15 @@ import * as nip44 from 'nostr-tools/nip44'
 
 const arg = (n, d) => { const i = process.argv.indexOf(n); return i === -1 ? d : process.argv[i + 1] }
 const DRY = process.argv.includes('--dry-run')
+// --queue: do the durable half only. Watch, verify, dedup, and RECORD that something arrived —
+// but do not try to start a session. That split exists because the two halves have different
+// requirements: detection needs a host that is always on, while acting needs a host that can
+// run an agent. Conflating them is why detection used to stop whenever a laptop slept.
+//
+// Queued, a granted arrival is never missed no matter what is awake. Whatever can act drains
+// the queue when it next exists, instead of rediscovering history.
+const QUEUE_ONLY = process.argv.includes('--queue')
+const QUEUE_PATH = arg('--queue-path', resolveQueue())
 const COOLDOWN = Number(arg('--cooldown', 90)) * 1000   // never wake more often than this
 const SETTLE = 4000                                      // coalesce a burst into one wake
 
@@ -79,6 +88,7 @@ const markSeen = (id) => {
   return true
 }
 
+function resolveQueue() { return process.env.WAKE_QUEUE_PATH || resolve(homedir(), '.nvoy', 'wake-queue.jsonl') }
 const LOG = resolve(homedir(), '.nvoy', 'wake-watcher.log')
 const say = (m) => {
   const line = `${new Date().toISOString()} ${m}`
@@ -115,6 +125,26 @@ function applyGrantEvent(ev) {
   permitted.set(grantee, ev.id)
 }
 
+// --- policy readiness, globally ------------------------------------------------------------
+// A grant may exist on one relay and not another — the policy is the UNION, so "policy is
+// loaded" is a fact about the relay SET, not about any single socket. Draining a held arrival
+// when one relay finishes means judging it against whatever fragment that relay happened to
+// hold, which is how a granted sender gets ignored for lacking a grant that simply had not
+// arrived yet. Held arrivals are therefore global, and released once the set has settled.
+let policyReady = false
+let policyDone = 0
+const heldGlobal = []
+function drainGlobal(why) {
+  if (policyReady) return
+  policyReady = true
+  if (heldGlobal.length) say(`policy settled (${why}) — evaluating ${heldGlobal.length} held arrival(s) against ${permitted.size} grant(s)`)
+  for (const fn of heldGlobal.splice(0)) fn()
+}
+function notePolicyRelay(host) {
+  policyDone++
+  if (policyDone >= RELAYS.length) drainGlobal(`all ${RELAYS.length} relays reported`)
+}
+
 // --- the wake itself --------------------------------------------------------------------------
 let lastWake = 0, settleTimer = null, pending = 0, running = false
 
@@ -147,6 +177,17 @@ function wake(reason) {
   if (now - lastWake < COOLDOWN) { say(`wake suppressed — cooldown ${Math.round((COOLDOWN - (now - lastWake)) / 1000)}s remaining (${reason})`); return }
   lastWake = now
   if (DRY) { say(`WOULD WAKE (${reason}) — dry run, no session started`); return }
+  if (QUEUE_ONLY) {
+    // Record only WHO and WHEN. The content-free rule holds here for the same reason it holds
+    // for a prompt: a queue entry that carried message text would be instructions waiting to be
+    // read by whatever drains it.
+    try {
+      mkdirSync(dirname(QUEUE_PATH), { recursive: true })
+      appendFileSync(QUEUE_PATH, JSON.stringify({ at: Math.floor(Date.now() / 1000), reason }) + '\n')
+      say(`queued (${reason}) — no session started here; whatever can act will drain it`)
+    } catch (e) { say(`QUEUE WRITE FAILED (${reason}): ${e.message}`) }
+    return
+  }
   running = true
   say(`waking a session (${reason})`)
   // The prompt goes on stdin, not argv: argv is world-readable, and this keeps the invocation
@@ -173,23 +214,42 @@ function nudge(reason) {
 
 // --- the subscriptions. Open, and kept open. ----------------------------------------------------
 function connect(url) {
-  let ws, alive = false, lastHeard = 0, watchdog = null
   const host = new URL(url).host
+  let ws, alive = false, lastHeard = 0, watchdog = null
+  // Mail and policy arrive on the same socket and the relay chooses the order. On a cold connect
+  // the backfill can deliver a wrap BEFORE the grants that authorise it — so evaluating at once
+  // means judging a legitimate sender against an empty policy and silently discarding a wake.
+  // Failing closed is right; failing closed because the answer has not arrived yet is a dropped
+  // message wearing a security argument. So arrivals are held until this relay has finished
+  // sending policy, then evaluated.
+  // Learn only WHO sent this, never what it says. The content is read later, by the session,
+  // through the gated path — see the rule at the top of this file.
+  const evaluateWrap = (ev) => {
+    if (!markSeen(ev.id)) return              // dedup before any decrypt work
+    let sender = null
+    try {
+      const seal = JSON.parse(nip44.decrypt(ev.content, nip44.getConversationKey(sk, ev.pubkey)))
+      if (seal.kind === 13) sender = seal.pubkey
+    } catch { return }                        // not addressed to me in a form I can open
+    if (!sender || sender === ME) return      // my own outbound copies land here too
+    if (!permitted.has(sender)) { say(`ignored — ${npubEncode(sender).slice(0, 12)}… holds no grant, so it cannot make me run`); return }
+    nudge(`mail from ${npubEncode(sender).slice(0, 12)}…`)
+  }
+
   const open = () => {
     try { ws = new WebSocket(url) } catch { return setTimeout(open, 10000) }
     ws.on('open', () => {
       alive = true; lastHeard = Date.now()
       say(`[${host}] connected`)
-      // BACKFILL, not live-only. See the note above: a reconnect that asks for `since: now`
-      // drops anything backdated into the gap, which is most of what a gap contains.
+      // BACKFILL, not live-only: a reconnect asking for `since: now` drops anything backdated
+      // into the gap, which is most of what a gap contains.
       const since = Math.floor(Date.now() / 1000) - BACKDATE_WINDOW - OVERLAP
       ws.send(JSON.stringify(['REQ', 'wake', { kinds: [1059], '#p': [ME], since }]))
       ws.send(JSON.stringify(['REQ', 'pol', { kinds: [440, 441], authors: GRANTORS, limit: 300 }]))
-      // Liveness watchdog. A socket that dies WITHOUT a close frame is invisible: the watcher
-      // believes it is connected and receives nothing, forever. That silent stall is far more
-      // dangerous than the noisy disconnects — a relay closing cleanly every ten minutes
-      // triggers reconnect and backfill and is therefore harmless. Force a reconnect if a relay
-      // has said nothing at all for long enough that silence has stopped being plausible.
+      // A relay that never EOSEs must not hold arrivals forever; proceed with what we have.
+      setTimeout(() => drainGlobal('grace period'), 10000)
+      // A socket that dies WITHOUT a close frame is invisible — the watcher believes it is
+      // connected and receives nothing, forever. Silence past 15m is treated as that stall.
       clearInterval(watchdog)
       watchdog = setInterval(() => {
         if (Date.now() - lastHeard > 15 * 60 * 1000) {
@@ -201,35 +261,29 @@ function connect(url) {
     ws.on('message', (d) => {
       lastHeard = Date.now()
       let m; try { m = JSON.parse(d.toString()) } catch { return }
+      if (m[0] === 'EOSE') { if (m[1] === 'pol') notePolicyRelay(host); return }
       if (m[0] !== 'EVENT') return
       const ev = m[2]
       if (!ev) return
       if (ev.kind === 440 || ev.kind === 441) return applyGrantEvent(ev)
       if (ev.kind !== 1059) return
-      // Dedup FIRST — before any decryption. Backfill re-delivers everything inside the 48h
-      // window on every reconnect, so without this the completeness fix would become a wake
-      // storm. It also blunts replay: a wrap id seen once never wakes anything again.
-      if (!markSeen(ev.id)) return
-      // Unwrap only far enough to learn WHO sent it. The content is not read, not logged, and
-      // not passed anywhere — the session will read it through the gated path.
-      let sender = null
-      try {
-        const seal = JSON.parse(nip44.decrypt(ev.content, nip44.getConversationKey(sk, ev.pubkey)))
-        if (seal.kind === 13) sender = seal.pubkey
-      } catch { return }  // not addressed to me in a form I can open
-      if (!sender) return
-      // My own outbound copies land here too (every DM is sealed to me as well). Skipping them
-      // explicitly keeps the log honest: they are not un-granted strangers, they are me.
-      if (sender === ME) return
-      if (!permitted.has(sender)) { say(`ignored — ${npubEncode(sender).slice(0, 12)}… holds no grant, so it cannot make me run`); return }
-      nudge(`mail from ${npubEncode(sender).slice(0, 12)}…`)
+      if (!policyReady) {
+        if (heldGlobal.length < 500) heldGlobal.push(() => evaluateWrap(ev))
+        else drainGlobal('buffer full')
+        return
+      }
+      evaluateWrap(ev)
     })
-    ws.on('close', () => { clearInterval(watchdog); if (alive) say(`[${host}] closed, reconnecting in 5s — the reconnect backfills, so the gap is covered`); alive = false; setTimeout(open, 5000) })
+    ws.on('close', () => {
+      clearInterval(watchdog)
+      if (alive) say(`[${host}] closed, reconnecting in 5s — the reconnect backfills, so the gap is covered`)
+      alive = false; setTimeout(open, 5000)
+    })
     ws.on('error', () => { try { ws.close() } catch { /* */ } })
   }
   open()
 }
 
-say(`wake-watcher up as ${npubEncode(ME).slice(0, 14)}…  · ${RELAYS.length} relays · cooldown ${COOLDOWN / 1000}s${DRY ? ' · DRY RUN' : ''}`)
+say(`wake-watcher up as ${npubEncode(ME).slice(0, 14)}…  · ${RELAYS.length} relays · cooldown ${COOLDOWN / 1000}s${DRY ? ' · DRY RUN' : ''}${QUEUE_ONLY ? ` · QUEUE ONLY -> ${QUEUE_PATH}` : ''}`)
 say('waiting for mail. A poll asks every N minutes whether anything happened; this is told.')
 for (const url of RELAYS) connect(url)
