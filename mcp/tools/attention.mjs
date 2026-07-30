@@ -76,7 +76,14 @@ const WATERMARK = resolve(homedir(), '.nvoy', 'attention-watermark')
 const onlyNew = process.argv.includes('--new')
 let mark = 0
 try { mark = Number(readFileSync(WATERMARK, 'utf8').trim()) || 0 } catch { mark = 0 }
-if (onlyNew && mark) since = Math.max(since, mark)
+// `mark + 1`, not `mark`: a nostr `since` is INCLUSIVE, and --mark records the timestamp OF the
+// newest message surfaced. Using it directly means that message matches again on the next run,
+// and every run after — so --new keeps returning exit 10 (actionable) forever after a clean
+// drain, and the wake it feeds never goes quiet. An alarm that always fires fails the same way
+// as one that never does. Observed live: #39 was drained, acted on and closed, and its message
+// still came back ACTIONABLE. Timestamps are whole seconds, so the only cost is a message
+// sharing the exact second of the last one handled.
+if (onlyNew && mark) since = Math.max(since, mark + 1)
 
 // One relay query. Reports whether it actually answered — a refusal is not an absence, and a
 // completeness claim built on a silent failure is void.
