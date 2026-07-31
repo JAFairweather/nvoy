@@ -31,7 +31,7 @@ import { homedir } from 'node:os'
 import { resolve, dirname } from 'node:path'
 import { createHash } from 'node:crypto'
 import { decode, npubEncode } from 'nostr-tools/nip19'
-import { getPublicKey, verifyEvent } from 'nostr-tools/pure'
+import { getPublicKey, verifyEvent, finalizeEvent, generateSecretKey } from 'nostr-tools/pure'
 import * as nip44 from 'nostr-tools/nip44'
 
 const arg = (n, d) => { const i = process.argv.indexOf(n); return i === -1 ? d : process.argv[i + 1] }
@@ -51,6 +51,19 @@ const SETTLE = 4000                                      // coalesce a burst int
 const raw = process.env.NVOY_NSEC || (() => { console.error('wake-watcher: set NVOY_NSEC'); process.exit(1) })()
 const sk = raw.startsWith('nsec1') ? decode(raw).data : Uint8Array.from(Buffer.from(raw, 'hex'))
 const ME = getPublicKey(sk)
+
+// --notify <npub|hex> (or WAKE_NOTIFY): who to tell, out of band, that a wake happened.
+// Optional on purpose — a watcher with no recipient still queues, exactly as before.
+const NOTIFY = (() => {
+  const v = arg('--notify', process.env.WAKE_NOTIFY || '')
+  if (!v) return null
+  try { return v.startsWith('npub1') ? decode(v).data : (/^[0-9a-f]{64}$/i.test(v) ? v.toLowerCase() : null) }
+  catch { return null }
+})()
+if (arg('--notify', process.env.WAKE_NOTIFY || '') && !NOTIFY) {
+  console.error('wake-watcher: --notify is not a valid npub or 64-hex key — refusing to start rather than run with delivery silently off')
+  process.exit(1)
+}
 const GRANTORS = String(process.env.GRANTORS || '4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b287ea84d')
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
 
@@ -175,6 +188,46 @@ function wake(reason) {
   const now = Date.now()
   if (running) { say(`wake suppressed — a session is still running (${reason})`); return }
   if (now - lastWake < COOLDOWN) { say(`wake suppressed — cooldown ${Math.round((COOLDOWN - (now - lastWake)) / 1000)}s remaining (${reason})`); return }
+// --- Delivery. Detection without delivery is a diary, not a wake.
+//
+// The queue is a FILE. When the watcher runs on an always-on host and the thing that can act
+// runs somewhere else, that file never crosses and nothing is ever woken — which is exactly what
+// happened here (waggle#106). So a wake can also be pushed out as a sealed DM.
+//
+// CONTENT-FREE, for the same reason the queue entry and the prompt are: this notice is delivered
+// to whoever holds the recipient key, and text carried here would be instructions arriving from
+// an inbox we do not control. It says THAT someone wrote. Never what, never who wrote it, never
+// a summary. A recipient who wants detail must go and read the inbox deliberately.
+async function sendNotice(reason) {
+  if (!NOTIFY) return
+  try {
+    const to = NOTIFY
+    const body = 'A granted sender wrote to this agent. Nothing about the message is carried here — read the inbox to see it.'
+    const backdated = () => Math.floor(Date.now() / 1000 - Math.random() * BACKDATE_WINDOW)
+    const rumor = { kind: 14, pubkey: ME, created_at: Math.floor(Date.now() / 1000), tags: [['p', to]], content: body }
+    const seal = finalizeEvent({ kind: 13, created_at: backdated(), tags: [],
+      content: nip44.encrypt(JSON.stringify(rumor), nip44.getConversationKey(sk, to)) }, sk)
+    const wsk = generateSecretKey()
+    const wrap = finalizeEvent({ kind: 1059, created_at: backdated(), tags: [['p', to]],
+      content: nip44.encrypt(JSON.stringify(seal), nip44.getConversationKey(wsk, to)) }, wsk)
+    let ok = 0
+    await Promise.all(RELAYS.map(url => new Promise(res => {
+      let ws
+      try { ws = new WebSocket(url) } catch { return res() }
+      const done = setTimeout(() => { try { ws.close() } catch {} ; res() }, 6000)
+      ws.on('open', () => ws.send(JSON.stringify(['EVENT', wrap])))
+      ws.on('message', () => { ok++; clearTimeout(done); try { ws.close() } catch {} ; res() })
+      ws.on('error', () => { clearTimeout(done); res() })
+    })))
+    // Say it either way. A notice that silently failed to send is the same failure this whole
+    // file exists to prevent, one layer up.
+    say(ok ? `notice sent to ${npubEncode(to).slice(0, 12)}… (${ok}/${RELAYS.length} relays)`
+           : `NOTICE FAILED — no relay accepted it (${reason}); the wake was recorded but nobody was told`)
+  } catch (e) {
+    say(`NOTICE FAILED (${reason}): ${e.message}`)
+  }
+}
+
   lastWake = now
   if (DRY) { say(`WOULD WAKE (${reason}) — dry run, no session started`); return }
   if (QUEUE_ONLY) {
@@ -185,6 +238,9 @@ function wake(reason) {
       mkdirSync(dirname(QUEUE_PATH), { recursive: true })
       appendFileSync(QUEUE_PATH, JSON.stringify({ at: Math.floor(Date.now() / 1000), reason }) + '\n')
       say(`queued (${reason}) — no session started here; whatever can act will drain it`)
+      // The queue is a file on THIS host. If the actor lives elsewhere it never sees it, so push
+      // a content-free notice outward too (waggle#106).
+      sendNotice(reason)
     } catch (e) { say(`QUEUE WRITE FAILED (${reason}): ${e.message}`) }
     return
   }
