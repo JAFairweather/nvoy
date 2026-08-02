@@ -12,6 +12,7 @@ import { sendRevocationNotice, grantWithTerms } from './nvoygrant.mjs'
 import { revokedEvent, rotatedEvent, grantedEvent, appendLedger, eventsFor, computeTotals, fmtCountdown } from './ledgerlog.mjs'
 import { rotateDropping, runRelinquishRotation, nextExpiry } from './ttl.mjs'
 import { state, $, esc, short, fmtWhen, agentName, agentsOf, load, RELAYS, showTab } from './main.mjs'
+import { buildExternalRevocation } from './capgrants.mjs'
 
 // Ledger organization (a grant has three axes — who / what / state).
 let groupBy = 'agent'           // primary axis — see GROUP_OPTS
@@ -169,6 +170,31 @@ const hRow = (ev) => {
 }
 
 function delegationCard(d, i) {
+  // External grants (read off the relays from another app — a waggle admit, a future app's
+  // capability) get a COMPACT card of their own. They are not in Nvoy's scope index, have no scope
+  // key, no TTL, no outputs — so none of the machinery below applies. Rendering them here, isolated,
+  // is what keeps the full Nvoy card path untouched while still showing every grant on one plane.
+  if (d.external) {
+    const gname = agentName(d.agent) || short(d.agent)
+    const canRevoke = d.status === 'active'
+    return `<div class="card st-${d.status} kind-external" data-i="${i}" data-scope="${esc(d.scope)}" data-agent="${esc(d.agent)}">
+      <div class="head">
+        <div>
+          <span class="lg-ic" title="external capability grant">🔗</span>
+          <span class="name">${esc(d.scopeName)}</span>
+          <span class="badge ${d.status}">${d.status}</span>
+          <span class="meta" title="issued by another app in the NIP-DA family and read from the relays — not an Nvoy scope">external</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px">
+          <span class="meta" title="the 440 event id this grant is">${esc(short(d.scope))}</span>
+          ${canRevoke ? '<button class="danger revoke">Revoke now</button>' : ''}
+        </div>
+      </div>
+      <div class="note lg-flow"><span class="lg-arrow">granted to</span>
+        <b style="color:var(--text)">${esc(gname)}</b> <span class="meta">${esc(short(d.agent))}</span></div>
+      ${d.purpose ? `<div class="chips"><span class="chip" title="the capability this grant conveys">${esc(d.purpose)}</span></div>` : ''}
+    </div>`
+  }
   const events = eventsFor(state.index, d.scope, d.agent)
   const soon = d.expiresAt !== null && d.expiresAt - Math.floor(Date.now() / 1000) < 24 * 3600
   // 'expired' can mean lapsed-but-still-holding (sweep imminent) OR already
@@ -513,6 +539,22 @@ async function confirmRelinquish(d, msg) {
  *  other grantees under their original terms, optionally send a gift-wrapped
  *  441 notice, and record revoked + rotated events in the ledger. */
 async function revoke(d, msg) {
+  // An EXTERNAL grant has no scope key to rotate — it is revoked the way its own app's bridge
+  // already honours: a plain, public kind-441 e-tagging the 440. This is the whole "administer from
+  // Nvoy" for foreign grants; it signs with the same delegator key, verified before it publishes.
+  if (d.external) {
+    if (!confirm(`Revoke “${d.scopeName}” from ${agentName(d.agent) || short(d.agent)}?\n\n` +
+      `Publishes a public 441 revocation. The grant's own bridge stops honouring it on its next read — ` +
+      `no restart anywhere. It cannot be un-published, but you can always issue a new grant.`)) return
+    msg.textContent = 'publishing 441 revocation…'
+    try {
+      const signed = await state.signer.signEvent(buildExternalRevocation(d.capId, Math.floor(Date.now() / 1000)))
+      await state.relay.publish(signed)
+      msg.textContent = 'revoked — the 441 is on the relays'
+      setTimeout(() => load(), 1200)
+    } catch (e) { msg.textContent = `revoke failed: ${e.message}` }
+    return
+  }
   const entry = (state.index.issued ?? []).find(e => e.scope === d.scope)
   if (!entry) { msg.textContent = 'scope not in the index — cannot rotate'; return }
   const others = (entry.grantees ?? []).filter(p => p !== d.agent).length
