@@ -12,6 +12,7 @@ import { nip07Signer, nip46Signer, serializeSession, parseSession, signerFromSes
 import { renderTitlebar, updateTitlebar } from '../lib/nave-titlebar.mjs'
 import { loadConfig } from './config.mjs'
 import { deriveDelegations } from './ledgerlog.mjs'
+import { readCapabilityGrants } from './capgrants.mjs'
 import { receiveGrantsWithTerms, receiveNotices } from './nvoygrant.mjs'
 import { expiryRotationPlan, nextExpiry, runExpiryRotation, relinquishPlan, runRelinquishRotation } from './ttl.mjs'
 import { renderAgents } from './agents.mjs'
@@ -217,6 +218,19 @@ export async function load() {
     state.pendingRelinquish = plan.confirm
 
     state.delegations = deriveDelegations(state.index)
+    // The universal grant plane (capgrants): every public 440 your key signed, from ANY app —
+    // waggle channel admits today, more of the family tomorrow. Additive and fail-safe: a read
+    // error leaves Nvoy's own grants exactly as they were, never a broken load.
+    try {
+      const capPub = await signer.getPublicKey()
+      const { rows: external, skippedData, unverified } = await readCapabilityGrants(relay, capPub)
+      state.externalGrants = external
+      state.externalGrantStats = { skippedData, unverified }
+      if (external.length) state.delegations = [...state.delegations, ...external]
+    } catch (err) {
+      state.externalGrants = []
+      console.warn('universal grant plane: could not read external grants —', err.message)
+    }
     const pubs = [...new Set([
       ...agentsOf().map(a => a.pub),
       ...state.delegations.map(d => d.agent),
