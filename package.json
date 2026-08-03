@@ -26,7 +26,7 @@
     "sync-connect": "{ echo \"// vendored from JAFairweather/luke @ $(git -C ../luke rev-parse --short HEAD) \u2014 do not edit; npm run sync-connect\"; cat ../luke/nave-connect.mjs; } > lib/nave-connect.mjs",
     "sync-titlebar": "{ echo \"// vendored from JAFairweather/nave.pub @ $(git -C ../nave.pub rev-parse --short HEAD) \u2014 do not edit; npm run sync-titlebar\"; cat ../nave.pub/components/nave-titlebar.mjs; } > lib/nave-titlebar.mjs",
     "nip46": "node test/nip46-signer.mjs",
-    "consent": "node test/consent-request.mjs"
+    "consent": "node test/consent-request.mjs && node test/consent-nsec-signer.mjs"
   },
   "dependencies": {
     "nostr-tools": "^2.23.9",
