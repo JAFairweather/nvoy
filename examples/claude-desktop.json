@@ -9,7 +9,7 @@
       "env": {
         "NVOY_NCRYPTSEC_FILE": "/ABSOLUTE/PATH/TO/agent.ncryptsec",
         "NVOY_NCRYPTSEC_PASSPHRASE": "REPLACE_WITH_YOUR_PASSPHRASE",
-        "NVOY_RELAYS": "wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net"
+        "NVOY_RELAYS": "wss://nos.lol,wss://relay.primal.net"
       }
     },
 
@@ -19,7 +19,7 @@
       "args": ["/ABSOLUTE/PATH/TO/nvoy/mcp/dist/server.js"],
       "env": {
         "NVOY_NSEC": "nsec1REPLACE_WITH_AGENT_SECRET_KEY",
-        "NVOY_RELAYS": "wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net"
+        "NVOY_RELAYS": "wss://nos.lol,wss://relay.primal.net"
       }
     },
 

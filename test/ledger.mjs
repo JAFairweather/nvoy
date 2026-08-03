@@ -164,7 +164,7 @@ check(`ledger log capped at ${LEDGER_CAP}, oldest trimmed`,
 check('config: ws:// kept for local relay, junk falls back to defaults',
   sanitizeConfig({ relays: ['ws://127.0.0.1:4460/'] }).relays[0] === 'ws://127.0.0.1:4460'
   && sanitizeConfig({ relays: ['http://nope', 42] }).relays.join() === DEFAULT_RELAYS.join()
-  && sanitizeConfig(null).relays.length === 3)
+  && sanitizeConfig(null).relays.length === DEFAULT_RELAYS.length)
 
 // ------------------- 7. §6.5 outputs: agent grants its outbox back (console
 // receives terms-aware — the read side of the Ledger "outputs" surface)

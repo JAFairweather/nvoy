@@ -38,7 +38,7 @@ const MAINT_RAW = flag('--maintainer', process.env.WAGGLE_MAINTAINER_NPUB ||
   '4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b287ea84d')
 const MAINT = MAINT_RAW.startsWith('npub1') ? nip19.decode(MAINT_RAW).data : MAINT_RAW.toLowerCase()
 const PURPOSE = flag('--purpose', '(unspecified)')
-const RELAYS = (process.env.RELAY_RELAYS || 'wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net')
+const RELAYS = (process.env.RELAY_RELAYS || 'wss://nos.lol,wss://relay.primal.net')
   .split(',').map(s => s.trim()).filter(Boolean)
 const DRY = !!process.env.DRY_RUN
 

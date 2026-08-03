@@ -19,7 +19,7 @@ detects it on the next dereference.
 ```
 npm run build           # ensure mcp/dist is current
 npm run demo            # in-memory relay (deterministic, offline)
-npm run demo:live       # real public relays (damus / nos.lol / primal)
+npm run demo:live       # real public relays (nos.lol / primal)
 ```
 
 Throwaway keys, demo data only. The script exits non-zero if any of the

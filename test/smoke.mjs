@@ -16,7 +16,7 @@ import { ScopeCache } from '../mcp/dist/scopes.js'
 import { parseTerms } from '../mcp/dist/terms.js'
 
 const LIVE = process.argv.includes('--live')
-const RELAYS = ['wss://relay.damus.io', 'wss://nos.lol', 'wss://relay.primal.net']
+const RELAYS = ['wss://nos.lol', 'wss://relay.primal.net']
 
 let n = 0, failed = 0
 const check = (name, cond) => {
