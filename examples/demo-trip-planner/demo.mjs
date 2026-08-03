@@ -24,7 +24,7 @@ import { grantWithTerms, sendRevocationNotice, opaqueScopeId, TRAVEL_PREFERENCES
 import { startWsRelay } from '../../test/wsrelay.mjs'
 
 const LIVE = process.argv.includes('--live')
-const PUBLIC_RELAYS = ['wss://relay.damus.io', 'wss://nos.lol', 'wss://relay.primal.net']
+const PUBLIC_RELAYS = ['wss://nos.lol', 'wss://relay.primal.net']
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 
 const say = (s = '') => console.log(s)

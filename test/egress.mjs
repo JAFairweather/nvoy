@@ -59,7 +59,7 @@ const check = (name, ok, detail = '') => {
 // Blossom hosts ship in v1 (outbox payloads are JSON; artifact pointers are
 // deferred — CLAUDE.md decision 26).
 const NETWORK = new Set([
-  'wss://relay.damus.io', 'wss://nos.lol', 'wss://relay.primal.net', // relays
+  'wss://nos.lol', 'wss://relay.primal.net', // relays
   'https://esm.sh',                                                  // pinned modules (console)
 ])
 const LINK_ONLY = new Set(['https://github.com'])   // <a href> / alpha banner in HTML only
@@ -126,7 +126,7 @@ console.log('\n2. Consistency: the allowlist matches the live console config')
 const cfgSrc = readFileSync(join(root, 'console', 'config.mjs'), 'utf8')
 const cfgRelays = cfgSrc.match(/wss:\/\/[a-z0-9.-]+/g) ?? []
 check('every default console relay is allowlisted',
-  cfgRelays.length >= 3 && cfgRelays.every(r => NETWORK.has(r)), cfgRelays.join(', '))
+  cfgRelays.length >= 2 && cfgRelays.every(r => NETWORK.has(r)), cfgRelays.join(', '))
 const htmlSrc = readFileSync(join(root, 'console', 'index.html'), 'utf8')
 const importMap = htmlSrc.match(/<script type="importmap">([\s\S]*?)<\/script>/)?.[1] ?? ''
 const imports = Object.values(JSON.parse(importMap).imports).map(u => new URL(u).origin)
@@ -156,7 +156,7 @@ check('zero network calls at console import time', calls.length === 0, calls.joi
 console.log('\n4. Live config: shipped defaults stay inside the allowlist; garbage cannot widen them')
 const dflt = config.defaultConfig()
 check('defaultConfig relays ⊆ allowlist',
-  dflt.relays.length >= 3 && dflt.relays.every(r => NETWORK.has(r)), dflt.relays.join(', '))
+  dflt.relays.length >= 2 && dflt.relays.every(r => NETWORK.has(r)), dflt.relays.join(', '))
 // A corrupt / hostile stored config must sanitize to the defaults, never
 // inject arbitrary origins with invalid schemes.
 const bad = { getItem: () => JSON.stringify({ relays: ['javascript:alert(1)', 'http://evil.example', 'ftp://evil.example'] }) }
@@ -220,7 +220,7 @@ let ident = null
 if (existsSync(join(distDir, 'identity.js'))) {
   ident = await import('../mcp/dist/identity.js')
   check('DEFAULT_RELAYS ⊆ allowlist',
-    ident.DEFAULT_RELAYS.length >= 3 && ident.DEFAULT_RELAYS.every(r => NETWORK.has(r)),
+    ident.DEFAULT_RELAYS.length >= 2 && ident.DEFAULT_RELAYS.every(r => NETWORK.has(r)),
     ident.DEFAULT_RELAYS.join(', '))
   check('loadRelays() default ⊆ allowlist',
     ident.loadRelays({}).every(r => NETWORK.has(r)), ident.loadRelays({}).join(', '))

@@ -32,7 +32,7 @@ let trusted = {}
 try { trusted = JSON.parse(readFileSync(resolve(homedir(), '.nvoy', 'trusted-senders.json'), 'utf8')).trusted || {} } catch { console.error('WARNING: no trusted-senders.json — every sender will read as UNTRUSTED') }
 
 const RELAYS = (process.env.NVOY_RELAYS?.split(',') || [
-  'wss://relay.damus.io', 'wss://nos.lol', 'wss://relay.primal.net',
+  'wss://nos.lol', 'wss://relay.primal.net',
   'wss://relay.ditto.pub', 'wss://relay.dreamith.to', 'wss://jskitty.com/nostr', 'wss://asia.vectorapp.io/nostr',
 ]).map(s => s.trim()).filter(Boolean)
 

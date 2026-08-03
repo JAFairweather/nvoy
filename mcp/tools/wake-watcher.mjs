@@ -68,7 +68,7 @@ const GRANTORS = String(process.env.GRANTORS || '4010ac438206dc10018b814be3ea01c
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
 
 const RELAYS = (process.env.NVOY_RELAYS?.split(',') || [
-  'wss://relay.damus.io', 'wss://nos.lol', 'wss://relay.primal.net', 'wss://relay.ditto.pub',
+  'wss://nos.lol', 'wss://relay.primal.net', 'wss://relay.ditto.pub',
 ]).map(s => s.trim()).filter(Boolean)
 
 // --- Completeness. A relay is NOT a queue: NIP-01 gives no delivery guarantee, and an open REQ

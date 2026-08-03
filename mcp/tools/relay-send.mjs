@@ -16,7 +16,7 @@
 //   NVOY_NSEC              (required) your identity — never printed, never in argv
 //   WAGGLE_BRIDGE_PUBKEY   waggle's hex pubkey        (default: the live bridge key)
 //   RELAY_CHANNEL          destination channel UUID   (default: #waggle-test)
-//   RELAY_RELAYS           comma-sep relays           (default: damus, nos.lol, primal)
+//   RELAY_RELAYS           comma-sep relays           (default: nos.lol, primal)
 //   DRY_RUN=1              build + report, publish nothing
 //
 // After sending, VERIFY by reading your own inbox (inbox.mjs) — the crew's replies come back
@@ -30,7 +30,7 @@ import WebSocket from 'ws'
 const BRIDGE = (process.env.WAGGLE_BRIDGE_PUBKEY ||
   '84753207f2c6ae73af247da174e8e7c91a7d939a8eb0b4c2b98b54ea567786e6').toLowerCase()
 const CHANNEL = process.env.RELAY_CHANNEL || 'a8186b53-537d-46ad-a7e7-b6486c58970e'
-const RELAYS = (process.env.RELAY_RELAYS || 'wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net')
+const RELAYS = (process.env.RELAY_RELAYS || 'wss://nos.lol,wss://relay.primal.net')
   .split(',').map(s => s.trim()).filter(Boolean)
 const DRY = !!process.env.DRY_RUN
 

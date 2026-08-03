@@ -190,7 +190,7 @@ export function loadIdentity(
 }
 
 /** Default relay set; override with NVOY_RELAYS (comma-separated). */
-export const DEFAULT_RELAYS = ['wss://relay.damus.io', 'wss://nos.lol', 'wss://relay.primal.net']
+export const DEFAULT_RELAYS = ['wss://nos.lol', 'wss://relay.primal.net']
 
 export function loadRelays(env: NodeJS.ProcessEnv = process.env): string[] {
   const raw = env.NVOY_RELAYS

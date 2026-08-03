@@ -6,7 +6,7 @@
 //
 // DOM-free: storage is injectable so Node tests exercise the sanitize path.
 
-export const DEFAULT_RELAYS = ['wss://relay.damus.io', 'wss://nos.lol', 'wss://relay.primal.net']
+export const DEFAULT_RELAYS = ['wss://nos.lol', 'wss://relay.primal.net']
 export const CONFIG_KEY = 'nvoy-config'
 
 export const defaultConfig = () => ({ relays: [...DEFAULT_RELAYS] })

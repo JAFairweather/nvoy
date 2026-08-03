@@ -15,7 +15,7 @@ import { newScopeKey, publishScope, loadGrantIndex, saveGrantIndex, toIssuedEntr
 import { LiveRelay } from '../lib/liverelay.mjs'
 import { grantWithTerms, opaqueScopeId, TRAVEL_PREFERENCES } from './nvoygrant.mjs'
 
-const DEFAULT_RELAYS = ['wss://relay.damus.io', 'wss://nos.lol', 'wss://relay.primal.net']
+const DEFAULT_RELAYS = ['wss://nos.lol', 'wss://relay.primal.net']
 
 const agentArg = process.argv[2]
 if (!agentArg) {

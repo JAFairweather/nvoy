@@ -55,7 +55,7 @@ const who = (pk) => NAMES[pk] || (() => { try { const n = npubEncode(pk); return
 const RELAYS = [
   { url: 'wss://jskitty.com/nostr', auth: false },
   { url: 'wss://asia.vectorapp.io/nostr', auth: false },
-  { url: 'wss://relay.damus.io', auth: false },
+  { url: auth: false },
   { url: 'wss://relay.ditto.pub', auth: true },
   { url: 'wss://relay.dreamith.to', auth: true },
 ]

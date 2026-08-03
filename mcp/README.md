@@ -71,7 +71,7 @@ printed on the server's first stderr line. Three sources, in precedence order:
 Other env:
 
 - `NVOY_RELAYS` — comma-separated relay list (default
-  `wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net`).
+  `wss://nos.lol,wss://relay.primal.net`).
 - `NVOY_HTTP_PORT` — if set, serve the Streamable HTTP transport instead of
   stdio (`0` = ephemeral port). Binds `127.0.0.1`; set `NVOY_HTTP_HOST` to
   expose it (an explicit operator act — the server carries an agent key and
@@ -97,7 +97,7 @@ an nsec and an ncryptsec-file variant. Minimal:
       "env": {
         "NVOY_NCRYPTSEC_FILE": "/ABSOLUTE/PATH/TO/agent.ncryptsec",
         "NVOY_NCRYPTSEC_PASSPHRASE": "your-passphrase",
-        "NVOY_RELAYS": "wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net"
+        "NVOY_RELAYS": "wss://nos.lol,wss://relay.primal.net"
       }
     }
   }

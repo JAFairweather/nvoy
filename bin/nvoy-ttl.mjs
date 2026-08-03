@@ -39,7 +39,7 @@ else {
   sk = data
 }
 
-const relays = (process.env.NVOY_RELAYS ?? 'wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net')
+const relays = (process.env.NVOY_RELAYS ?? 'wss://nos.lol,wss://relay.primal.net')
   .split(',').map(s => s.trim()).filter(Boolean)
 const intervalMs = Math.max(5, Number(process.env.NVOY_TTL_INTERVAL_S) || 60) * 1000
 const relay = new LiveRelay(relays)

@@ -58,7 +58,7 @@ const scopeHash = (agentHex, saltHex) => createHash('sha256').update(Buffer.conc
 ])).digest('hex')
 
 const RELAYS = (process.env.NVOY_RELAYS?.split(',') || [
-  'wss://relay.damus.io', 'wss://nos.lol', 'wss://relay.primal.net',
+  'wss://nos.lol', 'wss://relay.primal.net',
   'wss://relay.ditto.pub', 'wss://relay.dreamith.to', 'wss://jskitty.com/nostr',
 ]).map(s => s.trim()).filter(Boolean)
 
