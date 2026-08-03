@@ -5,6 +5,7 @@
 
 import { nip19, verifyEvent } from 'nostr-tools'
 import { LiveRelay } from '../lib/liverelay.mjs'
+import { publishAndReadBack } from './consent-publish.mjs'
 import { nip07Signer, nip46Signer } from '../lib/nave-connect.mjs'
 import { loadConfig } from './config.mjs'
 import { decodeConsentRequest, validateConsentRequest, termsHash } from './consent-request.mjs'
@@ -38,14 +39,16 @@ async function signAndPublish() {
     const signed = JSON.parse(JSON.stringify(await signer.signEvent(request.prefill)))
     if (!verifyEvent(signed)) throw new Error('your signer returned an invalid signature')
     const relay = new LiveRelay(relays)
-    setStatus('Publishing your signed consent to Nostr relays…')
-    const receipt = await relay.publish(signed)
-    relay.close()
+    let receipt
+    try {
+      setStatus('Publishing your signed consent to Nostr relays…')
+      receipt = await publishAndReadBack(relay, signed)
+    } finally { relay.close() }
     signer.clear?.() // session-only testing key: a successful one-shot has no reason to linger
     signer = null
     $('sign').disabled = true
     $('success').hidden = false
-    $('success').innerHTML = `Consent published to ${receipt.acks}/${receipt.of} relay(s). waggle can now mirror future public posts into <strong>${esc(request.hive.name)}</strong>. You can revoke this later with your own signer.`
+    $('success').innerHTML = `Consent published to ${receipt.acks}/${receipt.of} relay(s) and read back successfully. waggle can now mirror future public posts into <strong>${esc(request.hive.name)}</strong>. You can revoke this later with your own signer.`
     setStatus('')
   } catch (err) { setStatus(''); showError(`Nothing changed: ${err.message}`); $('sign').disabled = false }
 }
