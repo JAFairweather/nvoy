@@ -111,6 +111,7 @@ console.log('\nA. CONSOLE (browser client)')
 console.log('\n1. Static scan: every URL in shipped console code resolves to an allowed origin')
 const consoleFiles = [
   join(root, 'index.html'),                                // root redirect page
+  join(root, 'consent.html'),                              // public consent signer
   join(root, 'console', 'index.html'),
   ...readdirSync(join(root, 'console')).filter(f => f.endsWith('.mjs')).map(f => join(root, 'console', f)),
 ]
@@ -188,6 +189,13 @@ check('the only key-material localStorage write is the nip49 ncryptsec',
 check('config + dismissed-request writes carry no key material',
   !/localStorage\.setItem\([^)]*nsec/i.test(allConsoleSrc)
   && !/setItem\(\s*CONFIG_KEY[^)]*sk\b/.test(settingsSrc))
+const consentSrc = readFileSync(join(root, 'console', 'consent.mjs'), 'utf8')
+const consentHtml = readFileSync(join(root, 'consent.html'), 'utf8')
+check('the consent testing key is password-masked, immediately cleared, and never persisted',
+  /id="test-nsec" type="password"/.test(consentHtml)
+  && /field\.value = ''/.test(consentSrc)
+  && !/Storage\.(?:setItem|removeItem).*test-nsec|test-nsec.*Storage\.(?:setItem|removeItem)/s.test(consentSrc),
+  'the burner-only key must remain a one-tab, one-shot signer')
 const ssWrites = mainSrc.match(/sessionStorage\.setItem\('([^']+)'/g) ?? []
 check('sessionStorage keys are exactly the tab-session login + protect opt-out',
   ssWrites.length === 2

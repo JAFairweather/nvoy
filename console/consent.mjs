@@ -8,6 +8,7 @@ import { LiveRelay } from '../lib/liverelay.mjs'
 import { nip07Signer, nip46Signer } from '../lib/nave-connect.mjs'
 import { loadConfig } from './config.mjs'
 import { decodeConsentRequest, validateConsentRequest, termsHash } from './consent-request.mjs'
+import { testingNsecSigner } from './testing-nsec-signer.mjs'
 
 const $ = (id) => document.getElementById(id)
 const esc = (s) => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
@@ -40,6 +41,9 @@ async function signAndPublish() {
     setStatus('Publishing your signed consent to Nostr relays…')
     const receipt = await relay.publish(signed)
     relay.close()
+    signer.clear?.() // session-only testing key: a successful one-shot has no reason to linger
+    signer = null
+    $('sign').disabled = true
     $('success').hidden = false
     $('success').innerHTML = `Consent published to ${receipt.acks}/${receipt.of} relay(s). waggle can now mirror future public posts into <strong>${esc(request.hive.name)}</strong>. You can revoke this later with your own signer.`
     setStatus('')
@@ -66,4 +70,12 @@ $('bunker-go').onclick = () => {
   if (!uri) return showError('Paste your bunker:// or nostrconnect:// URI first.')
   connect(nip46Signer(uri, { onAuthUrl: url => { $('bunker-auth').hidden = false; $('bunker-auth').href = url } }))
 }
+$('test-nsec-go').onclick = () => {
+  const field = $('test-nsec')
+  const raw = field.value
+  field.value = ''
+  try { connect(testingNsecSigner(raw)) }
+  catch (err) { showError(`Could not use that test key: ${err.message}`) }
+}
+$('test-nsec').onkeydown = e => { if (e.key === 'Enter') $('test-nsec-go').onclick() }
 $('sign').onclick = signAndPublish

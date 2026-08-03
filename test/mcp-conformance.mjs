@@ -9,7 +9,7 @@
 // Covers the full §6.2 tool surface: whoami, grants_list, scope_read,
 // scope_subscribe (stdio cache-invalidation AND http update notifications),
 // outbox_write (§6.5), request_access, grant_relinquish + auto_relinquish
-// (§6.6), plus the M2 revocation beats. Fully offline.
+// (§6.6), plus the conversation tools and M2 revocation beats. Fully offline.
 
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
@@ -42,6 +42,7 @@ const TOOLS = [
   'nvoy_whoami', 'nvoy_grants_list', 'nvoy_scope_read', 'nvoy_scope_subscribe',
   'nvoy_outbox_write', 'nvoy_draft_publish', 'nvoy_draft_withdraw',
   'nvoy_request_access', 'nvoy_grant_relinquish',
+  'nvoy_chat_post', 'nvoy_chat_read', 'nvoy_dm_send', 'nvoy_dm_read',
 ]
 
 // ------------------------------------------------ seed a delegation offline
@@ -139,7 +140,7 @@ try {
 
   // ------------------------------------------------------------- tool list
   const tools = (await client.listTools()).tools.map(t => t.name)
-  check('server exposes exactly the §6.2 tool surface (7 tools)',
+  check('server exposes exactly the declared 13-tool surface',
     TOOLS.every(t => tools.includes(t)) && tools.length === TOOLS.length)
 
   // ---------------------------------------------------------------- whoami
@@ -351,7 +352,7 @@ try {
   await httpClient.connect(new StreamableHTTPClientTransport(new URL(http.url)))
 
   const httpTools = (await httpClient.listTools()).tools.map(t => t.name)
-  check('HTTP transport: same 7-tool surface', TOOLS.every(t => httpTools.includes(t)) && httpTools.length === TOOLS.length)
+  check('HTTP transport: same declared 13-tool surface', TOOLS.every(t => httpTools.includes(t)) && httpTools.length === TOOLS.length)
   const httpRead = textJson(await httpClient.callTool({
     name: 'nvoy_scope_read', arguments: { d: scopeId, author_npub: delegatorNpub },
   }))
