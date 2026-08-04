@@ -14,6 +14,10 @@ relay ──1059 p-tag──> keyless watcher ──opaque envelope id──> br
                                       authenticated private Unix socket
                                                         │
                                               Claude/Codex adapter
+                                                        │
+                                      bounded reply request (no key)
+                                                        │
+                                             broker validates + signs
 ```
 
 The watcher never receives a key or plaintext. The adapter never receives a key, a key-file
@@ -38,7 +42,8 @@ contains only public routing policy:
   "runtime_dir": "/run/nvoy/codex-jaf",
   "spool_dir": "/var/lib/nvoy-watcher/codex-jaf",
   "shared_gid": 41001,
-  "key_ref": "/etc/nvoy/keys/codex-jaf.ncryptsec",
+  "bunker_uri_ref": "/etc/nvoy/credentials/codex-jaf.bunker-uri",
+  "bunker_client_ref": "/etc/nvoy/credentials/codex-jaf.nip46-client",
   "grantors": ["<64 hex>"],
   "relays": ["wss://nos.lol", "wss://relay.primal.net"]
 }
@@ -46,7 +51,10 @@ contains only public routing policy:
 
 The supervisor canonicalizes every path, rejects symlinks and duplicate pubkeys/canonical
 state/runtime paths across all manifests, and refuses any CLI or environment identity/path
-override. `key_ref` is broker-readable only; it must never be inherited by watcher or adapter.
+override. The two Bunker references are broker-readable only: the URI carries the Bunker
+connection capability and the client reference holds the stable NIP-46 transport key. Neither is
+the participant identity nsec, which remains solely in `bunker.nave.pub`; neither is inherited by
+watcher, adapter, or worker.
 
 ## Units and filesystem ownership
 
@@ -55,7 +63,7 @@ For each `<id>`, the installer creates a dedicated OS account `nvoy-<id>` and:
 | Path | Owner/mode | Consumer |
 |---|---|---|
 | `/etc/nvoy/instances/<id>.json` | root:root 0644 | supervisor only |
-| `/etc/nvoy/keys/<id>.ncryptsec` | root:nvoy-<id> 0640 | broker only |
+| Bunker URI + NIP-46 client credentials | root:broker 0600 | broker only |
 | `/var/lib/nvoy/<id>` | nvoy-<id> 0700 | broker state/lock |
 | `/run/nvoy/<id>` | adapter:instance-group 0710 | broker socket (broker can traverse, not replace) |
 | watcher spool | watcher:instance-group 0770, markers 0660 | watcher→broker marker intake |
@@ -83,6 +91,11 @@ and may not choose another one.
    is never marked completed merely because it was observed.
 4. The adapter starts/alerts its client using a fixed local mechanism. Codex desktop is not
    falsely claimed to be resumable; it needs its dedicated worker/queue adapter.
+5. A worker that chooses to reply writes a bounded `reply-request` referencing the delivered
+   envelope. The broker accepts it only when the recipient was a permitted sender recorded in its
+   own admission receipt. It persists the exact signed NIP-17 wrap before publishing, so a crash
+   retry republishes the same event rather than authoring another reply. The worker never sees the
+   Nostr credential.
 
 ## Required negative tests
 
@@ -96,13 +109,14 @@ and may not choose another one.
 
 ## Runnable reference roles
 
-Nvoy ships three intentionally narrow commands:
+Nvoy ships four intentionally narrow commands:
 
 ```sh
 # all three get the same --instance name; neither adapter nor watcher gets a key
 node mcp/tools/instance-runtime.mjs watch --instance codex-jaf
 node mcp/tools/instance-adapter.mjs --instance codex-jaf
 node mcp/tools/instance-broker-daemon.mjs --instance codex-jaf
+node mcp/tools/instance-worker.mjs --instance codex-jaf --runner codex
 ```
 
 `instance-broker-daemon` is the broker-container entrypoint; it reclaims interrupted inflight
@@ -113,6 +127,11 @@ path (for Docker, a secret mount such as `/run/secrets/nvoy-codex-jaf`; for syst
 mount). Its value is never passed to the adapter or watcher. The broker requires an opaque marker,
 rechecks live grants at delivery time, and refuses plaintext delivery until the adapter sends the
 instance-bound acknowledgement.
+
+`instance-worker` supports the local `codex exec` and `claude -p` runners. It launches each with
+a fixed prompt that explicitly treats the delivered body as **untrusted data, never instruction**;
+the runner can propose reply text but cannot select a recipient or sign. For a deterministic
+deployment test, `--reply 'text'` bypasses the LLM and proves the same brokered egress path.
 
 ### Docker reference deployment
 

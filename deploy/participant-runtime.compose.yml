@@ -23,9 +23,9 @@ services:
         source: ${MANIFEST_DIR:?}
         target: /etc/nvoy/instances
         read_only: true
-      - watcher_spool:/var/lib/nvoy-watcher/${INSTANCE_ID}
-      - broker_state:/var/lib/nvoy/${INSTANCE_ID}
-      - adapter_runtime:/run/nvoy/${INSTANCE_ID}
+      - watcher_spool:${SPOOL_DIR:?}
+      - broker_state:${STATE_DIR:?}
+      - adapter_runtime:${RUNTIME_DIR:?}
     restart: "no"
 
   watcher:
@@ -43,7 +43,7 @@ services:
         source: ${MANIFEST_DIR:?}
         target: /etc/nvoy/instances
         read_only: true
-      - watcher_spool:/var/lib/nvoy-watcher/${INSTANCE_ID}
+      - watcher_spool:${SPOOL_DIR:?}
     depends_on:
       init:
         condition: service_completed_successfully
@@ -58,17 +58,18 @@ services:
     tmpfs: [/tmp:mode=1777]
     environment:
       NVOY_INSTANCE_ROOT: /etc/nvoy/instances
-      NVOY_BROKER_CREDENTIAL: /run/secrets/nvoy_identity
+      NVOY_BUNKER_URI_FILE: /run/secrets/nvoy_bunker_uri
+      NVOY_BROKER_CREDENTIAL: /run/secrets/nvoy_bunker_client
     command: ["node", "mcp/tools/instance-broker-daemon.mjs", "--instance", "${INSTANCE_ID:?}"]
-    secrets: [nvoy_identity]
+    secrets: [nvoy_bunker_uri, nvoy_bunker_client]
     volumes:
       - type: bind
         source: ${MANIFEST_DIR:?}
         target: /etc/nvoy/instances
         read_only: true
-      - broker_state:/var/lib/nvoy/${INSTANCE_ID}
-      - watcher_spool:/var/lib/nvoy-watcher/${INSTANCE_ID}
-      - adapter_runtime:/run/nvoy/${INSTANCE_ID}
+      - broker_state:${STATE_DIR:?}
+      - watcher_spool:${SPOOL_DIR:?}
+      - adapter_runtime:${RUNTIME_DIR:?}
     depends_on:
       init:
         condition: service_completed_successfully
@@ -89,15 +90,17 @@ services:
         source: ${MANIFEST_DIR:?}
         target: /etc/nvoy/instances
         read_only: true
-      - adapter_runtime:/run/nvoy/${INSTANCE_ID}
+      - adapter_runtime:${RUNTIME_DIR:?}
     depends_on:
       init:
         condition: service_completed_successfully
     restart: unless-stopped
 
 secrets:
-  nvoy_identity:
-    file: ${BROKER_CREDENTIAL_FILE:?set BROKER_CREDENTIAL_FILE}
+  nvoy_bunker_uri:
+    file: ${BUNKER_URI_FILE:?}
+  nvoy_bunker_client:
+    file: ${BUNKER_CLIENT_FILE:?}
 
 volumes:
   watcher_spool: {}

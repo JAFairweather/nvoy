@@ -33,14 +33,27 @@ import { createHash } from 'node:crypto'
 import { decode, npubEncode } from 'nostr-tools/nip19'
 import { getPublicKey, verifyEvent } from 'nostr-tools/pure'
 import * as nip44 from 'nostr-tools/nip44'
+import { makeBunkerSigner } from './nip46-signer.mjs'
 
 const arg = (n, d) => { const i = process.argv.indexOf(n); return i === -1 ? d : process.argv[i + 1] }
 const die = (m) => { console.error(`attention: ${m}`); process.exit(1) }
 const toHex = (s) => String(s).startsWith('npub1') ? decode(s).data : String(s).toLowerCase()
 
-const raw = process.env.NVOY_NSEC || die('set NVOY_NSEC')
-const sk = raw.startsWith('nsec1') ? decode(raw).data : Uint8Array.from(Buffer.from(raw, 'hex'))
-const ME = getPublicKey(sk)
+// The broker normally reaches the identity through Bunker/NIP-46. Local-key support remains
+// only for existing development fixtures; production manifests select the Bunker path.
+const bunkerUri = process.env.NVOY_BUNKER_URI || ''
+let ME, decrypt
+if (bunkerUri) {
+  const clientNsec = process.env.NVOY_NIP46_CLIENT_NSEC || die('set NVOY_NIP46_CLIENT_NSEC for the Bunker connection')
+  const signer = makeBunkerSigner(bunkerUri, clientNsec)
+  ME = await signer.getPublicKey()
+  decrypt = (peer, ciphertext) => signer.nip44Decrypt(peer, ciphertext)
+} else {
+  const raw = process.env.NVOY_NSEC || die('set NVOY_NSEC or NVOY_BUNKER_URI')
+  const sk = raw.startsWith('nsec1') ? decode(raw).data : Uint8Array.from(Buffer.from(raw, 'hex'))
+  ME = getPublicKey(sk)
+  decrypt = async (peer, ciphertext) => nip44.decrypt(ciphertext, nip44.getConversationKey(sk, peer))
+}
 
 // Whose signature counts as policy. Not a default — an unset grantor list means nothing can be
 // authorised, which is the correct failure direction.
@@ -147,9 +160,9 @@ const msgs = []
 for (const w of wraps.values()) {
   if (envelopeOnly && w.id !== envelopeOnly) continue
   try {
-    const seal = JSON.parse(nip44.decrypt(w.content, nip44.getConversationKey(sk, w.pubkey)))
+    const seal = JSON.parse(await decrypt(w.pubkey, w.content))
     if (seal.kind !== 13) continue
-    const rumor = JSON.parse(nip44.decrypt(seal.content, nip44.getConversationKey(sk, seal.pubkey)))
+    const rumor = JSON.parse(await decrypt(seal.pubkey, seal.content))
     if (rumor.kind !== 14 || rumor.pubkey !== seal.pubkey) continue // author-spoof guard
     if (rumor.created_at < since || seal.pubkey === ME) continue
     msgs.push({ from: seal.pubkey, at: rumor.created_at, content: String(rumor.content || '') })
@@ -182,9 +195,13 @@ if (process.argv.includes('--mark')) {
 }
 
 if (process.argv.includes('--json')) {
+  const admissions = actionable.map(m => {
+    const g = permitted.get(m.from)
+    return { from: m.from, grant_id: g?.grantId || '', grantor: g?.grantor || '', cap: g?.cap || '' }
+  })
   console.log(JSON.stringify({ me: ME, grantors: GRANTORS, relaysAnswered, policyUsable,
     permitted: [...permitted.keys()], rejectedGrants: rejected,
-    actionable, dataOnly: dataOnly.map(m => ({ from: m.from, at: m.at })) }, null, 2))
+    actionable, admissions, dataOnly: dataOnly.map(m => ({ from: m.from, at: m.at })) }, null, 2))
   // JSON is a transport format, not a weakening of the scheduler contract. The instance
   // adapter needs structured output AND the same 10 = actionable signal that text mode gives.
   // Returning 0 here made a granted arrival look quiet to every JSON-consuming runtime.

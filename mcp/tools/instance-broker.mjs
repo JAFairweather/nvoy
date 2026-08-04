@@ -76,8 +76,16 @@ try { nsec = readFileSync(credential, 'utf8').trim() } catch { die('cannot read 
 if (!/^nsec1[023456789acdefghjklmnpqrstuvwxyz]+$/.test(nsec) && !/^[0-9a-f]{64}$/i.test(nsec)) die('broker credential is not an nsec or hex key')
 
 const attention = resolve(new URL('.', import.meta.url).pathname, 'attention.mjs')
-const env = { HOME: manifest.stateDir, PATH: process.env.PATH || '', NVOY_NSEC: nsec,
-  NVOY_RELAYS: manifest.relays.join(','), GRANTORS: manifest.grantors.join(',') }
+const env = { HOME: manifest.stateDir, PATH: process.env.PATH || '', NVOY_RELAYS: manifest.relays.join(','), GRANTORS: manifest.grantors.join(',') }
+// In production this file is the stable NIP-46 *transport* credential, never the participant
+// identity nsec. The Bunker owns the identity and performs every decrypt/sign operation.
+const bunkerUriPath = process.env.NVOY_BUNKER_URI_FILE || ''
+if (bunkerUriPath) {
+  let bunkerUri; try { bunkerUri = readFileSync(bunkerUriPath, 'utf8').trim() } catch { die('cannot read Bunker URI credential') }
+  if (!/^bunker:\/\//i.test(bunkerUri)) die('Bunker URI credential is invalid')
+  env.NVOY_BUNKER_URI = bunkerUri
+  env.NVOY_NIP46_CLIENT_NSEC = nsec
+} else env.NVOY_NSEC = nsec
 const result = spawnSync(process.execPath, [attention, '--json', '--envelope', envelope], { env, encoding: 'utf8', timeout: 60000 })
 // 10 is attention's intentional "actionable" signal. Any other nonzero status is failure
 // closed: no plaintext leaves the broker.
@@ -89,6 +97,27 @@ if (!report.policyUsable || !Array.isArray(report.actionable) || !report.actiona
   try { renameSync(markerPath, `${markerPath}.done`) } catch (e) { die(`cannot finalize terminal marker: ${e.message}`) }
   process.exit(0)
 }
+
+// A reply may only be addressed to someone who was admitted for this exact envelope.  The
+// keyless adapter never creates this receipt and cannot add a new reply target to it.
+const receiptDir = resolve(manifest.stateDir, 'receipts')
+const receiptPath = resolve(receiptDir, `${envelope}.json`)
+const admissions = Array.isArray(report.admissions) ? report.admissions : []
+if (report.actionable.length !== 1 || admissions.length !== 1) die('an outbound-capable delivery must bind exactly one admitted sender')
+const admission = admissions[0]
+if (!/^[0-9a-f]{64}$/.test(String(admission?.from || '')) || !/^[0-9a-f]{64}$/.test(String(admission?.grant_id || '')) ||
+  String(admission.from).toLowerCase() !== String(report.actionable[0].from).toLowerCase()) die('admitted payload lacks a verifiable sender/grant binding')
+const receipt = { version: 1, instance: manifest.id, broker: manifest.pubkey, envelope,
+  sender: String(admission.from).toLowerCase(), grant_id: String(admission.grant_id).toLowerCase(),
+  grantor: String(admission.grantor || '').toLowerCase(), cap: String(admission.cap || ''),
+  admitted_at: Date.now(), expires_at: Date.now() + 5 * 60 * 1000 }
+if (!/^[0-9a-f]{64}$/.test(receipt.sender)) die('admitted payload had no valid sender identity')
+try {
+  mkdirSync(receiptDir, { recursive: true, mode: 0o700 })
+  const tmp = `${receiptPath}.${process.pid}.tmp`
+  writeFileSync(tmp, JSON.stringify(receipt), { mode: 0o600 })
+  renameSync(tmp, receiptPath)
+} catch (e) { die(`cannot persist admission receipt: ${e.message}`) }
 
 const socket = resolve(manifest.runtimeDir, 'adapter.sock')
 const payload = JSON.stringify({ type: 'admitted-task', instance: manifest.id, envelope, messages: report.actionable }) + '\n'

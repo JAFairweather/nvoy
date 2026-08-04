@@ -4,7 +4,7 @@
 // crash-left `.inflight` markers are requeued at boot and are harmless because the adapter queue
 // deduplicates on envelope before ACKing.
 
-import { readdirSync, renameSync } from 'node:fs'
+import { readdirSync, renameSync, readFileSync, lstatSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
@@ -18,7 +18,9 @@ let manifest
 try { manifest = readManifest(root, instanceId(id)); assertNoCollisions(root, manifest) } catch (e) { die(e.message) }
 if (!process.env.NVOY_BROKER_CREDENTIAL) die('broker credential path is unavailable')
 const broker = resolve(new URL('.', import.meta.url).pathname, 'instance-broker.mjs')
-const childEnv = { PATH: process.env.PATH || '', NVOY_INSTANCE_ROOT: root, NVOY_BROKER_CREDENTIAL: process.env.NVOY_BROKER_CREDENTIAL }
+const reply = resolve(new URL('.', import.meta.url).pathname, 'instance-broker-reply.mjs')
+const childEnv = { PATH: process.env.PATH || '', NVOY_INSTANCE_ROOT: root, NVOY_BROKER_CREDENTIAL: process.env.NVOY_BROKER_CREDENTIAL,
+  ...(process.env.NVOY_BUNKER_URI_FILE ? { NVOY_BUNKER_URI_FILE: process.env.NVOY_BUNKER_URI_FILE } : {}) }
 
 function recover() {
   let names = []
@@ -39,6 +41,21 @@ function drain() {
     const r = spawnSync(process.execPath, [broker, 'deliver', '--instance', manifest.id, '--envelope', m[1]], { env: childEnv, encoding: 'utf8', timeout: 90000 })
     if (r.status !== 0) console.error(`instance-broker-daemon: ${m[1].slice(0, 12)}… held for retry: ${String(r.stderr || '').trim()}`)
   }
+  // The adapter-owned queue is append-only.  A reply tool receives only a 32-hex request id;
+  // it reopens this fixed queue, then binds the request to the broker-authored admission receipt.
+  const replyQueue = resolve(manifest.runtimeDir, 'reply-requests.jsonl')
+  try {
+    const st = lstatSync(replyQueue)
+    if (!st.isFile() || st.isSymbolicLink()) throw new Error('reply queue is not a regular file')
+    const ids = new Set()
+    for (const line of readFileSync(replyQueue, 'utf8').split('\n')) {
+      try { const x = JSON.parse(line); if (/^[0-9a-f]{32}$/.test(String(x.id || ''))) ids.add(x.id) } catch { /* trailing partial line */ }
+    }
+    for (const request of ids) {
+      const r = spawnSync(process.execPath, [reply, '--instance', manifest.id, '--request', request], { env: childEnv, encoding: 'utf8', timeout: 90000 })
+      if (r.status !== 0) console.error(`instance-broker-daemon: reply ${request.slice(0, 12)}… held for retry: ${String(r.stderr || '').trim()}`)
+    }
+  } catch (e) { if (e.code !== 'ENOENT') console.error(`instance-broker-daemon: reply queue unavailable: ${e.message}`) }
 }
 recover()
 drain()
