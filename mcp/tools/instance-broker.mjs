@@ -91,7 +91,7 @@ if (!report.policyUsable || !Array.isArray(report.actionable) || !report.actiona
 }
 
 const socket = resolve(manifest.runtimeDir, 'adapter.sock')
-const payload = JSON.stringify({ type: 'admitted-task', instance: manifest.id, messages: report.actionable }) + '\n'
+const payload = JSON.stringify({ type: 'admitted-task', instance: manifest.id, envelope, messages: report.actionable }) + '\n'
 const client = net.createConnection(socket)
 const timer = setTimeout(() => { client.destroy(); die('adapter acknowledgement timed out') }, 15000)
 client.on('error', e => { clearTimeout(timer); die(`adapter socket unavailable: ${e.message}`) })

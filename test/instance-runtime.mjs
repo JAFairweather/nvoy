@@ -53,9 +53,10 @@ const waitFor = async (predicate, ms = 2000) => {
   while (Date.now() < until) { if (predicate()) return true; await new Promise(r => setTimeout(r, 25)) }
   return false
 }
-const packet = { type: 'admitted-task', instance: 'codex-test', messages: [{ from: 'a'.repeat(64), at: 1, content: 'only broker-admitted text' }] }
+const packet = { type: 'admitted-task', instance: 'codex-test', envelope: 'b'.repeat(64), messages: [{ from: 'a'.repeat(64), at: 1, content: 'only broker-admitted text' }] }
 let ack = ''
-if (await waitFor(() => existsSync(socket))) {
+const sendPacket = async () => {
+  if (!await waitFor(() => existsSync(socket))) return
   await new Promise(resolveAck => {
     const client = net.createConnection(socket)
     client.on('connect', () => client.write(JSON.stringify(packet) + '\n'))
@@ -64,11 +65,14 @@ if (await waitFor(() => existsSync(socket))) {
     client.on('error', resolveAck)
   })
 }
+await sendPacket()
+await sendPacket() // a redelivery after a broker crash must be acknowledgement-only
 adapter.kill('SIGTERM')
 if (!ack) console.error(`adapter diagnostic: ${adapterLog}`)
 ok('the keyless adapter accepts only the bound instance packet and acknowledges it', /"type":"ack"/.test(ack) && /"instance":"codex-test"/.test(ack))
 const admittedQueue = join(manifest.runtime_dir, 'admitted-tasks.jsonl')
 ok('the adapter durably queues admitted plaintext before acknowledging', existsSync(admittedQueue) && readFileSync(admittedQueue, 'utf8').includes('only broker-admitted text'))
+ok('a replayed envelope is acknowledged but never queued twice', existsSync(admittedQueue) && readFileSync(admittedQueue, 'utf8').trim().split('\n').length === 1)
 
 writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...manifest, id: 'collision', runtime_dir: join(root, 'run-other') }))
 const collision = cli('describe', '--instance', 'codex-test')
