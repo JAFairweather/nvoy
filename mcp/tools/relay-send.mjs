@@ -11,9 +11,13 @@
 //   NVOY_NSEC=$(grep -oE 'nsec1[0-9a-z]+' ~/.nvoy/claude-identity.env | head -1) \
 //     node tools/relay-send.mjs < message.txt
 //   echo "@Neil — ping" | NVOY_NSEC=… node tools/relay-send.mjs
+//   NVOY_BUNKER_URI_FILE=/run/secrets/uri NVOY_NIP46_CLIENT_FILE=/run/secrets/client \
+//     node tools/relay-send.mjs < message.txt
 //
 // Env:
-//   NVOY_NSEC              (required) your identity — never printed, never in argv
+//   NVOY_NSEC              local identity (one of this or the Bunker pair is required)
+//   NVOY_BUNKER_URI_FILE   Bunker connection capability file
+//   NVOY_NIP46_CLIENT_FILE Bunker transport nsec file (not the identity nsec)
 //   WAGGLE_BRIDGE_PUBKEY   waggle's hex pubkey        (default: the live bridge key)
 //   RELAY_CHANNEL          destination channel UUID   (default: #waggle-test)
 //   RELAY_RELAYS           comma-sep relays           (default: nos.lol, primal)
@@ -22,10 +26,12 @@
 // After sending, VERIFY by reading your own inbox (inbox.mjs) — the crew's replies come back
 // sealed to your key. Do NOT SSH-poll the channel; the inbox is the mechanism.
 
+import { readFileSync } from 'node:fs'
 import { getPublicKey, getEventHash, finalizeEvent, generateSecretKey } from 'nostr-tools/pure'
 import * as nip19 from 'nostr-tools/nip19'
 import * as nip44 from 'nostr-tools/nip44'
 import WebSocket from 'ws'
+import { makeBunkerSigner } from './nip46-signer.mjs'
 
 const BRIDGE = (process.env.WAGGLE_BRIDGE_PUBKEY ||
   '84753207f2c6ae73af247da174e8e7c91a7d939a8eb0b4c2b98b54ea567786e6').toLowerCase()
@@ -34,10 +40,19 @@ const RELAYS = (process.env.RELAY_RELAYS || 'wss://nos.lol,wss://relay.primal.ne
   .split(',').map(s => s.trim()).filter(Boolean)
 const DRY = !!process.env.DRY_RUN
 
-const raw = process.env.NVOY_NSEC
-if (!raw) { console.error('relay-send: set NVOY_NSEC (your identity)'); process.exit(1) }
-const sk = raw.startsWith('nsec1') ? nip19.decode(raw).data : Uint8Array.from(Buffer.from(raw, 'hex'))
-const pk = getPublicKey(sk)
+const readCredential = (path, label) => {
+  if (!path) return ''
+  try { return readFileSync(path, 'utf8').trim() } catch { console.error(`relay-send: cannot read ${label}`); process.exit(1) }
+}
+const bunkerUri = readCredential(process.env.NVOY_BUNKER_URI_FILE, 'Bunker URI credential')
+const bunkerClient = readCredential(process.env.NVOY_NIP46_CLIENT_FILE, 'Bunker client credential')
+if (!!bunkerUri !== !!bunkerClient) { console.error('relay-send: Bunker URI and client credential must be supplied together'); process.exit(1) }
+const raw = process.env.NVOY_NSEC || ''
+if (raw && bunkerUri) { console.error('relay-send: choose local NVOY_NSEC or the Bunker signer, never both'); process.exit(1) }
+if (!raw && !bunkerUri) { console.error('relay-send: set NVOY_NSEC or the Bunker credential-file pair'); process.exit(1) }
+const sk = raw ? (raw.startsWith('nsec1') ? nip19.decode(raw).data : Uint8Array.from(Buffer.from(raw, 'hex'))) : null
+const signer = bunkerUri ? makeBunkerSigner(bunkerUri, bunkerClient) : null
+const pk = signer ? await signer.getPublicKey() : getPublicKey(sk)
 
 const body = await new Promise((res) => {
   let s = ''
@@ -50,8 +65,9 @@ if (!body) { console.error('relay-send: empty body on stdin — nothing to send'
 const now = Math.floor(Date.now() / 1000)
 const rumor = { kind: 14, pubkey: pk, created_at: now, tags: [['relay', CHANNEL]], content: body }
 rumor.id = getEventHash(rumor)
-const seal = finalizeEvent({ kind: 13, created_at: now, tags: [],
-  content: nip44.encrypt(JSON.stringify(rumor), nip44.getConversationKey(sk, BRIDGE)) }, sk)
+const sealTemplate = { kind: 13, created_at: now, tags: [],
+  content: signer ? await signer.nip44Encrypt(BRIDGE, JSON.stringify(rumor)) : nip44.encrypt(JSON.stringify(rumor), nip44.getConversationKey(sk, BRIDGE)) }
+const seal = signer ? await signer.signEvent(sealTemplate) : finalizeEvent(sealTemplate, sk)
 const wsk = generateSecretKey()
 const wrap = finalizeEvent({ kind: 1059, created_at: now, tags: [['p', BRIDGE]],
   content: nip44.encrypt(JSON.stringify(seal), nip44.getConversationKey(wsk, BRIDGE)) }, wsk)
