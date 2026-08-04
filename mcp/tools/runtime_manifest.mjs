@@ -49,8 +49,9 @@ export function readManifest(root, requestedId) {
   if (raw.id !== id) die('manifest id does not match requested instance')
   const pubkey = toHex(raw.pubkey || raw.recipient)
   const grantors = (Array.isArray(raw.grantors) ? raw.grantors : []).map(toHex)
+  const relayAttestors = (Array.isArray(raw.relay_attestors || raw.relayAttestors) ? (raw.relay_attestors || raw.relayAttestors) : []).map(toHex)
   const relays = (Array.isArray(raw.relays) ? raw.relays : []).map(String).filter(v => /^wss:\/\//.test(v))
-  if (!valid(pubkey) || !grantors.length || !grantors.every(valid) || !relays.length) die('manifest requires pubkey, grantors, and wss relays')
+  if (!valid(pubkey) || !grantors.length || !grantors.every(valid) || !relayAttestors.every(valid) || !relays.length) die('manifest requires pubkey, valid grantors/relay_attestors, and wss relays')
   const rawStateDir = String(raw.state_dir || raw.stateDir || '')
   const rawRuntimeDir = String(raw.runtime_dir || raw.runtimeDir || '')
   const rawSpoolDir = String(raw.spool_dir || raw.spoolDir || '')
@@ -85,6 +86,8 @@ export function readManifest(root, requestedId) {
   const workerImage = String(raw.worker_image || raw.workerImage || '')
   const workerRunner = String(raw.worker_runner || raw.workerRunner || '')
   const workerCredentialRef = String(raw.worker_credential_ref || raw.workerCredentialRef || '')
+  const workerEnabled = raw.worker_enabled == null ? true : raw.worker_enabled
+  if (typeof workerEnabled !== 'boolean') die('worker_enabled must be boolean')
   if ((workerImage || workerRunner || workerCredentialRef) && (!/^[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$/i.test(workerImage) || !['codex', 'claude'].includes(workerRunner) || !workerCredentialRef.startsWith('/'))) die('worker_image must be digest-pinned, worker_runner must be codex or claude, and worker_credential_ref must be absolute')
   if (brokerMode === 'remote' && (workerImage || workerRunner || workerCredentialRef)) die('a remote-broker Desktop manifest cannot carry a model-worker credential or runtime')
   // Delivery is deliberately independent of the Nostr admission pipeline.  `headless` is the
@@ -113,8 +116,8 @@ export function readManifest(root, requestedId) {
       die('a remote broker manifest requires fixed ssh_target, absolute SSH files, and ssh_known_hosts_sha256')
     }
   }
-  return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, relays, stateDir, runtimeDir, spoolDir,
-    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath,
+  return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, relayAttestors, relays, stateDir, runtimeDir, spoolDir,
+    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerImage, workerRunner, workerCredentialRef, workerEnabled, deliveryMode, codexThreadId, codexTransport, codexSocketPath,
     sshTarget, sshIdentityFile, sshKnownHostsFile, sshKnownHostsSha256 })
 }
 

@@ -34,6 +34,7 @@ import { decode, npubEncode } from 'nostr-tools/nip19'
 import { getPublicKey, verifyEvent } from 'nostr-tools/pure'
 import * as nip44 from 'nostr-tools/nip44'
 import { makeBunkerSigner } from './nip46-signer.mjs'
+import { relayAttestation } from './relay_attestation.mjs'
 
 const arg = (n, d) => { const i = process.argv.indexOf(n); return i === -1 ? d : process.argv[i + 1] }
 const die = (m) => { console.error(`attention: ${m}`); process.exit(1) }
@@ -59,6 +60,10 @@ if (bunkerUri) {
 // authorised, which is the correct failure direction.
 const GRANTORS = String(process.env.GRANTORS || '4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b287ea84d')
   .split(',').map(s => toHex(s.trim())).filter(Boolean)
+// A relay attestor may transport a complete, independently-verifiable signed channel event.
+// It is never tasking authority itself: only the embedded event signer can hold that grant.
+const RELAY_ATTESTORS = String(process.env.RELAY_ATTESTORS || '')
+  .split(',').map(s => toHex(s.trim())).filter(s => /^[0-9a-f]{64}$/.test(s))
 
 // Kind numbers and tag names mirror the bridge's admission tier so one vocabulary covers both.
 const KIND = { grant: 440, revocation: 441 }
@@ -165,7 +170,9 @@ for (const w of wraps.values()) {
     const rumor = JSON.parse(await decrypt(seal.pubkey, seal.content))
     if (rumor.kind !== 14 || rumor.pubkey !== seal.pubkey) continue // author-spoof guard
     if (rumor.created_at < since || seal.pubkey === ME) continue
-    msgs.push({ from: seal.pubkey, at: rumor.created_at, content: String(rumor.content || '') })
+    const attested = relayAttestation(rumor, seal.pubkey, RELAY_ATTESTORS)
+    if (attested.present) { if (attested.message) msgs.push(attested.message); continue }
+    msgs.push({ from: seal.pubkey, transport_from: seal.pubkey, at: rumor.created_at, content: String(rumor.content || '') })
   } catch { /* not for me */ }
 }
 msgs.sort((a, b) => a.at - b.at)
@@ -197,7 +204,8 @@ if (process.argv.includes('--mark')) {
 if (process.argv.includes('--json')) {
   const admissions = actionable.map(m => {
     const g = permitted.get(m.from)
-    return { from: m.from, grant_id: g?.grantId || '', grantor: g?.grantor || '', cap: g?.cap || '' }
+    return { from: m.from, reply_to: m.transport_from || m.from, relay_channel: m.relay_channel || '',
+      grant_id: g?.grantId || '', grantor: g?.grantor || '', cap: g?.cap || '' }
   })
   console.log(JSON.stringify({ me: ME, grantors: GRANTORS, relaysAnswered, policyUsable,
     permitted: [...permitted.keys()], rejectedGrants: rejected,

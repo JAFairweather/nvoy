@@ -52,7 +52,7 @@ if (existsSync(receiptUsed)) { console.log(JSON.stringify({ request: requestId, 
 let receiptPath = existsSync(receiptInflight) ? receiptInflight : receiptBase
 regular(receiptPath, 'admission receipt')
 let receipt; try { receipt = JSON.parse(readFileSync(receiptPath, 'utf8')) } catch { die('admission receipt is invalid') }
-if (receipt.version !== 1 || receipt.instance !== manifest.id || receipt.broker !== manifest.pubkey || receipt.envelope !== request.receipt ||
+if (![1, 2].includes(receipt.version) || receipt.instance !== manifest.id || receipt.broker !== manifest.pubkey || receipt.envelope !== request.receipt ||
   !/^[0-9a-f]{64}$/.test(String(receipt.sender || '')) || !Number.isFinite(receipt.expires_at) || Date.now() > receipt.expires_at) {
   die('admission receipt is not a live broker-bound sender capability')
 }
@@ -76,13 +76,16 @@ if (await signer.getPublicKey() !== manifest.pubkey) die('signer does not match 
 // Re-open the exact envelope through the same signer and require the recorded grant to remain
 // live before consuming the one-use receipt or authoring a seal.
 const attention = resolve(new URL('.', import.meta.url).pathname, 'attention.mjs')
-const checkEnv = { HOME: manifest.stateDir, PATH: process.env.PATH || '', NVOY_RELAYS: manifest.relays.join(','), GRANTORS: manifest.grantors.join(',') }
+const checkEnv = { HOME: manifest.stateDir, PATH: process.env.PATH || '', NVOY_RELAYS: manifest.relays.join(','),
+  GRANTORS: manifest.grantors.join(','), RELAY_ATTESTORS: manifest.relayAttestors.join(',') }
 if (bunkerUri) { checkEnv.NVOY_BUNKER_URI = bunkerUri; checkEnv.NVOY_NIP46_CLIENT_NSEC = raw } else checkEnv.NVOY_NSEC = raw
 const checked = spawnSync(process.execPath, [attention, '--json', '--envelope', receipt.envelope], { env: checkEnv, encoding: 'utf8', timeout: 60000 })
 if (![0, 10].includes(checked.status)) die('could not recheck live grant policy')
 let policy; try { policy = JSON.parse(checked.stdout) } catch { die('live grant policy result is invalid') }
 const current = Array.isArray(policy.admissions) ? policy.admissions : []
-if (!policy.policyUsable || current.length !== 1 || current[0].from !== receipt.sender || current[0].grant_id !== receipt.grant_id) die('admission receipt no longer has a live matching grant')
+const principal = receipt.version === 2 ? receipt.principal : receipt.sender
+if (!policy.policyUsable || current.length !== 1 || current[0].from !== principal ||
+    String(current[0].reply_to || current[0].from) !== receipt.sender || current[0].grant_id !== receipt.grant_id) die('admission receipt no longer has a live matching grant')
 if (receiptPath === receiptBase) {
   try { renameSync(receiptBase, receiptInflight); receiptPath = receiptInflight }
   catch (e) { die(`cannot atomically claim one-use admission receipt: ${e.message}`) }
@@ -104,8 +107,9 @@ if (existsSync(recordPath)) {
   }
 } else {
   const now = Math.floor(Date.now() / 1000)
-  const rumor = { kind: 14, pubkey: manifest.pubkey, created_at: now,
-    tags: [['p', receipt.sender], ['e', receipt.envelope, '', 'reply']], content: request.content }
+  const tags = [['p', receipt.sender], ['e', receipt.envelope, '', 'reply']]
+  if (receipt.version === 2 && receipt.relay_channel) tags.push(['relay', receipt.relay_channel])
+  const rumor = { kind: 14, pubkey: manifest.pubkey, created_at: now, tags, content: request.content }
   rumor.id = getEventHash(rumor)
   const backdated = () => Math.floor(Date.now() / 1000 - Math.random() * 2 * 24 * 60 * 60)
   const seal = await signer.signEvent({ kind: 13, created_at: backdated(), tags: [],

@@ -13,9 +13,13 @@ export function validateAdmittedTask(record, { instance = '', scopeSubject = '',
       !Array.isArray(record.messages) || !record.messages.length || record.messages.length > 64) throw new Error('invalid admitted task')
   for (const message of record.messages) {
     if (!message || typeof message !== 'object' || Array.isArray(message) ||
-        Object.keys(message).some(key => !['from', 'at', 'content', 'event_id', 'kind'].includes(key)) ||
+        Object.keys(message).some(key => !['from', 'transport_from', 'at', 'content', 'event_id', 'kind', 'relay_channel'].includes(key)) ||
         !HEX64.test(String(message.from || '')) || !Number.isFinite(Number(message.at)) ||
-        typeof message.content !== 'string' || Buffer.byteLength(message.content) > 256 * 1024) throw new Error('invalid admitted message')
+        typeof message.content !== 'string' || Buffer.byteLength(message.content) > 256 * 1024 ||
+        (message.transport_from != null && !HEX64.test(String(message.transport_from))) ||
+        (message.event_id != null && !HEX64.test(String(message.event_id))) ||
+        (message.kind != null && message.kind !== 9) ||
+        (message.relay_channel != null && !/^[0-9a-f-]{0,128}$/i.test(String(message.relay_channel)))) throw new Error('invalid admitted message')
   }
   if (record.authority == null) return { trustedInstruction: false }
   const a = record.authority

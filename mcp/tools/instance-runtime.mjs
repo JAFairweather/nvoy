@@ -31,7 +31,8 @@ const baseEnv = { HOME: manifest.stateDir, PATH: process.env.PATH || '', NVOY_RE
 const tool = name => resolve(new URL('.', import.meta.url).pathname, name)
 if (command === 'describe') {
   console.log(JSON.stringify({ id: manifest.id, recipient: manifest.pubkey, grantors: manifest.grantors,
-    relays: manifest.relays, stateDir: manifest.stateDir, brokerMode: manifest.brokerMode,
+    relayAttestors: manifest.relayAttestors, relays: manifest.relays, stateDir: manifest.stateDir, brokerMode: manifest.brokerMode,
+    workerEnabled: manifest.workerEnabled,
     watcher: manifest.brokerMode === 'local' ? 'keyless' : 'remote' }, null, 2)); process.exit(0)
 }
 if (command === 'watch' || command === 'baseline') {

@@ -52,7 +52,9 @@ contains only public routing policy:
   "worker_image": "ghcr.io/example/nvoy-worker@sha256:<64-hex-digest>",
   "worker_runner": "codex",
   "worker_credential_ref": "/etc/nvoy/credentials/codex-jaf.openai-api-key",
+  "worker_enabled": false,
   "grantors": ["<64 hex>"],
+  "relay_attestors": ["<Waggle bridge 64 hex>"],
   "relays": ["wss://nos.lol", "wss://relay.primal.net"]
 }
 ```
@@ -120,6 +122,21 @@ and may not choose another one.
    sender, participant scope, and policy-check time. Every transport boundary validates that
    attestation and binds every message to its sender. Records from older runtimes without an
    attestation remain notifications/data; they are never silently promoted to instructions.
+
+### Channel-author relay attestations
+
+A direct DM proves its sender through the NIP-17 seal. A Buzz/Armada channel carry is different:
+the outer seal is authored by Waggle because Waggle is the transport that can read the gated
+channel. A runtime must never treat that bridge signature as the human author's task authority.
+
+An instance may therefore declare a narrow `relay_attestors` list. A configured Waggle bridge may
+place the complete original signed kind:9 event in an encrypted `waggle-source` rumor tag. The
+broker independently verifies the source event id/signature, keeps the bridge as `transport_from`,
+checks the live `task` grant for the original source pubkey and this exact participant scope, and
+only then emits scoped authority naming the source signer. Malformed claims, duplicate source
+tags, unconfigured transports, invalid signatures, and unavailable grant policy all fail closed.
+Replies go to the transport identity with the source event's signed channel id as a `relay` tag;
+the bridge still applies its own admission and channel allowlist before posting.
 4. The adapter starts/alerts its client using a fixed local mechanism. An MCP
 `resources/updated` notification is **not** a desktop wake guarantee. For Codex, the first
 context-preserving adapter is `codex-app-server-adapter.mjs`: it runs locally, resumes the one

@@ -30,4 +30,8 @@ const replacements = {
 }
 for (const [from, to] of Object.entries(replacements)) out = out.split(from).join(to)
 if (/\$\{(?:WATCHER_UID|BROKER_UID|ADAPTER_UID|WORKER_UID|BROKER_ADAPTER_GID|WORKER_HANDOFF_GID|INSTANCE_ID|MANIFEST_DIR|STATE_DIR|SPOOL_DIR|RUNTIME_DIR|BUNKER_URI_FILE|BUNKER_CLIENT_FILE|WORKER_IMAGE|WORKER_RUNNER|WORKER_CREDENTIAL_FILE|BROKER_CREDENTIAL_FILE)/.test(out)) die('template retained an identity deployment variable')
+// A Desktop-bound server has an external, exact-thread adapter. Omitting the independent worker
+// is stronger than restart:"no": `docker compose up` starts a disabled service once, which is
+// enough to produce a duplicate model reply. No service in the graph means no second actor.
+if (!m.workerEnabled) out = out.replace(/\n  worker:[\s\S]*?(?=\nsecrets:)/, '')
 process.stdout.write(out)

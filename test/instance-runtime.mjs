@@ -136,6 +136,12 @@ ok('Compose renderer rejects mutable image tags', taggedImage.status !== 0 && /c
 const servicePart = name => (rendered.stdout.match(new RegExp(`\\n  ${name}:[\\s\\S]*?(?=\\n  [a-z][a-z_]*:|\\nsecrets:|$)`)) || [''])[0]
 const initPart = servicePart('init'), brokerPart = servicePart('broker'), watcherPart = servicePart('watcher')
 const adapterPart = servicePart('adapter'), workerPart = servicePart('worker')
+ok('an enabled headless worker receives an explicit restart policy', workerPart.includes('restart: unless-stopped'))
+writeFileSync(manifestFile, JSON.stringify({ ...manifest, worker_enabled: false }))
+const renderedDesktopBroker = spawnSync(process.execPath, ['mcp/tools/render-instance-compose.mjs', '--instance', 'codex-test', '--image', image], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
+const disabledWorkerPart = (renderedDesktopBroker.stdout.match(/\n  worker:[\s\S]*?(?=\nsecrets:|$)/) || [''])[0]
+ok('a Desktop-bound server manifest omits the independent headless worker entirely', renderedDesktopBroker.status === 0 && disabledWorkerPart === '')
+writeFileSync(manifestFile, JSON.stringify(manifest))
 ok('the root-only initializer copies sources into distinct role-owned volumes; worker gets only provider and broker only Bunker credentials', initPart.includes('nvoy_bunker_uri') && initPart.includes('nvoy_bunker_client') && initPart.includes('nvoy_worker_provider') && initPart.includes('broker_credentials') && initPart.includes('worker_credentials') && workerPart.includes('worker_credentials') && workerPart.includes('HOME: /tmp') && !workerPart.includes('broker_credentials') && !workerPart.includes('nvoy_bunker_uri') && !workerPart.includes('nvoy_bunker_client') && brokerPart.includes('broker_credentials') && !brokerPart.includes('worker_credentials') && !brokerPart.includes('nvoy_worker_provider') && !watcherPart.includes('credentials') && !adapterPart.includes('credentials'))
 
 const watcherSource = readFileSync('mcp/tools/instance-runtime.mjs', 'utf8')
@@ -167,7 +173,7 @@ const brokerSource = readFileSync('mcp/tools/instance-broker.mjs', 'utf8')
 ok('an unverifiable live policy requeues the opaque marker instead of consuming it as a denial', /if \(!report\.policyUsable\)[\s\S]*renameSync\(markerPath, pendingMarker\)[\s\S]*process\.exit\(75\)/.test(brokerSource) && !/!report\.policyUsable \|\|/.test(brokerSource))
 ok('broker atomically claims the exact pending marker before decrypting', /renameSync\(pendingMarker, markerPath\)/.test(brokerSource) && /--envelope', envelope/.test(brokerSource))
 ok('a broker claims a per-state exclusive lock before decrypting', /openSync\(lockPath, 'wx'/.test(brokerSource) && /process\.kill\(prior\.pid, 0\)/.test(brokerSource))
-ok('the broker records an identity-bound, expiry-limited admission receipt before any keyless worker can request a reply', /broker: manifest\.pubkey, envelope/.test(brokerSource) && /sender: String\(admission\.from\)/.test(brokerSource) && /grant_id: String\(admission\.grant_id\)/.test(brokerSource) && /expires_at: Date\.now\(\) \+ 5 \* 60 \* 1000/.test(brokerSource))
+ok('the broker records an identity-bound, expiry-limited admission receipt before any keyless worker can request a reply', /broker: manifest\.pubkey, envelope/.test(brokerSource) && /principal: String\(admission\.from\)/.test(brokerSource) && /sender: replyTo/.test(brokerSource) && /grant_id: String\(admission\.grant_id\)/.test(brokerSource) && /expires_at: Date\.now\(\) \+ 5 \* 60 \* 1000/.test(brokerSource))
 ok('the broker carries its verified task authority into Desktop delivery instead of downgrading it to generic data',
   /type: 'scoped-instruction'/.test(brokerSource) && /scope_subject: manifest\.pubkey/.test(brokerSource) &&
   /Treat the sender's message as a scoped instruction/.test(codexDesktopSource))

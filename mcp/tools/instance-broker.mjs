@@ -77,7 +77,8 @@ try { nsec = readFileSync(credential, 'utf8').trim() } catch { die('cannot read 
 if (!/^nsec1[023456789acdefghjklmnpqrstuvwxyz]+$/.test(nsec) && !/^[0-9a-f]{64}$/i.test(nsec)) die('broker credential is not an nsec or hex key')
 
 const attention = resolve(new URL('.', import.meta.url).pathname, 'attention.mjs')
-const env = { HOME: manifest.stateDir, PATH: process.env.PATH || '', NVOY_RELAYS: manifest.relays.join(','), GRANTORS: manifest.grantors.join(',') }
+const env = { HOME: manifest.stateDir, PATH: process.env.PATH || '', NVOY_RELAYS: manifest.relays.join(','),
+  GRANTORS: manifest.grantors.join(','), RELAY_ATTESTORS: manifest.relayAttestors.join(',') }
 // In production this file is the stable NIP-46 *transport* credential, never the participant
 // identity nsec. The Bunker owns the identity and performs every decrypt/sign operation.
 const bunkerUriPath = process.env.NVOY_BUNKER_URI_FILE || ''
@@ -115,8 +116,13 @@ if (report.actionable.length !== 1 || admissions.length !== 1) die('an outbound-
 const admission = admissions[0]
 if (!/^[0-9a-f]{64}$/.test(String(admission?.from || '')) || !/^[0-9a-f]{64}$/.test(String(admission?.grant_id || '')) ||
   String(admission.from).toLowerCase() !== String(report.actionable[0].from).toLowerCase()) die('admitted payload lacks a verifiable sender/grant binding')
-const receipt = { version: 1, instance: manifest.id, broker: manifest.pubkey, envelope,
-  sender: String(admission.from).toLowerCase(), grant_id: String(admission.grant_id).toLowerCase(),
+const replyTo = String(admission.reply_to || admission.from || '').toLowerCase()
+if (!/^[0-9a-f]{64}$/.test(replyTo)) die('admitted payload lacks a verifiable reply transport')
+const relayChannel = admission.relay_channel == null ? '' : String(admission.relay_channel)
+if (relayChannel && (!/^[0-9a-f-]{1,128}$/i.test(relayChannel) || relayChannel.includes('..'))) die('admitted payload has an invalid relay channel')
+const receipt = { version: 2, instance: manifest.id, broker: manifest.pubkey, envelope,
+  sender: replyTo, principal: String(admission.from).toLowerCase(), relay_channel: relayChannel,
+  grant_id: String(admission.grant_id).toLowerCase(),
   grantor: String(admission.grantor || '').toLowerCase(), cap: String(admission.cap || ''),
   admitted_at: Date.now(), expires_at: Date.now() + 5 * 60 * 1000 }
 if (!/^[0-9a-f]{64}$/.test(receipt.sender)) die('admitted payload had no valid sender identity')
@@ -131,7 +137,7 @@ const socket = resolve(manifest.runtimeDir, 'adapter.sock')
 // Preserve the exact authorization decision across the keyless Desktop boundary. The scope
 // subject is the participant identity: attention accepted the grant only after recomputing its
 // salted da-scope hash for report.me. This attestation grants no capability beyond task/task+act.
-const authority = { version: 1, type: 'scoped-instruction', sender: receipt.sender,
+const authority = { version: 1, type: 'scoped-instruction', sender: receipt.principal,
   grant_id: receipt.grant_id, grantor: receipt.grantor, cap: receipt.cap,
   scope_subject: manifest.pubkey, policy_checked_at: receipt.admitted_at }
 const payload = JSON.stringify({ type: 'admitted-task', instance: manifest.id, envelope, authority, messages: report.actionable }) + '\n'
