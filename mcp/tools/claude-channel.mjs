@@ -26,18 +26,23 @@ try { manifest = readManifest(root, instanceId(id)); assertNoCollisions(root, ma
 if (manifest.brokerMode !== 'local' || manifest.deliveryMode !== 'notify_only' || manifest.workerEnabled) {
   die('Claude channel requires a local-broker, worker-disabled notify_only manifest')
 }
-if (process.getuid?.() !== manifest.adapterUid) die('Claude channel must run as the manifest-bound adapter user')
+// Claude Code invokes this MCP process from the model/tool account. That account must be the
+// manifest worker UID: it has group-read on the adapter-authored admitted queue, but no write or
+// replacement authority over that queue, runtime root, or adapter socket. Running as adapterUid
+// would let the consumer forge the very authority records it validates.
+if (process.getuid?.() !== manifest.workerUid) die('Claude channel must run as the manifest-bound worker user')
 
 const queuePath = resolve(manifest.runtimeDir, 'admitted-tasks.jsonl')
-const readPath = resolve(manifest.runtimeDir, 'claude-channel-read.jsonl')
-const replyPath = resolve(manifest.runtimeDir, 'desktop-reply-requests.jsonl')
+const channelStateDir = resolve(manifest.runtimeDir, 'claude-channel-state')
+const readPath = resolve(channelStateDir, 'read.jsonl')
+const replyPath = resolve(manifest.runtimeDir, 'reply-requests.jsonl')
 const HEX64 = /^[0-9a-f]{64}$/
 const notifiedThisRun = new Set()
 
 // One participant identity may bind one live Claude channel only. A second session would receive
 // the same marker and become a duplicate responder. Reclaim only a lock whose recorded PID is
 // demonstrably gone; malformed/foreign locks fail closed.
-const lockPath = resolve(manifest.runtimeDir, 'claude-channel.lock')
+const lockPath = resolve(channelStateDir, 'channel.lock')
 function claimLock() {
   try {
     const fd = openSync(lockPath, 'wx', 0o600)
