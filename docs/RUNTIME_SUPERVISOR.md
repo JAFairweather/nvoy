@@ -79,14 +79,20 @@ For each `<id>`, the installer creates a dedicated OS account `nvoy-<id>` and:
 | Path | Owner/mode | Consumer |
 |---|---|---|
 | `/etc/nvoy/instances/<id>.json` | root:root 0644 | supervisor only |
-| Bunker URI + NIP-46 client credentials | root:broker 0600 | broker only |
-| Model-provider credential | root:worker 0600 | worker only; never a Nostr key |
+| Bunker URI + NIP-46 client credentials | root:root 0600 on the host | broker only |
+| Model-provider credential | root:root 0600 on the host | worker only; never a Nostr key |
 | `/var/lib/nvoy/<id>` | nvoy-<id> 0700 | broker state/lock |
 | `/run/nvoy/<id>` | adapter:broker-adapter 0711 | broker socket (broker can traverse, not replace; worker can only traverse to named handoffs) |
 | adapter socket | adapter:broker-adapter 0660 | broker only |
 | task input + admitted queue | adapter:worker-handoff 0640 | adapter → worker, read-only for worker |
 | reply queue | worker:broker-adapter 0640 | worker → broker, read-only for broker |
 | watcher spool | watcher:broker-adapter 0770, markers 0660 | watcher→broker marker intake |
+
+Credentials are source files staged as `root:root` mode `0600`: that is safe even before an
+instance exists. The Docker deployment turns each into a Docker secret and mounts it only into
+its designated service. Do not use a shared host `broker` or `worker` group; it fails on a
+fresh host and would weaken separation between identities. A future systemd installer must
+instead create instance-specific groups before changing ownership.
 
 `nvoy-broker@<id>`, `nvoy-watcher@<id>`, `nvoy-adapter@<id>`, and `nvoy-worker@<id>` run under distinct accounts. The broker obtains an
 exclusive lock before opening its state. On systemd, a matching `nvoy-broker@.socket` unit creates
