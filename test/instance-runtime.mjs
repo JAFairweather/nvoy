@@ -39,7 +39,7 @@ const workerStart = rendered.stdout.indexOf('\n  worker:')
 const workerEnd = rendered.stdout.indexOf('\nsecrets:', workerStart)
 const workerPart = workerStart < 0 ? '' : rendered.stdout.slice(workerStart, workerEnd < 0 ? undefined : workerEnd)
 const nonWorkerPart = workerStart < 0 ? rendered.stdout : rendered.stdout.slice(0, workerStart)
-ok('the model-provider secret is worker-only and remains separate from the Bunker signer', workerPart.includes('nvoy_worker_provider') && !nonWorkerPart.includes('nvoy_worker_provider') && !workerPart.includes('nvoy_bunker_uri') && !workerPart.includes('nvoy_bunker_client'))
+ok('the model-provider secret is worker-only and remains separate from the Bunker signer', workerPart.includes('nvoy_worker_provider') && workerPart.includes('HOME: /tmp') && !nonWorkerPart.includes('nvoy_worker_provider') && !workerPart.includes('nvoy_bunker_uri') && !workerPart.includes('nvoy_bunker_client'))
 
 const watcherSource = readFileSync('mcp/tools/instance-runtime.mjs', 'utf8')
 ok('the keyless watcher receives an explicit environment, not inherited process secrets', !/\.\.\.process\.env/.test(watcherSource) && !/NVOY_NSEC/.test(watcherSource))
