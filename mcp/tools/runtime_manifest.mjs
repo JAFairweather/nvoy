@@ -67,7 +67,10 @@ export function readManifest(root, requestedId) {
   const bunkerUriRef = String(raw.bunker_uri_ref || raw.bunkerUriRef || '')
   const bunkerClientRef = String(raw.bunker_client_ref || raw.bunkerClientRef || '')
   if ((bunkerUriRef || bunkerClientRef) && (!bunkerUriRef.startsWith('/') || !bunkerClientRef.startsWith('/'))) die('Bunker signer references must both be absolute paths')
-  if (!keyRef && !bunkerUriRef) die('manifest requires a broker credential reference')
+  const brokerMode = String(raw.broker_mode || raw.brokerMode || 'local')
+  if (!['local', 'remote'].includes(brokerMode)) die('broker_mode must be local or remote')
+  if (brokerMode === 'local' && !keyRef && !bunkerUriRef) die('a local broker manifest requires a credential reference')
+  if (brokerMode === 'remote' && (keyRef || bunkerUriRef || bunkerClientRef)) die('a remote-broker Desktop manifest must be keyless')
   // These are intentionally different groups. The broker alone may connect to the adapter's
   // private socket; the worker instead gets only the narrower file handoff group.
   const brokerAdapterGid = Number(raw.broker_adapter_gid ?? raw.brokerAdapterGid)
@@ -83,6 +86,7 @@ export function readManifest(root, requestedId) {
   const workerRunner = String(raw.worker_runner || raw.workerRunner || '')
   const workerCredentialRef = String(raw.worker_credential_ref || raw.workerCredentialRef || '')
   if ((workerImage || workerRunner || workerCredentialRef) && (!/^[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$/i.test(workerImage) || !['codex', 'claude'].includes(workerRunner) || !workerCredentialRef.startsWith('/'))) die('worker_image must be digest-pinned, worker_runner must be codex or claude, and worker_credential_ref must be absolute')
+  if (brokerMode === 'remote' && (workerImage || workerRunner || workerCredentialRef)) die('a remote-broker Desktop manifest cannot carry a model-worker credential or runtime')
   // Delivery is deliberately independent of the Nostr admission pipeline.  `headless` is the
   // existing worker; a desktop adapter is a local process which resumes one explicit Codex
   // thread.  Never silently create or select a desktop conversation from an incoming message.
@@ -90,6 +94,10 @@ export function readManifest(root, requestedId) {
   const codexThreadId = String(raw.codex_thread_id || raw.codexThreadId || '')
   const codexTransport = String(raw.codex_transport || raw.codexTransport || 'spawn')
   const codexSocketPath = String(raw.codex_app_server_socket || raw.codexAppServerSocket || '')
+  const sshTarget = String(raw.ssh_target || raw.sshTarget || '')
+  const sshIdentityFile = String(raw.ssh_identity_file || raw.sshIdentityFile || '')
+  const sshKnownHostsFile = String(raw.ssh_known_hosts_file || raw.sshKnownHostsFile || '')
+  const sshKnownHostsSha256 = hex(raw.ssh_known_hosts_sha256 || raw.sshKnownHostsSha256 || '')
   if (!['headless', 'codex_app_server', 'notify_only'].includes(deliveryMode)) die('delivery_mode must be headless, codex_app_server, or notify_only')
   if (!['spawn', 'local_control_socket'].includes(codexTransport)) die('codex_transport must be spawn or local_control_socket')
   if (deliveryMode === 'codex_app_server') {
@@ -98,8 +106,16 @@ export function readManifest(root, requestedId) {
       try { localControlSocket(codexSocketPath) } catch (e) { die(e.message) }
     }
   }
+  if (brokerMode === 'remote') {
+    if (deliveryMode !== 'codex_app_server' || codexTransport !== 'local_control_socket') die('a remote broker is valid only for an exact local Codex control-socket binding')
+    if (!/^[a-z_][a-z0-9_-]{0,31}@[a-z0-9.-]+$/i.test(sshTarget) || !sshIdentityFile.startsWith('/') ||
+        !sshKnownHostsFile.startsWith('/') || !/^[0-9a-f]{64}$/.test(sshKnownHostsSha256)) {
+      die('a remote broker manifest requires fixed ssh_target, absolute SSH files, and ssh_known_hosts_sha256')
+    }
+  }
   return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, relays, stateDir, runtimeDir, spoolDir,
-    brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath })
+    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath,
+    sshTarget, sshIdentityFile, sshKnownHostsFile, sshKnownHostsSha256 })
 }
 
 // Supervisor preflight: a second identity must never accidentally share a state or runtime

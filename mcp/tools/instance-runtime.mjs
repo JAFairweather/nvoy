@@ -31,9 +31,11 @@ const baseEnv = { HOME: manifest.stateDir, PATH: process.env.PATH || '', NVOY_RE
 const tool = name => resolve(new URL('.', import.meta.url).pathname, name)
 if (command === 'describe') {
   console.log(JSON.stringify({ id: manifest.id, recipient: manifest.pubkey, grantors: manifest.grantors,
-    relays: manifest.relays, stateDir: manifest.stateDir, watcher: 'keyless' }, null, 2)); process.exit(0)
+    relays: manifest.relays, stateDir: manifest.stateDir, brokerMode: manifest.brokerMode,
+    watcher: manifest.brokerMode === 'local' ? 'keyless' : 'remote' }, null, 2)); process.exit(0)
 }
 if (command === 'watch' || command === 'baseline') {
+  if (manifest.brokerMode !== 'local') die('remote-broker Desktop manifests cannot start a second watcher')
   const child = spawn(process.execPath, [tool('keyless-wake-watcher.mjs'), '--recipient', manifest.pubkey,
     '--seen-path', resolve(manifest.spoolDir, 'keyless-wake-seen.log'), '--queue-path', resolve(manifest.spoolDir, 'keyless-wake-queue.jsonl'),
     '--marker-dir', manifest.spoolDir, '--marker-gid', String(manifest.brokerAdapterGid),

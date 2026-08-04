@@ -56,9 +56,11 @@ for (const line of input.split('\n').filter(Boolean)) {
         Buffer.byteLength(message.content) > 256 * 1024) die('remote export contains an invalid admitted message')
   }
   const durable = JSON.stringify({ version: 1, envelope: record.envelope, imported_at: Date.now() })
-  appendFileSync(cursor, durable + '\n', { mode: 0o600 }); chmodSync(cursor, 0o600)
+  // Queue first, cursor second. A crash after queue append is deduplicated on restart because
+  // startup unions both files; the opposite ordering could suppress a task that never queued.
   if (!baseline) { appendFileSync(queue, JSON.stringify(record) + '\n', { mode: 0o600 }); chmodSync(queue, 0o600); imported++ }
   else skipped++
+  appendFileSync(cursor, durable + '\n', { mode: 0o600 }); chmodSync(cursor, 0o600)
   seen.add(record.envelope)
 }
 console.log(`instance-admitted-import: ${baseline ? 'baselined' : 'imported'} ${baseline ? skipped : imported}; skipped ${baseline ? 0 : skipped}`)

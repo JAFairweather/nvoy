@@ -17,6 +17,7 @@ if (!id) die('usage: --instance <id>')
 const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 let manifest
 try { manifest = readManifest(root, instanceId(id)); assertNoCollisions(root, manifest) } catch (e) { die(e.message) }
+if (manifest.brokerMode !== 'local') die('remote-broker Desktop manifests cannot start a local broker daemon')
 if (!process.env.NVOY_BROKER_CREDENTIAL) die('broker credential path is unavailable')
 const broker = resolve(new URL('.', import.meta.url).pathname, 'instance-broker.mjs')
 const reply = resolve(new URL('.', import.meta.url).pathname, 'instance-broker-reply.mjs')
@@ -59,28 +60,30 @@ function drain() {
   }
   // The adapter-owned queue is append-only.  A reply tool receives only a 32-hex request id;
   // it reopens this fixed queue, then binds the request to the broker-authored admission receipt.
-  const replyQueue = resolve(manifest.runtimeDir, 'reply-requests.jsonl')
-  try {
-    const st = lstatSync(replyQueue)
-    if (!st.isFile() || st.isSymbolicLink()) throw new Error('reply queue is not a regular file')
-    const ids = new Set()
-    for (const line of readFileSync(replyQueue, 'utf8').split('\n')) {
-      try { const x = JSON.parse(line); if (/^[0-9a-f]{32}$/.test(String(x.id || ''))) ids.add(x.id) } catch { /* trailing partial line */ }
-    }
-    for (const request of ids) {
-      if (terminalReplyIds.has(request)) continue
-      const r = spawnSync(process.execPath, [reply, '--instance', manifest.id, '--request', request], { env: childEnv, encoding: 'utf8', timeout: 90000 })
-      if (r.status !== 0) {
-        const stderr = String(r.stderr || '').trim()
-        if (isTerminalReplyFailure(stderr)) {
-          try {
-            if (recordTerminalReply(terminalRepliesPath, terminalReplyIds, request, stderr))
-              console.error(`instance-broker-daemon: reply ${request.slice(0, 12)}… terminal — its receipt is no longer live`)
-          } catch (e) { console.error(`instance-broker-daemon: cannot record terminal reply ${request.slice(0, 12)}…: ${e.message || e}`) }
-        } else console.error(`instance-broker-daemon: reply ${request.slice(0, 12)}… held for retry: ${stderr}`)
+  for (const [source, filename] of [['worker', 'reply-requests.jsonl'], ['desktop', 'desktop-reply-requests.jsonl']]) {
+    const replyQueue = resolve(manifest.runtimeDir, filename)
+    try {
+      const st = lstatSync(replyQueue)
+      if (!st.isFile() || st.isSymbolicLink()) throw new Error('reply queue is not a regular file')
+      const ids = new Set()
+      for (const line of readFileSync(replyQueue, 'utf8').split('\n')) {
+        try { const x = JSON.parse(line); if (/^[0-9a-f]{32}$/.test(String(x.id || ''))) ids.add(x.id) } catch { /* trailing partial line */ }
       }
-    }
-  } catch (e) { if (e.code !== 'ENOENT') console.error(`instance-broker-daemon: reply queue unavailable: ${e.message}`) }
+      for (const request of ids) {
+        if (terminalReplyIds.has(request)) continue
+        const r = spawnSync(process.execPath, [reply, '--instance', manifest.id, '--request', request, '--source', source], { env: childEnv, encoding: 'utf8', timeout: 90000 })
+        if (r.status !== 0) {
+          const stderr = String(r.stderr || '').trim()
+          if (isTerminalReplyFailure(stderr)) {
+            try {
+              if (recordTerminalReply(terminalRepliesPath, terminalReplyIds, request, stderr))
+                console.error(`instance-broker-daemon: reply ${request.slice(0, 12)}… terminal — its receipt is no longer live`)
+            } catch (e) { console.error(`instance-broker-daemon: cannot record terminal reply ${request.slice(0, 12)}…: ${e.message || e}`) }
+          } else console.error(`instance-broker-daemon: reply ${request.slice(0, 12)}… held for retry: ${stderr}`)
+        }
+      }
+    } catch (e) { if (e.code !== 'ENOENT') console.error(`instance-broker-daemon: ${source} reply queue unavailable: ${e.message}`) }
+  }
 }
 recover()
 drain()

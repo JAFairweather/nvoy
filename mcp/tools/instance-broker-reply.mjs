@@ -19,17 +19,18 @@ import { makeBunkerSigner } from './nip46-signer.mjs'
 
 const die = m => { console.error(`instance-broker-reply: ${m}`); process.exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
-const id = flag('--instance'), requestId = flag('--request').toLowerCase()
-if (!id || !/^[0-9a-f]{32}$/.test(requestId)) die('usage: --instance <id> --request <32-hex-id>')
+const id = flag('--instance'), requestId = flag('--request').toLowerCase(), source = flag('--source') || 'worker'
+if (!id || !/^[0-9a-f]{32}$/.test(requestId) || !['worker', 'desktop'].includes(source)) die('usage: --instance <id> --request <32-hex-id> [--source worker|desktop]')
 const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 let manifest
 try { manifest = readManifest(root, instanceId(id)); assertNoCollisions(root, manifest) } catch (e) { die(e.message) }
+if (manifest.brokerMode !== 'local') die('remote-broker Desktop manifests cannot sign locally')
 
 function regular(path, label) {
   let st; try { st = lstatSync(path) } catch { die(`${label} is missing`) }
   if (!st.isFile() || st.isSymbolicLink()) die(`${label} must be a regular non-symlink file`)
 }
-const queue = resolve(manifest.runtimeDir, 'reply-requests.jsonl')
+const queue = resolve(manifest.runtimeDir, source === 'desktop' ? 'desktop-reply-requests.jsonl' : 'reply-requests.jsonl')
 regular(queue, 'reply request queue')
 let request
 try {
