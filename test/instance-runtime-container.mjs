@@ -44,6 +44,13 @@ try {
   for (const name of [instances, state, spool, runtime]) check(`create ${name}`, docker(['volume', 'create', name]))
   const seed = docker(['run', '--rm', '-i', '--user', '0:0', ...mount(instances, '/etc/nvoy/instances'), image, 'node', '-e', "const fs=require('node:fs');let body='';process.stdin.on('data',d=>body+=d);process.stdin.on('end',()=>{fs.mkdirSync('/etc/nvoy/instances',{recursive:true});fs.writeFileSync('/etc/nvoy/instances/codex-test.json',body,{mode:0o644})})"], JSON.stringify(manifest))
   check('seed immutable instance manifest', seed)
+  // The deployment host has only this pulled image and the public manifest — not a source
+  // checkout. Rendering must therefore prove the image carries its Compose template.
+  const rendered = docker(['run', '--rm', '--read-only', '--tmpfs', '/tmp:mode=1777', '--user', '0:0', ...mount(instances, '/etc/nvoy/instances:ro'), image,
+    'node', 'mcp/tools/render-instance-compose.mjs', '--instance', manifest.id,
+    '--image', 'registry.example/runtime@sha256:' + 'a'.repeat(64)])
+  check('runtime image renders the instance Compose contract', rendered)
+  if (!String(rendered.stdout).includes('name: nvoy-codex-test')) throw new Error('rendered Compose did not bind the instance id')
   run([...base, '--user', '0:0', '--cap-add=CHOWN', '--cap-add=FOWNER', '--cap-add=DAC_OVERRIDE', ...mount(state, manifest.state_dir), ...mount(spool, manifest.spool_dir), ...mount(runtime, manifest.runtime_dir), image, 'node', 'mcp/tools/instance-runtime-init.mjs', '--instance', manifest.id], 'initializer')
   check('start adapter', docker(['run', '-d', '--name', adapter, '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges:true', '--tmpfs', '/tmp:mode=1777', '--user', '41013:41001', '--group-add', '41002', ...mount(instances, '/etc/nvoy/instances:ro'), ...mount(runtime, manifest.runtime_dir), image, 'node', 'mcp/tools/instance-adapter.mjs', '--instance', manifest.id]))
   const probe = `const net=require('node:net');const c=net.createConnection('/run/nvoy/codex-test/adapter.sock');c.on('connect',()=>process.exit(9));c.on('error',e=>process.exit(e.code==='EACCES'?0:8));setTimeout(()=>process.exit(7),1500)`

@@ -17,6 +17,10 @@ COPY mcp/package.json mcp/package-lock.json ./mcp/
 RUN npm --prefix mcp ci --omit=dev --ignore-scripts
 
 COPY mcp/tools ./mcp/tools
+# The renderer is itself part of the runtime contract: an operations host pulls this
+# image, mounts only the public instance manifest, and renders Compose from here. Keep
+# the template in the image or the digest-pinned deploy path cannot bootstrap itself.
+COPY deploy/participant-runtime.compose.yml ./deploy/participant-runtime.compose.yml
 
 # Compose always supplies numeric per-instance identities. The image must not claim an identity
 # at build time, and must remain usable by each non-root runtime role.
