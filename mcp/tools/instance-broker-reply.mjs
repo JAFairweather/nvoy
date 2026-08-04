@@ -8,7 +8,7 @@
 
 import { readFileSync, writeFileSync, existsSync, lstatSync, mkdirSync, renameSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { createHash } from 'node:crypto'
+import { replyRequestDigest, validateOutboundRecord } from './outbound_record.mjs'
 import { spawnSync } from 'node:child_process'
 import WebSocket from 'ws'
 import { getPublicKey, getEventHash, finalizeEvent, generateSecretKey } from 'nostr-tools/pure'
@@ -103,12 +103,12 @@ if (receiptPath === receiptBase) {
 const outboundDir = resolve(manifest.stateDir, 'outbound')
 mkdirSync(outboundDir, { recursive: true, mode: 0o700 })
 const recordPath = resolve(outboundDir, `${requestId}.json`)
-const digest = createHash('sha256').update(JSON.stringify(request)).digest('hex')
+const digest = replyRequestDigest(request)
 let record
 if (existsSync(recordPath)) {
   regular(recordPath, 'outbound record')
   try { record = JSON.parse(readFileSync(recordPath, 'utf8')) } catch { die('outbound record is invalid') }
-  if (record.request_digest !== digest || !record.wrap || record.wrap.kind !== 1059) die('outbound record does not bind this request')
+  try { validateOutboundRecord(record, { requestId, requestDigest: digest }) } catch (e) { die(e.message) }
   if (record.published === true) {
     try { renameSync(receiptInflight, receiptUsed) } catch (e) { die(`could not finalize one-use receipt: ${e.message}`) }
     console.log(JSON.stringify({ request: requestId, receipt: request.receipt, accepted: record.accepted || 0, replay: true }))

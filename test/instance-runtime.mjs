@@ -7,9 +7,10 @@ import { spawnSync } from 'node:child_process'
 import { spawn } from 'node:child_process'
 import net from 'node:net'
 import { createHash } from 'node:crypto'
-import { generateSecretKey, getPublicKey } from 'nostr-tools/pure'
+import { generateSecretKey, getPublicKey, finalizeEvent } from 'nostr-tools/pure'
 import * as nip19 from 'nostr-tools/nip19'
-import { isTerminalReplyFailure, loadPublishedReplyIds, loadTerminalReplyIds, recordTerminalReply } from '../mcp/tools/reply_retry.mjs'
+import { isTerminalReplyFailure, loadPublishedReplyIds, loadReplyRequestDigests, loadTerminalReplyIds, recordTerminalReply } from '../mcp/tools/reply_retry.mjs'
+import { claimChannelSource, completeChannelSource, channelSourceClaims } from '../mcp/tools/channel_source_dedup.mjs'
 import { validateAdmittedTask } from '../mcp/tools/admitted_task.mjs'
 
 let fails = 0
@@ -190,9 +191,32 @@ ok('transient reply publish failures remain retryable', !isTerminalReplyFailure(
 const publishedDir = join(manifest.state_dir, 'outbound')
 mkdirSync(publishedDir, { recursive: true })
 const publishedRequest = 'b'.repeat(32)
-writeFileSync(join(publishedDir, `${publishedRequest}.json`), JSON.stringify({ version: 1, request_id: publishedRequest, published: true }))
+const publishedQueue = join(manifest.runtime_dir, 'published-reply-test.jsonl')
+mkdirSync(manifest.runtime_dir, { recursive: true })
+const publishedRequestRecord = { version: 1, type: 'reply-request', id: publishedRequest, instance: 'codex-test', receipt: 'a'.repeat(64), content: 'completed reply' }
+writeFileSync(publishedQueue, JSON.stringify(publishedRequestRecord) + '\n')
+const publishedRequestDigests = loadReplyRequestDigests([publishedQueue], 'codex-test')
+const publishedWrap = JSON.parse(JSON.stringify(finalizeEvent({ kind: 1059, created_at: 1, tags: [['p', pubkey]], content: 'ciphertext' }, generateSecretKey())))
+const validPublishedRecord = { version: 1, request_id: publishedRequest, request_digest: publishedRequestDigests.get(publishedRequest), wrap: publishedWrap, published: true, published_at: 1, accepted: 1 }
+writeFileSync(join(publishedDir, `${publishedRequest}.json`), JSON.stringify(validPublishedRecord))
 writeFileSync(join(publishedDir, `${'c'.repeat(32)}.json`), JSON.stringify({ version: 1, request_id: 'c'.repeat(32), published: false }))
-ok('a published reply is durably skipped instead of spawning a replay child every daemon tick', loadPublishedReplyIds(publishedDir).has(publishedRequest) && !loadPublishedReplyIds(publishedDir).has('c'.repeat(32)) && /publishedReplyIds\.has\(request\)/.test(daemonSource) && /publishedReplyIds\.add\(request\)/.test(daemonSource))
+writeFileSync(join(publishedDir, `${'d'.repeat(32)}.json`), JSON.stringify({ version: 1, request_id: 'd'.repeat(32), request_digest: 'e'.repeat(64), wrap: { ...publishedWrap, sig: '0'.repeat(128) }, published: true, published_at: 1, accepted: 1 }))
+const completedReplies = loadPublishedReplyIds(publishedDir, publishedRequestDigests)
+writeFileSync(join(publishedDir, `${publishedRequest}.json`), JSON.stringify({ ...validPublishedRecord, request_digest: '0'.repeat(64) }))
+const wrongDigestReplies = loadPublishedReplyIds(publishedDir, publishedRequestDigests)
+writeFileSync(join(publishedDir, `${publishedRequest}.json`), JSON.stringify({ ...validPublishedRecord, wrap: { ...publishedWrap, sig: '0'.repeat(128) } }))
+const forgedWrapReplies = loadPublishedReplyIds(publishedDir, publishedRequestDigests)
+writeFileSync(join(publishedDir, `${publishedRequest}.json`), JSON.stringify(validPublishedRecord))
+ok('only an exact-request-digest-bound valid signed published wrap durably suppresses a completed reply', completedReplies.has(publishedRequest) && !wrongDigestReplies.has(publishedRequest) && !forgedWrapReplies.has(publishedRequest) && !completedReplies.has('c'.repeat(32)) && !completedReplies.has('d'.repeat(32)) && /publishedReplyIds\.has\(request\)/.test(daemonSource) && /publishedReplyIds\.add\(request\)/.test(daemonSource))
+const sourceIndex = join(manifest.state_dir, 'channel-source-admissions.jsonl')
+const sourceEvent = 'e'.repeat(64), firstCarrierEnvelope = 'f'.repeat(64), rewrappedEnvelope = 'a'.repeat(64)
+const firstSource = claimChannelSource(sourceIndex, sourceEvent, firstCarrierEnvelope)
+const sameEnvelopeRetry = claimChannelSource(sourceIndex, sourceEvent, firstCarrierEnvelope)
+const sourceCompleted = completeChannelSource(sourceIndex, sourceEvent, firstCarrierEnvelope)
+const completionReplay = completeChannelSource(sourceIndex, sourceEvent, firstCarrierEnvelope)
+const afterRestartRewrap = claimChannelSource(sourceIndex, sourceEvent, rewrappedEnvelope)
+ok('two carrier envelopes for one signed source yield one durable admission across retry and restart', firstSource.accepted && !firstSource.replay && sameEnvelopeRetry.accepted && sameEnvelopeRetry.replay && sourceCompleted && !completionReplay && !afterRestartRewrap.accepted && channelSourceClaims(sourceIndex).get(sourceEvent)?.state === 'delivered')
+ok('channel source is claimed before any receipt or adapter delivery, so task-relay cannot amplify author authority', brokerSource.indexOf('claimChannelSource(') < brokerSource.indexOf('const receipt =') && brokerSource.indexOf('claimChannelSource(') < brokerSource.indexOf("net.createConnection(socket)"))
 const initSource = readFileSync('mcp/tools/instance-runtime-init.mjs', 'utf8')
 ok('a root-only initializer provisions all three volume roots, a credential-free Desktop queue, and role-owned credential copies', /process\.getuid\?\.\(\) !== 0/.test(initSource) && /provision\(m\.stateDir/.test(initSource) && /provision\(m\.spoolDir/.test(initSource) && /provision\(m\.runtimeDir/.test(initSource) && /desktop-reply-requests\.jsonl.*m\.adapterUid/.test(initSource) && /function provisionSecret/.test(initSource) && /brokerCredDir/.test(initSource) && /workerCredDir/.test(initSource))
 const replySource = readFileSync('mcp/tools/instance-broker-reply.mjs', 'utf8')
