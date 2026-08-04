@@ -3,7 +3,7 @@
 // Sources, in precedence order:
 //   1. --ephemeral flag           fresh keypair per boot (demos, CI)
 //   2. NVOY_SIGNER=nip46          remote signer: the key lives in a bunker
-//      + NVOY_BUNKER_URI          (bunker://<pubkey>?relay=…&secret=…). The key
+//      + NVOY_BUNKER_URI_FILE     a mode-0600 file containing the pairing URI. The key
 //                                 is NEVER on this host — signing goes over
 //                                 NIP-46. The scope (which kinds may be signed,
 //                                 rate limits) is enforced by the bunker's
@@ -24,7 +24,7 @@
 // issue). See requireLocalKey().
 
 import { randomUUID } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync } from 'node:fs'
 import { finalizeEvent, generateSecretKey, getPublicKey, nip19, nip44 } from 'nostr-tools'
 import { decrypt as nip49Decrypt } from 'nostr-tools/nip49'
 import { SimplePool } from 'nostr-tools/pool'
@@ -88,6 +88,45 @@ export function requireLocalKey(identity: Identity, op: string): Uint8Array {
  *    3. this nostr-tools subscribeMany takes a SINGLE filter object — an
  *       array of filters silently matches nothing. */
 const BUNKER_PUBKEY = /^bunker:\/\/([0-9a-f]{64})/i
+
+// A bunker URI has a bearer pairing secret. It is configuration, but it is not
+// harmless configuration: never accept a symlink or a file other local users
+// can read, and do not require it to be placed in an MCP config literal.  This
+// validates the *opened descriptor*, rather than lstat(path) then reopening the
+// path: a writable parent directory could otherwise swap the checked file for a
+// symlink in between those operations.
+function readPrivateFile(path: string, name: string): string {
+  let fd: number
+  try { fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW) }
+  catch { throw new Error(`${name} file cannot be read as a regular non-symlink file`) }
+  try {
+    const stat = fstatSync(fd)
+    if (!stat.isFile()) throw new Error(`${name} file must be a regular file, not a symlink`)
+    if (stat.mode & 0o077) throw new Error(`${name} file must not be group/world-readable (chmod 600)`)
+    // `fd` pins the verified inode even if its directory entry changes after open.
+    const value = readFileSync(fd, 'utf8').trim()
+    if (!value) throw new Error(`${name} file is empty`)
+    return value
+  } finally { closeSync(fd) }
+}
+
+/** Resolve a NIP-46 URI without putting its bearer secret in an env literal.
+ *  Direct env support is retained only for old deployments; ambiguous sources
+ *  are refused rather than silently choosing one. */
+export function loadBunkerUri(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const raw = env.NVOY_BUNKER_URI?.trim()
+  const file = env.NVOY_BUNKER_URI_FILE?.trim()
+  if (raw && file) throw new Error('set only one of NVOY_BUNKER_URI or NVOY_BUNKER_URI_FILE')
+  return file ? readPrivateFile(file, 'NVOY_BUNKER_URI') : raw || undefined
+}
+
+function loadNip46ClientKey(env: NodeJS.ProcessEnv): Uint8Array {
+  const raw = env.NVOY_NIP46_CLIENT_NSEC?.trim()
+  const file = env.NVOY_NIP46_CLIENT_NSEC_FILE?.trim()
+  if (raw && file) throw new Error('set only one of NVOY_NIP46_CLIENT_NSEC or NVOY_NIP46_CLIENT_NSEC_FILE')
+  return raw ? decodeNsec(raw) : file ? decodeNsec(readPrivateFile(file, 'NVOY_NIP46_CLIENT_NSEC')) : generateSecretKey()
+}
+
 function makeNip46(bunkerUri: string, env: NodeJS.ProcessEnv = process.env): { signer: Signer; pubkey: string } {
   const m = BUNKER_PUBKEY.exec(bunkerUri.trim())
   if (!m) throw new Error('NVOY_BUNKER_URI is not a valid bunker://<64-hex-pubkey>?… connection string')
@@ -96,7 +135,7 @@ function makeNip46(bunkerUri: string, env: NodeJS.ProcessEnv = process.env): { s
   const relays = [...new Set(uri.searchParams.getAll('relay'))]
   if (!relays.length) throw new Error('NVOY_BUNKER_URI carries no ?relay= — the signer would have nowhere to listen')
   const secret = uri.searchParams.get('secret') ?? ''
-  const clientKey = env.NVOY_NIP46_CLIENT_NSEC ? decodeNsec(env.NVOY_NIP46_CLIENT_NSEC) : generateSecretKey()
+  const clientKey = loadNip46ClientKey(env)
   const clientPk = getPublicKey(clientKey)
   const convKey = nip44.v2.utils.getConversationKey(clientKey, pubkey)
   const pool = new SimplePool()
@@ -153,13 +192,14 @@ export function loadIdentity(
   argv: string[] = process.argv.slice(2),
   env: NodeJS.ProcessEnv = process.env,
 ): Identity {
+  const bunkerUri = loadBunkerUri(env)
   // Remote signer: the key is off-host. Selected explicitly (NVOY_SIGNER=nip46),
   // or implied when only a bunker URI is present, so it never shadows a local key.
   const wantsNip46 = /^nip46$/i.test(env.NVOY_SIGNER || '') ||
-    (!!env.NVOY_BUNKER_URI && !env.NVOY_NSEC && !env.NVOY_NCRYPTSEC_FILE && !argv.includes('--ephemeral'))
+    (!!bunkerUri && !env.NVOY_NSEC && !env.NVOY_NCRYPTSEC_FILE && !argv.includes('--ephemeral'))
   if (wantsNip46) {
-    if (!env.NVOY_BUNKER_URI) throw new Error('NVOY_SIGNER=nip46 requires NVOY_BUNKER_URI (bunker://…)')
-    const { signer, pubkey } = makeNip46(env.NVOY_BUNKER_URI, env)
+    if (!bunkerUri) throw new Error('NVOY_SIGNER=nip46 requires NVOY_BUNKER_URI_FILE (or legacy NVOY_BUNKER_URI)')
+    const { signer, pubkey } = makeNip46(bunkerUri, env)
     return { signer, pubkey, npub: nip19.npubEncode(pubkey), source: 'nip46' }
   }
 
@@ -180,7 +220,7 @@ export function loadIdentity(
     source = 'ncryptsec'
   } else {
     throw new Error(
-      'no agent identity: set NVOY_NSEC, or NVOY_NCRYPTSEC_FILE + NVOY_NCRYPTSEC_PASSPHRASE, or NVOY_SIGNER=nip46 + NVOY_BUNKER_URI, or pass --ephemeral',
+      'no agent identity: set NVOY_NSEC, or NVOY_NCRYPTSEC_FILE + NVOY_NCRYPTSEC_PASSPHRASE, or NVOY_SIGNER=nip46 + NVOY_BUNKER_URI_FILE, or pass --ephemeral',
     )
   }
 
