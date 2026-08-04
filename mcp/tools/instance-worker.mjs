@@ -56,10 +56,11 @@ function composePrompt(inputPath) {
 }
 function runAgent(task) {
   if (suppliedReply) return suppliedReply
-  // The worker cannot create entries under the adapter-owned runtime root. Its task file is
-  // deliberately the immutable, adapter-authored JSONL record it already has group-read access
-  // to; do not copy untrusted text into a new mutable handoff path.
-  const inputPath = queue
+  // The worker cannot create entries under the adapter-owned runtime root. The adapter writes
+  // this exact immutable per-envelope file before it records the task in the queue.
+  const inputPath = resolve(manifest.runtimeDir, 'worker-input', `${task.envelope}.json`)
+  const inputSt = lstatSync(inputPath)
+  if (!inputSt.isFile() || inputSt.isSymbolicLink()) die('worker input must be a regular non-symlink file')
   writeFileSync(inputPath, JSON.stringify({ envelope: task.envelope, messages: task.messages }), { mode: 0o600 })
   const prompt = composePrompt(inputPath)
   const args = runner === 'codex'

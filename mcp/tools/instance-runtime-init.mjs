@@ -38,4 +38,7 @@ function provisionFile(path, uid, gid, mode, label) {
 provisionFile(`${m.runtimeDir}/admitted-tasks.jsonl`, m.adapterUid, m.sharedGid, 0o640, 'admitted task queue')
 provisionFile(`${m.runtimeDir}/reply-requests.jsonl`, m.workerUid, m.sharedGid, 0o640, 'worker reply queue')
 provisionFile(`${m.runtimeDir}/worker-consumed.jsonl`, m.workerUid, m.workerUid, 0o600, 'worker consumed queue')
+// Only the adapter can create these immutable per-envelope inputs; the worker gets group
+// traversal/read access but cannot replace an input belonging to a different envelope.
+provision(`${m.runtimeDir}/worker-input`, m.adapterUid, m.sharedGid, 0o710, 'worker input directory')
 console.log(`instance-runtime-init: provisioned ${m.id}`)

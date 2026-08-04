@@ -4,7 +4,7 @@
 // actual runner can watch that queue or send a platform-specific notification; this process
 // never receives a Nostr key or decrypt command.
 
-import { mkdirSync, appendFileSync, chmodSync, chownSync, lstatSync, unlinkSync, readFileSync } from 'node:fs'
+import { mkdirSync, appendFileSync, chmodSync, chownSync, lstatSync, unlinkSync, readFileSync, writeFileSync, renameSync } from 'node:fs'
 import { resolve } from 'node:path'
 import net from 'node:net'
 import { readManifest, instanceId } from './runtime_manifest.mjs'
@@ -24,6 +24,10 @@ chownSync(manifest.runtimeDir, -1, manifest.sharedGid)
 chmodSync(manifest.runtimeDir, 0o710)
 try { if (lstatSync(socket).isSocket()) unlinkSync(socket); else die('adapter socket path is not a socket') } catch (e) { if (e.code !== 'ENOENT') die(e.message) }
 const queue = resolve(manifest.runtimeDir, 'admitted-tasks.jsonl')
+const workerInputDir = resolve(manifest.runtimeDir, 'worker-input')
+mkdirSync(workerInputDir, { recursive: true, mode: 0o710 })
+chownSync(workerInputDir, -1, manifest.sharedGid)
+chmodSync(workerInputDir, 0o710)
 // The broker can be restarted after its adapter ACK but before it finalizes the marker. Queue
 // records are therefore the durable idempotency index: replaying the same envelope ACKs again,
 // but it never becomes a second task for the worker.
@@ -34,7 +38,16 @@ const server = net.createServer(conn => {
   conn.on('data', chunk => { data += chunk; if (!data.includes('\n')) return
     let packet; try { packet = JSON.parse(data.split('\n')[0]) } catch { conn.destroy(); return }
     if (packet.type !== 'admitted-task' || packet.instance !== manifest.id || !/^[0-9a-f]{64}$/.test(packet.envelope || '') || !Array.isArray(packet.messages)) { conn.destroy(); return }
-    try { if (!delivered.has(packet.envelope)) { appendFileSync(queue, JSON.stringify(packet) + '\n', { mode: 0o640 }); chmodSync(queue, 0o640); delivered.add(packet.envelope) } }
+    try {
+      if (!delivered.has(packet.envelope)) {
+        // The worker may only read/traverse this adapter-owned directory. Atomically publish the
+        // one task input before queueing its envelope, so a queue record never names missing data.
+        const input = resolve(workerInputDir, `${packet.envelope}.json`), tmp = `${input}.${process.pid}.tmp`
+        writeFileSync(tmp, JSON.stringify({ envelope: packet.envelope, messages: packet.messages }), { mode: 0o640 })
+        renameSync(tmp, input); chmodSync(input, 0o640)
+        appendFileSync(queue, JSON.stringify(packet) + '\n', { mode: 0o640 }); chmodSync(queue, 0o640); delivered.add(packet.envelope)
+      }
+    }
     catch { conn.destroy(); return }
     conn.end(JSON.stringify({ type: 'ack', instance: manifest.id }) + '\n')
   })
