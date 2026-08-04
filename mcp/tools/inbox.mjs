@@ -9,6 +9,8 @@
 // and the grant model: authority is a short, explicit list, not "whoever can reach me."
 //
 //   NVOY_NSEC=... node tools/inbox.mjs [--since-min 240]
+//   NVOY_BUNKER_URI_FILE=/run/secrets/uri NVOY_NIP46_CLIENT_FILE=/run/secrets/client \
+//     node tools/inbox.mjs [--since-min 240]
 //
 // Prints two sections (TRUSTED, UNTRUSTED). Exit 0 always; this only reads.
 
@@ -19,10 +21,21 @@ import { resolve } from 'node:path'
 import { decode } from 'nostr-tools/nip19'
 import { getPublicKey } from 'nostr-tools/pure'
 import * as nip44 from 'nostr-tools/nip44'
+import { makeBunkerSigner } from './nip46-signer.mjs'
 
-const raw = process.env.NVOY_NSEC || (() => { console.error('set NVOY_NSEC'); process.exit(1) })()
-const sk = raw.startsWith('nsec1') ? decode(raw).data : Uint8Array.from(Buffer.from(raw, 'hex'))
-const pk = getPublicKey(sk)
+const credential = (path, label) => {
+  if (!path) return ''
+  try { return readFileSync(path, 'utf8').trim() } catch { console.error(`inbox: cannot read ${label}`); process.exit(1) }
+}
+const bunkerUri = credential(process.env.NVOY_BUNKER_URI_FILE, 'Bunker URI credential')
+const bunkerClient = credential(process.env.NVOY_NIP46_CLIENT_FILE, 'Bunker client credential')
+if (!!bunkerUri !== !!bunkerClient) { console.error('inbox: Bunker URI and client credential must be supplied together'); process.exit(1) }
+const raw = process.env.NVOY_NSEC || ''
+if (raw && bunkerUri) { console.error('inbox: choose local NVOY_NSEC or the Bunker signer, never both'); process.exit(1) }
+if (!raw && !bunkerUri) { console.error('inbox: set NVOY_NSEC or the Bunker credential-file pair'); process.exit(1) }
+const sk = raw ? (raw.startsWith('nsec1') ? decode(raw).data : Uint8Array.from(Buffer.from(raw, 'hex'))) : null
+const signer = bunkerUri ? makeBunkerSigner(bunkerUri, bunkerClient) : null
+const pk = signer ? await signer.getPublicKey() : getPublicKey(sk)
 
 const arg = (n, d) => { const i = process.argv.indexOf(n); return i === -1 ? d : process.argv[i + 1] }
 const sinceMin = Number(arg('--since-min', 240))
@@ -50,9 +63,11 @@ await Promise.all(RELAYS.map(url => new Promise(res => {
 const msgs = []
 for (const w of wraps.values()) {
   try {
-    const seal = JSON.parse(nip44.decrypt(w.content, nip44.getConversationKey(sk, w.pubkey)))
+    const sealed = signer ? await signer.nip44Decrypt(w.pubkey, w.content) : nip44.decrypt(w.content, nip44.getConversationKey(sk, w.pubkey))
+    const seal = JSON.parse(sealed)
     if (seal.kind !== 13) continue
-    const rumor = JSON.parse(nip44.decrypt(seal.content, nip44.getConversationKey(sk, seal.pubkey)))
+    const plain = signer ? await signer.nip44Decrypt(seal.pubkey, seal.content) : nip44.decrypt(seal.content, nip44.getConversationKey(sk, seal.pubkey))
+    const rumor = JSON.parse(plain)
     if (rumor.kind !== 14 || rumor.pubkey !== seal.pubkey) continue // spoof guard
     if (rumor.created_at < since || seal.pubkey === pk) continue
     msgs.push({ from: seal.pubkey, at: rumor.created_at, content: rumor.content })
