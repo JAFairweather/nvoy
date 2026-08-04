@@ -9,6 +9,15 @@ ARG CODEX_VERSION=0.146.0
 ARG CLAUDE_VERSION=2.1.221
 WORKDIR /srv/nvoy
 
+# The coding-agent CLIs use their own TLS stacks rather than Node's bundled
+# roots.  bookworm-slim deliberately omits the OS trust store; without it a
+# keyless worker can receive an admitted task but cannot reach its provider.
+# Keep normal certificate validation ON — installing public roots is not a
+# request to bypass or disable TLS verification.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev \
  && npm install --global --no-audit --no-fund @openai/codex@${CODEX_VERSION} @anthropic-ai/claude-code@${CLAUDE_VERSION}
