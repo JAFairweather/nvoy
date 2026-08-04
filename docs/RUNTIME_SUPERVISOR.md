@@ -116,8 +116,13 @@ and may not choose another one.
    authenticated per-instance socket. The adapter acknowledges only after durable hand-off to
    its own execution queue. A broker restart redelivers unacknowledged admitted work; a marker
    is never marked completed merely because it was observed.
-4. The adapter starts/alerts its client using a fixed local mechanism. Codex desktop is not
-   falsely claimed to be resumable; it needs its dedicated worker/queue adapter.
+4. The adapter starts/alerts its client using a fixed local mechanism. An MCP
+`resources/updated` notification is **not** a desktop wake guarantee. For Codex, the first
+context-preserving adapter is `codex-app-server-adapter.mjs`: it runs locally, resumes the one
+manifest-bound `codex_thread_id`, and submits the broker-admitted event as a turn. It has no
+Nostr credential and cannot select a different thread. It does not claim to inject into an
+arbitrary already-open desktop task. Claude adapters must meet the same durable-queue and
+explicit-session-binding contract before they are called a wake mechanism.
 5. A worker that chooses to reply writes a bounded `reply-request` referencing the delivered
    envelope. The broker accepts it only when the recipient was a permitted sender recorded in its
    own admission receipt. It persists the exact signed NIP-17 wrap before publishing, so a crash
@@ -145,6 +150,29 @@ node mcp/tools/instance-adapter.mjs --instance codex-jaf
 node mcp/tools/instance-broker-daemon.mjs --instance codex-jaf
 node mcp/tools/instance-worker.mjs --instance codex-jaf --runner codex
 ```
+
+### Local Codex context adapter
+
+For a first-class Codex participant, run the Nostr watcher/broker and this adapter in the same
+trusted desktop environment (or use an explicitly secured queue forwarder). Give the manifest an
+explicit delivery binding:
+
+```json
+{ "delivery_mode": "codex_app_server", "codex_thread_id": "thr_<persistent-thread-id>" }
+```
+
+Then run:
+
+```sh
+node mcp/tools/codex-app-server-adapter.mjs --instance codex-jaf
+```
+
+It uses the supported local `codex app-server` JSON-RPC lifecycle (`initialize`, `thread/resume`,
+then `turn/start`). The target Codex home must already contain that participant's separately
+configured Nvoy MCP/Bunker pairing. A Nostr event only reaches the thread after the broker has
+verified/decrypted it and checked its live grant; the queue record is marked delivered only after
+Codex acknowledges the turn. This is the concrete Codex adapter. It does not yet make a claim
+for Claude Desktop; its native session/notification surface requires an adapter of the same form.
 
 `instance-broker-daemon` is the broker-container entrypoint; it reclaims interrupted inflight
 markers after a crash, then serially invokes the one-shot broker. `NVOY_INSTANCE_ROOT` is a deployment-only override for tests and staged installs. Production

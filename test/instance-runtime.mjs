@@ -1,6 +1,6 @@
 // Multi-instance runtime contract (#44): a public manifest names exactly one identity and
 // isolated state. This drives the real CLI, rather than duplicating its validation in a unit.
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlinkSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlinkSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -32,6 +32,16 @@ ok('a valid instance manifest describes its public identity', good.status === 0 
 ok('the description contains no private key reference', !/keyFile|nsec/.test(good.stdout))
 ok('the instance receives its own state directory', described.stateDir === manifest.state_dir)
 ok('the manifest binds four distinct non-root service UIDs', new Set([manifest.watcher_uid, manifest.broker_uid, manifest.adapter_uid, manifest.worker_uid]).size === 4)
+const desktopManifestFile = join(manifestRoot, 'codex-desktop.json')
+writeFileSync(desktopManifestFile, JSON.stringify({ ...manifest, id: 'codex-desktop', pubkey: '3'.repeat(64), state_dir: join(root, 'state-desktop'), runtime_dir: join(root, 'run-desktop'), spool_dir: join(root, 'spool-desktop'), delivery_mode: 'codex_app_server', codex_thread_id: 'thr_notification_bound_123' }))
+const desktop = cli('describe', '--instance', 'codex-desktop')
+ok('a Codex desktop delivery mode requires an explicit persistent thread binding', desktop.status === 0)
+writeFileSync(join(manifestRoot, 'bad-desktop.json'), JSON.stringify({ ...manifest, id: 'bad-desktop', pubkey: '4'.repeat(64), state_dir: join(root, 'state-bad-desktop'), runtime_dir: join(root, 'run-bad-desktop'), spool_dir: join(root, 'spool-bad-desktop'), delivery_mode: 'codex_app_server' }))
+const badDesktop = cli('describe', '--instance', 'bad-desktop')
+ok('an inbound event cannot silently select or create a Codex desktop thread', badDesktop.status !== 0 && /explicit codex_thread_id/.test(badDesktop.stderr))
+// Invalid manifests must not remain in this fixture: every production command preflights the
+// complete instance root and therefore correctly refuses an invalid neighbour.
+unlinkSync(join(manifestRoot, 'bad-desktop.json'))
 const image = 'registry.example/nvoy@sha256:' + 'e'.repeat(64)
 const rendered = spawnSync(process.execPath, ['mcp/tools/render-instance-compose.mjs', '--instance', 'codex-test', '--image', image], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
 ok('Compose UID/GID, every runtime path, and Bunker-only mounts are rendered from the immutable manifest', rendered.status === 0 && rendered.stdout.includes('\"41011:' + manifest.broker_adapter_gid + '\"') && rendered.stdout.includes('\"41014:' + manifest.worker_handoff_gid + '\"') && rendered.stdout.includes(manifest.bunker_uri_ref) && rendered.stdout.includes(manifest.bunker_client_ref) && rendered.stdout.includes(manifest.worker_credential_ref) && rendered.stdout.includes(manifest.state_dir) && rendered.stdout.includes(manifest.spool_dir) && rendered.stdout.includes(manifest.runtime_dir) && !rendered.stdout.includes('${WATCHER_UID'))
@@ -52,6 +62,8 @@ ok('watcher markers and adapter socket are group-limited to the matching broker'
 ok('the worker has no adapter-socket group but has a separate read-only handoff group', manifest.broker_adapter_gid !== manifest.worker_handoff_gid && rendered.stdout.includes('group_add: ["' + manifest.worker_handoff_gid + '"]') && !workerPart.includes(String(manifest.broker_adapter_gid)))
 ok('broker can traverse the adapter runtime but cannot replace its socket or queue', /chmodSync\(manifest\.runtimeDir, 0o711\)/.test(readFileSync('mcp/tools/instance-adapter.mjs', 'utf8')) && /provision\(m\.runtimeDir, m\.adapterUid, m\.brokerAdapterGid, 0o711/.test(readFileSync('mcp/tools/instance-runtime-init.mjs', 'utf8')))
 const workerSource = readFileSync('mcp/tools/instance-worker.mjs', 'utf8')
+const codexDesktopSource = readFileSync('mcp/tools/codex-app-server-adapter.mjs', 'utf8')
+ok('the Codex context adapter resumes only the manifest-bound thread after broker admission, without a Nostr key or network listener', /thread\/resume/.test(codexDesktopSource) && /threadId: manifest\.codexThreadId/.test(codexDesktopSource) && /turn\/start/.test(codexDesktopSource) && /admitted-tasks\.jsonl/.test(codexDesktopSource) && !/NVOY_NSEC|NVOY_BROKER_CREDENTIAL|bunker:|wss:\/\//.test(codexDesktopSource))
 ok('the worker has a separate UID and can use only pre-provisioned cross-UID handoff paths', rendered.stdout.includes('\"41014:' + manifest.worker_handoff_gid + '\"') && /admitted-tasks\.jsonl.*workerHandoffGid.*0o640/.test(readFileSync('mcp/tools/instance-runtime-init.mjs', 'utf8')) && /reply-requests\.jsonl.*brokerAdapterGid.*0o640/.test(readFileSync('mcp/tools/instance-runtime-init.mjs', 'utf8')) && /worker-input.*workerHandoffGid.*0o710/.test(readFileSync('mcp/tools/instance-runtime-init.mjs', 'utf8')) && /renameSync\(tmp, input\)/.test(readFileSync('mcp/tools/instance-adapter.mjs', 'utf8')) && /worker-input/.test(workerSource) && !/writeFileSync\(inputPath/.test(workerSource))
 ok('watcher cooldown coalesces notifications but never skips durable queueing', /function record\(id\)[\s\S]*appendFileSync[\s\S]*if \(now - lastWake < cooldown\) return true/.test(wakeSource))
 const brokerSource = readFileSync('mcp/tools/instance-broker.mjs', 'utf8')
