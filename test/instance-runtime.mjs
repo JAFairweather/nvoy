@@ -157,6 +157,7 @@ ok('the worker has no adapter-socket group but has a separate read-only handoff 
 ok('broker can traverse the adapter runtime but cannot replace its socket or queue', /chmodSync\(manifest\.runtimeDir, 0o711\)/.test(readFileSync('mcp/tools/instance-adapter.mjs', 'utf8')) && /provision\(m\.runtimeDir, m\.adapterUid, m\.brokerAdapterGid, 0o711/.test(readFileSync('mcp/tools/instance-runtime-init.mjs', 'utf8')))
 const workerSource = readFileSync('mcp/tools/instance-worker.mjs', 'utf8')
 const codexDesktopSource = readFileSync('mcp/tools/codex-app-server-adapter.mjs', 'utf8')
+const desktopPromptSource = readFileSync('mcp/tools/desktop_instruction_prompt.mjs', 'utf8')
 const codexTransportSource = readFileSync('mcp/tools/codex_app_server.mjs', 'utf8')
 const admittedExportSource = readFileSync('mcp/tools/instance-admitted-export.mjs', 'utf8')
 const admittedImportSource = readFileSync('mcp/tools/instance-admitted-import.mjs', 'utf8')
@@ -178,7 +179,9 @@ ok('a broker claims a per-state exclusive lock before decrypting', /openSync\(lo
 ok('the broker records an identity-bound, expiry-limited admission receipt before any keyless worker can request a reply', /broker: manifest\.pubkey, envelope/.test(brokerSource) && /sender: String\(admission\.from\)/.test(brokerSource) && /grant_id: String\(admission\.grant_id\)/.test(brokerSource) && /expires_at: Date\.now\(\) \+ 5 \* 60 \* 1000/.test(brokerSource))
 ok('the broker carries its verified task authority into Desktop delivery instead of downgrading it to generic data',
   /type: 'scoped-instruction'/.test(brokerSource) && /scope_subject: manifest\.pubkey/.test(brokerSource) &&
-  /Treat the sender's message as a scoped instruction/.test(codexDesktopSource))
+  /sender's own message is a scoped user instruction/.test(desktopPromptSource) &&
+  /GRANT-AUTHORIZED NOSTR INSTRUCTION/.test(desktopPromptSource) &&
+  /desktopInstructionPrompt/.test(codexDesktopSource))
 const daemonSource = readFileSync('mcp/tools/instance-broker-daemon.mjs', 'utf8')
 ok('the broker daemon rate-limits retries after transient policy failures', /retryAfter\.get\(item\.envelope\)/.test(daemonSource) && /Date\.now\(\) \+ 5000/.test(daemonSource))
 ok('broker restart requeues only interrupted inflight markers and prioritizes the newest opaque observation', /\.inflight/.test(daemonSource) && /\.pending/.test(daemonSource) && /marker\.observed_at/.test(daemonSource) && /b\.observed - a\.observed/.test(daemonSource) && /setInterval\(drain, 1000\)/.test(daemonSource))
