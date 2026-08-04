@@ -128,7 +128,13 @@ try {
 } catch (e) { die(`cannot persist admission receipt: ${e.message}`) }
 
 const socket = resolve(manifest.runtimeDir, 'adapter.sock')
-const payload = JSON.stringify({ type: 'admitted-task', instance: manifest.id, envelope, messages: report.actionable }) + '\n'
+// Preserve the exact authorization decision across the keyless Desktop boundary. The scope
+// subject is the participant identity: attention accepted the grant only after recomputing its
+// salted da-scope hash for report.me. This attestation grants no capability beyond task/task+act.
+const authority = { version: 1, type: 'scoped-instruction', sender: receipt.sender,
+  grant_id: receipt.grant_id, grantor: receipt.grantor, cap: receipt.cap,
+  scope_subject: manifest.pubkey, policy_checked_at: receipt.admitted_at }
+const payload = JSON.stringify({ type: 'admitted-task', instance: manifest.id, envelope, authority, messages: report.actionable }) + '\n'
 const client = net.createConnection(socket)
 const timer = setTimeout(() => { client.destroy(); die('adapter acknowledgement timed out') }, 15000)
 client.on('error', e => { clearTimeout(timer); die(`adapter socket unavailable: ${e.message}`) })

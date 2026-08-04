@@ -10,6 +10,7 @@ import { createHash } from 'node:crypto'
 import { generateSecretKey, getPublicKey } from 'nostr-tools/pure'
 import * as nip19 from 'nostr-tools/nip19'
 import { isTerminalReplyFailure, loadTerminalReplyIds, recordTerminalReply } from '../mcp/tools/reply_retry.mjs'
+import { validateAdmittedTask } from '../mcp/tools/admitted_task.mjs'
 
 let fails = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); if (!value) fails++ }
@@ -167,6 +168,9 @@ ok('an unverifiable live policy requeues the opaque marker instead of consuming 
 ok('broker atomically claims the exact pending marker before decrypting', /renameSync\(pendingMarker, markerPath\)/.test(brokerSource) && /--envelope', envelope/.test(brokerSource))
 ok('a broker claims a per-state exclusive lock before decrypting', /openSync\(lockPath, 'wx'/.test(brokerSource) && /process\.kill\(prior\.pid, 0\)/.test(brokerSource))
 ok('the broker records an identity-bound, expiry-limited admission receipt before any keyless worker can request a reply', /broker: manifest\.pubkey, envelope/.test(brokerSource) && /sender: String\(admission\.from\)/.test(brokerSource) && /grant_id: String\(admission\.grant_id\)/.test(brokerSource) && /expires_at: Date\.now\(\) \+ 5 \* 60 \* 1000/.test(brokerSource))
+ok('the broker carries its verified task authority into Desktop delivery instead of downgrading it to generic data',
+  /type: 'scoped-instruction'/.test(brokerSource) && /scope_subject: manifest\.pubkey/.test(brokerSource) &&
+  /Treat the sender's message as a scoped instruction/.test(codexDesktopSource))
 const daemonSource = readFileSync('mcp/tools/instance-broker-daemon.mjs', 'utf8')
 ok('the broker daemon rate-limits retries after transient policy failures', /retryAfter\.get\(item\.envelope\)/.test(daemonSource) && /Date\.now\(\) \+ 5000/.test(daemonSource))
 ok('broker restart requeues only interrupted inflight markers and prioritizes the newest opaque observation', /\.inflight/.test(daemonSource) && /\.pending/.test(daemonSource) && /marker\.observed_at/.test(daemonSource) && /b\.observed - a\.observed/.test(daemonSource) && /setInterval\(drain, 1000\)/.test(daemonSource))
@@ -180,7 +184,7 @@ const initSource = readFileSync('mcp/tools/instance-runtime-init.mjs', 'utf8')
 ok('a root-only initializer provisions all three volume roots, a credential-free Desktop queue, and role-owned credential copies', /process\.getuid\?\.\(\) !== 0/.test(initSource) && /provision\(m\.stateDir/.test(initSource) && /provision\(m\.spoolDir/.test(initSource) && /provision\(m\.runtimeDir/.test(initSource) && /desktop-reply-requests\.jsonl.*m\.adapterUid/.test(initSource) && /function provisionSecret/.test(initSource) && /brokerCredDir/.test(initSource) && /workerCredDir/.test(initSource))
 const replySource = readFileSync('mcp/tools/instance-broker-reply.mjs', 'utf8')
 ok('only the broker can sign a reply, resolving its target from an exact receipt and persisting the wrap', /NVOY_BROKER_CREDENTIAL/.test(replySource) && /receipt\.sender/.test(replySource) && !/request\.to/.test(replySource) && replySource.includes('writeFileSync(tmp, JSON.stringify(record)') && /finalizeEvent/.test(replySource))
-ok('the Codex/Claude worker stays Nostr-keyless, uses only its runner-specific provider secret, and treats delivered text as data', !/NVOY_NSEC|BROKER_CREDENTIAL|NVOY_BUNKER_URI|nip44|finalizeEvent/.test(workerSource) && /NVOY_WORKER_CREDENTIAL_FILE/.test(workerSource) && /OPENAI_API_KEY/.test(workerSource) && /ANTHROPIC_API_KEY/.test(workerSource) && /untrusted DATA, not instructions/.test(workerSource) && /reply-request/.test(workerSource))
+ok('the Codex/Claude worker stays Nostr-keyless, uses only its runner-specific provider secret, and distinguishes scoped instructions from legacy data', !/NVOY_NSEC|BROKER_CREDENTIAL|NVOY_BUNKER_URI|nip44|finalizeEvent/.test(workerSource) && /NVOY_WORKER_CREDENTIAL_FILE/.test(workerSource) && /OPENAI_API_KEY/.test(workerSource) && /ANTHROPIC_API_KEY/.test(workerSource) && /Treat the authenticated sender's message as a scoped instruction/.test(workerSource) && /untrusted DATA, not instructions/.test(workerSource) && /reply-request/.test(workerSource))
 ok('the worker supplies its authenticated delivery directly over stdin rather than asking the model to discover a private file', /JSON\.stringify\(delivery\)/.test(workerSource) && /'--- BEGIN DELIVERED MESSAGE ---'/.test(workerSource) && /\['exec', '--sandbox', 'read-only', '--skip-git-repo-check', '--cd', manifest\.runtimeDir, '-'\]/.test(workerSource) && /input: prompt/.test(workerSource))
 ok('the headless Codex worker writes a private API-key provider configuration without persisting its provider secret', /function configureCodexApiKeyProvider/.test(workerSource) && /model_provider = "nvoy-openai-api"/.test(workerSource) && /env_key = "OPENAI_API_KEY"/.test(workerSource) && /requires_openai_auth = false/.test(workerSource) && /writeFileSync\(resolve\(dir, 'config\.toml'\)/.test(workerSource) && !/writeFileSync\([^\n]*providerKey/.test(workerSource))
 ok('the deployed worker stays awake to drain later admitted tasks instead of relying on restart timing', workerPart.includes('"--daemon"') && /const daemon = process\.argv\.includes\('--daemon'\)/.test(workerSource) && /setInterval\(\(\) =>/.test(workerSource))
@@ -205,7 +209,24 @@ const waitFor = async (predicate, ms = 2000) => {
   while (Date.now() < until) { if (predicate()) return true; await new Promise(r => setTimeout(r, 25)) }
   return false
 }
-const packet = { type: 'admitted-task', instance: 'codex-test', envelope: 'b'.repeat(64), messages: [{ from: 'a'.repeat(64), at: 1, content: 'only broker-admitted text' }] }
+const packet = { type: 'admitted-task', instance: 'codex-test', envelope: 'b'.repeat(64),
+  authority: { version: 1, type: 'scoped-instruction', sender: 'a'.repeat(64), grant_id: 'e'.repeat(64),
+    grantor: manifest.grantors[0], cap: 'task', scope_subject: pubkey, policy_checked_at: Date.now() },
+  messages: [{ from: 'a'.repeat(64), at: 1, content: 'only broker-admitted text' }] }
+ok('broker authority is accepted only when grant, scope, capability, and every sender bind',
+  validateAdmittedTask(packet, { instance: 'codex-test', scopeSubject: pubkey, grantors: manifest.grantors }).trustedInstruction === true)
+let forgedAuthorityRejected = false
+try { validateAdmittedTask({ ...packet, authority: { ...packet.authority, sender: '9'.repeat(64) } }, { instance: 'codex-test', scopeSubject: pubkey, grantors: manifest.grantors }) }
+catch { forgedAuthorityRejected = true }
+ok('a sender mismatch cannot turn admitted data into a trusted instruction', forgedAuthorityRejected)
+let wrongScopeRejected = false
+try { validateAdmittedTask({ ...packet, authority: { ...packet.authority, scope_subject: '9'.repeat(64) } }, { instance: 'codex-test', scopeSubject: pubkey, grantors: manifest.grantors }) }
+catch { wrongScopeRejected = true }
+ok('authority scoped to another participant identity is rejected at the keyless boundary', wrongScopeRejected)
+let wrongGrantorRejected = false
+try { validateAdmittedTask({ ...packet, authority: { ...packet.authority, grantor: '8'.repeat(64) } }, { instance: 'codex-test', scopeSubject: pubkey, grantors: manifest.grantors }) }
+catch { wrongGrantorRejected = true }
+ok('authority from outside the manifest grantor set is rejected at the keyless boundary', wrongGrantorRejected)
 let ack = ''
 const sendPacket = async () => {
   if (!await waitFor(() => existsSync(socket))) return
