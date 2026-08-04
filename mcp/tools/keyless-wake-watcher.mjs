@@ -48,7 +48,10 @@ const mark = id => {
 let lastWake = 0
 function record(id) {
   const now = Date.now()
-  const marker = { observed_at: Math.floor(now / 1000), envelope: id }
+  // Milliseconds are intentional. A cold relay catch-up can deliver hundreds of historical
+  // wraps in the same second; the broker uses this opaque observation timestamp to put a
+  // genuinely new arrival ahead of that backlog without inspecting a sender or plaintext.
+  const marker = { observed_at: now, envelope: id }
   // The per-envelope marker is the authoritative watcher→broker handoff. It is written BEFORE
   // the seen log, so an I/O failure causes the relay event to be retried rather than suppressed.
   if (markerDir) {
