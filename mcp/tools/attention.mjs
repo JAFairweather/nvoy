@@ -170,6 +170,10 @@ if (process.argv.includes('--json')) {
   console.log(JSON.stringify({ me: ME, grantors: GRANTORS, relaysAnswered, policyUsable,
     permitted: [...permitted.keys()], rejectedGrants: rejected,
     actionable, dataOnly: dataOnly.map(m => ({ from: m.from, at: m.at })) }, null, 2))
+  // JSON is a transport format, not a weakening of the scheduler contract. The instance
+  // adapter needs structured output AND the same 10 = actionable signal that text mode gives.
+  // Returning 0 here made a granted arrival look quiet to every JSON-consuming runtime.
+  if (onlyNew) process.exit(actionable.length ? 10 : 0)
   process.exit(0)
 }
 
