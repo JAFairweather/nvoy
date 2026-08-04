@@ -19,6 +19,7 @@ import { renderAgents } from './agents.mjs'
 import { renderDelegate } from './delegate.mjs'
 import { renderLedger } from './ledger.mjs'
 import { renderSettings } from './settings.mjs'
+import { renderTaskAuthority } from './task-authority.mjs'
 
 export const config = loadConfig()
 export const RELAYS = config.relays
@@ -60,7 +61,7 @@ export function parsePub(input) {
   return data
 }
 
-const TABS = { agents: renderAgents, delegate: renderDelegate, ledger: renderLedger, settings: renderSettings }
+const TABS = { agents: renderAgents, delegate: renderDelegate, ledger: renderLedger, authority: renderTaskAuthority, settings: renderSettings }
 let current = 'agents'
 export function showTab(t) {
   current = t
