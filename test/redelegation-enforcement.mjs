@@ -44,6 +44,12 @@ const expiring = await parent({ purpose: 'root', redelegate: true, expires_at: e
 t('a child cannot omit its parent expiry', await forbid(expiring))
 t('a child cannot outlive its parent', await forbid(expiring, { purpose: 'leaf', expires_at: expiresAt + 1 }))
 
+const expired = await parent({ purpose: 'root', redelegate: true, expires_at: Math.floor(Date.now() / 1000) - 1 })
+t('the exported minting boundary refuses an expired parent', await forbid(expired, { purpose: 'leaf', expires_at: expiresAt }))
+const relinquished = await parent({ purpose: 'root', redelegate: true })
+relinquished.relinquished = { generation: relinquished.generation, destroyed_at: Math.floor(Date.now() / 1000) }
+t('the exported minting boundary refuses a locally relinquished parent', await forbid(relinquished))
+
 const allowed = await parent({ purpose: 'root', redelegate: true })
 const issued = await issueDerivedGrant(relay, centralIdentity, allowed, leaf, { safe: 'yes' }, 'derived:booking', { purpose: 'booking subset' })
 const leafGrant = (await receiveGrants(relay, leafSk)).find(g => g.publisher === central && g.scopeId === issued.scopeId)

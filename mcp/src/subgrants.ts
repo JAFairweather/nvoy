@@ -7,9 +7,9 @@
 
 import { finalizeEvent, generateSecretKey, getEventHash, nip44 } from 'nostr-tools'
 // @ts-ignore — vendored .mjs has no declarations
-import { KIND_DATA_SET, KIND_GRANT, loadGrantIndex, newScopeKey, publishScope, saveGrantIndex, toIssuedEntry, type RelayLike } from '../lib/nipxx.mjs'
+import { KIND_DATA_SET, KIND_GRANT, fetchScope, loadGrantIndex, newScopeKey, publishScope, saveGrantIndex, toIssuedEntry, type RelayLike } from '../lib/nipxx.mjs'
 import type { Identity, Signer } from './identity.js'
-import type { HeldGrant } from './grants.js'
+import { grantStatus, type HeldGrant } from './grants.js'
 
 const now = () => Math.floor(Date.now() / 1000)
 const fuzz = () => now() - Math.floor(Math.random() * 2 * 24 * 60 * 60)
@@ -74,6 +74,12 @@ async function giftWrap(signer: Signer, recipient: string, rumor: Record<string,
 }
 
 function validate(parent: HeldGrant, terms: DerivedTerms) {
+  // This function is also an exported boundary, not merely an implementation
+  // detail behind the MCP handler.  Never rely on a caller's earlier status
+  // check: expiry and local relinquishment must stop a direct caller before it
+  // publishes even an attenuated child.
+  if (grantStatus(parent) !== 'active')
+    throw new RedelegationForbidden('the parent grant is not active')
   if (parent.terms?.redelegate !== true) throw new RedelegationForbidden('the parent grant does not permit re-delegation')
   // A derived scope is necessarily encrypted data stored on relays.  Turning
   // a no_persist parent into one would defeat the parent term at its source.
@@ -84,9 +90,10 @@ function validate(parent: HeldGrant, terms: DerivedTerms) {
     throw new RedelegationForbidden('a derived grant must expire no later than its parent')
 }
 
-/** Create a new scope and wrap its *new* key to one leaf.  The caller must
- * fresh-read the parent immediately beforehand; this routine deliberately
- * receives the HeldGrant only for terms/expiry enforcement, never its key. */
+/** Create a new scope and wrap its *new* key to one leaf.  This exported
+ * boundary re-checks both local status and the parent data-set immediately
+ * before publishing, so callers cannot turn a cached/relinquished/rotated
+ * parent into a child. */
 export async function issueDerivedGrant(
   relay: RelayLike,
   identity: Identity,
@@ -97,6 +104,9 @@ export async function issueDerivedGrant(
   terms: DerivedTerms,
 ) {
   validate(parent, terms)
+  const fresh = await fetchScope(relay, parent)
+  if (fresh.status !== 'ok')
+    throw new RedelegationForbidden('the parent grant is no longer freshly readable')
   if (!scopeName.startsWith('derived:')) throw new RedelegationForbidden("derived scope names must begin 'derived:'")
   const scopeId = opaqueScopeId()
   const scopeKey = newScopeKey()
