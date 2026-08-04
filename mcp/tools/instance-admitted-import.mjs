@@ -6,6 +6,7 @@
 import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { readManifest, instanceId } from './runtime_manifest.mjs'
+import { validateAdmittedTask } from './admitted_task.mjs'
 
 const die = message => { console.error(`instance-admitted-import: ${message}`); process.exit(1) }
 const flag = name => { const i = process.argv.indexOf(name); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -43,18 +44,8 @@ for (const line of input.split('\n').filter(Boolean)) {
   if (Buffer.byteLength(line) > 1024 * 1024) die('remote record exceeds import bound')
   let record
   try { record = JSON.parse(line) } catch { die('remote export contains malformed JSON') }
-  if (Object.keys(record).some(key => !['type', 'instance', 'envelope', 'messages', 'received_at'].includes(key)) ||
-      record.type !== 'admitted-task' || record.instance !== manifest.id ||
-      !/^[0-9a-f]{64}$/.test(record.envelope || '') || !Array.isArray(record.messages) || record.messages.length > 64) {
-    die('remote export contains an invalid admitted record')
-  }
+  try { validateAdmittedTask(record, { instance: manifest.id, scopeSubject: manifest.pubkey, grantors: manifest.grantors }) } catch { die('remote export contains an invalid admitted record') }
   if (seen.has(record.envelope)) { skipped++; continue }
-  for (const message of record.messages) {
-    if (!message || typeof message !== 'object' || Array.isArray(message) ||
-        Object.keys(message).some(key => !['from', 'at', 'content', 'event_id', 'kind'].includes(key)) ||
-        !/^[0-9a-f]{64}$/.test(String(message.from || '')) || typeof message.content !== 'string' ||
-        Buffer.byteLength(message.content) > 256 * 1024) die('remote export contains an invalid admitted message')
-  }
   const durable = JSON.stringify({ version: 1, envelope: record.envelope, imported_at: Date.now() })
   // Queue first, cursor second. A crash after queue append is deduplicated on restart because
   // startup unions both files; the opposite ordering could suppress a task that never queued.

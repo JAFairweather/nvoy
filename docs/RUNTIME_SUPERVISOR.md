@@ -112,10 +112,14 @@ and may not choose another one.
 2. The broker atomically claims a marker, fetches the exact named envelope (not “all unread mail”), decrypts, and validates
    live 440/441 task policy. Unreadable, forged, revoked, duplicate, or stale markers are
    terminally recorded without delivery.
-3. The broker pushes `{ type: "admitted-task", envelope, received_at, content }` over the
+3. The broker pushes `{ type: "admitted-task", envelope, authority, messages }` over the
    authenticated per-instance socket. The adapter acknowledges only after durable hand-off to
    its own execution queue. A broker restart redelivers unacknowledged admitted work; a marker
    is never marked completed merely because it was observed.
+   `authority` preserves the broker's verified grant id, grantor, `task`/`task+act` capability,
+   sender, participant scope, and policy-check time. Every transport boundary validates that
+   attestation and binds every message to its sender. Records from older runtimes without an
+   attestation remain notifications/data; they are never silently promoted to instructions.
 4. The adapter starts/alerts its client using a fixed local mechanism. An MCP
 `resources/updated` notification is **not** a desktop wake guarantee. For Codex, the first
 context-preserving adapter is `codex-app-server-adapter.mjs`: it runs locally, resumes the one
@@ -223,8 +227,10 @@ mount). Its value is never passed to the adapter or watcher. The broker requires
 rechecks live grants at delivery time, and refuses plaintext delivery until the adapter sends the
 instance-bound acknowledgement.
 
-`instance-worker` supports the local `codex exec` and `claude -p` runners. It launches each with
-a fixed prompt that explicitly treats the delivered body as **untrusted data, never instruction**;
+`instance-worker` supports the local `codex exec` and `claude -p` runners. A broker-attested
+message is a scoped instruction only for its authenticated sender and `task`/`task+act`
+capability; embedded third-party material remains data and no grant expands tool permissions.
+Legacy deliveries without that authority attestation remain **untrusted data, never instruction**;
 the runner can propose reply text but cannot select a recipient or sign. For a deterministic
 deployment test, `--reply 'text'` bypasses the LLM and proves the same brokered egress path.
 

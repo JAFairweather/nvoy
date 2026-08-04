@@ -6,6 +6,7 @@
 import { appendFileSync, lstatSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { readManifest, instanceId } from './runtime_manifest.mjs'
+import { validateAdmittedTask } from './admitted_task.mjs'
 
 const die = message => { console.error(`instance-desktop-sync: ${message}`); process.exit(1) }
 const flag = name => { const i = process.argv.indexOf(name); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -34,7 +35,7 @@ for (const line of admittedLines) {
   if (Buffer.byteLength(line) > 1024 * 1024) die('admitted record exceeds sync bound')
   let record
   try { record = JSON.parse(line) } catch { die('admitted queue contains malformed JSON') }
-  if (record.type !== 'admitted-task' || record.instance !== manifest.id || !/^[0-9a-f]{64}$/.test(record.envelope || '') || !Array.isArray(record.messages)) die('admitted queue contains an invalid record')
+  try { validateAdmittedTask(record, { instance: manifest.id, scopeSubject: manifest.pubkey, grantors: manifest.grantors }) } catch { die('admitted queue contains an invalid record') }
   admitted.add(record.envelope)
 }
 const existing = new Set()
