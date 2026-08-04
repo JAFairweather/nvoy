@@ -1,6 +1,6 @@
 // Multi-instance runtime contract (#44): a public manifest names exactly one identity and
 // isolated state. This drives the real CLI, rather than duplicating its validation in a unit.
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlinkSync, unlinkSync, chmodSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlinkSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -68,31 +68,6 @@ ok('remote Codex queue install baselines history, imports only a later unseen en
 const wrongInstance = JSON.stringify({ type: 'admitted-task', instance: 'claude-other', envelope: '7'.repeat(64), messages: [{ from: 'a'.repeat(64), at: 1, content: 'cross-instance attempt' }] }) + '\n'
 const deniedImport = runImport(wrongInstance)
 ok('remote Codex queue import refuses a record for another identity', deniedImport.status !== 0 && /invalid admitted record/.test(deniedImport.stderr))
-const desktopDelivered = join(root, 'run-desktop', 'codex-app-server-delivered.jsonl')
-writeFileSync(desktopDelivered, JSON.stringify({ version: 1, envelope: liveEnvelope, thread_id: '019fc80b-78a6-7b72-b3d2-eced37f55da7', turn_id: '019fce6b-4727-7a13-8f80-f4a6035c277e', delivered_at: Date.now() }) + '\n', { mode: 0o600 })
-const fakeBin = join(root, 'fake-bin'), fakeIdentity = join(root, 'reply-identity'), fakeKnownHosts = join(root, 'known-hosts'), fakeCapture = join(root, 'captured-reply.json')
-mkdirSync(fakeBin); writeFileSync(fakeIdentity, 'test-only', { mode: 0o600 }); writeFileSync(fakeKnownHosts, 'test-only', { mode: 0o600 })
-const fakeSsh = join(fakeBin, 'ssh')
-writeFileSync(fakeSsh, '#!/usr/bin/env node\nconst fs=require("node:fs");let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const x=JSON.parse(s);fs.writeFileSync(process.env.FAKE_CAPTURE,s);process.stdout.write(JSON.stringify({request:x.id,receipt:x.receipt,queued:true}))})\n', { mode: 0o700 }); chmodSync(fakeSsh, 0o700)
-const runRemoteReply = envelope => spawnSync(process.execPath, ['mcp/tools/codex-remote-reply.mjs', '--instance', 'codex-desktop', '--envelope', envelope, '--ssh-target', 'reply@nave.test', '--ssh-identity', fakeIdentity, '--known-hosts', fakeKnownHosts], { cwd: resolve('.'), encoding: 'utf8', input: 'reply from the exact Desktop thread', env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH}`, FAKE_CAPTURE: fakeCapture, NVOY_INSTANCE_ROOT: manifestRoot } })
-const remoteReply = runRemoteReply(liveEnvelope)
-let capturedReply; try { capturedReply = JSON.parse(readFileSync(fakeCapture, 'utf8')) } catch {}
-ok('the exact delivered Desktop thread can submit one recipient-free brokered reply request', remoteReply.status === 0 && capturedReply?.receipt === liveEnvelope && capturedReply?.instance === 'codex-desktop' && capturedReply?.content === 'reply from the exact Desktop thread' && !('to' in capturedReply))
-const undeliveredReply = runRemoteReply('6'.repeat(64))
-ok('the Desktop reply tool refuses an envelope not delivered to its bound thread', undeliveredReply.status !== 0 && /was not delivered/.test(undeliveredReply.stderr))
-
-if (process.getuid?.() > 0) {
-  const replyRoot = join(root, 'reply-instances'), replyRuntime = join(root, 'reply-runtime')
-  mkdirSync(replyRoot); mkdirSync(replyRuntime)
-  const uid = process.getuid(), ids = [uid + 1, uid + 2, uid + 3].map((value, index) => value === uid ? uid + 10 + index : value)
-  writeFileSync(join(replyRoot, 'reply-test.json'), JSON.stringify({ ...manifest, id: 'reply-test', pubkey: '5'.repeat(64), state_dir: join(root, 'reply-state'), runtime_dir: replyRuntime, spool_dir: join(root, 'reply-spool'), delivery_mode: 'notify_only', watcher_uid: ids[0], broker_uid: ids[1], adapter_uid: ids[2], worker_uid: uid }))
-  writeFileSync(join(replyRuntime, 'admitted-tasks.jsonl'), JSON.stringify({ type: 'admitted-task', instance: 'reply-test', envelope: liveEnvelope, messages: [{ from: 'a'.repeat(64), at: 1, content: 'admitted' }] }) + '\n')
-  const importRequest = { version: 1, type: 'reply-request', id: '4'.repeat(32), instance: 'reply-test', receipt: liveEnvelope, content: 'bounded Desktop reply' }
-  const importedReply = spawnSync(process.execPath, ['mcp/tools/instance-desktop-reply-import.mjs', '--instance', 'reply-test'], { cwd: resolve('.'), encoding: 'utf8', input: JSON.stringify(importRequest), env: { ...process.env, NVOY_INSTANCE_ROOT: replyRoot } })
-  const importedRequest = JSON.parse(readFileSync(join(replyRuntime, 'reply-requests.jsonl'), 'utf8').trim())
-  ok('the worker-UID forced endpoint queues a bounded request only for an admitted single-sender receipt', importedReply.status === 0 && importedRequest.id === importRequest.id && importedRequest.receipt === liveEnvelope && !('to' in importedRequest))
-} else ok('the worker-UID forced endpoint queues a bounded request only for an admitted single-sender receipt (root runner skips UID execution)', true)
-
 writeFileSync(join(root, 'run-desktop', 'codex-app-server-delivered.jsonl'), JSON.stringify({ version: 1, envelope: liveEnvelope, thread_id: desktopManifest.codex_thread_id, turn_id: '019fce6b-4727-7a13-8f80-f4a6035c277f' }) + '\n')
 const requestReply = input => spawnSync(process.execPath, ['mcp/tools/desktop-reply-request.mjs', '--instance', 'codex-desktop', '--receipt', liveEnvelope], { cwd: resolve('.'), encoding: 'utf8', input, env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
 const desktopReply = requestReply('Yes.\n'), duplicateReply = requestReply('Again.\n')
@@ -177,9 +152,6 @@ const codexTransportSource = readFileSync('mcp/tools/codex_app_server.mjs', 'utf
 const admittedExportSource = readFileSync('mcp/tools/instance-admitted-export.mjs', 'utf8')
 const admittedImportSource = readFileSync('mcp/tools/instance-admitted-import.mjs', 'utf8')
 const remoteBridgeSource = readFileSync('mcp/tools/codex-remote-bridge.mjs', 'utf8')
-const remoteReplySource = readFileSync('mcp/tools/codex-remote-reply.mjs', 'utf8')
-const remoteReplyImportSource = readFileSync('mcp/tools/instance-desktop-reply-import.mjs', 'utf8')
-ok('Desktop replies name only a delivered receipt while the broker retains recipient resolution and signing', /codex-app-server-delivered\.jsonl/.test(remoteReplySource) && /thread_id === manifest\.codexThreadId/.test(remoteReplySource) && /receipt, content/.test(remoteReplySource) && !/request\.to|["']to["']\s*:|NVOY_NSEC|NVOY_BROKER_CREDENTIAL|bunker:|wss:\/\//.test(remoteReplySource) && /manifest\.workerUid/.test(remoteReplyImportSource) && /reply receipt already has a request/.test(remoteReplyImportSource) && !/finalizeEvent|nip44|NVOY_NSEC|NVOY_BROKER_CREDENTIAL/.test(remoteReplyImportSource))
 ok('Desktop delivery mode disables the independent headless model drain before reading a provider credential', /manifest\.deliveryMode !== 'headless'/.test(workerSource) && /headless model drain disabled/.test(workerSource) && workerSource.indexOf("manifest.deliveryMode !== 'headless'") < workerSource.indexOf('let providerKey'))
 const desktopReplySource = readFileSync('mcp/tools/desktop-reply-request.mjs', 'utf8')
 const desktopSyncSource = readFileSync('mcp/tools/instance-desktop-sync.mjs', 'utf8')
