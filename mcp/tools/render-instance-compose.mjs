@@ -21,7 +21,7 @@ let out = readFileSync(templatePath, 'utf8')
 const replacements = {
   '${NVOY_IMAGE:?set NVOY_IMAGE}': JSON.stringify(image), '${WATCHER_UID:?}': String(m.watcherUid),
   '${BROKER_UID:?}': String(m.brokerUid), '${ADAPTER_UID:?}': String(m.adapterUid), '${SHARED_GID:?}': String(m.sharedGid),
-  '${INSTANCE_ID:?}': JSON.stringify(m.id), '${INSTANCE_ID}': m.id, '${MANIFEST_DIR:?}': JSON.stringify(m.root),
+  '${INSTANCE_ID:?}': m.id, '${INSTANCE_ID}': m.id, '${MANIFEST_DIR:?}': JSON.stringify(m.root),
   '${STATE_DIR:?}': JSON.stringify(m.stateDir), '${SPOOL_DIR:?}': JSON.stringify(m.spoolDir), '${RUNTIME_DIR:?}': JSON.stringify(m.runtimeDir),
   '${BUNKER_URI_FILE:?}': JSON.stringify(m.bunkerUriRef), '${BUNKER_CLIENT_FILE:?}': JSON.stringify(m.bunkerClientRef),
   '${BROKER_CREDENTIAL_FILE:?set BROKER_CREDENTIAL_FILE}': JSON.stringify(m.keyRef),

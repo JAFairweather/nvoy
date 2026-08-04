@@ -6,6 +6,10 @@
 # from the one validated manifest. Do not put an nsec in `environment`; Docker
 # mounts the broker credential only at `/run/secrets/nvoy_identity`.
 
+# Renderer binds this Compose project name to the immutable instance ID. Named volumes are then
+# namespaced per identity even when every rendered file is launched from the same directory.
+name: nvoy-${INSTANCE_ID:?}
+
 services:
   init:
     image: ${NVOY_IMAGE:?set NVOY_IMAGE}

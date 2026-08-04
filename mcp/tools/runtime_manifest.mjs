@@ -88,7 +88,7 @@ export function assertNoCollisions(root, candidate) {
     const id = name.slice(0, -5)
     let m
     try { m = readManifest(canonicalRoot, id) } catch (e) { die(`invalid manifest ${name}: ${e.message}`) }
-    for (const [field, value] of [['pubkey', m.pubkey], ['stateDir', m.stateDir], ['runtimeDir', m.runtimeDir]]) {
+    for (const [field, value] of [['pubkey', m.pubkey], ['stateDir', m.stateDir], ['runtimeDir', m.runtimeDir], ['spoolDir', m.spoolDir]]) {
       const key = `${field}:${value}`
       if (seen.has(key)) die(`${field} collision between ${seen.get(key)} and ${m.id}`)
       seen.set(key, m.id)
