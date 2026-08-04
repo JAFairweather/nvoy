@@ -28,6 +28,15 @@ function regular(path, label) {
   return st
 }
 
+function safeDirectory(path, label) {
+  // It is fine for an installer to create this later. Once it exists, though, a symlink would
+  // let one identity point at another identity's state/socket tree.
+  try {
+    const st = lstatSync(path)
+    if (!st.isDirectory() || st.isSymbolicLink()) die(`${label} must be a directory, never a symlink`)
+  } catch (e) { if (e?.code !== 'ENOENT') throw e }
+}
+
 export function readManifest(root, requestedId) {
   const id = instanceId(requestedId)
   const canonicalRoot = realpathSync(root)
@@ -47,6 +56,8 @@ export function readManifest(root, requestedId) {
   const stateDir = resolve(rawStateDir)
   const runtimeDir = resolve(rawRuntimeDir)
   if (stateDir === '/' || runtimeDir === '/') die('manifest requires bounded state_dir and runtime_dir')
+  safeDirectory(stateDir, 'state_dir')
+  safeDirectory(runtimeDir, 'runtime_dir')
   return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, relays, stateDir, runtimeDir,
     serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef: String(raw.key_ref || raw.keyRef || '') })
 }
