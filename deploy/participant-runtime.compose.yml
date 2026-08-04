@@ -100,6 +100,27 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
+  worker:
+    image: ${WORKER_IMAGE:?}
+    user: "${ADAPTER_UID:?}:${SHARED_GID:?}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp:mode=1777]
+    environment:
+      NVOY_INSTANCE_ROOT: /etc/nvoy/instances
+    command: ["node", "mcp/tools/instance-worker.mjs", "--instance", "${INSTANCE_ID:?}", "--runner", "${WORKER_RUNNER:?}"]
+    volumes:
+      - type: bind
+        source: ${MANIFEST_DIR:?}
+        target: /etc/nvoy/instances
+        read_only: true
+      - adapter_runtime:${RUNTIME_DIR:?}
+    depends_on:
+      adapter:
+        condition: service_started
+    restart: unless-stopped
+
 secrets:
   nvoy_bunker_uri:
     file: ${BUNKER_URI_FILE:?}

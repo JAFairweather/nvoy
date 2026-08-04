@@ -74,8 +74,11 @@ export function readManifest(root, requestedId) {
   const adapterUid = Number(raw.adapter_uid ?? raw.adapterUid)
   if (![watcherUid, brokerUid, adapterUid].every(v => Number.isInteger(v) && v > 0)) die('manifest requires positive watcher_uid, broker_uid, and adapter_uid')
   if (new Set([watcherUid, brokerUid, adapterUid]).size !== 3) die('watcher_uid, broker_uid, and adapter_uid must be distinct')
+  const workerImage = String(raw.worker_image || raw.workerImage || '')
+  const workerRunner = String(raw.worker_runner || raw.workerRunner || '')
+  if ((workerImage || workerRunner) && (!/^[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$/i.test(workerImage) || !['codex', 'claude'].includes(workerRunner))) die('worker_image must be digest-pinned and worker_runner must be codex or claude')
   return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, relays, stateDir, runtimeDir, spoolDir,
-    sharedGid, watcherUid, brokerUid, adapterUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef })
+    sharedGid, watcherUid, brokerUid, adapterUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerImage, workerRunner })
 }
 
 // Supervisor preflight: a second identity must never accidentally share a state or runtime
