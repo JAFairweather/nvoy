@@ -66,9 +66,16 @@ printed on the server's first stderr line. Three sources, in precedence order:
 | :-- | :-- | :-- |
 | `--ephemeral` (flag) | fresh keypair each boot, memory only | demos, CI, throwaway agents |
 | `NVOY_NCRYPTSEC_FILE` + `NVOY_NCRYPTSEC_PASSPHRASE` | a file holding a NIP-49 `ncryptsec1…`, decrypted at boot | **recommended for a standing agent** — the key sits on disk only encrypted |
+| `NVOY_SIGNER=nip46` + `NVOY_BUNKER_URI_FILE` | a mode-0600 file holding a NIP-46 `bunker://…` pairing URI | **recommended when a bunker owns the identity** — no raw nsec is supplied to the MCP client |
 | `NVOY_NSEC` | a raw `nsec1…` or 64-char hex in the environment | convenient, but see the security note |
 
 Other env:
+
+- `NVOY_BUNKER_URI_FILE` — NIP-46 pairing URI file, required to be a regular,
+  non-symlink file with no group/world permissions. The URI contains a pairing
+  secret, so do not put it in JSON config, shell history, or environment files.
+  `NVOY_NIP46_CLIENT_NSEC_FILE` holds the stable NIP-46 transport key under the
+  same mode rule. Direct URI/key env forms are legacy compatibility only.
 
 - `NVOY_RELAYS` — comma-separated relay list (default
   `wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net`).
