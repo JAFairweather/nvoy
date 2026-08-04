@@ -57,7 +57,7 @@ For each `<id>`, the installer creates a dedicated OS account `nvoy-<id>` and:
 | `/etc/nvoy/instances/<id>.json` | root:root 0644 | supervisor only |
 | `/etc/nvoy/keys/<id>.ncryptsec` | root:nvoy-<id> 0640 | broker only |
 | `/var/lib/nvoy/<id>` | nvoy-<id> 0700 | broker state/lock |
-| `/run/nvoy/<id>` | adapter:instance-group 0770 | broker socket |
+| `/run/nvoy/<id>` | adapter:instance-group 0710 | broker socket (broker can traverse, not replace) |
 | watcher spool | watcher:instance-group 0770, markers 0660 | watcher→broker marker intake |
 
 `nvoy-broker@<id>` and `nvoy-watcher@<id>` run under distinct accounts. The broker obtains an
@@ -65,8 +65,9 @@ exclusive lock before opening its state. On systemd, a matching `nvoy-broker@.so
 the only socket path with `SocketUser=nvoy-<id>-broker`, `SocketGroup=nvoy-<id>-adapter`, and
 `SocketMode=0660`; only that adapter account belongs to the group. In Docker, use three distinct
 container users joined only by the manifest's numeric `shared_gid`, and mount the per-instance
-runtime volume only into broker and adapter. The adapter creates a `0660` socket inside a `0770`
-directory owned by that group; the broker gets the group, nobody else does. The adapter receives this fixed path from its unit/container
+runtime volume only into broker and adapter. The adapter creates a `0660` socket inside a `0710`
+directory owned by the adapter and group-executable only; the broker gets the group, so it can
+connect to the `0660` socket but cannot unlink or replace it. The adapter receives this fixed path from its unit/container
 and may not choose another one.
 
 ## Protocol and recovery
@@ -120,9 +121,18 @@ concrete three-container layout. It runs watcher, broker, and adapter under thre
 the only shared group is the manifest's `shared_gid`. It mounts the credential as a Docker secret
 only into the broker, mounts broker state only into the broker, mounts runtime only into broker and
 adapter, and mounts spool only into watcher and broker. Each service drops capabilities, has a
-read-only image filesystem, and uses a private `/tmp`. Start from
-[`deploy/participant-runtime.env.example`](../deploy/participant-runtime.env.example); the real
-env file and credential remain host-local, mode `0600`, and uncommitted.
+read-only image filesystem, and uses a private `/tmp`. Render the deployable file from the
+immutable manifest—never a hand-written UID/GID environment file:
+
+```sh
+NVOY_INSTANCE_ROOT=/etc/nvoy/instances \
+  node mcp/tools/render-instance-compose.mjs --instance codex-jaf --image nvoy-runtime:sha-… \
+  > /etc/nvoy/instances/codex-jaf.compose.yml
+docker compose -f /etc/nvoy/instances/codex-jaf.compose.yml up -d
+```
+
+The rendered Compose file is root-owned `0644`. The credential remains host-local, mode `0600`,
+and mounts only into the broker.
 
 The Compose `init` service is a one-shot root-only provisioner, not a long-running privileged
 sidecar. It reads the manifest and creates/verifies the three named-volume roots with exactly the

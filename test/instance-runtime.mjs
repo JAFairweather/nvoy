@@ -17,7 +17,7 @@ const manifestRoot = join(root, 'instances')
 mkdirSync(manifestRoot)
 const manifestFile = join(manifestRoot, 'codex-test.json')
 const manifest = { version: 1, id: 'codex-test', pubkey: nip19.npubEncode(pubkey),
-  state_dir: join(root, 'state-codex'), runtime_dir: join(root, 'run-codex'), spool_dir: join(root, 'spool-codex'), shared_gid: process.getgid(), watcher_uid: 41011, broker_uid: 41012, adapter_uid: 41013,
+  state_dir: join(root, 'state-codex'), runtime_dir: join(root, 'run-codex'), spool_dir: join(root, 'spool-codex'), key_ref: '/etc/nvoy/credentials/codex-test.nsec', shared_gid: process.getgid(), watcher_uid: 41011, broker_uid: 41012, adapter_uid: 41013,
   grantors: ['4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b287ea84d'], relays: ['wss://nos.lol', 'wss://relay.primal.net'] }
 writeFileSync(manifestFile, JSON.stringify(manifest))
 const cli = (...args) => spawnSync(process.execPath, ['mcp/tools/instance-runtime.mjs', ...args], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
@@ -28,12 +28,15 @@ ok('a valid instance manifest describes its public identity', good.status === 0 
 ok('the description contains no private key reference', !/keyFile|nsec/.test(good.stdout))
 ok('the instance receives its own state directory', described.stateDir === manifest.state_dir)
 ok('the manifest binds three distinct non-root service UIDs', manifest.watcher_uid !== manifest.broker_uid && manifest.broker_uid !== manifest.adapter_uid)
+const rendered = spawnSync(process.execPath, ['mcp/tools/render-instance-compose.mjs', '--instance', 'codex-test', '--image', 'nvoy:test'], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
+ok('Compose UID/GID and credential mount are rendered from the immutable manifest', rendered.status === 0 && rendered.stdout.includes('\"41011:' + process.getgid() + '\"') && rendered.stdout.includes('/etc/nvoy/credentials/codex-test.nsec') && !rendered.stdout.includes('${WATCHER_UID'))
 
 const watcherSource = readFileSync('mcp/tools/instance-runtime.mjs', 'utf8')
 ok('the keyless watcher receives an explicit environment, not inherited process secrets', !/\.\.\.process\.env/.test(watcherSource) && !/NVOY_NSEC/.test(watcherSource))
 const wakeSource = readFileSync('mcp/tools/keyless-wake-watcher.mjs', 'utf8')
 ok('watcher writes the pending marker before advancing seen state', wakeSource.includes('`${id}.pending`') && wakeSource.includes('!seen.has(m[2].id) && record(m[2].id)) mark(m[2].id)'))
 ok('watcher markers and adapter socket are group-limited to the matching broker', /chmodSync\(p, 0o660\)/.test(wakeSource) && /chmodSync\(socket, 0o660\)/.test(readFileSync('mcp/tools/instance-adapter.mjs', 'utf8')))
+ok('broker can traverse the adapter runtime but cannot replace its socket or queue', /chmodSync\(manifest\.runtimeDir, 0o710\)/.test(readFileSync('mcp/tools/instance-adapter.mjs', 'utf8')) && /provision\(m\.runtimeDir, m\.adapterUid, m\.sharedGid, 0o710/.test(readFileSync('mcp/tools/instance-runtime-init.mjs', 'utf8')))
 ok('watcher cooldown coalesces notifications but never skips durable queueing', /function record\(id\)[\s\S]*appendFileSync[\s\S]*if \(now - lastWake < cooldown\) return true/.test(wakeSource))
 const brokerSource = readFileSync('mcp/tools/instance-broker.mjs', 'utf8')
 ok('broker atomically claims the exact pending marker before decrypting', /renameSync\(pendingMarker, markerPath\)/.test(brokerSource) && /--envelope', envelope/.test(brokerSource))

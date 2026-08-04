@@ -1,11 +1,10 @@
 # One Nvoy participant identity: keyless watcher → keyed broker → keyless adapter.
 #
-# Copy this file once per participant and substitute the four numeric IDs from the root-owned
-# manifest. Do not put an nsec in `environment`; Docker mounts the broker credential only at
-# /run/secrets/nvoy_identity. The one-shot `init` service provisions the three named volumes from
-# the immutable manifest before any non-root runtime starts.
-#
-# Example: docker compose -f participant-runtime.compose.yml --env-file codex-jaf.env up -d
+# This is a template, not a hand-operated Compose file. Render it only with
+# `node mcp/tools/render-instance-compose.mjs --instance <id> --image <digest>`
+# so the runtime UID/GID, instance paths, and credential reference all come
+# from the one validated manifest. Do not put an nsec in `environment`; Docker
+# mounts the broker credential only at `/run/secrets/nvoy_identity`.
 
 services:
   init:

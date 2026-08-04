@@ -24,5 +24,5 @@ function provision(path, uid, gid, mode, label) {
 }
 provision(m.stateDir, m.brokerUid, m.sharedGid, 0o700, 'broker state')
 provision(m.spoolDir, m.watcherUid, m.sharedGid, 0o770, 'watcher spool')
-provision(m.runtimeDir, m.adapterUid, m.sharedGid, 0o770, 'adapter runtime')
+provision(m.runtimeDir, m.adapterUid, m.sharedGid, 0o710, 'adapter runtime')
 console.log(`instance-runtime-init: provisioned ${m.id}`)

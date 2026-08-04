@@ -17,9 +17,11 @@ const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 let manifest
 try { manifest = readManifest(root, instanceId(id)) } catch (e) { die(e.message) }
 const socket = resolve(manifest.runtimeDir, 'adapter.sock')
-mkdirSync(manifest.runtimeDir, { recursive: true, mode: 0o770 })
+// Broker gets group execute to traverse and group write on adapter.sock itself, but never
+// directory write: it must not be able to unlink/replace the socket or adapter queue.
+mkdirSync(manifest.runtimeDir, { recursive: true, mode: 0o710 })
 chownSync(manifest.runtimeDir, -1, manifest.sharedGid)
-chmodSync(manifest.runtimeDir, 0o770)
+chmodSync(manifest.runtimeDir, 0o710)
 try { if (lstatSync(socket).isSocket()) unlinkSync(socket); else die('adapter socket path is not a socket') } catch (e) { if (e.code !== 'ENOENT') die(e.message) }
 const queue = resolve(manifest.runtimeDir, 'admitted-tasks.jsonl')
 // The broker can be restarted after its adapter ACK but before it finalizes the marker. Queue

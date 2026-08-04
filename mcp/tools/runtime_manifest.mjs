@@ -61,6 +61,8 @@ export function readManifest(root, requestedId) {
   safeDirectory(stateDir, 'state_dir')
   safeDirectory(runtimeDir, 'runtime_dir')
   safeDirectory(spoolDir, 'spool_dir')
+  const keyRef = String(raw.key_ref || raw.keyRef || '')
+  if (!keyRef || !keyRef.startsWith('/')) die('manifest requires absolute key_ref for the broker-only credential mount')
   const sharedGid = Number(raw.shared_gid ?? raw.sharedGid)
   if (!Number.isInteger(sharedGid) || sharedGid < 0) die('manifest requires non-negative shared_gid for the broker/adapter group')
   const watcherUid = Number(raw.watcher_uid ?? raw.watcherUid)
@@ -69,7 +71,7 @@ export function readManifest(root, requestedId) {
   if (![watcherUid, brokerUid, adapterUid].every(v => Number.isInteger(v) && v > 0)) die('manifest requires positive watcher_uid, broker_uid, and adapter_uid')
   if (new Set([watcherUid, brokerUid, adapterUid]).size !== 3) die('watcher_uid, broker_uid, and adapter_uid must be distinct')
   return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, relays, stateDir, runtimeDir, spoolDir,
-    sharedGid, watcherUid, brokerUid, adapterUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef: String(raw.key_ref || raw.keyRef || '') })
+    sharedGid, watcherUid, brokerUid, adapterUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef })
 }
 
 // Supervisor preflight: a second identity must never accidentally share a state or runtime
