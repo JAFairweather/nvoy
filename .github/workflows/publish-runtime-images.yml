@@ -1,0 +1,58 @@
+name: Publish immutable runtime images
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - deploy/nvoy-runtime.Dockerfile
+      - deploy/nvoy-worker.Dockerfile
+      - mcp/**
+      - lib/**
+      - package.json
+      - package-lock.json
+      - .github/workflows/publish-runtime-images.yml
+  workflow_dispatch:
+
+# The runtime manifest accepts only `name@sha256:<digest>` references.  Publishing from this
+# repository with GITHUB_TOKEN associates the resulting GHCR package with its source, so a
+# deployed instance can use the build digest rather than a mutable tag.
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: runtime
+            file: deploy/nvoy-runtime.Dockerfile
+          - name: worker
+            file: deploy/nvoy-worker.Dockerfile
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Log in to GHCR
+        uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish ${{ matrix.name }}
+        id: push
+        uses: docker/build-push-action@f2a1d5e99d037542a71f64918e516c093c6f3fc4
+        with:
+          context: .
+          file: ${{ matrix.file }}
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/nvoy-${{ matrix.name }}:sha-${{ github.sha }}
+          labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Report immutable reference
+        run: |
+          echo "### nvoy-${{ matrix.name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`ghcr.io/${{ github.repository_owner }}/nvoy-${{ matrix.name }}@${{ steps.push.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"
