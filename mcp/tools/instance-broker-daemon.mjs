@@ -25,6 +25,7 @@ const childEnv = { PATH: process.env.PATH || '', NVOY_INSTANCE_ROOT: root, NVOY_
   ...(process.env.NVOY_BUNKER_URI_FILE ? { NVOY_BUNKER_URI_FILE: process.env.NVOY_BUNKER_URI_FILE } : {}) }
 const terminalRepliesPath = resolve(manifest.stateDir, 'terminal-replies.jsonl')
 let terminalReplyIds
+const retryAfter = new Map()
 try { terminalReplyIds = loadTerminalReplyIds(terminalRepliesPath) }
 catch (e) { die(`cannot load terminal reply log: ${e.message || e}`) }
 
@@ -55,8 +56,12 @@ function drain() {
     return [{ envelope: m[1], observed }]
   }).sort((a, b) => b.observed - a.observed || a.envelope.localeCompare(b.envelope))
   for (const item of pending) {
+    if ((retryAfter.get(item.envelope) || 0) > Date.now()) continue
     const r = spawnSync(process.execPath, [broker, 'deliver', '--instance', manifest.id, '--envelope', item.envelope], { env: childEnv, encoding: 'utf8', timeout: 90000 })
-    if (r.status !== 0) console.error(`instance-broker-daemon: ${item.envelope.slice(0, 12)}… held for retry: ${String(r.stderr || '').trim()}`)
+    if (r.status !== 0) {
+      retryAfter.set(item.envelope, Date.now() + 5000)
+      console.error(`instance-broker-daemon: ${item.envelope.slice(0, 12)}… held for retry: ${String(r.stderr || '').trim()}`)
+    } else retryAfter.delete(item.envelope)
   }
   // The adapter-owned queue is append-only.  A reply tool receives only a 32-hex request id;
   // it reopens this fixed queue, then binds the request to the broker-authored admission receipt.

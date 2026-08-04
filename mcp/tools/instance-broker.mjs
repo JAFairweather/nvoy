@@ -94,7 +94,14 @@ if (![0, 10].includes(result.status)) die(`attention failed (${result.status ?? 
 let report
 try { report = JSON.parse(result.stdout) } catch { die('attention returned invalid JSON') }
 if (report.me !== manifest.pubkey) die('credential does not match manifest pubkey')
-if (!report.policyUsable || !Array.isArray(report.actionable) || !report.actionable.length) {
+// No relay answer is not a denial. Policy is deliberately default-closed, but the opaque marker
+// must remain retryable so a transient relay outage cannot silently consume valid mail forever.
+if (!report.policyUsable) {
+  try { renameSync(markerPath, pendingMarker) } catch (e) { die(`policy unavailable and marker could not be requeued: ${e.message}`) }
+  console.error('instance-broker: live grant policy unavailable; marker requeued')
+  process.exit(75)
+}
+if (!Array.isArray(report.actionable) || !report.actionable.length) {
   try { renameSync(markerPath, `${markerPath}.done`) } catch (e) { die(`cannot finalize terminal marker: ${e.message}`) }
   process.exit(0)
 }
