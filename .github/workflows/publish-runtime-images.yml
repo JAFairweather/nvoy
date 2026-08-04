@@ -49,10 +49,12 @@ jobs:
           context: .
           file: ${{ matrix.file }}
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/nvoy-${{ matrix.name }}:sha-${{ github.sha }}
+          # Docker repository components must be lower-case; GitHub preserves the
+          # owner display casing in github.repository_owner (JAFairweather).
+          tags: ghcr.io/jafairweather/nvoy-${{ matrix.name }}:sha-${{ github.sha }}
           labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
       - name: Report immutable reference
         run: |
           echo "### nvoy-${{ matrix.name }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "\`ghcr.io/${{ github.repository_owner }}/nvoy-${{ matrix.name }}@${{ steps.push.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`ghcr.io/jafairweather/nvoy-${{ matrix.name }}@${{ steps.push.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"
