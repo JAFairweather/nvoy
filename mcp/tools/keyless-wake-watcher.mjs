@@ -13,7 +13,7 @@
 // needs text, a sender, or a secret does not belong here.
 
 import WebSocket from 'ws'
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync, chownSync, chmodSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { decode } from 'nostr-tools/nip19'
@@ -33,6 +33,8 @@ const cooldown = Number(arg('--cooldown', '90')) * 1000
 const statePath = arg('--seen-path', resolve(homedir(), '.nvoy', 'keyless-wake-seen.log'))
 const queuePath = arg('--queue-path', resolve(homedir(), '.nvoy', 'keyless-wake-queue.jsonl'))
 const markerDir = arg('--marker-dir', '')
+const markerGid = Number(arg('--marker-gid', ''))
+if (markerDir && (!Number.isInteger(markerGid) || markerGid < 0)) die('--marker-dir requires a non-negative --marker-gid')
 const command = process.env.WAKE_COMMAND || ''
 const seen = new Set()
 try { for (const line of readFileSync(statePath, 'utf8').split('\n')) if (/^[0-9a-f]{64}$/.test(line)) seen.add(line) } catch { /* first run */ }
@@ -50,7 +52,7 @@ function record(id) {
   // The per-envelope marker is the authoritative watcher→broker handoff. It is written BEFORE
   // the seen log, so an I/O failure causes the relay event to be retried rather than suppressed.
   if (markerDir) {
-    try { mkdirSync(markerDir, { recursive: true }); writeFileSync(resolve(markerDir, `${id}.pending`), JSON.stringify(marker) + '\n', { flag: 'wx', mode: 0o600 }) }
+    try { mkdirSync(markerDir, { recursive: true, mode: 0o770 }); chownSync(markerDir, -1, markerGid); chmodSync(markerDir, 0o770); const p = resolve(markerDir, `${id}.pending`); writeFileSync(p, JSON.stringify(marker) + '\n', { flag: 'wx', mode: 0o660 }); chownSync(p, -1, markerGid); chmodSync(p, 0o660) }
     catch (e) { if (e.code !== 'EEXIST') { console.error(`keyless-wake: marker write failed: ${e.message}`); return false } }
   }
   try { mkdirSync(dirname(queuePath), { recursive: true }); appendFileSync(queuePath, JSON.stringify(marker) + '\n') }

@@ -4,7 +4,7 @@
 // actual runner can watch that queue or send a platform-specific notification; this process
 // never receives a Nostr key or decrypt command.
 
-import { mkdirSync, appendFileSync, chmodSync, lstatSync, unlinkSync } from 'node:fs'
+import { mkdirSync, appendFileSync, chmodSync, chownSync, lstatSync, unlinkSync } from 'node:fs'
 import { resolve } from 'node:path'
 import net from 'node:net'
 import { readManifest, instanceId } from './runtime_manifest.mjs'
@@ -17,7 +17,9 @@ const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 let manifest
 try { manifest = readManifest(root, instanceId(id)) } catch (e) { die(e.message) }
 const socket = resolve(manifest.runtimeDir, 'adapter.sock')
-mkdirSync(manifest.runtimeDir, { recursive: true, mode: 0o700 })
+mkdirSync(manifest.runtimeDir, { recursive: true, mode: 0o770 })
+chownSync(manifest.runtimeDir, -1, manifest.sharedGid)
+chmodSync(manifest.runtimeDir, 0o770)
 try { if (lstatSync(socket).isSocket()) unlinkSync(socket); else die('adapter socket path is not a socket') } catch (e) { if (e.code !== 'ENOENT') die(e.message) }
 const queue = resolve(manifest.runtimeDir, 'admitted-tasks.jsonl')
 const server = net.createServer(conn => {
@@ -31,4 +33,4 @@ const server = net.createServer(conn => {
   })
 })
 server.on('error', e => die(`cannot bind private adapter socket: ${e.message}`))
-server.listen(socket, () => { chmodSync(socket, 0o600); console.log(`instance-adapter: listening for ${manifest.id}`) })
+server.listen(socket, () => { chownSync(socket, -1, manifest.sharedGid); chmodSync(socket, 0o660); console.log(`instance-adapter: listening for ${manifest.id}`) })

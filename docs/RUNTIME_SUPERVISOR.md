@@ -37,6 +37,7 @@ contains only public routing policy:
   "state_dir": "/var/lib/nvoy/codex-jaf",
   "runtime_dir": "/run/nvoy/codex-jaf",
   "spool_dir": "/var/lib/nvoy-watcher/codex-jaf",
+  "shared_gid": 41001,
   "key_ref": "/etc/nvoy/keys/codex-jaf.ncryptsec",
   "grantors": ["<64 hex>"],
   "relays": ["wss://nos.lol", "wss://relay.primal.net"]
@@ -56,15 +57,16 @@ For each `<id>`, the installer creates a dedicated OS account `nvoy-<id>` and:
 | `/etc/nvoy/instances/<id>.json` | root:root 0644 | supervisor only |
 | `/etc/nvoy/keys/<id>.ncryptsec` | root:nvoy-<id> 0640 | broker only |
 | `/var/lib/nvoy/<id>` | nvoy-<id> 0700 | broker state/lock |
-| `/run/nvoy/<id>` | nvoy-<id> 0700 | broker socket |
-| watcher spool | separate keyless account, append-only to watcher / read-rename by broker | watcher→broker marker intake |
+| `/run/nvoy/<id>` | adapter:instance-group 0770 | broker socket |
+| watcher spool | watcher:instance-group 0770, markers 0660 | watcher→broker marker intake |
 
 `nvoy-broker@<id>` and `nvoy-watcher@<id>` run under distinct accounts. The broker obtains an
 exclusive lock before opening its state. On systemd, a matching `nvoy-broker@.socket` unit creates
 the only socket path with `SocketUser=nvoy-<id>-broker`, `SocketGroup=nvoy-<id>-adapter`, and
 `SocketMode=0660`; only that adapter account belongs to the group. In Docker, use three distinct
-container users and mount the per-instance runtime volume only into broker and adapter; the socket
-is `0600` and created by the adapter. The adapter receives this fixed path from its unit/container
+container users joined only by the manifest's numeric `shared_gid`, and mount the per-instance
+runtime volume only into broker and adapter. The adapter creates a `0660` socket inside a `0770`
+directory owned by that group; the broker gets the group, nobody else does. The adapter receives this fixed path from its unit/container
 and may not choose another one.
 
 ## Protocol and recovery

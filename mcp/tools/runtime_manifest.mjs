@@ -61,8 +61,10 @@ export function readManifest(root, requestedId) {
   safeDirectory(stateDir, 'state_dir')
   safeDirectory(runtimeDir, 'runtime_dir')
   safeDirectory(spoolDir, 'spool_dir')
+  const sharedGid = Number(raw.shared_gid ?? raw.sharedGid)
+  if (!Number.isInteger(sharedGid) || sharedGid < 0) die('manifest requires non-negative shared_gid for the broker/adapter group')
   return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, relays, stateDir, runtimeDir, spoolDir,
-    serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef: String(raw.key_ref || raw.keyRef || '') })
+    sharedGid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef: String(raw.key_ref || raw.keyRef || '') })
 }
 
 // Supervisor preflight: a second identity must never accidentally share a state or runtime
