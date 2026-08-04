@@ -177,7 +177,9 @@ only already-admitted tasks, while stdin accepts bounded reply requests only for
 envelopes. It cannot decrypt, sign, query relays, choose a recipient or thread, read broker state,
 or access a model-provider credential. Generate the exact stanza with
 `instance-desktop-authorized-key.mjs --instance <id> --public-key-file <key.pub>` and install its
-unaltered output in that adapter account only. On first install, use
+unaltered output in that adapter account only. For the reference Docker deployment, add
+`--container <fixed-adapter-container>`; the rendered command uses `docker exec -i` with the
+manifest's exact adapter UID/GID and no shell. On first install, use
 `codex-remote-bridge.mjs --baseline` once so historical queue entries
 become the durable cursor without waking a conversation; subsequent runs import only unseen
 envelopes. The local importer rejects another instance, unknown fields, malformed messages,
