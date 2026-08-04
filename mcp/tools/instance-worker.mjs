@@ -14,6 +14,7 @@ import { readManifest, instanceId } from './runtime_manifest.mjs'
 const die = m => { console.error(`instance-worker: ${m}`); process.exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
 const id = flag('--instance'), runner = flag('--runner') || 'codex', suppliedReply = flag('--reply')
+const daemon = process.argv.includes('--daemon')
 if (!id || !['codex', 'claude'].includes(runner)) die('usage: --instance <id> [--runner codex|claude] [--reply <test text>]')
 const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 let manifest; try { manifest = readManifest(root, instanceId(id)) } catch (e) { die(e.message) }
@@ -40,10 +41,6 @@ function queueRecords(path) {
   const st = lstatSync(path); if (!st.isFile() || st.isSymbolicLink()) die('queue must be a regular non-symlink file')
   return readFileSync(path, 'utf8').split('\n').flatMap(line => { try { return [JSON.parse(line)] } catch { return [] } })
 }
-const consumed = new Set(queueRecords(consumedPath).map(x => x.envelope).filter(v => /^[0-9a-f]{64}$/.test(v || '')))
-const tasks = queueRecords(queue).filter(x => x?.type === 'admitted-task' && x.instance === manifest.id && /^[0-9a-f]{64}$/.test(x.envelope || '') && Array.isArray(x.messages) && !consumed.has(x.envelope))
-if (!tasks.length) { console.log('instance-worker: no admitted task pending'); process.exit(0) }
-
 function composePrompt(inputPath) {
   // The body does not appear in argv or in the initial prompt. The runner receives no shell
   // handle, no Nostr credential, and no authority to choose a reply recipient.
@@ -73,15 +70,29 @@ function runAgent(task) {
   if (!text || Buffer.byteLength(text, 'utf8') > 4000) die(`${runner} reply is empty or exceeds 4000 bytes`)
   return text
 }
-for (const task of tasks) {
-  const reply = runAgent(task)
-  if (task.messages.length === 1 && /^[0-9a-f]{64}$/.test(String(task.messages[0]?.from || ''))) {
-    // Recipient resolution belongs to the broker's immutable admission receipt, not this worker.
-    // The worker has only the opaque receipt/envelope id and its proposed bounded text.
-    const request = { version: 1, type: 'reply-request', id: randomBytes(16).toString('hex'), instance: manifest.id,
-      receipt: task.envelope.toLowerCase(), content: reply }
-    appendFileSync(replyQueue, JSON.stringify(request) + '\n', { mode: 0o640 })
+function drain() {
+  const consumed = new Set(queueRecords(consumedPath).map(x => x.envelope).filter(v => /^[0-9a-f]{64}$/.test(v || '')))
+  const tasks = queueRecords(queue).filter(x => x?.type === 'admitted-task' && x.instance === manifest.id && /^[0-9a-f]{64}$/.test(x.envelope || '') && Array.isArray(x.messages) && !consumed.has(x.envelope))
+  for (const task of tasks) {
+    const reply = runAgent(task)
+    if (task.messages.length === 1 && /^[0-9a-f]{64}$/.test(String(task.messages[0]?.from || ''))) {
+      // Recipient resolution belongs to the broker's immutable admission receipt, not this worker.
+      // The worker has only the opaque receipt/envelope id and its proposed bounded text.
+      const request = { version: 1, type: 'reply-request', id: randomBytes(16).toString('hex'), instance: manifest.id,
+        receipt: task.envelope.toLowerCase(), content: reply }
+      appendFileSync(replyQueue, JSON.stringify(request) + '\n', { mode: 0o640 })
+    }
+    appendFileSync(consumedPath, JSON.stringify({ envelope: task.envelope.toLowerCase(), consumed_at: Date.now() }) + '\n', { mode: 0o600 })
+    console.log(`instance-worker: queued ${task.messages.length} brokered reply request(s) for ${task.envelope.slice(0, 12)}…`)
   }
-  appendFileSync(consumedPath, JSON.stringify({ envelope: task.envelope.toLowerCase(), consumed_at: Date.now() }) + '\n', { mode: 0o600 })
-  console.log(`instance-worker: queued ${task.messages.length} brokered reply request(s) for ${task.envelope.slice(0, 12)}…`)
+  return tasks.length
 }
+const count = drain()
+if (!daemon) {
+  if (!count) console.log('instance-worker: no admitted task pending')
+  process.exit(0)
+}
+console.log(`instance-worker: daemon ready${count ? '' : ' (no admitted task pending)'}`)
+setInterval(() => {
+  try { drain() } catch (e) { console.error(`instance-worker: drain failed: ${e.message || e}`) }
+}, 1000)
