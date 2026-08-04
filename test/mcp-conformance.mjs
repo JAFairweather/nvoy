@@ -40,6 +40,7 @@ const textJson = (result) => JSON.parse(result.content.find(c => c.type === 'tex
 
 const TOOLS = [
   'nvoy_whoami', 'nvoy_grants_list', 'nvoy_scope_read', 'nvoy_scope_subscribe',
+  'nvoy_derived_grant_issue',
   'nvoy_outbox_write', 'nvoy_draft_publish', 'nvoy_draft_withdraw',
   'nvoy_request_access', 'nvoy_grant_relinquish',
   'nvoy_chat_post', 'nvoy_chat_read', 'nvoy_dm_send', 'nvoy_dm_read',
@@ -55,6 +56,8 @@ const delegatorPub = getPublicKey(delegatorSk)
 const delegatorNpub = nip19.npubEncode(delegatorPub)
 const agentSk = generateSecretKey()
 const agentNpub = nip19.npubEncode(getPublicKey(agentSk))
+const leafSk = generateSecretKey()
+const leafPub = getPublicKey(leafSk)
 
 const scopeId = opaqueScopeId()
 const scopeKey = newScopeKey()
@@ -63,6 +66,13 @@ await publishScope(seedRelay, delegatorSk, { scopeId, generation: 1, scopeKey, p
 await grantWithTerms(seedRelay, delegatorSk, getPublicKey(agentSk), {
   scopeId, generation: 1, scopeKey, scopeName: 'travel-preferences', relayHint: ws.url,
   terms: { purpose, expires_at: Math.floor(Date.now() / 1000) + 3600, no_persist: true, redelegate: false, reply_scope_requested: true, contact: delegatorNpub },
+})
+
+const derivedParentId = opaqueScopeId(), derivedParentKey = newScopeKey()
+await publishScope(seedRelay, delegatorSk, { scopeId: derivedParentId, generation: 1, scopeKey: derivedParentKey, payload: { safe: 'yes', secret: 'root-only' } })
+await grantWithTerms(seedRelay, delegatorSk, getPublicKey(agentSk), {
+  scopeId: derivedParentId, generation: 1, scopeKey: derivedParentKey, scopeName: 'derivable-parent', relayHint: ws.url,
+  terms: { purpose: 'derive bounded leaf', redelegate: true },
 })
 
 // a second, already-expired grant (soft expiry per §4 — the runtime honors it)
@@ -140,7 +150,7 @@ try {
 
   // ------------------------------------------------------------- tool list
   const tools = (await client.listTools()).tools.map(t => t.name)
-  check('server exposes exactly the declared 13-tool surface',
+  check('server exposes exactly the declared tool surface',
     TOOLS.every(t => tools.includes(t)) && tools.length === TOOLS.length)
 
   // ---------------------------------------------------------------- whoami
@@ -152,7 +162,7 @@ try {
 
   // ----------------------------------------------------------- grants_list
   const list = textJson(await client.callTool({ name: 'nvoy_grants_list' }))
-  check('nvoy_grants_list: all four held grants', list.grants?.length === 4)
+  check('nvoy_grants_list: all five held grants', list.grants?.length === 5)
   const lg = list.grants?.find(g => g.d === scopeId) ?? {}
   check('grants_list shape: { d, author_npub, purpose, expires_at, terms, v, status }',
     lg.d === scopeId && lg.author_npub === delegatorNpub && lg.purpose === purpose
@@ -189,6 +199,18 @@ try {
   const bad = await client.callTool({ name: 'nvoy_scope_read', arguments: { d: 'nope', author_npub: delegatorNpub } })
   check('nvoy_scope_read: unknown scope is a clean NVOY_NO_GRANT error',
     bad.isError === true && textJson(bad).code === 'NVOY_NO_GRANT')
+
+  const deniedDerive = await client.callTool({ name: 'nvoy_derived_grant_issue', arguments: {
+    parent_d: scopeId, parent_author_npub: delegatorNpub, grantee_npub: nip19.npubEncode(leafPub), payload: { safe: 'no' }, scope_name: 'derived:forbidden', purpose: 'must refuse',
+  } })
+  check('derived grant tool refuses parent without redelegate:true', deniedDerive.isError === true && textJson(deniedDerive).code === 'NVOY_REDELEGATION_FORBIDDEN')
+  const derived = textJson(await client.callTool({ name: 'nvoy_derived_grant_issue', arguments: {
+    parent_d: derivedParentId, parent_author_npub: delegatorNpub, grantee_npub: nip19.npubEncode(leafPub), payload: { safe: 'yes' }, scope_name: 'derived:booking', purpose: 'booking subset',
+  } }))
+  await sleep(80)
+  const leafGrant = (await receiveGrants(seedRelay, leafSk)).find(g => g.scopeId === derived.scopeId)
+  const leafData = leafGrant ? await fetchScope(seedRelay, leafGrant) : null
+  check('derived grant tool issues an attenuated new scope, never the parent key', leafGrant?.publisher === getPublicKey(agentSk) && leafData?.data?.safe === 'yes' && leafData?.data?.secret === undefined && !(await receiveGrants(seedRelay, leafSk)).some(g => g.scopeId === derivedParentId))
 
   // -------------------------------------------- scope_subscribe over stdio
   // The read above cached the scope (60s TTL). Subscribe arms invalidation;
@@ -352,7 +374,7 @@ try {
   await httpClient.connect(new StreamableHTTPClientTransport(new URL(http.url)))
 
   const httpTools = (await httpClient.listTools()).tools.map(t => t.name)
-  check('HTTP transport: same declared 13-tool surface', TOOLS.every(t => httpTools.includes(t)) && httpTools.length === TOOLS.length)
+  check('HTTP transport: same declared tool surface', TOOLS.every(t => httpTools.includes(t)) && httpTools.length === TOOLS.length)
   const httpRead = textJson(await httpClient.callTool({
     name: 'nvoy_scope_read', arguments: { d: scopeId, author_npub: delegatorNpub },
   }))
@@ -424,7 +446,7 @@ try {
   check('repeat read short-circuits on the recorded revocation', repeat.code === 'NVOY_GRANT_REVOKED')
 
   const res2 = await client.listResources()
-  check('resources list after revocation: nothing active remains', (res2.resources?.length ?? 0) === 0)
+  check('resources list after revocation: the revoked scope is absent while unrelated active scopes remain', !(res2.resources ?? []).some(x => x.uri === `nvoy://${delegatorNpub}/${scopeId}`))
 
   // -------------------------------------- adversarial observer, real relay
   const view = ws.store.observerView()
