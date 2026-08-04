@@ -1,0 +1,143 @@
+# One Nvoy participant identity: keyless watcher → keyed broker → keyless adapter.
+#
+# This is a template, not a hand-operated Compose file. Render it only with
+# `node mcp/tools/render-instance-compose.mjs --instance <id> --image <digest>`
+# so the runtime UID/GID, instance paths, and credential reference all come
+# from the one validated manifest. Do not put an nsec in `environment`; Docker
+# mounts the broker credential only at `/run/secrets/nvoy_identity`.
+
+# Renderer binds this Compose project name to the immutable instance ID. Named volumes are then
+# namespaced per identity even when every rendered file is launched from the same directory.
+name: nvoy-${INSTANCE_ID:?}
+
+services:
+  init:
+    image: ${NVOY_IMAGE:?set NVOY_IMAGE}
+    user: "0:0"
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp:mode=1777]
+    environment:
+      NVOY_INSTANCE_ROOT: /etc/nvoy/instances
+    command: ["node", "mcp/tools/instance-runtime-init.mjs", "--instance", "${INSTANCE_ID:?}"]
+    volumes:
+      - type: bind
+        source: ${MANIFEST_DIR:?}
+        target: /etc/nvoy/instances
+        read_only: true
+      - watcher_spool:${SPOOL_DIR:?}
+      - broker_state:${STATE_DIR:?}
+      - adapter_runtime:${RUNTIME_DIR:?}
+    restart: "no"
+
+  watcher:
+    image: ${NVOY_IMAGE:?set NVOY_IMAGE}
+    user: "${WATCHER_UID:?}:${BROKER_ADAPTER_GID:?}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp:mode=1777]
+    environment:
+      NVOY_INSTANCE_ROOT: /etc/nvoy/instances
+    command: ["node", "mcp/tools/instance-runtime.mjs", "watch", "--instance", "${INSTANCE_ID:?}"]
+    volumes:
+      - type: bind
+        source: ${MANIFEST_DIR:?}
+        target: /etc/nvoy/instances
+        read_only: true
+      - watcher_spool:${SPOOL_DIR:?}
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  broker:
+    image: ${NVOY_IMAGE:?set NVOY_IMAGE}
+    user: "${BROKER_UID:?}:${BROKER_ADAPTER_GID:?}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp:mode=1777]
+    environment:
+      NVOY_INSTANCE_ROOT: /etc/nvoy/instances
+      NVOY_BUNKER_URI_FILE: /run/secrets/nvoy_bunker_uri
+      NVOY_BROKER_CREDENTIAL: /run/secrets/nvoy_bunker_client
+    command: ["node", "mcp/tools/instance-broker-daemon.mjs", "--instance", "${INSTANCE_ID:?}"]
+    secrets: [nvoy_bunker_uri, nvoy_bunker_client]
+    volumes:
+      - type: bind
+        source: ${MANIFEST_DIR:?}
+        target: /etc/nvoy/instances
+        read_only: true
+      - broker_state:${STATE_DIR:?}
+      - watcher_spool:${SPOOL_DIR:?}
+      - adapter_runtime:${RUNTIME_DIR:?}
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  adapter:
+    image: ${NVOY_IMAGE:?set NVOY_IMAGE}
+    user: "${ADAPTER_UID:?}:${BROKER_ADAPTER_GID:?}"
+    group_add: ["${WORKER_HANDOFF_GID:?}"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp:mode=1777]
+    environment:
+      NVOY_INSTANCE_ROOT: /etc/nvoy/instances
+    command: ["node", "mcp/tools/instance-adapter.mjs", "--instance", "${INSTANCE_ID:?}"]
+    volumes:
+      - type: bind
+        source: ${MANIFEST_DIR:?}
+        target: /etc/nvoy/instances
+        read_only: true
+      - adapter_runtime:${RUNTIME_DIR:?}
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  worker:
+    image: ${WORKER_IMAGE:?}
+    user: "${WORKER_UID:?}:${WORKER_HANDOFF_GID:?}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp:mode=1777]
+    environment:
+      NVOY_INSTANCE_ROOT: /etc/nvoy/instances
+      NVOY_WORKER_CREDENTIAL_FILE: /run/secrets/nvoy_worker_provider
+      # The manifest UID is intentionally not the image's build-time user. Keep CLI state on the
+      # worker's private tmpfs, never in a shared or image-persistent home directory.
+      HOME: /tmp
+    command: ["node", "mcp/tools/instance-worker.mjs", "--instance", "${INSTANCE_ID:?}", "--runner", "${WORKER_RUNNER:?}"]
+    secrets: [nvoy_worker_provider]
+    volumes:
+      - type: bind
+        source: ${MANIFEST_DIR:?}
+        target: /etc/nvoy/instances
+        read_only: true
+      - adapter_runtime:${RUNTIME_DIR:?}
+    depends_on:
+      adapter:
+        condition: service_started
+    restart: unless-stopped
+
+secrets:
+  nvoy_bunker_uri:
+    file: ${BUNKER_URI_FILE:?}
+  nvoy_bunker_client:
+    file: ${BUNKER_CLIENT_FILE:?}
+  # This is a model-provider credential (for example a dedicated OPENAI_API_KEY), not a
+  # Nostr identity key. It is mounted only into the keyless worker and never into the broker.
+  nvoy_worker_provider:
+    file: ${WORKER_CREDENTIAL_FILE:?}
+
+volumes:
+  watcher_spool: {}
+  broker_state: {}
+  adapter_runtime: {}

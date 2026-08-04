@@ -13,7 +13,7 @@
 // needs text, a sender, or a secret does not belong here.
 
 import WebSocket from 'ws'
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync, chownSync, chmodSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { decode } from 'nostr-tools/nip19'
@@ -32,6 +32,9 @@ const DRY = process.argv.includes('--dry-run')
 const cooldown = Number(arg('--cooldown', '90')) * 1000
 const statePath = arg('--seen-path', resolve(homedir(), '.nvoy', 'keyless-wake-seen.log'))
 const queuePath = arg('--queue-path', resolve(homedir(), '.nvoy', 'keyless-wake-queue.jsonl'))
+const markerDir = arg('--marker-dir', '')
+const markerGid = Number(arg('--marker-gid', ''))
+if (markerDir && (!Number.isInteger(markerGid) || markerGid < 0)) die('--marker-dir requires a non-negative --marker-gid')
 const command = process.env.WAKE_COMMAND || ''
 const seen = new Set()
 try { for (const line of readFileSync(statePath, 'utf8').split('\n')) if (/^[0-9a-f]{64}$/.test(line)) seen.add(line) } catch { /* first run */ }
@@ -43,26 +46,35 @@ const mark = id => {
   return true
 }
 let lastWake = 0
-function wake(id) {
+function record(id) {
   const now = Date.now()
-  if (now - lastWake < cooldown) return
-  lastWake = now
-  const marker = { at: Math.floor(now / 1000), envelope: id }
+  const marker = { observed_at: Math.floor(now / 1000), envelope: id }
+  // The per-envelope marker is the authoritative watcher→broker handoff. It is written BEFORE
+  // the seen log, so an I/O failure causes the relay event to be retried rather than suppressed.
+  if (markerDir) {
+    try { mkdirSync(markerDir, { recursive: true, mode: 0o770 }); chownSync(markerDir, -1, markerGid); chmodSync(markerDir, 0o770); const p = resolve(markerDir, `${id}.pending`); writeFileSync(p, JSON.stringify(marker) + '\n', { flag: 'wx', mode: 0o660 }); chownSync(p, -1, markerGid); chmodSync(p, 0o660) }
+    catch (e) { if (e.code !== 'EEXIST') { console.error(`keyless-wake: marker write failed: ${e.message}`); return false } }
+  }
   try { mkdirSync(dirname(queuePath), { recursive: true }); appendFileSync(queuePath, JSON.stringify(marker) + '\n') }
-  catch (e) { return console.error(`keyless-wake: queue write failed: ${e.message}`) }
+  catch (e) { if (!markerDir) { console.error(`keyless-wake: queue write failed: ${e.message}`); return false } }
   console.log(`keyless-wake: envelope ${id.slice(0, 12)}… recorded — keyed runtime must run attention.mjs`)
-  if (!command || DRY) return
+  // Every observed envelope is durable. Cooldown applies only to the optional *notification*;
+  // applying it to queueing loses authorised arrivals forever once the seen log has advanced.
+  if (now - lastWake < cooldown) return true
+  lastWake = now
+  if (!command || DRY) return true
   // The fixed command receives no arrival data. Its own runtime owns its signer and chooses
   // whether to read the queue, then attention.mjs makes the authorisation decision.
   const child = spawn(command, [], { shell: true, stdio: 'ignore', detached: true })
   child.unref()
+  return true
 }
 function connect(url) {
   let ws
   const open = () => {
     try { ws = new WebSocket(url) } catch { return setTimeout(open, 10_000) }
     ws.on('open', () => ws.send(JSON.stringify(['REQ', 'wake', { kinds: [1059], '#p': [recipient], since: Math.floor(Date.now() / 1000) - 172920 } ])))
-    ws.on('message', data => { try { const m = JSON.parse(data.toString()); if (m[0] === 'EVENT' && m[2]?.id && mark(m[2].id)) wake(m[2].id) } catch {} })
+    ws.on('message', data => { try { const m = JSON.parse(data.toString()); if (m[0] === 'EVENT' && m[2]?.id && !seen.has(m[2].id) && record(m[2].id)) mark(m[2].id) } catch {} })
     ws.on('close', () => setTimeout(open, 10_000)); ws.on('error', () => {})
   }
   open()
