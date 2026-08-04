@@ -37,6 +37,8 @@ ok('watcher cooldown coalesces notifications but never skips durable queueing', 
 const brokerSource = readFileSync('mcp/tools/instance-broker.mjs', 'utf8')
 ok('broker atomically claims the exact pending marker before decrypting', /renameSync\(pendingMarker, markerPath\)/.test(brokerSource) && /--envelope', envelope/.test(brokerSource))
 ok('a broker claims a per-state exclusive lock before decrypting', /openSync\(lockPath, 'wx'/.test(brokerSource) && /process\.kill\(prior\.pid, 0\)/.test(brokerSource))
+const daemonSource = readFileSync('mcp/tools/instance-broker-daemon.mjs', 'utf8')
+ok('broker restart requeues only interrupted inflight markers before draining', /\.inflight/.test(daemonSource) && /\.pending/.test(daemonSource) && /setInterval\(drain, 1000\)/.test(daemonSource))
 
 const blocked = cli('attention', '--instance', 'codex-test')
 ok('an adapter cannot invoke the keyed attention path', blocked.status !== 0 && /usage/.test(blocked.stderr))

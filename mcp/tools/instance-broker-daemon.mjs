@@ -1,0 +1,46 @@
+#!/usr/bin/env node
+// instance-broker-daemon.mjs — supervisor entrypoint for one keyed broker identity (#44).
+// It owns no relay subscription. It serially drains only this manifest's opaque pending markers;
+// crash-left `.inflight` markers are requeued at boot and are harmless because the adapter queue
+// deduplicates on envelope before ACKing.
+
+import { readdirSync, renameSync } from 'node:fs'
+import { resolve } from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
+
+const die = m => { console.error(`instance-broker-daemon: ${m}`); process.exit(1) }
+const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
+const id = flag('--instance')
+if (!id) die('usage: --instance <id>')
+const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
+let manifest
+try { manifest = readManifest(root, instanceId(id)); assertNoCollisions(root, manifest) } catch (e) { die(e.message) }
+if (!process.env.NVOY_BROKER_CREDENTIAL) die('broker credential path is unavailable')
+const broker = resolve(new URL('.', import.meta.url).pathname, 'instance-broker.mjs')
+const childEnv = { PATH: process.env.PATH || '', NVOY_INSTANCE_ROOT: root, NVOY_BROKER_CREDENTIAL: process.env.NVOY_BROKER_CREDENTIAL }
+
+function recover() {
+  let names = []
+  try { names = readdirSync(manifest.spoolDir) } catch (e) { die(`cannot read marker spool: ${e.message}`) }
+  for (const name of names) {
+    const m = name.match(/^([0-9a-f]{64})\.inflight$/)
+    if (!m) continue
+    try { renameSync(resolve(manifest.spoolDir, name), resolve(manifest.spoolDir, `${m[1]}.pending`)) }
+    catch (e) { die(`cannot recover inflight marker ${m[1].slice(0, 12)}…: ${e.message}`) }
+  }
+}
+function drain() {
+  let names = []
+  try { names = readdirSync(manifest.spoolDir).sort() } catch (e) { console.error(`instance-broker-daemon: spool read failed: ${e.message}`); return }
+  for (const name of names) {
+    const m = name.match(/^([0-9a-f]{64})\.pending$/)
+    if (!m) continue
+    const r = spawnSync(process.execPath, [broker, 'deliver', '--instance', manifest.id, '--envelope', m[1]], { env: childEnv, encoding: 'utf8', timeout: 90000 })
+    if (r.status !== 0) console.error(`instance-broker-daemon: ${m[1].slice(0, 12)}… held for retry: ${String(r.stderr || '').trim()}`)
+  }
+}
+recover()
+drain()
+setInterval(drain, 1000)
+console.log(`instance-broker-daemon: draining ${manifest.id}`)

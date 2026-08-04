@@ -101,10 +101,11 @@ Nvoy ships three intentionally narrow commands:
 # all three get the same --instance name; neither adapter nor watcher gets a key
 node mcp/tools/instance-runtime.mjs watch --instance codex-jaf
 node mcp/tools/instance-adapter.mjs --instance codex-jaf
-node mcp/tools/instance-broker.mjs deliver --instance codex-jaf --marker /spool/<envelope>.json
+node mcp/tools/instance-broker-daemon.mjs --instance codex-jaf
 ```
 
-`NVOY_INSTANCE_ROOT` is a deployment-only override for tests and staged installs. Production
+`instance-broker-daemon` is the broker-container entrypoint; it reclaims interrupted inflight
+markers after a crash, then serially invokes the one-shot broker. `NVOY_INSTANCE_ROOT` is a deployment-only override for tests and staged installs. Production
 defaults to `/etc/nvoy/instances`; the commands take an instance identifier, never a caller-chosen
 manifest pathname. The broker alone receives `NVOY_BROKER_CREDENTIAL`, a protected credential-file
 path (for Docker, a secret mount such as `/run/secrets/nvoy-codex-jaf`; for systemd, a credential
