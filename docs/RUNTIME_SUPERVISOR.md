@@ -184,6 +184,16 @@ remote command**. Therefore the server-side key must be restricted with an `auth
 forced command that runs the exporter for exactly one instance. The key is an admitted-queue
 read capability, never a shell or signer capability.
 
+Desktop replies use a second, independent forced-command SSH key. `codex-remote-reply.mjs`
+accepts content on stdin only after proving the named envelope was delivered to the one
+manifest-bound Codex thread. The forced command runs `instance-desktop-reply-import.mjs` as the
+remote worker UID; that endpoint accepts only one bounded reply request for a single-sender
+envelope already present in this instance's admitted queue. Neither side can name a recipient.
+The broker resolves the sender from its short-lived admission receipt, rechecks the live grant,
+and alone asks Bunker to sign and publish. Configure the server manifest as `notify_only` so the
+remote headless model drain remains disabled; its worker role stays keyless and idle except when
+the forced command appends a Desktop reply request.
+
 With `codex_transport: "local_control_socket"`, it uses the supported local Codex app-server
 control socket and JSON-RPC lifecycle (`initialize`, `thread/resume`, then `turn/start`). The
 binding may name a real persistent app-server UUID or a `thr_` id; it is selected by the owner at
