@@ -61,7 +61,6 @@ function runAgent(task) {
   const inputPath = resolve(manifest.runtimeDir, 'worker-input', `${task.envelope}.json`)
   const inputSt = lstatSync(inputPath)
   if (!inputSt.isFile() || inputSt.isSymbolicLink()) die('worker input must be a regular non-symlink file')
-  writeFileSync(inputPath, JSON.stringify({ envelope: task.envelope, messages: task.messages }), { mode: 0o600 })
   const prompt = composePrompt(inputPath)
   const args = runner === 'codex'
     ? ['exec', '--sandbox', 'read-only', '--skip-git-repo-check', '--cd', manifest.runtimeDir, prompt]
