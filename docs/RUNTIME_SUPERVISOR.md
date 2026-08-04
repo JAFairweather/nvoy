@@ -154,12 +154,12 @@ node mcp/tools/instance-worker.mjs --instance codex-jaf --runner codex
 
 ### Local Codex context adapter
 
-For a first-class Codex participant, run the Nostr watcher/broker and this adapter in the same
-trusted desktop environment (or use an explicitly secured queue forwarder). Give the manifest an
-explicit delivery binding:
+For a first-class Codex participant, give the desktop manifest an explicit delivery binding. When
+the signer and relay broker run remotely, declare `broker_mode: "remote"`; this mechanically
+requires the desktop manifest to contain no key, Bunker, or worker-provider credential reference:
 
 ```json
-{ "delivery_mode": "codex_app_server", "codex_thread_id": "<persistent-thread-id>", "codex_transport": "local_control_socket", "codex_app_server_socket": "/Users/you/.codex/app-server-control/app-server-control.sock" }
+{ "broker_mode": "remote", "delivery_mode": "codex_app_server", "codex_thread_id": "<persistent-thread-id>", "codex_transport": "local_control_socket", "codex_app_server_socket": "/Users/you/.codex/app-server-control/app-server-control.sock" }
 ```
 
 Then run:
@@ -168,8 +168,9 @@ Then run:
 node mcp/tools/codex-app-server-adapter.mjs --instance codex-jaf
 ```
 
-When the isolated watcher/broker remain on a server, do not expose their socket or credential to
-the desktop. Run `instance-admitted-export.mjs` as the remote **adapter UID** behind an SSH
+When the isolated watcher/broker remain on a server, there must be exactly one broker for the
+identity. A `broker_mode: "remote"` Desktop cannot start another watcher. Do not expose the server
+broker socket or credential to the desktop. Run `instance-admitted-export.mjs` as the remote **adapter UID** behind an SSH
 `authorized_keys` forced command (`restrict`, no PTY, forwarding, or caller-selected command), and
 pipe that authenticated stream into `instance-admitted-import.mjs` on the Mac. On first install,
 use `--baseline` once so historical queue entries become the durable cursor without waking a

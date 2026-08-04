@@ -33,9 +33,14 @@ ok('the description contains no private key reference', !/keyFile|nsec/.test(goo
 ok('the instance receives its own state directory', described.stateDir === manifest.state_dir)
 ok('the manifest binds four distinct non-root service UIDs', new Set([manifest.watcher_uid, manifest.broker_uid, manifest.adapter_uid, manifest.worker_uid]).size === 4)
 const desktopManifestFile = join(manifestRoot, 'codex-desktop.json')
-writeFileSync(desktopManifestFile, JSON.stringify({ ...manifest, id: 'codex-desktop', pubkey: '3'.repeat(64), state_dir: join(root, 'state-desktop'), runtime_dir: join(root, 'run-desktop'), spool_dir: join(root, 'spool-desktop'), delivery_mode: 'codex_app_server', codex_thread_id: '019fc80b-78a6-7b72-b3d2-eced37f55da7', codex_transport: 'local_control_socket', codex_app_server_socket: '/tmp/codex-app-server.sock' }))
+const desktopManifest = { ...manifest, id: 'codex-desktop', pubkey: '3'.repeat(64), state_dir: join(root, 'state-desktop'), runtime_dir: join(root, 'run-desktop'), spool_dir: join(root, 'spool-desktop'),
+  broker_mode: 'remote', key_ref: '', bunker_uri_ref: '', bunker_client_ref: '', worker_image: '', worker_runner: '', worker_credential_ref: '',
+  delivery_mode: 'codex_app_server', codex_thread_id: '019fc80b-78a6-7b72-b3d2-eced37f55da7', codex_transport: 'local_control_socket', codex_app_server_socket: '/tmp/codex-app-server.sock' }
+writeFileSync(desktopManifestFile, JSON.stringify(desktopManifest))
 const desktop = cli('describe', '--instance', 'codex-desktop')
-ok('a Codex desktop delivery mode accepts only an explicit persistent thread binding and local socket', desktop.status === 0)
+ok('a remote-broker Codex desktop binding is keyless and names one explicit local thread', desktop.status === 0 && JSON.parse(desktop.stdout).brokerMode === 'remote' && !/credential|bunker|nsec/i.test(desktop.stdout))
+const duplicateDesktopWatcher = cli('watch', '--instance', 'codex-desktop')
+ok('a remote-broker Desktop manifest cannot start a second watcher', duplicateDesktopWatcher.status !== 0 && /cannot start a second watcher/.test(duplicateDesktopWatcher.stderr))
 mkdirSync(join(root, 'run-desktop'), { recursive: true })
 const importRecord = envelope => JSON.stringify({ type: 'admitted-task', instance: 'codex-desktop', envelope, messages: [{ from: 'a'.repeat(64), at: 1, content: 'remote admitted data' }] }) + '\n'
 const runImport = (input, ...args) => spawnSync(process.execPath, ['mcp/tools/instance-admitted-import.mjs', '--instance', 'codex-desktop', ...args], { cwd: resolve('.'), encoding: 'utf8', input, env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
@@ -78,6 +83,10 @@ ok('an inbound event cannot silently select or create a Codex desktop thread', b
 // Invalid manifests must not remain in this fixture: every production command preflights the
 // complete instance root and therefore correctly refuses an invalid neighbour.
 unlinkSync(join(manifestRoot, 'bad-desktop.json'))
+writeFileSync(join(manifestRoot, 'bad-remote.json'), JSON.stringify({ ...desktopManifest, id: 'bad-remote', pubkey: '6'.repeat(64), state_dir: join(root, 'state-bad-remote'), runtime_dir: join(root, 'run-bad-remote'), spool_dir: join(root, 'spool-bad-remote'), bunker_uri_ref: '/must-not-exist', bunker_client_ref: '/must-not-exist-either' }))
+const keyedRemote = cli('describe', '--instance', 'bad-remote')
+ok('a remote-broker Desktop manifest refuses every local signer reference', keyedRemote.status !== 0 && /must be keyless/.test(keyedRemote.stderr))
+unlinkSync(join(manifestRoot, 'bad-remote.json'))
 const image = 'registry.example/nvoy@sha256:' + 'e'.repeat(64)
 const rendered = spawnSync(process.execPath, ['mcp/tools/render-instance-compose.mjs', '--instance', 'codex-test', '--image', image], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
 ok('Compose UID/GID, every runtime path, and Bunker-only mounts are rendered from the immutable manifest', rendered.status === 0 && rendered.stdout.includes('\"41011:' + manifest.broker_adapter_gid + '\"') && rendered.stdout.includes('\"41014:' + manifest.worker_handoff_gid + '\"') && rendered.stdout.includes(manifest.bunker_uri_ref) && rendered.stdout.includes(manifest.bunker_client_ref) && rendered.stdout.includes(manifest.worker_credential_ref) && rendered.stdout.includes(manifest.state_dir) && rendered.stdout.includes(manifest.spool_dir) && rendered.stdout.includes(manifest.runtime_dir) && !rendered.stdout.includes('${WATCHER_UID'))

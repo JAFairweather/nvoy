@@ -67,7 +67,10 @@ export function readManifest(root, requestedId) {
   const bunkerUriRef = String(raw.bunker_uri_ref || raw.bunkerUriRef || '')
   const bunkerClientRef = String(raw.bunker_client_ref || raw.bunkerClientRef || '')
   if ((bunkerUriRef || bunkerClientRef) && (!bunkerUriRef.startsWith('/') || !bunkerClientRef.startsWith('/'))) die('Bunker signer references must both be absolute paths')
-  if (!keyRef && !bunkerUriRef) die('manifest requires a broker credential reference')
+  const brokerMode = String(raw.broker_mode || raw.brokerMode || 'local')
+  if (!['local', 'remote'].includes(brokerMode)) die('broker_mode must be local or remote')
+  if (brokerMode === 'local' && !keyRef && !bunkerUriRef) die('a local broker manifest requires a credential reference')
+  if (brokerMode === 'remote' && (keyRef || bunkerUriRef || bunkerClientRef)) die('a remote-broker Desktop manifest must be keyless')
   // These are intentionally different groups. The broker alone may connect to the adapter's
   // private socket; the worker instead gets only the narrower file handoff group.
   const brokerAdapterGid = Number(raw.broker_adapter_gid ?? raw.brokerAdapterGid)
@@ -98,8 +101,9 @@ export function readManifest(root, requestedId) {
       try { localControlSocket(codexSocketPath) } catch (e) { die(e.message) }
     }
   }
+  if (brokerMode === 'remote' && (deliveryMode !== 'codex_app_server' || codexTransport !== 'local_control_socket')) die('a remote broker is valid only for an exact local Codex control-socket binding')
   return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, relays, stateDir, runtimeDir, spoolDir,
-    brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath })
+    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath })
 }
 
 // Supervisor preflight: a second identity must never accidentally share a state or runtime
