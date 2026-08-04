@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Remote worker-side endpoint for one forced-command SSH key. It accepts only a bounded reply
+// Remote adapter-side endpoint for one forced-command SSH key. It accepts only a bounded reply
 // request for an envelope already present in this instance's adapter queue. It cannot choose a
 // recipient, decrypt, sign, or publish; the broker resolves the sender from its own live receipt.
 
@@ -15,7 +15,7 @@ const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 let manifest
 try { manifest = readManifest(root, instanceId(id)) } catch (error) { die(error.message) }
 if (!['notify_only', 'codex_app_server'].includes(manifest.deliveryMode)) die('desktop reply import requires a non-headless delivery mode')
-if (process.getuid?.() !== manifest.workerUid) die('must run as the manifest-bound worker user')
+if (process.getuid?.() !== manifest.adapterUid) die('must run as the credential-free manifest-bound adapter user')
 
 let input = ''
 for await (const chunk of process.stdin) {

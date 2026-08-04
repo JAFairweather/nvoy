@@ -20,10 +20,10 @@ const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 let manifest; try { manifest = readManifest(root, instanceId(id)) } catch (e) { die(e.message) }
 if (manifest.deliveryMode !== 'headless') {
   if (suppliedReply) die('headless reply runner is disabled for Desktop delivery mode')
-  console.log(`instance-worker: ${manifest.deliveryMode} — headless model drain disabled; waiting for brokered Desktop reply requests`)
+  console.log(`instance-worker: ${manifest.deliveryMode} — headless model drain disabled; Desktop replies enter through the credential-free adapter`)
   if (!daemon) process.exit(0)
-  // Keep the worker UID/container available only as the forced-command reply-queue boundary.
-  // It never reads the provider credential or admitted queue in Desktop delivery mode.
+  // Compose may keep the worker role present for one uniform topology, but Desktop delivery never
+  // uses it: the credential-free adapter owns remote queue I/O, and this process reads no secret.
   setInterval(() => {}, 60 * 60 * 1000)
   await new Promise(() => {})
 }
