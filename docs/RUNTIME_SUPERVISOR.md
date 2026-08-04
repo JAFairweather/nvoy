@@ -59,14 +59,16 @@ For each `<id>`, the installer creates a dedicated OS account `nvoy-<id>` and:
 | watcher spool | separate keyless account, append-only | watcher→broker marker intake |
 
 `nvoy-broker@<id>` and `nvoy-watcher@<id>` run under distinct accounts. The broker obtains an
-exclusive lock before opening its state. A matching `nvoy-broker@.socket` unit creates the only
-socket path with `SocketUser=nvoy-<id>-broker`, `SocketGroup=nvoy-<id>-adapter`, and
-`SocketMode=0660`; only that adapter account belongs to the group. The adapter receives this
-fixed path from its unit and may not choose another one.
+exclusive lock before opening its state. On systemd, a matching `nvoy-broker@.socket` unit creates
+the only socket path with `SocketUser=nvoy-<id>-broker`, `SocketGroup=nvoy-<id>-adapter`, and
+`SocketMode=0660`; only that adapter account belongs to the group. In Docker, use three distinct
+container users and mount the per-instance runtime volume only into broker and adapter; the socket
+is `0600` and created by the adapter. The adapter receives this fixed path from its unit/container
+and may not choose another one.
 
 ## Protocol and recovery
 
-1. The watcher appends `{ envelope, observed_at }` to its own spool. It never parses a seal.
+1. The watcher writes one `{ envelope, observed_at }` regular marker. It never parses a seal.
 2. The broker atomically claims a marker, fetches the exact envelope, decrypts, and validates
    live 440/441 task policy. Unreadable, forged, revoked, duplicate, or stale markers are
    terminally recorded without delivery.
@@ -86,3 +88,22 @@ fixed path from its unit and may not choose another one.
 - malformed/replayed marker and wrong-peer socket connection deliver no plaintext;
 - broker restart redelivers an unacknowledged admitted message exactly once after acknowledgement;
 - revoked grant after marker observation yields no delivery.
+
+## Runnable reference roles
+
+Nvoy ships three intentionally narrow commands:
+
+```sh
+# all three get the same --instance name; neither adapter nor watcher gets a key
+node mcp/tools/instance-runtime.mjs watch --instance codex-jaf
+node mcp/tools/instance-adapter.mjs --instance codex-jaf
+node mcp/tools/instance-broker.mjs deliver --instance codex-jaf --marker /spool/<envelope>.json
+```
+
+`NVOY_INSTANCE_ROOT` is a deployment-only override for tests and staged installs. Production
+defaults to `/etc/nvoy/instances`; the commands take an instance identifier, never a caller-chosen
+manifest pathname. The broker alone receives `NVOY_BROKER_CREDENTIAL`, a protected credential-file
+path (for Docker, a secret mount such as `/run/secrets/nvoy-codex-jaf`; for systemd, a credential
+mount). Its value is never passed to the adapter or watcher. The broker requires an opaque marker,
+rechecks live grants at delivery time, and refuses plaintext delivery until the adapter sends the
+instance-bound acknowledgement.

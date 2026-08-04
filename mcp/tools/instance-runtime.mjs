@@ -12,37 +12,27 @@
 // The `attention` command was intentionally removed: giving an adapter the key through a child
 // environment defeats the broker boundary. The broker service will own that operation.
 
-import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { spawn } from 'node:child_process'
-import { decode } from 'nostr-tools/nip19'
+import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 
 const die = m => { console.error(`instance-runtime: ${m}`); process.exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
 const command = process.argv[2]
-const manifestPath = flag('--manifest')
-if (!['describe', 'watch'].includes(command) || !manifestPath) die('usage: describe|watch --manifest <path>')
-
+const idFlag = flag('--instance')
+if (!['describe', 'watch'].includes(command) || !idFlag) die('usage: describe|watch --instance <id>')
+const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 let manifest
-try { manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) } catch (e) { die(`cannot read manifest: ${e.message}`) }
-const hex = v => String(v || '').toLowerCase()
-const toHex = v => String(v || '').startsWith('npub1') ? decode(String(v)).data : hex(v)
-const valid = v => /^[0-9a-f]{64}$/.test(v)
-const id = String(manifest.id || '')
-const stateDir = String(manifest.stateDir || '')
-const recipient = toHex(manifest.recipient || '')
-const grantors = (Array.isArray(manifest.grantors) ? manifest.grantors : []).map(toHex)
-const relays = (Array.isArray(manifest.relays) ? manifest.relays : []).map(String).filter(v => /^wss:\/\//.test(v))
-if (!/^[a-z0-9][a-z0-9._-]{1,63}$/i.test(id)) die('manifest.id must be a short stable identifier')
-if (!stateDir || !valid(recipient) || !grantors.length || !grantors.every(valid) || !relays.length) die('manifest requires stateDir, recipient, grantors, and wss relays')
-const baseEnv = { ...process.env, HOME: stateDir, NVOY_RELAYS: relays.join(','), GRANTORS: grantors.join(',') }
+try { manifest = readManifest(root, instanceId(idFlag)); assertNoCollisions(root, manifest) } catch (e) { die(e.message) }
+const baseEnv = { ...process.env, HOME: manifest.stateDir, NVOY_RELAYS: manifest.relays.join(','), GRANTORS: manifest.grantors.join(',') }
 delete baseEnv.NVOY_NSEC
 const tool = name => resolve(new URL('.', import.meta.url).pathname, name)
 if (command === 'describe') {
-  console.log(JSON.stringify({ id, recipient, grantors, relays, stateDir, watcher: 'keyless' }, null, 2)); process.exit(0)
+  console.log(JSON.stringify({ id: manifest.id, recipient: manifest.pubkey, grantors: manifest.grantors,
+    relays: manifest.relays, stateDir: manifest.stateDir, watcher: 'keyless' }, null, 2)); process.exit(0)
 }
 if (command === 'watch') {
-  const child = spawn(process.execPath, [tool('keyless-wake-watcher.mjs'), '--recipient', recipient,
-    '--seen-path', resolve(stateDir, 'keyless-wake-seen.log'), '--queue-path', resolve(stateDir, 'keyless-wake-queue.jsonl')], { env: baseEnv, stdio: 'inherit' })
+  const child = spawn(process.execPath, [tool('keyless-wake-watcher.mjs'), '--recipient', manifest.pubkey,
+    '--seen-path', resolve(manifest.stateDir, 'keyless-wake-seen.log'), '--queue-path', resolve(manifest.stateDir, 'keyless-wake-queue.jsonl')], { env: baseEnv, stdio: 'inherit' })
   child.on('exit', code => process.exit(code ?? 1))
 }

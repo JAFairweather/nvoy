@@ -1,0 +1,71 @@
+// runtime_manifest.mjs — the deliberately small trusted configuration reader for #44.
+//
+// The adapter must not be able to select somebody else's identity by passing a manifest
+// pathname.  Production callers name an instance, and this module finds its manifest below a
+// supervisor-owned directory.  Tests may supply a different root, but every caller still gets
+// the same structural validation and duplicate-identity check.
+
+import { lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs'
+import { resolve, dirname, relative, sep } from 'node:path'
+import { decode } from 'nostr-tools/nip19'
+
+const die = message => { throw new Error(message) }
+const hex = value => String(value || '').toLowerCase()
+const toHex = value => String(value || '').startsWith('npub1') ? decode(String(value)).data : hex(value)
+const valid = value => /^[0-9a-f]{64}$/.test(value)
+const contained = (root, child) => child === root || child.startsWith(root + sep)
+
+export function instanceId(value) {
+  const id = String(value || '')
+  if (!/^[a-z0-9][a-z0-9._-]{1,63}$/i.test(id)) die('instance id must be a short stable identifier')
+  return id
+}
+
+function regular(path, label) {
+  let st
+  try { st = lstatSync(path) } catch { die(`${label} is missing`) }
+  if (!st.isFile() || st.isSymbolicLink()) die(`${label} must be a regular non-symlink file`)
+  return st
+}
+
+export function readManifest(root, requestedId) {
+  const id = instanceId(requestedId)
+  const canonicalRoot = realpathSync(root)
+  const path = resolve(canonicalRoot, `${id}.json`)
+  if (dirname(path) !== canonicalRoot) die('manifest escapes instance root')
+  regular(path, 'manifest')
+  let raw
+  try { raw = JSON.parse(readFileSync(path, 'utf8')) } catch (e) { die(`manifest is not valid JSON: ${e.message}`) }
+  if (raw.id !== id) die('manifest id does not match requested instance')
+  const pubkey = toHex(raw.pubkey || raw.recipient)
+  const grantors = (Array.isArray(raw.grantors) ? raw.grantors : []).map(toHex)
+  const relays = (Array.isArray(raw.relays) ? raw.relays : []).map(String).filter(v => /^wss:\/\//.test(v))
+  if (!valid(pubkey) || !grantors.length || !grantors.every(valid) || !relays.length) die('manifest requires pubkey, grantors, and wss relays')
+  const rawStateDir = String(raw.state_dir || raw.stateDir || '')
+  const rawRuntimeDir = String(raw.runtime_dir || raw.runtimeDir || '')
+  if (!rawStateDir || !rawRuntimeDir) die('manifest requires state_dir and runtime_dir')
+  const stateDir = resolve(rawStateDir)
+  const runtimeDir = resolve(rawRuntimeDir)
+  if (stateDir === '/' || runtimeDir === '/') die('manifest requires bounded state_dir and runtime_dir')
+  return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, relays, stateDir, runtimeDir,
+    serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef: String(raw.key_ref || raw.keyRef || '') })
+}
+
+// Supervisor preflight: a second identity must never accidentally share a state or runtime
+// root. This is intentionally fail-closed rather than silently picking one manifest.
+export function assertNoCollisions(root, candidate) {
+  const canonicalRoot = realpathSync(root)
+  const seen = new Map()
+  for (const name of readdirSync(canonicalRoot)) {
+    if (!name.endsWith('.json')) continue
+    const id = name.slice(0, -5)
+    let m
+    try { m = readManifest(canonicalRoot, id) } catch (e) { die(`invalid manifest ${name}: ${e.message}`) }
+    for (const [field, value] of [['pubkey', m.pubkey], ['stateDir', m.stateDir], ['runtimeDir', m.runtimeDir]]) {
+      const key = `${field}:${value}`
+      if (seen.has(key)) die(`${field} collision between ${seen.get(key)} and ${m.id}`)
+      seen.set(key, m.id)
+    }
+  }
+  if (!candidate || !contained(canonicalRoot, candidate.path)) return
+}
