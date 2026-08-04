@@ -6,6 +6,8 @@ on:
     paths:
       - deploy/nvoy-runtime.Dockerfile
       - deploy/nvoy-worker.Dockerfile
+      # render-instance-compose loads this template from the runtime image.
+      - deploy/participant-runtime.compose.yml
       - mcp/**
       - lib/**
       - package.json
