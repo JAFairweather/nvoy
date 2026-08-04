@@ -14,7 +14,7 @@
     "nopersist": "node test/nopersist.mjs",
     "egress": "npm run build && node test/egress.mjs",
     "ledger": "node test/ledger.mjs",
-    "capgrants": "node test/capgrants.mjs",
+    "capgrants": "node test/capgrants.mjs && node test/task-authority.mjs",
     "accept": "node test/m4accept.mjs",
     "ttl-daemon": "node bin/nvoy-ttl.mjs",
     "console": "node console/serve.mjs",
