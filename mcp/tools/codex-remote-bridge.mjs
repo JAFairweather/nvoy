@@ -31,14 +31,17 @@ if (manifest.deliveryMode !== 'codex_app_server' || manifest.codexTransport !== 
 
 const sshArgs = ['-i', identity, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
   '-o', `UserKnownHostsFile=${knownHosts}`, '-o', 'ClearAllForwardings=yes', '-T', target]
-const childEnv = { ...process.env, NVOY_INSTANCE_ROOT: root }
+// The Desktop half is keyless. Do not let an unrelated shell's signer, cloud, or proxy
+// credentials leak into either parser or the Codex delivery adapter merely because the bridge
+// was launched from an interactive terminal.
+const childEnv = { HOME: process.env.HOME || '', PATH: process.env.PATH || '', NVOY_INSTANCE_ROOT: root }
 function cycle() {
   // No remote command is supplied. authorized_keys must force the single adapter export command;
   // a server that offers an interactive shell is a deployment error, not a supported mode.
   const pulled = spawnSync('ssh', sshArgs, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
   if (pulled.status !== 0) throw new Error(`restricted queue export failed (${pulled.status}): ${String(pulled.stderr || '').trim()}`)
   const imported = spawnSync(process.execPath, [resolve(repoRoot, 'mcp/tools/instance-admitted-import.mjs'), '--instance', manifest.id, ...(baseline ? ['--baseline'] : [])],
-    { cwd: repoRoot, encoding: 'utf8', input: pulled.stdout, env: childEnv, maxBuffer: 1024 * 1024 })
+    { cwd: repoRoot, encoding: 'utf8', input: pulled.stdout, env: childEnv, maxBuffer: 64 * 1024 * 1024 })
   if (imported.status !== 0) throw new Error(String(imported.stderr || 'admitted import failed').trim())
   if (!baseline) {
     const delivered = spawnSync(process.execPath, [resolve(repoRoot, 'mcp/tools/codex-app-server-adapter.mjs'), '--instance', manifest.id, '--once'],
