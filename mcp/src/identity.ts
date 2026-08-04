@@ -24,7 +24,7 @@
 // issue). See requireLocalKey().
 
 import { randomUUID } from 'node:crypto'
-import { lstatSync, readFileSync } from 'node:fs'
+import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync } from 'node:fs'
 import { finalizeEvent, generateSecretKey, getPublicKey, nip19, nip44 } from 'nostr-tools'
 import { decrypt as nip49Decrypt } from 'nostr-tools/nip49'
 import { SimplePool } from 'nostr-tools/pool'
@@ -91,15 +91,23 @@ const BUNKER_PUBKEY = /^bunker:\/\/([0-9a-f]{64})/i
 
 // A bunker URI has a bearer pairing secret. It is configuration, but it is not
 // harmless configuration: never accept a symlink or a file other local users
-// can read, and do not require it to be placed in an MCP config literal.
+// can read, and do not require it to be placed in an MCP config literal.  This
+// validates the *opened descriptor*, rather than lstat(path) then reopening the
+// path: a writable parent directory could otherwise swap the checked file for a
+// symlink in between those operations.
 function readPrivateFile(path: string, name: string): string {
-  let stat
-  try { stat = lstatSync(path) } catch { throw new Error(`${name} file cannot be read`) }
-  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`${name} file must be a regular file, not a symlink`)
-  if (stat.mode & 0o077) throw new Error(`${name} file must not be group/world-readable (chmod 600)`)
-  const value = readFileSync(path, 'utf8').trim()
-  if (!value) throw new Error(`${name} file is empty`)
-  return value
+  let fd: number
+  try { fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW) }
+  catch { throw new Error(`${name} file cannot be read as a regular non-symlink file`) }
+  try {
+    const stat = fstatSync(fd)
+    if (!stat.isFile()) throw new Error(`${name} file must be a regular file, not a symlink`)
+    if (stat.mode & 0o077) throw new Error(`${name} file must not be group/world-readable (chmod 600)`)
+    // `fd` pins the verified inode even if its directory entry changes after open.
+    const value = readFileSync(fd, 'utf8').trim()
+    if (!value) throw new Error(`${name} file is empty`)
+    return value
+  } finally { closeSync(fd) }
 }
 
 /** Resolve a NIP-46 URI without putting its bearer secret in an env literal.

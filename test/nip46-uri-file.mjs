@@ -1,6 +1,6 @@
 // A NIP-46 pairing URI carries a bearer secret. Nvoy may read it from a private
 // file, but it must never force callers to embed it in an MCP config/env literal.
-import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { loadBunkerUri } from '../mcp/dist/identity.js'
@@ -20,7 +20,12 @@ try {
   chmodSync(file, 0o600)
   const link = join(dir, 'link')
   symlinkSync(file, link)
-  check('symlink URI file is refused', /not a symlink/.test(read({ NVOY_BUNKER_URI_FILE: link }).error || ''))
+  check('symlink URI file is refused', /non-symlink/.test(read({ NVOY_BUNKER_URI_FILE: link }).error || ''))
+  // A symlink swap after an open must not change what gets read. We cannot reliably race the
+  // scheduler in a test, so assert the implementation uses the descriptor-safe primitives; the
+  // production code's open(O_NOFOLLOW) + fstat(fd) + read(fd) is the property being protected.
+  const identitySource = readFileSync(new URL('../mcp/src/identity.ts', import.meta.url), 'utf8')
+  check('credential file reads pin a no-follow opened descriptor (no pathname re-open race)', /openSync\(path, fsConstants\.O_RDONLY \| fsConstants\.O_NOFOLLOW\)/.test(identitySource) && /fstatSync\(fd\)/.test(identitySource) && /readFileSync\(fd, 'utf8'\)/.test(identitySource) && !/readFileSync\(path, 'utf8'\)/.test(identitySource))
   check('ambiguous direct and file URI is refused', /only one/.test(read({ NVOY_BUNKER_URI: uri, NVOY_BUNKER_URI_FILE: file }).error || ''))
 } finally { rmSync(dir, { recursive: true, force: true }) }
 

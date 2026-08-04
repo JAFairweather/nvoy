@@ -256,13 +256,14 @@ console.log('\n9. At-rest discipline: the MCP server writes NO key material to d
   const srcFiles = readdirSync(srcDir).filter(f => f.endsWith('.ts')).map(f => join(srcDir, f))
   const src = srcFiles.map(f => `\n// ${f}\n` + readFileSync(f, 'utf8')).join('')
   // No file-write API is used anywhere in the server (writeFile/appendFile/
-  // WriteStream/createWriteStream). Identity files are read only; lstatSync
-  // is also used to reject unsafe NIP-46 URI-file permissions/symlinks.
+  // WriteStream/createWriteStream). Identity files are read only; NIP-46 file
+  // credentials use an opened descriptor (open + fstat + read + close) so a
+  // pathname cannot be swapped to a symlink after it is checked.
   check('no writeFile / appendFile / WriteStream in mcp/src',
     !/writeFile|appendFile|WriteStream/.test(src))
   const identSrc = readFileSync(join(srcDir, 'identity.ts'), 'utf8')
-  check('identity.ts imports only readFileSync/lstatSync from fs (identity reads, never writes)',
-    /import\s*\{\s*lstatSync\s*,\s*readFileSync\s*\}\s*from\s*'node:fs'/.test(identSrc)
+  check('identity.ts imports only descriptor-safe read primitives from fs (identity never writes)',
+    /import\s*\{\s*closeSync\s*,\s*constants as fsConstants\s*,\s*fstatSync\s*,\s*openSync\s*,\s*readFileSync\s*\}\s*from\s*'node:fs'/.test(identSrc)
     && !/writeFileSync|writeSync/.test(identSrc))
   // server.ts uses fs.writeSync ONLY to fd 2 (stderr shutdown line) — never a file.
   const serverSrc = readFileSync(join(srcDir, 'server.ts'), 'utf8')
