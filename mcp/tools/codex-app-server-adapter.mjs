@@ -12,6 +12,7 @@ import { resolve } from 'node:path'
 import { spawn } from 'node:child_process'
 import readline from 'node:readline'
 import { readManifest, instanceId } from './runtime_manifest.mjs'
+import { appServerCall } from './codex_app_server.mjs'
 
 const die = m => { console.error(`codex-app-server-adapter: ${m}`); process.exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -36,7 +37,7 @@ function prompt(task) {
     '--- END BROKER-ADMITTED NOSTR NOTIFICATION ---',
   ].join('\n')
 }
-function deliver(task) {
+function deliverSpawn(task) {
   return new Promise((resolveDelivery, reject) => {
     // App-server is deliberately local-only stdio.  Never point this at a network listener or
     // inherit a remote address from the inbound event.
@@ -65,6 +66,11 @@ function deliver(task) {
     send({ method: 'initialized', params: {} })
     send({ method: 'thread/resume', id: 1, params: { threadId: manifest.codexThreadId } })
   })
+}
+async function deliver(task) {
+  if (manifest.codexTransport !== 'local_control_socket') return deliverSpawn(task)
+  const result = await appServerCall({ socketPath: manifest.codexSocketPath, threadId: manifest.codexThreadId, input: prompt(task) })
+  return result.turnId
 }
 async function drain() {
   const seen = new Set(records(deliveredPath).map(x => x.envelope).filter(v => /^[0-9a-f]{64}$/.test(v || '')))
