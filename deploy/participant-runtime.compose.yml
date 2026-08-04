@@ -4,7 +4,9 @@
 # `node mcp/tools/render-instance-compose.mjs --instance <id> --image <digest>`
 # so the runtime UID/GID, instance paths, and credential reference all come
 # from the one validated manifest. Do not put an nsec in `environment`; Docker
-# mounts the broker credential only at `/run/secrets/nvoy_identity`.
+# mounts source credentials only into the root-only initializer. It creates
+# role-owned copies in separate private volumes: Bunker credentials for the broker,
+# and the model-provider credential for the worker.
 
 # Renderer binds this Compose project name to the immutable instance ID. Named volumes are then
 # namespaced per identity even when every rendered file is launched from the same directory.
@@ -21,6 +23,9 @@ services:
     tmpfs: [/tmp:mode=1777]
     environment:
       NVOY_INSTANCE_ROOT: /etc/nvoy/instances
+      NVOY_BUNKER_URI_SOURCE: /run/secrets/bunker-uri
+      NVOY_BUNKER_CLIENT_SOURCE: /run/secrets/bunker-client
+      NVOY_WORKER_PROVIDER_SOURCE: /run/secrets/worker-provider
     command: ["node", "mcp/tools/instance-runtime-init.mjs", "--instance", "${INSTANCE_ID:?}"]
     volumes:
       - type: bind
@@ -36,6 +41,19 @@ services:
       - type: volume
         source: adapter_runtime
         target: ${RUNTIME_DIR:?}
+      - type: volume
+        source: broker_credentials
+        target: /run/nvoy-broker-credentials
+      - type: volume
+        source: worker_credentials
+        target: /run/nvoy-worker-credentials
+    secrets:
+      - source: nvoy_bunker_uri
+        target: bunker-uri
+      - source: nvoy_bunker_client
+        target: bunker-client
+      - source: nvoy_worker_provider
+        target: worker-provider
     restart: "no"
 
   watcher:
@@ -70,10 +88,9 @@ services:
     tmpfs: [/tmp:mode=1777]
     environment:
       NVOY_INSTANCE_ROOT: /etc/nvoy/instances
-      NVOY_BUNKER_URI_FILE: /run/secrets/nvoy_bunker_uri
-      NVOY_BROKER_CREDENTIAL: /run/secrets/nvoy_bunker_client
+      NVOY_BUNKER_URI_FILE: /run/nvoy-broker-credentials/bunker-uri
+      NVOY_BROKER_CREDENTIAL: /run/nvoy-broker-credentials/bunker-client
     command: ["node", "mcp/tools/instance-broker-daemon.mjs", "--instance", "${INSTANCE_ID:?}"]
-    secrets: [nvoy_bunker_uri, nvoy_bunker_client]
     volumes:
       - type: bind
         source: ${MANIFEST_DIR:?}
@@ -88,6 +105,10 @@ services:
       - type: volume
         source: adapter_runtime
         target: ${RUNTIME_DIR:?}
+      - type: volume
+        source: broker_credentials
+        target: /run/nvoy-broker-credentials
+        read_only: true
     depends_on:
       init:
         condition: service_completed_successfully
@@ -126,12 +147,11 @@ services:
     tmpfs: [/tmp:mode=1777]
     environment:
       NVOY_INSTANCE_ROOT: /etc/nvoy/instances
-      NVOY_WORKER_CREDENTIAL_FILE: /run/secrets/nvoy_worker_provider
+      NVOY_WORKER_CREDENTIAL_FILE: /run/nvoy-worker-credentials/provider
       # The manifest UID is intentionally not the image's build-time user. Keep CLI state on the
       # worker's private tmpfs, never in a shared or image-persistent home directory.
       HOME: /tmp
-    command: ["node", "mcp/tools/instance-worker.mjs", "--instance", "${INSTANCE_ID:?}", "--runner", "${WORKER_RUNNER:?}"]
-    secrets: [nvoy_worker_provider]
+    command: ["node", "mcp/tools/instance-worker.mjs", "--instance", "${INSTANCE_ID:?}", "--runner", "${WORKER_RUNNER:?}", "--daemon"]
     volumes:
       - type: bind
         source: ${MANIFEST_DIR:?}
@@ -140,6 +160,10 @@ services:
       - type: volume
         source: adapter_runtime
         target: ${RUNTIME_DIR:?}
+      - type: volume
+        source: worker_credentials
+        target: /run/nvoy-worker-credentials
+        read_only: true
     depends_on:
       adapter:
         condition: service_started
@@ -159,3 +183,5 @@ volumes:
   watcher_spool: {}
   broker_state: {}
   adapter_runtime: {}
+  broker_credentials: {}
+  worker_credentials: {}
