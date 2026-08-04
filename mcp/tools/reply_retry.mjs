@@ -7,6 +7,7 @@
 
 import { appendFileSync, existsSync, lstatSync, readFileSync, readdirSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { replyRequestDigest, validateOutboundRecord } from './outbound_record.mjs'
 
 const ID = /^[0-9a-f]{32}$/
 const TERMINAL = [
@@ -37,7 +38,34 @@ export function loadTerminalReplyIds(path) {
 // Successful replies already have a broker-owned, immutable outbound record. Derive the
 // durable completion set from those records at boot so an append-only request queue does not
 // spawn one replay-checking child per completed reply on every daemon tick forever.
-export function loadPublishedReplyIds(dir) {
+export function loadReplyRequestDigests(paths, instance) {
+  const found = new Map(), ambiguous = new Set()
+  for (const path of paths) {
+    if (!existsSync(path)) continue
+    const st = lstatSync(path)
+    if (!st.isFile() || st.isSymbolicLink()) throw new Error('reply queue is not a regular file')
+    for (const line of readFileSync(path, 'utf8').split('\n')) {
+      try {
+        const request = JSON.parse(line)
+        const allowed = ['version', 'type', 'id', 'instance', 'receipt', 'content']
+        if (!request || typeof request !== 'object' || Array.isArray(request) ||
+            Object.keys(request).some(key => !allowed.includes(key)) || request.version !== 1 ||
+            request.type !== 'reply-request' || request.instance !== instance || !ID.test(String(request.id || '')) ||
+            !/^[0-9a-f]{64}$/i.test(String(request.receipt || '')) || typeof request.content !== 'string' ||
+            !request.content.trim() || Buffer.byteLength(request.content, 'utf8') > 4000) continue
+        request.receipt = request.receipt.toLowerCase()
+        const digest = replyRequestDigest(request), prior = found.get(request.id)
+        if (prior && prior !== digest) ambiguous.add(request.id)
+        else found.set(request.id, digest)
+      } catch { /* trailing partial or malformed rows never become completion authority */ }
+    }
+  }
+  for (const id of ambiguous) found.delete(id)
+  return found
+}
+
+export function loadPublishedReplyIds(dir, requestDigests) {
+  if (!(requestDigests instanceof Map)) throw new Error('published reply scan requires exact request digests')
   if (!existsSync(dir)) return new Set()
   const st = lstatSync(dir)
   if (!st.isDirectory() || st.isSymbolicLink()) throw new Error('outbound reply path is not a regular directory')
@@ -49,8 +77,10 @@ export function loadPublishedReplyIds(dir) {
     const file = lstatSync(path)
     if (!file.isFile() || file.isSymbolicLink()) continue
     try {
-      const record = JSON.parse(readFileSync(path, 'utf8'))
-      if (record?.version === 1 && record?.request_id === match[1] && record?.published === true) ids.add(match[1])
+      const digest = requestDigests.get(match[1])
+      if (!digest) continue
+      const record = validateOutboundRecord(JSON.parse(readFileSync(path, 'utf8')), { requestId: match[1], requestDigest: digest })
+      if (record.published === true) ids.add(match[1])
     } catch { /* malformed records remain visible to the normal broker validation path */ }
   }
   return ids

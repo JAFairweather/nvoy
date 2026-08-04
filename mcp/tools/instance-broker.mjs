@@ -11,6 +11,7 @@ import { resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import net from 'node:net'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
+import { claimChannelSource, completeChannelSource } from './channel_source_dedup.mjs'
 
 const die = message => { console.error(`instance-broker: ${message}`); process.exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -127,6 +128,19 @@ if (channelCarry && (!/^[0-9a-f]{64}$/.test(String(admission.carrier || '')) ||
   !manifest.carriers.some(entry => entry.pubkey === admission.carrier && entry.channels.includes(admission.reply_channel)))) {
   die('channel carry lacks a verifiable carrier/source/channel binding')
 }
+const sourceIndex = resolve(manifest.stateDir, 'channel-source-admissions.jsonl')
+if (channelCarry) {
+  let claim
+  try { claim = claimChannelSource(sourceIndex, String(admission.source_event).toLowerCase(), envelope) }
+  catch (e) { die(`cannot claim channel source: ${e.message}`) }
+  if (!claim.accepted) {
+    // A different outer envelope carrying the same signed source is terminal. It gets no reply
+    // receipt and no adapter delivery; task-relay therefore cannot amplify the author's grant.
+    try { renameSync(markerPath, `${markerPath}.done`) } catch (e) { die(`cannot finalize duplicate-source marker: ${e.message}`) }
+    console.error(`instance-broker: duplicate channel source ${String(admission.source_event).slice(0, 12)}… suppressed`)
+    process.exit(0)
+  }
+}
 const receipt = { version: channelCarry ? 2 : 1, mode: admission.mode, instance: manifest.id, broker: manifest.pubkey, envelope,
   sender: String(admission.from).toLowerCase(), grant_id: String(admission.grant_id).toLowerCase(),
   grantor: String(admission.grantor || '').toLowerCase(), cap: String(admission.cap || ''),
@@ -166,6 +180,10 @@ client.on('data', chunk => {
   clearTimeout(timer)
   let ack; try { ack = JSON.parse(received.split('\n')[0]) } catch { die('adapter acknowledgement is malformed') }
   if (ack.type !== 'ack' || ack.instance !== manifest.id) die('adapter acknowledgement does not bind this instance')
+  if (channelCarry) {
+    try { completeChannelSource(sourceIndex, receipt.source_event, envelope) }
+    catch (e) { die(`adapter acknowledged but channel source completion failed: ${e.message}`) }
+  }
   // Mark only after the adapter has durably accepted this exact delivery. A broker crash before
   // this point yields redelivery; a crash after it yields no duplicate from this watermark.
   const marked = spawnSync(process.execPath, [attention, '--mark', '--json', '--envelope', envelope], { env, encoding: 'utf8', timeout: 60000 })

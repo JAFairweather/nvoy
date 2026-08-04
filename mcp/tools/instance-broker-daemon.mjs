@@ -8,7 +8,7 @@ import { readdirSync, renameSync, readFileSync, lstatSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
-import { isTerminalReplyFailure, loadPublishedReplyIds, loadTerminalReplyIds, recordTerminalReply } from './reply_retry.mjs'
+import { isTerminalReplyFailure, loadPublishedReplyIds, loadReplyRequestDigests, loadTerminalReplyIds, recordTerminalReply } from './reply_retry.mjs'
 
 const die = m => { console.error(`instance-broker-daemon: ${m}`); process.exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -29,7 +29,13 @@ let publishedReplyIds
 const retryAfter = new Map()
 try { terminalReplyIds = loadTerminalReplyIds(terminalRepliesPath) }
 catch (e) { die(`cannot load terminal reply log: ${e.message || e}`) }
-try { publishedReplyIds = loadPublishedReplyIds(resolve(manifest.stateDir, 'outbound')) }
+try {
+  const requestDigests = loadReplyRequestDigests([
+    resolve(manifest.runtimeDir, 'reply-requests.jsonl'),
+    resolve(manifest.runtimeDir, 'desktop-reply-requests.jsonl'),
+  ], manifest.id)
+  publishedReplyIds = loadPublishedReplyIds(resolve(manifest.stateDir, 'outbound'), requestDigests)
+}
 catch (e) { die(`cannot load published reply records: ${e.message || e}`) }
 
 function recover() {
