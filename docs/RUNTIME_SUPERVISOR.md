@@ -112,3 +112,14 @@ path (for Docker, a secret mount such as `/run/secrets/nvoy-codex-jaf`; for syst
 mount). Its value is never passed to the adapter or watcher. The broker requires an opaque marker,
 rechecks live grants at delivery time, and refuses plaintext delivery until the adapter sends the
 instance-bound acknowledgement.
+
+### Docker reference deployment
+
+[`deploy/participant-runtime.compose.yml`](../deploy/participant-runtime.compose.yml) is the
+concrete three-container layout. It runs watcher, broker, and adapter under three different UIDs;
+the only shared group is the manifest's `shared_gid`. It mounts the credential as a Docker secret
+only into the broker, mounts broker state only into the broker, mounts runtime only into broker and
+adapter, and mounts spool only into watcher and broker. Each service drops capabilities, has a
+read-only image filesystem, and uses a private `/tmp`. Start from
+[`deploy/participant-runtime.env.example`](../deploy/participant-runtime.env.example); the real
+env file and credential remain host-local, mode `0600`, and uncommitted.
