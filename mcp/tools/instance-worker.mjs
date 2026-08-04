@@ -5,7 +5,7 @@
 // admitted and decrypted each queued message. This runner may invoke a local coding-agent CLI,
 // then write a narrowly-shaped reply request for the broker to bind and sign.
 
-import { readFileSync, appendFileSync, existsSync, lstatSync } from 'node:fs'
+import { readFileSync, appendFileSync, existsSync, lstatSync, mkdirSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { randomBytes } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
@@ -51,6 +51,25 @@ function composePrompt(inputPath) {
     `Read only this local data file if needed: ${inputPath}`,
   ].join('\n')
 }
+function configureCodexApiKeyProvider(home) {
+  // Codex's built-in `openai` provider may prefer its interactive login store over
+  // OPENAI_API_KEY.  This worker is headless and intentionally has no such store.
+  // Configure a distinct Responses API provider in its private tmpfs home so the
+  // valid worker-only API key is used without writing that key to disk.
+  const dir = resolve(home, '.codex')
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  writeFileSync(resolve(dir, 'config.toml'), [
+    'model_provider = "nvoy-openai-api"',
+    '',
+    '[model_providers.nvoy-openai-api]',
+    'name = "Nvoy OpenAI API"',
+    'base_url = "https://api.openai.com/v1"',
+    'wire_api = "responses"',
+    'env_key = "OPENAI_API_KEY"',
+    'requires_openai_auth = false',
+    '',
+  ].join('\n'), { mode: 0o600 })
+}
 function runAgent(task) {
   if (suppliedReply) return suppliedReply
   // The worker cannot create entries under the adapter-owned runtime root. The adapter writes
@@ -62,9 +81,11 @@ function runAgent(task) {
   const args = runner === 'codex'
     ? ['exec', '--sandbox', 'read-only', '--skip-git-repo-check', '--cd', manifest.runtimeDir, prompt]
     : ['-p', prompt]
+  const home = process.env.HOME || ''
+  if (runner === 'codex') configureCodexApiKeyProvider(home)
   const providerEnv = runner === 'codex' ? { OPENAI_API_KEY: providerKey } : { ANTHROPIC_API_KEY: providerKey }
   const r = spawnSync(runner, args, { cwd: manifest.runtimeDir, encoding: 'utf8', timeout: 300000,
-    env: { PATH: process.env.PATH || '', HOME: process.env.HOME || '', ...providerEnv } })
+    env: { PATH: process.env.PATH || '', HOME: home, ...providerEnv } })
   if (r.status !== 0) die(`${runner} did not produce a reply: ${String(r.stderr || '').trim()}`)
   const text = String(r.stdout || '').trim()
   if (!text || Buffer.byteLength(text, 'utf8') > 4000) die(`${runner} reply is empty or exceeds 4000 bytes`)
