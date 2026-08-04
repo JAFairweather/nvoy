@@ -6,7 +6,7 @@
 // after that check, and pushes admitted plaintext to the fixed private adapter socket. The
 // adapter has no key, key path, manifest path, or decryption command.
 
-import { readFileSync, existsSync, lstatSync, renameSync } from 'node:fs'
+import { readFileSync, existsSync, lstatSync, renameSync, mkdirSync, openSync, writeFileSync, closeSync, unlinkSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import net from 'node:net'
@@ -21,6 +21,34 @@ if (command !== 'deliver' || !id || !markerPath) die('usage: deliver --instance 
 const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 let manifest
 try { manifest = readManifest(root, instanceId(id)); assertNoCollisions(root, manifest) } catch (e) { die(e.message) }
+
+// One broker owns one state root at a time. A stale lock is reclaimable only if its recorded PID
+// is demonstrably gone; a malformed or foreign lock fails closed rather than guessing.
+mkdirSync(manifest.stateDir, { recursive: true, mode: 0o700 })
+const lockPath = resolve(manifest.stateDir, 'broker.lock')
+function claimLock() {
+  try {
+    const fd = openSync(lockPath, 'wx', 0o600)
+    writeFileSync(fd, JSON.stringify({ pid: process.pid, instance: manifest.id, started_at: Date.now() }))
+    closeSync(fd)
+    return
+  } catch (e) {
+    if (e.code !== 'EEXIST') die(`cannot claim broker lock: ${e.message}`)
+  }
+  let prior
+  try {
+    const st = lstatSync(lockPath)
+    if (!st.isFile() || st.isSymbolicLink()) die('broker lock is not a regular file')
+    prior = JSON.parse(readFileSync(lockPath, 'utf8'))
+  } catch (e) { die(`cannot validate existing broker lock: ${e.message}`) }
+  if (prior.instance !== manifest.id || !Number.isInteger(prior.pid) || prior.pid < 1) die('broker lock does not bind this instance')
+  try { process.kill(prior.pid, 0); die(`broker already running as pid ${prior.pid}`) }
+  catch (e) { if (e.code !== 'ESRCH') die(`cannot establish whether existing broker is alive: ${e.message}`) }
+  try { unlinkSync(lockPath) } catch (e) { die(`cannot reclaim stale broker lock: ${e.message}`) }
+  claimLock()
+}
+claimLock()
+process.on('exit', () => { try { unlinkSync(lockPath) } catch {} })
 
 // A marker is only a wake hint. It must never carry plaintext, sender identity, grant id, or a
 // command. The broker nevertheless requires one so no process can turn it into a broad inbox

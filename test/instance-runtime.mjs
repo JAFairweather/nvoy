@@ -32,6 +32,8 @@ const watcherSource = readFileSync('mcp/tools/instance-runtime.mjs', 'utf8')
 ok('the keyless watcher receives an explicit environment, not inherited process secrets', !/\.\.\.process\.env/.test(watcherSource) && !/NVOY_NSEC/.test(watcherSource))
 const wakeSource = readFileSync('mcp/tools/keyless-wake-watcher.mjs', 'utf8')
 ok('watcher cooldown coalesces notifications but never skips durable queueing', /function record\(id\)[\s\S]*appendFileSync[\s\S]*if \(now - lastWake < cooldown\) return/.test(wakeSource))
+const brokerSource = readFileSync('mcp/tools/instance-broker.mjs', 'utf8')
+ok('a broker claims a per-state exclusive lock before decrypting', /openSync\(lockPath, 'wx'/.test(brokerSource) && /process\.kill\(prior\.pid, 0\)/.test(brokerSource))
 
 const blocked = cli('attention', '--instance', 'codex-test')
 ok('an adapter cannot invoke the keyed attention path', blocked.status !== 0 && /usage/.test(blocked.stderr))
