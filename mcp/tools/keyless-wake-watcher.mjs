@@ -30,6 +30,8 @@ const relays = (process.env.NVOY_RELAYS?.split(',') || ['wss://nos.lol', 'wss://
   .map(x => x.trim()).filter(Boolean)
 const DRY = process.argv.includes('--dry-run')
 const cooldown = Number(arg('--cooldown', '90')) * 1000
+const sinceSeconds = Number(arg('--since-seconds', '172920'))
+if (!Number.isInteger(sinceSeconds) || sinceSeconds < 0 || sinceSeconds > 604800) die('--since-seconds must be an integer from 0 through 604800')
 const statePath = arg('--seen-path', resolve(homedir(), '.nvoy', 'keyless-wake-seen.log'))
 const queuePath = arg('--queue-path', resolve(homedir(), '.nvoy', 'keyless-wake-queue.jsonl'))
 const markerDir = arg('--marker-dir', '')
@@ -76,7 +78,7 @@ function connect(url) {
   let ws
   const open = () => {
     try { ws = new WebSocket(url) } catch { return setTimeout(open, 10_000) }
-    ws.on('open', () => ws.send(JSON.stringify(['REQ', 'wake', { kinds: [1059], '#p': [recipient], since: Math.floor(Date.now() / 1000) - 172920 } ])))
+    ws.on('open', () => ws.send(JSON.stringify(['REQ', 'wake', { kinds: [1059], '#p': [recipient], since: Math.floor(Date.now() / 1000) - sinceSeconds } ])))
     ws.on('message', data => { try { const m = JSON.parse(data.toString()); if (m[0] === 'EVENT' && m[2]?.id && !seen.has(m[2].id) && record(m[2].id)) mark(m[2].id) } catch {} })
     ws.on('close', () => setTimeout(open, 10_000)); ws.on('error', () => {})
   }

@@ -168,6 +168,22 @@ Then run:
 node mcp/tools/codex-app-server-adapter.mjs --instance codex-jaf
 ```
 
+When the isolated watcher/broker remain on a server, do not expose their socket or credential to
+the desktop. Run `instance-admitted-export.mjs` as the remote **adapter UID** behind an SSH
+`authorized_keys` forced command (`restrict`, no PTY, forwarding, or caller-selected command), and
+pipe that authenticated stream into `instance-admitted-import.mjs` on the Mac. On first install,
+use `--baseline` once so historical queue entries become the durable cursor without waking a
+conversation; subsequent imports append only unseen envelopes. The exporter cannot decrypt,
+sign, query relays, choose a thread, or read broker state. The importer rejects another instance,
+unknown fields, malformed messages, oversized records, symlinked state, and duplicate envelopes.
+Only the separate local Codex adapter can submit the resulting queue to the manifest-bound thread.
+`codex-remote-bridge.mjs` is the durable desktop loop for that arrangement. It accepts only a
+validated `user@host`, a mode-0600 non-symlink SSH identity, and a pinned known-hosts file; it
+enables batch mode, strict host checking, and clears forwarding, and deliberately supplies **no
+remote command**. Therefore the server-side key must be restricted with an `authorized_keys`
+forced command that runs the exporter for exactly one instance. The key is an admitted-queue
+read capability, never a shell or signer capability.
+
 With `codex_transport: "local_control_socket"`, it uses the supported local Codex app-server
 control socket and JSON-RPC lifecycle (`initialize`, `thread/resume`, then `turn/start`). The
 binding may name a real persistent app-server UUID or a `thr_` id; it is selected by the owner at
