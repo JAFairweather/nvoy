@@ -8,6 +8,7 @@
 import { lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs'
 import { resolve, dirname, relative, sep } from 'node:path'
 import { decode } from 'nostr-tools/nip19'
+import { codexThreadId as validCodexThreadId, localControlSocket } from './codex_app_server.mjs'
 
 const die = message => { throw new Error(message) }
 const hex = value => String(value || '').toLowerCase()
@@ -87,10 +88,18 @@ export function readManifest(root, requestedId) {
   // thread.  Never silently create or select a desktop conversation from an incoming message.
   const deliveryMode = String(raw.delivery_mode || raw.deliveryMode || 'headless')
   const codexThreadId = String(raw.codex_thread_id || raw.codexThreadId || '')
+  const codexTransport = String(raw.codex_transport || raw.codexTransport || 'spawn')
+  const codexSocketPath = String(raw.codex_app_server_socket || raw.codexAppServerSocket || '')
   if (!['headless', 'codex_app_server', 'notify_only'].includes(deliveryMode)) die('delivery_mode must be headless, codex_app_server, or notify_only')
-  if (deliveryMode === 'codex_app_server' && !/^thr_[A-Za-z0-9_-]{6,}$/.test(codexThreadId)) die('codex_app_server delivery requires an explicit codex_thread_id')
+  if (!['spawn', 'local_control_socket'].includes(codexTransport)) die('codex_transport must be spawn or local_control_socket')
+  if (deliveryMode === 'codex_app_server') {
+    try { validCodexThreadId(codexThreadId) } catch { die('codex_app_server delivery requires an explicit codex_thread_id (persistent app-server UUID or thr_ id)') }
+    if (codexTransport === 'local_control_socket') {
+      try { localControlSocket(codexSocketPath) } catch (e) { die(e.message) }
+    }
+  }
   return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, relays, stateDir, runtimeDir, spoolDir,
-    brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId })
+    brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath })
 }
 
 // Supervisor preflight: a second identity must never accidentally share a state or runtime
