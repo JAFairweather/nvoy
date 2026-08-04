@@ -18,8 +18,10 @@ relay ──1059 p-tag──> keyless watcher ──opaque envelope id──> br
 
 The watcher never receives a key or plaintext. The adapter never receives a key, a key-file
 path, a manifest path, or a decrypt command. The broker is the only process that can run the
-grant gate or decrypt mail. It pushes an admitted message only after it verifies the adapter's
-OS peer identity on its instance socket. There is no bearer task handle to replay or forward.
+grant gate or decrypt mail. Its socket is created by systemd at one fixed per-instance path,
+owned by the broker user and mode `0660` for the one adapter group. Node does not expose Linux
+peer credentials on the deployed runtime, so that ownership/ACL is the enforceable OS identity
+check—not an invented in-process UID check. There is no bearer task handle to replay or forward.
 
 ## Supervisor-owned manifest
 
@@ -57,8 +59,10 @@ For each `<id>`, the installer creates a dedicated OS account `nvoy-<id>` and:
 | watcher spool | separate keyless account, append-only | watcher→broker marker intake |
 
 `nvoy-broker@<id>` and `nvoy-watcher@<id>` run under distinct accounts. The broker obtains an
-exclusive lock before opening its state or socket. The adapter connects to the broker socket
-through a supervisor-created, identity-bound credential; it may not choose a socket path.
+exclusive lock before opening its state. A matching `nvoy-broker@.socket` unit creates the only
+socket path with `SocketUser=nvoy-<id>-broker`, `SocketGroup=nvoy-<id>-adapter`, and
+`SocketMode=0660`; only that adapter account belongs to the group. The adapter receives this
+fixed path from its unit and may not choose another one.
 
 ## Protocol and recovery
 
