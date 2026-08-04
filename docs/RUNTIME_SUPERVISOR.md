@@ -216,36 +216,45 @@ Claude Code has a different native edge. Its research-preview channel protocol l
 push an event into an already-running session. Nvoy's `claude-channel.mjs` implements that official
 protocol without weakening the broker boundary:
 
-- it runs as the manifest's keyless adapter UID against a local-broker, worker-disabled
-  `delivery_mode: "notify_only"` instance;
+- it runs as the manifest's keyless **worker UID**, distinct from the adapter UID, against a
+  local-broker, worker-disabled `delivery_mode: "notify_only"` instance;
+- the adapter owns the admitted queue; the channel account has group-read only. It can write only
+  its private cursor/lock directory and the bounded reply-request file, and cannot connect to or
+  replace the adapter socket or queue;
 - `notifications/claude/channel` contains only the immutable instance id and opaque outer-envelope
   id—never sender, plaintext, grant, summary, or quoted content;
 - `nvoy_channel_read` exposes exactly that broker-admitted record after the wake;
 - `nvoy_channel_reply` accepts only that envelope plus bounded text. The broker rechecks live
   grants and resolves the recipient or channel before the Bunker signs anything.
 
-Register one server per identity in the Claude Code MCP configuration. The process must run under
-that instance's adapter account and use the supervisor-owned manifest root:
+Register one server per identity in the Claude Code MCP configuration. Do not point Claude at the
+Node script directly under the interactive user's UID. On the broker host, create a dedicated SSH
+principal and install the unmodified output of
+`instance-claude-channel-authorized-key.mjs --instance <id> --public-key-file <key.pub>
+--container <fixed-adapter-container>`. Its `restrict` forced command runs only the channel under
+the manifest worker UID and handoff GID; it grants no shell, forwarding, PTY, signer, adapter UID,
+or caller-selected command. The Claude-side MCP entry is then only that restricted stdio tunnel:
 
 ```json
 {
   "mcpServers": {
     "nvoy-codex-jaf": {
-      "command": "/usr/bin/node",
-      "args": ["/opt/nvoy/mcp/tools/claude-channel.mjs", "--instance", "codex-jaf"],
-      "env": { "NVOY_INSTANCE_ROOT": "/etc/nvoy/instances" }
+      "command": "/usr/bin/ssh",
+      "args": ["-T", "-o", "BatchMode=yes", "-o", "ClearAllForwardings=yes",
+        "-i", "/absolute/path/to/identity-scoped-ssh-key", "nvoy-channel@broker.example"]
     }
   }
 }
 ```
 
 Before enabling a newly installed channel against a queue that may already contain records,
-baseline it once under the same adapter account. This records existing envelopes without exposing
-or replying to them; later arrivals remain live:
+baseline it once on the broker host under the same worker UID/GID, before installing/enabling the
+restricted client key. This records existing envelopes without exposing or replying to them;
+later arrivals remain live:
 
 ```sh
-NVOY_INSTANCE_ROOT=/etc/nvoy/instances \
-  /usr/bin/node /opt/nvoy/mcp/tools/claude-channel.mjs --instance codex-jaf --baseline
+docker exec --user <worker_uid>:<worker_handoff_gid> <fixed-adapter-container> \
+  /usr/local/bin/node /srv/nvoy/mcp/tools/claude-channel.mjs --instance codex-jaf --baseline
 ```
 
 Custom channels require an explicit development opt-in during Anthropic's research preview:

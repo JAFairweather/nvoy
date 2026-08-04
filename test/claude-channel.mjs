@@ -18,7 +18,7 @@ const manifest = {
   bunker_uri_ref: '/etc/nvoy/test.bunker', bunker_client_ref: '/etc/nvoy/test.client',
   worker_enabled: false, delivery_mode: 'notify_only',
   broker_adapter_gid: gid, worker_handoff_gid: gid + 1,
-  watcher_uid: uid + 11, broker_uid: uid + 12, adapter_uid: uid, worker_uid: uid + 13,
+  watcher_uid: uid + 11, broker_uid: uid + 12, adapter_uid: uid + 13, worker_uid: uid,
   grantors: ['2'.repeat(64)], relays: ['wss://nos.lol'],
 }
 writeFileSync(join(manifests, 'claude-test.json'), JSON.stringify(manifest))
@@ -28,7 +28,8 @@ const task = { type: 'admitted-task', instance: manifest.id, envelope,
     grantor: manifest.grantors[0], cap: 'task', scope_subject: manifest.pubkey, policy_checked_at: Date.now() },
   messages: [{ from: '4'.repeat(64), at: 1785880000, content: 'inspect the queue' }] }
 writeFileSync(join(runtime, 'admitted-tasks.jsonl'), JSON.stringify(task) + '\n', { mode: 0o600 })
-writeFileSync(join(runtime, 'desktop-reply-requests.jsonl'), '', { mode: 0o640 })
+mkdirSync(join(runtime, 'claude-channel-state'))
+writeFileSync(join(runtime, 'reply-requests.jsonl'), '', { mode: 0o640 })
 
 const transport = new StdioClientTransport({ command: process.execPath,
   args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', manifest.id, '--poll-ms', '250'],
@@ -63,12 +64,12 @@ try {
   ok('an envelope that was not delivered through this channel is unreadable', unknown.isError === true)
   const reply = await client.callTool({ name: 'nvoy_channel_reply', arguments: { envelope, text: 'queue inspected' } })
   const queued = JSON.parse(reply.content[0].text)
-  const requests = readFileSync(join(runtime, 'desktop-reply-requests.jsonl'), 'utf8').trim().split('\n').map(JSON.parse)
+  const requests = readFileSync(join(runtime, 'reply-requests.jsonl'), 'utf8').trim().split('\n').map(JSON.parse)
   ok('reply tooling writes only envelope + bounded text; it cannot choose a recipient',
     queued.queued === true && requests.length === 1 && requests[0].receipt === envelope &&
     requests[0].content === 'queue inspected' && !('recipient' in requests[0]) && !('channel' in requests[0]))
   const duplicate = await client.callTool({ name: 'nvoy_channel_reply', arguments: { envelope, text: 'again' } })
-  ok('one delivered envelope cannot queue a second reply', duplicate.isError === true && readFileSync(join(runtime, 'desktop-reply-requests.jsonl'), 'utf8').trim().split('\n').length === 1)
+  ok('one delivered envelope cannot queue a second reply', duplicate.isError === true && readFileSync(join(runtime, 'reply-requests.jsonl'), 'utf8').trim().split('\n').length === 1)
 } finally { await client.close() }
 
 const historicalEnvelope = '8'.repeat(64)
@@ -76,10 +77,10 @@ writeFileSync(join(runtime, 'admitted-tasks.jsonl'), JSON.stringify(task) + '\n'
   JSON.stringify({ ...task, envelope: historicalEnvelope }) + '\n', { mode: 0o600 })
 const baseline = spawnSync(process.execPath, [resolve('mcp/tools/claude-channel.mjs'), '--instance', manifest.id, '--baseline'],
   { encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifests } })
-const readLog = readFileSync(join(runtime, 'claude-channel-read.jsonl'), 'utf8')
+const readLog = readFileSync(join(runtime, 'claude-channel-state', 'read.jsonl'), 'utf8')
 ok('one-time baseline records an old queue entry without launching a channel or reply',
   baseline.status === 0 && /baselined 1 existing/.test(baseline.stdout) && readLog.includes(historicalEnvelope) &&
-  readFileSync(join(runtime, 'desktop-reply-requests.jsonl'), 'utf8').trim().split('\n').length === 1)
+  readFileSync(join(runtime, 'reply-requests.jsonl'), 'utf8').trim().split('\n').length === 1)
 
 console.log(`\n${passed}/${passed + failed} passed`)
 process.exit(failed ? 1 : 0)

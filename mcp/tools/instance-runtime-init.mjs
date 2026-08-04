@@ -38,7 +38,7 @@ function provisionFile(path, uid, gid, mode, label) {
 // whole cross-UID protocol: task input is adapter-write/group-read; requests are worker-write/
 // group-read; consumed state is worker-private. No role can create a replacement socket or queue.
 provisionFile(`${m.runtimeDir}/admitted-tasks.jsonl`, m.adapterUid, m.workerHandoffGid, 0o640, 'admitted task queue')
-if (m.workerEnabled) provisionFile(`${m.runtimeDir}/reply-requests.jsonl`, m.workerUid, m.brokerAdapterGid, 0o640, 'worker reply queue')
+if (m.workerEnabled || m.deliveryMode === 'notify_only') provisionFile(`${m.runtimeDir}/reply-requests.jsonl`, m.workerUid, m.brokerAdapterGid, 0o640, 'worker/channel reply queue')
 // The restricted Desktop SSH principal is the credential-free adapter UID, never the model
 // worker UID. Its separate queue is writable by that UID and readable by the broker group.
 provisionFile(`${m.runtimeDir}/desktop-reply-requests.jsonl`, m.adapterUid, m.brokerAdapterGid, 0o640, 'Desktop reply queue')
@@ -46,6 +46,9 @@ if (m.workerEnabled) provisionFile(`${m.runtimeDir}/worker-consumed.jsonl`, m.wo
 // Only the adapter can create these immutable per-envelope inputs; the worker gets group
 // traversal/read access but cannot replace an input belonging to a different envelope.
 if (m.workerEnabled) provision(`${m.runtimeDir}/worker-input`, m.adapterUid, m.workerHandoffGid, 0o710, 'worker input directory')
+// A native Claude channel writes only its cursor/lock and bounded reply requests. Its model/tool
+// UID can traverse and group-read the adapter queue, but cannot write or replace that queue.
+if (m.deliveryMode === 'notify_only') provision(`${m.runtimeDir}/claude-channel-state`, m.workerUid, m.workerUid, 0o700, 'Claude channel state')
 
 // Compose file-backed secrets are bind-mounted as root-readable files even when a service uses
 // a non-root UID. Keep those host sources root:root 0600, then make one role-owned copy in a
