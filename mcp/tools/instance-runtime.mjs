@@ -20,7 +20,7 @@ const die = m => { console.error(`instance-runtime: ${m}`); process.exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
 const command = process.argv[2]
 const idFlag = flag('--instance')
-if (!['describe', 'watch'].includes(command) || !idFlag) die('usage: describe|watch --instance <id>')
+if (!['describe', 'watch', 'baseline'].includes(command) || !idFlag) die('usage: describe|watch|baseline --instance <id>')
 const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 let manifest
 try { manifest = readManifest(root, instanceId(idFlag)); assertNoCollisions(root, manifest) } catch (e) { die(e.message) }
@@ -33,9 +33,10 @@ if (command === 'describe') {
   console.log(JSON.stringify({ id: manifest.id, recipient: manifest.pubkey, grantors: manifest.grantors,
     relays: manifest.relays, stateDir: manifest.stateDir, watcher: 'keyless' }, null, 2)); process.exit(0)
 }
-if (command === 'watch') {
+if (command === 'watch' || command === 'baseline') {
   const child = spawn(process.execPath, [tool('keyless-wake-watcher.mjs'), '--recipient', manifest.pubkey,
     '--seen-path', resolve(manifest.spoolDir, 'keyless-wake-seen.log'), '--queue-path', resolve(manifest.spoolDir, 'keyless-wake-queue.jsonl'),
-    '--marker-dir', manifest.spoolDir, '--marker-gid', String(manifest.brokerAdapterGid)], { env: baseEnv, stdio: 'inherit' })
+    '--marker-dir', manifest.spoolDir, '--marker-gid', String(manifest.brokerAdapterGid),
+    ...(command === 'baseline' ? ['--baseline-existing', '--exit-after-baseline'] : [])], { env: baseEnv, stdio: 'inherit' })
   child.on('exit', code => process.exit(code ?? 1))
 }

@@ -18,6 +18,15 @@ const daemon = process.argv.includes('--daemon')
 if (!id || !['codex', 'claude'].includes(runner)) die('usage: --instance <id> [--runner codex|claude] [--reply <test text>]')
 const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 let manifest; try { manifest = readManifest(root, instanceId(id)) } catch (e) { die(e.message) }
+if (manifest.deliveryMode !== 'headless') {
+  if (suppliedReply) die('headless reply runner is disabled for Desktop delivery mode')
+  console.log(`instance-worker: ${manifest.deliveryMode} — headless model drain disabled; waiting for brokered Desktop reply requests`)
+  if (!daemon) process.exit(0)
+  // Keep the worker UID/container available only as the forced-command reply-queue boundary.
+  // It never reads the provider credential or admitted queue in Desktop delivery mode.
+  setInterval(() => {}, 60 * 60 * 1000)
+  await new Promise(() => {})
+}
 // The headless coding client needs its own provider credential.  This is deliberately separate
 // from the Nostr identity: the worker never gets the Bunker URI, its NIP-46 client key, or an
 // nsec. Docker mounts the provider value as a worker-only secret; it is read once and passed only

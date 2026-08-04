@@ -8,6 +8,7 @@
 import { lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs'
 import { resolve, dirname, relative, sep } from 'node:path'
 import { decode } from 'nostr-tools/nip19'
+import { codexThreadId as validCodexThreadId, localControlSocket } from './codex_app_server.mjs'
 
 const die = message => { throw new Error(message) }
 const hex = value => String(value || '').toLowerCase()
@@ -82,8 +83,23 @@ export function readManifest(root, requestedId) {
   const workerRunner = String(raw.worker_runner || raw.workerRunner || '')
   const workerCredentialRef = String(raw.worker_credential_ref || raw.workerCredentialRef || '')
   if ((workerImage || workerRunner || workerCredentialRef) && (!/^[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$/i.test(workerImage) || !['codex', 'claude'].includes(workerRunner) || !workerCredentialRef.startsWith('/'))) die('worker_image must be digest-pinned, worker_runner must be codex or claude, and worker_credential_ref must be absolute')
+  // Delivery is deliberately independent of the Nostr admission pipeline.  `headless` is the
+  // existing worker; a desktop adapter is a local process which resumes one explicit Codex
+  // thread.  Never silently create or select a desktop conversation from an incoming message.
+  const deliveryMode = String(raw.delivery_mode || raw.deliveryMode || 'headless')
+  const codexThreadId = String(raw.codex_thread_id || raw.codexThreadId || '')
+  const codexTransport = String(raw.codex_transport || raw.codexTransport || 'spawn')
+  const codexSocketPath = String(raw.codex_app_server_socket || raw.codexAppServerSocket || '')
+  if (!['headless', 'codex_app_server', 'notify_only'].includes(deliveryMode)) die('delivery_mode must be headless, codex_app_server, or notify_only')
+  if (!['spawn', 'local_control_socket'].includes(codexTransport)) die('codex_transport must be spawn or local_control_socket')
+  if (deliveryMode === 'codex_app_server') {
+    try { validCodexThreadId(codexThreadId) } catch { die('codex_app_server delivery requires an explicit codex_thread_id (persistent app-server UUID or thr_ id)') }
+    if (codexTransport === 'local_control_socket') {
+      try { localControlSocket(codexSocketPath) } catch (e) { die(e.message) }
+    }
+  }
   return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, relays, stateDir, runtimeDir, spoolDir,
-    brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerImage, workerRunner, workerCredentialRef })
+    brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath })
 }
 
 // Supervisor preflight: a second identity must never accidentally share a state or runtime

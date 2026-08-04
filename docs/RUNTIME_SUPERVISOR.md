@@ -116,8 +116,14 @@ and may not choose another one.
    authenticated per-instance socket. The adapter acknowledges only after durable hand-off to
    its own execution queue. A broker restart redelivers unacknowledged admitted work; a marker
    is never marked completed merely because it was observed.
-4. The adapter starts/alerts its client using a fixed local mechanism. Codex desktop is not
-   falsely claimed to be resumable; it needs its dedicated worker/queue adapter.
+4. The adapter starts/alerts its client using a fixed local mechanism. An MCP
+`resources/updated` notification is **not** a desktop wake guarantee. For Codex, the first
+context-preserving adapter is `codex-app-server-adapter.mjs`: it runs locally, resumes the one
+manifest-bound `codex_thread_id`, and submits the broker-admitted event as a turn. It has no
+Nostr credential and cannot select a different thread. With the owner-selected local control
+socket transport, that fixed binding may be an already-open desktop task; it is still never
+selected by an inbound event. Claude adapters must meet the same durable-queue and explicit
+session-binding contract before they are called a wake mechanism.
 5. A worker that chooses to reply writes a bounded `reply-request` referencing the delivered
    envelope. The broker accepts it only when the recipient was a permitted sender recorded in its
    own admission receipt. It persists the exact signed NIP-17 wrap before publishing, so a crash
@@ -145,6 +151,58 @@ node mcp/tools/instance-adapter.mjs --instance codex-jaf
 node mcp/tools/instance-broker-daemon.mjs --instance codex-jaf
 node mcp/tools/instance-worker.mjs --instance codex-jaf --runner codex
 ```
+
+### Local Codex context adapter
+
+For a first-class Codex participant, run the Nostr watcher/broker and this adapter in the same
+trusted desktop environment (or use an explicitly secured queue forwarder). Give the manifest an
+explicit delivery binding:
+
+```json
+{ "delivery_mode": "codex_app_server", "codex_thread_id": "<persistent-thread-id>", "codex_transport": "local_control_socket", "codex_app_server_socket": "/Users/you/.codex/app-server-control/app-server-control.sock" }
+```
+
+Then run:
+
+```sh
+node mcp/tools/codex-app-server-adapter.mjs --instance codex-jaf
+```
+
+When the isolated watcher/broker remain on a server, do not expose their socket or credential to
+the desktop. Run `instance-admitted-export.mjs` as the remote **adapter UID** behind an SSH
+`authorized_keys` forced command (`restrict`, no PTY, forwarding, or caller-selected command), and
+pipe that authenticated stream into `instance-admitted-import.mjs` on the Mac. On first install,
+use `--baseline` once so historical queue entries become the durable cursor without waking a
+conversation; subsequent imports append only unseen envelopes. The exporter cannot decrypt,
+sign, query relays, choose a thread, or read broker state. The importer rejects another instance,
+unknown fields, malformed messages, oversized records, symlinked state, and duplicate envelopes.
+Only the separate local Codex adapter can submit the resulting queue to the manifest-bound thread.
+`codex-remote-bridge.mjs` is the durable desktop loop for that arrangement. It accepts only a
+validated `user@host`, a mode-0600 non-symlink SSH identity, and a pinned known-hosts file; it
+enables batch mode, strict host checking, and clears forwarding, and deliberately supplies **no
+remote command**. Therefore the server-side key must be restricted with an `authorized_keys`
+forced command that runs the exporter for exactly one instance. The key is an admitted-queue
+read capability, never a shell or signer capability.
+
+Desktop replies use a second, independent forced-command SSH key. `codex-remote-reply.mjs`
+accepts content on stdin only after proving the named envelope was delivered to the one
+manifest-bound Codex thread. The forced command runs `instance-desktop-reply-import.mjs` as the
+remote worker UID; that endpoint accepts only one bounded reply request for a single-sender
+envelope already present in this instance's admitted queue. Neither side can name a recipient.
+The broker resolves the sender from its short-lived admission receipt, rechecks the live grant,
+and alone asks Bunker to sign and publish. Configure the server manifest as `notify_only` so the
+remote headless model drain remains disabled; its worker role stays keyless and idle except when
+the forced command appends a Desktop reply request.
+
+With `codex_transport: "local_control_socket"`, it uses the supported local Codex app-server
+control socket and JSON-RPC lifecycle (`initialize`, `thread/resume`, then `turn/start`). The
+binding may name a real persistent app-server UUID or a `thr_` id; it is selected by the owner at
+setup time, never by an inbound event. The target Codex home must already contain that
+participant's separately configured Nvoy MCP/Bunker pairing. A Nostr event only reaches the
+thread after the broker has verified/decrypted it and checked its live grant; the queue record is
+marked delivered only after Codex acknowledges the turn. This is the concrete Codex adapter. It
+does not yet make a claim for Claude Desktop; its native session/notification surface requires an
+adapter of the same form.
 
 `instance-broker-daemon` is the broker-container entrypoint; it reclaims interrupted inflight
 markers after a crash, then serially invokes the one-shot broker. `NVOY_INSTANCE_ROOT` is a deployment-only override for tests and staged installs. Production
