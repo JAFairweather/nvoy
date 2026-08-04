@@ -25,7 +25,7 @@ import { Outbox } from './outbox.js'
 import { DraftDesk } from './drafts.js'
 import { sendAccessRequest, sendRelinquishNotice } from './notices.js'
 import { registerChatTools } from './chat.js'
-import { issueDerivedGrant, RedelegationForbidden } from './subgrants.js'
+import { cascadeDerivedRevocation, issueDerivedGrant, RedelegationForbidden } from './subgrants.js'
 
 export interface NvoyContext {
   identity: Identity
@@ -95,6 +95,13 @@ export async function detectRevocation(ctx: NvoyContext, g: HeldGrant) {
   const found = await findRevocationNotice(ctx.relay, ctx.identity.signer, g.publisher, g.scopeId).catch(() => null)
   const record = ctx.grantStore.markRevoked(g.publisher, g.scopeId, g.generation, found?.content ?? null)
   ctx.scopeCache.zeroize(g.publisher, g.scopeId)
+  // This identity may have issued attenuated descendants of the dead grant.  Cascading is
+  // ordinary auditable code under the issuer's Bunker signer; a child never keeps its old key
+  // merely because the issuing runtime restarted.
+  try {
+    const cascade = await cascadeDerivedRevocation(ctx.relay, ctx.identity, g)
+    if (cascade.cascaded) ctx.log(`derived cascade: ${cascade.cascaded} child scope(s) severed from ${g.scopeId}`)
+  } catch (e) { ctx.log(`derived cascade for ${g.scopeId} failed; parent remains revoked: ${String((e as Error).message)}`) }
   ctx.log(`grant revoked-detected: scope ${g.scopeId} (v${g.generation} superseded) — key + cache zeroized`)
   return record
 }

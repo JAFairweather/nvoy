@@ -7,7 +7,7 @@
 
 import { finalizeEvent, generateSecretKey, getEventHash, nip44 } from 'nostr-tools'
 // @ts-ignore — vendored .mjs has no declarations
-import { KIND_DATA_SET, KIND_GRANT, newScopeKey, publishScope, type RelayLike } from '../lib/nipxx.mjs'
+import { KIND_DATA_SET, KIND_GRANT, loadGrantIndex, newScopeKey, publishScope, saveGrantIndex, toIssuedEntry, type RelayLike } from '../lib/nipxx.mjs'
 import type { Identity, Signer } from './identity.js'
 import type { HeldGrant } from './grants.js'
 
@@ -30,6 +30,31 @@ export interface DerivedTerms {
 
 export class RedelegationForbidden extends Error {
   constructor(message: string) { super(message); this.name = 'RedelegationForbidden' }
+}
+
+/** The sub-issuer's encrypted-to-self, relay-resident parent→child ledger.
+ * It intentionally contains no parent scope key and, after a cascade, no usable child key.
+ * Keeping this in the existing Grant Index gives restart recovery without an additional disk
+ * registry or a new public linkage between delegator and leaf. */
+interface DerivedChild {
+  parent: { publisher: string; scope: string; generation: number }
+  child: { scope: string; generation: number; grantee: string; scope_name: string }
+  state: 'active' | 'revoked'
+  issued_at: number
+  revoked_at?: number
+}
+
+const lineage = (index: Record<string, unknown>): DerivedChild[] =>
+  Array.isArray(index.nvoy_derived_children) ? index.nvoy_derived_children.filter((x): x is DerivedChild => {
+    const v = x as DerivedChild
+    return !!v && (v.state === 'active' || v.state === 'revoked') && /^[0-9a-f]{64}$/i.test(v.parent?.publisher || '') &&
+      typeof v.parent?.scope === 'string' && Number.isInteger(v.parent?.generation) && typeof v.child?.scope === 'string' &&
+      Number.isInteger(v.child?.generation) && /^[0-9a-f]{64}$/i.test(v.child?.grantee || '')
+  }) : []
+
+const saveLineage = async (relay: RelayLike, identity: Identity, index: Record<string, unknown>, rows: DerivedChild[]) => {
+  index.nvoy_derived_children = rows.slice(-500)
+  await saveGrantIndex(relay, identity.signer, index as { issued: unknown[]; received: unknown[] })
 }
 
 /** NIP-59 wrap through the signer's four primitive operations.  This is what
@@ -85,8 +110,62 @@ export async function issueDerivedGrant(
   }
   const wrap = await giftWrap(identity.signer, recipient, rumor)
   await relay.publish(wrap)
-  // The sub-issuer has its own key. Do not retain it in this one-shot helper;
-  // durable lineage/sweep state is deliberately a separate runtime concern.
+  // Persist parent→child lineage in the sub-issuer's own encrypted Grant Index.  This is
+  // deliberately after the child has been published: a stored active row always names a real
+  // leaf. If this write fails we fail loudly rather than claiming a cascade-capable grant.
+  const index = await loadGrantIndex(relay, identity.signer) as Record<string, unknown>
+  const issued = Array.isArray(index.issued) ? index.issued : []
+  issued.push(toIssuedEntry({ scopeId, scopeName, generation: 1, scopeKey }, [recipient]))
+  index.issued = issued
+  const rows = lineage(index)
+  rows.push({ parent: { publisher: parent.publisher, scope: parent.scopeId, generation: parent.generation },
+    child: { scope: scopeId, generation: 1, grantee: recipient, scope_name: scopeName }, state: 'active', issued_at: now() })
+  await saveLineage(relay, identity, index, rows)
+  // The live index has its own encrypted copy. Do not retain a second usable reference in this
+  // one-shot helper.
   scopeKey.fill(0)
   return { scopeId, generation: 1, scopeName, parent: { publisher: parent.publisher, scopeId: parent.scopeId, generation: parent.generation } }
+}
+
+/**
+ * Cascade an observed parent revocation through every locally issued descendant.  A new random
+ * generation with an empty payload cryptographically severs a leaf's old key; the optional 441
+ * tells a live leaf immediately.  The encrypted lineage row becomes a tombstone, so restarting
+ * this runtime cannot forget the severance or resurrect a child key.
+ */
+export async function cascadeDerivedRevocation(
+  relay: RelayLike,
+  identity: Identity,
+  revoked: Pick<HeldGrant, 'publisher' | 'scopeId' | 'generation'>,
+): Promise<{ cascaded: number }> {
+  const issuer = await identity.signer.getPublicKey()
+  const index = await loadGrantIndex(relay, identity.signer) as Record<string, unknown>
+  const rows = lineage(index)
+  const issued = Array.isArray(index.issued) ? index.issued : []
+  let cascaded = 0
+  const revokeChildren = async (publisher: string, scope: string, generation: number): Promise<void> => {
+    for (const row of rows.filter(r => r.state === 'active' && r.parent.publisher === publisher && r.parent.scope === scope && r.parent.generation <= generation)) {
+      const entry = issued.find((e: any) => e?.scope === row.child.scope)
+      // Missing issued material is already non-recoverable. Tombstone the lineage nevertheless
+      // so a restart does not keep attempting a keyless cascade.
+      if (entry) {
+        const nextKey = newScopeKey(), nextGeneration = Number(entry.v || row.child.generation) + 1
+        try {
+          await publishScope(relay, identity.signer, { scopeId: row.child.scope, generation: nextGeneration, scopeKey: nextKey, payload: {} })
+          const notice = { pubkey: issuer, kind: 441, created_at: now(),
+            tags: [['a', `${KIND_DATA_SET}:${issuer}:${row.child.scope}`], ['v', String(row.child.generation)]],
+            content: JSON.stringify({ reason: 'ancestor grant revoked' }) }
+          await relay.publish(await giftWrap(identity.signer, row.child.grantee, notice))
+        } finally { nextKey.fill(0) }
+        const at = issued.indexOf(entry); if (at >= 0) issued.splice(at, 1)
+      }
+      row.state = 'revoked'; row.revoked_at = now(); cascaded++
+      // A leaf allowed to re-delegate may have locally issued further descendants.  They are
+      // tracked in this same encrypted index under this issuer's pubkey.
+      await revokeChildren(issuer, row.child.scope, row.child.generation)
+    }
+  }
+  await revokeChildren(revoked.publisher, revoked.scopeId, revoked.generation)
+  if (cascaded) { index.issued = issued; await saveLineage(relay, identity, index, rows) }
+  return { cascaded }
 }

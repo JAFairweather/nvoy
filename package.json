@@ -21,7 +21,7 @@
     "wsrelay": "node test/wsrelay.mjs 4460",
     "demo": "node examples/demo-trip-planner/demo.mjs",
     "demo:live": "node examples/demo-trip-planner/demo.mjs --live",
-    "test": "npm run build && npm run smoke && npm run ledger && npm run capgrants && npm run conformance && npm run nopersist && npm run accept && npm run nip46 && npm run consent && node test/egress.mjs && node test/instance-runtime.mjs && node test/instance-runtime-container.mjs",
+    "test": "npm run build && npm run smoke && npm run ledger && npm run capgrants && npm run conformance && npm run nopersist && npm run accept && npm run nip46 && npm run consent && node test/redelegation-enforcement.mjs && node test/egress.mjs && node test/instance-runtime.mjs && node test/instance-runtime-container.mjs",
     "sync-lib": "for f in nipxx.mjs liverelay.mjs relay.mjs; do { echo \"// vendored from JAFairweather/nostr-scoped-data-grants @ $(git -C ../nip-demo rev-parse --short HEAD) \u2014 do not edit; npm run sync-lib\"; cat ../nip-demo/$f; } > lib/$f; done",
     "sync-connect": "{ echo \"// vendored from JAFairweather/luke @ $(git -C ../luke rev-parse --short HEAD) \u2014 do not edit; npm run sync-connect\"; cat ../luke/nave-connect.mjs; } > lib/nave-connect.mjs",
     "sync-titlebar": "{ echo \"// vendored from JAFairweather/nave.pub @ $(git -C ../nave.pub rev-parse --short HEAD) \u2014 do not edit; npm run sync-titlebar\"; cat ../nave.pub/components/nave-titlebar.mjs; } > lib/nave-titlebar.mjs",

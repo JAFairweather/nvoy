@@ -5,10 +5,10 @@
 import { generateSecretKey, getPublicKey } from 'nostr-tools'
 import { LocalRelay } from '../lib/liverelay.mjs'
 import { Relay } from '../lib/relay.mjs'
-import { localSigner, newScopeKey, publishScope, fetchScope } from '../lib/nipxx.mjs'
+import { localSigner, newScopeKey, publishScope, fetchScope, loadGrantIndex } from '../lib/nipxx.mjs'
 import { grantWithTerms, opaqueScopeId } from './nvoygrant.mjs'
 import { receiveGrants } from '../mcp/dist/grants.js'
-import { issueDerivedGrant, RedelegationForbidden } from '../mcp/dist/subgrants.js'
+import { cascadeDerivedRevocation, issueDerivedGrant, RedelegationForbidden } from '../mcp/dist/subgrants.js'
 
 let n = 0, pass = 0
 const t = (name, ok) => { n++; if (ok) { pass++; console.log(`PASS ${n}. ${name}`) } else console.error(`FAIL ${n}. ${name}`) }
@@ -53,6 +53,17 @@ t('the child defaults to redelegate:false', leafGrant?.terms?.redelegate === fal
 const data = await fetchScope(relay, leafGrant)
 t('the leaf sees only the deliberately attenuated payload', data.status === 'ok' && data.data.safe === 'yes' && data.data.secret === undefined)
 t('the parent key was not re-wrapped to the leaf', !(await receiveGrants(relay, leafSk)).some(g => g.publisher === director && g.scopeId === allowed.scopeId))
+
+const beforeCascade = await loadGrantIndex(relay, centralIdentity.signer)
+t('parent-to-child lineage is encrypted in the sub-issuer Grant Index before a restart',
+  Array.isArray(beforeCascade.nvoy_derived_children) && beforeCascade.nvoy_derived_children.some(x => x?.parent?.scope === allowed.scopeId && x?.child?.scope === issued.scopeId && x?.state === 'active'))
+const cascade = await cascadeDerivedRevocation(relay, centralIdentity, allowed)
+t('revoking the parent cryptographically severs its child scope', cascade.cascaded === 1 && (await fetchScope(relay, leafGrant)).status === 'stale')
+const afterCascade = await loadGrantIndex(relay, centralIdentity.signer)
+t('restart recovery retains only a revoked lineage tombstone, not a usable child key',
+  afterCascade.nvoy_derived_children?.some(x => x?.child?.scope === issued.scopeId && x?.state === 'revoked') && !afterCascade.issued?.some(x => x?.scope === issued.scopeId))
+const replay = await cascadeDerivedRevocation(relay, centralIdentity, allowed)
+t('replaying a parent revocation after restart is idempotent', replay.cascaded === 0)
 
 console.log(`\n${pass}/${n} passed`)
 process.exit(pass === n ? 0 : 1)
