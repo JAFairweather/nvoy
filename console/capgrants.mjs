@@ -40,7 +40,7 @@ export function classifyGrant(ev) {
     const cap = capTag[1] || 'grant'
     const scope = tag('da-scope')
     // Human labels for the caps we know; anything else renders as its raw cap, still legible.
-    const LABELS = { admit: 'Channel admission', 'admit+read': 'Channel admission + read', task: 'Tasking authority', 'task+act': 'Tasking + act' }
+    const LABELS = { admit: 'Channel admission', 'admit+read': 'Channel admission + read', task: 'Tasking authority', 'task+act': 'Tasking + act', 'task-relay': 'Task relay carrier' }
     return { type: 'capability', grantee, label: LABELS[cap] || `Capability: ${cap}`, cap, scopeHash: scope?.[1] || null }
   }
 

@@ -35,7 +35,7 @@ for (const line of admittedLines) {
   if (Buffer.byteLength(line) > 1024 * 1024) die('admitted record exceeds sync bound')
   let record
   try { record = JSON.parse(line) } catch { die('admitted queue contains malformed JSON') }
-  try { validateAdmittedTask(record, { instance: manifest.id, scopeSubject: manifest.pubkey, grantors: manifest.grantors }) } catch { die('admitted queue contains an invalid record') }
+  try { validateAdmittedTask(record, { instance: manifest.id, scopeSubject: manifest.pubkey, grantors: manifest.grantors, carriers: manifest.carriers }) } catch { die('admitted queue contains an invalid record') }
   admitted.add(record.envelope)
 }
 const existing = new Set()

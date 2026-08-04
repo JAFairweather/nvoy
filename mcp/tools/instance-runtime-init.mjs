@@ -38,14 +38,14 @@ function provisionFile(path, uid, gid, mode, label) {
 // whole cross-UID protocol: task input is adapter-write/group-read; requests are worker-write/
 // group-read; consumed state is worker-private. No role can create a replacement socket or queue.
 provisionFile(`${m.runtimeDir}/admitted-tasks.jsonl`, m.adapterUid, m.workerHandoffGid, 0o640, 'admitted task queue')
-provisionFile(`${m.runtimeDir}/reply-requests.jsonl`, m.workerUid, m.brokerAdapterGid, 0o640, 'worker reply queue')
+if (m.workerEnabled) provisionFile(`${m.runtimeDir}/reply-requests.jsonl`, m.workerUid, m.brokerAdapterGid, 0o640, 'worker reply queue')
 // The restricted Desktop SSH principal is the credential-free adapter UID, never the model
 // worker UID. Its separate queue is writable by that UID and readable by the broker group.
 provisionFile(`${m.runtimeDir}/desktop-reply-requests.jsonl`, m.adapterUid, m.brokerAdapterGid, 0o640, 'Desktop reply queue')
-provisionFile(`${m.runtimeDir}/worker-consumed.jsonl`, m.workerUid, m.workerUid, 0o600, 'worker consumed queue')
+if (m.workerEnabled) provisionFile(`${m.runtimeDir}/worker-consumed.jsonl`, m.workerUid, m.workerUid, 0o600, 'worker consumed queue')
 // Only the adapter can create these immutable per-envelope inputs; the worker gets group
 // traversal/read access but cannot replace an input belonging to a different envelope.
-provision(`${m.runtimeDir}/worker-input`, m.adapterUid, m.workerHandoffGid, 0o710, 'worker input directory')
+if (m.workerEnabled) provision(`${m.runtimeDir}/worker-input`, m.adapterUid, m.workerHandoffGid, 0o710, 'worker input directory')
 
 // Compose file-backed secrets are bind-mounted as root-readable files even when a service uses
 // a non-root UID. Keep those host sources root:root 0600, then make one role-owned copy in a
@@ -67,14 +67,20 @@ const sources = {
   bunkerClient: process.env.NVOY_BUNKER_CLIENT_SOURCE || '',
   workerProvider: process.env.NVOY_WORKER_PROVIDER_SOURCE || '',
 }
-const sourceValues = Object.values(sources)
-if (sourceValues.some(Boolean)) {
-  if (sourceValues.some(v => !v)) die('credential sources must be supplied as one complete set')
-  const brokerCredDir = '/run/nvoy-broker-credentials', workerCredDir = '/run/nvoy-worker-credentials'
+const brokerSources = [sources.bunkerUri, sources.bunkerClient]
+if (brokerSources.some(Boolean)) {
+  if (brokerSources.some(v => !v)) die('Bunker credential sources must be supplied as one complete pair')
+  const brokerCredDir = '/run/nvoy-broker-credentials'
   provision(brokerCredDir, 0, 0, 0o711, 'broker credential directory')
-  provision(workerCredDir, 0, 0, 0o711, 'worker credential directory')
   provisionSecret(sources.bunkerUri, `${brokerCredDir}/bunker-uri`, m.brokerUid, m.brokerAdapterGid, 'Bunker URI')
   provisionSecret(sources.bunkerClient, `${brokerCredDir}/bunker-client`, m.brokerUid, m.brokerAdapterGid, 'Bunker client')
+}
+if (m.workerEnabled) {
+  if (!sources.workerProvider) die('worker-enabled runtime requires a provider credential source')
+  const workerCredDir = '/run/nvoy-worker-credentials'
+  provision(workerCredDir, 0, 0, 0o711, 'worker credential directory')
   provisionSecret(sources.workerProvider, `${workerCredDir}/provider`, m.workerUid, m.workerHandoffGid, 'worker provider')
+} else if (sources.workerProvider) {
+  die('worker-disabled runtime refuses a provider credential source')
 }
 console.log(`instance-runtime-init: provisioned ${m.id}`)

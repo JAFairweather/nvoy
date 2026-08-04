@@ -53,6 +53,7 @@ contains only public routing policy:
   "worker_runner": "codex",
   "worker_credential_ref": "/etc/nvoy/credentials/codex-jaf.openai-api-key",
   "grantors": ["<64 hex>"],
+  "task_carriers": [{ "pubkey": "<Waggle bridge 64 hex>", "channels": ["<Buzz channel UUID>"] }],
   "relays": ["wss://nos.lol", "wss://relay.primal.net"]
 }
 ```
@@ -120,6 +121,10 @@ and may not choose another one.
    sender, participant scope, and policy-check time. Every transport boundary validates that
    attestation and binds every message to its sender. Records from older runtimes without an
    attestation remain notifications/data; they are never silently promoted to instructions.
+   A configured channel carrier uses authority version 2: the broker additionally verifies the
+   complete embedded kind:9 source event, the original author's task grant, the carrier's distinct
+   `task-relay` grant, and the manifest-allowed reply channel. The original author remains
+   `authority.sender`; the bridge is transport only.
 4. The adapter starts/alerts its client using a fixed local mechanism. An MCP
 `resources/updated` notification is **not** a desktop wake guarantee. For Codex, the first
 context-preserving adapter is `codex-app-server-adapter.mjs`: it runs locally, resumes the one
@@ -129,8 +134,9 @@ socket transport, that fixed binding may be an already-open desktop task; it is 
 selected by an inbound event. Claude adapters must meet the same durable-queue and explicit
 session-binding contract before they are called a wake mechanism.
 5. A worker that chooses to reply writes a bounded `reply-request` referencing the delivered
-   envelope. The broker accepts it only when the recipient was a permitted sender recorded in its
-   own admission receipt. It persists the exact signed NIP-17 wrap before publishing, so a crash
+   envelope. The broker accepts it only when a live admission chain is recorded in its own
+   receipt. Direct replies return to the sender; a channel-carry reply returns to its fixed carrier
+   with the receipt-bound `relay` channel tag. It persists the exact signed NIP-17 wrap before publishing, so a crash
    retry republishes the same event rather than authoring another reply. The worker never sees the
    Nostr credential.
 
@@ -163,7 +169,7 @@ desktop connected to a server-side broker must also declare `broker_mode: "remot
 forbids every key, Bunker, and worker-credential reference in the desktop manifest:
 
 ```json
-{ "broker_mode": "remote", "delivery_mode": "codex_app_server", "codex_thread_id": "<persistent-thread-id>", "codex_transport": "local_control_socket", "codex_app_server_socket": "/Users/you/.codex/app-server-control/app-server-control.sock", "ssh_target": "nvoy-sync@example.net", "ssh_identity_file": "/Users/you/.nvoy/desktop/id_ed25519", "ssh_known_hosts_file": "/Users/you/.nvoy/desktop/known_hosts", "ssh_known_hosts_sha256": "<64-hex-sha256>" }
+{ "broker_mode": "remote", "delivery_mode": "codex_app_server", "worker_enabled": false, "codex_thread_id": "<persistent-thread-id>", "codex_transport": "local_control_socket", "codex_app_server_socket": "/Users/you/.codex/app-server-control/app-server-control.sock", "ssh_target": "nvoy-sync@example.net", "ssh_identity_file": "/Users/you/.nvoy/desktop/id_ed25519", "ssh_known_hosts_file": "/Users/you/.nvoy/desktop/known_hosts", "ssh_known_hosts_sha256": "<64-hex-sha256>" }
 ```
 
 Then run:

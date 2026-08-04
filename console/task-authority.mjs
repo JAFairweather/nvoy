@@ -17,7 +17,7 @@ export function renderTaskAuthority() {
       <div class="head"><div><span class="name">Give task authority</span><div class="note">A portable, public NIP-DA grant. It authorizes one identity to wake one agent; Nvoy keeps the resulting record on the universal Access plane.</div></div></div>
       <div class="frow"><label for="ta-sender">May task</label><input id="ta-sender" autocomplete="off" placeholder="npub or 64-character public key"><datalist id="ta-known-agents">${agentOptions}</datalist></div>
       <div class="frow"><label for="ta-agent">Agent</label><input id="ta-agent" list="ta-known-agents" autocomplete="off" placeholder="agent npub or public key"></div>
-      <div class="frow"><label for="ta-cap">Can do</label><select id="ta-cap"><option value="task">Task — wake and reply</option><option value="task+act">Task + act — wake, reply, and take authorized action</option></select></div>
+      <div class="frow"><label for="ta-cap">Can do</label><select id="ta-cap"><option value="task">Task — wake and reply</option><option value="task+act">Task + act — wake, reply, and take authorized action</option><option value="task-relay">Task relay — carry signed channel instructions (not an instructor)</option></select></div>
       <div class="note">The agent identity is cryptographically bound into a salted scope hash, so this approval cannot be replayed to a different agent. Your signer creates the authority; this page never receives an nsec.</div>
       <div class="actions"><button class="primary" id="ta-issue">Review and sign authority</button><span class="msg" id="ta-msg"></span></div>
     </div>`
@@ -34,8 +34,9 @@ async function issue() {
     if (senderPub === agentPub) throw new Error('the person authorizing tasks and the agent must be different identities')
     const cap = $('ta-cap').value
     const draft = await buildTaskAuthority({ senderPub, agentPub, cap })
-    const label = cap === 'task+act' ? 'Task + act' : 'Task'
-    if (!confirm(`Sign ${label} authority?\n\n${short(senderPub)} may task ${short(agentPub)}.\n\nThis public, revocable record will appear in Nvoy Access.`)) return
+    const label = cap === 'task+act' ? 'Task + act' : cap === 'task-relay' ? 'Task relay' : 'Task'
+    const verb = cap === 'task-relay' ? 'may carry independently signed channel instructions to' : 'may task'
+    if (!confirm(`Sign ${label} authority?\n\n${short(senderPub)} ${verb} ${short(agentPub)}.\n\nThis public, revocable record will appear in Nvoy Access.`)) return
     msg.textContent = 'asking your signer…'
     const { signed, receipt } = await signPublishTaskAuthority({ signer: state.signer, relay: state.relay, draft })
     msg.textContent = `active — ${receipt.acks ?? '?'} relay acknowledgement(s), read back as ${signed.id.slice(0, 12)}…`

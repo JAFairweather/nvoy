@@ -14,6 +14,7 @@ const die = message => { throw new Error(message) }
 const hex = value => String(value || '').toLowerCase()
 const toHex = value => String(value || '').startsWith('npub1') ? decode(String(value)).data : hex(value)
 const valid = value => /^[0-9a-f]{64}$/.test(value)
+const validChannel = value => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value)
 const contained = (root, child) => child === root || child.startsWith(root + sep)
 
 export function instanceId(value) {
@@ -49,8 +50,15 @@ export function readManifest(root, requestedId) {
   if (raw.id !== id) die('manifest id does not match requested instance')
   const pubkey = toHex(raw.pubkey || raw.recipient)
   const grantors = (Array.isArray(raw.grantors) ? raw.grantors : []).map(toHex)
+  const carriers = (Array.isArray(raw.task_carriers || raw.taskCarriers) ? (raw.task_carriers || raw.taskCarriers) : []).map(entry => {
+    const pubkey = toHex(entry?.pubkey)
+    const channels = (Array.isArray(entry?.channels) ? entry.channels : []).map(value => String(value || '').toLowerCase())
+    if (!valid(pubkey) || !channels.length || !channels.every(validChannel) || new Set(channels).size !== channels.length) die('each task_carrier requires one pubkey and distinct channel UUIDs')
+    return Object.freeze({ pubkey, channels: Object.freeze(channels) })
+  })
   const relays = (Array.isArray(raw.relays) ? raw.relays : []).map(String).filter(v => /^wss:\/\//.test(v))
   if (!valid(pubkey) || !grantors.length || !grantors.every(valid) || !relays.length) die('manifest requires pubkey, grantors, and wss relays')
+  if (new Set(carriers.map(entry => entry.pubkey)).size !== carriers.length) die('task_carrier pubkeys must be distinct')
   const rawStateDir = String(raw.state_dir || raw.stateDir || '')
   const rawRuntimeDir = String(raw.runtime_dir || raw.runtimeDir || '')
   const rawSpoolDir = String(raw.spool_dir || raw.spoolDir || '')
@@ -86,11 +94,17 @@ export function readManifest(root, requestedId) {
   const workerRunner = String(raw.worker_runner || raw.workerRunner || '')
   const workerCredentialRef = String(raw.worker_credential_ref || raw.workerCredentialRef || '')
   if ((workerImage || workerRunner || workerCredentialRef) && (!/^[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$/i.test(workerImage) || !['codex', 'claude'].includes(workerRunner) || !workerCredentialRef.startsWith('/'))) die('worker_image must be digest-pinned, worker_runner must be codex or claude, and worker_credential_ref must be absolute')
-  if (brokerMode === 'remote' && (workerImage || workerRunner || workerCredentialRef)) die('a remote-broker Desktop manifest cannot carry a model-worker credential or runtime')
   // Delivery is deliberately independent of the Nostr admission pipeline.  `headless` is the
   // existing worker; a desktop adapter is a local process which resumes one explicit Codex
   // thread.  Never silently create or select a desktop conversation from an incoming message.
   const deliveryMode = String(raw.delivery_mode || raw.deliveryMode || 'headless')
+  const workerEnabled = raw.worker_enabled == null && raw.workerEnabled == null
+    ? deliveryMode === 'headless'
+    : (raw.worker_enabled ?? raw.workerEnabled)
+  if (typeof workerEnabled !== 'boolean') die('worker_enabled must be boolean')
+  if (workerEnabled && deliveryMode !== 'headless') die('worker_enabled is valid only for headless delivery')
+  if (workerEnabled && (!workerImage || !workerRunner || !workerCredentialRef)) die('a worker-enabled manifest requires worker_image, worker_runner, and worker_credential_ref')
+  if (!workerEnabled && (workerImage || workerRunner || workerCredentialRef)) die('a worker-disabled manifest cannot carry a model-worker credential or runtime')
   const codexThreadId = String(raw.codex_thread_id || raw.codexThreadId || '')
   const codexTransport = String(raw.codex_transport || raw.codexTransport || 'spawn')
   const codexSocketPath = String(raw.codex_app_server_socket || raw.codexAppServerSocket || '')
@@ -113,8 +127,8 @@ export function readManifest(root, requestedId) {
       die('a remote broker manifest requires fixed ssh_target, absolute SSH files, and ssh_known_hosts_sha256')
     }
   }
-  return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, relays, stateDir, runtimeDir, spoolDir,
-    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath,
+  return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, carriers: Object.freeze(carriers), relays, stateDir, runtimeDir, spoolDir,
+    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath,
     sshTarget, sshIdentityFile, sshKnownHostsFile, sshKnownHostsSha256 })
 }
 

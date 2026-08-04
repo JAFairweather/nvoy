@@ -38,7 +38,7 @@ const server = net.createServer(conn => {
   let data = ''
   conn.on('data', chunk => { data += chunk; if (!data.includes('\n')) return
     let packet; try { packet = JSON.parse(data.split('\n')[0]) } catch { conn.destroy(); return }
-    try { validateAdmittedTask(packet, { instance: manifest.id, scopeSubject: manifest.pubkey, grantors: manifest.grantors }) } catch { conn.destroy(); return }
+    try { validateAdmittedTask(packet, { instance: manifest.id, scopeSubject: manifest.pubkey, grantors: manifest.grantors, carriers: manifest.carriers }) } catch { conn.destroy(); return }
     try {
       if (!delivered.has(packet.envelope)) {
         // The worker may only read/traverse this adapter-owned directory. Atomically publish the
