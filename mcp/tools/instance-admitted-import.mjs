@@ -44,7 +44,7 @@ for (const line of input.split('\n').filter(Boolean)) {
   if (Buffer.byteLength(line) > 1024 * 1024) die('remote record exceeds import bound')
   let record
   try { record = JSON.parse(line) } catch { die('remote export contains malformed JSON') }
-  try { validateAdmittedTask(record, { instance: manifest.id, scopeSubject: manifest.pubkey, grantors: manifest.grantors }) } catch { die('remote export contains an invalid admitted record') }
+  try { validateAdmittedTask(record, { instance: manifest.id, scopeSubject: manifest.pubkey, grantors: manifest.grantors, carriers: manifest.carriers }) } catch { die('remote export contains an invalid admitted record') }
   if (seen.has(record.envelope)) { skipped++; continue }
   const durable = JSON.stringify({ version: 1, envelope: record.envelope, imported_at: Date.now() })
   // Queue first, cursor second. A crash after queue append is deduplicated on restart because

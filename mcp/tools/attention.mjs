@@ -34,6 +34,7 @@ import { decode, npubEncode } from 'nostr-tools/nip19'
 import { getPublicKey, verifyEvent } from 'nostr-tools/pure'
 import * as nip44 from 'nostr-tools/nip44'
 import { makeBunkerSigner } from './nip46-signer.mjs'
+import { verifyChannelTaskCarry } from './channel_task_carry.mjs'
 
 const arg = (n, d) => { const i = process.argv.indexOf(n); return i === -1 ? d : process.argv[i + 1] }
 const die = (m) => { console.error(`attention: ${m}`); process.exit(1) }
@@ -128,7 +129,21 @@ for (const url of RELAYS) {
 
 // Grants first, then revocations — order matters, and a 441 must be able to kill a 440 seen
 // on a different relay in the same pass.
-const permitted = new Map() // sender hex -> { grantId, grantor, cap }
+// One identity may legitimately hold both `task` and the carrier-only `task-relay`. Keep grants
+// by capability rather than letting the newest one overwrite the other.
+const permitted = new Map() // sender hex -> Map(cap -> { grantId, grantor, cap })
+const putGrant = (pk, grant) => {
+  if (!permitted.has(pk)) permitted.set(pk, new Map())
+  permitted.get(pk).set(grant.cap, grant)
+}
+const dropGrant = grantId => {
+  for (const [pk, caps] of permitted) {
+    for (const [cap, grant] of caps) if (grant.grantId === grantId) caps.delete(cap)
+    if (!caps.size) permitted.delete(pk)
+  }
+}
+const taskGrant = pk => permitted.get(pk)?.get('task+act') || permitted.get(pk)?.get('task') || null
+const relayGrant = pk => permitted.get(pk)?.get('task-relay') || null
 const sorted = [...grantEvents.values()].sort((a, b) => (a.created_at || 0) - (b.created_at || 0))
 let rejected = 0
 for (const ev of sorted) {
@@ -137,7 +152,7 @@ for (const ev of sorted) {
   if (!ok) { rejected++; continue }
   if (ev.kind === KIND.revocation) {
     const target = (ev.tags || []).find(t => t[0] === 'e')?.[1]
-    for (const [pk, g] of permitted) if (g.grantId === target) permitted.delete(pk)
+    dropGrant(target)
     continue
   }
   const grantee = (ev.tags || []).find(t => t[0] === 'p')?.[1]
@@ -145,8 +160,28 @@ for (const ev of sorted) {
   const cap = (ev.tags || []).find(t => t[0] === TAG.cap)?.[1]
   if (!grantee || !scope || !cap) continue
   if (scope[1] !== scopeHash(ME, scope[2] || '')) continue // authorises tasking some other agent
-  if (cap !== 'task' && cap !== 'task+act') continue
-  permitted.set(String(grantee).toLowerCase(), { grantId: ev.id, grantor: ev.pubkey, cap })
+  if (!['task', 'task+act', 'task-relay'].includes(cap)) continue
+  putGrant(String(grantee).toLowerCase(), { grantId: ev.id, grantor: ev.pubkey, cap })
+}
+
+const TASK_CARRIERS = (() => {
+  let raw
+  try { raw = JSON.parse(process.env.NVOY_TASK_CARRIERS || '[]') } catch { return new Map() }
+  if (!Array.isArray(raw)) return new Map()
+  const out = new Map()
+  for (const entry of raw) {
+    const pk = String(entry?.pubkey || '').toLowerCase()
+    const channels = Array.isArray(entry?.channels) ? entry.channels.map(value => String(value || '').toLowerCase()) : []
+    if (!/^[0-9a-f]{64}$/.test(pk) || !channels.length || !channels.every(value => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value))) return new Map()
+    out.set(pk, new Set(channels))
+  }
+  return out
+})()
+
+function channelCarry(message) {
+  const allowedChannels = TASK_CARRIERS.get(message.from)
+  const carrierGrant = relayGrant(message.from)
+  return verifyChannelTaskCarry(message, { channels: [...(allowedChannels || [])], carrierGrant, taskGrantFor: taskGrant })
 }
 
 // --- 2. Read the inbox. ----------------------------------------------------------------------
@@ -174,8 +209,23 @@ msgs.sort((a, b) => a.at - b.at)
 // Default-closed: no verified policy means nothing is actionable, however many grants we think
 // we remember. Being unable to check is not permission.
 const policyUsable = relaysAnswered > 0
-const actionable = policyUsable ? msgs.filter(m => permitted.has(m.from)) : []
-const dataOnly = msgs.filter(m => !actionable.includes(m))
+const admitted = []
+const admittedRaw = new Set()
+if (policyUsable) for (const message of msgs) {
+  const carried = channelCarry(message)
+  const direct = taskGrant(message.from)
+  if (carried) {
+    admitted.push(carried)
+    admittedRaw.add(message)
+  } else if (direct) {
+    admitted.push({ message, admission: { mode: 'direct', from: message.from,
+      grant_id: direct.grantId, grantor: direct.grantor, cap: direct.cap } })
+    admittedRaw.add(message)
+  }
+}
+const actionable = admitted.map(item => item.message)
+const admissions = admitted.map(item => item.admission)
+const dataOnly = msgs.filter(message => !admittedRaw.has(message))
 
 const label = (hex) => {
   try { const n = npubEncode(hex); return `${n.slice(0, 10)}…${n.slice(-5)}` } catch { return hex.slice(0, 12) + '…' }
@@ -195,12 +245,8 @@ if (process.argv.includes('--mark')) {
 }
 
 if (process.argv.includes('--json')) {
-  const admissions = actionable.map(m => {
-    const g = permitted.get(m.from)
-    return { from: m.from, grant_id: g?.grantId || '', grantor: g?.grantor || '', cap: g?.cap || '' }
-  })
   console.log(JSON.stringify({ me: ME, grantors: GRANTORS, relaysAnswered, policyUsable,
-    permitted: [...permitted.keys()], rejectedGrants: rejected,
+    permitted: [...permitted.entries()].map(([pk, caps]) => ({ pubkey: pk, caps: [...caps.keys()] })), rejectedGrants: rejected,
     actionable, admissions, dataOnly: dataOnly.map(m => ({ from: m.from, at: m.at })) }, null, 2))
   // JSON is a transport format, not a weakening of the scheduler contract. The instance
   // adapter needs structured output AND the same 10 = actionable signal that text mode gives.
@@ -209,10 +255,10 @@ if (process.argv.includes('--json')) {
   process.exit(0)
 }
 
-console.log(`authority — ${permitted.size} sender(s) hold a live grant to task this agent`)
+console.log(`authority — ${permitted.size} identity(s) hold live task/carrier grants for this agent`)
 console.log(`  grantor(s):  ${GRANTORS.map(g => g.slice(0, 12) + '…').join(', ')}`)
 console.log(`  relays answered: ${relaysAnswered}/${RELAYS.length}${rejected ? ` · ${rejected} grant(s) failed signature check` : ''}`)
-for (const [pk, g] of permitted) console.log(`  ✓ ${label(pk)}  (${g.cap}, grant ${g.grantId.slice(0, 10)}…)`)
+for (const [pk, caps] of permitted) for (const g of caps.values()) console.log(`  ✓ ${label(pk)}  (${g.cap}, grant ${g.grantId.slice(0, 10)}…)`)
 if (!policyUsable) console.log('  ⚠ no relay answered — policy unverifiable, so NOTHING is actionable this run')
 else if (!permitted.size) console.log('  (no grants issued yet — until one is, nothing is actionable, which is the correct default)')
 

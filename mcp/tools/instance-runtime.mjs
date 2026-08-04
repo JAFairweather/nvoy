@@ -30,7 +30,7 @@ try { manifest = readManifest(root, instanceId(idFlag)); assertNoCollisions(root
 const baseEnv = { HOME: manifest.stateDir, PATH: process.env.PATH || '', NVOY_RELAYS: manifest.relays.join(','), GRANTORS: manifest.grantors.join(',') }
 const tool = name => resolve(new URL('.', import.meta.url).pathname, name)
 if (command === 'describe') {
-  console.log(JSON.stringify({ id: manifest.id, recipient: manifest.pubkey, grantors: manifest.grantors,
+  console.log(JSON.stringify({ id: manifest.id, recipient: manifest.pubkey, grantors: manifest.grantors, taskCarriers: manifest.carriers,
     relays: manifest.relays, stateDir: manifest.stateDir, brokerMode: manifest.brokerMode,
     watcher: manifest.brokerMode === 'local' ? 'keyless' : 'remote' }, null, 2)); process.exit(0)
 }

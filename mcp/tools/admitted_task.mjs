@@ -5,7 +5,7 @@
 const HEX64 = /^[0-9a-f]{64}$/
 const TASK_CAPS = new Set(['task', 'task+act'])
 
-export function validateAdmittedTask(record, { instance = '', scopeSubject = '', grantors = [] } = {}) {
+export function validateAdmittedTask(record, { instance = '', scopeSubject = '', grantors = [], carriers = [] } = {}) {
   if (!record || typeof record !== 'object' || Array.isArray(record)) throw new Error('admitted task must be an object')
   const allowed = ['type', 'instance', 'envelope', 'messages', 'received_at', 'authority']
   if (Object.keys(record).some(key => !allowed.includes(key)) || record.type !== 'admitted-task' ||
@@ -19,14 +19,27 @@ export function validateAdmittedTask(record, { instance = '', scopeSubject = '',
   }
   if (record.authority == null) return { trustedInstruction: false }
   const a = record.authority
-  const authorityKeys = ['version', 'type', 'sender', 'grant_id', 'grantor', 'cap', 'scope_subject', 'policy_checked_at']
+  const v1Keys = ['version', 'type', 'sender', 'grant_id', 'grantor', 'cap', 'scope_subject', 'policy_checked_at']
+  const v2Keys = [...v1Keys, 'carrier', 'carrier_grant_id', 'carrier_grantor', 'source_event', 'reply_channel']
+  const authorityKeys = a.version === 2 ? v2Keys : v1Keys
   if (!a || typeof a !== 'object' || Array.isArray(a) || Object.keys(a).some(key => !authorityKeys.includes(key)) ||
-      a.version !== 1 || a.type !== 'scoped-instruction' || !HEX64.test(String(a.sender || '')) ||
+      ![1, 2].includes(a.version) || a.type !== 'scoped-instruction' || !HEX64.test(String(a.sender || '')) ||
       !HEX64.test(String(a.grant_id || '')) || !HEX64.test(String(a.grantor || '')) ||
       !TASK_CAPS.has(a.cap) || !HEX64.test(String(a.scope_subject || '')) ||
       !Number.isFinite(Number(a.policy_checked_at)) || Number(a.policy_checked_at) <= 0 ||
       record.messages.some(message => message.from !== a.sender) ||
       (scopeSubject && a.scope_subject !== scopeSubject) ||
       (grantors.length && !grantors.includes(a.grantor))) throw new Error('invalid admitted authority')
+  if (a.version === 2) {
+    const carrier = carriers.find(entry => entry.pubkey === a.carrier)
+    if (!HEX64.test(String(a.carrier || '')) || !HEX64.test(String(a.carrier_grant_id || '')) ||
+        !HEX64.test(String(a.carrier_grantor || '')) || !HEX64.test(String(a.source_event || '')) ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(String(a.reply_channel || '')) ||
+        !carrier || !carrier.channels.includes(a.reply_channel) ||
+        (grantors.length && !grantors.includes(a.carrier_grantor)) ||
+        record.messages.some(message => message.event_id !== a.source_event || message.kind !== 9)) {
+      throw new Error('invalid channel-carried authority')
+    }
+  }
   return { trustedInstruction: true, authority: a }
 }

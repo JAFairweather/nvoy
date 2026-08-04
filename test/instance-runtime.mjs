@@ -24,7 +24,9 @@ mkdirSync(manifestRoot)
 const manifestFile = join(manifestRoot, 'codex-test.json')
 const manifest = { version: 1, id: 'codex-test', pubkey: nip19.npubEncode(pubkey),
   state_dir: join(root, 'state-codex'), runtime_dir: join(root, 'run-codex'), spool_dir: join(root, 'spool-codex'), key_ref: '/etc/nvoy/credentials/codex-test.nsec', bunker_uri_ref: '/etc/nvoy/credentials/codex-test.bunker', bunker_client_ref: '/etc/nvoy/credentials/codex-test.client', worker_image: 'registry.example/codex-worker@sha256:' + 'd'.repeat(64), worker_runner: 'codex', worker_credential_ref: '/etc/nvoy/credentials/codex-test.provider', broker_adapter_gid: brokerAdapterGid, worker_handoff_gid: workerHandoffGid, watcher_uid: 41011, broker_uid: 41012, adapter_uid: 41013, worker_uid: 41014,
-  grantors: ['4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b287ea84d'], relays: ['wss://nos.lol', 'wss://relay.primal.net'] }
+  grantors: ['4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b287ea84d'],
+  task_carriers: [{ pubkey: '7'.repeat(64), channels: ['a8186b53-537d-46ad-a7e7-b6486c58970e'] }],
+  relays: ['wss://nos.lol', 'wss://relay.primal.net'] }
 writeFileSync(manifestFile, JSON.stringify(manifest))
 const cli = (...args) => spawnSync(process.execPath, ['mcp/tools/instance-runtime.mjs', ...args], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
 
@@ -233,6 +235,20 @@ let wrongGrantorRejected = false
 try { validateAdmittedTask({ ...packet, authority: { ...packet.authority, grantor: '8'.repeat(64) } }, { instance: 'codex-test', scopeSubject: pubkey, grantors: manifest.grantors }) }
 catch { wrongGrantorRejected = true }
 ok('authority from outside the manifest grantor set is rejected at the keyless boundary', wrongGrantorRejected)
+const carriedPacket = { ...packet, envelope: 'c'.repeat(64),
+  authority: { ...packet.authority, version: 2, carrier: '7'.repeat(64), carrier_grant_id: '6'.repeat(64),
+    carrier_grantor: manifest.grantors[0], source_event: '5'.repeat(64), reply_channel: manifest.task_carriers[0].channels[0] },
+  messages: [{ from: packet.authority.sender, at: 2, content: 'signed channel instruction', event_id: '5'.repeat(64), kind: 9 }] }
+ok('channel authority requires the original sender plus a separately configured carrier and reply channel',
+  validateAdmittedTask(carriedPacket, { instance: 'codex-test', scopeSubject: pubkey, grantors: manifest.grantors, carriers: manifest.task_carriers }).trustedInstruction === true)
+let wrongCarrierRejected = false
+try { validateAdmittedTask({ ...carriedPacket, authority: { ...carriedPacket.authority, carrier: '4'.repeat(64) } }, { instance: 'codex-test', scopeSubject: pubkey, grantors: manifest.grantors, carriers: manifest.task_carriers }) }
+catch { wrongCarrierRejected = true }
+ok('an unconfigured carrier cannot launder channel text into an instruction', wrongCarrierRejected)
+let redirectedChannelRejected = false
+try { validateAdmittedTask({ ...carriedPacket, authority: { ...carriedPacket.authority, reply_channel: 'ffffffff-ffff-ffff-ffff-ffffffffffff' } }, { instance: 'codex-test', scopeSubject: pubkey, grantors: manifest.grantors, carriers: manifest.task_carriers }) }
+catch { redirectedChannelRejected = true }
+ok('a carrier cannot redirect authority or replies to another channel', redirectedChannelRejected)
 let ack = ''
 const sendPacket = async () => {
   if (!await waitFor(() => existsSync(socket))) return

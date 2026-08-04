@@ -52,9 +52,16 @@ if (existsSync(receiptUsed)) { console.log(JSON.stringify({ request: requestId, 
 let receiptPath = existsSync(receiptInflight) ? receiptInflight : receiptBase
 regular(receiptPath, 'admission receipt')
 let receipt; try { receipt = JSON.parse(readFileSync(receiptPath, 'utf8')) } catch { die('admission receipt is invalid') }
-if (receipt.version !== 1 || receipt.instance !== manifest.id || receipt.broker !== manifest.pubkey || receipt.envelope !== request.receipt ||
+if (![1, 2].includes(receipt.version) || receipt.instance !== manifest.id || receipt.broker !== manifest.pubkey || receipt.envelope !== request.receipt ||
   !/^[0-9a-f]{64}$/.test(String(receipt.sender || '')) || !Number.isFinite(receipt.expires_at) || Date.now() > receipt.expires_at) {
   die('admission receipt is not a live broker-bound sender capability')
+}
+const channelCarry = receipt.version === 2 && receipt.mode === 'channel-carry'
+if (receipt.version === 2 && (!channelCarry || !/^[0-9a-f]{64}$/.test(String(receipt.carrier || '')) ||
+  !/^[0-9a-f]{64}$/.test(String(receipt.carrier_grant_id || '')) ||
+  !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(String(receipt.reply_channel || '')) ||
+  !manifest.carriers.some(entry => entry.pubkey === receipt.carrier && entry.channels.includes(receipt.reply_channel)))) {
+  die('channel-carry receipt is not bound to an allowed carrier and channel')
 }
 const credential = process.env.NVOY_BROKER_CREDENTIAL
 if (!credential || !existsSync(credential)) die('broker credential file is unavailable')
@@ -76,13 +83,18 @@ if (await signer.getPublicKey() !== manifest.pubkey) die('signer does not match 
 // Re-open the exact envelope through the same signer and require the recorded grant to remain
 // live before consuming the one-use receipt or authoring a seal.
 const attention = resolve(new URL('.', import.meta.url).pathname, 'attention.mjs')
-const checkEnv = { HOME: manifest.stateDir, PATH: process.env.PATH || '', NVOY_RELAYS: manifest.relays.join(','), GRANTORS: manifest.grantors.join(',') }
+const checkEnv = { HOME: manifest.stateDir, PATH: process.env.PATH || '', NVOY_RELAYS: manifest.relays.join(','),
+  GRANTORS: manifest.grantors.join(','), NVOY_TASK_CARRIERS: JSON.stringify(manifest.carriers) }
 if (bunkerUri) { checkEnv.NVOY_BUNKER_URI = bunkerUri; checkEnv.NVOY_NIP46_CLIENT_NSEC = raw } else checkEnv.NVOY_NSEC = raw
 const checked = spawnSync(process.execPath, [attention, '--json', '--envelope', receipt.envelope], { env: checkEnv, encoding: 'utf8', timeout: 60000 })
 if (![0, 10].includes(checked.status)) die('could not recheck live grant policy')
 let policy; try { policy = JSON.parse(checked.stdout) } catch { die('live grant policy result is invalid') }
 const current = Array.isArray(policy.admissions) ? policy.admissions : []
-if (!policy.policyUsable || current.length !== 1 || current[0].from !== receipt.sender || current[0].grant_id !== receipt.grant_id) die('admission receipt no longer has a live matching grant')
+const liveAdmission = current.length === 1 ? current[0] : null
+if (!policy.policyUsable || !liveAdmission || liveAdmission.from !== receipt.sender || liveAdmission.grant_id !== receipt.grant_id ||
+  (channelCarry && (liveAdmission.mode !== 'channel-carry' || liveAdmission.carrier !== receipt.carrier ||
+    liveAdmission.carrier_grant_id !== receipt.carrier_grant_id || liveAdmission.reply_channel !== receipt.reply_channel ||
+    liveAdmission.source_event !== receipt.source_event))) die('admission receipt no longer has a live matching grant chain')
 if (receiptPath === receiptBase) {
   try { renameSync(receiptBase, receiptInflight); receiptPath = receiptInflight }
   catch (e) { die(`cannot atomically claim one-use admission receipt: ${e.message}`) }
@@ -104,15 +116,17 @@ if (existsSync(recordPath)) {
   }
 } else {
   const now = Math.floor(Date.now() / 1000)
+  const peer = channelCarry ? receipt.carrier : receipt.sender
   const rumor = { kind: 14, pubkey: manifest.pubkey, created_at: now,
-    tags: [['p', receipt.sender], ['e', receipt.envelope, '', 'reply']], content: request.content }
+    tags: [['p', peer], ['e', channelCarry ? receipt.source_event : receipt.envelope, '', 'reply'],
+      ...(channelCarry ? [['relay', receipt.reply_channel]] : [])], content: request.content }
   rumor.id = getEventHash(rumor)
   const backdated = () => Math.floor(Date.now() / 1000 - Math.random() * 2 * 24 * 60 * 60)
   const seal = await signer.signEvent({ kind: 13, created_at: backdated(), tags: [],
-    content: await signer.nip44Encrypt(receipt.sender, JSON.stringify(rumor)) })
+    content: await signer.nip44Encrypt(peer, JSON.stringify(rumor)) })
   const wrapSk = generateSecretKey()
-  const wrap = finalizeEvent({ kind: 1059, created_at: backdated(), tags: [['p', receipt.sender]],
-    content: nip44.encrypt(JSON.stringify(seal), nip44.getConversationKey(wrapSk, receipt.sender)) }, wrapSk)
+  const wrap = finalizeEvent({ kind: 1059, created_at: backdated(), tags: [['p', peer]],
+    content: nip44.encrypt(JSON.stringify(seal), nip44.getConversationKey(wrapSk, peer)) }, wrapSk)
   record = { version: 1, request_digest: digest, request_id: requestId, wrap, published: false }
   const tmp = `${recordPath}.${process.pid}.tmp`
   try { writeFileSync(tmp, JSON.stringify(record), { mode: 0o600 }); renameSync(tmp, recordPath) } catch (e) { die(`cannot persist outbound record: ${e.message}`) }

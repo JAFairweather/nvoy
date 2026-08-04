@@ -2,7 +2,7 @@
 // Nact operation approval use this exact event shape.
 import { verifyEvent } from 'nostr-tools'
 
-export const TASK_CAPS = new Set(['task', 'task+act'])
+export const TASK_CAPS = new Set(['task', 'task+act', 'task-relay'])
 const DOMAIN = 'waggle/da-scope/v1\0'
 const hex = (s) => typeof s === 'string' && /^[0-9a-f]{64}$/i.test(s)
 const hexBytes = (s) => Uint8Array.from(String(s).match(/../g) || [], h => parseInt(h, 16))
@@ -17,7 +17,7 @@ export async function taskScopeHash(agentPub, saltHex) {
 
 export async function buildTaskAuthority({ senderPub, agentPub, cap = 'task', createdAt = Math.floor(Date.now() / 1000), salt } = {}) {
   if (!hex(senderPub) || !hex(agentPub)) throw new Error('sender and agent must be 64-character public keys')
-  if (!TASK_CAPS.has(cap)) throw new Error('choose Task or Task + act')
+  if (!TASK_CAPS.has(cap)) throw new Error('choose Task, Task + act, or Task relay')
   const saltHex = salt || hexOf(crypto.getRandomValues(new Uint8Array(16)))
   return { kind: 440, created_at: Math.floor(createdAt), tags: [['p', senderPub.toLowerCase()], ['da-scope', await taskScopeHash(agentPub, saltHex), saltHex], ['da-cap', cap]], content: '' }
 }

@@ -77,7 +77,8 @@ try { nsec = readFileSync(credential, 'utf8').trim() } catch { die('cannot read 
 if (!/^nsec1[023456789acdefghjklmnpqrstuvwxyz]+$/.test(nsec) && !/^[0-9a-f]{64}$/i.test(nsec)) die('broker credential is not an nsec or hex key')
 
 const attention = resolve(new URL('.', import.meta.url).pathname, 'attention.mjs')
-const env = { HOME: manifest.stateDir, PATH: process.env.PATH || '', NVOY_RELAYS: manifest.relays.join(','), GRANTORS: manifest.grantors.join(',') }
+const env = { HOME: manifest.stateDir, PATH: process.env.PATH || '', NVOY_RELAYS: manifest.relays.join(','),
+  GRANTORS: manifest.grantors.join(','), NVOY_TASK_CARRIERS: JSON.stringify(manifest.carriers) }
 // In production this file is the stable NIP-46 *transport* credential, never the participant
 // identity nsec. The Bunker owns the identity and performs every decrypt/sign operation.
 const bunkerUriPath = process.env.NVOY_BUNKER_URI_FILE || ''
@@ -114,11 +115,27 @@ const admissions = Array.isArray(report.admissions) ? report.admissions : []
 if (report.actionable.length !== 1 || admissions.length !== 1) die('an outbound-capable delivery must bind exactly one admitted sender')
 const admission = admissions[0]
 if (!/^[0-9a-f]{64}$/.test(String(admission?.from || '')) || !/^[0-9a-f]{64}$/.test(String(admission?.grant_id || '')) ||
+  !/^[0-9a-f]{64}$/.test(String(admission?.grantor || '')) || !['task', 'task+act'].includes(admission?.cap) ||
   String(admission.from).toLowerCase() !== String(report.actionable[0].from).toLowerCase()) die('admitted payload lacks a verifiable sender/grant binding')
-const receipt = { version: 1, instance: manifest.id, broker: manifest.pubkey, envelope,
+const channelCarry = admission.mode === 'channel-carry'
+if (!['direct', 'channel-carry'].includes(admission.mode)) die('admitted payload has no valid delivery mode')
+if (channelCarry && (!/^[0-9a-f]{64}$/.test(String(admission.carrier || '')) ||
+  !/^[0-9a-f]{64}$/.test(String(admission.carrier_grant_id || '')) ||
+  !/^[0-9a-f]{64}$/.test(String(admission.carrier_grantor || '')) ||
+  !/^[0-9a-f]{64}$/.test(String(admission.source_event || '')) ||
+  !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(String(admission.reply_channel || '')) ||
+  !manifest.carriers.some(entry => entry.pubkey === admission.carrier && entry.channels.includes(admission.reply_channel)))) {
+  die('channel carry lacks a verifiable carrier/source/channel binding')
+}
+const receipt = { version: channelCarry ? 2 : 1, mode: admission.mode, instance: manifest.id, broker: manifest.pubkey, envelope,
   sender: String(admission.from).toLowerCase(), grant_id: String(admission.grant_id).toLowerCase(),
   grantor: String(admission.grantor || '').toLowerCase(), cap: String(admission.cap || ''),
   admitted_at: Date.now(), expires_at: Date.now() + 5 * 60 * 1000 }
+if (channelCarry) Object.assign(receipt, {
+  carrier: String(admission.carrier).toLowerCase(), carrier_grant_id: String(admission.carrier_grant_id).toLowerCase(),
+  carrier_grantor: String(admission.carrier_grantor || '').toLowerCase(), source_event: String(admission.source_event).toLowerCase(),
+  reply_channel: String(admission.reply_channel).toLowerCase(),
+})
 if (!/^[0-9a-f]{64}$/.test(receipt.sender)) die('admitted payload had no valid sender identity')
 try {
   mkdirSync(receiptDir, { recursive: true, mode: 0o700 })
@@ -131,9 +148,12 @@ const socket = resolve(manifest.runtimeDir, 'adapter.sock')
 // Preserve the exact authorization decision across the keyless Desktop boundary. The scope
 // subject is the participant identity: attention accepted the grant only after recomputing its
 // salted da-scope hash for report.me. This attestation grants no capability beyond task/task+act.
-const authority = { version: 1, type: 'scoped-instruction', sender: receipt.sender,
+const authority = { version: channelCarry ? 2 : 1, type: 'scoped-instruction', sender: receipt.sender,
   grant_id: receipt.grant_id, grantor: receipt.grantor, cap: receipt.cap,
   scope_subject: manifest.pubkey, policy_checked_at: receipt.admitted_at }
+if (channelCarry) Object.assign(authority, { carrier: receipt.carrier, carrier_grant_id: receipt.carrier_grant_id,
+  carrier_grantor: receipt.carrier_grantor,
+  source_event: receipt.source_event, reply_channel: receipt.reply_channel })
 const payload = JSON.stringify({ type: 'admitted-task', instance: manifest.id, envelope, authority, messages: report.actionable }) + '\n'
 const client = net.createConnection(socket)
 const timer = setTimeout(() => { client.destroy(); die('adapter acknowledgement timed out') }, 15000)

@@ -14,6 +14,7 @@ const die = message => { throw new Error(message) }
 const hex = value => String(value || '').toLowerCase()
 const toHex = value => String(value || '').startsWith('npub1') ? decode(String(value)).data : hex(value)
 const valid = value => /^[0-9a-f]{64}$/.test(value)
+const validChannel = value => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value)
 const contained = (root, child) => child === root || child.startsWith(root + sep)
 
 export function instanceId(value) {
@@ -49,8 +50,15 @@ export function readManifest(root, requestedId) {
   if (raw.id !== id) die('manifest id does not match requested instance')
   const pubkey = toHex(raw.pubkey || raw.recipient)
   const grantors = (Array.isArray(raw.grantors) ? raw.grantors : []).map(toHex)
+  const carriers = (Array.isArray(raw.task_carriers || raw.taskCarriers) ? (raw.task_carriers || raw.taskCarriers) : []).map(entry => {
+    const pubkey = toHex(entry?.pubkey)
+    const channels = (Array.isArray(entry?.channels) ? entry.channels : []).map(value => String(value || '').toLowerCase())
+    if (!valid(pubkey) || !channels.length || !channels.every(validChannel) || new Set(channels).size !== channels.length) die('each task_carrier requires one pubkey and distinct channel UUIDs')
+    return Object.freeze({ pubkey, channels: Object.freeze(channels) })
+  })
   const relays = (Array.isArray(raw.relays) ? raw.relays : []).map(String).filter(v => /^wss:\/\//.test(v))
   if (!valid(pubkey) || !grantors.length || !grantors.every(valid) || !relays.length) die('manifest requires pubkey, grantors, and wss relays')
+  if (new Set(carriers.map(entry => entry.pubkey)).size !== carriers.length) die('task_carrier pubkeys must be distinct')
   const rawStateDir = String(raw.state_dir || raw.stateDir || '')
   const rawRuntimeDir = String(raw.runtime_dir || raw.runtimeDir || '')
   const rawSpoolDir = String(raw.spool_dir || raw.spoolDir || '')
@@ -113,7 +121,7 @@ export function readManifest(root, requestedId) {
       die('a remote broker manifest requires fixed ssh_target, absolute SSH files, and ssh_known_hosts_sha256')
     }
   }
-  return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, relays, stateDir, runtimeDir, spoolDir,
+  return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, carriers: Object.freeze(carriers), relays, stateDir, runtimeDir, spoolDir,
     brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath,
     sshTarget, sshIdentityFile, sshKnownHostsFile, sshKnownHostsSha256 })
 }

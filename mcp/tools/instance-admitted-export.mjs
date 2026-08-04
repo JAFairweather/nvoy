@@ -27,6 +27,6 @@ for (const line of readFileSync(queue, 'utf8').split('\n').filter(Boolean)) {
   if (Buffer.byteLength(line) > 1024 * 1024) die('admitted record exceeds export bound')
   let record
   try { record = JSON.parse(line) } catch { die('admitted queue contains malformed JSON') }
-  try { validateAdmittedTask(record, { instance: manifest.id, scopeSubject: manifest.pubkey, grantors: manifest.grantors }) } catch { die('admitted queue contains an invalid record') }
+  try { validateAdmittedTask(record, { instance: manifest.id, scopeSubject: manifest.pubkey, grantors: manifest.grantors, carriers: manifest.carriers }) } catch { die('admitted queue contains an invalid admitted record') }
   process.stdout.write(JSON.stringify(record) + '\n')
 }

@@ -12,9 +12,11 @@ t('builds a public 440 task authority for the sender', draft.kind === 440 && dra
 t('uses exactly the requested capability', draft.tags.find(t => t[0] === 'da-cap')?.[1] === 'task+act')
 t('binds scope to the intended agent using the shared domain', draft.tags.find(t => t[0] === 'da-scope')?.[1] === await taskScopeHash(agent, salt))
 t('does not expose the agent public key in the public tags', !draft.tags.flat().includes(agent))
+const relayDraft = await buildTaskAuthority({ senderPub: sender, agentPub: agent, cap: 'task-relay', createdAt: 1000, salt })
+t('builds the distinct carrier-only task-relay capability', relayDraft.tags.find(tag => tag[0] === 'da-cap')?.[1] === 'task-relay')
 await Promise.all(['wat', '', 'task+anything'].map(async cap => {
   try { await buildTaskAuthority({ senderPub: sender, agentPub: agent, cap }); return false } catch { return true }
-})).then(v => t('rejects every capability outside task/task+act', v.every(Boolean)))
+})).then(v => t('rejects every capability outside task/task+act/task-relay', v.every(Boolean)))
 
 const signer = { async getPublicKey() { return operator }, async signEvent(ev) { return finalizeEvent(ev, operatorSk) } }
 const events = []
