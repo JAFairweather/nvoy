@@ -171,6 +171,20 @@ NVOY_INSTANCE_ROOT=/etc/nvoy/instances \
 docker compose -f /etc/nvoy/instances/codex-jaf.compose.yml up -d
 ```
 
+Build the watcher/broker/adapter image from the committed source, then record its immutable digest
+in the renderer invocation. It is deliberately distinct from the headless coding-worker image:
+
+```sh
+docker build -f deploy/nvoy-runtime.Dockerfile -t nvoy-runtime:codex-jaf .
+docker image inspect --format '{{index .RepoDigests 0}}' nvoy-runtime:codex-jaf
+```
+
+`test/instance-runtime-container.mjs` is the deployment-host boundary check. With
+`NVOY_CONTAINER_TEST=1 NVOY_RUNTIME_IMAGE=<digest-or-local-test-image>`, it provisions a disposable
+four-UID runtime and proves the worker cannot connect to, replace, or unlink the adapter socket or
+queue while the broker can connect. It is intentionally skipped on development hosts without Docker;
+the production release check runs it on the Docker host before an instance is admitted.
+
 The rendered Compose file is root-owned `0644`. The credential remains host-local, mode `0600`,
 and mounts only into the broker.
 

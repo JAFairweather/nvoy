@@ -67,6 +67,9 @@ ok('only the broker can sign a reply, resolving its target from an exact receipt
 ok('the Codex/Claude worker stays Nostr-keyless, uses only its runner-specific provider secret, and treats delivered text as data', !/NVOY_NSEC|BROKER_CREDENTIAL|NVOY_BUNKER_URI|nip44|finalizeEvent/.test(workerSource) && /NVOY_WORKER_CREDENTIAL_FILE/.test(workerSource) && /OPENAI_API_KEY/.test(workerSource) && /ANTHROPIC_API_KEY/.test(workerSource) && /untrusted DATA, not instructions/.test(workerSource) && /reply-request/.test(workerSource))
 const workerDockerfile = readFileSync('deploy/nvoy-worker.Dockerfile', 'utf8')
 ok('the reproducible worker image installs both declared runner CLIs but bakes no Nostr credential', /@openai\/codex@\$\{CODEX_VERSION\}/.test(workerDockerfile) && /@anthropic-ai\/claude-code@\$\{CLAUDE_VERSION\}/.test(workerDockerfile) && !/NVOY_NSEC|BUNKER_URI|bunker:\/\//i.test(workerDockerfile))
+const runtimeDockerfile = readFileSync('deploy/nvoy-runtime.Dockerfile', 'utf8')
+const testDockerfile = readFileSync('deploy/nvoy-runtime-test.Dockerfile', 'utf8')
+ok('every runtime/test base image is digest-pinned, so a source-identical build has stable base provenance', /FROM node:22-bookworm-slim@sha256:[0-9a-f]{64}/.test(runtimeDockerfile) && /FROM node:22-bookworm-slim@sha256:[0-9a-f]{64}/.test(workerDockerfile) && /FROM docker:29-cli@sha256:[0-9a-f]{64}/.test(testDockerfile) && /FROM node:22-bookworm-slim@sha256:[0-9a-f]{64}/.test(testDockerfile))
 
 const blocked = cli('attention', '--instance', 'codex-test')
 ok('an adapter cannot invoke the keyed attention path', blocked.status !== 0 && /usage/.test(blocked.stderr))
