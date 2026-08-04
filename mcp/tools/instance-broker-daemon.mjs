@@ -17,6 +17,7 @@ if (!id) die('usage: --instance <id>')
 const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 let manifest
 try { manifest = readManifest(root, instanceId(id)); assertNoCollisions(root, manifest) } catch (e) { die(e.message) }
+if (manifest.brokerMode !== 'local') die('remote-broker Desktop manifests cannot start a local broker daemon')
 if (!process.env.NVOY_BROKER_CREDENTIAL) die('broker credential path is unavailable')
 const broker = resolve(new URL('.', import.meta.url).pathname, 'instance-broker.mjs')
 const reply = resolve(new URL('.', import.meta.url).pathname, 'instance-broker-reply.mjs')

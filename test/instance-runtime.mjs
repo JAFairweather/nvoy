@@ -33,9 +33,14 @@ ok('the description contains no private key reference', !/keyFile|nsec/.test(goo
 ok('the instance receives its own state directory', described.stateDir === manifest.state_dir)
 ok('the manifest binds four distinct non-root service UIDs', new Set([manifest.watcher_uid, manifest.broker_uid, manifest.adapter_uid, manifest.worker_uid]).size === 4)
 const desktopManifestFile = join(manifestRoot, 'codex-desktop.json')
-writeFileSync(desktopManifestFile, JSON.stringify({ ...manifest, id: 'codex-desktop', pubkey: '3'.repeat(64), state_dir: join(root, 'state-desktop'), runtime_dir: join(root, 'run-desktop'), spool_dir: join(root, 'spool-desktop'), delivery_mode: 'codex_app_server', codex_thread_id: '019fc80b-78a6-7b72-b3d2-eced37f55da7', codex_transport: 'local_control_socket', codex_app_server_socket: '/tmp/codex-app-server.sock' }))
+const desktopManifest = { ...manifest, id: 'codex-desktop', pubkey: '3'.repeat(64), state_dir: join(root, 'state-desktop'), runtime_dir: join(root, 'run-desktop'), spool_dir: join(root, 'spool-desktop'),
+  broker_mode: 'remote', key_ref: '', bunker_uri_ref: '', bunker_client_ref: '', worker_image: '', worker_runner: '', worker_credential_ref: '',
+  delivery_mode: 'codex_app_server', codex_thread_id: '019fc80b-78a6-7b72-b3d2-eced37f55da7', codex_transport: 'local_control_socket', codex_app_server_socket: '/tmp/codex-app-server.sock' }
+writeFileSync(desktopManifestFile, JSON.stringify(desktopManifest))
 const desktop = cli('describe', '--instance', 'codex-desktop')
-ok('a Codex desktop delivery mode accepts only an explicit persistent thread binding and local socket', desktop.status === 0)
+ok('a remote-broker Codex desktop binding is keyless and names one explicit local thread', desktop.status === 0 && JSON.parse(desktop.stdout).brokerMode === 'remote' && !/credential|bunker|nsec/i.test(desktop.stdout))
+const duplicateDesktopWatcher = cli('watch', '--instance', 'codex-desktop')
+ok('a remote-broker Desktop manifest cannot start a second watcher', duplicateDesktopWatcher.status !== 0 && /cannot start a second watcher/.test(duplicateDesktopWatcher.stderr))
 mkdirSync(join(root, 'run-desktop'), { recursive: true })
 const importRecord = envelope => JSON.stringify({ type: 'admitted-task', instance: 'codex-desktop', envelope, messages: [{ from: 'a'.repeat(64), at: 1, content: 'remote admitted data' }] }) + '\n'
 const runImport = (input, ...args) => spawnSync(process.execPath, ['mcp/tools/instance-admitted-import.mjs', '--instance', 'codex-desktop', ...args], { cwd: resolve('.'), encoding: 'utf8', input, env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
@@ -49,7 +54,7 @@ const wrongInstance = JSON.stringify({ type: 'admitted-task', instance: 'claude-
 const deniedImport = runImport(wrongInstance)
 ok('remote Codex queue import refuses a record for another identity', deniedImport.status !== 0 && /invalid admitted record/.test(deniedImport.stderr))
 const desktopDelivered = join(root, 'run-desktop', 'codex-app-server-delivered.jsonl')
-writeFileSync(desktopDelivered, JSON.stringify({ version: 1, envelope: liveEnvelope, thread_id: '019fc80b-78a6-7b72-b3d2-eced37f55da7', turn_id: 'turn-test', delivered_at: Date.now() }) + '\n', { mode: 0o600 })
+writeFileSync(desktopDelivered, JSON.stringify({ version: 1, envelope: liveEnvelope, thread_id: '019fc80b-78a6-7b72-b3d2-eced37f55da7', turn_id: '019fce6b-4727-7a13-8f80-f4a6035c277e', delivered_at: Date.now() }) + '\n', { mode: 0o600 })
 const fakeBin = join(root, 'fake-bin'), fakeIdentity = join(root, 'reply-identity'), fakeKnownHosts = join(root, 'known-hosts'), fakeCapture = join(root, 'captured-reply.json')
 mkdirSync(fakeBin); writeFileSync(fakeIdentity, 'test-only', { mode: 0o600 }); writeFileSync(fakeKnownHosts, 'test-only', { mode: 0o600 })
 const fakeSsh = join(fakeBin, 'ssh')
@@ -72,6 +77,23 @@ if (process.getuid?.() > 0) {
   const importedRequest = JSON.parse(readFileSync(join(replyRuntime, 'reply-requests.jsonl'), 'utf8').trim())
   ok('the worker-UID forced endpoint queues a bounded request only for an admitted single-sender receipt', importedReply.status === 0 && importedRequest.id === importRequest.id && importedRequest.receipt === liveEnvelope && !('to' in importedRequest))
 } else ok('the worker-UID forced endpoint queues a bounded request only for an admitted single-sender receipt (root runner skips UID execution)', true)
+
+writeFileSync(join(root, 'run-desktop', 'codex-app-server-delivered.jsonl'), JSON.stringify({ version: 1, envelope: liveEnvelope, thread_id: desktopManifest.codex_thread_id, turn_id: '019fce6b-4727-7a13-8f80-f4a6035c277f' }) + '\n')
+const requestReply = input => spawnSync(process.execPath, ['mcp/tools/desktop-reply-request.mjs', '--instance', 'codex-desktop', '--receipt', liveEnvelope], { cwd: resolve('.'), encoding: 'utf8', input, env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
+const desktopReply = requestReply('Yes.\n'), duplicateReply = requestReply('Again.\n')
+ok('the keyless Desktop can request one reply only for a notification delivered to its fixed thread', desktopReply.status === 0 && duplicateReply.status !== 0 && /already has a reply request/.test(duplicateReply.stderr) && readFileSync(join(root, 'run-desktop', 'reply-requests.jsonl'), 'utf8').includes('"content":"Yes."'))
+
+const syncUid = process.getuid(), syncRuntime = join(root, 'run-sync'), syncEnvelope = '6'.repeat(64)
+const syncManifest = { ...manifest, id: 'sync-test', pubkey: '5'.repeat(64), state_dir: join(root, 'state-sync'), runtime_dir: syncRuntime, spool_dir: join(root, 'spool-sync'),
+  watcher_uid: syncUid === 41021 ? 41024 : 41021, broker_uid: syncUid === 41022 ? 41025 : 41022, adapter_uid: syncUid === 41023 ? 41026 : 41023, worker_uid: syncUid }
+writeFileSync(join(manifestRoot, 'sync-test.json'), JSON.stringify(syncManifest)); mkdirSync(syncRuntime, { recursive: true })
+writeFileSync(join(syncRuntime, 'admitted-tasks.jsonl'), JSON.stringify({ type: 'admitted-task', instance: 'sync-test', envelope: syncEnvelope, messages: [{ from: 'a'.repeat(64), at: 1, content: 'sync me' }] }) + '\n')
+writeFileSync(join(syncRuntime, 'reply-requests.jsonl'), '')
+const syncRequest = JSON.stringify({ version: 1, type: 'reply-request', id: '1'.repeat(32), instance: 'sync-test', receipt: syncEnvelope, content: 'Remote yes.' }) + '\n'
+const runSync = input => spawnSync(process.execPath, ['mcp/tools/instance-desktop-sync.mjs', '--instance', 'sync-test'], { cwd: resolve('.'), encoding: 'utf8', input, env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
+const firstSync = runSync(syncRequest), replaySync = runSync(syncRequest)
+const badSync = runSync(JSON.stringify({ ...JSON.parse(syncRequest), id: '2'.repeat(32), receipt: '7'.repeat(64) }) + '\n')
+ok('the restricted server sync imports a bounded admitted-envelope reply exactly once and exports only admitted tasks', firstSync.status === 0 && replaySync.status === 0 && badSync.status !== 0 && firstSync.stdout.includes(syncEnvelope) && readFileSync(join(syncRuntime, 'reply-requests.jsonl'), 'utf8').trim().split('\n').length === 1)
 writeFileSync(join(manifestRoot, 'bad-desktop.json'), JSON.stringify({ ...manifest, id: 'bad-desktop', pubkey: '4'.repeat(64), state_dir: join(root, 'state-bad-desktop'), runtime_dir: join(root, 'run-bad-desktop'), spool_dir: join(root, 'spool-bad-desktop'), delivery_mode: 'codex_app_server' }))
 const badDesktop = cli('describe', '--instance', 'bad-desktop')
 ok('an inbound event cannot silently select or create a Codex desktop thread', badDesktop.status !== 0 && /explicit codex_thread_id/.test(badDesktop.stderr))
@@ -106,11 +128,14 @@ const admittedImportSource = readFileSync('mcp/tools/instance-admitted-import.mj
 const remoteBridgeSource = readFileSync('mcp/tools/codex-remote-bridge.mjs', 'utf8')
 const remoteReplySource = readFileSync('mcp/tools/codex-remote-reply.mjs', 'utf8')
 const remoteReplyImportSource = readFileSync('mcp/tools/instance-desktop-reply-import.mjs', 'utf8')
-ok('the Codex context adapter resumes only the manifest-bound thread after broker admission, with no Nostr key or network listener', /thread\/resume/.test(codexTransportSource) && /threadId: id/.test(codexTransportSource) && /turn\/start/.test(codexTransportSource) && /local_control_socket/.test(codexDesktopSource) && /admitted-tasks\.jsonl/.test(codexDesktopSource) && !/NVOY_NSEC|NVOY_BROKER_CREDENTIAL|bunker:|wss:\/\//.test(codexDesktopSource + codexTransportSource))
-ok('remote desktop delivery exports only adapter-admitted records and imports them without any Nostr credential', /process\.getuid.*manifest\.adapterUid/.test(admittedExportSource) && /admitted-tasks\.jsonl/.test(admittedExportSource) && /--baseline/.test(admittedImportSource) && /remote-imported\.jsonl/.test(admittedImportSource) && !/NVOY_NSEC|NVOY_BROKER_CREDENTIAL|bunker:|wss:\/\//.test(admittedExportSource + admittedImportSource))
-ok('the remote Codex bridge uses a restricted forced-command SSH transport and a keyless child environment', /BatchMode=yes/.test(remoteBridgeSource) && /StrictHostKeyChecking=yes/.test(remoteBridgeSource) && /ClearAllForwardings=yes/.test(remoteBridgeSource) && /spawnSync\('ssh', sshArgs/.test(remoteBridgeSource) && /const childEnv = \{ HOME:/.test(remoteBridgeSource) && !/\.\.\.process\.env/.test(remoteBridgeSource) && !/NVOY_NSEC|NVOY_BROKER_CREDENTIAL|bunker:|wss:\/\//.test(remoteBridgeSource))
 ok('Desktop replies name only a delivered receipt while the broker retains recipient resolution and signing', /codex-app-server-delivered\.jsonl/.test(remoteReplySource) && /thread_id === manifest\.codexThreadId/.test(remoteReplySource) && /receipt, content/.test(remoteReplySource) && !/request\.to|["']to["']\s*:|NVOY_NSEC|NVOY_BROKER_CREDENTIAL|bunker:|wss:\/\//.test(remoteReplySource) && /manifest\.workerUid/.test(remoteReplyImportSource) && /reply receipt already has a request/.test(remoteReplyImportSource) && !/finalizeEvent|nip44|NVOY_NSEC|NVOY_BROKER_CREDENTIAL/.test(remoteReplyImportSource))
 ok('Desktop delivery mode disables the independent headless model drain before reading a provider credential', /manifest\.deliveryMode !== 'headless'/.test(workerSource) && /headless model drain disabled/.test(workerSource) && workerSource.indexOf("manifest.deliveryMode !== 'headless'") < workerSource.indexOf('let providerKey'))
+const desktopReplySource = readFileSync('mcp/tools/desktop-reply-request.mjs', 'utf8')
+const desktopSyncSource = readFileSync('mcp/tools/instance-desktop-sync.mjs', 'utf8')
+ok('the Codex context adapter resumes only the manifest-bound thread after broker admission, with no Nostr key or network listener', /thread\/resume/.test(codexTransportSource) && /threadId: id/.test(codexTransportSource) && /turn\/start/.test(codexTransportSource) && /local_control_socket/.test(codexDesktopSource) && /admitted-tasks\.jsonl/.test(codexDesktopSource) && !/NVOY_NSEC|NVOY_BROKER_CREDENTIAL|bunker:|wss:\/\//.test(codexDesktopSource + codexTransportSource))
+ok('remote desktop delivery exports only adapter-admitted records and imports them without any Nostr credential', /process\.getuid.*manifest\.adapterUid/.test(admittedExportSource) && /admitted-tasks\.jsonl/.test(admittedExportSource) && /--baseline/.test(admittedImportSource) && /remote-imported\.jsonl/.test(admittedImportSource) && !/NVOY_NSEC|NVOY_BROKER_CREDENTIAL|bunker:|wss:\/\//.test(admittedExportSource + admittedImportSource))
+ok('the remote Codex bridge uses a restricted duplex sync and a keyless child environment', /BatchMode=yes/.test(remoteBridgeSource) && /StrictHostKeyChecking=yes/.test(remoteBridgeSource) && /ClearAllForwardings=yes/.test(remoteBridgeSource) && /input: replies/.test(remoteBridgeSource) && /const childEnv = \{ HOME:/.test(remoteBridgeSource) && !/\.\.\.process\.env/.test(remoteBridgeSource) && !/NVOY_NSEC|NVOY_BROKER_CREDENTIAL|bunker:|wss:\/\//.test(remoteBridgeSource + desktopReplySource + desktopSyncSource))
+ok('Desktop reply tooling cannot choose a recipient or sign; server sync runs only as the manifest worker UID', /codex-app-server-delivered\.jsonl/.test(desktopReplySource) && /already has a reply request/.test(desktopReplySource) && /process\.getuid.*manifest\.workerUid/.test(desktopSyncSource) && !/recipient|\[['"]p['"]|signEvent|nip44|finalizeEvent/.test(desktopReplySource + desktopSyncSource))
 ok('the worker has a separate UID and can use only pre-provisioned cross-UID handoff paths', rendered.stdout.includes('\"41014:' + manifest.worker_handoff_gid + '\"') && /admitted-tasks\.jsonl.*workerHandoffGid.*0o640/.test(readFileSync('mcp/tools/instance-runtime-init.mjs', 'utf8')) && /reply-requests\.jsonl.*brokerAdapterGid.*0o640/.test(readFileSync('mcp/tools/instance-runtime-init.mjs', 'utf8')) && /worker-input.*workerHandoffGid.*0o710/.test(readFileSync('mcp/tools/instance-runtime-init.mjs', 'utf8')) && /renameSync\(tmp, input\)/.test(readFileSync('mcp/tools/instance-adapter.mjs', 'utf8')) && /worker-input/.test(workerSource) && !/writeFileSync\(inputPath/.test(workerSource))
 ok('watcher cooldown coalesces notifications but never skips durable queueing', /function record\(id\)[\s\S]*appendFileSync[\s\S]*if \(now - lastWake < cooldown\) return true/.test(wakeSource))
 const brokerSource = readFileSync('mcp/tools/instance-broker.mjs', 'utf8')

@@ -154,12 +154,12 @@ node mcp/tools/instance-worker.mjs --instance codex-jaf --runner codex
 
 ### Local Codex context adapter
 
-For a first-class Codex participant, run the Nostr watcher/broker and this adapter in the same
-trusted desktop environment (or use an explicitly secured queue forwarder). Give the manifest an
-explicit delivery binding:
+For a first-class Codex participant, give the desktop manifest an explicit delivery binding. A
+desktop connected to a server-side broker must also declare `broker_mode: "remote"`; that mode
+forbids every key, Bunker, and worker-credential reference in the desktop manifest:
 
 ```json
-{ "delivery_mode": "codex_app_server", "codex_thread_id": "<persistent-thread-id>", "codex_transport": "local_control_socket", "codex_app_server_socket": "/Users/you/.codex/app-server-control/app-server-control.sock" }
+{ "broker_mode": "remote", "delivery_mode": "codex_app_server", "codex_thread_id": "<persistent-thread-id>", "codex_transport": "local_control_socket", "codex_app_server_socket": "/Users/you/.codex/app-server-control/app-server-control.sock" }
 ```
 
 Then run:
@@ -168,21 +168,26 @@ Then run:
 node mcp/tools/codex-app-server-adapter.mjs --instance codex-jaf
 ```
 
-When the isolated watcher/broker remain on a server, do not expose their socket or credential to
-the desktop. Run `instance-admitted-export.mjs` as the remote **adapter UID** behind an SSH
-`authorized_keys` forced command (`restrict`, no PTY, forwarding, or caller-selected command), and
-pipe that authenticated stream into `instance-admitted-import.mjs` on the Mac. On first install,
-use `--baseline` once so historical queue entries become the durable cursor without waking a
-conversation; subsequent imports append only unseen envelopes. The exporter cannot decrypt,
-sign, query relays, choose a thread, or read broker state. The importer rejects another instance,
-unknown fields, malformed messages, oversized records, symlinked state, and duplicate envelopes.
-Only the separate local Codex adapter can submit the resulting queue to the manifest-bound thread.
-`codex-remote-bridge.mjs` is the durable desktop loop for that arrangement. It accepts only a
+When the isolated watcher/broker remain on a server, there must be exactly one broker for the
+identity. Do not run a second desktop watcher or broker and do not expose the server broker socket,
+signing credential, or Bunker capability to the desktop. Run `instance-desktop-sync.mjs` as the
+remote **worker UID** behind an SSH `authorized_keys` forced command (`restrict`, no PTY,
+forwarding, or caller-selected command). It is a duplex, instance-fixed boundary: stdout exports
+only already-admitted tasks, while stdin accepts bounded reply requests only for those same
+envelopes. It cannot decrypt, sign, query relays, choose a recipient or thread, or read broker
+state. On first install, use `codex-remote-bridge.mjs --baseline` once so historical queue entries
+become the durable cursor without waking a conversation; subsequent runs import only unseen
+envelopes. The local importer rejects another instance, unknown fields, malformed messages,
+oversized records, symlinked state, and duplicate envelopes. Only the separate local Codex adapter
+can submit the resulting queue to the manifest-bound thread. `desktop-reply-request.mjs` permits
+one response only after that exact envelope appears in the exact-thread delivery journal; the
+server broker revalidates the grant, chooses the original sender, and signs the final reply.
+`codex-remote-bridge.mjs` is the durable desktop loop for this arrangement. It accepts only a
 validated `user@host`, a mode-0600 non-symlink SSH identity, and a pinned known-hosts file; it
 enables batch mode, strict host checking, and clears forwarding, and deliberately supplies **no
 remote command**. Therefore the server-side key must be restricted with an `authorized_keys`
-forced command that runs the exporter for exactly one instance. The key is an admitted-queue
-read capability, never a shell or signer capability.
+forced command that runs the sync endpoint for exactly one instance. The key is a narrow queue
+sync capability, never a shell or signer capability.
 
 Desktop replies use a second, independent forced-command SSH key. `codex-remote-reply.mjs`
 accepts content on stdin only after proving the named envelope was delivered to the one

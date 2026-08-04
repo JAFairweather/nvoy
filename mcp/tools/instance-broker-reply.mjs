@@ -24,6 +24,7 @@ if (!id || !/^[0-9a-f]{32}$/.test(requestId)) die('usage: --instance <id> --requ
 const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 let manifest
 try { manifest = readManifest(root, instanceId(id)); assertNoCollisions(root, manifest) } catch (e) { die(e.message) }
+if (manifest.brokerMode !== 'local') die('remote-broker Desktop manifests cannot sign locally')
 
 function regular(path, label) {
   let st; try { st = lstatSync(path) } catch { die(`${label} is missing`) }

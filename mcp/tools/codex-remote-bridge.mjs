@@ -3,7 +3,7 @@
 // Codex Desktop thread. The SSH credential can read only this instance's admitted queue; it is
 // not a login key and it is never a Nostr signer.
 
-import { lstatSync } from 'node:fs'
+import { existsSync, lstatSync, readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
@@ -27,7 +27,7 @@ const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
 let manifest
 try { manifest = readManifest(root, instanceId(id)) } catch (error) { die(error.message) }
-if (manifest.deliveryMode !== 'codex_app_server' || manifest.codexTransport !== 'local_control_socket') die('manifest is not bound to a local Codex control socket')
+if (manifest.brokerMode !== 'remote' || manifest.deliveryMode !== 'codex_app_server' || manifest.codexTransport !== 'local_control_socket') die('manifest is not a keyless remote-broker Codex binding')
 
 const sshArgs = ['-i', identity, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
   '-o', `UserKnownHostsFile=${knownHosts}`, '-o', 'ClearAllForwardings=yes', '-T', target]
@@ -36,9 +36,16 @@ const sshArgs = ['-i', identity, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=ye
 // was launched from an interactive terminal.
 const childEnv = { HOME: process.env.HOME || '', PATH: process.env.PATH || '', NVOY_INSTANCE_ROOT: root }
 function cycle() {
-  // No remote command is supplied. authorized_keys must force the single adapter export command;
+  // No remote command is supplied. authorized_keys must force the single worker-UID sync command;
   // a server that offers an interactive shell is a deployment error, not a supported mode.
-  const pulled = spawnSync('ssh', sshArgs, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+  const replyQueue = resolve(manifest.runtimeDir, 'reply-requests.jsonl')
+  let replies = ''
+  if (!baseline && existsSync(replyQueue)) {
+    const stat = lstatSync(replyQueue)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 16 * 1024 * 1024) throw new Error('local reply queue is not a bounded regular file')
+    replies = readFileSync(replyQueue, 'utf8')
+  }
+  const pulled = spawnSync('ssh', sshArgs, { encoding: 'utf8', input: replies, maxBuffer: 64 * 1024 * 1024 })
   if (pulled.status !== 0) throw new Error(`restricted queue export failed (${pulled.status}): ${String(pulled.stderr || '').trim()}`)
   const imported = spawnSync(process.execPath, [resolve(repoRoot, 'mcp/tools/instance-admitted-import.mjs'), '--instance', manifest.id, ...(baseline ? ['--baseline'] : [])],
     { cwd: repoRoot, encoding: 'utf8', input: pulled.stdout, env: childEnv, maxBuffer: 64 * 1024 * 1024 })

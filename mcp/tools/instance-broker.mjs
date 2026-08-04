@@ -21,6 +21,7 @@ if (command !== 'deliver' || !id || !/^[0-9a-f]{64}$/.test(envelope)) die('usage
 const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 let manifest
 try { manifest = readManifest(root, instanceId(id)); assertNoCollisions(root, manifest) } catch (e) { die(e.message) }
+if (manifest.brokerMode !== 'local') die('remote-broker Desktop manifests cannot start a local broker')
 
 // One broker owns one state root at a time. A stale lock is reclaimable only if its recorded PID
 // is demonstrably gone; a malformed or foreign lock fails closed rather than guessing.
