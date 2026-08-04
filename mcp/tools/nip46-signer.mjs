@@ -39,7 +39,12 @@ export function makeBunkerSigner(uriText, clientNsec) {
     setTimeout(() => { if (pending.delete(id)) reject(new Error(`nip46 ${method} timed out`)) }, timeout)
   })
   const ready = () => (connected ??= rpc('connect', [pubkey, secret], 15000).catch(() => 'active'))
-  return Object.freeze({ pubkey, async getPublicKey() { await ready(); return rpc('get_public_key', []) },
+  const close = () => {
+    for (const { reject } of pending.values()) reject(new Error('nip46 signer closed'))
+    pending.clear()
+    try { pool.close(relays) } catch { /* best-effort socket cleanup */ }
+  }
+  return Object.freeze({ pubkey, close, async getPublicKey() { await ready(); return rpc('get_public_key', []) },
     async nip44Decrypt(peer, ciphertext) { await ready(); return rpc('nip44_decrypt', [peer, ciphertext]) },
     async nip44Encrypt(peer, plaintext) { await ready(); return rpc('nip44_encrypt', [peer, plaintext]) },
     async signEvent(event) { await ready(); return JSON.parse(await rpc('sign_event', [JSON.stringify(event)])) } })
