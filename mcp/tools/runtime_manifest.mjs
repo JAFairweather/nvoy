@@ -51,8 +51,6 @@ export function readManifest(root, requestedId) {
   const grantors = (Array.isArray(raw.grantors) ? raw.grantors : []).map(toHex)
   const relays = (Array.isArray(raw.relays) ? raw.relays : []).map(String).filter(v => /^wss:\/\//.test(v))
   if (!valid(pubkey) || !grantors.length || !grantors.every(valid) || !relays.length) die('manifest requires pubkey, grantors, and wss relays')
-  const watchSinceSeconds = Number(raw.watch_since_seconds ?? raw.watchSinceSeconds ?? 172920)
-  if (!Number.isInteger(watchSinceSeconds) || watchSinceSeconds < 0 || watchSinceSeconds > 604800) die('watch_since_seconds must be an integer from 0 through 604800')
   const rawStateDir = String(raw.state_dir || raw.stateDir || '')
   const rawRuntimeDir = String(raw.runtime_dir || raw.runtimeDir || '')
   const rawSpoolDir = String(raw.spool_dir || raw.spoolDir || '')
@@ -100,7 +98,7 @@ export function readManifest(root, requestedId) {
       try { localControlSocket(codexSocketPath) } catch (e) { die(e.message) }
     }
   }
-  return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, relays, watchSinceSeconds, stateDir, runtimeDir, spoolDir,
+  return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, relays, stateDir, runtimeDir, spoolDir,
     brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath })
 }
 
