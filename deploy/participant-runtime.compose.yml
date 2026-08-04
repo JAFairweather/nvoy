@@ -27,9 +27,15 @@ services:
         source: ${MANIFEST_DIR:?}
         target: /etc/nvoy/instances
         read_only: true
-      - watcher_spool:${SPOOL_DIR:?}
-      - broker_state:${STATE_DIR:?}
-      - adapter_runtime:${RUNTIME_DIR:?}
+      - type: volume
+        source: watcher_spool
+        target: ${SPOOL_DIR:?}
+      - type: volume
+        source: broker_state
+        target: ${STATE_DIR:?}
+      - type: volume
+        source: adapter_runtime
+        target: ${RUNTIME_DIR:?}
     restart: "no"
 
   watcher:
@@ -47,7 +53,9 @@ services:
         source: ${MANIFEST_DIR:?}
         target: /etc/nvoy/instances
         read_only: true
-      - watcher_spool:${SPOOL_DIR:?}
+      - type: volume
+        source: watcher_spool
+        target: ${SPOOL_DIR:?}
     depends_on:
       init:
         condition: service_completed_successfully
@@ -71,9 +79,15 @@ services:
         source: ${MANIFEST_DIR:?}
         target: /etc/nvoy/instances
         read_only: true
-      - broker_state:${STATE_DIR:?}
-      - watcher_spool:${SPOOL_DIR:?}
-      - adapter_runtime:${RUNTIME_DIR:?}
+      - type: volume
+        source: broker_state
+        target: ${STATE_DIR:?}
+      - type: volume
+        source: watcher_spool
+        target: ${SPOOL_DIR:?}
+      - type: volume
+        source: adapter_runtime
+        target: ${RUNTIME_DIR:?}
     depends_on:
       init:
         condition: service_completed_successfully
@@ -95,7 +109,9 @@ services:
         source: ${MANIFEST_DIR:?}
         target: /etc/nvoy/instances
         read_only: true
-      - adapter_runtime:${RUNTIME_DIR:?}
+      - type: volume
+        source: adapter_runtime
+        target: ${RUNTIME_DIR:?}
     depends_on:
       init:
         condition: service_completed_successfully
@@ -121,7 +137,9 @@ services:
         source: ${MANIFEST_DIR:?}
         target: /etc/nvoy/instances
         read_only: true
-      - adapter_runtime:${RUNTIME_DIR:?}
+      - type: volume
+        source: adapter_runtime
+        target: ${RUNTIME_DIR:?}
     depends_on:
       adapter:
         condition: service_started

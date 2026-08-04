@@ -51,6 +51,7 @@ try {
     '--image', 'registry.example/runtime@sha256:' + 'a'.repeat(64)])
   check('runtime image renders the instance Compose contract', rendered)
   if (!String(rendered.stdout).includes('name: nvoy-codex-test')) throw new Error('rendered Compose did not bind the instance id')
+  if (!String(rendered.stdout).includes('target: "/run/nvoy/codex-test"')) throw new Error('rendered Compose did not produce YAML-safe volume targets')
   run([...base, '--user', '0:0', '--cap-add=CHOWN', '--cap-add=FOWNER', '--cap-add=DAC_OVERRIDE', ...mount(state, manifest.state_dir), ...mount(spool, manifest.spool_dir), ...mount(runtime, manifest.runtime_dir), image, 'node', 'mcp/tools/instance-runtime-init.mjs', '--instance', manifest.id], 'initializer')
   check('start adapter', docker(['run', '-d', '--name', adapter, '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges:true', '--tmpfs', '/tmp:mode=1777', '--user', '41013:41001', '--group-add', '41002', ...mount(instances, '/etc/nvoy/instances:ro'), ...mount(runtime, manifest.runtime_dir), image, 'node', 'mcp/tools/instance-adapter.mjs', '--instance', manifest.id]))
   const probe = `const net=require('node:net');const c=net.createConnection('/run/nvoy/codex-test/adapter.sock');c.on('connect',()=>process.exit(9));c.on('error',e=>process.exit(e.code==='EACCES'?0:8));setTimeout(()=>process.exit(7),1500)`
