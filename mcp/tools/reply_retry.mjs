@@ -9,6 +9,7 @@ import { appendFileSync, existsSync, lstatSync, readFileSync } from 'node:fs'
 
 const ID = /^[0-9a-f]{32}$/
 const TERMINAL = [
+  'admission receipt is missing',
   'admission receipt is not a live broker-bound sender capability',
   'admission receipt no longer has a live matching grant',
 ]
