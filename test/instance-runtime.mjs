@@ -17,7 +17,7 @@ const manifestRoot = join(root, 'instances')
 mkdirSync(manifestRoot)
 const manifestFile = join(manifestRoot, 'codex-test.json')
 const manifest = { version: 1, id: 'codex-test', pubkey: nip19.npubEncode(pubkey),
-  state_dir: join(root, 'state-codex'), runtime_dir: join(root, 'run-codex'), spool_dir: join(root, 'spool-codex'), key_ref: '/etc/nvoy/credentials/codex-test.nsec', bunker_uri_ref: '/etc/nvoy/credentials/codex-test.bunker', bunker_client_ref: '/etc/nvoy/credentials/codex-test.client', worker_image: 'registry.example/codex-worker@sha256:' + 'd'.repeat(64), worker_runner: 'codex', shared_gid: process.getgid(), watcher_uid: 41011, broker_uid: 41012, adapter_uid: 41013,
+  state_dir: join(root, 'state-codex'), runtime_dir: join(root, 'run-codex'), spool_dir: join(root, 'spool-codex'), key_ref: '/etc/nvoy/credentials/codex-test.nsec', bunker_uri_ref: '/etc/nvoy/credentials/codex-test.bunker', bunker_client_ref: '/etc/nvoy/credentials/codex-test.client', worker_image: 'registry.example/codex-worker@sha256:' + 'd'.repeat(64), worker_runner: 'codex', worker_credential_ref: '/etc/nvoy/credentials/codex-test.provider', shared_gid: process.getgid(), watcher_uid: 41011, broker_uid: 41012, adapter_uid: 41013,
   grantors: ['4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b287ea84d'], relays: ['wss://nos.lol', 'wss://relay.primal.net'] }
 writeFileSync(manifestFile, JSON.stringify(manifest))
 const cli = (...args) => spawnSync(process.execPath, ['mcp/tools/instance-runtime.mjs', ...args], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
@@ -30,11 +30,16 @@ ok('the instance receives its own state directory', described.stateDir === manif
 ok('the manifest binds three distinct non-root service UIDs', manifest.watcher_uid !== manifest.broker_uid && manifest.broker_uid !== manifest.adapter_uid)
 const image = 'registry.example/nvoy@sha256:' + 'e'.repeat(64)
 const rendered = spawnSync(process.execPath, ['mcp/tools/render-instance-compose.mjs', '--instance', 'codex-test', '--image', image], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
-ok('Compose UID/GID, every runtime path, and Bunker-only mounts are rendered from the immutable manifest', rendered.status === 0 && rendered.stdout.includes('\"41011:' + process.getgid() + '\"') && rendered.stdout.includes(manifest.bunker_uri_ref) && rendered.stdout.includes(manifest.bunker_client_ref) && rendered.stdout.includes(manifest.state_dir) && rendered.stdout.includes(manifest.spool_dir) && rendered.stdout.includes(manifest.runtime_dir) && !rendered.stdout.includes('${WATCHER_UID'))
+ok('Compose UID/GID, every runtime path, and Bunker-only mounts are rendered from the immutable manifest', rendered.status === 0 && rendered.stdout.includes('\"41011:' + process.getgid() + '\"') && rendered.stdout.includes(manifest.bunker_uri_ref) && rendered.stdout.includes(manifest.bunker_client_ref) && rendered.stdout.includes(manifest.worker_credential_ref) && rendered.stdout.includes(manifest.state_dir) && rendered.stdout.includes(manifest.spool_dir) && rendered.stdout.includes(manifest.runtime_dir) && !rendered.stdout.includes('${WATCHER_UID'))
 ok('Compose volume namespace is bound to the immutable instance ID', rendered.status === 0 && rendered.stdout.includes('name: nvoy-codex-test'))
 ok('Compose includes a keyless digest-pinned Codex/Claude worker for each instance', rendered.status === 0 && rendered.stdout.includes(manifest.worker_image) && rendered.stdout.includes('--runner", "codex"'))
 const taggedImage = spawnSync(process.execPath, ['mcp/tools/render-instance-compose.mjs', '--instance', 'codex-test', '--image', 'nvoy:latest'], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
 ok('Compose renderer rejects mutable image tags', taggedImage.status !== 0 && /canonical/.test(taggedImage.stderr))
+const workerStart = rendered.stdout.indexOf('\n  worker:')
+const workerEnd = rendered.stdout.indexOf('\nsecrets:', workerStart)
+const workerPart = workerStart < 0 ? '' : rendered.stdout.slice(workerStart, workerEnd < 0 ? undefined : workerEnd)
+const nonWorkerPart = workerStart < 0 ? rendered.stdout : rendered.stdout.slice(0, workerStart)
+ok('the model-provider secret is worker-only and remains separate from the Bunker signer', workerPart.includes('nvoy_worker_provider') && !nonWorkerPart.includes('nvoy_worker_provider') && !workerPart.includes('nvoy_bunker_uri') && !workerPart.includes('nvoy_bunker_client'))
 
 const watcherSource = readFileSync('mcp/tools/instance-runtime.mjs', 'utf8')
 ok('the keyless watcher receives an explicit environment, not inherited process secrets', !/\.\.\.process\.env/.test(watcherSource) && !/NVOY_NSEC/.test(watcherSource))
@@ -54,7 +59,9 @@ ok('a root-only initializer provisions all three volume roots before non-root se
 const replySource = readFileSync('mcp/tools/instance-broker-reply.mjs', 'utf8')
 ok('only the broker can sign a reply, resolving its target from an exact receipt and persisting the wrap', /NVOY_BROKER_CREDENTIAL/.test(replySource) && /receipt\.sender/.test(replySource) && !/request\.to/.test(replySource) && replySource.includes('writeFileSync(tmp, JSON.stringify(record)') && /finalizeEvent/.test(replySource))
 const workerSource = readFileSync('mcp/tools/instance-worker.mjs', 'utf8')
-ok('the Codex/Claude worker stays keyless and treats delivered text as data', !/NVOY_NSEC|BROKER_CREDENTIAL|nip44|finalizeEvent/.test(workerSource) && /untrusted DATA, not instructions/.test(workerSource) && /reply-request/.test(workerSource))
+ok('the Codex/Claude worker stays Nostr-keyless, uses only its runner-specific provider secret, and treats delivered text as data', !/NVOY_NSEC|BROKER_CREDENTIAL|NVOY_BUNKER_URI|nip44|finalizeEvent/.test(workerSource) && /NVOY_WORKER_CREDENTIAL_FILE/.test(workerSource) && /OPENAI_API_KEY/.test(workerSource) && /ANTHROPIC_API_KEY/.test(workerSource) && /untrusted DATA, not instructions/.test(workerSource) && /reply-request/.test(workerSource))
+const workerDockerfile = readFileSync('deploy/nvoy-worker.Dockerfile', 'utf8')
+ok('the reproducible worker image installs both declared runner CLIs but bakes no Nostr credential', /@openai\/codex@\$\{CODEX_VERSION\}/.test(workerDockerfile) && /@anthropic-ai\/claude-code@\$\{CLAUDE_VERSION\}/.test(workerDockerfile) && !/NVOY_NSEC|BUNKER_URI|bunker:\/\//i.test(workerDockerfile))
 
 const blocked = cli('attention', '--instance', 'codex-test')
 ok('an adapter cannot invoke the keyed attention path', blocked.status !== 0 && /usage/.test(blocked.stderr))

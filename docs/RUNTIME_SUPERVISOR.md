@@ -44,6 +44,9 @@ contains only public routing policy:
   "shared_gid": 41001,
   "bunker_uri_ref": "/etc/nvoy/credentials/codex-jaf.bunker-uri",
   "bunker_client_ref": "/etc/nvoy/credentials/codex-jaf.nip46-client",
+  "worker_image": "ghcr.io/example/nvoy-worker@sha256:<64-hex-digest>",
+  "worker_runner": "codex",
+  "worker_credential_ref": "/etc/nvoy/credentials/codex-jaf.openai-api-key",
   "grantors": ["<64 hex>"],
   "relays": ["wss://nos.lol", "wss://relay.primal.net"]
 }
@@ -56,6 +59,14 @@ connection capability and the client reference holds the stable NIP-46 transport
 the participant identity nsec, which remains solely in `bunker.nave.pub`; neither is inherited by
 watcher, adapter, or worker.
 
+`worker_credential_ref` is intentionally a different credential class: a dedicated, revocable
+model-provider API key used by the headless Claude/Codex process. It is mounted only in the
+keyless worker, never in the broker. For `worker_runner: "codex"` its file holds an
+`OPENAI_API_KEY`; for `"claude"` it holds an `ANTHROPIC_API_KEY`. It cannot sign or decrypt Nostr
+traffic; the worker still cannot choose a recipient or publish a Nostr event. Use one
+least-privilege provider key per participant runtime and rotate/revoke it independently of the
+Bunker identity.
+
 ## Units and filesystem ownership
 
 For each `<id>`, the installer creates a dedicated OS account `nvoy-<id>` and:
@@ -64,6 +75,7 @@ For each `<id>`, the installer creates a dedicated OS account `nvoy-<id>` and:
 |---|---|---|
 | `/etc/nvoy/instances/<id>.json` | root:root 0644 | supervisor only |
 | Bunker URI + NIP-46 client credentials | root:broker 0600 | broker only |
+| Model-provider credential | root:worker 0600 | worker only; never a Nostr key |
 | `/var/lib/nvoy/<id>` | nvoy-<id> 0700 | broker state/lock |
 | `/run/nvoy/<id>` | adapter:instance-group 0710 | broker socket (broker can traverse, not replace) |
 | watcher spool | watcher:instance-group 0770, markers 0660 | watcher→broker marker intake |

@@ -17,6 +17,21 @@ const id = flag('--instance'), runner = flag('--runner') || 'codex', suppliedRep
 if (!id || !['codex', 'claude'].includes(runner)) die('usage: --instance <id> [--runner codex|claude] [--reply <test text>]')
 const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 let manifest; try { manifest = readManifest(root, instanceId(id)) } catch (e) { die(e.message) }
+// The headless coding client needs its own provider credential.  This is deliberately separate
+// from the Nostr identity: the worker never gets the Bunker URI, its NIP-46 client key, or an
+// nsec. Docker mounts the provider value as a worker-only secret; it is read once and passed only
+// to the local coding-client child, never to task data or any broker call.
+let providerKey = ''
+if (!suppliedReply) {
+  const providerPath = process.env.NVOY_WORKER_CREDENTIAL_FILE || ''
+  if (!providerPath) die('NVOY_WORKER_CREDENTIAL_FILE is required for a live coding worker')
+  try {
+    const st = lstatSync(providerPath)
+    if (!st.isFile() || st.isSymbolicLink()) die('worker provider credential must be a regular non-symlink file')
+    providerKey = readFileSync(providerPath, 'utf8').trim()
+  } catch (e) { die(e.message || 'cannot read worker provider credential') }
+  if (!providerKey) die('worker provider credential is empty')
+}
 const queue = resolve(manifest.runtimeDir, 'admitted-tasks.jsonl')
 const consumedPath = resolve(manifest.runtimeDir, 'worker-consumed.jsonl')
 const replyQueue = resolve(manifest.runtimeDir, 'reply-requests.jsonl')
@@ -49,7 +64,9 @@ function runAgent(task) {
   const args = runner === 'codex'
     ? ['exec', '--sandbox', 'read-only', '--skip-git-repo-check', '--cd', manifest.runtimeDir, prompt]
     : ['-p', prompt]
-  const r = spawnSync(runner, args, { cwd: manifest.runtimeDir, encoding: 'utf8', timeout: 300000, env: { PATH: process.env.PATH || '', HOME: process.env.HOME || '' } })
+  const providerEnv = runner === 'codex' ? { OPENAI_API_KEY: providerKey } : { ANTHROPIC_API_KEY: providerKey }
+  const r = spawnSync(runner, args, { cwd: manifest.runtimeDir, encoding: 'utf8', timeout: 300000,
+    env: { PATH: process.env.PATH || '', HOME: process.env.HOME || '', ...providerEnv } })
   if (r.status !== 0) die(`${runner} did not produce a reply: ${String(r.stderr || '').trim()}`)
   const text = String(r.stdout || '').trim()
   if (!text || Buffer.byteLength(text, 'utf8') > 4000) die(`${runner} reply is empty or exceeds 4000 bytes`)

@@ -109,7 +109,9 @@ services:
     tmpfs: [/tmp:mode=1777]
     environment:
       NVOY_INSTANCE_ROOT: /etc/nvoy/instances
+      NVOY_WORKER_CREDENTIAL_FILE: /run/secrets/nvoy_worker_provider
     command: ["node", "mcp/tools/instance-worker.mjs", "--instance", "${INSTANCE_ID:?}", "--runner", "${WORKER_RUNNER:?}"]
+    secrets: [nvoy_worker_provider]
     volumes:
       - type: bind
         source: ${MANIFEST_DIR:?}
@@ -126,6 +128,10 @@ secrets:
     file: ${BUNKER_URI_FILE:?}
   nvoy_bunker_client:
     file: ${BUNKER_CLIENT_FILE:?}
+  # This is a model-provider credential (for example a dedicated OPENAI_API_KEY), not a
+  # Nostr identity key. It is mounted only into the keyless worker and never into the broker.
+  nvoy_worker_provider:
+    file: ${WORKER_CREDENTIAL_FILE:?}
 
 volumes:
   watcher_spool: {}
