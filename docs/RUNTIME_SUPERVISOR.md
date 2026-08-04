@@ -123,3 +123,7 @@ adapter, and mounts spool only into watcher and broker. Each service drops capab
 read-only image filesystem, and uses a private `/tmp`. Start from
 [`deploy/participant-runtime.env.example`](../deploy/participant-runtime.env.example); the real
 env file and credential remain host-local, mode `0600`, and uncommitted.
+
+The Compose `init` service is a one-shot root-only provisioner, not a long-running privileged
+sidecar. It reads the manifest and creates/verifies the three named-volume roots with exactly the
+declared owner, group, and mode before the non-root services can start. It has no credential mount.

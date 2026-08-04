@@ -2,12 +2,33 @@
 #
 # Copy this file once per participant and substitute the four numeric IDs from the root-owned
 # manifest. Do not put an nsec in `environment`; Docker mounts the broker credential only at
-# /run/secrets/nvoy_identity. The three named volumes MUST be provisioned by root with the owner
-# / group / modes documented in docs/RUNTIME_SUPERVISOR.md before `docker compose up`.
+# /run/secrets/nvoy_identity. The one-shot `init` service provisions the three named volumes from
+# the immutable manifest before any non-root runtime starts.
 #
 # Example: docker compose -f participant-runtime.compose.yml --env-file codex-jaf.env up -d
 
 services:
+  init:
+    image: ${NVOY_IMAGE:?set NVOY_IMAGE}
+    user: "0:0"
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp:mode=1777]
+    environment:
+      NVOY_INSTANCE_ROOT: /etc/nvoy/instances
+    command: ["node", "mcp/tools/instance-runtime-init.mjs", "--instance", "${INSTANCE_ID:?}"]
+    volumes:
+      - type: bind
+        source: ${MANIFEST_DIR:?}
+        target: /etc/nvoy/instances
+        read_only: true
+      - watcher_spool:/var/lib/nvoy-watcher/${INSTANCE_ID}
+      - broker_state:/var/lib/nvoy/${INSTANCE_ID}
+      - adapter_runtime:/run/nvoy/${INSTANCE_ID}
+    restart: "no"
+
   watcher:
     image: ${NVOY_IMAGE:?set NVOY_IMAGE}
     user: "${WATCHER_UID:?}:${SHARED_GID:?}"
@@ -24,6 +45,9 @@ services:
         target: /etc/nvoy/instances
         read_only: true
       - watcher_spool:/var/lib/nvoy-watcher/${INSTANCE_ID}
+    depends_on:
+      init:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   broker:
@@ -46,6 +70,9 @@ services:
       - broker_state:/var/lib/nvoy/${INSTANCE_ID}
       - watcher_spool:/var/lib/nvoy-watcher/${INSTANCE_ID}
       - adapter_runtime:/run/nvoy/${INSTANCE_ID}
+    depends_on:
+      init:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   adapter:
@@ -64,6 +91,9 @@ services:
         target: /etc/nvoy/instances
         read_only: true
       - adapter_runtime:/run/nvoy/${INSTANCE_ID}
+    depends_on:
+      init:
+        condition: service_completed_successfully
     restart: unless-stopped
 
 secrets:

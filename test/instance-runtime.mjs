@@ -17,7 +17,7 @@ const manifestRoot = join(root, 'instances')
 mkdirSync(manifestRoot)
 const manifestFile = join(manifestRoot, 'codex-test.json')
 const manifest = { version: 1, id: 'codex-test', pubkey: nip19.npubEncode(pubkey),
-  state_dir: join(root, 'state-codex'), runtime_dir: join(root, 'run-codex'), spool_dir: join(root, 'spool-codex'), shared_gid: process.getgid(),
+  state_dir: join(root, 'state-codex'), runtime_dir: join(root, 'run-codex'), spool_dir: join(root, 'spool-codex'), shared_gid: process.getgid(), watcher_uid: 41011, broker_uid: 41012, adapter_uid: 41013,
   grantors: ['4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b287ea84d'], relays: ['wss://nos.lol', 'wss://relay.primal.net'] }
 writeFileSync(manifestFile, JSON.stringify(manifest))
 const cli = (...args) => spawnSync(process.execPath, ['mcp/tools/instance-runtime.mjs', ...args], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
@@ -27,6 +27,7 @@ const described = JSON.parse(good.stdout || '{}')
 ok('a valid instance manifest describes its public identity', good.status === 0 && described.recipient === pubkey)
 ok('the description contains no private key reference', !/keyFile|nsec/.test(good.stdout))
 ok('the instance receives its own state directory', described.stateDir === manifest.state_dir)
+ok('the manifest binds three distinct non-root service UIDs', manifest.watcher_uid !== manifest.broker_uid && manifest.broker_uid !== manifest.adapter_uid)
 
 const watcherSource = readFileSync('mcp/tools/instance-runtime.mjs', 'utf8')
 ok('the keyless watcher receives an explicit environment, not inherited process secrets', !/\.\.\.process\.env/.test(watcherSource) && !/NVOY_NSEC/.test(watcherSource))
@@ -39,6 +40,8 @@ ok('broker atomically claims the exact pending marker before decrypting', /renam
 ok('a broker claims a per-state exclusive lock before decrypting', /openSync\(lockPath, 'wx'/.test(brokerSource) && /process\.kill\(prior\.pid, 0\)/.test(brokerSource))
 const daemonSource = readFileSync('mcp/tools/instance-broker-daemon.mjs', 'utf8')
 ok('broker restart requeues only interrupted inflight markers before draining', /\.inflight/.test(daemonSource) && /\.pending/.test(daemonSource) && /setInterval\(drain, 1000\)/.test(daemonSource))
+const initSource = readFileSync('mcp/tools/instance-runtime-init.mjs', 'utf8')
+ok('a root-only initializer provisions all three volume roots before non-root services start', /process\.getuid\?\.\(\) !== 0/.test(initSource) && /provision\(m\.stateDir/.test(initSource) && /provision\(m\.spoolDir/.test(initSource) && /provision\(m\.runtimeDir/.test(initSource))
 
 const blocked = cli('attention', '--instance', 'codex-test')
 ok('an adapter cannot invoke the keyed attention path', blocked.status !== 0 && /usage/.test(blocked.stderr))
