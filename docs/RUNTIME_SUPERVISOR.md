@@ -159,7 +159,7 @@ desktop connected to a server-side broker must also declare `broker_mode: "remot
 forbids every key, Bunker, and worker-credential reference in the desktop manifest:
 
 ```json
-{ "broker_mode": "remote", "delivery_mode": "codex_app_server", "codex_thread_id": "<persistent-thread-id>", "codex_transport": "local_control_socket", "codex_app_server_socket": "/Users/you/.codex/app-server-control/app-server-control.sock" }
+{ "broker_mode": "remote", "delivery_mode": "codex_app_server", "codex_thread_id": "<persistent-thread-id>", "codex_transport": "local_control_socket", "codex_app_server_socket": "/Users/you/.codex/app-server-control/app-server-control.sock", "ssh_target": "nvoy-sync@example.net", "ssh_identity_file": "/Users/you/.nvoy/desktop/id_ed25519", "ssh_known_hosts_file": "/Users/you/.nvoy/desktop/known_hosts", "ssh_known_hosts_sha256": "<64-hex-sha256>" }
 ```
 
 Then run:
@@ -171,20 +171,29 @@ node mcp/tools/codex-app-server-adapter.mjs --instance codex-jaf
 When the isolated watcher/broker remain on a server, there must be exactly one broker for the
 identity. Do not run a second desktop watcher or broker and do not expose the server broker socket,
 signing credential, or Bunker capability to the desktop. Run `instance-desktop-sync.mjs` as the
-remote **worker UID** behind an SSH `authorized_keys` forced command (`restrict`, no PTY,
+remote **adapter UID** behind an SSH `authorized_keys` forced command (`restrict`, no PTY,
 forwarding, or caller-selected command). It is a duplex, instance-fixed boundary: stdout exports
 only already-admitted tasks, while stdin accepts bounded reply requests only for those same
-envelopes. It cannot decrypt, sign, query relays, choose a recipient or thread, or read broker
-state. On first install, use `codex-remote-bridge.mjs --baseline` once so historical queue entries
+envelopes. It cannot decrypt, sign, query relays, choose a recipient or thread, read broker state,
+or access a model-provider credential. Generate the exact stanza with
+`instance-desktop-authorized-key.mjs --instance <id> --public-key-file <key.pub>` and install its
+unaltered output in that adapter account only. On first install, use
+`codex-remote-bridge.mjs --baseline` once so historical queue entries
 become the durable cursor without waking a conversation; subsequent runs import only unseen
 envelopes. The local importer rejects another instance, unknown fields, malformed messages,
 oversized records, symlinked state, and duplicate envelopes. Only the separate local Codex adapter
 can submit the resulting queue to the manifest-bound thread. `desktop-reply-request.mjs` permits
 one response only after that exact envelope appears in the exact-thread delivery journal; the
-server broker revalidates the grant, chooses the original sender, and signs the final reply.
+server broker revalidates the grant, chooses the original sender, and signs the final reply. This
+local journal is a misuse guard, not remote attestation of model authorship: possession of the
+restricted SSH capability can request one reply for any admitted receipt it receives. The server
+makes no broader claim that Codex authored the text. Keep that capability owner-only and revoke it
+independently of the Nostr identity.
+
 `codex-remote-bridge.mjs` is the durable desktop loop for this arrangement. It accepts only a
-validated `user@host`, a mode-0600 non-symlink SSH identity, and a pinned known-hosts file; it
-enables batch mode, strict host checking, and clears forwarding, and deliberately supplies **no
+manifest-fixed `user@host`, mode-0600 non-symlink SSH files, and the known-hosts file's pinned
+SHA-256 digest; it enables batch mode, strict host checking, and clears forwarding, and
+deliberately supplies **no
 remote command**. Therefore the server-side key must be restricted with an `authorized_keys`
 forced command that runs the sync endpoint for exactly one instance. The key is a narrow queue
 sync capability, never a shell or signer capability.
@@ -200,12 +209,16 @@ remote headless model drain remains disabled; its worker role stays keyless and 
 the forced command appends a Desktop reply request.
 
 With `codex_transport: "local_control_socket"`, it uses the supported local Codex app-server
-control socket and JSON-RPC lifecycle (`initialize`, `thread/resume`, then `turn/start`). The
-binding may name a real persistent app-server UUID or a `thr_` id; it is selected by the owner at
+control socket and JSON-RPC lifecycle (`initialize`, `thread/read`, `thread/resume`, then
+`turn/start`). The binding may name a real persistent app-server UUID or a `thr_` id; it is
+selected by the owner at
 setup time, never by an inbound event. The target Codex home must already contain that
 participant's separately configured Nvoy MCP/Bunker pairing. A Nostr event only reaches the
 thread after the broker has verified/decrypted it and checked its live grant; the queue record is
-marked delivered only after Codex acknowledges the turn. This is the concrete Codex adapter. It
+marked delivered only after Codex acknowledges the turn. Before retrying, the adapter reads the
+stored thread for its exact envelope marker; that recovers a crash after `turn/start` but before
+the local delivery journal without starting a duplicate turn. A process lock also prevents two
+local adapters from racing the same queue. This is the concrete Codex adapter. It
 does not yet make a claim for Claude Desktop; its native session/notification surface requires an
 adapter of the same form.
 

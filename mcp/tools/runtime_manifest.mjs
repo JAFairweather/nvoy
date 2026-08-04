@@ -93,6 +93,10 @@ export function readManifest(root, requestedId) {
   const codexThreadId = String(raw.codex_thread_id || raw.codexThreadId || '')
   const codexTransport = String(raw.codex_transport || raw.codexTransport || 'spawn')
   const codexSocketPath = String(raw.codex_app_server_socket || raw.codexAppServerSocket || '')
+  const sshTarget = String(raw.ssh_target || raw.sshTarget || '')
+  const sshIdentityFile = String(raw.ssh_identity_file || raw.sshIdentityFile || '')
+  const sshKnownHostsFile = String(raw.ssh_known_hosts_file || raw.sshKnownHostsFile || '')
+  const sshKnownHostsSha256 = hex(raw.ssh_known_hosts_sha256 || raw.sshKnownHostsSha256 || '')
   if (!['headless', 'codex_app_server', 'notify_only'].includes(deliveryMode)) die('delivery_mode must be headless, codex_app_server, or notify_only')
   if (!['spawn', 'local_control_socket'].includes(codexTransport)) die('codex_transport must be spawn or local_control_socket')
   if (deliveryMode === 'codex_app_server') {
@@ -101,9 +105,16 @@ export function readManifest(root, requestedId) {
       try { localControlSocket(codexSocketPath) } catch (e) { die(e.message) }
     }
   }
-  if (brokerMode === 'remote' && (deliveryMode !== 'codex_app_server' || codexTransport !== 'local_control_socket')) die('a remote broker is valid only for an exact local Codex control-socket binding')
+  if (brokerMode === 'remote') {
+    if (deliveryMode !== 'codex_app_server' || codexTransport !== 'local_control_socket') die('a remote broker is valid only for an exact local Codex control-socket binding')
+    if (!/^[a-z_][a-z0-9_-]{0,31}@[a-z0-9.-]+$/i.test(sshTarget) || !sshIdentityFile.startsWith('/') ||
+        !sshKnownHostsFile.startsWith('/') || !/^[0-9a-f]{64}$/.test(sshKnownHostsSha256)) {
+      die('a remote broker manifest requires fixed ssh_target, absolute SSH files, and ssh_known_hosts_sha256')
+    }
+  }
   return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, relays, stateDir, runtimeDir, spoolDir,
-    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath })
+    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath,
+    sshTarget, sshIdentityFile, sshKnownHostsFile, sshKnownHostsSha256 })
 }
 
 // Supervisor preflight: a second identity must never accidentally share a state or runtime

@@ -38,13 +38,18 @@ const markerDir = arg('--marker-dir', '')
 const markerGid = Number(arg('--marker-gid', ''))
 if (markerDir && (!Number.isInteger(markerGid) || markerGid < 0)) die('--marker-dir requires a non-negative --marker-gid')
 const command = process.env.WAKE_COMMAND || ''
+// NIP-59 envelopes are backdated, so a time watermark cannot replace exact IDs. Keep a bounded
+// 48-hour replay set large enough for hostile-but-plausible traffic and fail a first baseline
+// closed rather than silently truncating it into later false wakes.
+const SEEN_CAP = 100_000
+const SEEN_RETAIN = 90_000
 const seen = new Set()
 try { for (const line of readFileSync(statePath, 'utf8').split('\n')) if (/^[0-9a-f]{64}$/.test(line)) seen.add(line) } catch { /* first run */ }
 const mark = id => {
   if (seen.has(id)) return false
   seen.add(id)
   try { mkdirSync(dirname(statePath), { recursive: true }); appendFileSync(statePath, id + '\n') } catch (e) { console.error(`keyless-wake: seen write failed: ${e.message}`); return false }
-  if (seen.size > 5000) { const keep = [...seen].slice(-4000); seen.clear(); keep.forEach(x => seen.add(x)); try { writeFileSync(statePath, keep.join('\n') + '\n') } catch {} }
+  if (seen.size > SEEN_CAP) { const keep = [...seen].slice(-SEEN_RETAIN); seen.clear(); keep.forEach(x => seen.add(x)); try { writeFileSync(statePath, keep.join('\n') + '\n') } catch {} }
   return true
 }
 let lastWake = 0
@@ -56,6 +61,7 @@ const baselineTimer = baselineExisting
 baselineTimer?.unref()
 function baseline(id) {
   if (seen.has(id)) return
+  if (seen.size >= SEEN_CAP) die(`baseline exceeds the ${SEEN_CAP}-envelope safety bound; no live delivery was enabled`)
   if (mark(id)) baselined++
 }
 function finishBaseline(url) {

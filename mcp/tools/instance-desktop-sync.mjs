@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// Fixed-command server half of a keyless Desktop bridge. Run as the manifest worker UID. It may
+// Fixed-command server half of a keyless Desktop bridge. Run as the manifest adapter UID. It may
 // read adapter-admitted tasks and append bounded reply requests, but has no signer, broker state,
-// relay client, thread selector, or arbitrary path argument.
+// relay client, model-provider credential, thread selector, or arbitrary path argument.
 
 import { appendFileSync, lstatSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -15,7 +15,7 @@ const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 let manifest
 try { manifest = readManifest(root, instanceId(id)) } catch (error) { die(error.message) }
 if (manifest.brokerMode !== 'local') die('server sync requires the single local broker manifest')
-if (process.getuid?.() !== manifest.workerUid) die('must run as the manifest-bound worker user')
+if (process.getuid?.() !== manifest.adapterUid) die('must run as the manifest-bound adapter user')
 
 function regular(path, label) {
   let stat
@@ -24,7 +24,7 @@ function regular(path, label) {
   return stat
 }
 const admittedPath = resolve(manifest.runtimeDir, 'admitted-tasks.jsonl')
-const replyPath = resolve(manifest.runtimeDir, 'reply-requests.jsonl')
+const replyPath = resolve(manifest.runtimeDir, 'desktop-reply-requests.jsonl')
 for (const [path, label] of [[admittedPath, 'admitted queue'], [replyPath, 'reply request queue']]) {
   if (regular(path, label).size > 64 * 1024 * 1024) die(`${label} exceeds sync bound`)
 }
