@@ -24,8 +24,10 @@ if (!['describe', 'watch'].includes(command) || !idFlag) die('usage: describe|wa
 const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 let manifest
 try { manifest = readManifest(root, instanceId(idFlag)); assertNoCollisions(root, manifest) } catch (e) { die(e.message) }
-const baseEnv = { ...process.env, HOME: manifest.stateDir, NVOY_RELAYS: manifest.relays.join(','), GRANTORS: manifest.grantors.join(',') }
-delete baseEnv.NVOY_NSEC
+// A watcher has no business inheriting the supervisor environment: that is where credential
+// paths, proxy tokens, and accidental future secrets accumulate. Keep a deliberately tiny
+// allowlist. `PATH` is needed only to execute Node's relay dependencies, not for identity.
+const baseEnv = { HOME: manifest.stateDir, PATH: process.env.PATH || '', NVOY_RELAYS: manifest.relays.join(','), GRANTORS: manifest.grantors.join(',') }
 const tool = name => resolve(new URL('.', import.meta.url).pathname, name)
 if (command === 'describe') {
   console.log(JSON.stringify({ id: manifest.id, recipient: manifest.pubkey, grantors: manifest.grantors,

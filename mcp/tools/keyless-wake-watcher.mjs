@@ -43,14 +43,16 @@ const mark = id => {
   return true
 }
 let lastWake = 0
-function wake(id) {
+function record(id) {
   const now = Date.now()
-  if (now - lastWake < cooldown) return
-  lastWake = now
-  const marker = { at: Math.floor(now / 1000), envelope: id }
+  const marker = { observed_at: Math.floor(now / 1000), envelope: id }
   try { mkdirSync(dirname(queuePath), { recursive: true }); appendFileSync(queuePath, JSON.stringify(marker) + '\n') }
   catch (e) { return console.error(`keyless-wake: queue write failed: ${e.message}`) }
   console.log(`keyless-wake: envelope ${id.slice(0, 12)}… recorded — keyed runtime must run attention.mjs`)
+  // Every observed envelope is durable. Cooldown applies only to the optional *notification*;
+  // applying it to queueing loses authorised arrivals forever once the seen log has advanced.
+  if (now - lastWake < cooldown) return
+  lastWake = now
   if (!command || DRY) return
   // The fixed command receives no arrival data. Its own runtime owns its signer and chooses
   // whether to read the queue, then attention.mjs makes the authorisation decision.
@@ -62,7 +64,7 @@ function connect(url) {
   const open = () => {
     try { ws = new WebSocket(url) } catch { return setTimeout(open, 10_000) }
     ws.on('open', () => ws.send(JSON.stringify(['REQ', 'wake', { kinds: [1059], '#p': [recipient], since: Math.floor(Date.now() / 1000) - 172920 } ])))
-    ws.on('message', data => { try { const m = JSON.parse(data.toString()); if (m[0] === 'EVENT' && m[2]?.id && mark(m[2].id)) wake(m[2].id) } catch {} })
+    ws.on('message', data => { try { const m = JSON.parse(data.toString()); if (m[0] === 'EVENT' && m[2]?.id && mark(m[2].id)) record(m[2].id) } catch {} })
     ws.on('close', () => setTimeout(open, 10_000)); ws.on('error', () => {})
   }
   open()

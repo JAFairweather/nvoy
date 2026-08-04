@@ -28,6 +28,11 @@ ok('a valid instance manifest describes its public identity', good.status === 0 
 ok('the description contains no private key reference', !/keyFile|nsec/.test(good.stdout))
 ok('the instance receives its own state directory', described.stateDir === manifest.state_dir)
 
+const watcherSource = readFileSync('mcp/tools/instance-runtime.mjs', 'utf8')
+ok('the keyless watcher receives an explicit environment, not inherited process secrets', !/\.\.\.process\.env/.test(watcherSource) && !/NVOY_NSEC/.test(watcherSource))
+const wakeSource = readFileSync('mcp/tools/keyless-wake-watcher.mjs', 'utf8')
+ok('watcher cooldown coalesces notifications but never skips durable queueing', /function record\(id\)[\s\S]*appendFileSync[\s\S]*if \(now - lastWake < cooldown\) return/.test(wakeSource))
+
 const blocked = cli('attention', '--instance', 'codex-test')
 ok('an adapter cannot invoke the keyed attention path', blocked.status !== 0 && /usage/.test(blocked.stderr))
 
