@@ -110,8 +110,8 @@ const spawnManifest = { ...manifest, id: 'spawn-test', pubkey: 'd'.repeat(64), s
   delivery_mode: 'codex_app_server', codex_thread_id: spawnThread, codex_transport: 'spawn' }
 writeFileSync(join(manifestRoot, 'spawn-test.json'), JSON.stringify(spawnManifest)); mkdirSync(spawnRuntime, { recursive: true })
 writeFileSync(join(spawnRuntime, 'admitted-tasks.jsonl'), JSON.stringify({ type: 'admitted-task', instance: 'spawn-test', envelope: spawnEnvelope, messages: [{ from: 'a'.repeat(64), at: 1, content: 'fake lifecycle' }] }) + '\n')
-const fakeBin = join(root, 'fake-bin'), fakeCodex = join(fakeBin, 'codex'), lifecycleLog = join(root, 'app-server-lifecycle.log')
-mkdirSync(fakeBin)
+const appServerFakeBin = join(root, 'fake-app-server-bin'), fakeCodex = join(appServerFakeBin, 'codex'), lifecycleLog = join(root, 'app-server-lifecycle.log')
+mkdirSync(appServerFakeBin)
 const fakeSource = prior => `#!/usr/bin/env node
 import readline from 'node:readline'; import { appendFileSync } from 'node:fs'
 const thread=${JSON.stringify(spawnThread)}, log=${JSON.stringify(lifecycleLog)}, prior=${JSON.stringify(prior)}, token=${JSON.stringify(`NVOY_ENVELOPE_ID=${spawnEnvelope}`)}
@@ -122,7 +122,7 @@ if(m.method==='thread/read')out({id:m.id,result:{thread:{id:thread,turns:prior?[
 if(m.method==='thread/resume')out({id:m.id,result:{thread:{id:thread}}})
 if(m.method==='turn/start')out({id:m.id,result:{turn:{id:'019fce6b-4727-7a13-8f80-f4a6035c2771'}}})})`
 writeFileSync(fakeCodex, fakeSource(false), { mode: 0o700 })
-const runSpawnAdapter = () => spawnSync(process.execPath, ['mcp/tools/codex-app-server-adapter.mjs', '--instance', 'spawn-test', '--once'], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH}`, NVOY_INSTANCE_ROOT: manifestRoot } })
+const runSpawnAdapter = () => spawnSync(process.execPath, ['mcp/tools/codex-app-server-adapter.mjs', '--instance', 'spawn-test', '--once'], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, PATH: `${appServerFakeBin}:${process.env.PATH}`, NVOY_INSTANCE_ROOT: manifestRoot } })
 const firstSpawn = runSpawnAdapter(), firstLifecycle = readFileSync(lifecycleLog, 'utf8')
 ok('spawn app-server uses ordered initialize/read/resume/start framing with unique request ids', firstSpawn.status === 0 && /initialize:1[\s\S]*initialized:notify[\s\S]*thread\/read:2[\s\S]*thread\/resume:3[\s\S]*turn\/start:4/.test(firstLifecycle))
 unlinkSync(join(spawnRuntime, 'codex-app-server-delivered.jsonl')); writeFileSync(lifecycleLog, ''); writeFileSync(fakeCodex, fakeSource(true), { mode: 0o700 })
