@@ -86,6 +86,7 @@ export function readManifest(root, requestedId) {
   const workerRunner = String(raw.worker_runner || raw.workerRunner || '')
   const workerCredentialRef = String(raw.worker_credential_ref || raw.workerCredentialRef || '')
   if ((workerImage || workerRunner || workerCredentialRef) && (!/^[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$/i.test(workerImage) || !['codex', 'claude'].includes(workerRunner) || !workerCredentialRef.startsWith('/'))) die('worker_image must be digest-pinned, worker_runner must be codex or claude, and worker_credential_ref must be absolute')
+  if (brokerMode === 'remote' && (workerImage || workerRunner || workerCredentialRef)) die('a remote-broker Desktop manifest cannot carry a model-worker credential or runtime')
   // Delivery is deliberately independent of the Nostr admission pipeline.  `headless` is the
   // existing worker; a desktop adapter is a local process which resumes one explicit Codex
   // thread.  Never silently create or select a desktop conversation from an incoming message.
