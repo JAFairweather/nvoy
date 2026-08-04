@@ -68,8 +68,9 @@ and may not choose another one.
 
 ## Protocol and recovery
 
-1. The watcher writes one `{ envelope, observed_at }` regular marker. It never parses a seal.
-2. The broker atomically claims a marker, fetches the exact envelope, decrypts, and validates
+1. The watcher writes `{ envelope, observed_at }` opaque marker records. A tiny supervisor-owned
+   dispatcher materializes one regular marker file per record; it never parses a seal.
+2. The broker atomically claims a marker, fetches the exact named envelope (not “all unread mail”), decrypts, and validates
    live 440/441 task policy. Unreadable, forged, revoked, duplicate, or stale markers are
    terminally recorded without delivery.
 3. The broker pushes `{ type: "admitted-task", envelope, received_at, content }` over the

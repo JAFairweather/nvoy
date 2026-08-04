@@ -6,7 +6,7 @@
 // after that check, and pushes admitted plaintext to the fixed private adapter socket. The
 // adapter has no key, key path, manifest path, or decryption command.
 
-import { readFileSync, existsSync, lstatSync } from 'node:fs'
+import { readFileSync, existsSync, lstatSync, renameSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import net from 'node:net'
@@ -45,7 +45,7 @@ if (!/^nsec1[023456789acdefghjklmnpqrstuvwxyz]+$/.test(nsec) && !/^[0-9a-f]{64}$
 const attention = resolve(new URL('.', import.meta.url).pathname, 'attention.mjs')
 const env = { HOME: manifest.stateDir, PATH: process.env.PATH || '', NVOY_NSEC: nsec,
   NVOY_RELAYS: manifest.relays.join(','), GRANTORS: manifest.grantors.join(',') }
-const result = spawnSync(process.execPath, [attention, '--new', '--json'], { env, encoding: 'utf8', timeout: 60000 })
+const result = spawnSync(process.execPath, [attention, '--json', '--envelope', String(marker.envelope).toLowerCase()], { env, encoding: 'utf8', timeout: 60000 })
 // 10 is attention's intentional "actionable" signal. Any other nonzero status is failure
 // closed: no plaintext leaves the broker.
 if (![0, 10].includes(result.status)) die(`attention failed (${result.status ?? 'signal'}): ${String(result.stderr || '').trim()}`)
@@ -69,7 +69,10 @@ client.on('data', chunk => {
   if (ack.type !== 'ack' || ack.instance !== manifest.id) die('adapter acknowledgement does not bind this instance')
   // Mark only after the adapter has durably accepted this exact delivery. A broker crash before
   // this point yields redelivery; a crash after it yields no duplicate from this watermark.
-  const marked = spawnSync(process.execPath, [attention, '--mark', '--json'], { env, encoding: 'utf8', timeout: 60000 })
+  const marked = spawnSync(process.execPath, [attention, '--mark', '--json', '--envelope', String(marker.envelope).toLowerCase()], { env, encoding: 'utf8', timeout: 60000 })
   if (marked.status !== 0) die(`attention watermark failed (${marked.status ?? 'signal'})`)
+  // A completed marker stays as durable audit evidence but cannot be delivered a second time.
+  // Rename is atomic on the single spool filesystem; a second broker sees no source marker.
+  try { renameSync(markerPath, `${markerPath}.done`) } catch (e) { die(`acknowledged but could not finalize marker: ${e.message}`) }
   client.end()
 })

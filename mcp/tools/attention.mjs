@@ -64,6 +64,8 @@ const RELAYS = (process.env.NVOY_RELAYS?.split(',') || [
 
 const sinceMin = Number(arg('--since-min', 240))
 let since = Math.floor(Date.now() / 1000) - sinceMin * 60
+const envelopeOnly = arg('--envelope', '')
+if (envelopeOnly && !/^[0-9a-f]{64}$/i.test(envelopeOnly)) die('--envelope must be a 64-hex outer event id')
 
 // --- Watermark. Lets a scheduler ask "is there anything NEW?" cheaply, and keeps a wake from
 // re-handling mail it already handled.
@@ -143,6 +145,7 @@ for (const url of RELAYS) {
 }
 const msgs = []
 for (const w of wraps.values()) {
+  if (envelopeOnly && w.id !== envelopeOnly) continue
   try {
     const seal = JSON.parse(nip44.decrypt(w.content, nip44.getConversationKey(sk, w.pubkey)))
     if (seal.kind !== 13) continue
