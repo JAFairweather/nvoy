@@ -34,7 +34,7 @@ services:
 
   watcher:
     image: ${NVOY_IMAGE:?set NVOY_IMAGE}
-    user: "${WATCHER_UID:?}:${SHARED_GID:?}"
+    user: "${WATCHER_UID:?}:${BROKER_ADAPTER_GID:?}"
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -55,7 +55,7 @@ services:
 
   broker:
     image: ${NVOY_IMAGE:?set NVOY_IMAGE}
-    user: "${BROKER_UID:?}:${SHARED_GID:?}"
+    user: "${BROKER_UID:?}:${BROKER_ADAPTER_GID:?}"
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -81,7 +81,8 @@ services:
 
   adapter:
     image: ${NVOY_IMAGE:?set NVOY_IMAGE}
-    user: "${ADAPTER_UID:?}:${SHARED_GID:?}"
+    user: "${ADAPTER_UID:?}:${BROKER_ADAPTER_GID:?}"
+    group_add: ["${WORKER_HANDOFF_GID:?}"]
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -102,7 +103,7 @@ services:
 
   worker:
     image: ${WORKER_IMAGE:?}
-    user: "${WORKER_UID:?}:${SHARED_GID:?}"
+    user: "${WORKER_UID:?}:${WORKER_HANDOFF_GID:?}"
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]

@@ -67,8 +67,11 @@ export function readManifest(root, requestedId) {
   const bunkerClientRef = String(raw.bunker_client_ref || raw.bunkerClientRef || '')
   if ((bunkerUriRef || bunkerClientRef) && (!bunkerUriRef.startsWith('/') || !bunkerClientRef.startsWith('/'))) die('Bunker signer references must both be absolute paths')
   if (!keyRef && !bunkerUriRef) die('manifest requires a broker credential reference')
-  const sharedGid = Number(raw.shared_gid ?? raw.sharedGid)
-  if (!Number.isInteger(sharedGid) || sharedGid < 0) die('manifest requires non-negative shared_gid for the broker/adapter group')
+  // These are intentionally different groups. The broker alone may connect to the adapter's
+  // private socket; the worker instead gets only the narrower file handoff group.
+  const brokerAdapterGid = Number(raw.broker_adapter_gid ?? raw.brokerAdapterGid)
+  const workerHandoffGid = Number(raw.worker_handoff_gid ?? raw.workerHandoffGid)
+  if (![brokerAdapterGid, workerHandoffGid].every(v => Number.isInteger(v) && v >= 0) || brokerAdapterGid === workerHandoffGid) die('manifest requires distinct non-negative broker_adapter_gid and worker_handoff_gid')
   const watcherUid = Number(raw.watcher_uid ?? raw.watcherUid)
   const brokerUid = Number(raw.broker_uid ?? raw.brokerUid)
   const adapterUid = Number(raw.adapter_uid ?? raw.adapterUid)
@@ -80,7 +83,7 @@ export function readManifest(root, requestedId) {
   const workerCredentialRef = String(raw.worker_credential_ref || raw.workerCredentialRef || '')
   if ((workerImage || workerRunner || workerCredentialRef) && (!/^[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$/i.test(workerImage) || !['codex', 'claude'].includes(workerRunner) || !workerCredentialRef.startsWith('/'))) die('worker_image must be digest-pinned, worker_runner must be codex or claude, and worker_credential_ref must be absolute')
   return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, relays, stateDir, runtimeDir, spoolDir,
-    sharedGid, watcherUid, brokerUid, adapterUid, workerUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerImage, workerRunner, workerCredentialRef })
+    brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerImage, workerRunner, workerCredentialRef })
 }
 
 // Supervisor preflight: a second identity must never accidentally share a state or runtime

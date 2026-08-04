@@ -21,7 +21,7 @@ const templatePath = resolve(new URL('../../deploy/participant-runtime.compose.y
 let out = readFileSync(templatePath, 'utf8')
 const replacements = {
   '${NVOY_IMAGE:?set NVOY_IMAGE}': JSON.stringify(image), '${WATCHER_UID:?}': String(m.watcherUid),
-  '${BROKER_UID:?}': String(m.brokerUid), '${ADAPTER_UID:?}': String(m.adapterUid), '${WORKER_UID:?}': String(m.workerUid), '${SHARED_GID:?}': String(m.sharedGid),
+  '${BROKER_UID:?}': String(m.brokerUid), '${ADAPTER_UID:?}': String(m.adapterUid), '${WORKER_UID:?}': String(m.workerUid), '${BROKER_ADAPTER_GID:?}': String(m.brokerAdapterGid), '${WORKER_HANDOFF_GID:?}': String(m.workerHandoffGid),
   '${INSTANCE_ID:?}': m.id, '${INSTANCE_ID}': m.id, '${MANIFEST_DIR:?}': JSON.stringify(m.root),
   '${STATE_DIR:?}': JSON.stringify(m.stateDir), '${SPOOL_DIR:?}': JSON.stringify(m.spoolDir), '${RUNTIME_DIR:?}': JSON.stringify(m.runtimeDir),
   '${BUNKER_URI_FILE:?}': JSON.stringify(m.bunkerUriRef), '${BUNKER_CLIENT_FILE:?}': JSON.stringify(m.bunkerClientRef),
@@ -29,5 +29,5 @@ const replacements = {
   '${BROKER_CREDENTIAL_FILE:?set BROKER_CREDENTIAL_FILE}': JSON.stringify(m.keyRef),
 }
 for (const [from, to] of Object.entries(replacements)) out = out.split(from).join(to)
-if (/\$\{(?:WATCHER_UID|BROKER_UID|ADAPTER_UID|WORKER_UID|SHARED_GID|INSTANCE_ID|MANIFEST_DIR|STATE_DIR|SPOOL_DIR|RUNTIME_DIR|BUNKER_URI_FILE|BUNKER_CLIENT_FILE|WORKER_IMAGE|WORKER_RUNNER|WORKER_CREDENTIAL_FILE|BROKER_CREDENTIAL_FILE)/.test(out)) die('template retained an identity deployment variable')
+if (/\$\{(?:WATCHER_UID|BROKER_UID|ADAPTER_UID|WORKER_UID|BROKER_ADAPTER_GID|WORKER_HANDOFF_GID|INSTANCE_ID|MANIFEST_DIR|STATE_DIR|SPOOL_DIR|RUNTIME_DIR|BUNKER_URI_FILE|BUNKER_CLIENT_FILE|WORKER_IMAGE|WORKER_RUNNER|WORKER_CREDENTIAL_FILE|BROKER_CREDENTIAL_FILE)/.test(out)) die('template retained an identity deployment variable')
 process.stdout.write(out)

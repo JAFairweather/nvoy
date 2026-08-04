@@ -22,9 +22,10 @@ function provision(path, uid, gid, mode, label) {
   const s = statSync(path), actual = s.mode & 0o777
   if (s.uid !== uid || s.gid !== gid || actual !== mode) die(`${label} root ownership/mode verification failed`)
 }
-provision(m.stateDir, m.brokerUid, m.sharedGid, 0o700, 'broker state')
-provision(m.spoolDir, m.watcherUid, m.sharedGid, 0o770, 'watcher spool')
-provision(m.runtimeDir, m.adapterUid, m.sharedGid, 0o710, 'adapter runtime')
+provision(m.stateDir, m.brokerUid, m.brokerAdapterGid, 0o700, 'broker state')
+provision(m.spoolDir, m.watcherUid, m.brokerAdapterGid, 0o770, 'watcher spool')
+// Worker needs only traversal to its exact handoff paths; it never shares the socket group.
+provision(m.runtimeDir, m.adapterUid, m.brokerAdapterGid, 0o711, 'adapter runtime')
 function provisionFile(path, uid, gid, mode, label) {
   try { const s = lstatSync(path); if (!s.isFile() || s.isSymbolicLink()) die(`${label} is not a regular file`) }
   catch (e) { if (e.code === 'ENOENT') closeSync(openSync(path, 'wx', mode)); else throw e }
@@ -35,10 +36,10 @@ function provisionFile(path, uid, gid, mode, label) {
 // Worker only has group traversal on the adapter-owned runtime root. These named files are the
 // whole cross-UID protocol: task input is adapter-write/group-read; requests are worker-write/
 // group-read; consumed state is worker-private. No role can create a replacement socket or queue.
-provisionFile(`${m.runtimeDir}/admitted-tasks.jsonl`, m.adapterUid, m.sharedGid, 0o640, 'admitted task queue')
-provisionFile(`${m.runtimeDir}/reply-requests.jsonl`, m.workerUid, m.sharedGid, 0o640, 'worker reply queue')
+provisionFile(`${m.runtimeDir}/admitted-tasks.jsonl`, m.adapterUid, m.workerHandoffGid, 0o640, 'admitted task queue')
+provisionFile(`${m.runtimeDir}/reply-requests.jsonl`, m.workerUid, m.brokerAdapterGid, 0o640, 'worker reply queue')
 provisionFile(`${m.runtimeDir}/worker-consumed.jsonl`, m.workerUid, m.workerUid, 0o600, 'worker consumed queue')
 // Only the adapter can create these immutable per-envelope inputs; the worker gets group
 // traversal/read access but cannot replace an input belonging to a different envelope.
-provision(`${m.runtimeDir}/worker-input`, m.adapterUid, m.sharedGid, 0o710, 'worker input directory')
+provision(`${m.runtimeDir}/worker-input`, m.adapterUid, m.workerHandoffGid, 0o710, 'worker input directory')
 console.log(`instance-runtime-init: provisioned ${m.id}`)

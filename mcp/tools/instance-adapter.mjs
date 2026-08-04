@@ -20,13 +20,13 @@ const socket = resolve(manifest.runtimeDir, 'adapter.sock')
 // Broker gets group execute to traverse and group write on adapter.sock itself, but never
 // directory write: it must not be able to unlink/replace the socket or adapter queue.
 mkdirSync(manifest.runtimeDir, { recursive: true, mode: 0o710 })
-chownSync(manifest.runtimeDir, -1, manifest.sharedGid)
-chmodSync(manifest.runtimeDir, 0o710)
+chownSync(manifest.runtimeDir, -1, manifest.brokerAdapterGid)
+chmodSync(manifest.runtimeDir, 0o711)
 try { if (lstatSync(socket).isSocket()) unlinkSync(socket); else die('adapter socket path is not a socket') } catch (e) { if (e.code !== 'ENOENT') die(e.message) }
 const queue = resolve(manifest.runtimeDir, 'admitted-tasks.jsonl')
 const workerInputDir = resolve(manifest.runtimeDir, 'worker-input')
 mkdirSync(workerInputDir, { recursive: true, mode: 0o710 })
-chownSync(workerInputDir, -1, manifest.sharedGid)
+chownSync(workerInputDir, -1, manifest.workerHandoffGid)
 chmodSync(workerInputDir, 0o710)
 // The broker can be restarted after its adapter ACK but before it finalizes the marker. Queue
 // records are therefore the durable idempotency index: replaying the same envelope ACKs again,
@@ -44,8 +44,8 @@ const server = net.createServer(conn => {
         // one task input before queueing its envelope, so a queue record never names missing data.
         const input = resolve(workerInputDir, `${packet.envelope}.json`), tmp = `${input}.${process.pid}.tmp`
         writeFileSync(tmp, JSON.stringify({ envelope: packet.envelope, messages: packet.messages }), { mode: 0o640 })
-        renameSync(tmp, input); chmodSync(input, 0o640)
-        appendFileSync(queue, JSON.stringify(packet) + '\n', { mode: 0o640 }); chmodSync(queue, 0o640); delivered.add(packet.envelope)
+        renameSync(tmp, input); chownSync(input, -1, manifest.workerHandoffGid); chmodSync(input, 0o640)
+        appendFileSync(queue, JSON.stringify(packet) + '\n', { mode: 0o640 }); chownSync(queue, -1, manifest.workerHandoffGid); chmodSync(queue, 0o640); delivered.add(packet.envelope)
       }
     }
     catch { conn.destroy(); return }
@@ -53,4 +53,4 @@ const server = net.createServer(conn => {
   })
 })
 server.on('error', e => die(`cannot bind private adapter socket: ${e.message}`))
-server.listen(socket, () => { chownSync(socket, -1, manifest.sharedGid); chmodSync(socket, 0o660); console.log(`instance-adapter: listening for ${manifest.id}`) })
+server.listen(socket, () => { chownSync(socket, -1, manifest.brokerAdapterGid); chmodSync(socket, 0o660); console.log(`instance-adapter: listening for ${manifest.id}`) })

@@ -41,7 +41,8 @@ contains only public routing policy:
   "state_dir": "/var/lib/nvoy/codex-jaf",
   "runtime_dir": "/run/nvoy/codex-jaf",
   "spool_dir": "/var/lib/nvoy-watcher/codex-jaf",
-  "shared_gid": 41001,
+  "broker_adapter_gid": 41001,
+  "worker_handoff_gid": 41002,
   "watcher_uid": 41011,
   "broker_uid": 41012,
   "adapter_uid": 41013,
@@ -81,17 +82,21 @@ For each `<id>`, the installer creates a dedicated OS account `nvoy-<id>` and:
 | Bunker URI + NIP-46 client credentials | root:broker 0600 | broker only |
 | Model-provider credential | root:worker 0600 | worker only; never a Nostr key |
 | `/var/lib/nvoy/<id>` | nvoy-<id> 0700 | broker state/lock |
-| `/run/nvoy/<id>` | adapter:instance-group 0710 | broker socket (broker can traverse, not replace) |
-| watcher spool | watcher:instance-group 0770, markers 0660 | watcher→broker marker intake |
+| `/run/nvoy/<id>` | adapter:broker-adapter 0711 | broker socket (broker can traverse, not replace; worker can only traverse to named handoffs) |
+| adapter socket | adapter:broker-adapter 0660 | broker only |
+| task input + admitted queue | adapter:worker-handoff 0640 | adapter → worker, read-only for worker |
+| reply queue | worker:broker-adapter 0640 | worker → broker, read-only for broker |
+| watcher spool | watcher:broker-adapter 0770, markers 0660 | watcher→broker marker intake |
 
 `nvoy-broker@<id>`, `nvoy-watcher@<id>`, `nvoy-adapter@<id>`, and `nvoy-worker@<id>` run under distinct accounts. The broker obtains an
 exclusive lock before opening its state. On systemd, a matching `nvoy-broker@.socket` unit creates
 the only socket path with `SocketUser=nvoy-<id>-broker`, `SocketGroup=nvoy-<id>-adapter`, and
 `SocketMode=0660`; only that adapter account belongs to the group. In Docker, use four distinct
-container users joined only by the manifest's numeric `shared_gid`, and mount the per-instance
-runtime volume only into broker and adapter. The adapter creates a `0660` socket inside a `0710`
-directory owned by the adapter and group-executable only; the broker gets the group, so it can
-connect to the `0660` socket but cannot unlink or replace it. The adapter receives this fixed path from its unit/container
+container users and two distinct manifest groups: `broker_adapter_gid` for the broker↔adapter
+socket and `worker_handoff_gid` for the adapter↔worker files. The worker is not in the socket
+group. The adapter creates a `0660` socket inside an adapter-owned `0711` directory; the broker
+gets the socket group and can connect but cannot unlink or replace it, while the worker has only
+traversal to its named read-only input paths. The adapter receives this fixed path from its unit/container
 and may not choose another one.
 
 ## Protocol and recovery
@@ -152,8 +157,8 @@ deployment test, `--reply 'text'` bypasses the LLM and proves the same brokered 
 ### Docker reference deployment
 
 [`deploy/participant-runtime.compose.yml`](../deploy/participant-runtime.compose.yml) is the
-concrete four-role layout. It runs watcher, broker, adapter, and worker under four different UIDs;
-the only shared group is the manifest's `shared_gid`. It mounts the credential as a Docker secret
+concrete four-role layout. It runs watcher, broker, adapter, and worker under four different UIDs
+and separates the broker/adapter socket group from the worker handoff group. It mounts the credential as a Docker secret
 only into the broker, mounts broker state only into the broker, mounts runtime only into broker and
 adapter, and mounts spool only into watcher and broker. Each service drops capabilities, has a
 read-only image filesystem, and uses a private `/tmp`. Render the deployable file from the

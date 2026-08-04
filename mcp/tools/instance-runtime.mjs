@@ -36,6 +36,6 @@ if (command === 'describe') {
 if (command === 'watch') {
   const child = spawn(process.execPath, [tool('keyless-wake-watcher.mjs'), '--recipient', manifest.pubkey,
     '--seen-path', resolve(manifest.spoolDir, 'keyless-wake-seen.log'), '--queue-path', resolve(manifest.spoolDir, 'keyless-wake-queue.jsonl'),
-    '--marker-dir', manifest.spoolDir, '--marker-gid', String(manifest.sharedGid)], { env: baseEnv, stdio: 'inherit' })
+    '--marker-dir', manifest.spoolDir, '--marker-gid', String(manifest.brokerAdapterGid)], { env: baseEnv, stdio: 'inherit' })
   child.on('exit', code => process.exit(code ?? 1))
 }
