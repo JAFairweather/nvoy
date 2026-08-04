@@ -25,7 +25,9 @@ services:
       NVOY_INSTANCE_ROOT: /etc/nvoy/instances
       NVOY_BUNKER_URI_SOURCE: /run/secrets/bunker-uri
       NVOY_BUNKER_CLIENT_SOURCE: /run/secrets/bunker-client
+      # @worker-begin
       NVOY_WORKER_PROVIDER_SOURCE: /run/secrets/worker-provider
+      # @worker-end
     command: ["node", "mcp/tools/instance-runtime-init.mjs", "--instance", "${INSTANCE_ID:?}"]
     volumes:
       - type: bind
@@ -44,16 +46,20 @@ services:
       - type: volume
         source: broker_credentials
         target: /run/nvoy-broker-credentials
+      # @worker-begin
       - type: volume
         source: worker_credentials
         target: /run/nvoy-worker-credentials
+      # @worker-end
     secrets:
       - source: nvoy_bunker_uri
         target: bunker-uri
       - source: nvoy_bunker_client
         target: bunker-client
+      # @worker-begin
       - source: nvoy_worker_provider
         target: worker-provider
+      # @worker-end
     restart: "no"
 
   watcher:
@@ -137,7 +143,7 @@ services:
       init:
         condition: service_completed_successfully
     restart: unless-stopped
-
+  # @worker-begin
   worker:
     image: ${WORKER_IMAGE:?}
     user: "${WORKER_UID:?}:${WORKER_HANDOFF_GID:?}"
@@ -168,6 +174,7 @@ services:
       adapter:
         condition: service_started
     restart: unless-stopped
+  # @worker-end
 
 secrets:
   nvoy_bunker_uri:
@@ -176,12 +183,16 @@ secrets:
     file: ${BUNKER_CLIENT_FILE:?}
   # This is a model-provider credential (for example a dedicated OPENAI_API_KEY), not a
   # Nostr identity key. It is mounted only into the keyless worker and never into the broker.
+  # @worker-begin
   nvoy_worker_provider:
     file: ${WORKER_CREDENTIAL_FILE:?}
+  # @worker-end
 
 volumes:
   watcher_spool: {}
   broker_state: {}
   adapter_runtime: {}
   broker_credentials: {}
+  # @worker-begin
   worker_credentials: {}
+  # @worker-end

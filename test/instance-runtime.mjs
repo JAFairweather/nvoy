@@ -52,7 +52,7 @@ const duplicateDesktopWatcher = cli('watch', '--instance', 'codex-desktop')
 ok('a remote-broker Desktop manifest cannot start a second watcher', duplicateDesktopWatcher.status !== 0 && /cannot start a second watcher/.test(duplicateDesktopWatcher.stderr))
 writeFileSync(join(manifestRoot, 'remote-with-worker.json'), JSON.stringify({ ...desktopManifest, id: 'remote-with-worker', pubkey: 'e'.repeat(64), state_dir: join(root, 'state-remote-worker'), runtime_dir: join(root, 'run-remote-worker'), spool_dir: join(root, 'spool-remote-worker'), worker_image: manifest.worker_image, worker_runner: manifest.worker_runner, worker_credential_ref: manifest.worker_credential_ref }))
 const remoteWithWorker = cli('describe', '--instance', 'remote-with-worker')
-ok('a remote-broker Desktop manifest rejects every model-worker/provider credential reference', remoteWithWorker.status !== 0 && /cannot carry a model-worker credential/.test(remoteWithWorker.stderr))
+ok('a remote-broker Desktop manifest rejects every model-worker/provider credential reference', remoteWithWorker.status !== 0 && /worker-disabled manifest cannot carry/.test(remoteWithWorker.stderr))
 unlinkSync(join(manifestRoot, 'remote-with-worker.json'))
 const keyedEnv = { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot, NVOY_BROKER_CREDENTIAL: desktopSshKey }
 const blockedBroker = spawnSync(process.execPath, ['mcp/tools/instance-broker.mjs', 'deliver', '--instance', 'codex-desktop', '--envelope', 'f'.repeat(64)], { cwd: resolve('.'), encoding: 'utf8', env: keyedEnv })
@@ -94,7 +94,7 @@ ok('the restricted server sync imports a bounded admitted-envelope reply exactly
 // recover the envelope marker without starting another turn.
 const spawnRuntime = join(root, 'run-spawn'), spawnThread = '019fc80b-78a6-7b72-b3d2-eced37f55da8', spawnEnvelope = '4'.repeat(64)
 const spawnManifest = { ...manifest, id: 'spawn-test', pubkey: 'd'.repeat(64), state_dir: join(root, 'state-spawn'), runtime_dir: spawnRuntime, spool_dir: join(root, 'spool-spawn'),
-  delivery_mode: 'codex_app_server', codex_thread_id: spawnThread, codex_transport: 'spawn' }
+  worker_image: '', worker_runner: '', worker_credential_ref: '', delivery_mode: 'codex_app_server', codex_thread_id: spawnThread, codex_transport: 'spawn' }
 writeFileSync(join(manifestRoot, 'spawn-test.json'), JSON.stringify(spawnManifest)); mkdirSync(spawnRuntime, { recursive: true })
 writeFileSync(join(spawnRuntime, 'admitted-tasks.jsonl'), JSON.stringify({ type: 'admitted-task', instance: 'spawn-test', envelope: spawnEnvelope, messages: [{ from: 'a'.repeat(64), at: 1, content: 'fake lifecycle' }] }) + '\n')
 const appServerFakeBin = join(root, 'fake-app-server-bin'), fakeCodex = join(appServerFakeBin, 'codex'), lifecycleLog = join(root, 'app-server-lifecycle.log')
@@ -122,7 +122,7 @@ const forcedKey = spawnSync(process.execPath, ['mcp/tools/instance-desktop-autho
 ok('the installer renders an exact restrict+forced-command SSH capability for only one instance', forcedKey.status === 0 && forcedKey.stdout.startsWith('restrict,command="/usr/bin/env NVOY_INSTANCE_ROOT=/etc/nvoy/instances /usr/bin/node /opt/nvoy/mcp/tools/instance-desktop-sync.mjs --instance codex-test" ssh-ed25519 ') && !/permitopen|environment=|pty/.test(forcedKey.stdout))
 const forcedDockerKey = spawnSync(process.execPath, ['mcp/tools/instance-desktop-authorized-key.mjs', '--instance', 'codex-test', '--public-key-file', desktopPublicKey, '--container', 'nvoy-codex-jaf-adapter-1'], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
 ok('the Docker installer stanza fixes container, non-root adapter UID/GID, executable, and instance without a shell', forcedDockerKey.status === 0 && forcedDockerKey.stdout.startsWith(`restrict,command="/usr/bin/docker exec -i --user ${manifest.adapter_uid}:${manifest.broker_adapter_gid} nvoy-codex-jaf-adapter-1 /usr/local/bin/node /srv/nvoy/mcp/tools/instance-desktop-sync.mjs --instance codex-test" ssh-ed25519 `))
-writeFileSync(join(manifestRoot, 'bad-desktop.json'), JSON.stringify({ ...manifest, id: 'bad-desktop', pubkey: '4'.repeat(64), state_dir: join(root, 'state-bad-desktop'), runtime_dir: join(root, 'run-bad-desktop'), spool_dir: join(root, 'spool-bad-desktop'), delivery_mode: 'codex_app_server' }))
+writeFileSync(join(manifestRoot, 'bad-desktop.json'), JSON.stringify({ ...manifest, id: 'bad-desktop', pubkey: '4'.repeat(64), state_dir: join(root, 'state-bad-desktop'), runtime_dir: join(root, 'run-bad-desktop'), spool_dir: join(root, 'spool-bad-desktop'), worker_image: '', worker_runner: '', worker_credential_ref: '', delivery_mode: 'codex_app_server' }))
 const badDesktop = cli('describe', '--instance', 'bad-desktop')
 ok('an inbound event cannot silently select or create a Codex desktop thread', badDesktop.status !== 0 && /explicit codex_thread_id/.test(badDesktop.stderr))
 // Invalid manifests must not remain in this fixture: every production command preflights the
@@ -133,6 +133,11 @@ const rendered = spawnSync(process.execPath, ['mcp/tools/render-instance-compose
 ok('Compose UID/GID, every runtime path, and Bunker-only mounts are rendered from the immutable manifest', rendered.status === 0 && rendered.stdout.includes('\"41011:' + manifest.broker_adapter_gid + '\"') && rendered.stdout.includes('\"41014:' + manifest.worker_handoff_gid + '\"') && rendered.stdout.includes(manifest.bunker_uri_ref) && rendered.stdout.includes(manifest.bunker_client_ref) && rendered.stdout.includes(manifest.worker_credential_ref) && rendered.stdout.includes(manifest.state_dir) && rendered.stdout.includes(manifest.spool_dir) && rendered.stdout.includes(manifest.runtime_dir) && !rendered.stdout.includes('${WATCHER_UID'))
 ok('Compose volume namespace is bound to the immutable instance ID', rendered.status === 0 && rendered.stdout.includes('name: nvoy-codex-test'))
 ok('Compose includes a keyless digest-pinned Codex/Claude worker for each instance', rendered.status === 0 && rendered.stdout.includes(manifest.worker_image) && rendered.stdout.includes('--runner", "codex"'))
+const desktopComposeManifest = { ...manifest, id: 'desktop-compose', pubkey: 'b'.repeat(64), state_dir: join(root, 'state-desktop-compose'), runtime_dir: join(root, 'run-desktop-compose'), spool_dir: join(root, 'spool-desktop-compose'),
+  worker_image: '', worker_runner: '', worker_credential_ref: '', delivery_mode: 'codex_app_server', codex_thread_id: spawnThread, codex_transport: 'spawn' }
+writeFileSync(join(manifestRoot, 'desktop-compose.json'), JSON.stringify(desktopComposeManifest))
+const renderedDesktop = spawnSync(process.execPath, ['mcp/tools/render-instance-compose.mjs', '--instance', 'desktop-compose', '--image', image], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
+ok('Desktop Compose omits the independent model worker and every provider-secret provisioning path', renderedDesktop.status === 0 && !/\n  worker:/.test(renderedDesktop.stdout) && !/worker-provider|worker_credentials|nvoy_worker_provider|WORKER_CREDENTIAL|WORKER_IMAGE|WORKER_RUNNER/.test(renderedDesktop.stdout))
 const taggedImage = spawnSync(process.execPath, ['mcp/tools/render-instance-compose.mjs', '--instance', 'codex-test', '--image', 'nvoy:latest'], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
 ok('Compose renderer rejects mutable image tags', taggedImage.status !== 0 && /canonical/.test(taggedImage.stderr))
 const servicePart = name => (rendered.stdout.match(new RegExp(`\\n  ${name}:[\\s\\S]*?(?=\\n  [a-z][a-z_]*:|\\nsecrets:|$)`)) || [''])[0]

@@ -16,9 +16,11 @@ const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 let m
 try { m = readManifest(root, instanceId(id)); assertNoCollisions(root, m) } catch (e) { die(e.message) }
 if (!m.bunkerUriRef || !m.bunkerClientRef) die('production runtime requires bunker_uri_ref and bunker_client_ref in its manifest')
-if (!m.workerImage || !m.workerRunner || !m.workerCredentialRef) die('production runtime requires a digest-pinned worker_image, worker_runner, and worker_credential_ref')
+if (m.workerEnabled && (!m.workerImage || !m.workerRunner || !m.workerCredentialRef)) die('a worker-enabled production runtime requires a digest-pinned worker_image, worker_runner, and worker_credential_ref')
 const templatePath = resolve(new URL('../../deploy/participant-runtime.compose.yml', import.meta.url).pathname)
 let out = readFileSync(templatePath, 'utf8')
+if (!m.workerEnabled) out = out.replace(/^\s*# @worker-begin\n[\s\S]*?^\s*# @worker-end\n?/gm, '')
+else out = out.replace(/^\s*# @worker-(?:begin|end)\n?/gm, '')
 const replacements = {
   '${NVOY_IMAGE:?set NVOY_IMAGE}': JSON.stringify(image), '${WATCHER_UID:?}': String(m.watcherUid),
   '${BROKER_UID:?}': String(m.brokerUid), '${ADAPTER_UID:?}': String(m.adapterUid), '${WORKER_UID:?}': String(m.workerUid), '${BROKER_ADAPTER_GID:?}': String(m.brokerAdapterGid), '${WORKER_HANDOFF_GID:?}': String(m.workerHandoffGid),

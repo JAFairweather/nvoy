@@ -169,7 +169,7 @@ desktop connected to a server-side broker must also declare `broker_mode: "remot
 forbids every key, Bunker, and worker-credential reference in the desktop manifest:
 
 ```json
-{ "broker_mode": "remote", "delivery_mode": "codex_app_server", "codex_thread_id": "<persistent-thread-id>", "codex_transport": "local_control_socket", "codex_app_server_socket": "/Users/you/.codex/app-server-control/app-server-control.sock", "ssh_target": "nvoy-sync@example.net", "ssh_identity_file": "/Users/you/.nvoy/desktop/id_ed25519", "ssh_known_hosts_file": "/Users/you/.nvoy/desktop/known_hosts", "ssh_known_hosts_sha256": "<64-hex-sha256>" }
+{ "broker_mode": "remote", "delivery_mode": "codex_app_server", "worker_enabled": false, "codex_thread_id": "<persistent-thread-id>", "codex_transport": "local_control_socket", "codex_app_server_socket": "/Users/you/.codex/app-server-control/app-server-control.sock", "ssh_target": "nvoy-sync@example.net", "ssh_identity_file": "/Users/you/.nvoy/desktop/id_ed25519", "ssh_known_hosts_file": "/Users/you/.nvoy/desktop/known_hosts", "ssh_known_hosts_sha256": "<64-hex-sha256>" }
 ```
 
 Then run:

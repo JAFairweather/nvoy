@@ -94,11 +94,17 @@ export function readManifest(root, requestedId) {
   const workerRunner = String(raw.worker_runner || raw.workerRunner || '')
   const workerCredentialRef = String(raw.worker_credential_ref || raw.workerCredentialRef || '')
   if ((workerImage || workerRunner || workerCredentialRef) && (!/^[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$/i.test(workerImage) || !['codex', 'claude'].includes(workerRunner) || !workerCredentialRef.startsWith('/'))) die('worker_image must be digest-pinned, worker_runner must be codex or claude, and worker_credential_ref must be absolute')
-  if (brokerMode === 'remote' && (workerImage || workerRunner || workerCredentialRef)) die('a remote-broker Desktop manifest cannot carry a model-worker credential or runtime')
   // Delivery is deliberately independent of the Nostr admission pipeline.  `headless` is the
   // existing worker; a desktop adapter is a local process which resumes one explicit Codex
   // thread.  Never silently create or select a desktop conversation from an incoming message.
   const deliveryMode = String(raw.delivery_mode || raw.deliveryMode || 'headless')
+  const workerEnabled = raw.worker_enabled == null && raw.workerEnabled == null
+    ? deliveryMode === 'headless'
+    : (raw.worker_enabled ?? raw.workerEnabled)
+  if (typeof workerEnabled !== 'boolean') die('worker_enabled must be boolean')
+  if (workerEnabled && deliveryMode !== 'headless') die('worker_enabled is valid only for headless delivery')
+  if (workerEnabled && (!workerImage || !workerRunner || !workerCredentialRef)) die('a worker-enabled manifest requires worker_image, worker_runner, and worker_credential_ref')
+  if (!workerEnabled && (workerImage || workerRunner || workerCredentialRef)) die('a worker-disabled manifest cannot carry a model-worker credential or runtime')
   const codexThreadId = String(raw.codex_thread_id || raw.codexThreadId || '')
   const codexTransport = String(raw.codex_transport || raw.codexTransport || 'spawn')
   const codexSocketPath = String(raw.codex_app_server_socket || raw.codexAppServerSocket || '')
@@ -122,7 +128,7 @@ export function readManifest(root, requestedId) {
     }
   }
   return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, carriers: Object.freeze(carriers), relays, stateDir, runtimeDir, spoolDir,
-    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath,
+    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath,
     sshTarget, sshIdentityFile, sshKnownHostsFile, sshKnownHostsSha256 })
 }
 
