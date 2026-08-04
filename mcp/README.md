@@ -135,6 +135,18 @@ cached plaintext and scope key for that scope on detection.
 
 ## Security note
 
+### Keyless wake detector
+
+`tools/keyless-wake-watcher.mjs` is intentionally not an inbox reader. Give it
+only `WAKE_RECIPIENT` (an npub/public key); it subscribes to the cleartext
+NIP-59 outer `p` tag, records an envelope marker, and optionally invokes an
+owner-installed fixed command. It refuses to start if `NVOY_NSEC` is present.
+
+It cannot learn a sender or message content. The keyed agent runtime must use
+`tools/attention.mjs` to decrypt its inbox and verify a live task grant before
+showing any message to an agent. This is the split that keeps a shared detector
+keyless without turning an unverified envelope into an instruction.
+
 - **`no_persist`, `redelegate: false`, and relinquishment are *compliance*
   guarantees, not cryptographic ones.** This runtime honors them mechanically
   (no disk writes, no re-wrapping keys to third parties, key destroyed on
