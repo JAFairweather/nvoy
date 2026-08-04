@@ -25,6 +25,7 @@ import { Outbox } from './outbox.js'
 import { DraftDesk } from './drafts.js'
 import { sendAccessRequest, sendRelinquishNotice } from './notices.js'
 import { registerChatTools } from './chat.js'
+import { cascadeDerivedRevocation, issueDerivedGrant, RedelegationForbidden } from './subgrants.js'
 
 export interface NvoyContext {
   identity: Identity
@@ -94,6 +95,13 @@ export async function detectRevocation(ctx: NvoyContext, g: HeldGrant) {
   const found = await findRevocationNotice(ctx.relay, ctx.identity.signer, g.publisher, g.scopeId).catch(() => null)
   const record = ctx.grantStore.markRevoked(g.publisher, g.scopeId, g.generation, found?.content ?? null)
   ctx.scopeCache.zeroize(g.publisher, g.scopeId)
+  // This identity may have issued attenuated descendants of the dead grant.  Cascading is
+  // ordinary auditable code under the issuer's Bunker signer; a child never keeps its old key
+  // merely because the issuing runtime restarted.
+  try {
+    const cascade = await cascadeDerivedRevocation(ctx.relay, ctx.identity, g)
+    if (cascade.cascaded) ctx.log(`derived cascade: ${cascade.cascaded} child scope(s) severed from ${g.scopeId}`)
+  } catch (e) { ctx.log(`derived cascade for ${g.scopeId} failed; parent remains revoked: ${String((e as Error).message)}`) }
   ctx.log(`grant revoked-detected: scope ${g.scopeId} (v${g.generation} superseded) — key + cache zeroized`)
   return record
 }
@@ -355,6 +363,46 @@ export function createNvoyServer(ctx: NvoyContext): NvoyServerHandle {
       timer.unref?.()
       pollers.set(key, timer)
       return json({ subscribed: true, ...info })
+    },
+  )
+
+  server.registerTool(
+    'nvoy_derived_grant_issue',
+    {
+      title: 'Issue an attenuated derived grant',
+      description:
+        'Create a new encrypted derived scope from a parent grant and give it to one leaf identity. This is the only supported re-delegation mechanism: it requires a live parent with redelegate:true, never re-wraps the parent key, refuses no_persist parents, and bounds the child expiry to the parent. Payload is the intentionally narrowed child document, not an automatic copy of the parent.',
+      inputSchema: {
+        parent_d: z.string().describe('parent scope id (d) already held by this agent'),
+        parent_author_npub: z.string().describe('parent delegator, as npub or hex public key'),
+        grantee_npub: z.string().describe('leaf identity receiving the NEW derived scope, as npub or hex public key'),
+        payload: z.record(z.unknown()).describe('attenuated JSON object for the leaf; do not copy a parent wholesale'),
+        scope_name: z.string().startsWith('derived:').describe("derived scope name; must begin 'derived:'"),
+        purpose: z.string().min(1).describe('specific purpose for this leaf grant'),
+        expires_at: z.number().int().optional().describe('optional child expiry; required when parent has an expiry and may not exceed it'),
+        allow_redelegate: z.boolean().optional().describe('default false; permit one further derived hop only when explicitly intended'),
+      },
+    },
+    async ({ parent_d, parent_author_npub, grantee_npub, payload, scope_name, purpose, expires_at, allow_redelegate }) => {
+      let publisher: string, recipient: string
+      try { publisher = toHexPubkey(parent_author_npub); recipient = toHexPubkey(grantee_npub) }
+      catch (e) { return jsonError({ code: 'NVOY_BAD_INPUT', message: String((e as Error).message) }) }
+      const parent = await ctx.grantStore.find(publisher, parent_d)
+      if (!parent) return jsonError({ code: 'NVOY_NO_GRANT', d: parent_d, author_npub: parent_author_npub, message: 'no held parent grant exists to derive from' })
+      if (grantStatus(parent) !== 'active') return jsonError({ code: 'NVOY_PARENT_NOT_ACTIVE', d: parent_d, message: 'the parent grant is not active; no derived grant was issued' })
+      // Force a fresh parent fetch before minting anything. A stale/missing
+      // source is a hard stop, never an opportunity to sub-issue an old view.
+      const fresh = await ctx.scopeCache.read(parent, { maxAgeSec: 0 })
+      if (fresh.status !== 'ok') return jsonError({ code: 'NVOY_PARENT_UNAVAILABLE', d: parent_d, status: fresh.status, message: 'parent data was not freshly readable; no derived grant was issued' })
+      try {
+        const issued = await issueDerivedGrant(ctx.relay, ctx.identity, parent, recipient, payload, scope_name, {
+          purpose, expires_at, redelegate: allow_redelegate === true,
+        })
+        return json({ ...issued, grantee_npub: nip19.npubEncode(recipient), parent_author_npub: nip19.npubEncode(publisher), redelegate: allow_redelegate === true })
+      } catch (e) {
+        const code = e instanceof RedelegationForbidden ? 'NVOY_REDELEGATION_FORBIDDEN' : 'NVOY_DERIVED_GRANT_FAILED'
+        return jsonError({ code, message: String((e as Error).message) })
+      }
     },
   )
 
