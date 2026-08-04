@@ -34,7 +34,7 @@ const server = net.createServer(conn => {
   conn.on('data', chunk => { data += chunk; if (!data.includes('\n')) return
     let packet; try { packet = JSON.parse(data.split('\n')[0]) } catch { conn.destroy(); return }
     if (packet.type !== 'admitted-task' || packet.instance !== manifest.id || !/^[0-9a-f]{64}$/.test(packet.envelope || '') || !Array.isArray(packet.messages)) { conn.destroy(); return }
-    try { if (!delivered.has(packet.envelope)) { appendFileSync(queue, JSON.stringify(packet) + '\n', { mode: 0o600 }); chmodSync(queue, 0o600); delivered.add(packet.envelope) } }
+    try { if (!delivered.has(packet.envelope)) { appendFileSync(queue, JSON.stringify(packet) + '\n', { mode: 0o640 }); chmodSync(queue, 0o640); delivered.add(packet.envelope) } }
     catch { conn.destroy(); return }
     conn.end(JSON.stringify({ type: 'ack', instance: manifest.id }) + '\n')
   })

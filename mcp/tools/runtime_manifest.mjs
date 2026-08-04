@@ -72,14 +72,15 @@ export function readManifest(root, requestedId) {
   const watcherUid = Number(raw.watcher_uid ?? raw.watcherUid)
   const brokerUid = Number(raw.broker_uid ?? raw.brokerUid)
   const adapterUid = Number(raw.adapter_uid ?? raw.adapterUid)
-  if (![watcherUid, brokerUid, adapterUid].every(v => Number.isInteger(v) && v > 0)) die('manifest requires positive watcher_uid, broker_uid, and adapter_uid')
-  if (new Set([watcherUid, brokerUid, adapterUid]).size !== 3) die('watcher_uid, broker_uid, and adapter_uid must be distinct')
+  const workerUid = Number(raw.worker_uid ?? raw.workerUid)
+  if (![watcherUid, brokerUid, adapterUid, workerUid].every(v => Number.isInteger(v) && v > 0)) die('manifest requires positive watcher_uid, broker_uid, adapter_uid, and worker_uid')
+  if (new Set([watcherUid, brokerUid, adapterUid, workerUid]).size !== 4) die('watcher_uid, broker_uid, adapter_uid, and worker_uid must be distinct')
   const workerImage = String(raw.worker_image || raw.workerImage || '')
   const workerRunner = String(raw.worker_runner || raw.workerRunner || '')
   const workerCredentialRef = String(raw.worker_credential_ref || raw.workerCredentialRef || '')
   if ((workerImage || workerRunner || workerCredentialRef) && (!/^[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$/i.test(workerImage) || !['codex', 'claude'].includes(workerRunner) || !workerCredentialRef.startsWith('/'))) die('worker_image must be digest-pinned, worker_runner must be codex or claude, and worker_credential_ref must be absolute')
   return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, relays, stateDir, runtimeDir, spoolDir,
-    sharedGid, watcherUid, brokerUid, adapterUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerImage, workerRunner, workerCredentialRef })
+    sharedGid, watcherUid, brokerUid, adapterUid, workerUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerImage, workerRunner, workerCredentialRef })
 }
 
 // Supervisor preflight: a second identity must never accidentally share a state or runtime

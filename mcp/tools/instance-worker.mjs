@@ -5,7 +5,7 @@
 // admitted and decrypted each queued message. This runner may invoke a local coding-agent CLI,
 // then write a narrowly-shaped reply request for the broker to bind and sign.
 
-import { readFileSync, appendFileSync, existsSync, lstatSync, mkdirSync, writeFileSync, chmodSync } from 'node:fs'
+import { readFileSync, appendFileSync, existsSync, lstatSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { randomBytes } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
@@ -56,9 +56,10 @@ function composePrompt(inputPath) {
 }
 function runAgent(task) {
   if (suppliedReply) return suppliedReply
-  const inputDir = resolve(manifest.runtimeDir, 'worker-input')
-  mkdirSync(inputDir, { recursive: true, mode: 0o700 }); chmodSync(inputDir, 0o700)
-  const inputPath = resolve(inputDir, `${task.envelope}.json`)
+  // The worker cannot create entries under the adapter-owned runtime root. Its task file is
+  // deliberately the immutable, adapter-authored JSONL record it already has group-read access
+  // to; do not copy untrusted text into a new mutable handoff path.
+  const inputPath = queue
   writeFileSync(inputPath, JSON.stringify({ envelope: task.envelope, messages: task.messages }), { mode: 0o600 })
   const prompt = composePrompt(inputPath)
   const args = runner === 'codex'

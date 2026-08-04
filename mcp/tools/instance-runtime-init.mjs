@@ -3,7 +3,7 @@
 // It is the ONLY role allowed to chown runtime roots. It reads no credential and exits before
 // watcher/broker/adapter start; each later role is non-root and gets only its own mounts.
 
-import { mkdirSync, lstatSync, chownSync, chmodSync, statSync } from 'node:fs'
+import { mkdirSync, lstatSync, chownSync, chmodSync, statSync, openSync, closeSync } from 'node:fs'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 
 const die = m => { console.error(`instance-runtime-init: ${m}`); process.exit(1) }
@@ -25,4 +25,17 @@ function provision(path, uid, gid, mode, label) {
 provision(m.stateDir, m.brokerUid, m.sharedGid, 0o700, 'broker state')
 provision(m.spoolDir, m.watcherUid, m.sharedGid, 0o770, 'watcher spool')
 provision(m.runtimeDir, m.adapterUid, m.sharedGid, 0o710, 'adapter runtime')
+function provisionFile(path, uid, gid, mode, label) {
+  try { const s = lstatSync(path); if (!s.isFile() || s.isSymbolicLink()) die(`${label} is not a regular file`) }
+  catch (e) { if (e.code === 'ENOENT') closeSync(openSync(path, 'wx', mode)); else throw e }
+  chownSync(path, uid, gid); chmodSync(path, mode)
+  const s = statSync(path), actual = s.mode & 0o777
+  if (s.uid !== uid || s.gid !== gid || actual !== mode) die(`${label} ownership/mode verification failed`)
+}
+// Worker only has group traversal on the adapter-owned runtime root. These named files are the
+// whole cross-UID protocol: task input is adapter-write/group-read; requests are worker-write/
+// group-read; consumed state is worker-private. No role can create a replacement socket or queue.
+provisionFile(`${m.runtimeDir}/admitted-tasks.jsonl`, m.adapterUid, m.sharedGid, 0o640, 'admitted task queue')
+provisionFile(`${m.runtimeDir}/reply-requests.jsonl`, m.workerUid, m.sharedGid, 0o640, 'worker reply queue')
+provisionFile(`${m.runtimeDir}/worker-consumed.jsonl`, m.workerUid, m.workerUid, 0o600, 'worker consumed queue')
 console.log(`instance-runtime-init: provisioned ${m.id}`)

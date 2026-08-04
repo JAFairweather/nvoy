@@ -102,7 +102,7 @@ services:
 
   worker:
     image: ${WORKER_IMAGE:?}
-    user: "${ADAPTER_UID:?}:${SHARED_GID:?}"
+    user: "${WORKER_UID:?}:${SHARED_GID:?}"
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
