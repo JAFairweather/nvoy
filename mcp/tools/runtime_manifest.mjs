@@ -52,13 +52,16 @@ export function readManifest(root, requestedId) {
   if (!valid(pubkey) || !grantors.length || !grantors.every(valid) || !relays.length) die('manifest requires pubkey, grantors, and wss relays')
   const rawStateDir = String(raw.state_dir || raw.stateDir || '')
   const rawRuntimeDir = String(raw.runtime_dir || raw.runtimeDir || '')
-  if (!rawStateDir || !rawRuntimeDir) die('manifest requires state_dir and runtime_dir')
+  const rawSpoolDir = String(raw.spool_dir || raw.spoolDir || '')
+  if (!rawStateDir || !rawRuntimeDir || !rawSpoolDir) die('manifest requires state_dir, runtime_dir, and spool_dir')
   const stateDir = resolve(rawStateDir)
   const runtimeDir = resolve(rawRuntimeDir)
-  if (stateDir === '/' || runtimeDir === '/') die('manifest requires bounded state_dir and runtime_dir')
+  const spoolDir = resolve(rawSpoolDir)
+  if (stateDir === '/' || runtimeDir === '/' || spoolDir === '/') die('manifest requires bounded state_dir, runtime_dir, and spool_dir')
   safeDirectory(stateDir, 'state_dir')
   safeDirectory(runtimeDir, 'runtime_dir')
-  return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, relays, stateDir, runtimeDir,
+  safeDirectory(spoolDir, 'spool_dir')
+  return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, relays, stateDir, runtimeDir, spoolDir,
     serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef: String(raw.key_ref || raw.keyRef || '') })
 }
 

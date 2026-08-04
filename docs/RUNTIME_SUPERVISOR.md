@@ -36,6 +36,7 @@ contains only public routing policy:
   "service_user": "nvoy-codex-jaf",
   "state_dir": "/var/lib/nvoy/codex-jaf",
   "runtime_dir": "/run/nvoy/codex-jaf",
+  "spool_dir": "/var/lib/nvoy-watcher/codex-jaf",
   "key_ref": "/etc/nvoy/keys/codex-jaf.ncryptsec",
   "grantors": ["<64 hex>"],
   "relays": ["wss://nos.lol", "wss://relay.primal.net"]
@@ -56,7 +57,7 @@ For each `<id>`, the installer creates a dedicated OS account `nvoy-<id>` and:
 | `/etc/nvoy/keys/<id>.ncryptsec` | root:nvoy-<id> 0640 | broker only |
 | `/var/lib/nvoy/<id>` | nvoy-<id> 0700 | broker state/lock |
 | `/run/nvoy/<id>` | nvoy-<id> 0700 | broker socket |
-| watcher spool | separate keyless account, append-only | watcher→broker marker intake |
+| watcher spool | separate keyless account, append-only to watcher / read-rename by broker | watcher→broker marker intake |
 
 `nvoy-broker@<id>` and `nvoy-watcher@<id>` run under distinct accounts. The broker obtains an
 exclusive lock before opening its state. On systemd, a matching `nvoy-broker@.socket` unit creates
@@ -68,8 +69,8 @@ and may not choose another one.
 
 ## Protocol and recovery
 
-1. The watcher writes `{ envelope, observed_at }` opaque marker records. A tiny supervisor-owned
-   dispatcher materializes one regular marker file per record; it never parses a seal.
+1. The watcher atomically writes one `<envelope>.pending` marker containing only
+   `{ envelope, observed_at }`, then advances its seen log. It never parses a seal.
 2. The broker atomically claims a marker, fetches the exact named envelope (not “all unread mail”), decrypts, and validates
    live 440/441 task policy. Unreadable, forged, revoked, duplicate, or stale markers are
    terminally recorded without delivery.
