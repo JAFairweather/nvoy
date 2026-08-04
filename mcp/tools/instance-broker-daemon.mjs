@@ -8,7 +8,7 @@ import { readdirSync, renameSync, readFileSync, lstatSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
-import { isTerminalReplyFailure, loadTerminalReplyIds, recordTerminalReply } from './reply_retry.mjs'
+import { isTerminalReplyFailure, loadPublishedReplyIds, loadTerminalReplyIds, recordTerminalReply } from './reply_retry.mjs'
 
 const die = m => { console.error(`instance-broker-daemon: ${m}`); process.exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -25,9 +25,12 @@ const childEnv = { PATH: process.env.PATH || '', NVOY_INSTANCE_ROOT: root, NVOY_
   ...(process.env.NVOY_BUNKER_URI_FILE ? { NVOY_BUNKER_URI_FILE: process.env.NVOY_BUNKER_URI_FILE } : {}) }
 const terminalRepliesPath = resolve(manifest.stateDir, 'terminal-replies.jsonl')
 let terminalReplyIds
+let publishedReplyIds
 const retryAfter = new Map()
 try { terminalReplyIds = loadTerminalReplyIds(terminalRepliesPath) }
 catch (e) { die(`cannot load terminal reply log: ${e.message || e}`) }
+try { publishedReplyIds = loadPublishedReplyIds(resolve(manifest.stateDir, 'outbound')) }
+catch (e) { die(`cannot load published reply records: ${e.message || e}`) }
 
 function recover() {
   let names = []
@@ -75,7 +78,7 @@ function drain() {
         try { const x = JSON.parse(line); if (/^[0-9a-f]{32}$/.test(String(x.id || ''))) ids.add(x.id) } catch { /* trailing partial line */ }
       }
       for (const request of ids) {
-        if (terminalReplyIds.has(request)) continue
+        if (terminalReplyIds.has(request) || publishedReplyIds.has(request)) continue
         const r = spawnSync(process.execPath, [reply, '--instance', manifest.id, '--request', request, '--source', source], { env: childEnv, encoding: 'utf8', timeout: 90000 })
         if (r.status !== 0) {
           const stderr = String(r.stderr || '').trim()
@@ -85,7 +88,7 @@ function drain() {
                 console.error(`instance-broker-daemon: reply ${request.slice(0, 12)}… terminal — its receipt is no longer live`)
             } catch (e) { console.error(`instance-broker-daemon: cannot record terminal reply ${request.slice(0, 12)}…: ${e.message || e}`) }
           } else console.error(`instance-broker-daemon: reply ${request.slice(0, 12)}… held for retry: ${stderr}`)
-        }
+        } else publishedReplyIds.add(request)
       }
     } catch (e) { if (e.code !== 'ENOENT') console.error(`instance-broker-daemon: ${source} reply queue unavailable: ${e.message}`) }
   }

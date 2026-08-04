@@ -5,7 +5,8 @@
 // relays once per broker tick.  Keep only an opaque request id and a bounded
 // reason in broker-owned state: this is an audit record, not message storage.
 
-import { appendFileSync, existsSync, lstatSync, readFileSync } from 'node:fs'
+import { appendFileSync, existsSync, lstatSync, readFileSync, readdirSync } from 'node:fs'
+import { resolve } from 'node:path'
 
 const ID = /^[0-9a-f]{32}$/
 const TERMINAL = [
@@ -29,6 +30,28 @@ export function loadTerminalReplyIds(path) {
       const record = JSON.parse(line)
       if (record?.version === 1 && record?.type === 'terminal-reply' && ID.test(String(record.id || ''))) ids.add(record.id)
     } catch { /* trailing partial line never changes retry policy */ }
+  }
+  return ids
+}
+
+// Successful replies already have a broker-owned, immutable outbound record. Derive the
+// durable completion set from those records at boot so an append-only request queue does not
+// spawn one replay-checking child per completed reply on every daemon tick forever.
+export function loadPublishedReplyIds(dir) {
+  if (!existsSync(dir)) return new Set()
+  const st = lstatSync(dir)
+  if (!st.isDirectory() || st.isSymbolicLink()) throw new Error('outbound reply path is not a regular directory')
+  const ids = new Set()
+  for (const name of readdirSync(dir)) {
+    const match = name.match(/^([0-9a-f]{32})\.json$/)
+    if (!match) continue
+    const path = resolve(dir, name)
+    const file = lstatSync(path)
+    if (!file.isFile() || file.isSymbolicLink()) continue
+    try {
+      const record = JSON.parse(readFileSync(path, 'utf8'))
+      if (record?.version === 1 && record?.request_id === match[1] && record?.published === true) ids.add(match[1])
+    } catch { /* malformed records remain visible to the normal broker validation path */ }
   }
   return ids
 }

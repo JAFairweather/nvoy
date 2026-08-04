@@ -9,7 +9,7 @@ import net from 'node:net'
 import { createHash } from 'node:crypto'
 import { generateSecretKey, getPublicKey } from 'nostr-tools/pure'
 import * as nip19 from 'nostr-tools/nip19'
-import { isTerminalReplyFailure, loadTerminalReplyIds, recordTerminalReply } from '../mcp/tools/reply_retry.mjs'
+import { isTerminalReplyFailure, loadPublishedReplyIds, loadTerminalReplyIds, recordTerminalReply } from '../mcp/tools/reply_retry.mjs'
 import { validateAdmittedTask } from '../mcp/tools/admitted_task.mjs'
 
 let fails = 0
@@ -180,6 +180,12 @@ const terminalIds = loadTerminalReplyIds(terminalReplies)
 const expiredRequest = 'a'.repeat(32)
 ok('a missing or stale admission receipt is terminal, rather than a relay-query retry loop', isTerminalReplyFailure('instance-broker-reply: admission receipt is missing') && isTerminalReplyFailure('instance-broker-reply: admission receipt is not a live broker-bound sender capability') && recordTerminalReply(terminalReplies, terminalIds, expiredRequest, 'admission receipt is not a live broker-bound sender capability', 1) && terminalIds.has(expiredRequest) && !recordTerminalReply(terminalReplies, terminalIds, expiredRequest, 'admission receipt is not a live broker-bound sender capability', 2) && loadTerminalReplyIds(terminalReplies).has(expiredRequest) && !readFileSync(terminalReplies, 'utf8').includes('must not be signed'))
 ok('transient reply publish failures remain retryable', !isTerminalReplyFailure('instance-broker-reply: no relay accepted the persisted outbound wrap; it remains retryable') && /terminalReplyIds\.has\(request\)/.test(daemonSource))
+const publishedDir = join(manifest.state_dir, 'outbound')
+mkdirSync(publishedDir, { recursive: true })
+const publishedRequest = 'b'.repeat(32)
+writeFileSync(join(publishedDir, `${publishedRequest}.json`), JSON.stringify({ version: 1, request_id: publishedRequest, published: true }))
+writeFileSync(join(publishedDir, `${'c'.repeat(32)}.json`), JSON.stringify({ version: 1, request_id: 'c'.repeat(32), published: false }))
+ok('a published reply is durably skipped instead of spawning a replay child every daemon tick', loadPublishedReplyIds(publishedDir).has(publishedRequest) && !loadPublishedReplyIds(publishedDir).has('c'.repeat(32)) && /publishedReplyIds\.has\(request\)/.test(daemonSource) && /publishedReplyIds\.add\(request\)/.test(daemonSource))
 const initSource = readFileSync('mcp/tools/instance-runtime-init.mjs', 'utf8')
 ok('a root-only initializer provisions all three volume roots, a credential-free Desktop queue, and role-owned credential copies', /process\.getuid\?\.\(\) !== 0/.test(initSource) && /provision\(m\.stateDir/.test(initSource) && /provision\(m\.spoolDir/.test(initSource) && /provision\(m\.runtimeDir/.test(initSource) && /desktop-reply-requests\.jsonl.*m\.adapterUid/.test(initSource) && /function provisionSecret/.test(initSource) && /brokerCredDir/.test(initSource) && /workerCredDir/.test(initSource))
 const replySource = readFileSync('mcp/tools/instance-broker-reply.mjs', 'utf8')
