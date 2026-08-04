@@ -35,11 +35,22 @@ function recover() {
 function drain() {
   let names = []
   try { names = readdirSync(manifest.spoolDir).sort() } catch (e) { console.error(`instance-broker-daemon: spool read failed: ${e.message}`); return }
-  for (const name of names) {
+  // A marker contains no plaintext or sender identity, but it does carry the watcher's
+  // observation time. Prefer the newest first: a backlog after a broker outage must not turn
+  // a live @mention into an hours-late task simply because its random Nostr id sorts last.
+  const pending = names.flatMap(name => {
     const m = name.match(/^([0-9a-f]{64})\.pending$/)
-    if (!m) continue
-    const r = spawnSync(process.execPath, [broker, 'deliver', '--instance', manifest.id, '--envelope', m[1]], { env: childEnv, encoding: 'utf8', timeout: 90000 })
-    if (r.status !== 0) console.error(`instance-broker-daemon: ${m[1].slice(0, 12)}… held for retry: ${String(r.stderr || '').trim()}`)
+    if (!m) return []
+    let observed = 0
+    try {
+      const marker = JSON.parse(readFileSync(resolve(manifest.spoolDir, name), 'utf8'))
+      if (String(marker.envelope || '').toLowerCase() === m[1] && Number.isFinite(Number(marker.observed_at))) observed = Number(marker.observed_at)
+    } catch { /* broker deliver will validate this malformed marker before any decrypt */ }
+    return [{ envelope: m[1], observed }]
+  }).sort((a, b) => b.observed - a.observed || a.envelope.localeCompare(b.envelope))
+  for (const item of pending) {
+    const r = spawnSync(process.execPath, [broker, 'deliver', '--instance', manifest.id, '--envelope', item.envelope], { env: childEnv, encoding: 'utf8', timeout: 90000 })
+    if (r.status !== 0) console.error(`instance-broker-daemon: ${item.envelope.slice(0, 12)}… held for retry: ${String(r.stderr || '').trim()}`)
   }
   // The adapter-owned queue is append-only.  A reply tool receives only a 32-hex request id;
   // it reopens this fixed queue, then binds the request to the broker-authored admission receipt.
