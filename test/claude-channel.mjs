@@ -1,6 +1,7 @@
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { spawnSync } from 'node:child_process'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { z } from 'zod'
@@ -50,6 +51,10 @@ try {
   const tools = (await client.listTools()).tools.map(tool => tool.name)
   ok('Claude receives one explicit read tool and one receipt-bound reply tool',
     tools.length === 2 && tools.includes('nvoy_channel_read') && tools.includes('nvoy_channel_reply'))
+  const duplicateProcess = spawnSync(process.execPath, [resolve('mcp/tools/claude-channel.mjs'), '--instance', manifest.id, '--baseline'],
+    { encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifests } })
+  ok('a second Claude session cannot bind the same participant identity',
+    duplicateProcess.status !== 0 && /already runs as pid/.test(duplicateProcess.stderr))
   const read = await client.callTool({ name: 'nvoy_channel_read', arguments: { envelope } })
   const body = JSON.parse(read.content[0].text)
   ok('the exact marker reads only its broker-validated task and authority',
@@ -65,6 +70,16 @@ try {
   const duplicate = await client.callTool({ name: 'nvoy_channel_reply', arguments: { envelope, text: 'again' } })
   ok('one delivered envelope cannot queue a second reply', duplicate.isError === true && readFileSync(join(runtime, 'desktop-reply-requests.jsonl'), 'utf8').trim().split('\n').length === 1)
 } finally { await client.close() }
+
+const historicalEnvelope = '8'.repeat(64)
+writeFileSync(join(runtime, 'admitted-tasks.jsonl'), JSON.stringify(task) + '\n' +
+  JSON.stringify({ ...task, envelope: historicalEnvelope }) + '\n', { mode: 0o600 })
+const baseline = spawnSync(process.execPath, [resolve('mcp/tools/claude-channel.mjs'), '--instance', manifest.id, '--baseline'],
+  { encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifests } })
+const readLog = readFileSync(join(runtime, 'claude-channel-read.jsonl'), 'utf8')
+ok('one-time baseline records an old queue entry without launching a channel or reply',
+  baseline.status === 0 && /baselined 1 existing/.test(baseline.stdout) && readLog.includes(historicalEnvelope) &&
+  readFileSync(join(runtime, 'desktop-reply-requests.jsonl'), 'utf8').trim().split('\n').length === 1)
 
 console.log(`\n${passed}/${passed + failed} passed`)
 process.exit(failed ? 1 : 0)

@@ -239,6 +239,15 @@ that instance's adapter account and use the supervisor-owned manifest root:
 }
 ```
 
+Before enabling a newly installed channel against a queue that may already contain records,
+baseline it once under the same adapter account. This records existing envelopes without exposing
+or replying to them; later arrivals remain live:
+
+```sh
+NVOY_INSTANCE_ROOT=/etc/nvoy/instances \
+  /usr/bin/node /opt/nvoy/mcp/tools/claude-channel.mjs --instance codex-jaf --baseline
+```
+
 Custom channels require an explicit development opt-in during Anthropic's research preview:
 
 ```sh
@@ -248,7 +257,8 @@ claude --dangerously-load-development-channels server:nvoy-codex-jaf
 The session must remain open; Claude Code does not acknowledge channel notifications. Nvoy marks an
 envelope read only when `nvoy_channel_read` succeeds, so a channel-process restart re-notifies any
 unread admitted record. Repeated markers remain harmless and cannot produce a second brokered
-reply. This adapter does not use
+reply. An exclusive per-instance PID lock refuses a second live Claude channel, preventing two
+sessions from becoming duplicate responders. This adapter does not use
 `--dangerously-skip-permissions`; ordinary Claude Code tool permissions still apply. The protocol
 and preview constraints are documented in Anthropic's official
 [Channels guide](https://code.claude.com/docs/en/channels) and

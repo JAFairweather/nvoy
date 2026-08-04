@@ -8,7 +8,7 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
-import { appendFileSync, chmodSync, existsSync, lstatSync, readFileSync } from 'node:fs'
+import { appendFileSync, chmodSync, closeSync, existsSync, lstatSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { resolve } from 'node:path'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
@@ -18,7 +18,8 @@ const die = message => { console.error(`nvoy-claude-channel: ${message}`); proce
 const flag = name => { const i = process.argv.indexOf(name); return i < 0 ? '' : process.argv[i + 1] || '' }
 const id = flag('--instance')
 const pollMs = Number(flag('--poll-ms') || 1000)
-if (!id || !Number.isInteger(pollMs) || pollMs < 250 || pollMs > 60000) die('usage: --instance <id> [--poll-ms 250..60000]')
+const baseline = process.argv.includes('--baseline')
+if (!id || !Number.isInteger(pollMs) || pollMs < 250 || pollMs > 60000) die('usage: --instance <id> [--baseline] [--poll-ms 250..60000]')
 const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 let manifest
 try { manifest = readManifest(root, instanceId(id)); assertNoCollisions(root, manifest) } catch (error) { die(error.message) }
@@ -32,6 +33,32 @@ const readPath = resolve(manifest.runtimeDir, 'claude-channel-read.jsonl')
 const replyPath = resolve(manifest.runtimeDir, 'desktop-reply-requests.jsonl')
 const HEX64 = /^[0-9a-f]{64}$/
 const notifiedThisRun = new Set()
+
+// One participant identity may bind one live Claude channel only. A second session would receive
+// the same marker and become a duplicate responder. Reclaim only a lock whose recorded PID is
+// demonstrably gone; malformed/foreign locks fail closed.
+const lockPath = resolve(manifest.runtimeDir, 'claude-channel.lock')
+function claimLock() {
+  try {
+    const fd = openSync(lockPath, 'wx', 0o600)
+    writeFileSync(fd, JSON.stringify({ version: 1, instance: manifest.id, pid: process.pid, started_at: Date.now() }))
+    closeSync(fd)
+    return
+  } catch (error) { if (error.code !== 'EEXIST') throw error }
+  let prior
+  try {
+    const stat = lstatSync(lockPath)
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('channel lock is not a regular file')
+    prior = JSON.parse(readFileSync(lockPath, 'utf8'))
+  } catch (error) { throw new Error(`cannot validate existing channel lock: ${error.message}`) }
+  if (prior?.version !== 1 || prior?.instance !== manifest.id || !Number.isInteger(prior?.pid) || prior.pid < 1) throw new Error('channel lock does not bind this instance')
+  try { process.kill(prior.pid, 0); throw new Error(`Claude channel already runs as pid ${prior.pid}`) }
+  catch (error) { if (error.code !== 'ESRCH') throw error }
+  unlinkSync(lockPath)
+  claimLock()
+}
+try { claimLock() } catch (error) { die(error.message) }
+process.on('exit', () => { try { unlinkSync(lockPath) } catch {} })
 
 function regular(path, label, required = true) {
   if (!existsSync(path)) {
@@ -74,6 +101,22 @@ function readIds() {
 
 function toolResult(value, isError = false) {
   return { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }], ...(isError ? { isError: true } : {}) }
+}
+
+if (baseline) {
+  let added = 0
+  try {
+    const read = readIds()
+    for (const task of tasks()) {
+      if (read.has(task.envelope)) continue
+      appendFileSync(readPath, JSON.stringify({ version: 1, instance: manifest.id,
+        envelope: task.envelope, read_at: Date.now() }) + '\n', { mode: 0o600 })
+      read.add(task.envelope); added++
+    }
+    if (existsSync(readPath)) chmodSync(readPath, 0o600)
+  } catch (error) { die(`baseline failed: ${error.message}`) }
+  console.log(`nvoy-claude-channel: baselined ${added} existing admitted envelope(s)`)
+  process.exit(0)
 }
 
 const mcp = new Server(
