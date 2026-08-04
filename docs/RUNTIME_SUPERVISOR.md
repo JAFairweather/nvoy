@@ -210,6 +210,60 @@ remote command**. Therefore the server-side key must be restricted with an `auth
 forced command that runs the sync endpoint for exactly one instance. The key is a narrow queue
 sync capability, never a shell or signer capability.
 
+### Running Claude Code channel adapter
+
+Claude Code has a different native edge. Its research-preview channel protocol lets an MCP server
+push an event into an already-running session. Nvoy's `claude-channel.mjs` implements that official
+protocol without weakening the broker boundary:
+
+- it runs as the manifest's keyless adapter UID against a local-broker, worker-disabled
+  `delivery_mode: "notify_only"` instance;
+- `notifications/claude/channel` contains only the immutable instance id and opaque outer-envelope
+  id—never sender, plaintext, grant, summary, or quoted content;
+- `nvoy_channel_read` exposes exactly that broker-admitted record after the wake;
+- `nvoy_channel_reply` accepts only that envelope plus bounded text. The broker rechecks live
+  grants and resolves the recipient or channel before the Bunker signs anything.
+
+Register one server per identity in the Claude Code MCP configuration. The process must run under
+that instance's adapter account and use the supervisor-owned manifest root:
+
+```json
+{
+  "mcpServers": {
+    "nvoy-codex-jaf": {
+      "command": "/usr/bin/node",
+      "args": ["/opt/nvoy/mcp/tools/claude-channel.mjs", "--instance", "codex-jaf"],
+      "env": { "NVOY_INSTANCE_ROOT": "/etc/nvoy/instances" }
+    }
+  }
+}
+```
+
+Before enabling a newly installed channel against a queue that may already contain records,
+baseline it once under the same adapter account. This records existing envelopes without exposing
+or replying to them; later arrivals remain live:
+
+```sh
+NVOY_INSTANCE_ROOT=/etc/nvoy/instances \
+  /usr/bin/node /opt/nvoy/mcp/tools/claude-channel.mjs --instance codex-jaf --baseline
+```
+
+Custom channels require an explicit development opt-in during Anthropic's research preview:
+
+```sh
+claude --dangerously-load-development-channels server:nvoy-codex-jaf
+```
+
+The session must remain open; Claude Code does not acknowledge channel notifications. Nvoy marks an
+envelope read only when `nvoy_channel_read` succeeds, so a channel-process restart re-notifies any
+unread admitted record. Repeated markers remain harmless and cannot produce a second brokered
+reply. An exclusive per-instance PID lock refuses a second live Claude channel, preventing two
+sessions from becoming duplicate responders. This adapter does not use
+`--dangerously-skip-permissions`; ordinary Claude Code tool permissions still apply. The protocol
+and preview constraints are documented in Anthropic's official
+[Channels guide](https://code.claude.com/docs/en/channels) and
+[Channels reference](https://code.claude.com/docs/en/channels-reference).
+
 With `codex_transport: "local_control_socket"`, it uses the supported local Codex app-server
 control socket and JSON-RPC lifecycle (`initialize`, `thread/read`, `thread/resume`, then
 `turn/start`). The binding may name a real persistent app-server UUID or a `thr_` id; it is
