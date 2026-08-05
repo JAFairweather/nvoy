@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { validateAdmittedTask } from './admitted_task.mjs'
 
 const HEX64 = /^[0-9a-f]{64}$/
+const THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const sha256 = value => createHash('sha256').update(value).digest('hex')
 
 export function visibleReceipt(envelope) {
@@ -23,9 +24,11 @@ export function desktopDeliveryRequest(record, binding, policy = {}) {
   const text = visibleDesktopMessage(record, policy)
   if (!binding || binding.appBundleId !== 'com.openai.codex' ||
       typeof binding.projectLabel !== 'string' || !binding.projectLabel.trim() ||
-      typeof binding.chatLabel !== 'string' || !binding.chatLabel.trim()) throw new Error('invalid fixed Desktop binding')
+      typeof binding.chatLabel !== 'string' || !binding.chatLabel.trim() ||
+      !THREAD_ID.test(String(binding.threadId || '')) || !String(binding.statePath || '').startsWith('/')) throw new Error('invalid fixed Desktop binding')
   return Object.freeze({ version: 1, envelope: record.envelope, app_bundle_id: binding.appBundleId,
     project_label: binding.projectLabel.trim(), chat_label: binding.chatLabel.trim(),
+    thread_id: binding.threadId, codex_state_path: binding.statePath,
     receipt: visibleReceipt(record.envelope), message_sha256: sha256(text), text })
 }
 
@@ -33,6 +36,7 @@ export function verifyDesktopEvidence(request, evidence) {
   if (!request || !evidence || evidence.version !== 1 || evidence.status !== 'visible' ||
       evidence.envelope !== request.envelope || evidence.app_bundle_id !== request.app_bundle_id ||
       evidence.project_label !== request.project_label || evidence.chat_label !== request.chat_label ||
+      evidence.thread_id !== request.thread_id ||
       evidence.receipt !== request.receipt || evidence.message_sha256 !== request.message_sha256 ||
       evidence.project_chat_count !== 1 || evidence.active_chat_count !== 1 ||
       evidence.composer_count !== 1 || evidence.visible_match_count !== 1) {
@@ -40,5 +44,5 @@ export function verifyDesktopEvidence(request, evidence) {
   }
   return Object.freeze({ envelope: request.envelope, receipt: request.receipt,
     messageSha256: request.message_sha256, appBundleId: request.app_bundle_id,
-    projectLabel: request.project_label, chatLabel: request.chat_label })
+    projectLabel: request.project_label, chatLabel: request.chat_label, threadId: request.thread_id })
 }

@@ -1,6 +1,9 @@
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { generateSecretKey, getPublicKey } from 'nostr-tools/pure'
 import { desktopDeliveryRequest, verifyDesktopEvidence, visibleReceipt } from '../mcp/tools/macos_desktop_delivery.mjs'
+import { verifySelectedDesktopProject } from '../mcp/tools/codex_desktop_selection.mjs'
 
 let passed = 0, failed = 0
 const ok = (name, value) => { if (value) { passed++; console.log(`ok - ${name}`) } else { failed++; console.error(`not ok - ${name}`) } }
@@ -12,18 +15,36 @@ const task = { type: 'admitted-task', instance: 'codex-jaf', envelope, messages:
   version: 2, type: 'scoped-instruction', sender, grant_id: 'c'.repeat(64), grantor, cap: 'task', scope_subject: agent, policy_checked_at: 1,
   carrier, carrier_grant_id: 'd'.repeat(64), carrier_grantor: grantor, source_event: 'b'.repeat(64), reply_channel: channel,
 } }
-const binding = { appBundleId: 'com.openai.codex', projectLabel: 'connect', chatLabel: 'Waggle live binder' }
+const threadId = '019fce57-063d-7f50-b837-967d33ee384a'
+const binding = { appBundleId: 'com.openai.codex', projectLabel: 'connect', chatLabel: 'Waggle live binder',
+  threadId, statePath: '/tmp/.codex-global-state.json' }
 const request = desktopDeliveryRequest(task, binding, policy)
 ok('authenticated words remain first', request.text.startsWith('Do the visible thing.\n\n—'))
 ok('visible non-secret receipt binds the envelope', request.receipt === visibleReceipt(envelope) && request.text.endsWith(request.receipt))
-ok('request fixes app, project, chat, and message digest', request.app_bundle_id === 'com.openai.codex' && request.project_label === 'connect' && request.chat_label === 'Waggle live binder' && /^[0-9a-f]{64}$/.test(request.message_sha256))
+ok('request fixes app, project, chat, thread, state path, and message digest', request.app_bundle_id === 'com.openai.codex' && request.project_label === 'connect' && request.chat_label === 'Waggle live binder' && request.thread_id === threadId && request.codex_state_path === binding.statePath && /^[0-9a-f]{64}$/.test(request.message_sha256))
 const evidence = { version: 1, status: 'visible', envelope, app_bundle_id: request.app_bundle_id, project_label: request.project_label,
-  chat_label: request.chat_label, receipt: request.receipt, message_sha256: request.message_sha256,
+  chat_label: request.chat_label, thread_id: request.thread_id, receipt: request.receipt, message_sha256: request.message_sha256,
   project_chat_count: 1, active_chat_count: 1, composer_count: 1, visible_match_count: 1 }
 ok('one exact visible bubble is accepted', verifyDesktopEvidence(request, evidence).envelope === envelope)
 const nativeSource = readFileSync(new URL('../mcp/tools/codex-macos-ui.swift', import.meta.url), 'utf8')
-ok('duplicate chat titles in another project cannot own the configured composer',
-  /let owned = projectChats\.compactMap/.test(nativeSource) && !/let owned = named\.compactMap/.test(nativeSource))
+const adapterSource = readFileSync(new URL('../mcp/tools/codex-macos-desktop-adapter.mjs', import.meta.url), 'utf8')
+const selectionSource = readFileSync(new URL('../mcp/tools/codex_desktop_selection.mjs', import.meta.url), 'utf8')
+ok('project-qualified sidebar task and active header are independently required',
+  /let projectChats = named\.filter/.test(nativeSource) && /let active = named\.compactMap/.test(nativeSource))
+ok('selected-project proof precedes every native binder invocation',
+  adapterSource.indexOf('verifySelectedDesktopProject({') < adapterSource.indexOf('spawnSync(manifest.codexUiDriver'))
+ok('native binder revalidates selected project after staging and before Send', (() => {
+  const checks = [...nativeSource.matchAll(/selectedProjectIsBound\(request\)/g)].map(match => match.index)
+  return checks.length === 2 && checks[0] < nativeSource.indexOf('request.text as CFTypeRef') &&
+    checks[1] > nativeSource.indexOf('let send = ready.filter') && checks[1] < nativeSource.indexOf('kAXPressAction')
+})())
+ok('native selection proof is itself descriptor-pinned and no-follow',
+  /Darwin\.open\(request\.codex_state_path, O_RDONLY \| O_NOFOLLOW\)/.test(nativeSource) &&
+  /fstat\(fd, &info\)/.test(nativeSource) && /Darwin\.read\(fd/.test(nativeSource))
+ok('Desktop state validation and reading are pinned to one no-follow descriptor',
+  /openSync\(path, constants\.O_RDONLY \| constants\.O_NOFOLLOW\)/.test(selectionSource) &&
+  /fstatSync\(fd\)/.test(selectionSource) && /readFileSync\(fd, 'utf8'\)/.test(selectionSource) &&
+  !/readFileSync\(path/.test(selectionSource))
 ok('Electron semantic accessibility is enabled before the focused window is inspected', (() => {
   const enable = nativeSource.indexOf('"AXManualAccessibility" as CFString')
   const inspect = nativeSource.indexOf('kAXFocusedWindowAttribute')
@@ -33,6 +54,7 @@ for (const [name, mutate] of [
   ['wrong app fails closed', x => { x.app_bundle_id = 'com.apple.TextEdit' }],
   ['wrong project fails closed', x => { x.project_label = 'other' }],
   ['wrong chat fails closed', x => { x.chat_label = 'other' }],
+  ['wrong thread fails closed', x => { x.thread_id = '019fce56-7a71-7f82-9eff-efc731c8bdc6' }],
   ['configured chat present but inactive fails closed', x => { x.active_chat_count = 0 }],
   ['configured chat outside its project fails closed', x => { x.project_chat_count = 0 }],
   ['missing composer fails closed', x => { x.composer_count = 0 }],
@@ -44,5 +66,28 @@ for (const [name, mutate] of [
 throws('notification cannot reach the binder', () => desktopDeliveryRequest({ type: 'verified-notification' }, binding, policy))
 throws('unauthorized admitted-shaped data cannot reach the binder', () => desktopDeliveryRequest({ ...task, authority: null }, binding, policy))
 throws('network input cannot select another application', () => desktopDeliveryRequest(task, { ...binding, appBundleId: 'com.apple.TextEdit' }, policy))
+const stateDir = mkdtempSync(join(tmpdir(), 'nvoy-codex-selection-'))
+const statePath = join(stateDir, 'state.json')
+const projectId = '47ad8e40-4c29-4e97-9b31-69903dc37e4e'
+const selectedState = {
+  'selected-project': { type: 'local', projectId },
+  'thread-project-assignments': { [threadId]: { projectKind: 'local', projectId, cwd: '/workspace/connect' } },
+  'local-projects': { [projectId]: { id: projectId, name: 'connect', rootPaths: ['/workspace/connect'] } },
+}
+writeFileSync(statePath, JSON.stringify(selectedState), { mode: 0o600 })
+ok('immutable thread is accepted only in its selected project',
+  verifySelectedDesktopProject({ statePath, threadId, projectLabel: 'connect' }).projectId === projectId)
+for (const [name, mutate] of [
+  ['another selected project fails closed', x => { x['selected-project'].projectId = 'other' }],
+  ['thread assigned to another project fails closed', x => { x['thread-project-assignments'][threadId].projectId = 'other' }],
+  ['wrong project label fails closed', x => { x['local-projects'][projectId].name = 'other' }],
+  ['thread outside the project root fails closed', x => { x['thread-project-assignments'][threadId].cwd = '/workspace/other' }],
+]) throws(name, () => {
+  const bad = structuredClone(selectedState); mutate(bad); writeFileSync(statePath, JSON.stringify(bad), { mode: 0o600 })
+  verifySelectedDesktopProject({ statePath, threadId, projectLabel: 'connect' })
+})
+writeFileSync(statePath, JSON.stringify(selectedState), { mode: 0o600 })
+const linkPath = join(stateDir, 'state-link.json'); symlinkSync(statePath, linkPath)
+throws('symlinked Desktop state fails closed', () => verifySelectedDesktopProject({ statePath: linkPath, threadId, projectLabel: 'connect' }))
 console.log(`${passed}/${passed + failed} passed`)
 if (failed) process.exit(1)

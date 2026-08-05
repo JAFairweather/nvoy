@@ -13,12 +13,13 @@ const task = { type: 'admitted-task', instance: 'codex-jaf', envelope, messages:
   version: 2, type: 'scoped-instruction', sender, grant_id: 'c'.repeat(64), grantor, cap: 'task', scope_subject: agent, policy_checked_at: 1,
   carrier, carrier_grant_id: 'd'.repeat(64), carrier_grantor: grantor, source_event: 'b'.repeat(64), reply_channel: channel,
 } }
-const binding = { appBundleId: 'com.openai.codex', projectLabel: 'connect', chatLabel: 'Waggle live binder' }
+const binding = { appBundleId: 'com.openai.codex', projectLabel: 'connect', chatLabel: 'Waggle live binder',
+  threadId: '019fce57-063d-7f50-b837-967d33ee384a', statePath: '/tmp/.codex-global-state.json' }
 const dir = mkdtempSync(join(tmpdir(), 'nvoy-macos-adapter-')), queuePath = join(dir, 'queue.jsonl'), baselinePath = join(dir, 'baseline.jsonl'), visiblePath = join(dir, 'visible.jsonl'), completedPath = join(dir, 'completed.jsonl')
 writeFileSync(queuePath, JSON.stringify(task) + '\n', { mode: 0o600 })
 let calls = 0, observations = 0, replies = 0
 const invoke = async request => { calls++; return { version: 1, status: 'visible', envelope: request.envelope,
-  app_bundle_id: request.app_bundle_id, project_label: request.project_label, chat_label: request.chat_label,
+  app_bundle_id: request.app_bundle_id, project_label: request.project_label, chat_label: request.chat_label, thread_id: request.thread_id,
   receipt: request.receipt, message_sha256: request.message_sha256, project_chat_count: 1,
   active_chat_count: 1, composer_count: 1, visible_match_count: 1 } }
 const observe = async () => { observations++; return 'Desktop answer.' }
@@ -33,7 +34,7 @@ writeFileSync(queuePath, JSON.stringify({ ...task, envelope: 'e'.repeat(64), aut
 const ignored = await deliverPending({ queuePath, baselinePath, visiblePath, completedPath, binding, policy, invoke, observe, queueReply })
 ok('data-only admitted records never reach Accessibility', ignored.delivered === 0 && calls === 1)
 writeFileSync(queuePath, JSON.stringify({ ...task, envelope: 'f'.repeat(64) }) + '\n', { mode: 0o600 })
-try { await deliverPending({ queuePath, baselinePath, visiblePath, completedPath, binding, policy, observe, queueReply, invoke: async request => ({ version: 1, status: 'visible', envelope: request.envelope, app_bundle_id: request.app_bundle_id, project_label: request.project_label, chat_label: request.chat_label, receipt: request.receipt, message_sha256: request.message_sha256, project_chat_count: 1, active_chat_count: 1, composer_count: 2, visible_match_count: 1 }) }); ok('ambiguous UI evidence is never journaled', false) } catch { ok('ambiguous UI evidence is never journaled', true) }
+try { await deliverPending({ queuePath, baselinePath, visiblePath, completedPath, binding, policy, observe, queueReply, invoke: async request => ({ version: 1, status: 'visible', envelope: request.envelope, app_bundle_id: request.app_bundle_id, project_label: request.project_label, chat_label: request.chat_label, thread_id: request.thread_id, receipt: request.receipt, message_sha256: request.message_sha256, project_chat_count: 1, active_chat_count: 1, composer_count: 2, visible_match_count: 1 }) }); ok('ambiguous UI evidence is never journaled', false) } catch { ok('ambiguous UI evidence is never journaled', true) }
 
 // Crash after visible proof but before a final answer: restart must observe, never inject again.
 writeFileSync(queuePath, JSON.stringify({ ...task, envelope: '1'.repeat(64) }) + '\n', { mode: 0o600 })

@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import CryptoKit
+import Darwin
 import Foundation
 
 struct Request: Decodable {
@@ -9,6 +10,8 @@ struct Request: Decodable {
   let app_bundle_id: String
   let project_label: String
   let chat_label: String
+  let thread_id: String
+  let codex_state_path: String
   let receipt: String
   let message_sha256: String
   let text: String
@@ -21,6 +24,7 @@ struct Evidence: Encodable {
   let app_bundle_id: String
   let project_label: String
   let chat_label: String
+  let thread_id: String
   let receipt: String
   let message_sha256: String
   let project_chat_count: Int
@@ -88,10 +92,45 @@ func hasAncestorDescription(_ element: AXUIElement, _ expected: String) -> Bool 
   lineage(element).dropFirst().contains { text($0, kAXDescriptionAttribute as CFString) == expected }
 }
 
+func standardized(_ path: String) -> String { URL(fileURLWithPath: path).standardizedFileURL.path }
+
+func selectedProjectIsBound(_ request: Request) -> Bool {
+  let expectedState = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent(".codex/.codex-global-state.json").standardizedFileURL.path
+  guard standardized(request.codex_state_path) == expectedState else { return false }
+  let fd = Darwin.open(request.codex_state_path, O_RDONLY | O_NOFOLLOW)
+  guard fd >= 0 else { return false }
+  defer { Darwin.close(fd) }
+  var info = stat()
+  guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
+        info.st_size >= 2, info.st_size <= 4 * 1024 * 1024,
+        (info.st_mode & (S_IWGRP | S_IWOTH)) == 0 else { return false }
+  var data = Data(), buffer = [UInt8](repeating: 0, count: 64 * 1024)
+  while true {
+    let count = buffer.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, $0.count) }
+    if count < 0 { return false }
+    if count == 0 { break }
+    data.append(buffer, count: count)
+    if data.count > 4 * 1024 * 1024 { return false }
+  }
+  guard let state = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let selected = state["selected-project"] as? [String: Any], selected["type"] as? String == "local",
+        let assignments = state["thread-project-assignments"] as? [String: Any],
+        let assignment = assignments[request.thread_id] as? [String: Any], assignment["projectKind"] as? String == "local",
+        let projectId = assignment["projectId"] as? String, !projectId.isEmpty,
+        selected["projectId"] as? String == projectId,
+        let cwd = assignment["cwd"] as? String, cwd.hasPrefix("/"),
+        let projects = state["local-projects"] as? [String: Any],
+        let project = projects[projectId] as? [String: Any], project["id"] as? String == projectId,
+        project["name"] as? String == request.project_label,
+        let roots = project["rootPaths"] as? [String], roots.map(standardized).contains(standardized(cwd)) else { return false }
+  return true
+}
+
 let input = FileHandle.standardInput.readDataToEndOfFile()
 guard input.count > 0 && input.count <= 512 * 1024 else { fail("request is empty or too large") }
 guard let object = try? JSONSerialization.jsonObject(with: input) as? [String: Any],
-      Set(object.keys) == Set(["version", "envelope", "app_bundle_id", "project_label", "chat_label", "receipt", "message_sha256", "text"]) else {
+      Set(object.keys) == Set(["version", "envelope", "app_bundle_id", "project_label", "chat_label", "thread_id", "codex_state_path", "receipt", "message_sha256", "text"]) else {
   fail("request contains missing or unknown fields")
 }
 let request: Request
@@ -102,6 +141,8 @@ guard request.version == 1,
       request.envelope.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
       request.receipt == "[nvoy:\(request.envelope.prefix(16))]",
       request.message_sha256 == digest,
+      request.thread_id.range(of: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", options: .regularExpression) != nil,
+      request.codex_state_path.hasPrefix("/"),
       !request.project_label.isEmpty, !request.chat_label.isEmpty, !request.text.isEmpty,
       request.text.utf8.count <= 256 * 1024 else { fail("invalid fixed delivery request") }
 
@@ -124,21 +165,22 @@ func inspect() -> ([Node], [Node], [Node], AXUIElement?) {
   guard composers.count == 1 else { return (projects, [], composers, nil) }
   let named = nodes.filter { role($0) == kAXButtonRole && title($0) == request.chat_label }
   let projectChats = named.filter { hasAncestorDescription($0.element, request.project_label) }
-  // Composer ownership must be proven by the same element that is already bound to the
-  // configured project. Searching all same-titled chats here would let an active chat in a
-  // different project satisfy this proof while an inactive target-project chat satisfies the
-  // project proof above.
-  let owned = projectChats.compactMap { node -> (Node, AXUIElement)? in
+  // Electron renders the project-qualified sidebar task and the active-chat header as separate
+  // buttons. The keyless adapter has already proved from Codex's own state that this immutable
+  // thread belongs to the selected project. Here the header must independently and uniquely own
+  // the composer; neither a sidebar task nor a same-named inactive task can satisfy that proof.
+  let active = named.compactMap { node -> (Node, AXUIElement)? in
     guard let relation = commonAncestor(node.element, composers[0].element), relation.firstDistance <= 4 else { return nil }
     return (node, relation.element)
   }
-  return (projectChats, owned.map { $0.0 }, composers, owned.count == 1 ? owned[0].1 : nil)
+  return (projectChats, active.map { $0.0 }, composers, active.count == 1 ? active[0].1 : nil)
 }
 
 var (projectChats, chats, composers, conversationRoot) = inspect()
 guard projectChats.count == 1 else { fail("configured chat is absent or ambiguous inside its project") }
 guard chats.count == 1, let conversationRoot else { fail("configured chat does not uniquely own the composer") }
 guard composers.count == 1 else { fail("composer is absent or ambiguous") }
+guard selectedProjectIsBound(request) else { fail("configured thread is not in the selected project") }
 guard value(composers[0]).isEmpty else { fail("composer is not empty") }
 guard !tree(window).contains(where: { role($0) == kAXButtonRole && description($0) == "Stop" }) else {
   fail("Codex is still producing a turn")
@@ -153,6 +195,13 @@ let send = ready.filter { role($0) == kAXButtonRole && description($0) == "Send"
 guard send.count == 1 else {
   _ = AXUIElementSetAttributeValue(composers[0].element, kAXValueAttribute as CFString, "" as CFTypeRef)
   fail("Send control is absent or ambiguous")
+}
+// Close the project-switch race across AX activation and composer mutation. Revalidate after
+// discovering the dynamic Send control and immediately before pressing it; if selection changed,
+// remove the staged text and leave no instruction behind.
+guard selectedProjectIsBound(request) else {
+  _ = AXUIElementSetAttributeValue(composers[0].element, kAXValueAttribute as CFString, "" as CFTypeRef)
+  fail("selected project changed before send")
 }
 guard AXUIElementPerformAction(send[0].element, kAXPressAction as CFString) == .success else {
   _ = AXUIElementSetAttributeValue(composers[0].element, kAXValueAttribute as CFString, "" as CFTypeRef)
@@ -173,7 +222,7 @@ repeat {
 
 guard matches == 1 else { fail("one exact visible receipt was not observed") }
 let evidence = Evidence(status: "visible", envelope: request.envelope, app_bundle_id: request.app_bundle_id,
-  project_label: request.project_label, chat_label: request.chat_label, receipt: request.receipt,
+  project_label: request.project_label, chat_label: request.chat_label, thread_id: request.thread_id, receipt: request.receipt,
   message_sha256: request.message_sha256, project_chat_count: projectChats.count,
   active_chat_count: chats.count, composer_count: 1, visible_match_count: matches)
 let encoded = try JSONEncoder().encode(evidence)
