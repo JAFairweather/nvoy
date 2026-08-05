@@ -138,6 +138,8 @@ try {
 
   const workflow = readFileSync('.github/workflows/publish-runtime-images.yml', 'utf8')
   ok('image publication is downstream of the complete test gate', /publish:\n\s+needs: test/.test(workflow) && /run: npm test/.test(workflow))
+  ok('the non-container gate uses the immutable official setup-node v4 commit',
+    workflow.includes('actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020'))
   const unit = readFileSync('deploy/nvoy-runtime-deploy.service', 'utf8')
   ok('GitHub gets no host deployment credential; the host timer owns promotion', !/ssh|DEPLOY_KEY|HOST_KEY/i.test(workflow) && /runtime-deploy-runner\.py/.test(unit))
 } finally { rmSync(work, { recursive: true, force: true }) }
