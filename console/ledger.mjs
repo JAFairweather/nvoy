@@ -13,6 +13,7 @@ import { revokedEvent, rotatedEvent, grantedEvent, appendLedger, eventsFor, comp
 import { rotateDropping, runRelinquishRotation, nextExpiry } from './ttl.mjs'
 import { state, $, esc, short, fmtWhen, agentName, agentsOf, load, RELAYS, showTab } from './main.mjs'
 import { buildExternalRevocation } from './capgrants.mjs'
+import { childrenOf, coverageNote, unrenderedLineage, parentKey } from './lineage.mjs'
 
 // Ledger organization (a grant has three axes — who / what / state).
 let groupBy = 'agent'           // primary axis — see GROUP_OPTS
@@ -145,6 +146,12 @@ const LEDGER_STYLE = `<style>
 #ledger .lg-kid-name{font-weight:600}
 #ledger .lg-coverage{margin-top:5px;max-width:66ch}
 #ledger .lg-mono{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:50%;background:color-mix(in srgb,var(--gold) 16%,transparent);border:1px solid color-mix(in srgb,var(--gold) 45%,transparent);color:var(--gold-bright);font-family:var(--mono);font-size:11px;font-weight:700;flex:none}
+/* onward = children whose parent is a grant this key HOLDS, so it has no card above */
+#ledger .lg-onward{margin-top:14px;border:1px solid var(--line);border-radius:10px;background:var(--panel-2,var(--panel));padding:10px 12px}
+#ledger .lg-onward-h{font-size:12px;font-weight:600;color:var(--text)}
+#ledger .lg-onward-p{margin:6px 0 10px;font-size:12px;color:var(--muted);line-height:1.5}
+#ledger .lg-onward-parent{padding:8px 0;border-top:1px solid var(--line)}
+#ledger .lg-onward-parent:first-of-type{border-top:0}
 </style>`
 
 const termChips = (t) => !t ? '<span class="chip warn" title="granted without an nvoy terms object — a vanilla NIP-DA grant">vanilla grant · no terms</span>' : [
@@ -154,6 +161,18 @@ const termChips = (t) => !t ? '<span class="chip warn" title="granted without an
   t.reply_scope_requested ? '<span class="chip term" title="agent grants results back via its outbox (§6.5) — see the output panel below">reply requested</span>' : '',
   t.auto_relinquish ? '<span class="chip term" title="agent destroys key + cache on completion / at expiry (§6.6)">auto-relinquish</span>' : '',
 ].filter(Boolean).join('')
+
+/** One attenuation chain, rendered identically wherever its parent turns out to live. */
+const kidList = (kids) => `<div class="lg-lineage">${kids.map(k => {
+  const dead = k.state === 'revoked'
+  return `<div class="lg-kid${dead ? ' dead' : ''}">
+    <span class="lg-kid-arm">└─</span>
+    <span class="lg-kid-name">${esc(k.child.scope_name || k.child.scope)}</span>
+    <span class="chip scope-${dead ? 'revoked' : 'active'}">${dead ? 'severed' : 'active'}</span>
+    <span class="msg">→ ${esc(short(k.child.grantee))} · v${k.child.generation}${
+      dead && k.revoked_at ? ` · severed ${esc(fmtWhen(k.revoked_at))}` : ''}</span>
+  </div>`
+}).join('')}</div>`
 
 const hRow = (ev) => {
   const what = ev.t === 'granted'
@@ -245,16 +264,7 @@ function delegationCard(d, i) {
       const note = coverageNote(d, state.index, state.me)
       if (!kids.length && !note) return ''
       return `<div class="sect2">granted onward (attenuated children you issued)</div>` +
-        (kids.length ? `<div class="lg-lineage">${kids.map(k => {
-          const dead = k.state === 'revoked'
-          return `<div class="lg-kid${dead ? ' dead' : ''}">
-            <span class="lg-kid-arm">└─</span>
-            <span class="lg-kid-name">${esc(k.child.scope_name || k.child.scope)}</span>
-            <span class="chip scope-${dead ? 'revoked' : 'active'}">${dead ? 'severed' : 'active'}</span>
-            <span class="msg">→ ${esc(short(k.child.grantee))} · v${k.child.generation}${
-              dead && k.revoked_at ? ` · severed ${esc(fmtWhen(k.revoked_at))}` : ''}</span>
-          </div>`
-        }).join('')}</div>` : '') +
+        (kids.length ? kidList(kids) : '') +
         (note ? `<div class="msg lg-coverage">${esc(note)}</div>` : '')
     })()}
     ${wantsOutput ? `<div class="sect2">agent output (§6.5 — dereferenced live, never stored)</div>
@@ -295,6 +305,18 @@ export function renderLedger() {
   const isAgent = pub => agentPubs.has(pub)
   const t = computeTotals(all, state.index.nvoy_ledger ?? [], undefined, agentPubs)
   const next = nextExpiry(state.index)
+
+  // Lineage rows whose parent has no card above, and therefore no home in the grouped list.
+  //
+  // A card in `all` is an issued grant, so it can only ever host children whose parent publisher
+  // is THIS key. The first hop of a chain — this key deriving from a grant it HOLDS — carries the
+  // upstream delegator as `parent.publisher`, so it matches no card and would vanish. Computed
+  // against the UNFILTERED `all` on purpose: whether a row has a parent card is a fact about the
+  // index, not about the filter rail, and a disclosure that flickered with the filters would be
+  // worse than none.
+  const onward = unrenderedLineage(state.index, new Set(all.map(d => parentKey(state.me, d.scope))))
+  // Name the held parent from the grants readable this session. A miss is reported, never guessed.
+  const heldParent = (g) => state.received.find(r => r.publisher === g.publisher && r.scopeId === g.scope) || null
 
   // Multi-select filters (empty set = all) + agent + free-text; then group.
   const q = fQuery.trim().toLowerCase()
@@ -441,6 +463,27 @@ export function renderLedger() {
             : `Nothing delegated yet.<br>
           The ledger is the audit view: every delegation, its terms, every rotation and revocation —
           a query over your encrypted Grant Index, not archaeology across admin panels.`}</div>`}
+        ${onward.length ? `<div class="lg-onward">
+          <div class="lg-onward-h">granted onward from grants you hold</div>
+          <div class="lg-onward-p">You derived ${onward.reduce((n, g) => n + g.children.length, 0)}
+            attenuated grant${onward.reduce((n, g) => n + g.children.length, 0) === 1 ? '' : 's'} from
+            ${onward.length} grant${onward.length === 1 ? '' : 's'} <b>issued to you by someone else</b>.
+            Those parents are not delegations you made, so they have no card above — but the children are
+            recorded on your own index and are yours to answer for.</div>
+          ${onward.map(g => {
+            const p = heldParent(g)
+            return `<div class="lg-onward-parent">
+              <div class="note lg-flow"><span class="lg-arrow">from</span>
+                <b style="color:var(--text)">${esc(p?.scopeName || g.scope)}</b>
+                <span class="meta" title="the parent grant's publisher — the delegator who granted it to you">${esc(short(g.publisher))}</span>
+                ${g.generation !== null ? `<span class="meta" title="parent scope key generation at derivation">v${g.generation}</span>` : ''}</div>
+              ${p ? '' : `<div class="msg">The parent grant is not among the grants readable in this session —
+                it may have been rotated or revoked since you derived from it. The children below are still
+                recorded on your index; this is not a claim that the parent is gone.</div>`}
+              ${kidList(g.children)}
+            </div>`
+          }).join('')}
+        </div>` : ''}
       </div>
     </div>`
 

@@ -18,7 +18,9 @@
 //
 //   node test/lineage.mjs
 
-import { childrenOf, lineageSummary, mayHaveHiddenDescendants, coverageNote } from '../console/lineage.mjs'
+import { childrenOf, lineageSummary, mayHaveHiddenDescendants, coverageNote,
+  lineageByParent, unrenderedLineage, parentKey } from '../console/lineage.mjs'
+import { deriveDelegations } from '../console/ledgerlog.mjs'
 
 let pass = 0, fail = 0
 const ok = (name, value, detail = '') => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}${value ? '' : ` (${detail})`}`); value ? pass++ : fail++ }
@@ -93,6 +95,82 @@ ok('a grant held by this key needs no disclaimer — its own derivations are rea
 ok('a row that already shows children does not also disclaim',
   coverageNote({ scope: 'house-style', agent: ME, terms: { redelegate: true } },
     index([row({ parent: { publisher: ME } })]), ME) === null)
+
+// ── composition: what the Ledger ACTUALLY renders ─────────────────────────────
+//
+// The assertions above all pass on a build where the first derived child is invisible, because
+// each one tests a function in isolation. The defect only exists in the composition: `renderLedger`
+// builds cards from `deriveDelegations(index)` — this key's ISSUED grants — and then asks
+// `childrenOf(index, d.scope, ME)`. A first-hop row carries the upstream delegator as
+// `parent.publisher` (`mcp/src/subgrants.ts` stores the parent verbatim), so it matches no card.
+//
+// So this section drives the REAL `deriveDelegations` over a REAL index and asserts the property
+// the screen owes: every readable row reaches the reader from its own parent identity.
+
+const DIRECTOR = 'e'.repeat(64)
+
+// An index shaped the way one actually arrives: this key issued one grant onward to LEAF2, and
+// separately derived a child from `project-brief` — a grant the DIRECTOR issued TO this key.
+const composed = {
+  issued: [{ scope: 'my-own', scope_name: 'my-own', grantees: [LEAF2] }],
+  received: [],
+  nvoy_ledger: [{ t: 'granted', scope: 'my-own', agent: LEAF2, at: 500, v: 1, name: 'my-own' }],
+  nvoy_derived_children: [
+    // the case that motivated the PR: derived from a grant this key HOLDS
+    row({ parent: { publisher: DIRECTOR, scope: 'project-brief', generation: 2 },
+      child: { scope: 'kid-first', grantee: LEAF1, generation: 1, scope_name: 'derived:project-brief/tone' },
+      issued_at: 1200 }),
+    // and a later hop whose parent IS this key's own scope, which always worked
+    row({ parent: { publisher: ME, scope: 'my-own', generation: 1 },
+      child: { scope: 'kid-second', grantee: LEAF2, generation: 1, scope_name: 'derived:my-own/x' },
+      issued_at: 1300 }),
+  ],
+}
+const cards = deriveDelegations(composed)
+// Exactly how renderLedger computes what it can host inline.
+const covered = new Set(cards.map(d => parentKey(ME, d.scope)))
+const inlineShown = cards.flatMap(d => childrenOf(composed, d.scope, ME))
+const onward = unrenderedLineage(composed, covered)
+
+ok('deriveDelegations produces a card for the grant this key ISSUED', cards.some(d => d.scope === 'my-own'))
+ok('…and produces NO card for the grant this key HOLDS — which is why the inline call cannot host it',
+  !cards.some(d => d.scope === 'project-brief'))
+ok('the second-hop child IS shown inline, as it always was',
+  inlineShown.some(k => k.child.scope === 'kid-second'))
+ok('THE DEFECT: the first derived child is invisible to the inline call alone',
+  !inlineShown.some(k => k.child.scope === 'kid-first'))
+ok('THE FIX: the first derived child is visible in the onward view',
+  onward.some(g => g.children.some(k => k.child.scope === 'kid-first')))
+ok('…keyed by its REAL parent identity, not by this key',
+  onward.some(g => g.publisher === DIRECTOR && g.scope === 'project-brief'))
+ok('…carrying the parent generation, so the reader knows which key version it attenuated',
+  onward.find(g => g.scope === 'project-brief')?.generation === 2)
+ok('the onward view does not duplicate what a card already shows',
+  !onward.some(g => g.children.some(k => k.child.scope === 'kid-second')))
+
+// The partition invariant. This is the assertion that makes the class of bug unrepeatable: it
+// fails for ANY row the composition drops, not just the one row this PR was about.
+const rendered = new Set([...inlineShown, ...onward.flatMap(g => g.children)].map(k => k.child.scope))
+ok('EVERY readable row reaches the reader — inline or onward, none dropped',
+  composed.nvoy_derived_children.every(r => rendered.has(r.child.scope)),
+  `dropped: ${composed.nvoy_derived_children.filter(r => !rendered.has(r.child.scope)).map(r => r.child.scope)}`)
+ok('…and each row appears exactly once', rendered.size === composed.nvoy_derived_children.length)
+
+// A row whose parent is neither an issued card nor a currently-readable received grant must still
+// be reachable. The Ledger reports the miss; it does not drop the child to hide it.
+const rotatedAway = { ...composed, nvoy_derived_children: [composed.nvoy_derived_children[0]] }
+ok('a row whose parent grant is no longer readable is still shown, not silently dropped',
+  unrenderedLineage(rotatedAway, new Set(deriveDelegations(rotatedAway).map(d => parentKey(ME, d.scope))))
+    .flatMap(g => g.children).length === 1)
+
+// Grouping is by the pair, never the `d` alone — the same conflation guarded at the top, at the
+// level where two delegators could hand this key the same scope name.
+const twoParents = index([
+  row({ parent: { publisher: DIRECTOR, scope: 'brief' }, child: { scope: 'k1', grantee: LEAF1, generation: 1 } }),
+  row({ parent: { publisher: OTHER, scope: 'brief' }, child: { scope: 'k2', grantee: LEAF2, generation: 1 } }),
+])
+ok('two delegators granting the same scope name stay two parents, not one',
+  lineageByParent(twoParents).length === 2)
 
 console.log(`\n${pass}/${pass + fail} passed`)
 process.exit(fail ? 1 : 0)

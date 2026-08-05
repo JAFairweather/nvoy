@@ -44,6 +44,51 @@ export function childrenOf(index, parentScope, parentPublisher = null) {
     .sort((a, b) => (a.issued_at || 0) - (b.issued_at || 0))
 }
 
+/** The join key for a parent identity. A scope `d` is only unique per publisher. */
+export const parentKey = (publisher, scope) => `${publisher}:${scope}`
+
+/**
+ * Every readable row, grouped by its REAL parent identity `(publisher, scope)`.
+ *
+ * This is the total partition of the lineage ledger: each row lands in exactly one group, so a
+ * caller that renders every group cannot silently omit a row. That property is the point.
+ * `childrenOf(index, scope, selfPub)` answers a NARROWER question — children derived from a scope
+ * THIS key published — and is the right call for a card the Ledger built from `index.issued`. But
+ * the first hop of an attenuation chain has `parent.publisher = the upstream delegator`
+ * (`mcp/src/subgrants.ts` writes the parent verbatim), so it belongs to no issued scope and would
+ * be invisible to a view built only from `deriveDelegations`. Grouping by the real parent is how a
+ * row's parent identity is recovered rather than assumed.
+ */
+export function lineageByParent(index) {
+  const rows = (Array.isArray(index?.nvoy_derived_children) ? index.nvoy_derived_children : []).filter(wellFormed)
+  const groups = new Map()
+  for (const r of rows) {
+    const key = parentKey(r.parent.publisher, r.parent.scope)
+    if (!groups.has(key)) groups.set(key, {
+      key,
+      publisher: r.parent.publisher,
+      scope: r.parent.scope,
+      generation: typeof r.parent.generation === 'number' ? r.parent.generation : null,
+      children: [],
+    })
+    groups.get(key).children.push(r)
+  }
+  for (const g of groups.values()) g.children.sort((a, b) => (a.issued_at || 0) - (b.issued_at || 0))
+  return [...groups.values()].sort((a, b) => (b.children[0]?.issued_at || 0) - (a.children[0]?.issued_at || 0))
+}
+
+/**
+ * The lineage groups a caller has NOT already rendered under a parent card.
+ *
+ * `renderedParents` is the set of `parentKey(publisher, scope)` values the caller can show inline.
+ * Whatever comes back has no home yet and MUST be given one — the Ledger may not claim to show
+ * what this key granted onward while dropping the rows whose parent it never had a card for.
+ */
+export function unrenderedLineage(index, renderedParents) {
+  const seen = renderedParents instanceof Set ? renderedParents : new Set(renderedParents || [])
+  return lineageByParent(index).filter(g => !seen.has(g.key))
+}
+
 /** Every parent scope this key has derived from — for a "granted onward" summary. */
 export function lineageSummary(index) {
   const rows = (Array.isArray(index?.nvoy_derived_children) ? index.nvoy_derived_children : []).filter(wellFormed)
