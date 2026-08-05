@@ -197,6 +197,11 @@ guard !tree(window).contains(where: { role($0) == kAXButtonRole && description($
 
 let setResult = AXUIElementSetAttributeValue(composers[0].element, kAXValueAttribute as CFString, request.text as CFTypeRef)
 guard setResult == .success, value(composers[0]) == request.text else { fail("could not set the exact composer value") }
+func clearExactStagedText() {
+  if value(composers[0]) == request.text {
+    _ = AXUIElementSetAttributeValue(composers[0].element, kAXValueAttribute as CFString, "" as CFTypeRef)
+  }
+}
 
 // Re-read after setting text because the Send button is rendered dynamically.
 let ready = tree(window)
@@ -221,8 +226,18 @@ guard AXUIElementPerformAction(send[0].element, kAXPressAction as CFString) == .
 // not a global Return keystroke, so it cannot land in another app or conversation.
 usleep(300_000)
 if value(composers[0]) == request.text {
+  guard selectedProjectIsBound(request) else {
+    clearExactStagedText()
+    fail("selected project changed before background confirm")
+  }
+  let rebound = inspect()
+  guard rebound.1.count == 1, rebound.2.count == 1, rebound.3 != nil,
+        CFEqual(rebound.2[0].element, composers[0].element) else {
+    clearExactStagedText()
+    fail("configured chat no longer uniquely owns the staged composer")
+  }
   guard AXUIElementPerformAction(composers[0].element, kAXConfirmAction as CFString) == .success else {
-    _ = AXUIElementSetAttributeValue(composers[0].element, kAXValueAttribute as CFString, "" as CFTypeRef)
+    clearExactStagedText()
     fail("background Send did not submit and composer refused AXConfirm")
   }
 }
@@ -239,7 +254,10 @@ repeat {
   matches = seen.count
 } while matches == 0 && Date() < deadline
 
-guard matches == 1 else { fail("one exact visible receipt was not observed") }
+guard matches == 1 else {
+  clearExactStagedText()
+  fail("one exact visible receipt was not observed")
+}
 let evidence = Evidence(status: "visible", envelope: request.envelope, app_bundle_id: request.app_bundle_id,
   project_label: request.project_label, chat_label: request.chat_label, thread_id: request.thread_id, receipt: request.receipt,
   message_sha256: request.message_sha256, project_chat_count: projectChats.count,
