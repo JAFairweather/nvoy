@@ -375,3 +375,6 @@ read-only `GH_TOKEN` in `/etc/nvoy/runtime-deploy.env` (root-owned mode `0600`).
 host credential: merged, tested source authorizes a release, while promotion remains local.
 The runtime host requires Python 3, Git, Docker, and the Compose plugin; it deliberately does not
 need a host Node/npm installation because rendering executes inside the candidate runtime image.
+Install the Compose plugin in a system-wide Docker CLI plugin directory. The hardened unit hides
+`/root` and intentionally uses an empty private `DOCKER_CONFIG`; a plugin or registry credential
+installed only beneath `/root/.docker` is not part of the deployment service's capability set.

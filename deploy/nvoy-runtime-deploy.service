@@ -13,6 +13,10 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin
 Environment=NVOY_INSTANCE_ROOT=/etc/nvoy/instances
 Environment=NVOY_DEPLOY_STATE=/var/lib/nvoy-deploy
 Environment=NVOY_DEPLOY_HUB=/opt/nvoy-hub
+# ProtectHome deliberately hides root's Docker configuration. Point the CLI at this service's
+# private /tmp so an unreadable /root/.docker/config.json cannot suppress discovery of the
+# system-wide Compose plugin. The deployer needs no registry credential for public images.
+Environment=DOCKER_CONFIG=/tmp/nvoy-docker
 EnvironmentFile=-/etc/nvoy/runtime-deploy.env
 ExecStart=/usr/bin/python3 /opt/nvoy-hub/deploy/runtime-deploy-runner.py
 PrivateTmp=yes
