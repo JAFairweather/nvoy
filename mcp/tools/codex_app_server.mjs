@@ -72,7 +72,17 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
         let message; try { message = JSON.parse(String(body)) } catch { continue }
         if (waitForCompletion && message.method === 'item/completed') {
           const p = message.params || {}
-          if (p.threadId === id && p.turnId === startedTurn && p.item?.type === 'agentMessage' && typeof p.item.text === 'string') finalText = p.item.text
+          if (p.threadId === id && p.turnId === startedTurn && p.item?.type === 'agentMessage' && typeof p.item.text === 'string') {
+            // A remotely controlled Desktop turn can publish its durable final-answer item
+            // without replaying turn/completed to this secondary socket subscriber. Waiting
+            // only for the latter strands the broker receipt after the user has already seen
+            // the answer. Commentary is never a reply; only Codex's explicit final phase may
+            // close the call early. Older app-server builds without item phases retain the
+            // turn/completed path below.
+            if (p.item.phase === 'final_answer' && p.item.text.trim())
+              return finish(null, { threadId: id, turnId: startedTurn, recovered: false, finalText: p.item.text })
+            if (p.item.phase !== 'commentary') finalText = p.item.text
+          }
           continue
         }
         if (waitForCompletion && message.method === 'turn/completed') {

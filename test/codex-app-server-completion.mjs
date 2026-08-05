@@ -42,8 +42,10 @@ const server = net.createServer(stream => {
       if (request.method === 'thread/resume') stream.write(frame({ id: request.id, result: { thread: { id: thread } } }))
       if (request.method === 'turn/start') {
         stream.write(frame({ id: request.id, result: { turn: { id: turn } } }))
-        stream.write(frame({ method: 'item/completed', params: { threadId: thread, turnId: turn, completedAtMs: Date.now(), item: { id: 'msg', type: 'agentMessage', text: 'WAKE proof acknowledged once.' } } }))
-        stream.write(frame({ method: 'turn/completed', params: { threadId: thread, turn: { id: turn, status: 'completed', items: [] } } }))
+        stream.write(frame({ method: 'item/completed', params: { threadId: thread, turnId: turn, completedAtMs: Date.now(), item: { id: 'comment', type: 'agentMessage', phase: 'commentary', text: 'Still working.' } } }))
+        stream.write(frame({ method: 'item/completed', params: { threadId: thread, turnId: turn, completedAtMs: Date.now(), item: { id: 'msg', type: 'agentMessage', phase: 'final_answer', text: 'WAKE proof acknowledged once.' } } }))
+        // Deliberately omit turn/completed: the live secondary control-socket subscriber can
+        // miss it even though the explicitly phased final item is durable in the thread.
       }
     }
   })
@@ -54,7 +56,7 @@ try {
   const result = await appServerCall({ socketPath: socket, threadId: thread, input: 'wake', clientUserMessageId: 'nvoy:test',
     dedupeToken: 'NVOY_ENVELOPE_ID=' + 'a'.repeat(64), waitForCompletion: true, timeoutMs: 10_000 })
   if (result.turnId !== turn || result.finalText !== 'WAKE proof acknowledged once.') throw new Error('completed response was not bound and captured')
-  console.log('codex-app-server-completion: exact turn final response captured')
+  console.log('codex-app-server-completion: commentary ignored and exact final item captured without turn/completed')
 } finally {
   await new Promise(resolve => server.close(resolve))
   rmSync(root, { recursive: true, force: true })
