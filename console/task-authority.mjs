@@ -5,7 +5,7 @@
 
 import { nip19 } from 'nostr-tools'
 import { state, $, esc, parsePub, short, load } from './main.mjs'
-import { buildTaskAuthority, signPublishTaskAuthority } from './task-authority-lib.mjs'
+import { buildTaskAuthority, parseTaskAuthorityPrefill, signPublishTaskAuthority } from './task-authority-lib.mjs'
 
 const npub = (hexPub) => nip19.npubEncode(hexPub)
 const option = (agent) => `<option value="${esc(npub(agent.pub))}">${esc(agent.name || agent.display_name || short(agent.pub))}</option>`
@@ -22,6 +22,13 @@ export function renderTaskAuthority() {
       <div class="actions"><button class="primary" id="ta-issue">Review and sign authority</button><span class="msg" id="ta-msg"></span></div>
     </div>`
   $('ta-issue').onclick = issue
+  const prefill = parseTaskAuthorityPrefill(location.search)
+  if (prefill) {
+    $('ta-sender').value = npub(prefill.senderPub)
+    $('ta-agent').value = npub(prefill.agentPub)
+    $('ta-cap').value = prefill.cap
+    $('ta-msg').textContent = 'prefilled from link — review every field before signing'
+  }
 }
 
 async function issue() {
