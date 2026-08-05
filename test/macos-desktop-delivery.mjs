@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { generateSecretKey, getPublicKey } from 'nostr-tools/pure'
 import { desktopDeliveryRequest, verifyDesktopEvidence, visibleReceipt } from '../mcp/tools/macos_desktop_delivery.mjs'
 
@@ -20,6 +21,9 @@ const evidence = { version: 1, status: 'visible', envelope, app_bundle_id: reque
   chat_label: request.chat_label, receipt: request.receipt, message_sha256: request.message_sha256,
   project_chat_count: 1, active_chat_count: 1, composer_count: 1, visible_match_count: 1 }
 ok('one exact visible bubble is accepted', verifyDesktopEvidence(request, evidence).envelope === envelope)
+const nativeSource = readFileSync(new URL('../mcp/tools/codex-macos-ui.swift', import.meta.url), 'utf8')
+ok('duplicate chat titles in another project cannot own the configured composer',
+  /let owned = projectChats\.compactMap/.test(nativeSource) && !/let owned = named\.compactMap/.test(nativeSource))
 for (const [name, mutate] of [
   ['wrong app fails closed', x => { x.app_bundle_id = 'com.apple.TextEdit' }],
   ['wrong project fails closed', x => { x.project_label = 'other' }],

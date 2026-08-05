@@ -118,7 +118,11 @@ func inspect() -> ([Node], [Node], [Node], AXUIElement?) {
   guard composers.count == 1 else { return (projects, [], composers, nil) }
   let named = nodes.filter { role($0) == kAXButtonRole && title($0) == request.chat_label }
   let projectChats = named.filter { hasAncestorDescription($0.element, request.project_label) }
-  let owned = named.compactMap { node -> (Node, AXUIElement)? in
+  // Composer ownership must be proven by the same element that is already bound to the
+  // configured project. Searching all same-titled chats here would let an active chat in a
+  // different project satisfy this proof while an inactive target-project chat satisfies the
+  // project proof above.
+  let owned = projectChats.compactMap { node -> (Node, AXUIElement)? in
     guard let relation = commonAncestor(node.element, composers[0].element), relation.firstDistance <= 4 else { return nil }
     return (node, relation.element)
   }
