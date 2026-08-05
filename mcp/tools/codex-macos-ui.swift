@@ -100,6 +100,9 @@ guard projects.count == 1 else { fail("configured project is absent or ambiguous
 guard chats.count == 1 else { fail("configured active chat is absent or ambiguous") }
 guard composers.count == 1 else { fail("composer is absent or ambiguous") }
 guard value(composers[0]).isEmpty else { fail("composer is not empty") }
+guard !tree(window).contains(where: { role($0) == kAXButtonRole && description($0) == "Stop" }) else {
+  fail("Codex is still producing a turn")
+}
 
 let setResult = AXUIElementSetAttributeValue(composers[0].element, kAXValueAttribute as CFString, request.text as CFTypeRef)
 guard setResult == .success, value(composers[0]) == request.text else { fail("could not set the exact composer value") }
