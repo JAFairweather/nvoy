@@ -24,18 +24,111 @@
      monospace for labels/keys. Semantics: accent = the app's act,
      ok/green = active delegation, amber = expiring/stale/draft,
      red = revoke/destroy. */
+  /* ─── The Nave design system — canonical tokens ───────────────────────────
+     VENDORED VERBATIM from nave.pub design/tokens.css. Keep in sync:
+       NAVE_HUB=<hub> npm run sync-vendor   (reports this block's drift)
+     An app overrides ONLY --accent / --accent-bright / --accent-ink; see below. */
+  /* ─── The Nave design system — canonical tokens ───────────────────────────
+     Source of truth for the whole family. No-build static clients VENDOR (inline)
+     this block into their <style>; keep them in sync with this file. Each app
+     overrides only --accent / --accent-bright / --accent-ink with its own seal
+     colour (see design/DESIGN.md).
+
+     Art direction: a machinist's workbench at night. Warm brown-black ground, a
+     single brass tool-line of light, everything squared and legible. Mono labels
+     stamp the surface like an engraver's marks; the serif signs its name.
+
+     Type has three jobs: --sans does all UI/body work, --mono is the signature
+     (labels, keys, code, values), --display (serif) is for titles and editorial
+     asides only. Themes: dark is canonical; light is derived (warm-biased). The
+     viewer's OS pref drives prefers-color-scheme; a data-theme="light|dark" on
+     :root wins over it in both directions. */
   :root {
-    --ink: #0b0906; --bg: #0b0906; --panel: #14100a; --panel2: #1b1409; --line: #2a2317;
-    --text: #f4efe4; --dim: #9c927f;
+    /* surfaces (dark = canonical) */
+    --ground: #0b0906; --panel: #14100a; --panel-2: #1b1409;
+    --line: #2a2317; --line-strong: #3a3020;
+    --field: #0d0a06;                      /* inputs / code wells, one notch below panel */
+    /* legacy aliases (older vendored copies referenced these) */
+    --ink: #0b0906; --bg: #0b0906;
+    /* text */
+    --text: #f4efe4; --dim: #9c927f; --faint: #6f6555;
+    /* the Nave brand (brass) — the through-line colour */
     --gold: #c39a56; --gold-bright: #e2c079;
-    --accent: #6fa8a0; --accent-bright: #8bc0b8; --accent-ink: #06140f;
-    --ok: #8fae6a; --warn: #d9a648; --danger: #c0705a;
+    /* per-app accent — OVERRIDE these three per app; default = brass */
+    --accent: #c39a56; --accent-bright: #e2c079; --accent-ink: #0b0906;
+    /* semantics (both name sets kept; new = good/warn/critical) */
+    --good: #8fae6a; --warn: #d9a648; --critical: #c0705a;
+    --ok: #8fae6a; --danger: #c0705a;
+    /* diff highlight: authored-by-you (green) vs from-template (slate) */
+    --diff-user: #8fae6a;     --diff-user-bg: color-mix(in srgb, #8fae6a 14%, transparent);
+    --diff-template: #7f95ad; --diff-template-bg: color-mix(in srgb, #7f95ad 12%, transparent);
+    /* Alby sign-in (NIP-07) */
     --alby: #ffdf6f; --alby-bright: #ffe98c; --alby-ink: #1c1400;
+    /* type */
     --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", Roboto, "Helvetica Neue", Arial, sans-serif;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Roboto Mono", monospace;
-    --serif: var(--sans);   /* the family is sans-serif now; alias kept for any legacy refs */
-    --radius: 6px;
+    --display: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+    --serif: var(--sans);   /* legacy alias — kept so old vendored refs stay sans */
+    /* radii */
+    --r-sm: 6px; --r-md: 10px; --r-pill: 999px; --radius: 6px;
   }
+
+  /* Light theme — derived, warm-biased (never a dead grey). Brass darkens to hold
+     contrast as text/borders; use bright brass only for large fills or the seal. */
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --ground: #f5f0e4; --panel: #fffdf7; --panel-2: #ece4d2;
+      --line: #ddd2ba; --line-strong: #c8b89a; --field: #fffdf7;
+      --ink: #f5f0e4; --bg: #f5f0e4;
+      --text: #241d12; --dim: #6f6553; --faint: #8a7f66;
+      --accent: #8f6a2c; --accent-bright: #b0863c; --accent-ink: #fffdf7;
+      --good: #4f7a34; --warn: #9a6a12; --critical: #a2482f;
+      --ok: #4f7a34; --danger: #a2482f;
+      --diff-user: #4f7a34;     --diff-user-bg: #e9f0dd;
+      --diff-template: #48607a; --diff-template-bg: #e6ecf3;
+    }
+  }
+  :root[data-theme="light"] {
+    --ground: #f5f0e4; --panel: #fffdf7; --panel-2: #ece4d2;
+    --line: #ddd2ba; --line-strong: #c8b89a; --field: #fffdf7;
+    --ink: #f5f0e4; --bg: #f5f0e4;
+    --text: #241d12; --dim: #6f6553; --faint: #8a7f66;
+    --accent: #8f6a2c; --accent-bright: #b0863c; --accent-ink: #fffdf7;
+    --good: #4f7a34; --warn: #9a6a12; --critical: #a2482f;
+    --ok: #4f7a34; --danger: #a2482f;
+    --diff-user: #4f7a34;     --diff-user-bg: #e9f0dd;
+    --diff-template: #48607a; --diff-template-bg: #e6ecf3;
+  }
+  /* data-theme="dark" is the canonical :root block above; this selector just makes
+     the toggle authoritative when the OS pref is light. */
+  :root[data-theme="dark"] {
+    --ground: #0b0906; --panel: #14100a; --panel-2: #1b1409;
+    --line: #2a2317; --line-strong: #3a3020; --field: #0d0a06;
+    --ink: #0b0906; --bg: #0b0906;
+    --text: #f4efe4; --dim: #9c927f; --faint: #6f6555;
+    --accent: #c39a56; --accent-bright: #e2c079; --accent-ink: #0b0906;
+    --good: #8fae6a; --warn: #d9a648; --critical: #c0705a;
+    --ok: #8fae6a; --danger: #c0705a;
+    --diff-user: #8fae6a;     --diff-user-bg: color-mix(in srgb, #8fae6a 14%, transparent);
+    --diff-template: #7f95ad; --diff-template-bg: color-mix(in srgb, #7f95ad 12%, transparent);
+  }
+
+  /* ── nvoy's own accent, the only tokens design/tokens.css permits an app to override ──
+     Teal, per design/DESIGN.md's per-app table. Light needs a darker teal to hold contrast
+     as text and borders, the same way the hub's brass darkens. */
+  :root { --accent: #6fa8a0; --accent-bright: #8bc0b8; --accent-ink: #06140f; }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) { --accent: #2f6b63; --accent-bright: #3f8078; --accent-ink: #fffdf7; }
+  }
+  :root[data-theme="light"] { --accent: #2f6b63; --accent-bright: #3f8078; --accent-ink: #fffdf7; }
+  :root[data-theme="dark"]  { --accent: #6fa8a0; --accent-bright: #8bc0b8; --accent-ink: #06140f; }
+
+  /* ── transitional alias, remove one deploy later ──
+     This console referenced `--panel2`; the system defines `--panel-2`. They were silently
+     separate variables, so the console has been falling back to unset for that surface. Aliased
+     rather than renamed in the same commit as the re-vendor: a token change that also moves
+     markup is unreviewable. The rulesets are renamed in a follow-up, then this line goes. */
+  :root { --panel2: var(--panel-2); }
   * { box-sizing: border-box; }
   body {
     margin: 0; background: var(--bg); color: var(--text);
