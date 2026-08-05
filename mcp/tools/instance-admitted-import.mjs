@@ -6,7 +6,7 @@
 import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { readManifest, instanceId } from './runtime_manifest.mjs'
-import { validateAdmittedTask } from './admitted_task.mjs'
+import { validateDesktopDelivery } from './admitted_task.mjs'
 
 const die = message => { console.error(`instance-admitted-import: ${message}`); process.exit(1) }
 const flag = name => { const i = process.argv.indexOf(name); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -44,7 +44,7 @@ for (const line of input.split('\n').filter(Boolean)) {
   if (Buffer.byteLength(line) > 1024 * 1024) die('remote record exceeds import bound')
   let record
   try { record = JSON.parse(line) } catch { die('remote export contains malformed JSON') }
-  try { validateAdmittedTask(record, { instance: manifest.id, scopeSubject: manifest.pubkey, grantors: manifest.grantors, carriers: manifest.carriers }) } catch { die('remote export contains an invalid admitted record') }
+  try { validateDesktopDelivery(record, { instance: manifest.id, scopeSubject: manifest.pubkey, grantors: manifest.grantors, carriers: manifest.carriers }) } catch { die('remote export contains an invalid admitted record') }
   if (seen.has(record.envelope)) { skipped++; continue }
   const durable = JSON.stringify({ version: 1, envelope: record.envelope, imported_at: Date.now() })
   // Queue first, cursor second. A crash after queue append is deduplicated on restart because

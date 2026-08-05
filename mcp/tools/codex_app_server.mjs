@@ -32,12 +32,12 @@ export function localControlSocket(value = '') {
 // Minimal RFC 6455 client for the documented Unix app-server transport. `ws` does not reliably
 // route Unix sockets on every supported Node build; keeping the transport here also means a
 // desktop adapter has no HTTP listener and no path supplied by an incoming notification.
-export function appServerCall({ socketPath, threadId, input, clientUserMessageId = null, listOnly = false, dedupeToken = '', timeoutMs = 30000 }) {
+export function appServerCall({ socketPath, threadId, input, clientUserMessageId = null, listOnly = false, dedupeToken = '', waitForCompletion = false, timeoutMs = 30000 }) {
   const socket = localControlSocket(socketPath)
   const id = listOnly ? null : codexThreadId(threadId)
   return new Promise((resolveCall, rejectCall) => {
     const stream = net.createConnection({ path: socket })
-    let buffer = Buffer.alloc(0), upgraded = false, finished = false
+    let buffer = Buffer.alloc(0), upgraded = false, finished = false, startedTurn = '', finalText = ''
     const finish = (error, value) => {
       if (finished) return
       finished = true; clearTimeout(timer)
@@ -70,6 +70,22 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
         if (opcode === 9) { sendFrame(10, body); continue }
         if (opcode !== 1) continue
         let message; try { message = JSON.parse(String(body)) } catch { continue }
+        if (waitForCompletion && message.method === 'item/completed') {
+          const p = message.params || {}
+          if (p.threadId === id && p.turnId === startedTurn && p.item?.type === 'agentMessage' && typeof p.item.text === 'string') finalText = p.item.text
+          continue
+        }
+        if (waitForCompletion && message.method === 'turn/completed') {
+          const p = message.params || {}
+          if (p.threadId !== id || p.turn?.id !== startedTurn) continue
+          if (p.turn.status !== 'completed') return finish(new Error(`Codex turn ended with status ${p.turn.status || 'unknown'}`))
+          if (!finalText) {
+            const agent = [...(p.turn.items || [])].reverse().find(item => item?.type === 'agentMessage' && typeof item.text === 'string')
+            finalText = agent?.text || ''
+          }
+          if (!finalText.trim()) return finish(new Error('Codex completed without a final assistant message'))
+          return finish(null, { threadId: id, turnId: startedTurn, recovered: false, finalText })
+        }
         if (message.id === 1) {
           if (message.error) return finish(new Error(`Codex initialize failed: ${message.error.message || 'unknown error'}`))
           send({ method: 'initialized', params: {} })
@@ -82,7 +98,12 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
           if (message.result?.thread?.id !== id) return finish(new Error('Codex app-server returned an unexpected thread'))
           if (dedupeToken) {
             const prior = (message.result.thread.turns || []).find(turn => JSON.stringify(turn).includes(dedupeToken))
-            if (prior?.id) return finish(null, { threadId: id, turnId: prior.id, recovered: true })
+            if (prior?.id) {
+              const agent = [...(prior.items || [])].reverse().find(item => item?.type === 'agentMessage' && typeof item.text === 'string')
+              if (waitForCompletion && prior.status === 'completed' && agent?.text?.trim()) return finish(null, { threadId: id, turnId: prior.id, recovered: true, finalText: agent.text })
+              if (waitForCompletion) return finish(new Error('recovered Codex turn is not complete with a final assistant message'))
+              return finish(null, { threadId: id, turnId: prior.id, recovered: true })
+            }
             request('thread/resume', 3, { threadId: id })
           } else request('turn/start', 3, { threadId: id, input: [{ type: 'text', text: String(input || '') }], clientUserMessageId })
         } else if (message.id === 3) {
@@ -93,12 +114,14 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
           } else {
             if (message.error) return finish(new Error(`Codex turn/start failed: ${message.error.message || 'unknown error'}`))
             if (!message.result?.turn?.id) return finish(new Error('Codex app-server returned an invalid turn acknowledgement'))
-            return finish(null, { threadId: id, turnId: message.result.turn.id })
+            startedTurn = message.result.turn.id
+            if (!waitForCompletion) return finish(null, { threadId: id, turnId: startedTurn })
           }
         } else if (message.id === 4 && dedupeToken) {
           if (message.error) return finish(new Error(`Codex turn/start failed: ${message.error.message || 'unknown error'}`))
           if (!message.result?.turn?.id) return finish(new Error('Codex app-server returned an invalid turn acknowledgement'))
-          return finish(null, { threadId: id, turnId: message.result.turn.id, recovered: false })
+          startedTurn = message.result.turn.id
+          if (!waitForCompletion) return finish(null, { threadId: id, turnId: startedTurn, recovered: false })
         }
       }
     }

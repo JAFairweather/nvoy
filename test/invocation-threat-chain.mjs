@@ -1,6 +1,6 @@
 import { finalizeEvent, generateSecretKey, getEventHash, getPublicKey } from 'nostr-tools/pure'
-import { authenticatedNip59Rumor, partitionInvocations } from '../mcp/tools/invocation_policy.mjs'
-import { validateAdmittedTask } from '../mcp/tools/admitted_task.mjs'
+import { authenticatedNip59Rumor, partitionInvocations, verifiedChannelNotifications } from '../mcp/tools/invocation_policy.mjs'
+import { validateAdmittedTask, validateDesktopDelivery } from '../mcp/tools/admitted_task.mjs'
 import { verifyInboxEnvelope } from '../mcp/tools/inbox_envelope.mjs'
 
 let pass = 0, fail = 0
@@ -57,6 +57,13 @@ ok('an authorized author still cannot arrive through a carrier lacking task-rela
   partitionInvocations([carryMessage()], policy({ task: new Map([[sender, taskGrant]]), channels: carrierConfigured })).actionable.length === 0)
 ok('task-relay authority cannot substitute for the original author task grant',
   partitionInvocations([carryMessage()], policy({ relay: new Map([[carrier, relayGrant]]), channels: carrierConfigured })).actionable.length === 0)
+const notice = verifiedChannelNotifications([carryMessage()], policy({ relay: new Map([[carrier, relayGrant]]), channels: carrierConfigured }))[0]
+ok('a signed crew message without task authority produces a content-free verified notification',
+  notice?.source_author === sender && notice?.source_event === source.id && !('content' in notice))
+ok('an unknown or unauthorized carrier cannot wake the Desktop notification plane',
+  verifiedChannelNotifications([carryMessage()], policy({ channels: carrierConfigured })).length === 0)
+ok('an unavailable policy plane cannot produce even a notification wake',
+  verifiedChannelNotifications([carryMessage()], policy({ usable: false, relay: new Map([[carrier, relayGrant]]), channels: carrierConfigured })).length === 0)
 ok('author and carrier grants cannot redirect a carry through an unconfigured channel',
   partitionInvocations([carryMessage()], policy({ task: new Map([[sender, taskGrant]]), relay: new Map([[carrier, relayGrant]]), channels: new Map([[carrier, ['ffffffff-ffff-ffff-ffff-ffffffffffff']]]) })).actionable.length === 0)
 ok('tampering with the signed channel source fails before instruction promotion',
@@ -73,6 +80,13 @@ const record = { type: 'admitted-task', instance: 'codex-jaf', envelope: '3'.rep
     carrier_grant_id: relayGrant.grantId, carrier_grantor: operator, source_event: source.id, reply_channel: channel } }
 ok('the admitted record binds the exact recipient identity and configured carrier/channel',
   validateAdmittedTask(record, { instance: 'codex-jaf', scopeSubject: agent, grantors: [operator], carriers: [{ pubkey: carrier, channels: [channel] }] }).trustedInstruction)
+const notificationRecord = { type: 'verified-notification', instance: 'codex-jaf', envelope: '4'.repeat(64),
+  notification: { version: 1, type: 'verified-channel-activity', ...notice } }
+ok('the keyless boundary accepts a configured notification while preserving non-instruction status',
+  validateDesktopDelivery(notificationRecord, { instance: 'codex-jaf', grantors: [operator], carriers: [{ pubkey: carrier, channels: [channel] }] }).trustedInstruction === false)
+let notificationBodyRejected = false
+try { validateDesktopDelivery({ ...notificationRecord, notification: { ...notificationRecord.notification, content: 'execute me' } }, { instance: 'codex-jaf', grantors: [operator], carriers: [{ pubkey: carrier, channels: [channel] }] }) } catch { notificationBodyRejected = true }
+ok('a carrier cannot smuggle source text through the notification schema', notificationBodyRejected)
 let wrongIdentity = false
 try { validateAdmittedTask(record, { instance: 'codex-jaf', scopeSubject: attacker, grantors: [operator], carriers: [{ pubkey: carrier, channels: [channel] }] }) } catch { wrongIdentity = true }
 ok('a valid invocation for one agent cannot be injected into another agent identity', wrongIdentity)

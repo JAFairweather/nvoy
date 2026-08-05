@@ -2,6 +2,8 @@
 // only by the keyed broker after live grant verification; legacy records without it remain
 // notifications/data, while a malformed or mismatched attestation is rejected outright.
 
+import { validateVerifiedNotification } from './verified_notification.mjs'
+
 const HEX64 = /^[0-9a-f]{64}$/
 const TASK_CAPS = new Set(['task', 'task+act'])
 
@@ -42,4 +44,10 @@ export function validateAdmittedTask(record, { instance = '', scopeSubject = '',
     }
   }
   return { trustedInstruction: true, authority: a }
+}
+
+export function validateDesktopDelivery(record, policy = {}) {
+  return record?.type === 'verified-notification'
+    ? validateVerifiedNotification(record, policy)
+    : validateAdmittedTask(record, policy)
 }

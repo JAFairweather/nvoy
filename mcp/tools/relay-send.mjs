@@ -21,6 +21,7 @@
 //   WAGGLE_BRIDGE_PUBKEY   waggle's hex pubkey        (default: the live bridge key)
 //   RELAY_CHANNEL          destination channel UUID   (default: #waggle-test)
 //   RELAY_RELAYS           comma-sep relays           (default: nos.lol, primal)
+//   EXPECT_PUBKEY          required signer identity (npub or 64-hex); mismatch fails before send
 //   DRY_RUN=1              build + report, publish nothing
 //
 // After sending, VERIFY by reading your own inbox (inbox.mjs) — the crew's replies come back
@@ -53,6 +54,13 @@ if (!raw && !bunkerUri) { console.error('relay-send: set NVOY_NSEC or the Bunker
 const sk = raw ? (raw.startsWith('nsec1') ? nip19.decode(raw).data : Uint8Array.from(Buffer.from(raw, 'hex'))) : null
 const signer = bunkerUri ? makeBunkerSigner(bunkerUri, bunkerClient) : null
 const pk = signer ? await signer.getPublicKey() : getPublicKey(sk)
+const expectedRaw = String(process.env.EXPECT_PUBKEY || '').trim()
+if (expectedRaw) {
+  let expected
+  try { expected = expectedRaw.startsWith('npub1') ? nip19.decode(expectedRaw).data : expectedRaw.toLowerCase() } catch { expected = '' }
+  if (!/^[0-9a-f]{64}$/.test(String(expected || ''))) { console.error('relay-send: EXPECT_PUBKEY must be an npub or 64-hex pubkey'); process.exit(1) }
+  if (pk !== expected) { console.error(`relay-send: signer identity mismatch (resolved ${nip19.npubEncode(pk)}, expected ${nip19.npubEncode(expected)})`); process.exit(1) }
+}
 
 const body = await new Promise((res) => {
   let s = ''

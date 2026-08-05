@@ -72,10 +72,21 @@ ok('remote Codex queue install baselines history, imports only a later unseen en
 const wrongInstance = JSON.stringify({ type: 'admitted-task', instance: 'claude-other', envelope: '7'.repeat(64), messages: [{ from: 'a'.repeat(64), at: 1, content: 'cross-instance attempt' }] }) + '\n'
 const deniedImport = runImport(wrongInstance)
 ok('remote Codex queue import refuses a record for another identity', deniedImport.status !== 0 && /invalid admitted record/.test(deniedImport.stderr))
+const notificationEnvelope = 'a'.repeat(64)
+const notificationRecord = JSON.stringify({ type: 'verified-notification', instance: 'codex-desktop', envelope: notificationEnvelope,
+  notification: { version: 1, type: 'verified-channel-activity', source_author: 'b'.repeat(64), source_event: 'c'.repeat(64),
+    source_channel: manifest.task_carriers[0].channels[0], carrier: manifest.task_carriers[0].pubkey,
+    carrier_grant_id: 'd'.repeat(64), carrier_grantor: manifest.grantors[0], reason: 'reply', observed_at: 1785930000 } }) + '\n'
+const notificationImport = runImport(notificationRecord)
+ok('remote import accepts a content-free verified notification through the same fixed-instance transport',
+  notificationImport.status === 0 && readFileSync(desktopQueue, 'utf8').includes(notificationEnvelope) && !readFileSync(desktopQueue, 'utf8').includes('execute me'))
 writeFileSync(join(root, 'run-desktop', 'codex-app-server-delivered.jsonl'), JSON.stringify({ version: 1, envelope: liveEnvelope, thread_id: desktopManifest.codex_thread_id, turn_id: '019fce6b-4727-7a13-8f80-f4a6035c277f' }) + '\n')
-const requestReply = input => spawnSync(process.execPath, ['mcp/tools/desktop-reply-request.mjs', '--instance', 'codex-desktop', '--receipt', liveEnvelope], { cwd: resolve('.'), encoding: 'utf8', input, env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
+const requestReply = (input, receipt = liveEnvelope) => spawnSync(process.execPath, ['mcp/tools/desktop-reply-request.mjs', '--instance', 'codex-desktop', '--receipt', receipt], { cwd: resolve('.'), encoding: 'utf8', input, env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
 const desktopReply = requestReply('Yes.\n'), duplicateReply = requestReply('Again.\n')
 ok('the keyless Desktop can request one reply only for a notification delivered to its fixed thread', desktopReply.status === 0 && duplicateReply.status !== 0 && /already has a reply request/.test(duplicateReply.stderr) && readFileSync(join(root, 'run-desktop', 'reply-requests.jsonl'), 'utf8').includes('"content":"Yes."'))
+const notificationReply = requestReply('No authority.\n', notificationEnvelope)
+ok('a verified activity notification cannot acquire a reply capability at the keyless Desktop boundary',
+  notificationReply.status !== 0 && /not a single-sender admitted notification/.test(notificationReply.stderr))
 
 const syncUid = process.getuid(), syncRuntime = join(root, 'run-sync'), syncEnvelope = '6'.repeat(64)
 const syncManifest = { ...manifest, id: 'sync-test', pubkey: '5'.repeat(64), state_dir: join(root, 'state-sync'), runtime_dir: syncRuntime, spool_dir: join(root, 'spool-sync'),
@@ -241,7 +252,7 @@ const sourceCompleted = completeChannelSource(sourceIndex, sourceEvent, firstCar
 const completionReplay = completeChannelSource(sourceIndex, sourceEvent, firstCarrierEnvelope)
 const afterRestartRewrap = claimChannelSource(sourceIndex, sourceEvent, rewrappedEnvelope)
 ok('two carrier envelopes for one signed source yield one durable admission across retry and restart', firstSource.accepted && !firstSource.replay && sameEnvelopeRetry.accepted && sameEnvelopeRetry.replay && sourceCompleted && !completionReplay && !afterRestartRewrap.accepted && channelSourceClaims(sourceIndex).get(sourceEvent)?.state === 'delivered')
-ok('channel source is claimed before any receipt or adapter delivery, so task-relay cannot amplify author authority', brokerSource.indexOf('claimChannelSource(') < brokerSource.indexOf('const receipt =') && brokerSource.indexOf('claimChannelSource(') < brokerSource.indexOf("net.createConnection(socket)"))
+ok('channel source is claimed before any instruction receipt or instruction adapter delivery, so task-relay cannot amplify author authority', brokerSource.indexOf('claimChannelSource(') < brokerSource.indexOf('const receipt =') && brokerSource.indexOf('claimChannelSource(') < brokerSource.indexOf('const payload ='))
 const initSource = readFileSync('mcp/tools/instance-runtime-init.mjs', 'utf8')
 ok('a root-only initializer provisions all three volume roots, a credential-free Desktop queue, and role-owned credential copies', /process\.getuid\?\.\(\) !== 0/.test(initSource) && /provision\(m\.stateDir/.test(initSource) && /provision\(m\.spoolDir/.test(initSource) && /provision\(m\.runtimeDir/.test(initSource) && /desktop-reply-requests\.jsonl.*m\.adapterUid/.test(initSource) && /function provisionSecret/.test(initSource) && /brokerCredDir/.test(initSource) && /workerCredDir/.test(initSource))
 const replySource = readFileSync('mcp/tools/instance-broker-reply.mjs', 'utf8')
