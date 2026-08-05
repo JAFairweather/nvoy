@@ -24,6 +24,11 @@ ok('one exact visible bubble is accepted', verifyDesktopEvidence(request, eviden
 const nativeSource = readFileSync(new URL('../mcp/tools/codex-macos-ui.swift', import.meta.url), 'utf8')
 ok('duplicate chat titles in another project cannot own the configured composer',
   /let owned = projectChats\.compactMap/.test(nativeSource) && !/let owned = named\.compactMap/.test(nativeSource))
+ok('Electron semantic accessibility is enabled before the focused window is inspected', (() => {
+  const enable = nativeSource.indexOf('"AXManualAccessibility" as CFString')
+  const inspect = nativeSource.indexOf('kAXFocusedWindowAttribute')
+  return enable >= 0 && inspect > enable && nativeSource.includes('usleep(500_000)')
+})())
 for (const [name, mutate] of [
   ['wrong app fails closed', x => { x.app_bundle_id = 'com.apple.TextEdit' }],
   ['wrong project fails closed', x => { x.project_label = 'other' }],

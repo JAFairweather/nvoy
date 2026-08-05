@@ -109,6 +109,12 @@ guard AXIsProcessTrusted() else { fail("Accessibility permission is not enabled"
 let apps = NSRunningApplication.runningApplications(withBundleIdentifier: request.app_bundle_id)
 guard apps.count == 1, let app = apps.first, app.isActive else { fail("Codex must be the single frontmost application") }
 let application = AXUIElementCreateApplication(app.processIdentifier)
+// Electron exposes only its native window chrome until an assistive client requests the
+// Chromium accessibility tree.  The setter may return kAXErrorCannotComplete even when the
+// renderer accepts it, so the expanded tree below—not the setter's return code—is the proof.
+// This is Electron's documented third-party activation mechanism on macOS.
+_ = AXUIElementSetAttributeValue(application, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+usleep(500_000)
 guard let window = attribute(application, kAXFocusedWindowAttribute as CFString) as! AXUIElement? else { fail("Codex has no focused window") }
 
 func inspect() -> ([Node], [Node], [Node], AXUIElement?) {
