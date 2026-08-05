@@ -181,7 +181,16 @@ guard projectChats.count == 1 else { fail("configured chat is absent or ambiguou
 guard chats.count == 1, let conversationRoot else { fail("configured chat does not uniquely own the composer") }
 guard composers.count == 1 else { fail("composer is absent or ambiguous") }
 guard selectedProjectIsBound(request) else { fail("configured thread is not in the selected project") }
-guard value(composers[0]).isEmpty else { fail("composer is not empty") }
+let composerValue = value(composers[0])
+let composerPlaceholder = placeholder(composers[0])
+let normalizedComposer = composerValue.trimmingCharacters(in: .whitespacesAndNewlines)
+let composerDescription = description(composers[0]).trimmingCharacters(in: .whitespacesAndNewlines)
+let composerIsEmpty = normalizedComposer.isEmpty ||
+  (!composerPlaceholder.isEmpty && composerValue == composerPlaceholder) ||
+  (!composerDescription.isEmpty && normalizedComposer == composerDescription)
+guard composerIsEmpty else {
+  fail("composer is not empty (value \(composerValue.utf8.count) bytes; placeholder \(composerPlaceholder.utf8.count) bytes; equal \(composerValue == composerPlaceholder))")
+}
 guard !tree(window).contains(where: { role($0) == kAXButtonRole && description($0) == "Stop" }) else {
   fail("Codex is still producing a turn")
 }

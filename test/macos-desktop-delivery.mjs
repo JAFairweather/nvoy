@@ -54,6 +54,13 @@ ok('background delivery requires one Codex process but never steals or requires 
   nativeSource.includes('apps.count == 1') &&
   !nativeSource.includes('frontmostApplication') && !nativeSource.includes('app.isActive') &&
   !nativeSource.includes('activate(options:'))
+ok('whitespace-only AX composer state is empty without permitting draft overwrite',
+  nativeSource.includes('trimmingCharacters(in: .whitespacesAndNewlines)') &&
+  nativeSource.includes('let composerIsEmpty = normalizedComposer.isEmpty'))
+ok('an AX value equal to its non-empty native placeholder is not mistaken for a user draft',
+  nativeSource.includes('!composerPlaceholder.isEmpty && composerValue == composerPlaceholder'))
+ok('Chromium semantic placeholder values are accepted only when they equal the composer description',
+  nativeSource.includes('!composerDescription.isEmpty && normalizedComposer == composerDescription'))
 for (const [name, mutate] of [
   ['wrong app fails closed', x => { x.app_bundle_id = 'com.apple.TextEdit' }],
   ['wrong project fails closed', x => { x.project_label = 'other' }],
