@@ -10,6 +10,10 @@ User=root
 Group=root
 WorkingDirectory=/opt/nvoy-hub
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# ProtectHome hides root's ordinary CLI state. Keep Git and Docker out of that inaccessible
+# namespace while still allowing Docker to discover its system Compose plugin.
+Environment=HOME=/tmp/nvoy-home
+Environment=DOCKER_CONFIG=/tmp/nvoy-docker
 Environment=NVOY_INSTANCE_ROOT=/etc/nvoy/instances
 Environment=NVOY_DEPLOY_STATE=/var/lib/nvoy-deploy
 Environment=NVOY_DEPLOY_HUB=/opt/nvoy-hub

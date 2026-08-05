@@ -142,6 +142,10 @@ try {
     workflow.includes('actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020'))
   const unit = readFileSync('deploy/nvoy-runtime-deploy.service', 'utf8')
   ok('GitHub gets no host deployment credential; the host timer owns promotion', !/ssh|DEPLOY_KEY|HOST_KEY/i.test(workflow) && /runtime-deploy-runner\.py/.test(unit))
+  ok('the protected unit keeps Docker and Git out of the hidden root home',
+    /Environment=HOME=\/tmp\/nvoy-home/.test(unit) &&
+    /Environment=DOCKER_CONFIG=\/tmp\/nvoy-docker/.test(unit) &&
+    /PrivateTmp=yes/.test(unit) && /ProtectHome=yes/.test(unit))
 } finally { rmSync(work, { recursive: true, force: true }) }
 
 if (failures) process.exit(1)
