@@ -5,7 +5,12 @@ import net from 'node:net'
 import { randomBytes } from 'node:crypto'
 import { resolve } from 'node:path'
 
-const MAX_FRAME = 10 * 1024 * 1024
+// `thread/read` returns the complete durable thread when the adapter checks its envelope token
+// after an uncertain prior delivery.  A healthy, long-lived Desktop thread can exceed 10 MiB;
+// rejecting that response wedges every later wake even though the admitted task is small. Keep
+// a finite local-only transport bound, but size it for real project threads. Inbound Nostr data
+// remains independently bounded by the broker/adapter before this control-plane call.
+const MAX_FRAME = 64 * 1024 * 1024
 const defaultSocket = () => resolve(process.env.HOME || '', '.codex', 'app-server-control', 'app-server-control.sock')
 
 function validThread(id) {
