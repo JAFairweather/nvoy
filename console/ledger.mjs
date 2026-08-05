@@ -137,13 +137,20 @@ const LEDGER_STYLE = `<style>
 #ledger .lg-ic{font-size:14px;margin-right:3px;filter:grayscale(.2)}
 #ledger .lg-flow{display:flex;align-items:center;gap:7px;margin-top:8px}
 #ledger .lg-arrow{color:var(--dim)}
+#ledger .lg-lineage{margin:4px 0 0 2px;display:flex;flex-direction:column;gap:3px}
+#ledger .lg-kid{display:flex;align-items:center;gap:7px;font-size:12.5px}
+#ledger .lg-kid.dead{opacity:.62}
+#ledger .lg-kid.dead .lg-kid-name{text-decoration:line-through}
+#ledger .lg-kid-arm{font-family:var(--mono);color:var(--faint)}
+#ledger .lg-kid-name{font-weight:600}
+#ledger .lg-coverage{margin-top:5px;max-width:66ch}
 #ledger .lg-mono{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:50%;background:color-mix(in srgb,var(--gold) 16%,transparent);border:1px solid color-mix(in srgb,var(--gold) 45%,transparent);color:var(--gold-bright);font-family:var(--mono);font-size:11px;font-weight:700;flex:none}
 </style>`
 
 const termChips = (t) => !t ? '<span class="chip warn" title="granted without an nvoy terms object — a vanilla NIP-DA grant">vanilla grant · no terms</span>' : [
   t.no_persist ? '<span class="chip term" title="runtime serves this to model context only — no disk, no logs">no_persist</span>' : '',
   t.redelegate === false ? '<span class="chip term" title="audit term: runtime refuses to re-wrap keys for third parties">no redelegate</span>' : '',
-  t.redelegate === true ? '<span class="chip warn" title="you allowed the runtime to re-wrap keys">redelegate allowed</span>' : '',
+  t.redelegate === true ? '<span class="chip warn" title="you allowed the holder to derive attenuated children from this grant. Their derivations are recorded on THEIR own encrypted index, so any descendants are not visible in this ledger — publishing that chain would link you to every leaf.">redelegate allowed</span>' : '',
   t.reply_scope_requested ? '<span class="chip term" title="agent grants results back via its outbox (§6.5) — see the output panel below">reply requested</span>' : '',
   t.auto_relinquish ? '<span class="chip term" title="agent destroys key + cache on completion / at expiry (§6.6)">auto-relinquish</span>' : '',
 ].filter(Boolean).join('')
@@ -230,6 +237,26 @@ function delegationCard(d, i) {
       (survivors are re-granted under their original terms).</span>
       <button class="primary rel-confirm">Rotate now</button>
     </div>` : ''}
+    ${(() => {
+      // What THIS key granted onward from this scope. Readable only because the rows are on our
+      // own index; an agent's derivations from the same scope are encrypted to the agent and are
+      // deliberately unavailable here (see lineage.mjs).
+      const kids = childrenOf(state.index, d.scope, state.me)
+      const note = coverageNote(d, state.index, state.me)
+      if (!kids.length && !note) return ''
+      return `<div class="sect2">granted onward (attenuated children you issued)</div>` +
+        (kids.length ? `<div class="lg-lineage">${kids.map(k => {
+          const dead = k.state === 'revoked'
+          return `<div class="lg-kid${dead ? ' dead' : ''}">
+            <span class="lg-kid-arm">└─</span>
+            <span class="lg-kid-name">${esc(k.child.scope_name || k.child.scope)}</span>
+            <span class="chip scope-${dead ? 'revoked' : 'active'}">${dead ? 'severed' : 'active'}</span>
+            <span class="msg">→ ${esc(short(k.child.grantee))} · v${k.child.generation}${
+              dead && k.revoked_at ? ` · severed ${esc(fmtWhen(k.revoked_at))}` : ''}</span>
+          </div>`
+        }).join('')}</div>` : '') +
+        (note ? `<div class="msg lg-coverage">${esc(note)}</div>` : '')
+    })()}
     ${wantsOutput ? `<div class="sect2">agent output (§6.5 — dereferenced live, never stored)</div>
       <div class="outbox" data-agent="${d.agent}"><span class="msg">loading output scope…</span></div>` : ''}
     ${events.length ? `<div class="history">${events.map(hRow).join('')}</div>` : ''}
