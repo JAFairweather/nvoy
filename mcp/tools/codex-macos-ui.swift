@@ -124,15 +124,15 @@ func inspect() -> ([Node], [Node], [Node], AXUIElement?) {
   guard composers.count == 1 else { return (projects, [], composers, nil) }
   let named = nodes.filter { role($0) == kAXButtonRole && title($0) == request.chat_label }
   let projectChats = named.filter { hasAncestorDescription($0.element, request.project_label) }
-  // Composer ownership must be proven by the same element that is already bound to the
-  // configured project. Searching all same-titled chats here would let an active chat in a
-  // different project satisfy this proof while an inactive target-project chat satisfies the
-  // project proof above.
-  let owned = projectChats.compactMap { node -> (Node, AXUIElement)? in
+  // Electron renders the project-qualified sidebar task and the active-chat header as separate
+  // buttons. The keyless adapter has already proved from Codex's own state that this immutable
+  // thread belongs to the selected project. Here the header must independently and uniquely own
+  // the composer; neither a sidebar task nor a same-named inactive task can satisfy that proof.
+  let active = named.compactMap { node -> (Node, AXUIElement)? in
     guard let relation = commonAncestor(node.element, composers[0].element), relation.firstDistance <= 4 else { return nil }
     return (node, relation.element)
   }
-  return (projectChats, owned.map { $0.0 }, composers, owned.count == 1 ? owned[0].1 : nil)
+  return (projectChats, active.map { $0.0 }, composers, active.count == 1 ? active[0].1 : nil)
 }
 
 var (projectChats, chats, composers, conversationRoot) = inspect()

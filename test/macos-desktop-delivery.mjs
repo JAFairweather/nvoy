@@ -1,6 +1,9 @@
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { generateSecretKey, getPublicKey } from 'nostr-tools/pure'
 import { desktopDeliveryRequest, verifyDesktopEvidence, visibleReceipt } from '../mcp/tools/macos_desktop_delivery.mjs'
+import { verifySelectedDesktopProject } from '../mcp/tools/codex_desktop_selection.mjs'
 
 let passed = 0, failed = 0
 const ok = (name, value) => { if (value) { passed++; console.log(`ok - ${name}`) } else { failed++; console.error(`not ok - ${name}`) } }
@@ -22,8 +25,11 @@ const evidence = { version: 1, status: 'visible', envelope, app_bundle_id: reque
   project_chat_count: 1, active_chat_count: 1, composer_count: 1, visible_match_count: 1 }
 ok('one exact visible bubble is accepted', verifyDesktopEvidence(request, evidence).envelope === envelope)
 const nativeSource = readFileSync(new URL('../mcp/tools/codex-macos-ui.swift', import.meta.url), 'utf8')
-ok('duplicate chat titles in another project cannot own the configured composer',
-  /let owned = projectChats\.compactMap/.test(nativeSource) && !/let owned = named\.compactMap/.test(nativeSource))
+const adapterSource = readFileSync(new URL('../mcp/tools/codex-macos-desktop-adapter.mjs', import.meta.url), 'utf8')
+ok('project-qualified sidebar task and active header are independently required',
+  /let projectChats = named\.filter/.test(nativeSource) && /let active = named\.compactMap/.test(nativeSource))
+ok('selected-project proof precedes every native binder invocation',
+  adapterSource.indexOf('verifySelectedDesktopProject({') < adapterSource.indexOf('spawnSync(manifest.codexUiDriver'))
 ok('Electron semantic accessibility is enabled before the focused window is inspected', (() => {
   const enable = nativeSource.indexOf('"AXManualAccessibility" as CFString')
   const inspect = nativeSource.indexOf('kAXFocusedWindowAttribute')
@@ -44,5 +50,28 @@ for (const [name, mutate] of [
 throws('notification cannot reach the binder', () => desktopDeliveryRequest({ type: 'verified-notification' }, binding, policy))
 throws('unauthorized admitted-shaped data cannot reach the binder', () => desktopDeliveryRequest({ ...task, authority: null }, binding, policy))
 throws('network input cannot select another application', () => desktopDeliveryRequest(task, { ...binding, appBundleId: 'com.apple.TextEdit' }, policy))
+const stateDir = mkdtempSync(join(tmpdir(), 'nvoy-codex-selection-'))
+const statePath = join(stateDir, 'state.json'), threadId = '019fce57-063d-7f50-b837-967d33ee384a'
+const projectId = '47ad8e40-4c29-4e97-9b31-69903dc37e4e'
+const selectedState = {
+  'selected-project': { type: 'local', projectId },
+  'thread-project-assignments': { [threadId]: { projectKind: 'local', projectId, cwd: '/workspace/connect' } },
+  'local-projects': { [projectId]: { id: projectId, name: 'connect', rootPaths: ['/workspace/connect'] } },
+}
+writeFileSync(statePath, JSON.stringify(selectedState), { mode: 0o600 })
+ok('immutable thread is accepted only in its selected project',
+  verifySelectedDesktopProject({ statePath, threadId, projectLabel: 'connect' }).projectId === projectId)
+for (const [name, mutate] of [
+  ['another selected project fails closed', x => { x['selected-project'].projectId = 'other' }],
+  ['thread assigned to another project fails closed', x => { x['thread-project-assignments'][threadId].projectId = 'other' }],
+  ['wrong project label fails closed', x => { x['local-projects'][projectId].name = 'other' }],
+  ['thread outside the project root fails closed', x => { x['thread-project-assignments'][threadId].cwd = '/workspace/other' }],
+]) throws(name, () => {
+  const bad = structuredClone(selectedState); mutate(bad); writeFileSync(statePath, JSON.stringify(bad), { mode: 0o600 })
+  verifySelectedDesktopProject({ statePath, threadId, projectLabel: 'connect' })
+})
+writeFileSync(statePath, JSON.stringify(selectedState), { mode: 0o600 })
+const linkPath = join(stateDir, 'state-link.json'); symlinkSync(statePath, linkPath)
+throws('symlinked Desktop state fails closed', () => verifySelectedDesktopProject({ statePath: linkPath, threadId, projectLabel: 'connect' }))
 console.log(`${passed}/${passed + failed} passed`)
 if (failed) process.exit(1)

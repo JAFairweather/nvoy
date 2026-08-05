@@ -2,12 +2,13 @@
 // Keyless V1 binder: one broker-admitted identity queue -> one visible Codex Desktop chat.
 
 import { appendFileSync, closeSync, existsSync, fsyncSync, lstatSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { dirname, resolve } from 'node:path'
 import { randomBytes } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { readManifest, instanceId } from './runtime_manifest.mjs'
 import { baselineDesktopQueue, deliverPending } from './macos_desktop_adapter.mjs'
 import { observeDesktopTurn } from './codex_app_server.mjs'
+import { verifySelectedDesktopProject } from './codex_desktop_selection.mjs'
 
 const die = message => { console.error(`codex-macos-desktop-adapter: ${message}`); process.exit(1) }
 const flag = name => { const i = process.argv.indexOf(name); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -38,6 +39,14 @@ function durableAppend(path, row) {
   try { appendFileSync(fd, JSON.stringify(row) + '\n'); fsyncSync(fd) } finally { closeSync(fd) }
 }
 async function invoke(request) {
+  // Codex renders the project-qualified sidebar task and the active-chat header as distinct AX
+  // elements.  Prove that this manifest's immutable thread belongs to the currently selected
+  // project before allowing the header/composer proof to continue in the native binder.
+  verifySelectedDesktopProject({
+    statePath: resolve(dirname(manifest.codexSocketPath), '..', '.codex-global-state.json'),
+    threadId: manifest.codexThreadId,
+    projectLabel: manifest.codexProjectLabel,
+  })
   const stat = lstatSync(manifest.codexUiDriver)
   if (!stat.isFile() || stat.isSymbolicLink() || !(stat.mode & 0o100)) throw new Error('Codex UI driver must be an executable regular non-symlink file')
   const result = spawnSync(manifest.codexUiDriver, [], { input: JSON.stringify(request), encoding: 'utf8',
