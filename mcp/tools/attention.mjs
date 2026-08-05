@@ -34,7 +34,8 @@ import { decode, npubEncode } from 'nostr-tools/nip19'
 import { getPublicKey, verifyEvent } from 'nostr-tools/pure'
 import * as nip44 from 'nostr-tools/nip44'
 import { makeBunkerSigner } from './nip46-signer.mjs'
-import { authenticatedNip59Rumor, partitionInvocations } from './invocation_policy.mjs'
+import { partitionInvocations, verifiedChannelNotifications } from './invocation_policy.mjs'
+import { verifyInboxEnvelope } from './inbox_envelope.mjs'
 
 const arg = (n, d) => { const i = process.argv.indexOf(n); return i === -1 ? d : process.argv[i + 1] }
 const die = (m) => { console.error(`attention: ${m}`); process.exit(1) }
@@ -192,9 +193,12 @@ for (const w of wraps.values()) {
     const seal = JSON.parse(await decrypt(w.pubkey, w.content))
     if (seal.kind !== 13) continue
     const rumor = JSON.parse(await decrypt(seal.pubkey, seal.content))
-    if (!authenticatedNip59Rumor(seal, rumor)) continue
-    if (rumor.created_at < since || seal.pubkey === ME) continue
-    msgs.push({ from: seal.pubkey, at: rumor.created_at, content: String(rumor.content || '') })
+    // Decryption is not authentication. Verify the complete wire boundary before a byte reaches
+    // grant policy: signed outer 1059, exact single recipient, signed 13 seal, author-bound and
+    // hash-bound kind 14 rumor, and closed schemas at every layer.
+    const message = verifyInboxEnvelope({ wrap: w, seal, rumor, recipient: ME })
+    if (!message || message.at < since || message.from === ME) continue
+    msgs.push(message)
   } catch { /* not for me */ }
 }
 msgs.sort((a, b) => a.at - b.at)
@@ -209,6 +213,13 @@ const { admitted, actionable, admissions, dataOnly } = partitionInvocations(msgs
   relayGrantFor: relayGrant,
   carrierChannels: sender => [...(TASK_CARRIERS.get(sender) || [])],
 })
+// A configured carrier with a live task-relay grant may also wake the fixed Desktop thread to
+// announce signed channel activity whose author does NOT hold task authority. The source body is
+// intentionally discarded here. This is awareness, never instruction promotion.
+const admittedRaw = new Set(admitted.map(item => item.message?.event_id).filter(Boolean))
+const notifications = verifiedChannelNotifications(dataOnly, { policyUsable, relayGrantFor: relayGrant,
+  carrierChannels: sender => [...(TASK_CARRIERS.get(sender) || [])] })
+  .filter(item => !admittedRaw.has(item.source_event))
 
 const label = (hex) => {
   try { const n = npubEncode(hex); return `${n.slice(0, 10)}…${n.slice(-5)}` } catch { return hex.slice(0, 12) + '…' }
@@ -230,7 +241,7 @@ if (process.argv.includes('--mark')) {
 if (process.argv.includes('--json')) {
   console.log(JSON.stringify({ me: ME, grantors: GRANTORS, relaysAnswered, policyUsable,
     permitted: [...permitted.entries()].map(([pk, caps]) => ({ pubkey: pk, caps: [...caps.keys()] })), rejectedGrants: rejected,
-    actionable, admissions, dataOnly: dataOnly.map(m => ({ from: m.from, at: m.at })) }, null, 2))
+    actionable, admissions, notifications, dataOnly: dataOnly.map(m => ({ from: m.from, at: m.at })) }, null, 2))
   // JSON is a transport format, not a weakening of the scheduler contract. The instance
   // adapter needs structured output AND the same 10 = actionable signal that text mode gives.
   // Returning 0 here made a granted arrival look quiet to every JSON-consuming runtime.

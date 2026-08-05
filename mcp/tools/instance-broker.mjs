@@ -103,8 +103,41 @@ if (!report.policyUsable) {
   console.error('instance-broker: live grant policy unavailable; marker requeued')
   process.exit(75)
 }
-if (!Array.isArray(report.actionable) || !report.actionable.length) {
+const notifications = Array.isArray(report.notifications) ? report.notifications : []
+if ((!Array.isArray(report.actionable) || !report.actionable.length) && !notifications.length) {
   try { renameSync(markerPath, `${markerPath}.done`) } catch (e) { die(`cannot finalize terminal marker: ${e.message}`) }
+  process.exit(0)
+}
+
+// A notification is mutually exclusive with an actionable delivery for one outer envelope. It
+// carries only provenance; there is no source body, receipt, reply target, or authority object.
+if (!report.actionable.length && notifications.length) {
+  if (notifications.length !== 1) die('one envelope must not produce multiple notifications')
+  const n = notifications[0]
+  const packet = { type: 'verified-notification', instance: manifest.id, envelope,
+    notification: { version: 1, type: 'verified-channel-activity', ...n } }
+  const socket = resolve(manifest.runtimeDir, 'adapter.sock')
+  const client = net.createConnection(socket)
+  const timer = setTimeout(() => { client.destroy(); die('adapter acknowledgement timed out') }, 15000)
+  client.on('error', e => { clearTimeout(timer); die(`adapter socket unavailable: ${e.message}`) })
+  client.on('connect', () => client.write(JSON.stringify(packet) + '\n'))
+  let received = ''
+  client.on('data', chunk => {
+    received += chunk
+    if (!received.includes('\n')) return
+    clearTimeout(timer)
+    let ack; try { ack = JSON.parse(received.split('\n')[0]) } catch { die('adapter acknowledgement is malformed') }
+    if (ack.type !== 'ack' || ack.instance !== manifest.id) die('adapter acknowledgement does not bind this instance')
+    const marked = spawnSync(process.execPath, [attention, '--mark', '--json', '--envelope', envelope], { env, encoding: 'utf8', timeout: 60000 })
+    if (marked.status !== 0) die(`attention watermark failed (${marked.status ?? 'signal'})`)
+    try { renameSync(markerPath, `${markerPath}.done`) } catch (e) { die(`acknowledged but could not finalize marker: ${e.message}`) }
+    client.end()
+  })
+  // Do not fall through and manufacture an instruction receipt for a notification.
+  await new Promise((resolveDone, rejectDone) => {
+    client.on('close', resolveDone)
+    client.on('error', rejectDone)
+  })
   process.exit(0)
 }
 

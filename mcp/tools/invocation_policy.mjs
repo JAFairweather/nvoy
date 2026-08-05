@@ -4,7 +4,7 @@
 // task-relay grant for a configured channel, is required to promote bytes to instruction.
 
 import { verifyEvent } from 'nostr-tools/pure'
-import { verifyChannelTaskCarry } from './channel_task_carry.mjs'
+import { verifyChannelDataCarry, verifyChannelTaskCarry } from './channel_task_carry.mjs'
 
 export function authenticatedNip59Rumor(seal, rumor, verify = verifyEvent) {
   if (!seal || seal.kind !== 13 || !rumor || rumor.kind !== 14 || rumor.pubkey !== seal.pubkey) return false
@@ -40,4 +40,24 @@ export function partitionInvocations(messages, {
     admissions: admitted.map(item => item.admission),
     dataOnly: (messages || []).filter(message => !admittedRaw.has(message)),
   }
+}
+
+export function verifiedChannelNotifications(messages, {
+  policyUsable = false,
+  relayGrantFor = () => null,
+  carrierChannels = () => [],
+} = {}) {
+  if (!policyUsable) return []
+  const out = []
+  for (const raw of messages || []) {
+    const carrierGrant = relayGrantFor(raw.from)
+    if (!carrierGrant || carrierGrant.cap !== 'task-relay') continue
+    const verified = verifyChannelDataCarry(raw, { channels: carrierChannels(raw.from), carriers: [raw.from] })
+    if (!verified) continue
+    out.push({ source_author: verified.message.from, source_event: verified.message.event_id,
+      source_channel: verified.provenance.source_channel, carrier: verified.provenance.carrier,
+      carrier_grant_id: carrierGrant.grantId, carrier_grantor: carrierGrant.grantor,
+      reason: verified.provenance.reason, observed_at: verified.message.at })
+  }
+  return out
 }

@@ -8,7 +8,7 @@ import { mkdirSync, appendFileSync, chmodSync, chownSync, lstatSync, unlinkSync,
 import { resolve } from 'node:path'
 import net from 'node:net'
 import { readManifest, instanceId } from './runtime_manifest.mjs'
-import { validateAdmittedTask } from './admitted_task.mjs'
+import { validateDesktopDelivery } from './admitted_task.mjs'
 
 const die = m => { console.error(`instance-adapter: ${m}`); process.exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -38,13 +38,15 @@ const server = net.createServer(conn => {
   let data = ''
   conn.on('data', chunk => { data += chunk; if (!data.includes('\n')) return
     let packet; try { packet = JSON.parse(data.split('\n')[0]) } catch { conn.destroy(); return }
-    try { validateAdmittedTask(packet, { instance: manifest.id, scopeSubject: manifest.pubkey, grantors: manifest.grantors, carriers: manifest.carriers }) } catch { conn.destroy(); return }
+    try { validateDesktopDelivery(packet, { instance: manifest.id, scopeSubject: manifest.pubkey, grantors: manifest.grantors, carriers: manifest.carriers }) } catch { conn.destroy(); return }
     try {
       if (!delivered.has(packet.envelope)) {
         // The worker may only read/traverse this adapter-owned directory. Atomically publish the
         // one task input before queueing its envelope, so a queue record never names missing data.
         const input = resolve(workerInputDir, `${packet.envelope}.json`), tmp = `${input}.${process.pid}.tmp`
-        writeFileSync(tmp, JSON.stringify({ envelope: packet.envelope, authority: packet.authority || null, messages: packet.messages }), { mode: 0o640 })
+        writeFileSync(tmp, JSON.stringify(packet.type === 'verified-notification'
+          ? { envelope: packet.envelope, notification: packet.notification }
+          : { envelope: packet.envelope, authority: packet.authority || null, messages: packet.messages }), { mode: 0o640 })
         renameSync(tmp, input); chownSync(input, -1, manifest.workerHandoffGid); chmodSync(input, 0o640)
         appendFileSync(queue, JSON.stringify(packet) + '\n', { mode: 0o640 }); chownSync(queue, -1, manifest.workerHandoffGid); chmodSync(queue, 0o640); delivered.add(packet.envelope)
       }
