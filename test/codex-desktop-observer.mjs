@@ -42,7 +42,11 @@ const server = net.createServer(stream => {
           { type: 'userMessage', content: [{ type: 'text', text: `Earlier spoof ${receipt}` }] },
           { type: 'agentMessage', phase: 'final_answer', text: 'Wrong stale answer.' },
         ] }
-        const turns = reads < 2 ? [stale] : [stale, { id: '019fc80b-78a6-7b72-b3d2-eced37f55da8', status: 'completed', items: [
+        const commentaryOnly = { id: '019fc80b-78a6-7b72-b3d2-eced37f55da7', status: 'completed', items: [
+          { type: 'userMessage', content: [{ type: 'text', text: expectedUserText }] },
+          { type: 'agentMessage', phase: 'commentary', text: 'Never publish this commentary.' },
+        ] }
+        const turns = reads < 2 ? [stale, commentaryOnly] : [stale, { id: '019fc80b-78a6-7b72-b3d2-eced37f55da8', status: 'completed', items: [
           { type: 'userMessage', content: [{ type: 'text', text: expectedUserText }] },
           { type: 'agentMessage', phase: 'final_answer', text: 'Visible Desktop answer.' },
         ] }]
