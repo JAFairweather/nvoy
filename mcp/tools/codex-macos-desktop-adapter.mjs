@@ -25,7 +25,9 @@ const visiblePath = resolve(manifest.runtimeDir, 'macos-desktop-visible.jsonl')
 const completedPath = resolve(manifest.runtimeDir, 'macos-desktop-completed.jsonl')
 const replyPath = resolve(manifest.runtimeDir, 'reply-requests.jsonl')
 const lockPath = resolve(manifest.runtimeDir, 'macos-desktop-adapter.lock')
-const binding = { appBundleId: manifest.codexAppBundleId, projectLabel: manifest.codexProjectLabel, chatLabel: manifest.codexChatLabel }
+const codexStatePath = resolve(dirname(manifest.codexSocketPath), '..', '.codex-global-state.json')
+const binding = { appBundleId: manifest.codexAppBundleId, projectLabel: manifest.codexProjectLabel,
+  chatLabel: manifest.codexChatLabel, threadId: manifest.codexThreadId, statePath: codexStatePath }
 const policy = { instance: manifest.id, scopeSubject: manifest.pubkey, grantors: manifest.grantors, carriers: manifest.carriers }
 
 function records(path) {
@@ -43,7 +45,7 @@ async function invoke(request) {
   // elements.  Prove that this manifest's immutable thread belongs to the currently selected
   // project before allowing the header/composer proof to continue in the native binder.
   verifySelectedDesktopProject({
-    statePath: resolve(dirname(manifest.codexSocketPath), '..', '.codex-global-state.json'),
+    statePath: codexStatePath,
     threadId: manifest.codexThreadId,
     projectLabel: manifest.codexProjectLabel,
   })
