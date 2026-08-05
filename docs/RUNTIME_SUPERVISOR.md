@@ -340,3 +340,38 @@ and mounts only into the broker.
 The Compose `init` service is a one-shot root-only provisioner, not a long-running privileged
 sidecar. It reads the manifest and creates/verifies the three named-volume roots with exactly the
 declared owner, group, and mode before the non-root services can start. It has no credential mount.
+
+### Automatic verified releases
+
+Routine releases are pull-based; an operator must not copy source or hand-edit image tags. The
+`Publish immutable runtime images` workflow first runs the complete non-container test gate, then
+publishes runtime and worker images tagged with the exact main SHA. The host-side
+[`runtime-deploy-runner.py`](../deploy/runtime-deploy-runner.py) polls only successful runs of
+that workflow, verifies the SHA is on `origin/main`, pulls both images, resolves their immutable
+digests, and renders every identity from its existing host-local manifest. It never reads or
+changes a Bunker URI, client credential, provider credential, grant, or routing policy.
+
+The runner validates each candidate Compose file before starting it. It then requires watcher,
+broker, adapter, and (where configured) worker to be running for every identity. The release SHA
+and image digests are recorded only after all identities pass. If any identity fails, every
+already-touched identity is restored from the previous Compose set; the failed SHA remains
+unrecorded so the timer alarms and retries rather than silently accepting a partial release.
+
+Bootstrap once on the runtime host:
+
+```sh
+git clone https://github.com/JAFairweather/nvoy.git /opt/nvoy-hub
+install -d -m 0700 /var/lib/nvoy-deploy
+install -m 0644 /opt/nvoy-hub/deploy/nvoy-runtime-deploy.service /etc/systemd/system/
+install -m 0644 /opt/nvoy-hub/deploy/nvoy-runtime-deploy.timer /etc/systemd/system/
+systemctl daemon-reload
+DRY_RUN=1 python3 /opt/nvoy-hub/deploy/runtime-deploy-runner.py
+systemctl start nvoy-runtime-deploy.service
+systemctl enable --now nvoy-runtime-deploy.timer
+```
+
+The public repository and public GHCR packages require no token. A private fork may place a
+read-only `GH_TOKEN` in `/etc/nvoy/runtime-deploy.env` (root-owned mode `0600`). GitHub receives no
+host credential: merged, tested source authorizes a release, while promotion remains local.
+The runtime host requires Python 3, Git, Docker, and the Compose plugin; it deliberately does not
+need a host Node/npm installation because rendering executes inside the candidate runtime image.
