@@ -148,7 +148,7 @@ guard request.version == 1,
 
 guard AXIsProcessTrusted() else { fail("Accessibility permission is not enabled") }
 let apps = NSRunningApplication.runningApplications(withBundleIdentifier: request.app_bundle_id)
-guard apps.count == 1, let app = apps.first, app.isActive else { fail("Codex must be the single frontmost application") }
+guard apps.count == 1, let app = apps.first else { fail("Codex must be the single running application") }
 let application = AXUIElementCreateApplication(app.processIdentifier)
 // Electron exposes only its native window chrome until an assistive client requests the
 // Chromium accessibility tree.  The setter may return kAXErrorCannotComplete even when the

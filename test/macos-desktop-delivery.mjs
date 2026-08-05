@@ -50,6 +50,10 @@ ok('Electron semantic accessibility is enabled before the focused window is insp
   const inspect = nativeSource.indexOf('kAXFocusedWindowAttribute')
   return enable >= 0 && inspect > enable && nativeSource.includes('usleep(500_000)')
 })())
+ok('background delivery requires one Codex process but never steals or requires OS focus',
+  nativeSource.includes('apps.count == 1') &&
+  !nativeSource.includes('frontmostApplication') && !nativeSource.includes('app.isActive') &&
+  !nativeSource.includes('activate(options:'))
 for (const [name, mutate] of [
   ['wrong app fails closed', x => { x.app_bundle_id = 'com.apple.TextEdit' }],
   ['wrong project fails closed', x => { x.project_label = 'other' }],
