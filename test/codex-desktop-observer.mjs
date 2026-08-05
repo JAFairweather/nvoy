@@ -7,6 +7,7 @@ import { observeDesktopTurn } from '../mcp/tools/codex_app_server.mjs'
 
 const socketPath = join(mkdtempSync(join(tmpdir(), 'nvoy-observer-')), 'control.sock')
 const threadId = '019fc80b-78a6-7b72-b3d2-eced37f55da7', receipt = '[nvoy:aaaaaaaaaaaaaaaa]'
+const expectedUserText = `Visible message ${receipt}`
 let reads = 0, forbidden = false
 const frame = value => {
   const body = Buffer.from(JSON.stringify(value))
@@ -37,8 +38,12 @@ const server = net.createServer(stream => {
       else if (request.method === 'initialized') {}
       else if (request.method === 'thread/read') {
         reads++
-        const turns = reads < 2 ? [] : [{ id: '019fc80b-78a6-7b72-b3d2-eced37f55da8', status: 'completed', items: [
-          { type: 'userMessage', content: [{ type: 'text', text: `Visible message ${receipt}` }] },
+        const stale = { id: '019fc80b-78a6-7b72-b3d2-eced37f55da6', status: 'completed', items: [
+          { type: 'userMessage', content: [{ type: 'text', text: `Earlier spoof ${receipt}` }] },
+          { type: 'agentMessage', phase: 'final_answer', text: 'Wrong stale answer.' },
+        ] }
+        const turns = reads < 2 ? [stale] : [stale, { id: '019fc80b-78a6-7b72-b3d2-eced37f55da8', status: 'completed', items: [
+          { type: 'userMessage', content: [{ type: 'text', text: expectedUserText }] },
           { type: 'agentMessage', phase: 'final_answer', text: 'Visible Desktop answer.' },
         ] }]
         stream.write(frame({ id: request.id, result: { thread: { id: threadId, turns } } }))
@@ -48,7 +53,8 @@ const server = net.createServer(stream => {
 })
 await new Promise(resolve => server.listen(socketPath, resolve))
 try {
-  const result = await observeDesktopTurn({ socketPath, threadId, receipt, timeoutMs: 3000 })
+  const result = await observeDesktopTurn({ socketPath, threadId, receipt, expectedUserText,
+    expectedUserSha256: createHash('sha256').update(expectedUserText).digest('hex'), timeoutMs: 3000 })
   if (result.finalText !== 'Visible Desktop answer.' || reads !== 2 || forbidden) throw new Error('observer invariant failed')
   console.log('codex-desktop-observer: read-only visible turn recovered')
 } finally { await new Promise(resolve => server.close(resolve)) }

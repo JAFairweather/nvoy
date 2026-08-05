@@ -2,7 +2,7 @@
 // never accepts a network address, never knows Nostr credentials, and receives its thread id
 // only from the supervisor-owned runtime manifest.
 import net from 'node:net'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { resolve } from 'node:path'
 
 // `thread/read` returns the complete durable thread when the adapter checks its envelope token
@@ -41,10 +41,13 @@ export function finalAgentText(items = []) {
 // Minimal RFC 6455 client for the documented Unix app-server transport. `ws` does not reliably
 // route Unix sockets on every supported Node build; keeping the transport here also means a
 // desktop adapter has no HTTP listener and no path supplied by an incoming notification.
-export function appServerCall({ socketPath, threadId, input, clientUserMessageId = null, listOnly = false, dedupeToken = '', waitForCompletion = false, observeOnly = false, timeoutMs = 30000 }) {
+export function appServerCall({ socketPath, threadId, input, clientUserMessageId = null, listOnly = false, dedupeToken = '', waitForCompletion = false, observeOnly = false, expectedUserText = '', expectedUserSha256 = '', timeoutMs = 30000 }) {
   const socket = localControlSocket(socketPath)
   const id = listOnly ? null : codexThreadId(threadId)
-  if (observeOnly && (!dedupeToken || !waitForCompletion || listOnly)) throw new Error('observeOnly requires one receipt-bound completed turn')
+  if (observeOnly && (!dedupeToken || !waitForCompletion || listOnly || !expectedUserText ||
+      createHash('sha256').update(expectedUserText).digest('hex') !== expectedUserSha256)) {
+    throw new Error('observeOnly requires one exact receipt-and-message-bound completed turn')
+  }
   return new Promise((resolveCall, rejectCall) => {
     const stream = net.createConnection({ path: socket })
     let buffer = Buffer.alloc(0), upgraded = false, finished = false, startedTurn = '', finalText = '', sawPhasedAgent = false
@@ -117,8 +120,14 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
           if (listOnly) return finish(null, message.result?.data || [])
           if (message.result?.thread?.id !== id) return finish(new Error('Codex app-server returned an unexpected thread'))
           if (dedupeToken) {
-            const prior = (message.result.thread.turns || []).find(turn => (turn.items || []).some(item =>
-              item?.type === 'userMessage' && JSON.stringify(item).includes(dedupeToken)))
+            const userText = item => (item?.content || []).map(part => typeof part === 'string' ? part :
+              (typeof part?.text === 'string' ? part.text : '')).join('')
+            const prior = (message.result.thread.turns || []).find(turn => (turn.items || []).some(item => {
+              if (item?.type !== 'userMessage' || !JSON.stringify(item).includes(dedupeToken)) return false
+              if (!observeOnly) return true
+              const exact = userText(item)
+              return exact === expectedUserText && createHash('sha256').update(exact).digest('hex') === expectedUserSha256
+            }))
             if (prior?.id) {
               const recoveredText = finalAgentText(prior.items || [])
               if (waitForCompletion && prior.status === 'completed' && recoveredText.trim()) return finish(null, { threadId: id, turnId: prior.id, recovered: true, finalText: recoveredText })
@@ -167,10 +176,10 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
 // Observe a turn created by the visible Codex Desktop UI. This path can only poll thread/read;
 // it cannot resume a thread or call turn/start, so a secondary client never manufactures a
 // background response that is absent from the user's Desktop transcript.
-export async function observeDesktopTurn({ socketPath, threadId, receipt, timeoutMs = 10 * 60 * 1000 }) {
+export async function observeDesktopTurn({ socketPath, threadId, receipt, expectedUserText, expectedUserSha256, timeoutMs = 10 * 60 * 1000 }) {
   const token = String(receipt || '')
   if (!/^\[nvoy:[0-9a-f]{16}\]$/.test(token)) throw new Error('Desktop observer requires an exact visible receipt')
   const result = await appServerCall({ socketPath, threadId, input: '', dedupeToken: token,
-    waitForCompletion: true, observeOnly: true, timeoutMs })
+    waitForCompletion: true, observeOnly: true, expectedUserText, expectedUserSha256, timeoutMs })
   return result
 }

@@ -23,6 +23,8 @@ struct Evidence: Encodable {
   let chat_label: String
   let receipt: String
   let message_sha256: String
+  let project_chat_count: Int
+  let active_chat_count: Int
   let composer_count: Int
   let visible_match_count: Int
 }
@@ -64,6 +66,28 @@ func description(_ node: Node) -> String { text(node.element, kAXDescriptionAttr
 func placeholder(_ node: Node) -> String { text(node.element, kAXPlaceholderValueAttribute as CFString) }
 func value(_ node: Node) -> String { text(node.element, kAXValueAttribute as CFString) }
 
+func lineage(_ start: AXUIElement, limit: Int = 80) -> [AXUIElement] {
+  var result: [AXUIElement] = [], current: AXUIElement? = start
+  while let item = current, result.count < limit {
+    result.append(item)
+    guard let parent = attribute(item, kAXParentAttribute as CFString) as! AXUIElement? else { break }
+    current = parent
+  }
+  return result
+}
+
+func commonAncestor(_ first: AXUIElement, _ second: AXUIElement) -> (element: AXUIElement, firstDistance: Int, secondDistance: Int)? {
+  let a = lineage(first), b = lineage(second)
+  for (ai, left) in a.enumerated() {
+    for (bi, right) in b.enumerated() where CFEqual(left, right) { return (left, ai, bi) }
+  }
+  return nil
+}
+
+func hasAncestorDescription(_ element: AXUIElement, _ expected: String) -> Bool {
+  lineage(element).dropFirst().contains { text($0, kAXDescriptionAttribute as CFString) == expected }
+}
+
 let input = FileHandle.standardInput.readDataToEndOfFile()
 guard input.count > 0 && input.count <= 512 * 1024 else { fail("request is empty or too large") }
 guard let object = try? JSONSerialization.jsonObject(with: input) as? [String: Any],
@@ -87,17 +111,23 @@ guard apps.count == 1, let app = apps.first, app.isActive else { fail("Codex mus
 let application = AXUIElementCreateApplication(app.processIdentifier)
 guard let window = attribute(application, kAXFocusedWindowAttribute as CFString) as! AXUIElement? else { fail("Codex has no focused window") }
 
-func inspect() -> ([Node], [Node], [Node]) {
+func inspect() -> ([Node], [Node], [Node], AXUIElement?) {
   let nodes = tree(window)
   let projects = nodes.filter { role($0) == kAXButtonRole && description($0) == request.project_label }
-  let activeChats = nodes.filter { role($0) == kAXButtonRole && title($0) == request.chat_label && $0.depth <= 18 }
-  let composers = nodes.filter { role($0) == kAXTextAreaRole && placeholder($0) == "Do anything" }
-  return (projects, activeChats, composers)
+  let composers = nodes.filter { role($0) == kAXTextAreaRole && description($0) == "Do anything" }
+  guard composers.count == 1 else { return (projects, [], composers, nil) }
+  let named = nodes.filter { role($0) == kAXButtonRole && title($0) == request.chat_label }
+  let projectChats = named.filter { hasAncestorDescription($0.element, request.project_label) }
+  let owned = named.compactMap { node -> (Node, AXUIElement)? in
+    guard let relation = commonAncestor(node.element, composers[0].element), relation.firstDistance <= 4 else { return nil }
+    return (node, relation.element)
+  }
+  return (projectChats, owned.map { $0.0 }, composers, owned.count == 1 ? owned[0].1 : nil)
 }
 
-var (projects, chats, composers) = inspect()
-guard projects.count == 1 else { fail("configured project is absent or ambiguous") }
-guard chats.count == 1 else { fail("configured active chat is absent or ambiguous") }
+var (projectChats, chats, composers, conversationRoot) = inspect()
+guard projectChats.count == 1 else { fail("configured chat is absent or ambiguous inside its project") }
+guard chats.count == 1, let conversationRoot else { fail("configured chat does not uniquely own the composer") }
 guard composers.count == 1 else { fail("composer is absent or ambiguous") }
 guard value(composers[0]).isEmpty else { fail("composer is not empty") }
 guard !tree(window).contains(where: { role($0) == kAXButtonRole && description($0) == "Stop" }) else {
@@ -123,7 +153,7 @@ let deadline = Date().addingTimeInterval(15)
 var matches = 0
 repeat {
   usleep(150_000)
-  let nodes = tree(window)
+  let nodes = tree(conversationRoot)
   let seen = Set(nodes.compactMap { node -> String? in
     for candidate in [value(node), title(node), description(node)] where candidate.contains(request.receipt) { return candidate }
     return nil
@@ -134,7 +164,8 @@ repeat {
 guard matches == 1 else { fail("one exact visible receipt was not observed") }
 let evidence = Evidence(status: "visible", envelope: request.envelope, app_bundle_id: request.app_bundle_id,
   project_label: request.project_label, chat_label: request.chat_label, receipt: request.receipt,
-  message_sha256: request.message_sha256, composer_count: 1, visible_match_count: matches)
+  message_sha256: request.message_sha256, project_chat_count: projectChats.count,
+  active_chat_count: chats.count, composer_count: 1, visible_match_count: matches)
 let encoded = try JSONEncoder().encode(evidence)
 FileHandle.standardOutput.write(encoded)
 FileHandle.standardOutput.write(Data([0x0a]))

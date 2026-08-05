@@ -48,7 +48,8 @@ async function invoke(request) {
 }
 async function observe(request) {
   const result = await observeDesktopTurn({ socketPath: manifest.codexSocketPath, threadId: manifest.codexThreadId,
-    receipt: request.receipt, timeoutMs: 10 * 60 * 1000 })
+    receipt: request.receipt, expectedUserText: request.text, expectedUserSha256: request.message_sha256,
+    timeoutMs: 10 * 60 * 1000 })
   return result.finalText
 }
 async function queueReply({ envelope, content }) {

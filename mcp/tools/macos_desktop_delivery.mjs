@@ -34,6 +34,7 @@ export function verifyDesktopEvidence(request, evidence) {
       evidence.envelope !== request.envelope || evidence.app_bundle_id !== request.app_bundle_id ||
       evidence.project_label !== request.project_label || evidence.chat_label !== request.chat_label ||
       evidence.receipt !== request.receipt || evidence.message_sha256 !== request.message_sha256 ||
+      evidence.project_chat_count !== 1 || evidence.active_chat_count !== 1 ||
       evidence.composer_count !== 1 || evidence.visible_match_count !== 1) {
     throw new Error('Desktop did not prove one exact visible delivery in the configured chat')
   }

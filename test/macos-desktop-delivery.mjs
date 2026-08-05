@@ -17,12 +17,15 @@ ok('authenticated words remain first', request.text.startsWith('Do the visible t
 ok('visible non-secret receipt binds the envelope', request.receipt === visibleReceipt(envelope) && request.text.endsWith(request.receipt))
 ok('request fixes app, project, chat, and message digest', request.app_bundle_id === 'com.openai.codex' && request.project_label === 'connect' && request.chat_label === 'Waggle live binder' && /^[0-9a-f]{64}$/.test(request.message_sha256))
 const evidence = { version: 1, status: 'visible', envelope, app_bundle_id: request.app_bundle_id, project_label: request.project_label,
-  chat_label: request.chat_label, receipt: request.receipt, message_sha256: request.message_sha256, composer_count: 1, visible_match_count: 1 }
+  chat_label: request.chat_label, receipt: request.receipt, message_sha256: request.message_sha256,
+  project_chat_count: 1, active_chat_count: 1, composer_count: 1, visible_match_count: 1 }
 ok('one exact visible bubble is accepted', verifyDesktopEvidence(request, evidence).envelope === envelope)
 for (const [name, mutate] of [
   ['wrong app fails closed', x => { x.app_bundle_id = 'com.apple.TextEdit' }],
   ['wrong project fails closed', x => { x.project_label = 'other' }],
   ['wrong chat fails closed', x => { x.chat_label = 'other' }],
+  ['configured chat present but inactive fails closed', x => { x.active_chat_count = 0 }],
+  ['configured chat outside its project fails closed', x => { x.project_chat_count = 0 }],
   ['missing composer fails closed', x => { x.composer_count = 0 }],
   ['ambiguous composer fails closed', x => { x.composer_count = 2 }],
   ['missing visible bubble fails closed', x => { x.visible_match_count = 0 }],
