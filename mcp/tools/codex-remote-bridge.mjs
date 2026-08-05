@@ -21,7 +21,7 @@ const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
 let manifest
 try { manifest = readManifest(root, instanceId(id)) } catch (error) { die(error.message) }
-if (manifest.brokerMode !== 'remote' || manifest.deliveryMode !== 'codex_app_server' || manifest.codexTransport !== 'local_control_socket') die('manifest is not a keyless remote-broker Codex binding')
+if (manifest.brokerMode !== 'remote' || !['codex_app_server', 'macos_desktop'].includes(manifest.deliveryMode) || manifest.codexTransport !== 'local_control_socket') die('manifest is not a keyless remote-broker Codex binding')
 const target = manifest.sshTarget, identity = resolve(manifest.sshIdentityFile), knownHosts = resolve(manifest.sshKnownHostsFile)
 for (const [path, label] of [[identity, 'SSH identity'], [knownHosts, 'known-hosts file']]) {
   let stat; try { stat = lstatSync(path) } catch { die(`${label} is missing`) }
@@ -53,10 +53,16 @@ function cycle() {
     { cwd: repoRoot, encoding: 'utf8', input: pulled.stdout, env: childEnv, maxBuffer: 64 * 1024 * 1024 })
   if (imported.status !== 0) throw new Error(String(imported.stderr || 'admitted import failed').trim())
   if (!baseline) {
-    const delivered = spawnSync(process.execPath, [resolve(repoRoot, 'mcp/tools/codex-app-server-adapter.mjs'), '--instance', manifest.id, '--once'],
+    const adapter = manifest.deliveryMode === 'macos_desktop' ? 'codex-macos-desktop-adapter.mjs' : 'codex-app-server-adapter.mjs'
+    const delivered = spawnSync(process.execPath, [resolve(repoRoot, `mcp/tools/${adapter}`), '--instance', manifest.id, '--once'],
       { cwd: repoRoot, encoding: 'utf8', env: childEnv, maxBuffer: 1024 * 1024 })
     if (delivered.status !== 0) throw new Error(String(delivered.stderr || 'Codex delivery failed').trim())
     if (delivered.stdout) process.stdout.write(delivered.stdout)
+  } else if (manifest.deliveryMode === 'macos_desktop') {
+    const localBaseline = spawnSync(process.execPath, [resolve(repoRoot, 'mcp/tools/codex-macos-desktop-adapter.mjs'), '--instance', manifest.id, '--baseline'],
+      { cwd: repoRoot, encoding: 'utf8', env: childEnv, maxBuffer: 1024 * 1024 })
+    if (localBaseline.status !== 0) throw new Error(String(localBaseline.stderr || 'local Desktop baseline failed').trim())
+    if (localBaseline.stdout) process.stdout.write(localBaseline.stdout)
   }
   if (imported.stdout) process.stdout.write(imported.stdout)
 }

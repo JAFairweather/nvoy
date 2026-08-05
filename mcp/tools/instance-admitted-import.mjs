@@ -15,7 +15,7 @@ if (!id || process.argv.some((v, i) => i > 1 && !['--instance', id, '--baseline'
 const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 let manifest
 try { manifest = readManifest(root, instanceId(id)) } catch (error) { die(error.message) }
-if (manifest.deliveryMode !== 'codex_app_server') die('local import requires codex_app_server delivery')
+if (!['codex_app_server', 'macos_desktop'].includes(manifest.deliveryMode)) die('local import requires a Codex Desktop delivery mode')
 
 let input = ''
 for await (const chunk of process.stdin) {
