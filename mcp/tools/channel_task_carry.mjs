@@ -47,6 +47,26 @@ function parseChannelCarry(message, { channels = [], carriers = null, verify = v
   return { carry, source, carrier, channel }
 }
 
+// Does this message CLAIM to be a channel carry at all?
+//
+// `verifyChannelDataCarry` returning null answers two very different questions with the
+// same value: "this carry failed verification" and "this was never a carry." A
+// configured carrier sends both — a malformed carry, and its own ordinary notices (a
+// delivery receipt, a reply relayed back out of the community). Collapsing them makes a
+// reader call a `{"ok":true}` receipt a rejected carry, which is a false verdict about
+// the reader's own mail.
+//
+// Deliberately shallow: only the envelope's self-declared `type`. Anything deeper would
+// start re-deciding validity, which is `parseChannelCarry`'s job — this asks only what
+// the sender was attempting, so that a failure can be described honestly.
+export function claimsChannelCarry(message) {
+  try {
+    const body = JSON.parse(message?.content ?? '')
+    return !!body && typeof body === 'object' && !Array.isArray(body) &&
+      body.type === 'waggle-channel-task-carry'
+  } catch { return false }
+}
+
 // A cryptographically verified channel item without instruction authority. This is for readers
 // and review surfaces: it proves who signed the words and which channel they signed them in, but
 // deliberately does not claim a live task grant or make the content actionable.
