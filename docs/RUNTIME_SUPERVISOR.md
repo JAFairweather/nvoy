@@ -172,6 +172,13 @@ forbids every key, Bunker, and worker-credential reference in the desktop manife
 { "broker_mode": "remote", "delivery_mode": "codex_app_server", "worker_enabled": false, "codex_thread_id": "<persistent-thread-id>", "codex_transport": "local_control_socket", "codex_app_server_socket": "/Users/you/.codex/app-server-control/app-server-control.sock", "ssh_target": "nvoy-sync@example.net", "ssh_identity_file": "/Users/you/.nvoy/desktop/id_ed25519", "ssh_known_hosts_file": "/Users/you/.nvoy/desktop/known_hosts", "ssh_known_hosts_sha256": "<64-hex-sha256>" }
 ```
 
+For V1 visible delivery into an already-open Codex Desktop chat, use `delivery_mode:
+"macos_desktop"` and additionally fix `codex_app_bundle_id: "com.openai.codex"`,
+`codex_project_label`, `codex_chat_label`, and the absolute installed `codex_ui_driver` path.
+The local adapter uses Accessibility only for visible submission; App Server is read-only and
+observes the resulting Desktop-owned turn by its receipt marker. See
+[`MACOS_DESKTOP_BINDER.md`](MACOS_DESKTOP_BINDER.md).
+
 Then run:
 
 ```sh

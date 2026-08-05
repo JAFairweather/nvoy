@@ -32,7 +32,9 @@ const tool = name => resolve(new URL('.', import.meta.url).pathname, name)
 if (command === 'describe') {
   console.log(JSON.stringify({ id: manifest.id, recipient: manifest.pubkey, grantors: manifest.grantors, taskCarriers: manifest.carriers,
     relays: manifest.relays, stateDir: manifest.stateDir, brokerMode: manifest.brokerMode,
-    watcher: manifest.brokerMode === 'local' ? 'keyless' : 'remote' }, null, 2)); process.exit(0)
+    watcher: manifest.brokerMode === 'local' ? 'keyless' : 'remote', deliveryMode: manifest.deliveryMode,
+    desktopBinding: manifest.deliveryMode === 'macos_desktop' ? { appBundleId: manifest.codexAppBundleId,
+      projectLabel: manifest.codexProjectLabel, chatLabel: manifest.codexChatLabel, threadId: manifest.codexThreadId } : null }, null, 2)); process.exit(0)
 }
 if (command === 'watch' || command === 'baseline') {
   if (manifest.brokerMode !== 'local') die('remote-broker Desktop manifests cannot start a second watcher')

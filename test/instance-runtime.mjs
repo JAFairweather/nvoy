@@ -49,6 +49,19 @@ const desktopManifest = { ...manifest, id: 'codex-desktop', pubkey: '3'.repeat(6
 writeFileSync(desktopManifestFile, JSON.stringify(desktopManifest))
 const desktop = cli('describe', '--instance', 'codex-desktop')
 ok('a remote-broker Codex desktop binding is keyless and names one explicit local thread', desktop.status === 0 && JSON.parse(desktop.stdout).brokerMode === 'remote' && !/credential|bunker|nsec/i.test(desktop.stdout))
+const macDriver = join(root, 'codex-macos-ui'); writeFileSync(macDriver, '#!/bin/sh\n', { mode: 0o700 })
+const macManifest = { ...desktopManifest, id: 'codex-macos', pubkey: '2'.repeat(64), state_dir: join(root, 'state-macos'), runtime_dir: join(root, 'run-macos'), spool_dir: join(root, 'spool-macos'),
+  delivery_mode: 'macos_desktop', codex_app_bundle_id: 'com.openai.codex', codex_project_label: 'connect', codex_chat_label: 'Waggle V1', codex_ui_driver: macDriver }
+writeFileSync(join(manifestRoot, 'codex-macos.json'), JSON.stringify(macManifest))
+const macDesktop = cli('describe', '--instance', 'codex-macos'), macDescription = JSON.parse(macDesktop.stdout || '{}')
+ok('macOS V1 binds one keyless identity to the fixed app, project, chat, and durable thread', macDesktop.status === 0 &&
+  macDescription.deliveryMode === 'macos_desktop' && macDescription.desktopBinding?.appBundleId === 'com.openai.codex' &&
+  macDescription.desktopBinding?.projectLabel === 'connect' && macDescription.desktopBinding?.chatLabel === 'Waggle V1' &&
+  macDescription.desktopBinding?.threadId === desktopManifest.codex_thread_id)
+writeFileSync(join(manifestRoot, 'bad-macos.json'), JSON.stringify({ ...macManifest, id: 'bad-macos', pubkey: '1'.repeat(64), state_dir: join(root, 'state-bad-macos'), runtime_dir: join(root, 'run-bad-macos'), spool_dir: join(root, 'spool-bad-macos'), codex_app_bundle_id: 'com.apple.TextEdit' }))
+const badMac = cli('describe', '--instance', 'bad-macos')
+ok('macOS V1 refuses a manifest-selected foreign application', badMac.status !== 0 && /fixed Codex bundle/.test(badMac.stderr))
+unlinkSync(join(manifestRoot, 'bad-macos.json'))
 const duplicateDesktopWatcher = cli('watch', '--instance', 'codex-desktop')
 ok('a remote-broker Desktop manifest cannot start a second watcher', duplicateDesktopWatcher.status !== 0 && /cannot start a second watcher/.test(duplicateDesktopWatcher.stderr))
 writeFileSync(join(manifestRoot, 'remote-with-worker.json'), JSON.stringify({ ...desktopManifest, id: 'remote-with-worker', pubkey: 'e'.repeat(64), state_dir: join(root, 'state-remote-worker'), runtime_dir: join(root, 'run-remote-worker'), spool_dir: join(root, 'spool-remote-worker'), worker_image: manifest.worker_image, worker_runner: manifest.worker_runner, worker_credential_ref: manifest.worker_credential_ref }))
@@ -355,7 +368,7 @@ writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...manifest
 const collision = cli('describe', '--instance', 'codex-test')
 ok('duplicate participant pubkeys are refused before a runtime starts', collision.status !== 0 && /collision/.test(collision.stderr))
 // Keep the manifest set valid for the independent spool-root collision case below.
-writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...manifest, id: 'collision', pubkey: '2'.repeat(64), state_dir: join(root, 'state-collision'), runtime_dir: join(root, 'run-collision'), spool_dir: join(root, 'spool-collision') }))
+writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...manifest, id: 'collision', pubkey: '0'.repeat(64), state_dir: join(root, 'state-collision'), runtime_dir: join(root, 'run-collision'), spool_dir: join(root, 'spool-collision') }))
 
 const symlinkRoot = join(root, 'symlink-instances')
 mkdirSync(symlinkRoot)

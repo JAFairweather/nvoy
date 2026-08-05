@@ -108,11 +108,15 @@ export function readManifest(root, requestedId) {
   const codexThreadId = String(raw.codex_thread_id || raw.codexThreadId || '')
   const codexTransport = String(raw.codex_transport || raw.codexTransport || 'spawn')
   const codexSocketPath = String(raw.codex_app_server_socket || raw.codexAppServerSocket || '')
+  const codexAppBundleId = String(raw.codex_app_bundle_id || raw.codexAppBundleId || '')
+  const codexProjectLabel = String(raw.codex_project_label || raw.codexProjectLabel || '')
+  const codexChatLabel = String(raw.codex_chat_label || raw.codexChatLabel || '')
+  const codexUiDriver = String(raw.codex_ui_driver || raw.codexUiDriver || '')
   const sshTarget = String(raw.ssh_target || raw.sshTarget || '')
   const sshIdentityFile = String(raw.ssh_identity_file || raw.sshIdentityFile || '')
   const sshKnownHostsFile = String(raw.ssh_known_hosts_file || raw.sshKnownHostsFile || '')
   const sshKnownHostsSha256 = hex(raw.ssh_known_hosts_sha256 || raw.sshKnownHostsSha256 || '')
-  if (!['headless', 'codex_app_server', 'notify_only'].includes(deliveryMode)) die('delivery_mode must be headless, codex_app_server, or notify_only')
+  if (!['headless', 'codex_app_server', 'macos_desktop', 'notify_only'].includes(deliveryMode)) die('delivery_mode must be headless, codex_app_server, macos_desktop, or notify_only')
   if (!['spawn', 'local_control_socket'].includes(codexTransport)) die('codex_transport must be spawn or local_control_socket')
   if (deliveryMode === 'codex_app_server') {
     try { validCodexThreadId(codexThreadId) } catch { die('codex_app_server delivery requires an explicit codex_thread_id (persistent app-server UUID or thr_ id)') }
@@ -120,15 +124,23 @@ export function readManifest(root, requestedId) {
       try { localControlSocket(codexSocketPath) } catch (e) { die(e.message) }
     }
   }
+  if (deliveryMode === 'macos_desktop') {
+    try { validCodexThreadId(codexThreadId) } catch { die('macos_desktop delivery requires an explicit codex_thread_id') }
+    if (codexTransport !== 'local_control_socket') die('macos_desktop requires the read-only local control socket observer')
+    try { localControlSocket(codexSocketPath) } catch (e) { die(e.message) }
+    if (codexAppBundleId !== 'com.openai.codex' || !codexProjectLabel.trim() || !codexChatLabel.trim() || !codexUiDriver.startsWith('/')) {
+      die('macos_desktop requires the fixed Codex bundle, project/chat labels, and an absolute UI driver')
+    }
+  }
   if (brokerMode === 'remote') {
-    if (deliveryMode !== 'codex_app_server' || codexTransport !== 'local_control_socket') die('a remote broker is valid only for an exact local Codex control-socket binding')
+    if (!['codex_app_server', 'macos_desktop'].includes(deliveryMode) || codexTransport !== 'local_control_socket') die('a remote broker is valid only for an exact local Codex Desktop binding')
     if (!/^[a-z_][a-z0-9_-]{0,31}@[a-z0-9.-]+$/i.test(sshTarget) || !sshIdentityFile.startsWith('/') ||
         !sshKnownHostsFile.startsWith('/') || !/^[0-9a-f]{64}$/.test(sshKnownHostsSha256)) {
       die('a remote broker manifest requires fixed ssh_target, absolute SSH files, and ssh_known_hosts_sha256')
     }
   }
   return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, carriers: Object.freeze(carriers), relays, stateDir, runtimeDir, spoolDir,
-    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath,
+    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath, codexAppBundleId, codexProjectLabel, codexChatLabel, codexUiDriver,
     sshTarget, sshIdentityFile, sshKnownHostsFile, sshKnownHostsSha256 })
 }
 
