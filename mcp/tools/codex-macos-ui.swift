@@ -198,48 +198,34 @@ guard !tree(window).contains(where: { role($0) == kAXButtonRole && description($
 let setResult = AXUIElementSetAttributeValue(composers[0].element, kAXValueAttribute as CFString, request.text as CFTypeRef)
 guard setResult == .success, value(composers[0]) == request.text else { fail("could not set the exact composer value") }
 func clearExactStagedText() {
-  if value(composers[0]) == request.text {
-    _ = AXUIElementSetAttributeValue(composers[0].element, kAXValueAttribute as CFString, "" as CFTypeRef)
-  }
-}
-
-// Re-read after setting text because the Send button is rendered dynamically.
-let ready = tree(window)
-let send = ready.filter { role($0) == kAXButtonRole && description($0) == "Send" }
-guard send.count == 1 else {
-  _ = AXUIElementSetAttributeValue(composers[0].element, kAXValueAttribute as CFString, "" as CFTypeRef)
-  fail("Send control is absent or ambiguous")
-}
-// Close the project-switch race across AX activation and composer mutation. Revalidate after
-// discovering the dynamic Send control and immediately before pressing it; if selection changed,
-// remove the staged text and leave no instruction behind.
-guard selectedProjectIsBound(request) else {
-  _ = AXUIElementSetAttributeValue(composers[0].element, kAXValueAttribute as CFString, "" as CFTypeRef)
-  fail("selected project changed before send")
-}
-guard AXUIElementPerformAction(send[0].element, kAXPressAction as CFString) == .success else {
-  _ = AXUIElementSetAttributeValue(composers[0].element, kAXValueAttribute as CFString, "" as CFTypeRef)
-  fail("Send control refused AXPress")
-}
-// Chromium can acknowledge a background AXPress without dispatching the form.  If the exact
-// staged value remains, confirm that same bound composer directly.  This is a targeted AX action,
-// not a global Return keystroke, so it cannot land in another app or conversation.
-usleep(300_000)
-if value(composers[0]) == request.text {
-  guard selectedProjectIsBound(request) else {
-    clearExactStagedText()
-    fail("selected project changed before background confirm")
-  }
+  // Cleanup is a mutation too. Never clear through a stale cached AX reference: re-prove the
+  // selected project, unique active conversation, and identical composer immediately first.
+  guard selectedProjectIsBound(request) else { return }
   let rebound = inspect()
   guard rebound.1.count == 1, rebound.2.count == 1, rebound.3 != nil,
-        CFEqual(rebound.2[0].element, composers[0].element) else {
-    clearExactStagedText()
-    fail("configured chat no longer uniquely owns the staged composer")
-  }
-  guard AXUIElementPerformAction(composers[0].element, kAXConfirmAction as CFString) == .success else {
-    clearExactStagedText()
-    fail("background Send did not submit and composer refused AXConfirm")
-  }
+        CFEqual(rebound.2[0].element, composers[0].element),
+        value(rebound.2[0]) == request.text else { return }
+  _ = AXUIElementSetAttributeValue(rebound.2[0].element, kAXValueAttribute as CFString, "" as CFTypeRef)
+}
+
+// Submit through exactly ONE targeted AX mutation. AXPress followed by a timed AXConfirm fallback
+// is unsafe: Chromium may dispatch the press but clear the composer later, making retained text
+// indistinguishable from failure and allowing a duplicate turn. AXConfirm on the uniquely bound
+// composer is the one observable path that works in the background without a global keystroke.
+guard selectedProjectIsBound(request) else {
+  clearExactStagedText()
+  fail("selected project changed before confirm")
+}
+let rebound = inspect()
+guard rebound.1.count == 1, rebound.2.count == 1, rebound.3 != nil,
+      CFEqual(rebound.2[0].element, composers[0].element),
+      value(rebound.2[0]) == request.text else {
+  clearExactStagedText()
+  fail("configured chat no longer uniquely owns the staged composer")
+}
+guard AXUIElementPerformAction(rebound.2[0].element, kAXConfirmAction as CFString) == .success else {
+  clearExactStagedText()
+  fail("bound composer refused AXConfirm")
 }
 
 let deadline = Date().addingTimeInterval(15)

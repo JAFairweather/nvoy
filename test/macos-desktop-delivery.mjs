@@ -33,11 +33,11 @@ ok('project-qualified sidebar task and active header are independently required'
   /let projectChats = named\.filter/.test(nativeSource) && /let active = named\.compactMap/.test(nativeSource))
 ok('selected-project proof precedes every native binder invocation',
   adapterSource.indexOf('verifySelectedDesktopProject({') < adapterSource.indexOf('spawnSync(manifest.codexUiDriver'))
-ok('native binder revalidates selected project after staging and before Send', (() => {
+ok('native binder revalidates selected project after staging and before its one submit mutation', (() => {
   const checks = [...nativeSource.matchAll(/selectedProjectIsBound\(request\)/g)].map(match => match.index)
-  return checks.length === 3 && checks[0] < nativeSource.indexOf('request.text as CFTypeRef') &&
-    checks[1] > nativeSource.indexOf('let send = ready.filter') && checks[1] < nativeSource.indexOf('kAXPressAction') &&
-    checks[2] > nativeSource.indexOf('usleep(300_000)') && checks[2] < nativeSource.indexOf('kAXConfirmAction')
+  const stage = nativeSource.indexOf('request.text as CFTypeRef')
+  const confirm = nativeSource.indexOf('kAXConfirmAction')
+  return checks.length >= 3 && checks[0] < stage && checks.some(index => index > stage && index < confirm)
 })())
 ok('native selection proof is itself descriptor-pinned and no-follow',
   /Darwin\.open\(request\.codex_state_path, O_RDONLY \| O_NOFOLLOW\)/.test(nativeSource) &&
@@ -62,24 +62,32 @@ ok('an AX value equal to its non-empty native placeholder is not mistaken for a 
   nativeSource.includes('!composerPlaceholder.isEmpty && composerValue == composerPlaceholder'))
 ok('Chromium semantic placeholder values are accepted only when they equal the composer description',
   nativeSource.includes('!composerDescription.isEmpty && normalizedComposer == composerDescription'))
-ok('a background Send fallback confirms only the exact bound composer, never global keyboard input',
-  nativeSource.includes('if value(composers[0]) == request.text') &&
-  nativeSource.includes('kAXConfirmAction') && !nativeSource.includes('CGEvent'))
-const fallbackInvariant = source => {
-  const wait = source.indexOf('usleep(300_000)')
-  const rebind = source.indexOf('selectedProjectIsBound(request)', wait)
-  const reinspect = source.indexOf('let rebound = inspect()', wait)
-  const sameComposer = source.indexOf('CFEqual(rebound.2[0].element, composers[0].element)', wait)
-  const confirm = source.indexOf('kAXConfirmAction', wait)
-  return wait >= 0 && rebind > wait && reinspect > rebind && sameComposer > reinspect && confirm > sameComposer
+ok('background delivery has one targeted submit mutation and no timed fallback',
+  !nativeSource.includes('kAXPressAction') &&
+  (nativeSource.match(/kAXConfirmAction/g) || []).length === 1 &&
+  !nativeSource.includes('usleep(300_000)') && !nativeSource.includes('CGEvent'))
+const submitInvariant = source => {
+  const stage = source.indexOf('let setResult = AXUIElementSetAttributeValue')
+  const submit = source.indexOf('// Submit through exactly ONE', stage)
+  const rebind = source.indexOf('selectedProjectIsBound(request)', submit)
+  const reinspect = source.indexOf('let rebound = inspect()', rebind)
+  const sameComposer = source.indexOf('CFEqual(rebound.2[0].element, composers[0].element)', reinspect)
+  const exactValue = source.indexOf('value(rebound.2[0]) == request.text', sameComposer)
+  const confirm = source.indexOf('kAXConfirmAction', exactValue)
+  return stage >= 0 && submit > stage && rebind > submit && reinspect > rebind && sameComposer > reinspect &&
+    exactValue > sameComposer && confirm > exactValue
 }
-ok('fallback wait re-proves project, active chat, and the same composer immediately before AXConfirm',
-  fallbackInvariant(nativeSource))
-ok('NEGATIVE CONTROL — removing the post-wait project proof breaks the fallback invariant',
-  !fallbackInvariant(nativeSource.replace('guard selectedProjectIsBound(request) else {\n    clearExactStagedText()', 'guard true else {\n    clearExactStagedText()')))
+ok('single submit re-proves project, active chat, same composer, and exact staged bytes',
+  submitInvariant(nativeSource))
+ok('NEGATIVE CONTROL — removing the pre-submit project proof breaks the submit invariant',
+  !submitInvariant(nativeSource.replace('guard selectedProjectIsBound(request) else {\n  clearExactStagedText()', 'guard true else {\n  clearExactStagedText()')))
 const noReceipt = nativeSource.indexOf('guard matches == 1 else')
-ok('a no-receipt timeout clears only the exact text this binder staged before failing',
+const cleanup = nativeSource.slice(nativeSource.indexOf('func clearExactStagedText()'), nativeSource.indexOf('// Submit through exactly ONE'))
+ok('a no-receipt timeout invokes target-revalidated exact-text cleanup before failing',
   noReceipt >= 0 && nativeSource.indexOf('clearExactStagedText()', noReceipt) > noReceipt &&
+  /selectedProjectIsBound\(request\)/.test(cleanup) && /let rebound = inspect\(\)/.test(cleanup) &&
+  /CFEqual\(rebound\.2\[0\]\.element, composers\[0\]\.element\)/.test(cleanup) &&
+  /value\(rebound\.2\[0\]\) == request\.text/.test(cleanup) &&
   nativeSource.indexOf('fail("one exact visible receipt was not observed")', noReceipt) >
     nativeSource.indexOf('clearExactStagedText()', noReceipt))
 for (const [name, mutate] of [
