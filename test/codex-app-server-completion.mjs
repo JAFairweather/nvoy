@@ -6,6 +6,7 @@ import { appServerCall } from '../mcp/tools/codex_app_server.mjs'
 
 const root = mkdtempSync(join(tmpdir(), 'nvoy-codex-completion-'))
 const socket = join(root, 'control.sock'), thread = '019fce57-063d-7f50-b837-967d33ee384a', turn = '019fd200-0000-7000-8000-000000000001'
+let started = 0, reads = 0
 const frame = value => {
   const body = Buffer.from(JSON.stringify(value)); let head
   if (body.length < 126) head = Buffer.from([0x81, body.length])
@@ -38,14 +39,28 @@ const server = net.createServer(stream => {
     const parsed = requests(buffer); buffer = parsed.rest
     for (const request of parsed.out) {
       if (request.method === 'initialize') stream.write(frame({ id: request.id, result: {} }))
-      if (request.method === 'thread/read') stream.write(frame({ id: request.id, result: { thread: { id: thread, turns: [] } } }))
+      if (request.method === 'thread/read') {
+        reads++
+        const turns = reads < 3 ? [] : [{ id: turn, status: 'completed', items: [
+          { type: 'userMessage', content: [{ type: 'text', text: 'NVOY_ENVELOPE_ID=' + 'c'.repeat(64) }] },
+          { type: 'agentMessage', phase: 'commentary', text: 'Never publish recovered commentary.' },
+        ] }]
+        stream.write(frame({ id: request.id, result: { thread: { id: thread, turns } } }))
+      }
       if (request.method === 'thread/resume') stream.write(frame({ id: request.id, result: { thread: { id: thread } } }))
       if (request.method === 'turn/start') {
+        started++
         stream.write(frame({ id: request.id, result: { turn: { id: turn } } }))
         stream.write(frame({ method: 'item/completed', params: { threadId: thread, turnId: turn, completedAtMs: Date.now(), item: { id: 'comment', type: 'agentMessage', phase: 'commentary', text: 'Still working.' } } }))
-        stream.write(frame({ method: 'item/completed', params: { threadId: thread, turnId: turn, completedAtMs: Date.now(), item: { id: 'msg', type: 'agentMessage', phase: 'final_answer', text: 'WAKE proof acknowledged once.' } } }))
-        // Deliberately omit turn/completed: the live secondary control-socket subscriber can
-        // miss it even though the explicitly phased final item is durable in the thread.
+        if (started === 1) {
+          stream.write(frame({ method: 'item/completed', params: { threadId: thread, turnId: turn, completedAtMs: Date.now(), item: { id: 'msg', type: 'agentMessage', phase: 'final_answer', text: 'WAKE proof acknowledged once.' } } }))
+          // Deliberately omit turn/completed: the live secondary control-socket subscriber can
+          // miss it even though the explicitly phased final item is durable in the thread.
+        } else {
+          stream.write(frame({ method: 'turn/completed', params: { threadId: thread, turn: { id: turn, status: 'completed', items: [
+            { id: 'comment', type: 'agentMessage', phase: 'commentary', text: 'Never publish live commentary.' },
+          ] } } }))
+        }
       }
     }
   })
@@ -56,6 +71,16 @@ try {
   const result = await appServerCall({ socketPath: socket, threadId: thread, input: 'wake', clientUserMessageId: 'nvoy:test',
     dedupeToken: 'NVOY_ENVELOPE_ID=' + 'a'.repeat(64), waitForCompletion: true, timeoutMs: 10_000 })
   if (result.turnId !== turn || result.finalText !== 'WAKE proof acknowledged once.') throw new Error('completed response was not bound and captured')
+  let liveRefused = false, recoveryRefused = false
+  try {
+    await appServerCall({ socketPath: socket, threadId: thread, input: 'wake again', clientUserMessageId: 'nvoy:test-2',
+      dedupeToken: 'NVOY_ENVELOPE_ID=' + 'b'.repeat(64), waitForCompletion: true, timeoutMs: 10_000 })
+  } catch (error) { liveRefused = /without a final assistant message/.test(error.message) }
+  try {
+    await appServerCall({ socketPath: socket, threadId: thread, input: 'recover', clientUserMessageId: 'nvoy:test-3',
+      dedupeToken: 'NVOY_ENVELOPE_ID=' + 'c'.repeat(64), waitForCompletion: true, timeoutMs: 10_000 })
+  } catch (error) { recoveryRefused = /not complete with a final assistant message/.test(error.message) }
+  if (!liveRefused || !recoveryRefused) throw new Error('phased commentary became a live or recovered reply')
   console.log('codex-app-server-completion: commentary ignored and exact final item captured without turn/completed')
 } finally {
   await new Promise(resolve => server.close(resolve))

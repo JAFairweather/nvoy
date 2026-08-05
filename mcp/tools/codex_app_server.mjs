@@ -29,6 +29,15 @@ export function localControlSocket(value = '') {
   return path
 }
 
+// Once Codex supplies phase metadata for any assistant item, only an explicit final_answer is
+// replyable. The legacy last-message fallback is reserved for turns with no phases at all.
+export function finalAgentText(items = []) {
+  const agents = items.filter(item => item?.type === 'agentMessage' && typeof item.text === 'string')
+  const phased = agents.filter(item => typeof item.phase === 'string' && item.phase.length > 0)
+  const candidates = phased.length ? phased.filter(item => item.phase === 'final_answer') : agents
+  return [...candidates].reverse().find(item => item.text.trim())?.text || ''
+}
+
 // Minimal RFC 6455 client for the documented Unix app-server transport. `ws` does not reliably
 // route Unix sockets on every supported Node build; keeping the transport here also means a
 // desktop adapter has no HTTP listener and no path supplied by an incoming notification.
@@ -37,7 +46,7 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
   const id = listOnly ? null : codexThreadId(threadId)
   return new Promise((resolveCall, rejectCall) => {
     const stream = net.createConnection({ path: socket })
-    let buffer = Buffer.alloc(0), upgraded = false, finished = false, startedTurn = '', finalText = ''
+    let buffer = Buffer.alloc(0), upgraded = false, finished = false, startedTurn = '', finalText = '', sawPhasedAgent = false
     const finish = (error, value) => {
       if (finished) return
       finished = true; clearTimeout(timer)
@@ -79,9 +88,10 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
             // the answer. Commentary is never a reply; only Codex's explicit final phase may
             // close the call early. Older app-server builds without item phases retain the
             // turn/completed path below.
+            if (typeof p.item.phase === 'string' && p.item.phase.length > 0) sawPhasedAgent = true
             if (p.item.phase === 'final_answer' && p.item.text.trim())
               return finish(null, { threadId: id, turnId: startedTurn, recovered: false, finalText: p.item.text })
-            if (p.item.phase !== 'commentary') finalText = p.item.text
+            if (!sawPhasedAgent) finalText = p.item.text
           }
           continue
         }
@@ -89,10 +99,9 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
           const p = message.params || {}
           if (p.threadId !== id || p.turn?.id !== startedTurn) continue
           if (p.turn.status !== 'completed') return finish(new Error(`Codex turn ended with status ${p.turn.status || 'unknown'}`))
-          if (!finalText) {
-            const agent = [...(p.turn.items || [])].reverse().find(item => item?.type === 'agentMessage' && typeof item.text === 'string')
-            finalText = agent?.text || ''
-          }
+          const items = p.turn.items || []
+          const turnHasPhases = items.some(item => item?.type === 'agentMessage' && typeof item.phase === 'string' && item.phase.length > 0)
+          if (sawPhasedAgent || turnHasPhases || !finalText) finalText = finalAgentText(items)
           if (!finalText.trim()) return finish(new Error('Codex completed without a final assistant message'))
           return finish(null, { threadId: id, turnId: startedTurn, recovered: false, finalText })
         }
@@ -109,8 +118,8 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
           if (dedupeToken) {
             const prior = (message.result.thread.turns || []).find(turn => JSON.stringify(turn).includes(dedupeToken))
             if (prior?.id) {
-              const agent = [...(prior.items || [])].reverse().find(item => item?.type === 'agentMessage' && typeof item.text === 'string')
-              if (waitForCompletion && prior.status === 'completed' && agent?.text?.trim()) return finish(null, { threadId: id, turnId: prior.id, recovered: true, finalText: agent.text })
+              const recoveredText = finalAgentText(prior.items || [])
+              if (waitForCompletion && prior.status === 'completed' && recoveredText.trim()) return finish(null, { threadId: id, turnId: prior.id, recovered: true, finalText: recoveredText })
               if (waitForCompletion) return finish(new Error('recovered Codex turn is not complete with a final assistant message'))
               return finish(null, { threadId: id, turnId: prior.id, recovered: true })
             }
