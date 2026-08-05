@@ -104,7 +104,7 @@ const fakeSource = prior => `#!/usr/bin/env node
 import readline from 'node:readline'; import { appendFileSync } from 'node:fs'
 const thread=${JSON.stringify(spawnThread)}, log=${JSON.stringify(lifecycleLog)}, prior=${JSON.stringify(prior)}, token=${JSON.stringify(`NVOY_ENVELOPE_ID=${spawnEnvelope}`)}
 const out=x=>process.stdout.write(JSON.stringify(x)+'\\n')
-readline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line); appendFileSync(log,m.method+':'+String(m.id||'notify')+'\\n')
+readline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line); appendFileSync(log,m.method+':'+String(m.id||'notify')+(m.method==='turn/start'?':'+String(m.params?.clientUserMessageId||''):'')+'\\n')
 if(m.method==='initialize')out({id:m.id,result:{}})
 if(m.method==='thread/read')out({id:m.id,result:{thread:{id:thread,turns:prior?[{id:'019fce6b-4727-7a13-8f80-f4a6035c2770',items:[{type:'userMessage',content:[{type:'text',text:token}]}]}]:[]}}})
 if(m.method==='thread/resume')out({id:m.id,result:{thread:{id:thread}}})
@@ -112,7 +112,7 @@ if(m.method==='turn/start')out({id:m.id,result:{turn:{id:'019fce6b-4727-7a13-8f8
 writeFileSync(fakeCodex, fakeSource(false), { mode: 0o700 })
 const runSpawnAdapter = () => spawnSync(process.execPath, ['mcp/tools/codex-app-server-adapter.mjs', '--instance', 'spawn-test', '--once'], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, PATH: `${appServerFakeBin}:${process.env.PATH}`, NVOY_INSTANCE_ROOT: manifestRoot } })
 const firstSpawn = runSpawnAdapter(), firstLifecycle = readFileSync(lifecycleLog, 'utf8')
-ok('spawn app-server uses ordered initialize/read/resume/start framing with unique request ids', firstSpawn.status === 0 && /initialize:1[\s\S]*initialized:notify[\s\S]*thread\/read:2[\s\S]*thread\/resume:3[\s\S]*turn\/start:4/.test(firstLifecycle))
+ok('spawn app-server uses ordered initialize/read/resume/start framing with unique request ids and an envelope-owned user-message id', firstSpawn.status === 0 && /initialize:1[\s\S]*initialized:notify[\s\S]*thread\/read:2[\s\S]*thread\/resume:3[\s\S]*turn\/start:4:nvoy:4444/.test(firstLifecycle))
 unlinkSync(join(spawnRuntime, 'codex-app-server-delivered.jsonl')); writeFileSync(lifecycleLog, ''); writeFileSync(fakeCodex, fakeSource(true), { mode: 0o700 })
 const recoveredSpawn = runSpawnAdapter(), recoveredLifecycle = readFileSync(lifecycleLog, 'utf8')
 ok('a persisted Codex envelope marker closes the post-turn/start crash duplicate window', recoveredSpawn.status === 0 && /thread\/read:2/.test(recoveredLifecycle) && !/thread\/resume|turn\/start/.test(recoveredLifecycle) && readFileSync(join(spawnRuntime, 'codex-app-server-delivered.jsonl'), 'utf8').includes(spawnEnvelope))
@@ -197,9 +197,13 @@ ok('a broker claims a per-state exclusive lock before decrypting', /openSync\(lo
 ok('the broker records an identity-bound, expiry-limited admission receipt before any keyless worker can request a reply', /broker: manifest\.pubkey, envelope/.test(brokerSource) && /sender: String\(admission\.from\)/.test(brokerSource) && /grant_id: String\(admission\.grant_id\)/.test(brokerSource) && /expires_at: Date\.now\(\) \+ 5 \* 60 \* 1000/.test(brokerSource))
 ok('the broker carries its verified task authority into Desktop delivery instead of downgrading it to generic data',
   /type: 'scoped-instruction'/.test(brokerSource) && /scope_subject: manifest\.pubkey/.test(brokerSource) &&
-  /sender's own message is a scoped user instruction/.test(desktopPromptSource) &&
-  /GRANT-AUTHORIZED NOSTR INSTRUCTION/.test(desktopPromptSource) &&
+  /authenticated sender text above is a user instruction/.test(desktopPromptSource) &&
+  /DATA-ONLY NOSTR NOTIFICATION/.test(desktopPromptSource) &&
   /desktopInstructionPrompt/.test(codexDesktopSource))
+ok('the Desktop adapter gives each admitted envelope a stable app-server user-message id',
+  /return `nvoy:\$\{task\.envelope\}`/.test(codexDesktopSource) &&
+  /clientUserMessageId: userMessageId\(task\)/.test(codexDesktopSource) &&
+  /clientUserMessageId/.test(codexTransportSource))
 const daemonSource = readFileSync('mcp/tools/instance-broker-daemon.mjs', 'utf8')
 ok('the broker daemon rate-limits retries after transient policy failures', /retryAfter\.get\(item\.envelope\)/.test(daemonSource) && /Date\.now\(\) \+ 5000/.test(daemonSource))
 ok('broker restart requeues only interrupted inflight markers and prioritizes the newest opaque observation', /\.inflight/.test(daemonSource) && /\.pending/.test(daemonSource) && /marker\.observed_at/.test(daemonSource) && /b\.observed - a\.observed/.test(daemonSource) && /setInterval\(drain, 1000\)/.test(daemonSource))
