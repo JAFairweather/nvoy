@@ -8,6 +8,19 @@ const hex = (s) => typeof s === 'string' && /^[0-9a-f]{64}$/i.test(s)
 const hexBytes = (s) => Uint8Array.from(String(s).match(/../g) || [], h => parseInt(h, 16))
 const hexOf = (bytes) => [...bytes].map(b => b.toString(16).padStart(2, '0')).join('')
 
+// URL input is convenience only: it may fill public identities and a closed capability,
+// but it can never trigger signing. Reject the whole prefill if any field is absent,
+// duplicated, unknown, or malformed so a link cannot create a misleading partial review.
+export function parseTaskAuthorityPrefill(search) {
+  const params = new URLSearchParams(String(search || '').replace(/^\?/, ''))
+  const allowed = new Set(['sender', 'agent', 'cap'])
+  if ([...params.keys()].some(key => !allowed.has(key))) return null
+  if ([...allowed].some(key => params.getAll(key).length !== 1)) return null
+  const senderPub = params.get('sender')?.toLowerCase(), agentPub = params.get('agent')?.toLowerCase(), cap = params.get('cap')
+  if (!hex(senderPub) || !hex(agentPub) || senderPub === agentPub || !TASK_CAPS.has(cap)) return null
+  return Object.freeze({ senderPub, agentPub, cap })
+}
+
 export async function taskScopeHash(agentPub, saltHex) {
   if (!hex(agentPub) || !/^[0-9a-f]{32}$/i.test(saltHex || '')) throw new Error('invalid task scope input')
   const body = new Uint8Array([...new TextEncoder().encode(DOMAIN), ...new TextEncoder().encode(agentPub.toLowerCase()), ...hexBytes(saltHex)])

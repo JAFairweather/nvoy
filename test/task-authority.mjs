@@ -1,5 +1,5 @@
 import { finalizeEvent, generateSecretKey, getPublicKey, verifyEvent } from 'nostr-tools'
-import { buildTaskAuthority, taskScopeHash, signPublishTaskAuthority } from '../console/task-authority-lib.mjs'
+import { buildTaskAuthority, parseTaskAuthorityPrefill, taskScopeHash, signPublishTaskAuthority } from '../console/task-authority-lib.mjs'
 import { desktopInstructionPrompt } from '../mcp/tools/desktop_instruction_prompt.mjs'
 
 let n = 0, pass = 0
@@ -15,6 +15,14 @@ t('binds scope to the intended agent using the shared domain', draft.tags.find(t
 t('does not expose the agent public key in the public tags', !draft.tags.flat().includes(agent))
 const relayDraft = await buildTaskAuthority({ senderPub: sender, agentPub: agent, cap: 'task-relay', createdAt: 1000, salt })
 t('builds the distinct carrier-only task-relay capability', relayDraft.tags.find(tag => tag[0] === 'da-cap')?.[1] === 'task-relay')
+t('parses a complete public-key task-relay prefill without signing', (() => {
+  const value = parseTaskAuthorityPrefill(`?sender=${sender}&agent=${agent}&cap=task-relay`)
+  return value?.senderPub === sender && value?.agentPub === agent && value?.cap === 'task-relay'
+})())
+t('refuses partial, duplicated, widened, or self-authority prefills', [
+  `?sender=${sender}&agent=${agent}`, `?sender=${sender}&sender=${agent}&agent=${agent}&cap=task`,
+  `?sender=${sender}&agent=${agent}&cap=task&sign=yes`, `?sender=${sender}&agent=${sender}&cap=task`,
+].every(value => parseTaskAuthorityPrefill(value) === null))
 await Promise.all(['wat', '', 'task+anything'].map(async cap => {
   try { await buildTaskAuthority({ senderPub: sender, agentPub: agent, cap }); return false } catch { return true }
 })).then(v => t('rejects every capability outside task/task+act/task-relay', v.every(Boolean)))
