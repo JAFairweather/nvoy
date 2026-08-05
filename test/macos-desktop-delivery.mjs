@@ -26,10 +26,15 @@ const evidence = { version: 1, status: 'visible', envelope, app_bundle_id: reque
 ok('one exact visible bubble is accepted', verifyDesktopEvidence(request, evidence).envelope === envelope)
 const nativeSource = readFileSync(new URL('../mcp/tools/codex-macos-ui.swift', import.meta.url), 'utf8')
 const adapterSource = readFileSync(new URL('../mcp/tools/codex-macos-desktop-adapter.mjs', import.meta.url), 'utf8')
+const selectionSource = readFileSync(new URL('../mcp/tools/codex_desktop_selection.mjs', import.meta.url), 'utf8')
 ok('project-qualified sidebar task and active header are independently required',
   /let projectChats = named\.filter/.test(nativeSource) && /let active = named\.compactMap/.test(nativeSource))
 ok('selected-project proof precedes every native binder invocation',
   adapterSource.indexOf('verifySelectedDesktopProject({') < adapterSource.indexOf('spawnSync(manifest.codexUiDriver'))
+ok('Desktop state validation and reading are pinned to one no-follow descriptor',
+  /openSync\(path, constants\.O_RDONLY \| constants\.O_NOFOLLOW\)/.test(selectionSource) &&
+  /fstatSync\(fd\)/.test(selectionSource) && /readFileSync\(fd, 'utf8'\)/.test(selectionSource) &&
+  !/readFileSync\(path/.test(selectionSource))
 ok('Electron semantic accessibility is enabled before the focused window is inspected', (() => {
   const enable = nativeSource.indexOf('"AXManualAccessibility" as CFString')
   const inspect = nativeSource.indexOf('kAXFocusedWindowAttribute')
