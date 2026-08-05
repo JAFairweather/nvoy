@@ -4,10 +4,8 @@ on:
   push:
     branches: [main]
     paths:
-      - deploy/nvoy-runtime.Dockerfile
-      - deploy/nvoy-worker.Dockerfile
-      # render-instance-compose loads this template from the runtime image.
-      - deploy/participant-runtime.compose.yml
+      # Runtime image contracts and the host-side pull reconciler must advance together.
+      - deploy/**
       - mcp/**
       - lib/**
       - package.json
@@ -23,7 +21,26 @@ permissions:
   packages: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Set up Node
+        uses: actions/setup-node@1e60f620b9541dca151540d0c3c0b65636a8f247
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci && npm --prefix mcp ci
+
+      - name: Run complete non-container gate
+        run: npm test
+
   publish:
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

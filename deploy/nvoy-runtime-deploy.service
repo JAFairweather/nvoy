@@ -1,0 +1,25 @@
+[Unit]
+Description=Nvoy runtime deploy — pull latest verified immutable release
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/nvoy-hub
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=NVOY_INSTANCE_ROOT=/etc/nvoy/instances
+Environment=NVOY_DEPLOY_STATE=/var/lib/nvoy-deploy
+Environment=NVOY_DEPLOY_HUB=/opt/nvoy-hub
+EnvironmentFile=-/etc/nvoy/runtime-deploy.env
+ExecStart=/usr/bin/python3 /opt/nvoy-hub/deploy/runtime-deploy-runner.py
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/nvoy-hub /etc/nvoy/instances /var/lib/nvoy-deploy
+ReadOnlyPaths=/run/docker.sock
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
