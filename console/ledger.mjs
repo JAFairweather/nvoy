@@ -50,19 +50,8 @@ const AGENT_ICON = '<svg class="lg-grantee-ic" width="13" height="13" viewBox="0
 // …and a person glyph for an identity that isn't an agent (a real npub that
 // holds a grant — a contact, a peer). Same size, muted colour (see CSS).
 const PERSON_ICON = '<svg class="lg-grantee-ic" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-label="identity"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>'
-// The "type" facet: classify a delegation by the nature of what it grants.
-function scopeKind(d) {
-  // External grants (read off the relays from another app) are their own facet — they carry no
-  // Nvoy scope, so the name-based classification below does not apply and would wrongly file them
-  // under 'data' (making a Data filter include them and an External filter impossible).
-  if (d.external) return 'external'
-  const n = `${d.scopeName || ''} ${d.scope || ''}`.toLowerCase()
-  if (n.includes('steer')) return 'steering'
-  if (/nactjaf|approval/.test(n)) return 'approvals'
-  if (n.includes('credential')) return 'credentials'
-  return 'data'
-}
-const TYPES = ['credentials', 'data', 'approvals', 'steering', 'external']
+import { scopeKind, TYPES } from './scope-facet.mjs'
+
 const STATUSES = ['active', 'expired', 'revoked', 'relinquished']
 const STATUS_RANK = { active: 0, expired: 1, relinquished: 2, revoked: 3 }
 // The primary grouping axis. 'scope' groups all grantees of one credential under
@@ -212,7 +201,8 @@ function delegationCard(d, i) {
   // a misbehaving agent's INPUT while retaining its output history.
   const wantsOutput = !!d.terms?.reply_scope_requested || state.received.some(g => g.publisher === d.agent)
   const kind = scopeKind(d)
-  const icon = kind === 'credentials' ? '🔑' : kind === 'approvals' ? '✅' : '📄'
+  const icon = kind === 'credential' ? '🔑' : kind === 'admission' ? '🚪'
+    : kind === 'action' ? '✋' : kind === 'unnamespaced' ? '❔' : '📄'
   const gname = agentName(d.agent) || short(d.agent)
   const mono = esc(((gname || '?').trim()[0] || '?').toUpperCase())
   return `<div class="card st-${d.status} kind-${kind}" data-i="${i}" data-scope="${esc(d.scope)}" data-agent="${esc(d.agent)}">
@@ -365,7 +355,7 @@ export function renderLedger() {
           ${GROUP_OPTS.map(([g, lbl]) => check(lbl, groupBy === g, `data-group="${g}"`, true)).join('')}
         </div>
         <div class="lg-nav-sect">
-          <div class="lg-nav-h">Grantee</div>
+          <div class="lg-nav-h">Narrow to one grantee</div>
           <select id="lg-agent" title="filter to one grantee — agents and other identities are separated">
             <option value="">all grantees</option>
             ${(() => {
@@ -385,7 +375,7 @@ export function renderLedger() {
           ${STATUSES.map(x => check(x, fStatuses.has(x), `data-status="${x}"`)).join('')}
         </div>
         <div class="lg-nav-sect">
-          <div class="lg-nav-h">Grantee</div>
+          <div class="lg-nav-h">Grantee kind</div>
           ${check('agents', fKinds.has('agent'), 'data-kind="agent"')}
           ${check('other identities', fKinds.has('identity'), 'data-kind="identity"')}
         </div>
