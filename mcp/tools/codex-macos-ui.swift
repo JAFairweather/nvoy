@@ -208,10 +208,10 @@ func clearExactStagedText() {
   _ = AXUIElementSetAttributeValue(rebound.2[0].element, kAXValueAttribute as CFString, "" as CFTypeRef)
 }
 
-// Submit through exactly ONE targeted AX mutation. AXPress followed by a timed AXConfirm fallback
-// is unsafe: Chromium may dispatch the press but clear the composer later, making retained text
-// indistinguishable from failure and allowing a duplicate turn. AXConfirm on the uniquely bound
-// composer is the one observable path that works in the background without a global keystroke.
+// Submit through one process-targeted Return keystroke. Electron's composer reports AXConfirm as
+// successful without dispatching the form, while a global CGEvent could land in another app. Bind
+// keyboard focus to the exact re-proved composer, then post the key pair only to this Codex PID.
+// The visible receipt below—not event delivery—is still the proof that submission occurred.
 guard selectedProjectIsBound(request) else {
   clearExactStagedText()
   fail("selected project changed before confirm")
@@ -223,10 +223,19 @@ guard rebound.1.count == 1, rebound.2.count == 1, rebound.3 != nil,
   clearExactStagedText()
   fail("configured chat no longer uniquely owns the staged composer")
 }
-guard AXUIElementPerformAction(rebound.2[0].element, kAXConfirmAction as CFString) == .success else {
+guard AXUIElementSetAttributeValue(rebound.2[0].element, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success,
+      attribute(rebound.2[0].element, kAXFocusedAttribute as CFString) as? Bool == true else {
   clearExactStagedText()
-  fail("bound composer refused AXConfirm")
+  fail("bound composer refused process-local focus")
 }
+guard let source = CGEventSource(stateID: .privateState),
+      let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: true),
+      let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: false) else {
+  clearExactStagedText()
+  fail("could not construct process-targeted Return")
+}
+keyDown.postToPid(app.processIdentifier)
+keyUp.postToPid(app.processIdentifier)
 
 let deadline = Date().addingTimeInterval(15)
 var matches = 0

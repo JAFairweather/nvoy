@@ -175,8 +175,11 @@ forbids every key, Bunker, and worker-credential reference in the desktop manife
 For V1 visible delivery into an already-open Codex Desktop chat, use `delivery_mode:
 "macos_desktop"` and additionally fix `codex_app_bundle_id: "com.openai.codex"`,
 `codex_project_label`, `codex_chat_label`, and the absolute installed `codex_ui_driver` path.
-The local adapter uses Accessibility only for visible submission; App Server is read-only and
-observes the resulting Desktop-owned turn by its receipt marker. See
+The project/chat label may include the participant's short pubkey fingerprint as a human safety
+signal; the full participant pubkey remains the manifest identity and must be shown in Console.
+The local adapter uses a process-targeted macOS submission only after proving the exact app,
+workspace, chat, composer and staged bytes. App Server is read-only and observes the resulting
+Desktop-owned turn by its receipt marker. A sibling `turn/start` is not a visible Desktop wake. See
 [`MACOS_DESKTOP_BINDER.md`](MACOS_DESKTOP_BINDER.md).
 
 Then run:
@@ -280,7 +283,7 @@ and preview constraints are documented in Anthropic's official
 [Channels guide](https://code.claude.com/docs/en/channels) and
 [Channels reference](https://code.claude.com/docs/en/channels-reference).
 
-With `codex_transport: "local_control_socket"`, it uses the supported local Codex app-server
+With `delivery_mode: "codex_app_server"` and `codex_transport: "local_control_socket"`, it uses the supported local Codex app-server
 control socket and JSON-RPC lifecycle (`initialize`, `thread/read`, `thread/resume`, then
 `turn/start`). The binding may name a real persistent app-server UUID or a `thr_` id; it is
 selected by the owner at

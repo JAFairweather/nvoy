@@ -36,8 +36,8 @@ ok('selected-project proof precedes every native binder invocation',
 ok('native binder revalidates selected project after staging and before its one submit mutation', (() => {
   const checks = [...nativeSource.matchAll(/selectedProjectIsBound\(request\)/g)].map(match => match.index)
   const stage = nativeSource.indexOf('request.text as CFTypeRef')
-  const confirm = nativeSource.indexOf('kAXConfirmAction')
-  return checks.length >= 3 && checks[0] < stage && checks.some(index => index > stage && index < confirm)
+  const targetedPost = nativeSource.indexOf('postToPid(app.processIdentifier)')
+  return checks.length >= 3 && checks[0] < stage && checks.some(index => index > stage && index < targetedPost)
 })())
 ok('native selection proof is itself descriptor-pinned and no-follow',
   /Darwin\.open\(request\.codex_state_path, O_RDONLY \| O_NOFOLLOW\)/.test(nativeSource) &&
@@ -62,18 +62,19 @@ ok('an AX value equal to its non-empty native placeholder is not mistaken for a 
   nativeSource.includes('!composerPlaceholder.isEmpty && composerValue == composerPlaceholder'))
 ok('Chromium semantic placeholder values are accepted only when they equal the composer description',
   nativeSource.includes('!composerDescription.isEmpty && normalizedComposer == composerDescription'))
-ok('background delivery has one targeted submit mutation and no timed fallback',
-  !nativeSource.includes('kAXPressAction') &&
-  (nativeSource.match(/kAXConfirmAction/g) || []).length === 1 &&
-  !nativeSource.includes('usleep(300_000)') && !nativeSource.includes('CGEvent'))
+ok('background delivery posts one Return pair only to the verified Codex PID and has no global or timed fallback',
+  !nativeSource.includes('kAXPressAction') && !nativeSource.includes('kAXConfirmAction') &&
+  (nativeSource.match(/postToPid\(app\.processIdentifier\)/g) || []).length === 2 &&
+  nativeSource.includes('kAXFocusedAttribute') && !nativeSource.includes('.post(tap:') &&
+  !nativeSource.includes('usleep(300_000)'))
 const submitInvariant = source => {
   const stage = source.indexOf('let setResult = AXUIElementSetAttributeValue')
-  const submit = source.indexOf('// Submit through exactly ONE', stage)
+  const submit = source.indexOf('// Submit through one process-targeted', stage)
   const rebind = source.indexOf('selectedProjectIsBound(request)', submit)
   const reinspect = source.indexOf('let rebound = inspect()', rebind)
   const sameComposer = source.indexOf('CFEqual(rebound.2[0].element, composers[0].element)', reinspect)
   const exactValue = source.indexOf('value(rebound.2[0]) == request.text', sameComposer)
-  const confirm = source.indexOf('kAXConfirmAction', exactValue)
+  const confirm = source.indexOf('postToPid(app.processIdentifier)', exactValue)
   return stage >= 0 && submit > stage && rebind > submit && reinspect > rebind && sameComposer > reinspect &&
     exactValue > sameComposer && confirm > exactValue
 }
