@@ -1,5 +1,6 @@
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
 import { verifyChannelDataCarry } from '../mcp/tools/channel_task_carry.mjs'
+import { partitionInboxMessages } from '../mcp/tools/inbox_trust.mjs'
 
 let pass = 0, fail = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); value ? pass++ : fail++ }
@@ -25,6 +26,19 @@ const wrongChannelSource = JSON.parse(JSON.stringify(finalizeEvent({ kind: 9, cr
   tags: [['h', 'ffffffff-ffff-ffff-ffff-ffffffffffff']], content: source.content }, authorSk)))
 ok('a valid source signed for another channel cannot be relabelled by the carrier', !verify({ ...carry, source: wrongChannelSource }))
 ok('unknown carry fields are refused', !verify({ ...carry, authority: 'task' }))
+
+const malformedCarrier = wire({ ...carry, source: { ...source, content: source.content + ' forged' } })
+const rejectedCarryFallback = verifyChannelDataCarry(malformedCarrier, { channels: [channel], carriers: [carrier] })?.message || malformedCarrier
+const overlap = partitionInboxMessages([rejectedCarryFallback], {
+  trusted: { [carrier]: 'waggle' }, carriers: [carrier],
+})
+ok('a configured carrier can never regain direct authority through trusted-senders overlap',
+  rejectedCarryFallback === malformedCarrier && overlap.trustedDirect.length === 0 &&
+  overlap.rejectedCarrier[0] === malformedCarrier)
+const direct = { from: author, at: source.created_at, content: 'operator direct message' }
+const directPartition = partitionInboxMessages([direct], { trusted: { [author]: 'operator' }, carriers: [carrier] })
+ok('a non-carrier trusted sender remains in the explicit direct partition',
+  directPartition.trustedDirect[0] === direct && directPartition.rejectedCarrier.length === 0)
 
 console.log(`\n${pass}/${pass + fail} passed`)
 process.exit(fail ? 1 : 0)
