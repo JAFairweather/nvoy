@@ -7,7 +7,7 @@ const authorSk = generateSecretKey(), author = getPublicKey(authorSk)
 const carrier = getPublicKey(generateSecretKey())
 const channel = 'a8186b53-537d-46ad-a7e7-b6486c58970e'
 const source = JSON.parse(JSON.stringify(finalizeEvent({ kind: 9, created_at: 1785870000,
-  tags: [['h', 'signed-channel-address'], ['p', '1'.repeat(64)]], content: 'please inspect the queue' }, authorSk)))
+  tags: [['h', channel], ['p', '1'.repeat(64)]], content: 'please inspect the queue' }, authorSk)))
 const authorGrant = { grantId: 'a'.repeat(64), grantor: 'b'.repeat(64), cap: 'task' }
 const carrierGrant = { grantId: 'c'.repeat(64), grantor: 'b'.repeat(64), cap: 'task-relay' }
 const wire = payload => ({ from: carrier, at: 1785870001, content: JSON.stringify(payload) })
@@ -22,6 +22,9 @@ ok('the exact source event and reply channel are bound into admission', admitted
 ok('task-relay alone cannot authorize a bridge-authored instruction', !verifyChannelTaskCarry(wire(carry), { channels: [channel], carrierGrant, taskGrantFor: () => null }))
 ok('a carrier task grant cannot substitute for task-relay', !verifyChannelTaskCarry(wire(carry), { channels: [channel], carrierGrant: { ...carrierGrant, cap: 'task' }, taskGrantFor: () => authorGrant }))
 ok('an unconfigured channel fails closed', !verifyChannelTaskCarry(wire(carry), { channels: ['ffffffff-ffff-ffff-ffff-ffffffffffff'], carrierGrant, taskGrantFor: () => authorGrant }))
+const crossChannel = JSON.parse(JSON.stringify(finalizeEvent({ kind: 9, created_at: source.created_at,
+  tags: [['h', 'ffffffff-ffff-ffff-ffff-ffffffffffff']], content: source.content }, authorSk)))
+ok('a carrier cannot replay a signed source across a different channel', !verify({ ...carry, source: crossChannel }))
 ok('tampering with the original content breaks its signature', !verify({ ...carry, source: { ...source, content: source.content + ' now' } }))
 ok('tampering with the original signer breaks its signature', !verify({ ...carry, source: { ...source, pubkey: 'd'.repeat(64) } }))
 ok('unknown carry fields are rejected rather than ignored', !verify({ ...carry, command: 'redirect' }))
