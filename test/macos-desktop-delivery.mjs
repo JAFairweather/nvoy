@@ -61,6 +61,9 @@ ok('an AX value equal to its non-empty native placeholder is not mistaken for a 
   nativeSource.includes('!composerPlaceholder.isEmpty && composerValue == composerPlaceholder'))
 ok('Chromium semantic placeholder values are accepted only when they equal the composer description',
   nativeSource.includes('!composerDescription.isEmpty && normalizedComposer == composerDescription'))
+ok('a background Send fallback confirms only the exact bound composer, never global keyboard input',
+  nativeSource.includes('if value(composers[0]) == request.text') &&
+  nativeSource.includes('kAXConfirmAction') && !nativeSource.includes('CGEvent'))
 for (const [name, mutate] of [
   ['wrong app fails closed', x => { x.app_bundle_id = 'com.apple.TextEdit' }],
   ['wrong project fails closed', x => { x.project_label = 'other' }],

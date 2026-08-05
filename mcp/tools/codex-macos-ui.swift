@@ -216,6 +216,16 @@ guard AXUIElementPerformAction(send[0].element, kAXPressAction as CFString) == .
   _ = AXUIElementSetAttributeValue(composers[0].element, kAXValueAttribute as CFString, "" as CFTypeRef)
   fail("Send control refused AXPress")
 }
+// Chromium can acknowledge a background AXPress without dispatching the form.  If the exact
+// staged value remains, confirm that same bound composer directly.  This is a targeted AX action,
+// not a global Return keystroke, so it cannot land in another app or conversation.
+usleep(300_000)
+if value(composers[0]) == request.text {
+  guard AXUIElementPerformAction(composers[0].element, kAXConfirmAction as CFString) == .success else {
+    _ = AXUIElementSetAttributeValue(composers[0].element, kAXValueAttribute as CFString, "" as CFTypeRef)
+    fail("background Send did not submit and composer refused AXConfirm")
+  }
+}
 
 let deadline = Date().addingTimeInterval(15)
 var matches = 0
