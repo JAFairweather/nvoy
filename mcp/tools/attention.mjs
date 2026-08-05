@@ -34,7 +34,7 @@ import { decode, npubEncode } from 'nostr-tools/nip19'
 import { getPublicKey, verifyEvent } from 'nostr-tools/pure'
 import * as nip44 from 'nostr-tools/nip44'
 import { makeBunkerSigner } from './nip46-signer.mjs'
-import { verifyChannelTaskCarry } from './channel_task_carry.mjs'
+import { authenticatedNip59Rumor, partitionInvocations } from './invocation_policy.mjs'
 
 const arg = (n, d) => { const i = process.argv.indexOf(n); return i === -1 ? d : process.argv[i + 1] }
 const die = (m) => { console.error(`attention: ${m}`); process.exit(1) }
@@ -178,12 +178,6 @@ const TASK_CARRIERS = (() => {
   return out
 })()
 
-function channelCarry(message) {
-  const allowedChannels = TASK_CARRIERS.get(message.from)
-  const carrierGrant = relayGrant(message.from)
-  return verifyChannelTaskCarry(message, { channels: [...(allowedChannels || [])], carrierGrant, taskGrantFor: taskGrant })
-}
-
 // --- 2. Read the inbox. ----------------------------------------------------------------------
 const wraps = new Map()
 for (const url of RELAYS) {
@@ -198,7 +192,7 @@ for (const w of wraps.values()) {
     const seal = JSON.parse(await decrypt(w.pubkey, w.content))
     if (seal.kind !== 13) continue
     const rumor = JSON.parse(await decrypt(seal.pubkey, seal.content))
-    if (rumor.kind !== 14 || rumor.pubkey !== seal.pubkey) continue // author-spoof guard
+    if (!authenticatedNip59Rumor(seal, rumor)) continue
     if (rumor.created_at < since || seal.pubkey === ME) continue
     msgs.push({ from: seal.pubkey, at: rumor.created_at, content: String(rumor.content || '') })
   } catch { /* not for me */ }
@@ -209,23 +203,12 @@ msgs.sort((a, b) => a.at - b.at)
 // Default-closed: no verified policy means nothing is actionable, however many grants we think
 // we remember. Being unable to check is not permission.
 const policyUsable = relaysAnswered > 0
-const admitted = []
-const admittedRaw = new Set()
-if (policyUsable) for (const message of msgs) {
-  const carried = channelCarry(message)
-  const direct = taskGrant(message.from)
-  if (carried) {
-    admitted.push(carried)
-    admittedRaw.add(message)
-  } else if (direct) {
-    admitted.push({ message, admission: { mode: 'direct', from: message.from,
-      grant_id: direct.grantId, grantor: direct.grantor, cap: direct.cap } })
-    admittedRaw.add(message)
-  }
-}
-const actionable = admitted.map(item => item.message)
-const admissions = admitted.map(item => item.admission)
-const dataOnly = msgs.filter(message => !admittedRaw.has(message))
+const { admitted, actionable, admissions, dataOnly } = partitionInvocations(msgs, {
+  policyUsable,
+  taskGrantFor: taskGrant,
+  relayGrantFor: relayGrant,
+  carrierChannels: sender => [...(TASK_CARRIERS.get(sender) || [])],
+})
 
 const label = (hex) => {
   try { const n = npubEncode(hex); return `${n.slice(0, 10)}…${n.slice(-5)}` } catch { return hex.slice(0, 12) + '…' }

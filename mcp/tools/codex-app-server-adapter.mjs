@@ -35,6 +35,10 @@ function records(path) {
 function prompt(task) {
   return desktopInstructionPrompt(task, { instance: manifest.id, scopeSubject: manifest.pubkey, grantors: manifest.grantors, carriers: manifest.carriers })
 }
+function userMessageId(task) {
+  // The broker-authenticated envelope, not network-supplied message text, owns the stable ID.
+  return `nvoy:${task.envelope}`
+}
 function deliverSpawn(task) {
   return new Promise((resolveDelivery, reject) => {
     // App-server is deliberately local-only stdio.  Never point this at a network listener or
@@ -64,7 +68,7 @@ function deliverSpawn(task) {
         if (msg.error) return fail(new Error(`thread/resume failed: ${msg.error.message || 'unknown error'}`))
         if (msg.result?.thread?.id !== manifest.codexThreadId) return fail(new Error('Codex app-server resumed an unexpected thread'))
         resumed = true
-        send({ method: 'turn/start', id: 4, params: { threadId: manifest.codexThreadId, input: [{ type: 'text', text: prompt(task) }] } })
+        send({ method: 'turn/start', id: 4, params: { threadId: manifest.codexThreadId, input: [{ type: 'text', text: prompt(task) }], clientUserMessageId: userMessageId(task) } })
       } else if (msg.id === 4) {
         if (msg.error) return fail(new Error(`turn/start failed: ${msg.error.message || 'unknown error'}`))
         if (!resumed || !msg.result?.turn?.id) return fail(new Error('Codex app-server returned an invalid turn acknowledgement'))
@@ -77,7 +81,7 @@ function deliverSpawn(task) {
 async function deliver(task) {
   if (manifest.codexTransport !== 'local_control_socket') return deliverSpawn(task)
   const result = await appServerCall({ socketPath: manifest.codexSocketPath, threadId: manifest.codexThreadId,
-    input: prompt(task), dedupeToken: `NVOY_ENVELOPE_ID=${task.envelope}` })
+    input: prompt(task), clientUserMessageId: userMessageId(task), dedupeToken: `NVOY_ENVELOPE_ID=${task.envelope}` })
   return result.turnId
 }
 async function drain() {
