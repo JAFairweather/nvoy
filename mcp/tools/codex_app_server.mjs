@@ -41,13 +41,16 @@ export function finalAgentText(items = []) {
 // Minimal RFC 6455 client for the documented Unix app-server transport. `ws` does not reliably
 // route Unix sockets on every supported Node build; keeping the transport here also means a
 // desktop adapter has no HTTP listener and no path supplied by an incoming notification.
-export function appServerCall({ socketPath, threadId, input, clientUserMessageId = null, listOnly = false, readOnly = false, bootstrap = null, dedupeToken = '', waitForCompletion = false, observeOnly = false, steerActive = false, expectedUserText = '', expectedUserSha256 = '', timeoutMs = 30000 }) {
+export function appServerCall({ socketPath, threadId, input, clientUserMessageId = null, listOnly = false, readOnly = false, bootstrap = null, dedupeToken = '', waitForCompletion = false, observeOnly = false, steerActive = false, captureSteeredCompletion = false, expectedUserText = '', expectedUserSha256 = '', timeoutMs = 30000 }) {
   const socket = localControlSocket(socketPath)
   const id = listOnly || bootstrap ? null : codexThreadId(threadId)
   if ([listOnly, readOnly, Boolean(bootstrap)].filter(Boolean).length > 1) throw new Error('Codex app-server call cannot combine list, read, and bootstrap modes')
   if (observeOnly && (!dedupeToken || !waitForCompletion || listOnly || !expectedUserText ||
       createHash('sha256').update(expectedUserText).digest('hex') !== expectedUserSha256)) {
     throw new Error('observeOnly requires one exact receipt-and-message-bound completed turn')
+  }
+  if (captureSteeredCompletion && (!dedupeToken || !waitForCompletion || !steerActive || observeOnly || listOnly || readOnly || bootstrap)) {
+    throw new Error('captureSteeredCompletion requires one receipt-bound active-turn delivery')
   }
   return new Promise((resolveCall, rejectCall) => {
     const stream = net.createConnection({ path: socket })
@@ -133,6 +136,15 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
           if (readOnly) return finish(null, message.result?.thread)
           if (message.result?.thread?.id !== id) return finish(new Error('Codex app-server returned an unexpected thread'))
           if (dedupeToken) {
+            if (captureSteeredCompletion && startedTurn) {
+              const steered = (message.result.thread.turns || []).find(turn => turn?.id === startedTurn)
+              if (!steered) return finish(new Error('the receipt-bound steered turn disappeared from the exact thread'))
+              const completedText = finalAgentText(steered.items || [])
+              if (steered.status === 'completed' && completedText.trim())
+                return finish(null, { threadId: id, turnId: startedTurn, recovered: true, steered: true, finalText: completedText })
+              if (steered.status !== 'inProgress') return finish(new Error('the receipt-bound steered turn ended without a final assistant message'))
+              return setTimeout(() => request('thread/read', 2, { threadId: id, includeTurns: true }), 250)
+            }
             const userText = item => (item?.content || []).map(part => typeof part === 'string' ? part :
               (typeof part?.text === 'string' ? part.text : '')).join('')
             const prior = (message.result.thread.turns || []).find(turn => (turn.items || []).some(item => {
@@ -144,7 +156,10 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
             if (prior?.id) {
               const recoveredText = finalAgentText(prior.items || [])
               if (waitForCompletion && prior.status === 'completed' && recoveredText.trim()) return finish(null, { threadId: id, turnId: prior.id, recovered: true, finalText: recoveredText })
-              if (observeOnly) return setTimeout(() => request('thread/read', 2, { threadId: id, includeTurns: true }), 250)
+              if (observeOnly || (captureSteeredCompletion && prior.status === 'inProgress')) {
+                startedTurn = prior.id
+                return setTimeout(() => request('thread/read', 2, { threadId: id, includeTurns: true }), 250)
+              }
               if (waitForCompletion) return finish(new Error('recovered Codex turn is not complete with a final assistant message'))
               return finish(null, { threadId: id, turnId: prior.id, recovered: true })
             }
@@ -188,10 +203,11 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
               }
               if (!message.result?.turnId) return finish(new Error('Codex turn/steer returned an invalid acknowledgement'))
               startedTurn = message.result.turnId
-              // A steer joins an owner-controlled turn that existed before this envelope. Its
-              // eventual final_answer belongs to that whole owner turn, not necessarily to the
-              // steered Nostr instruction. Never export it automatically. A reply to a steered
-              // delivery must be created through the separate receipt-bound reply path.
+              // A task grant is authority to instruct this exact conversation and receive its
+              // response. For that explicitly requested path, wait for the final answer from the
+              // exact preconditioned turn and bind it to this envelope. Notification deliveries
+              // leave captureSteeredCompletion false and still finish as non-replyable.
+              if (captureSteeredCompletion) return setTimeout(() => request('thread/read', 2, { threadId: id, includeTurns: true }), 250)
               return finish(null, { threadId: id, turnId: startedTurn, recovered: false, steered: true, replyEligible: false })
             }
             if (message.error) return finish(new Error(`Codex thread/resume failed: ${message.error.message || 'unknown error'}`))
@@ -222,8 +238,7 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
           if (!message.result?.turnId || !inProgressTurnIds.has(message.result.turnId))
             return finish(new Error('Codex reconciled turn/steer returned an invalid acknowledgement'))
           startedTurn = message.result.turnId
-          // The reconciled turn is still an owner-controlled pre-existing turn. Its completion
-          // is not an envelope-bound reply artifact and must never be auto-exported.
+          if (captureSteeredCompletion) return setTimeout(() => request('thread/read', 2, { threadId: id, includeTurns: true }), 250)
           return finish(null, { threadId: id, turnId: startedTurn, recovered: false, steered: true, reconciled: true, replyEligible: false })
         }
       }

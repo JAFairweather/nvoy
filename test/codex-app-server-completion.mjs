@@ -70,7 +70,7 @@ const server = net.createServer(stream => {
         stream.write(frame({ id: request.id, result: { turnId: turn } }))
         setTimeout(() => {
           ownerFinalEmitted++
-          stream.write(frame({ method: 'item/completed', params: { threadId: thread, turnId: turn, item: { id: 'owner-final', type: 'agentMessage', phase: 'final_answer', text: 'Owner goal final answer — never export this.' } } }))
+          stream.write(frame({ method: 'item/completed', params: { threadId: thread, turnId: turn, item: { id: 'owner-final', type: 'agentMessage', phase: 'final_answer', text: 'Steered Nostr answer.' } } }))
         }, 20)
       }
     }
@@ -82,13 +82,20 @@ try {
   const snapshot = await appServerCall({ socketPath: socket, threadId: thread, readOnly: true, timeoutMs: 10_000 })
   if (snapshot?.id !== thread || snapshot.status?.type !== 'active' || started !== 0 || steered !== 0) throw new Error('read-only probe mutated the active thread')
   reads = 0
-  const result = await appServerCall({ socketPath: socket, threadId: thread, input: 'wake', clientUserMessageId: 'nvoy:test',
-    dedupeToken: 'NVOY_ENVELOPE_ID=' + 'a'.repeat(64), waitForCompletion: true, steerActive: true, timeoutMs: 10_000 })
-  if (result.turnId !== turn || result.finalText || result.replyEligible !== false || !result.steered ||
-      steerAttempts !== 2 || steered !== 1 || started !== 0 || steeredInput !== 'wake')
-    throw new Error('steered owner turn was not delivered as explicitly non-replyable')
+  const notice = await appServerCall({ socketPath: socket, threadId: thread, input: 'content-free notice', clientUserMessageId: 'nvoy:notice',
+    dedupeToken: 'NVOY_ENVELOPE_ID=' + 'd'.repeat(64), waitForCompletion: false, steerActive: true, timeoutMs: 10_000 })
+  if (notice.turnId !== turn || notice.replyEligible !== false || !notice.steered)
+    throw new Error('notification-only active steer became replyable')
   await new Promise(resolve => setTimeout(resolve, 40))
-  if (ownerFinalEmitted !== 1) throw new Error('negative control did not emit the owner turn final answer')
+  reads = 0; steerAttempts = 0; steered = 0; steeredInput = ''
+  const result = await appServerCall({ socketPath: socket, threadId: thread, input: 'wake', clientUserMessageId: 'nvoy:test',
+    dedupeToken: 'NVOY_ENVELOPE_ID=' + 'a'.repeat(64), waitForCompletion: true, steerActive: true,
+    captureSteeredCompletion: true, timeoutMs: 10_000 })
+  if (result.turnId !== turn || result.finalText !== 'Steered Nostr answer.' || result.replyEligible === false ||
+      steerAttempts !== 2 || steered !== 1 || started !== 0 || steeredInput !== 'wake')
+    throw new Error('steered owner turn did not return its exact final answer')
+  await new Promise(resolve => setTimeout(resolve, 40))
+  if (ownerFinalEmitted !== 2) throw new Error('active-turn final-answer controls did not both fire')
   let liveRefused = false, recoveryRefused = false
   try {
     await appServerCall({ socketPath: socket, threadId: thread, input: 'wake again', clientUserMessageId: 'nvoy:test-2',
@@ -99,7 +106,7 @@ try {
       dedupeToken: 'NVOY_ENVELOPE_ID=' + 'c'.repeat(64), waitForCompletion: true, timeoutMs: 10_000 })
   } catch (error) { recoveryRefused = /not complete with a final assistant message/.test(error.message) }
   if (!liveRefused || !recoveryRefused) throw new Error('phased commentary became a live or recovered reply')
-  console.log('codex-app-server-completion: exact turn steered; owner final answer is never an envelope reply')
+  console.log('codex-app-server-completion: exact active turn steered and its final answer is receipt-bound')
 } finally {
   await new Promise(resolve => server.close(resolve))
   rmSync(root, { recursive: true, force: true })
