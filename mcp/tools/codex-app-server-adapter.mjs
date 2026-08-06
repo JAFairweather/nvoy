@@ -4,8 +4,9 @@
 // This intentionally runs beside a user's Codex installation, not in the remote relay
 // container.  The broker has already authenticated/decrypted the message and the manifest has
 // already selected the one allowed Codex thread.  This process has no Nostr credential, cannot
-// choose a recipient, and does not manufacture a reply.  It merely resumes the named thread and
-// starts one turn with the immutable broker-admitted delivery.
+// choose a recipient, and does not manufacture a reply. It submits the immutable broker-admitted
+// delivery only to the manifest-bound task: steering its exact active turn or starting the next
+// turn when idle.
 
 import { appendFileSync, existsSync, lstatSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'

@@ -6,7 +6,7 @@ import { appServerCall } from '../mcp/tools/codex_app_server.mjs'
 
 const root = mkdtempSync(join(tmpdir(), 'nvoy-codex-completion-'))
 const socket = join(root, 'control.sock'), thread = '019fce57-063d-7f50-b837-967d33ee384a', turn = '019fd200-0000-7000-8000-000000000001'
-let started = 0, reads = 0, steered = 0
+let started = 0, reads = 0, steered = 0, steeredInput = ''
 const frame = value => {
   const body = Buffer.from(JSON.stringify(value)); let head
   if (body.length < 126) head = Buffer.from([0x81, body.length])
@@ -59,6 +59,7 @@ const server = net.createServer(stream => {
       if (request.method === 'turn/steer') {
         steered++
         if (request.params.expectedTurnId !== turn || request.params.threadId !== thread) throw new Error('steer was not bound to the exact active turn')
+        steeredInput = request.params.input?.[0]?.text || ''
         stream.write(frame({ id: request.id, result: { turnId: turn } }))
         stream.write(frame({ method: 'item/completed', params: { threadId: thread, turnId: turn, item: { id: 'steered-final', type: 'agentMessage', phase: 'final_answer', text: 'Steered wake acknowledged.' } } }))
       }
@@ -73,7 +74,7 @@ try {
   reads = 0
   const result = await appServerCall({ socketPath: socket, threadId: thread, input: 'wake', clientUserMessageId: 'nvoy:test',
     dedupeToken: 'NVOY_ENVELOPE_ID=' + 'a'.repeat(64), waitForCompletion: true, steerActive: true, timeoutMs: 10_000 })
-  if (result.turnId !== turn || result.finalText !== 'Steered wake acknowledged.' || steered !== 1 || started !== 0) throw new Error('active response was not steered into the exact turn')
+  if (result.turnId !== turn || result.finalText !== 'Steered wake acknowledged.' || steered !== 1 || started !== 0 || steeredInput !== 'wake') throw new Error('active response was not steered with exact input into the exact turn')
   let liveRefused = false, recoveryRefused = false
   try {
     await appServerCall({ socketPath: socket, threadId: thread, input: 'wake again', clientUserMessageId: 'nvoy:test-2',

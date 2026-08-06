@@ -41,17 +41,17 @@ export function finalAgentText(items = []) {
 // Minimal RFC 6455 client for the documented Unix app-server transport. `ws` does not reliably
 // route Unix sockets on every supported Node build; keeping the transport here also means a
 // desktop adapter has no HTTP listener and no path supplied by an incoming notification.
-export function appServerCall({ socketPath, threadId, input, clientUserMessageId = null, listOnly = false, readOnly = false, dedupeToken = '', waitForCompletion = false, observeOnly = false, steerActive = false, expectedUserText = '', expectedUserSha256 = '', timeoutMs = 30000 }) {
+export function appServerCall({ socketPath, threadId, input, clientUserMessageId = null, listOnly = false, readOnly = false, bootstrap = null, dedupeToken = '', waitForCompletion = false, observeOnly = false, steerActive = false, expectedUserText = '', expectedUserSha256 = '', timeoutMs = 30000 }) {
   const socket = localControlSocket(socketPath)
-  const id = listOnly ? null : codexThreadId(threadId)
-  if (listOnly && readOnly) throw new Error('Codex app-server call cannot list and read a thread simultaneously')
+  const id = listOnly || bootstrap ? null : codexThreadId(threadId)
+  if ([listOnly, readOnly, Boolean(bootstrap)].filter(Boolean).length > 1) throw new Error('Codex app-server call cannot combine list, read, and bootstrap modes')
   if (observeOnly && (!dedupeToken || !waitForCompletion || listOnly || !expectedUserText ||
       createHash('sha256').update(expectedUserText).digest('hex') !== expectedUserSha256)) {
     throw new Error('observeOnly requires one exact receipt-and-message-bound completed turn')
   }
   return new Promise((resolveCall, rejectCall) => {
     const stream = net.createConnection({ path: socket })
-    let buffer = Buffer.alloc(0), upgraded = false, finished = false, startedTurn = '', finalText = '', sawPhasedAgent = false, requestThree = ''
+    let buffer = Buffer.alloc(0), upgraded = false, finished = false, startedTurn = '', finalText = '', sawPhasedAgent = false, requestThree = '', bootstrappedThread = ''
     const finish = (error, value) => {
       if (finished) return
       finished = true; clearTimeout(timer)
@@ -114,12 +114,21 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
           if (message.error) return finish(new Error(`Codex initialize failed: ${message.error.message || 'unknown error'}`))
           send({ method: 'initialized', params: {} })
           if (listOnly) request('thread/list', 2, { limit: 50, sortKey: 'recency_at', sortDirection: 'desc' })
+          else if (bootstrap) request('thread/list', 2, { limit: 50, searchTerm: bootstrap.name, cwd: bootstrap.cwd, sourceKinds: ['appServer'] })
           else if (readOnly) request('thread/read', 2, { threadId: id, includeTurns: true })
           else if (dedupeToken) request('thread/read', 2, { threadId: id, includeTurns: true })
           else request('thread/resume', 2, { threadId: id })
         } else if (message.id === 2) {
-          if (message.error) return finish(new Error(`Codex ${listOnly ? 'thread/list' : readOnly || dedupeToken ? 'thread/read' : 'thread/resume'} failed: ${message.error.message || 'unknown error'}`))
+          if (message.error) return finish(new Error(`Codex ${listOnly || bootstrap ? 'thread/list' : readOnly || dedupeToken ? 'thread/read' : 'thread/resume'} failed: ${message.error.message || 'unknown error'}`))
           if (listOnly) return finish(null, message.result?.data || [])
+          if (bootstrap) {
+            const exact = (message.result?.data || []).filter(thread => thread?.name === bootstrap.name && thread?.cwd === bootstrap.cwd && typeof thread.id === 'string')
+            if (exact.length > 1) return finish(new Error('multiple exact Codex participant tasks exist; refusing ambiguous selection'))
+            if (exact.length === 1) return finish(null, { version: 1, created: false, thread_id: exact[0].id, name: bootstrap.name, cwd: bootstrap.cwd })
+            const params = { cwd: bootstrap.cwd, serviceName: 'nvoy_nostr_participant' }
+            if (bootstrap.model) params.model = bootstrap.model
+            return request('thread/start', 3, params)
+          }
           if (readOnly) return finish(null, message.result?.thread)
           if (message.result?.thread?.id !== id) return finish(new Error('Codex app-server returned an unexpected thread'))
           if (dedupeToken) {
@@ -151,6 +160,13 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
             }
           } else request('turn/start', 3, { threadId: id, input: [{ type: 'text', text: String(input || '') }], clientUserMessageId })
         } else if (message.id === 3) {
+          if (bootstrap) {
+            if (message.error) return finish(new Error(`Codex thread/start failed: ${message.error.message || 'unknown error'}`))
+            bootstrappedThread = message.result?.thread?.id || ''
+            try { codexThreadId(bootstrappedThread) } catch { return finish(new Error('Codex thread/start returned an invalid task id')) }
+            request('thread/name/set', 4, { threadId: bootstrappedThread, name: bootstrap.name })
+            continue
+          }
           if (dedupeToken) {
             if (requestThree === 'steer') {
               if (message.error) return finish(new Error(`Codex turn/steer failed: ${message.error.message || 'unknown error'}`))
@@ -168,11 +184,20 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
             startedTurn = message.result.turn.id
             if (!waitForCompletion) return finish(null, { threadId: id, turnId: startedTurn })
           }
+        } else if (message.id === 4 && bootstrap) {
+          if (message.error) return finish(new Error(`Codex thread/name/set failed: ${message.error.message || 'unknown error'}`))
+          request('thread/read', 5, { threadId: bootstrappedThread, includeTurns: false })
         } else if (message.id === 4 && dedupeToken) {
           if (message.error) return finish(new Error(`Codex turn/start failed: ${message.error.message || 'unknown error'}`))
           if (!message.result?.turn?.id) return finish(new Error('Codex app-server returned an invalid turn acknowledgement'))
           startedTurn = message.result.turn.id
           if (!waitForCompletion) return finish(null, { threadId: id, turnId: startedTurn, recovered: false })
+        } else if (message.id === 5 && bootstrap) {
+          if (message.error) return finish(new Error(`Codex bootstrap verification failed: ${message.error.message || 'unknown error'}`))
+          const thread = message.result?.thread
+          if (thread?.id !== bootstrappedThread || thread?.name !== bootstrap.name || thread?.cwd !== bootstrap.cwd)
+            return finish(new Error('Codex bootstrap could not verify the exact named task'))
+          return finish(null, { version: 1, created: true, thread_id: bootstrappedThread, name: bootstrap.name, cwd: bootstrap.cwd })
         }
       }
     }

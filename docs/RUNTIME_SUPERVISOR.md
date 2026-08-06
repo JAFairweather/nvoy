@@ -172,14 +172,12 @@ forbids every key, Bunker, and worker-credential reference in the desktop manife
 { "broker_mode": "remote", "delivery_mode": "codex_app_server", "worker_enabled": false, "codex_thread_id": "<persistent-thread-id>", "codex_transport": "local_control_socket", "codex_app_server_socket": "/Users/you/.codex/app-server-control/app-server-control.sock", "ssh_target": "nvoy-sync@example.net", "ssh_identity_file": "/Users/you/.nvoy/desktop/id_ed25519", "ssh_known_hosts_file": "/Users/you/.nvoy/desktop/known_hosts", "ssh_known_hosts_sha256": "<64-hex-sha256>" }
 ```
 
-For V1 visible delivery into an already-open Codex Desktop chat, use `delivery_mode:
-"macos_desktop"` and additionally fix `codex_app_bundle_id: "com.openai.codex"`,
-`codex_project_label`, `codex_chat_label`, and the absolute installed `codex_ui_driver` path.
-The project/chat label may include the participant's short pubkey fingerprint as a human safety
-signal; the full participant pubkey remains the manifest identity and must be shown in Console.
-The local adapter uses a process-targeted macOS submission only after proving the exact app,
-workspace, chat, composer and staged bytes. App Server is read-only and observes the resulting
-Desktop-owned turn by its receipt marker. A sibling `turn/start` is not a visible Desktop wake. See
+The supported macOS V1 uses `delivery_mode: "codex_app_server"`. The owner binds one immutable
+persistent task—normally the existing goal-bearing Desktop project task. The adapter uses
+`turn/steer(expectedTurnId)` when that task has an active turn and `turn/start` when it is idle.
+An isolated CLI participant is optional, not required. The failed Accessibility/AppleScript
+composer experiments are not a release path: an OS automation success was not reliable evidence
+that a user turn entered the intended conversation. See
 [`MACOS_DESKTOP_BINDER.md`](MACOS_DESKTOP_BINDER.md).
 
 Then run:
@@ -212,13 +210,30 @@ restricted SSH capability can request one reply for any admitted receipt it rece
 makes no broader claim that Codex authored the text. Keep that capability owner-only and revoke it
 independently of the Nostr identity.
 
-`codex-remote-bridge.mjs` is the durable desktop loop for this arrangement. It accepts only a
+`codex-remote-bridge.mjs` is the durable macOS loop for this arrangement. It accepts only a
 manifest-fixed `user@host`, mode-0600 non-symlink SSH files, and the known-hosts file's pinned
 SHA-256 digest; it enables batch mode, strict host checking, and clears forwarding, and
 deliberately supplies **no
 remote command**. Therefore the server-side key must be restricted with an `authorized_keys`
 forced command that runs the sync endpoint for exactly one instance. The key is a narrow queue
 sync capability, never a shell or signer capability.
+
+Install one supervised LaunchAgent per identity after the one-time historical baseline:
+
+```sh
+NVOY_INSTANCE_ROOT="$HOME/.nvoy/desktop/codex-jaf/instances" \
+  node mcp/tools/codex-remote-bridge.mjs --instance codex-jaf --baseline
+
+NVOY_INSTANCE_ROOT="$HOME/.nvoy/desktop/codex-jaf/instances" \
+  node mcp/tools/install-codex-bridge-launchagent.mjs --instance codex-jaf
+
+launchctl bootstrap "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/pub.nave.nvoy.codex-jaf.codex-bridge.plist"
+```
+
+The generated plist is mode `0600`, fixes the repository bridge, manifest root, and instance id,
+and carries only `HOME`, a bounded `PATH`, and `NVOY_INSTANCE_ROOT`. It contains no Nostr key,
+Bunker URI, NIP-46 client secret, model-provider key, relay URL, or caller-selected thread.
 
 ### Running Claude Code channel adapter
 
