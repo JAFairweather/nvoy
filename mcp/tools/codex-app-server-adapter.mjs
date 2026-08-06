@@ -95,6 +95,7 @@ async function deliver(task) {
   const result = await appServerCall({ socketPath: manifest.codexSocketPath, threadId: manifest.codexThreadId,
     input: prompt(task), clientUserMessageId: userMessageId(task), dedupeToken: `NVOY_ENVELOPE_ID=${task.envelope}`,
     waitForCompletion: task.type === 'admitted-task', steerActive: true,
+    captureSteeredCompletion: task.type === 'admitted-task',
     timeoutMs: task.type === 'admitted-task' ? 10 * 60 * 1000 : 30000 })
   return result
 }
