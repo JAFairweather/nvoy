@@ -9,7 +9,7 @@
 
 import { saveGrantIndex } from '../lib/nipxx.mjs'
 import { sendRevocationNotice, grantWithTerms } from './nvoygrant.mjs'
-import { revokedEvent, rotatedEvent, grantedEvent, appendLedger, eventsFor, computeTotals, fmtCountdown } from './ledgerlog.mjs'
+import { revokedEvent, rotatedEvent, grantedEvent, appendLedger, eventsFor, computeTotals, fmtCountdown, receivedActions } from './ledgerlog.mjs'
 import { rotateDropping, runRelinquishRotation, nextExpiry } from './ttl.mjs'
 import { state, $, esc, short, fmtWhen, agentName, agentsOf, load, RELAYS, showTab } from './main.mjs'
 import { buildExternalRevocation } from './capgrants.mjs'
@@ -445,6 +445,36 @@ export function renderLedger() {
             : `Nothing delegated yet.<br>
           The ledger is the audit view: every delegation, its terms, every rotation and revocation —
           a query over your encrypted Grant Index, not archaeology across admin panels.`}</div>`}
+        ${(() => {
+          // WHAT THIS KEY DID WITH GRANTS IT RECEIVED. Nothing else on this screen shows the inbound
+          // direction: `deriveDelegations` answers "what did I grant", so a draft an agent granted TO
+          // the Director had no card and no row. Ngage recorded it in localStorage only, which made
+          // half of that desk invisible in the console that claims to be the source of truth for all
+          // grants — invisible BY CONSTRUCTION, the same class of defect as the agent that showed in
+          // Nvoy and not in Nact.
+          const { rows: acted, dropped: actedDropped } = receivedActions(state.index)
+          if (!acted.length && !actedDropped) return ''
+          return `<div class="lg-onward">
+            <div class="lg-onward-h">what you did with grants you received</div>
+            <div class="lg-onward-p">These are not delegations you issued — an agent granted them to
+              <b>you</b>, and you acted in your own hand. Kept separate for that reason: a received draft
+              listed among your delegations would read as though you had delegated something.
+              ${actedDropped ? `<b>${actedDropped} record${actedDropped === 1 ? '' : 's'} could not be read
+                and ${actedDropped === 1 ? 'is' : 'are'} not shown.</b>` : ''}</div>
+            ${acted.map(r => `<div class="lg-onward-parent">
+              <div class="note lg-flow">
+                <span class="lg-arrow">${r.outcome === 'posted' ? 'posted in your hand' : 'passed'}</span>
+                <b style="color:var(--text)">${esc(r.name)}</b>
+                <span class="meta" title="the agent that granted this to you">${esc(short(r.publisher))}</span>
+                ${r.at ? `<span class="meta">${esc(fmtWhen(r.at))}</span>` : ''}
+              </div>
+              ${r.outcome === 'posted' && r.noteId
+                ? `<div class="msg">published as ${esc(String(r.noteId).slice(0, 16))}… — signed by you, not by the agent.</div>`
+                : r.outcome === 'passed'
+                  ? '<div class="msg">You declined it. The grant was real; nothing was signed.</div>' : ''}
+            </div>`).join('')}
+          </div>`
+        })()}
         ${onward.length ? `<div class="lg-onward">
           <div class="lg-onward-h">granted onward from grants you hold</div>
           <div class="lg-onward-p">You derived ${onward.reduce((n, g) => n + g.children.length, 0)}
