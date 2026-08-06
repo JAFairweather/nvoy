@@ -15,6 +15,7 @@
 // model reading the tool list is the one deciding to call it.
 
 import { z } from 'zod'
+import { decideTap, draftScopeName, tapAudit, resolveDraftGrantee } from './tap.js'
 import { finalizeEvent, generateSecretKey, getEventHash, verifyEvent, type NostrEvent, type UnsignedEvent } from 'nostr-tools/pure'
 import * as nip44 from 'nostr-tools/nip44'
 import * as nip19 from 'nostr-tools/nip19'
@@ -113,9 +114,18 @@ export function registerChatTools(server: any, ctx: NvoyContext): void {
       inputSchema: {
         content: z.string().min(1).describe('the note text'),
         reply_to: z.string().optional().describe('event id (64-hex) of the note being replied to'),
+        // AD-12 3a: a standing grant confers queue entry, never a signature. WITHOUT this, the call becomes
+        // a draft the Director signs in his own hand. There is deliberately no config, env var or standing
+        // grant that substitutes for it — those are all standing authority to sign.
+        approval: z.string().optional().describe(
+          'the 64-hex id of the approval event the Director issued FOR THIS MESSAGE. Omit it and this '
+          + 'becomes a draft on his desk instead of a published note.'),
       },
     },
-    async ({ content, reply_to }: { content: string; reply_to?: string }) => {
+    async ({ content, reply_to, approval }: { content: string; reply_to?: string; approval?: string }) => {
+      const tap = decideTap('nvoy_chat_post', approval)
+      console.error(tapAudit('nvoy_chat_post', tap))
+      if (tap.mode === 'refuse') return jsonError({ code: 'NVOY_BAD_APPROVAL', message: tap.why })
       const tags: string[][] = []
       if (reply_to) {
         if (!HEX64.test(reply_to)) return jsonError({ code: 'NVOY_BAD_INPUT', message: 'reply_to must be a 64-hex event id' })
@@ -129,11 +139,23 @@ export function registerChatTools(server: any, ctx: NvoyContext): void {
         tags.push(['e', id, '', parentRoot && parentRoot !== id ? 'reply' : 'root'])
         if (parent?.pubkey) tags.push(['p', parent.pubkey])
       }
+      // The draft path uses the machinery that already exists end-to-end: drafts.ts mints the offer,
+      // Ngage renders it, and the Director signs. The agent still acts; what it no longer does is sign.
+      if (tap.mode === 'draft') {
+        const held = await ctx.grantStore.list()
+        const who = resolveDraftGrantee(held.map((g: { publisher: string }) => g.publisher))
+        if (!who.ok) return jsonError({ code: 'NVOY_NO_DESK', message: `${tap.notice}\n\n${who.why}` })
+        const seed = Math.random().toString(16).slice(2).padEnd(10, '0')
+        const offer = await ctx.drafts.publish(who.grantee, { text: content, reply_to: reply_to ?? null },
+          draftScopeName('nvoy_chat_post', seed))
+        return json({ published: false, drafted: offer, notice: tap.notice })
+      }
       const event = await ctx.identity.signer.signEvent(
         { kind: 1, created_at: Math.floor(Date.now() / 1000), tags, content },
       )
       const res = await ctx.relay.publish(event)
-      return json({ id: event.id, note: nip19.noteEncode(event.id), published: res })
+      // The approval that authorised THIS signature, echoed back so the caller's own log carries it too.
+      return json({ id: event.id, note: nip19.noteEncode(event.id), published: res, approval })
     },
   )
 
@@ -186,9 +208,17 @@ export function registerChatTools(server: any, ctx: NvoyContext): void {
         to: z.string().describe('recipient npub or hex pubkey'),
         message: z.string().min(1).describe('the message text'),
         reply_to: z.string().optional().describe('rumor event id being replied to, if threading'),
+        // AD-12 3a, same gate as nvoy_chat_post. A DM is not public, but it is still an act emitted under
+        // the agent's own key — the doctrine is about who signs, not about who can read.
+        approval: z.string().optional().describe(
+          'the 64-hex id of the approval event the Director issued FOR THIS MESSAGE. Omit it and this '
+          + 'becomes a draft on his desk instead of a sent DM.'),
       },
     },
-    async ({ to, message, reply_to }: { to: string; message: string; reply_to?: string }) => {
+    async ({ to, message, reply_to, approval }: { to: string; message: string; reply_to?: string; approval?: string }) => {
+      const tap = decideTap('nvoy_dm_send', approval)
+      console.error(tapAudit('nvoy_dm_send', tap))
+      if (tap.mode === 'refuse') return jsonError({ code: 'NVOY_BAD_APPROVAL', message: tap.why })
       let recipient: string
       try {
         recipient = toHex(to)
@@ -196,6 +226,20 @@ export function registerChatTools(server: any, ctx: NvoyContext): void {
         return jsonError({ code: 'NVOY_BAD_INPUT', message: String((e as Error).message) })
       }
       const replyTo = reply_to ? reply_to.toLowerCase() : undefined
+      // Drafted under `draft:dm/…` so the desk can tell it from a public post WITHOUT decrypting: approving
+      // a note and approving a private message are different decisions, and a desk that rendered them
+      // identically would collapse them. The intended recipient rides in the payload, because the Director
+      // cannot judge a DM without knowing who it is addressed to.
+      if (tap.mode === 'draft') {
+        const held = await ctx.grantStore.list()
+        const who = resolveDraftGrantee(held.map((g: { publisher: string }) => g.publisher))
+        if (!who.ok) return jsonError({ code: 'NVOY_NO_DESK', message: `${tap.notice}\n\n${who.why}` })
+        const seed = Math.random().toString(16).slice(2).padEnd(10, '0')
+        const offer = await ctx.drafts.publish(who.grantee,
+          { text: message, dm_to: nip19.npubEncode(recipient), reply_to: replyTo ?? null },
+          draftScopeName('nvoy_dm_send', seed))
+        return json({ published: false, drafted: offer, notice: tap.notice })
+      }
       const wrap = await sealAndWrap(ctx, recipient, message, replyTo)
       const selfWrap = await sealAndWrap(ctx, ctx.identity.pubkey, message, replyTo)
       const sent = await ctx.relay.publish(wrap)
@@ -204,7 +248,7 @@ export function registerChatTools(server: any, ctx: NvoyContext): void {
       if (dmCc && dmCc !== recipient && dmCc !== ctx.identity.pubkey) {
         try { await ctx.relay.publish(await sealAndWrap(ctx, dmCc, message, replyTo)); cc = nip19.npubEncode(dmCc) } catch { /* CC is best-effort, the send already stands */ }
       }
-      return json({ to: nip19.npubEncode(recipient), wrap_id: wrap.id, published: sent, ...(cc ? { cc } : {}) })
+      return json({ to: nip19.npubEncode(recipient), wrap_id: wrap.id, published: sent, approval, ...(cc ? { cc } : {}) })
     },
   )
 
