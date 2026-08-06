@@ -6,6 +6,7 @@
 // revocation and makes `redelegate` a concrete gate rather than an audit note.
 
 import { finalizeEvent, generateSecretKey, getEventHash, nip44 } from 'nostr-tools'
+import { boundOf, admitsAnother } from './redelegate-bound.js'
 // @ts-ignore — vendored .mjs has no declarations
 import { KIND_DATA_SET, KIND_GRANT, fetchScope, loadGrantIndex, newScopeKey, publishScope, saveGrantIndex, toIssuedEntry, type RelayLike } from '../lib/nipxx.mjs'
 import type { Identity, Signer } from './identity.js'
@@ -104,6 +105,27 @@ export async function issueDerivedGrant(
   terms: DerivedTerms,
 ) {
   validate(parent, terms)
+
+  // THE RE-DELEGATION BUDGET, CHECKED BEFORE ANYTHING IS PUBLISHED (#111).
+  //
+  // Ordering is the whole point: a budget checked after `publishScope` is decoration, because the child
+  // scope is already on the relays and the data has already been spread. So the lineage is read here, and
+  // the write below stays where it is — deliberately after publication, so a stored active row always
+  // names a real leaf.
+  //
+  // This reads the index a second time rather than reusing the later load. That load is deliberately
+  // FRESH so concurrent writers merge instead of clobbering, and moving it up here to save a round trip
+  // would trade a correctness property for one request.
+  const boundRead = boundOf(parent.terms)
+  if (!boundRead.ok) throw new RedelegationForbidden(boundRead.why)
+  {
+    const idx = await loadGrantIndex(relay, identity.signer) as Record<string, unknown>
+    const mine = lineage(idx).filter(r =>
+      r.parent.publisher === parent.publisher && r.parent.scope === parent.scopeId)
+    const room = admitsAnother(boundRead.bound, mine, recipient)
+    if (!room.ok) throw new RedelegationForbidden(room.why)
+  }
+
   const fresh = await fetchScope(relay, parent)
   if (fresh.status !== 'ok')
     throw new RedelegationForbidden('the parent grant is no longer freshly readable')

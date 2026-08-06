@@ -19,6 +19,7 @@
 // narrow, always short-TTL, always rate-limited, always revocable" — applied to data rather than action.
 
 import assert from 'node:assert'
+import { readFileSync } from 'node:fs'
 import { boundOf, admitsAnother, boundNote, REDELEGATE_DEFAULTS } from '../mcp/dist/redelegate-bound.js'
 
 let pass = 0, fail = 0
@@ -113,6 +114,47 @@ t('a defaulted bound is disclosed as NOT his choice, with the repair', () => {
   assert.match(note, /ESTATE DEFAULTS rather than a bound you chose/)
   assert.match(note, /Re-issue it with an explicit bound/)
 })
+
+// ── the bound is ENFORCED, and enforced BEFORE anything is published ────────
+//
+// A budget checked after `publishScope` is decoration: the child scope is already on the relays and the
+// data has already been spread. So the ordering is asserted at the source, not just the presence of a
+// check — the same reason the Ngage mirror asserts its own ordering per path.
+{
+  const src = readFileSync(new URL('../mcp/src/subgrants.ts', import.meta.url), 'utf8')
+  const body = src.slice(src.indexOf('export async function issueDerivedGrant'))
+
+  t('issueDerivedGrant reads the bound and asks whether one more fits', () => {
+    assert.match(body, /boundOf\(parent\.terms\)/)
+    assert.match(body, /admitsAnother\(/)
+  })
+  t('THE ORDERING: the budget check precedes publishScope', () => {
+    const check = body.indexOf('admitsAnother(')
+    const publish = body.indexOf('publishScope(')
+    assert.ok(check > -1 && publish > -1, 'both must be present')
+    assert.ok(check < publish, 'a budget checked after publication is decoration')
+  })
+  t('an over-budget derivation throws RedelegationForbidden, the existing refusal type', () => {
+    // Not a new error class: callers already handle this one, and a novel type would slip through.
+    const around = body.slice(body.indexOf('admitsAnother('), body.indexOf('admitsAnother(') + 220)
+    assert.match(around, /throw new RedelegationForbidden\(room\.why\)/)
+  })
+  t('a parent that forbids re-delegation is refused by the bound reader too', () => {
+    // Belt and braces with validate(): boundOf returns not-ok for false/absent, so a caller reaching this
+    // boundary directly cannot bypass the term by skipping validate.
+    assert.equal(boundOf({}).ok, false)
+    assert.equal(boundOf({ redelegate: false }).ok, false)
+  })
+  t('the lineage write still happens AFTER publication', () => {
+    // The pre-existing invariant this change must not disturb: a stored active row always names a real leaf.
+    assert.ok(body.indexOf('saveLineage(') > body.indexOf('publishScope('))
+  })
+  t('the budget counts only THIS parent\'s children', () => {
+    // Filtering on publisher AND scope: a sibling scope's fan-out must not consume this grant's budget, and
+    // a scope `d` alone is not identity across publishers.
+    assert.match(body, /r\.parent\.publisher === parent\.publisher && r\.parent\.scope === parent\.scopeId/)
+  })
+}
 
 console.log(`\n${pass}/${pass + fail} passed`)
 process.exit(fail ? 1 : 0)
