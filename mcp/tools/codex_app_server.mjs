@@ -188,8 +188,11 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
               }
               if (!message.result?.turnId) return finish(new Error('Codex turn/steer returned an invalid acknowledgement'))
               startedTurn = message.result.turnId
-              if (!waitForCompletion) return finish(null, { threadId: id, turnId: startedTurn, recovered: false, steered: true })
-              continue
+              // A steer joins an owner-controlled turn that existed before this envelope. Its
+              // eventual final_answer belongs to that whole owner turn, not necessarily to the
+              // steered Nostr instruction. Never export it automatically. A reply to a steered
+              // delivery must be created through the separate receipt-bound reply path.
+              return finish(null, { threadId: id, turnId: startedTurn, recovered: false, steered: true, replyEligible: false })
             }
             if (message.error) return finish(new Error(`Codex thread/resume failed: ${message.error.message || 'unknown error'}`))
             if (message.result?.thread?.id !== id) return finish(new Error('Codex app-server resumed an unexpected thread'))
@@ -219,7 +222,9 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
           if (!message.result?.turnId || !inProgressTurnIds.has(message.result.turnId))
             return finish(new Error('Codex reconciled turn/steer returned an invalid acknowledgement'))
           startedTurn = message.result.turnId
-          if (!waitForCompletion) return finish(null, { threadId: id, turnId: startedTurn, recovered: false, steered: true, reconciled: true })
+          // The reconciled turn is still an owner-controlled pre-existing turn. Its completion
+          // is not an envelope-bound reply artifact and must never be auto-exported.
+          return finish(null, { threadId: id, turnId: startedTurn, recovered: false, steered: true, reconciled: true, replyEligible: false })
         }
       }
     }

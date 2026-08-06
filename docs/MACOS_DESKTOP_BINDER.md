@@ -3,7 +3,7 @@
 ## Supported outcome
 
 An owner-authorized Nostr instruction can enter one immutable Codex project/thread as a genuine
-user turn. The response is returned once through the receipt-bound Nostr path. The supported V1
+user turn or steer. A response is returned only through a receipt-bound Nostr path. The supported V1
 uses Codex App Server protocol through the local control socket; it does not automate the Desktop
 composer.
 
@@ -23,9 +23,9 @@ signed Nostr/Buzz channel event
   -> restricted SSH forced command exports only admitted records
   -> keyless macOS bridge imports and deduplicates the envelope
   -> App Server adapter reads the fixed thread
-       active: turn/steer(expectedTurnId)
-       idle:   turn/start
-  -> final answer is durably queued against the admitted receipt
+       active: turn/steer(expectedTurnId), delivery-only
+       idle:   turn/start, whose final answer is receipt-bound
+  -> an eligible final answer or explicit receipt-bound reply is durably queued
   -> remote broker revalidates authority and signs/publishes one reply
   -> Waggle reacts 👍 to the original user message after relay acceptance
 ```
@@ -51,8 +51,10 @@ acceptance path below. Historical queue entries must be baselined rather than re
    recipient-selection capability.
 6. Every envelope has one durable import cursor, one delivery record, and at most one reply
    request. A crash retries from those records rather than inventing a second identity or turn.
-7. Only the final answer from the exact protocol turn is eligible for reply. Commentary and tool
-   events are not published.
+7. Only the final answer from a new envelope-owned protocol turn is automatically eligible for
+   reply. A steer joins a pre-existing owner turn, so its eventual final answer is never
+   auto-exported; replying to a steer requires a separate explicit receipt-bound reply action.
+   Commentary and tool events are never published.
 8. A durable task may retain stale historical `inProgress` rows. If `expectedTurnId` rejects one,
    the adapter may reconcile exactly once to the server-reported active id only when that id was
    also present as in-progress in the same immutable task snapshot. The failed first steer is

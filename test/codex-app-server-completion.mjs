@@ -7,7 +7,7 @@ import { appServerCall } from '../mcp/tools/codex_app_server.mjs'
 const root = mkdtempSync(join(tmpdir(), 'nvoy-codex-completion-'))
 const socket = join(root, 'control.sock'), thread = '019fce57-063d-7f50-b837-967d33ee384a', turn = '019fd200-0000-7000-8000-000000000001'
 const staleTurn = '019fd100-0000-7000-8000-000000000002'
-let started = 0, reads = 0, steerAttempts = 0, steered = 0, steeredInput = ''
+let started = 0, reads = 0, steerAttempts = 0, steered = 0, steeredInput = '', ownerFinalEmitted = 0
 const frame = value => {
   const body = Buffer.from(JSON.stringify(value)); let head
   if (body.length < 126) head = Buffer.from([0x81, body.length])
@@ -68,7 +68,10 @@ const server = net.createServer(stream => {
         steered++
         steeredInput = request.params.input?.[0]?.text || ''
         stream.write(frame({ id: request.id, result: { turnId: turn } }))
-        stream.write(frame({ method: 'item/completed', params: { threadId: thread, turnId: turn, item: { id: 'steered-final', type: 'agentMessage', phase: 'final_answer', text: 'Steered wake acknowledged.' } } }))
+        setTimeout(() => {
+          ownerFinalEmitted++
+          stream.write(frame({ method: 'item/completed', params: { threadId: thread, turnId: turn, item: { id: 'owner-final', type: 'agentMessage', phase: 'final_answer', text: 'Owner goal final answer — never export this.' } } }))
+        }, 20)
       }
     }
   })
@@ -81,7 +84,11 @@ try {
   reads = 0
   const result = await appServerCall({ socketPath: socket, threadId: thread, input: 'wake', clientUserMessageId: 'nvoy:test',
     dedupeToken: 'NVOY_ENVELOPE_ID=' + 'a'.repeat(64), waitForCompletion: true, steerActive: true, timeoutMs: 10_000 })
-  if (result.turnId !== turn || result.finalText !== 'Steered wake acknowledged.' || steerAttempts !== 2 || steered !== 1 || started !== 0 || steeredInput !== 'wake') throw new Error('stale active metadata was not reconciled once with exact input into the exact turn')
+  if (result.turnId !== turn || result.finalText || result.replyEligible !== false || !result.steered ||
+      steerAttempts !== 2 || steered !== 1 || started !== 0 || steeredInput !== 'wake')
+    throw new Error('steered owner turn was not delivered as explicitly non-replyable')
+  await new Promise(resolve => setTimeout(resolve, 40))
+  if (ownerFinalEmitted !== 1) throw new Error('negative control did not emit the owner turn final answer')
   let liveRefused = false, recoveryRefused = false
   try {
     await appServerCall({ socketPath: socket, threadId: thread, input: 'wake again', clientUserMessageId: 'nvoy:test-2',
@@ -92,7 +99,7 @@ try {
       dedupeToken: 'NVOY_ENVELOPE_ID=' + 'c'.repeat(64), waitForCompletion: true, timeoutMs: 10_000 })
   } catch (error) { recoveryRefused = /not complete with a final assistant message/.test(error.message) }
   if (!liveRefused || !recoveryRefused) throw new Error('phased commentary became a live or recovered reply')
-  console.log('codex-app-server-completion: stale active metadata reconciled once; exact turn steered and commentary ignored')
+  console.log('codex-app-server-completion: exact turn steered; owner final answer is never an envelope reply')
 } finally {
   await new Promise(resolve => server.close(resolve))
   rmSync(root, { recursive: true, force: true })

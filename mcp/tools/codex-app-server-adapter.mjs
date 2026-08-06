@@ -123,7 +123,7 @@ async function drain() {
     // Queue the receipt-bound response before marking the turn delivered. A crash in between is
     // safe: thread/read recovers the exact completed turn and queueReply deduplicates by receipt.
     // Reversing this order could strand a visible response forever after a one-line journal write.
-    if (result.finalText) queueReply(task, result.finalText)
+    if (result.replyEligible !== false && result.finalText) queueReply(task, result.finalText)
     // Only acknowledge permanent local delivery after the target thread accepted the turn and
     // any required outbound reply is durably queued.
     appendFileSync(deliveredPath, JSON.stringify({ version: 1, envelope: task.envelope, thread_id: manifest.codexThreadId, turn_id: result.turnId, delivered_at: Date.now() }) + '\n', { mode: 0o600 })
