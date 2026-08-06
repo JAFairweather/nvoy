@@ -8,6 +8,7 @@ import { nip19 } from 'nostr-tools'
 import { newScopeKey, publishScope, saveGrantIndex, toIssuedEntry } from '../lib/nipxx.mjs'
 import { grantWithTerms, opaqueScopeId, TEMPLATES } from './nvoygrant.mjs'
 import { appendLedger, grantedEvent } from './ledgerlog.mjs'
+import { enrol } from './registry.mjs'
 import { closeDrawer } from './main.mjs'
 import { openDelegationInLedger } from './ledger.mjs'
 import { state, $, esc, agentsOf, agentName, load, RELAYS } from './main.mjs'
@@ -274,9 +275,19 @@ export function renderDelegate(agentPub = null) {
         toIssuedEntry({ scopeId, scopeName, generation: 1, scopeKey }, [agent])]
       state.index.nvoy_ledger = appendLedger(state.index,
         grantedEvent({ scope: scopeId, agent, v: 1, terms: { nvoy: 1, ...terms }, name: scopeName }))
+      // Issuing a grant IS how an agent comes into existence here (AD-12 ruling g). Before this,
+      // it was not: the grantee landed in the Ledger and never in the roster, so the most direct
+      // way to give an agent authority left it filed under "other identities". Folded into the
+      // same save as the grant on purpose — a separate write can fail on its own, and a roster
+      // that is behind the grants it describes is the divergence this whole plane exists to end.
+      const enrolled = enrol(state.index, agent, { me: state.me, now: Math.floor(Date.now() / 1000) })
+      state.index.nvoy_agents = enrolled.agents
       await saveGrantIndex(state.relay, state.signer, state.index)
       draft = emptyDraft()
-      msg.textContent = `delegated — scope ${scopeId} to ${agentName(agent)}. See the Ledger.`
+      // Say it, because it is a second thing that happened. A roster that grows silently is how
+      // nobody noticed it was not growing at all.
+      msg.textContent = `delegated — scope ${scopeId} to ${agentName(agent)}.` +
+        `${enrolled.added ? ' Added to your agents.' : ''} See the Ledger.`
       await load()
       // A composer is a drawer over the list it writes to, so the last step lands ON the new row
       // rather than on a form you then have to leave. Closing and opening the grant in the Ledger
