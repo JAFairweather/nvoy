@@ -70,7 +70,7 @@ const LEDGER_STYLE = `<style>
 #ledger .lg-nav select{width:100%;font-family:var(--mono);font-size:12px;padding:5px 8px;border-radius:8px;border:1px solid var(--line);background:transparent;color:var(--text)}
 /* a checkmark row — Type / Status / Group-by all use it */
 #ledger .lg-check{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:12.5px;padding:4px 7px;border-radius:7px;border:1px solid transparent;background:transparent;color:var(--dim);cursor:pointer;text-align:left;text-transform:capitalize}
-#ledger .lg-check:hover{color:var(--text);background:color-mix(in srgb,var(--panel2) 60%,transparent)}
+#ledger .lg-check:hover{color:var(--text);background:color-mix(in srgb,var(--panel-2) 60%,transparent)}
 #ledger .lg-check.on{color:var(--text)}
 #ledger .lg-box{flex:none;width:15px;height:15px;border-radius:4px;border:1.5px solid var(--line);display:inline-grid;place-items:center;font-size:11px;line-height:1;color:var(--accent-ink)}
 #ledger .lg-check.on .lg-box{background:var(--accent);border-color:var(--accent)}
@@ -89,7 +89,7 @@ const LEDGER_STYLE = `<style>
 #ledger .lg-search::placeholder{color:var(--dim)}
 /* group = a lineage container */
 #ledger .lg-group{margin:0 0 16px;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:color-mix(in srgb,var(--panel) 55%,transparent)}
-#ledger .lg-group>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:10px;padding:12px 16px;background:color-mix(in srgb,var(--panel2) 65%,transparent);user-select:none;border-bottom:1px solid transparent}
+#ledger .lg-group>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:10px;padding:12px 16px;background:color-mix(in srgb,var(--panel-2) 65%,transparent);user-select:none;border-bottom:1px solid transparent}
 #ledger .lg-group[open]>summary{border-bottom-color:var(--line)}
 #ledger .lg-group>summary::-webkit-details-marker{display:none}
 #ledger .lg-group>summary::before{content:'▸';color:var(--dim);font-size:12px;transition:transform .12s;flex:none;width:10px}
