@@ -1,9 +1,18 @@
 // lineage.mjs — what THIS key granted onward, read from its own Grant Index.
 //
+// ATTENUATION IS NOMINAL ON CONTENT, AND THIS MODULE MUST NOT IMPLY OTHERWISE. `mcp/src/subgrants.ts`
+// bounds a child's TERMS — it cannot outlive its parent, a no_persist parent cannot become a stored
+// child, a purpose is required — but the child's PAYLOAD is supplied by the holder and published
+// verbatim (`publishScope(..., { payload })`). Nothing compares it to the parent.
+//
+// So a row here proves a derivation was RECORDED, not that the child is narrower than its parent. The
+// first version of this screen called them "attenuated children", which asserted a property no code
+// enforces; the labels now say "derived". Filed as the fourth path in nvoy#111.
+//
 // `mcp/src/subgrants.ts` records every derived grant it mints as an `nvoy_derived_children`
-// row, and cascades revocation recursively when a parent dies. Nothing has ever read it back,
-// so attenuation — the one mechanism that lets authority NARROW as it spreads — has been
-// invisible even to the party who performed it.
+// row, and cascades revocation recursively when a parent dies. Nothing has ever read it back, so
+// re-delegation — the mechanism INTENDED to let authority narrow as it spreads — has been invisible
+// even to the party who performed it. "Intended" is doing real work in that sentence: see the header.
 //
 // WHOSE LINEAGE THIS IS, AND WHY IT CANNOT BE ANYONE ELSE'S. `saveLineage` writes through the
 // sub-issuer's own signer, and `loadGrantIndex` reads `{ kinds:[10440], authors:[own pubkey] }`
