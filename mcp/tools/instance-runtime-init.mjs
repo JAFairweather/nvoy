@@ -49,6 +49,7 @@ if (m.workerEnabled) provision(`${m.runtimeDir}/worker-input`, m.adapterUid, m.w
 // A native Claude channel writes only its cursor/lock and bounded reply requests. Its model/tool
 // UID can traverse and group-read the adapter queue, but cannot write or replace that queue.
 if (m.deliveryMode === 'notify_only') provision(`${m.runtimeDir}/claude-channel-state`, m.workerUid, m.workerUid, 0o700, 'Claude channel state')
+if (m.deliveryMode === 'notify_only') provision(`${m.runtimeDir}/codex-mcp-state`, m.workerUid, m.workerUid, 0o700, 'Codex MCP state')
 
 // Compose file-backed secrets are bind-mounted as root-readable files even when a service uses
 // a non-root UID. Keep those host sources root:root 0600, then make one role-owned copy in a

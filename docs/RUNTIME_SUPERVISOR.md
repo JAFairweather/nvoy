@@ -4,6 +4,10 @@ This is the implementation contract for Nvoy #44. A participant is not a
 configuration convention: it is one immutable identity, one supervised runtime, and one
 separate security domain. This applies equally to Claude and Codex workers.
 
+For the cross-system map, deployment inventory and shipped-versus-pending status, begin with
+[Nostr agent architecture](NOSTR_AGENT_ARCHITECTURE.md). This document is the lower-level runtime
+and filesystem contract.
+
 ## Process boundary
 
 ```
@@ -235,7 +239,47 @@ The generated plist is mode `0600`, fixes the repository bridge, manifest root, 
 and carries only `HOME`, a bounded `PATH`, and `NVOY_INSTANCE_ROOT`. It contains no Nostr key,
 Bunker URI, NIP-46 client secret, model-provider key, relay URL, or caller-selected thread.
 
+### Reading authenticated channel feedback from Codex
+
+The Desktop wake binding deliberately injects only task-authorized instructions. Reviews and
+other authenticated channel activity may instead remain data-only. `codex-channel-mcp.mjs` gives
+the fixed Codex project a deliberate read surface for that queue without making the MCP process a
+second authority verifier:
+
+- `nvoy_channel_list` returns only envelope, record type, receipt time, message count, read state,
+  and whether the broker attached scoped instruction authority. It returns no sender or content.
+- `nvoy_channel_read` accepts one exact 64-hex envelope and returns only the broker-admitted
+  record. A null authority remains data; reading it never promotes it to an instruction.
+- `nvoy_channel_reply` is available only for a single-sender `admitted-task` carrying broker-
+  attested scoped authority. It writes envelope plus bounded text; the Bunker broker rechecks the
+  live grant and chooses the recipient. Data-only activity cannot acquire reply authority.
+
+Run one MCP server per participant identity through a dedicated SSH key. Generate the server-side
+forced command with:
+
+```sh
+NVOY_INSTANCE_ROOT=/etc/nvoy/instances \
+  node mcp/tools/instance-codex-channel-authorized-key.mjs \
+  --instance codex-jaf --public-key-file /etc/nvoy/keys/codex-jaf-reader.pub \
+  --container nvoy-codex-jaf-adapter
+```
+
+Install that exact `restrict,command=...` line for a dedicated account. The command fixes the
+container, worker UID/GID, executable, and instance and grants no shell, PTY, forwarding, signer,
+relay query, adapter UID, or caller-selected argument. Configure the Codex project MCP entry as a
+stdio SSH command using `-F /dev/null`, `-T`, `BatchMode=yes`, `IdentitiesOnly=yes`, strict pinned
+known hosts, `ClearAllForwardings=yes`, and that one mode-0600 identity key. Reattaching the project
+reopens the same identity-local read journal; unread queue entries remain listable and an exact
+envelope is acknowledged durably only after a successful read.
+
 ### Running Claude Code channel adapter
+
+> **Outbound-action hold (AD-12 / #111):** the native wake/read side is ready for deployment, but
+> do not enable `nvoy_channel_reply` in production until its queued reply passes the estate's
+> discrete WYSIWYS approval path. A task or task-relay grant authorizes proposal and delivery; it
+> does not authorize the participant key to sign the proposed reply. The current broker reply
+> worker is retained for migration/testing and must not be treated as an approval gate. The shared
+> actuator contract and release negatives are in [OUTBOUND_ACTION_APPROVAL.md](OUTBOUND_ACTION_APPROVAL.md).
 
 Claude Code has a different native edge. Its research-preview channel protocol lets an MCP server
 push an event into an already-running session. Nvoy's `claude-channel.mjs` implements that official
@@ -260,6 +304,12 @@ principal and install the unmodified output of
 the manifest worker UID and handoff GID; it grants no shell, forwarding, PTY, signer, adapter UID,
 or caller-selected command. The Claude-side MCP entry is then only that restricted stdio tunnel:
 
+The Claude participant must have its **own Nostr identity and its own manifest**. Do not reuse the
+Codex participant, Claude OG, a burner, or another Claude session merely because that identity
+already has grants. `assertNoCollisions` refuses duplicate pubkeys and runtime paths across the
+manifest root, and the channel's exclusive lock permits one live Claude session for that identity.
+The examples below therefore use `claude-jaf`, distinct from the `codex-jaf` examples above.
+
 Run `claude-channel-doctor.mjs` on both sides before installing it. The broker pass validates the
 fixed `notify_only` identity and renders its baseline and forced-key commands. The client pass
 requires Claude Code 2.1.80 or newer, a mode-0600 non-symlink identity, a non-writable pinned
@@ -267,11 +317,11 @@ requires Claude Code 2.1.80 or newer, a mode-0600 non-symlink identity, a non-wr
 reading or printing private-key contents:
 
 ```sh
-node mcp/tools/claude-channel-doctor.mjs --mode broker --instance codex-jaf \
-  --public-key-file /etc/nvoy/keys/codex-jaf-channel.pub --container nvoy-adapter-1
+node mcp/tools/claude-channel-doctor.mjs --mode broker --instance claude-jaf \
+  --public-key-file /etc/nvoy/keys/claude-jaf-channel.pub --container nvoy-claude-jaf-adapter-1
 
-node mcp/tools/claude-channel-doctor.mjs --mode client --server nvoy-codex-jaf \
-  --claude /usr/local/bin/claude --identity-file /absolute/path/codex-jaf-channel \
+node mcp/tools/claude-channel-doctor.mjs --mode client --server nvoy-claude-jaf \
+  --claude /usr/local/bin/claude --identity-file /absolute/path/claude-jaf-channel \
   --known-hosts-file /absolute/path/nvoy-channel-known-hosts \
   --ssh-target nvoy-channel@broker.example
 ```
@@ -282,7 +332,7 @@ Channels. That organization setting cannot be inferred safely by a local install
 ```json
 {
   "mcpServers": {
-    "nvoy-codex-jaf": {
+    "nvoy-claude-jaf": {
       "command": "/usr/bin/ssh",
       "args": ["-F", "/dev/null", "-T", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
         "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=/absolute/path/to/known_hosts",
@@ -300,13 +350,13 @@ later arrivals remain live:
 
 ```sh
 docker exec --user <worker_uid>:<worker_handoff_gid> <fixed-adapter-container> \
-  /usr/local/bin/node /srv/nvoy/mcp/tools/claude-channel.mjs --instance codex-jaf --baseline
+  /usr/local/bin/node /srv/nvoy/mcp/tools/claude-channel.mjs --instance claude-jaf --baseline
 ```
 
 Custom channels require an explicit development opt-in during Anthropic's research preview:
 
 ```sh
-claude --dangerously-load-development-channels server:nvoy-codex-jaf
+claude --dangerously-load-development-channels server:nvoy-claude-jaf
 ```
 
 The session must remain open; Claude Code does not acknowledge channel notifications. Nvoy marks an

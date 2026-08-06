@@ -32,6 +32,12 @@ no admin panel, no ACL. Nobody in the OAuth world can show that.
   agents hold right now, under what terms — and show me the revocations."* The
   whole record reconstitutes from the delegator nsec alone, on any device.
 
+Nvoy also supplies isolated participant runtimes that make persistent Codex and Claude sessions
+first-class Nostr identities. This is not the same service as the general scoped-data MCP above:
+each participant gets its own watcher, Bunker-backed broker, keyless adapter, MCP endpoint and
+fixed model-session binding. See
+[`docs/NOSTR_AGENT_ARCHITECTURE.md`](docs/NOSTR_AGENT_ARCHITECTURE.md).
+
 ## The nvoy terms extension
 
 A grant payload MAY carry an `nvoy` object — `purpose`, `expires_at`,

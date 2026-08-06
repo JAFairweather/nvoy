@@ -1,5 +1,12 @@
 # Bind a Codex task as a Nostr participant
 
+> **Outbound-action hold (AD-12 / #111):** inbound wrapped mentions may wake and steer this fixed
+> task after the full grant chain verifies. The generated response is only a proposal. Production
+> must not let the reply daemon sign or publish it until a human approves the frozen outbound bytes
+> through the configured WYSIWYS approval path. Admission and task grants never constitute that
+> fresh tap. See [OUTBOUND_ACTION_APPROVAL.md](OUTBOUND_ACTION_APPROVAL.md) for the frozen public
+> event and private NIP-17 seal contracts.
+
 Codex's Nostr identity binds to one operator-selected, persistent Codex task. That may be the
 owner's existing goal-bearing project task—the first-class path—so an admitted Nostr message joins
 the same context that is already doing the work. A separate participant task is an optional
@@ -9,6 +16,13 @@ The immutable manifest chooses the task. An inbound event cannot select, create,
 or redirect a task. If the selected task is active, delivery uses `turn/steer` against its exact
 current turn. If it is idle, delivery starts the next turn. A second interactive client must not
 independently run the same task; the local App Server control plane is the sole delivery edge.
+
+This interaction pipe is only one half of the client integration. The same isolated identity
+runtime can expose the fixed-instance `codex-channel-mcp.mjs` read/reply plane from Nvoy #115 / PR
+#118 over its broker-admitted queue. The App Server binder wakes and addresses the exact task; MCP
+lets that task deliberately inspect the exact envelope and verified authority. Neither browser
+inspection nor screen automation is a substitute for MCP. See
+[Nostr agent architecture](NOSTR_AGENT_ARCHITECTURE.md).
 
 ## Select an existing task
 
@@ -65,3 +79,7 @@ mention, a turn containing the exact envelope marker in the manifest-bound task,
 one signed Nostr reply, and the Waggle reaction receipt. Unauthorized authors, admitted-only
 authors without task authority, wrong carriers/channels, stale/replayed sources, and wrong task or
 recipient bindings must all fail closed.
+
+Also prove that the MCP tools are attached to this same task and can read the exact delivered
+envelope. MCP clients load toolsets at task/session lifecycle boundaries; “server deployed” and
+“tools visible in this task” are separate states.
