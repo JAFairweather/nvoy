@@ -22,6 +22,7 @@ const broker = resolve(new URL('.', import.meta.url).pathname, 'instance-broker.
 const childEnv = { PATH: process.env.PATH || '', NVOY_INSTANCE_ROOT: root, NVOY_BROKER_CREDENTIAL: process.env.NVOY_BROKER_CREDENTIAL,
   ...(process.env.NVOY_BUNKER_URI_FILE ? { NVOY_BUNKER_URI_FILE: process.env.NVOY_BUNKER_URI_FILE } : {}) }
 const retryAfter = new Map()
+const proposalRetryAfter = new Map()
 const announcedProposals = new Set()
 
 function recover() {
@@ -73,6 +74,15 @@ function drain() {
       for (const request of ids) {
         const key = `${source}:${request}`
         if (announcedProposals.has(key)) continue
+        if ((proposalRetryAfter.get(key) || 0) > Date.now()) continue
+        const proposed = spawnSync(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-reply.mjs'),
+          '--instance', manifest.id, '--request', request, '--source', source, '--prepare'], { env: childEnv, encoding: 'utf8', timeout: 90000 })
+        if (proposed.status !== 0) {
+          proposalRetryAfter.set(key, Date.now() + 5000)
+          console.error(`instance-broker-daemon: ${source} reply proposal ${request.slice(0, 12)}… held: ${String(proposed.stderr || '').trim()}`)
+          continue
+        }
+        proposalRetryAfter.delete(key)
         announcedProposals.add(key)
         console.log(`instance-broker-daemon: ${source} reply proposal ${request.slice(0, 12)}… awaiting discrete approval`)
       }

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
-import { generateSecretKey, getPublicKey, finalizeEvent } from 'nostr-tools/pure'
+import { generateSecretKey, getEventHash, getPublicKey, finalizeEvent } from 'nostr-tools/pure'
 import { approvalBody, approvalTemplate, approvalUrl, verifyOutboundApproval } from '../mcp/tools/outbound_approval.mjs'
+import { validateOutboundRecord } from '../mcp/tools/outbound_record.mjs'
 
 let total = 0, passed = 0
 const test = (name, fn) => {
@@ -20,6 +21,14 @@ test('canonical body and URL bind one proposal and frozen fingerprint', () => {
   assert.equal(approvalBody(proposalId, fingerprint), JSON.stringify({ proposal_id: proposalId, fingerprint, verb: 'approve' }))
 })
 test('one fresh exact Director signature opens the approval boundary', () => assert.equal(verify(signed).eventId, signed.id))
+test('a frozen unsigned seal is durable proposal state, never publication evidence', () => {
+  const seal = { pubkey: 'c'.repeat(64), created_at: 1, kind: 13, tags: [], content: 'ciphertext' }
+  const record = { version: 2, request_digest: 'd'.repeat(64), request_id: proposalId,
+    fingerprint: getEventHash(seal), unsigned_seal: seal, wrap: null, published: false }
+  assert.equal(validateOutboundRecord(record, { requestId: proposalId }).published, false)
+  assert.throws(() => validateOutboundRecord({ ...record, published: true }), /claims enactment/)
+  assert.throws(() => validateOutboundRecord({ ...record, unsigned_seal: { ...seal, extra: true } }), /exact frozen/)
+})
 for (const [name, mutate, pattern] of [
   ['foreign signer', () => finalizeEvent(approvalTemplate({ approver: foreignApprover, instance, proposalId, fingerprint, createdAt: nowMs / 1000 }), foreignSk), /authorized approver/],
   ['wrong instance', event => event, /exact approval body/],

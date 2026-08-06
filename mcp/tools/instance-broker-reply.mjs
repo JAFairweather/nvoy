@@ -11,24 +11,24 @@ import { resolve } from 'node:path'
 import { replyRequestDigest, validateOutboundRecord } from './outbound_record.mjs'
 import { spawnSync } from 'node:child_process'
 import WebSocket from 'ws'
-import { getPublicKey, getEventHash, finalizeEvent, generateSecretKey } from 'nostr-tools/pure'
+import { getPublicKey, getEventHash, finalizeEvent, generateSecretKey, verifyEvent } from 'nostr-tools/pure'
 import { decode } from 'nostr-tools/nip19'
 import * as nip44 from 'nostr-tools/nip44'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { makeBunkerSigner } from './nip46-signer.mjs'
+import { verifyOutboundApproval } from './outbound_approval.mjs'
 
 const die = m => { console.error(`instance-broker-reply: ${m}`); process.exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
-const id = flag('--instance'), requestId = flag('--request').toLowerCase(), source = flag('--source') || 'worker'
-if (!id || !/^[0-9a-f]{32}$/.test(requestId) || !['worker', 'desktop'].includes(source)) die('usage: --instance <id> --request <32-hex-id> [--source worker|desktop]')
+const id = flag('--instance'), requestId = flag('--request').toLowerCase(), source = flag('--source') || 'worker', approvalPath = flag('--approval')
+const prepareOnly = process.argv.includes('--prepare')
+if (!id || !/^[0-9a-f]{32}$/.test(requestId) || !['worker', 'desktop'].includes(source) || prepareOnly === !!approvalPath) {
+  die('usage: --instance <id> --request <32-hex-id> [--source worker|desktop] (--prepare | --approval <signed-event.json>)')
+}
 const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 let manifest
 try { manifest = readManifest(root, instanceId(id)); assertNoCollisions(root, manifest) } catch (e) { die(e.message) }
 if (manifest.brokerMode !== 'local') die('remote-broker Desktop manifests cannot sign locally')
-// AD-12 migration hold. This keyed executable used to treat a queued model result as standing
-// authority to sign. Keep the old actuator unreachable until the replacement verifies a discrete
-// approval bound to the exact frozen event fingerprint.
-die('outbound action is awaiting discrete approval; automatic signing is disabled')
 
 function regular(path, label) {
   let st; try { st = lstatSync(path) } catch { die(`${label} is missing`) }
@@ -113,6 +113,7 @@ if (existsSync(recordPath)) {
   regular(recordPath, 'outbound record')
   try { record = JSON.parse(readFileSync(recordPath, 'utf8')) } catch { die('outbound record is invalid') }
   try { validateOutboundRecord(record, { requestId, requestDigest: digest }) } catch (e) { die(e.message) }
+  if (record.version !== 2) die('legacy signed reply record has no discrete approval and cannot be resumed')
   if (record.published === true) {
     try { renameSync(receiptInflight, receiptUsed) } catch (e) { die(`could not finalize one-use receipt: ${e.message}`) }
     console.log(JSON.stringify({ request: requestId, receipt: request.receipt, accepted: record.accepted || 0, replay: true }))
@@ -126,14 +127,39 @@ if (existsSync(recordPath)) {
       ...(channelCarry ? [['relay', receipt.reply_channel]] : [])], content: request.content }
   rumor.id = getEventHash(rumor)
   const backdated = () => Math.floor(Date.now() / 1000 - Math.random() * 2 * 24 * 60 * 60)
-  const seal = await signer.signEvent({ kind: 13, created_at: backdated(), tags: [],
-    content: await signer.nip44Encrypt(peer, JSON.stringify(rumor)) })
-  const wrapSk = generateSecretKey()
-  const wrap = finalizeEvent({ kind: 1059, created_at: backdated(), tags: [['p', peer]],
-    content: nip44.encrypt(JSON.stringify(seal), nip44.getConversationKey(wrapSk, peer)) }, wrapSk)
-  record = { version: 1, request_digest: digest, request_id: requestId, wrap, published: false }
+  const unsignedSeal = { kind: 13, pubkey: manifest.pubkey, created_at: backdated(), tags: [],
+    content: await signer.nip44Encrypt(peer, JSON.stringify(rumor)) }
+  record = { version: 2, request_digest: digest, request_id: requestId,
+    fingerprint: getEventHash(unsignedSeal), unsigned_seal: unsignedSeal, wrap: null, published: false }
   const tmp = `${recordPath}.${process.pid}.tmp`
   try { writeFileSync(tmp, JSON.stringify(record), { mode: 0o600 }); renameSync(tmp, recordPath) } catch (e) { die(`cannot persist outbound record: ${e.message}`) }
+}
+
+if (prepareOnly) {
+  console.log(JSON.stringify({ request: requestId, receipt: request.receipt, status: 'awaiting-approval', fingerprint: record.fingerprint }))
+  process.exit(0)
+}
+regular(approvalPath, 'approval event')
+let approvalEvent
+try { approvalEvent = JSON.parse(readFileSync(approvalPath, 'utf8')) } catch { die('approval event is invalid JSON') }
+let approval
+try {
+  approval = verifyOutboundApproval(approvalEvent, { instance: manifest.id, proposalId: requestId,
+    fingerprint: record.fingerprint, approvers: manifest.grantors,
+    ...(record.approval_id ? { maxAgeMs: Number.MAX_SAFE_INTEGER } : {}) })
+} catch (e) { die(e.message) }
+if (record.approval_id && record.approval_id !== approval.eventId) die('outbound proposal is already bound to another approval')
+if (!record.wrap) {
+  const seal = await signer.signEvent(record.unsigned_seal)
+  if (seal.id !== record.fingerprint || getEventHash(seal) !== record.fingerprint || !verifyEvent(JSON.parse(JSON.stringify(seal)))) die('signer changed or invalidly signed the approved frozen seal')
+  const peer = channelCarry ? receipt.carrier : receipt.sender
+  const wrapSk = generateSecretKey()
+  const backdated = () => Math.floor(Date.now() / 1000 - Math.random() * 2 * 24 * 60 * 60)
+  record.wrap = finalizeEvent({ kind: 1059, created_at: backdated(), tags: [['p', peer]],
+    content: nip44.encrypt(JSON.stringify(seal), nip44.getConversationKey(wrapSk, peer)) }, wrapSk)
+  record.approval_id = approval.eventId
+  const tmp = `${recordPath}.${process.pid}.approved.tmp`
+  try { writeFileSync(tmp, JSON.stringify(record), { mode: 0o600 }); renameSync(tmp, recordPath) } catch (e) { die(`cannot persist approved outbound record: ${e.message}`) }
 }
 
 async function publish(url) {
