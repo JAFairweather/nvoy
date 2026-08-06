@@ -7,6 +7,7 @@ import { appServerCall } from '../mcp/tools/codex_app_server.mjs'
 const root = mkdtempSync(join(tmpdir(), 'nvoy-codex-long-thread-'))
 const socket = join(root, 'control.sock')
 const largeHistory = 'x'.repeat(12 * 1024 * 1024)
+let serverError = null
 
 function frame(value) {
   const body = Buffer.from(JSON.stringify(value))
@@ -37,6 +38,10 @@ function requests(buffer) {
 
 const server = net.createServer(stream => {
   let upgraded = false, buffer = Buffer.alloc(0)
+  // appServerCall intentionally destroys its local socket after the complete frame is parsed.
+  // A queued tail write may then report EPIPE to this fake peer even though the client received
+  // and verified the whole 12 MiB response. Preserve every other transport error.
+  stream.on('error', error => { if (error.code !== 'EPIPE') serverError = error })
   stream.on('data', chunk => {
     buffer = Buffer.concat([buffer, chunk])
     if (!upgraded) {
@@ -58,6 +63,7 @@ try {
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(socket, resolve) })
   const rows = await appServerCall({ socketPath: socket, listOnly: true, timeoutMs: 10_000 })
   if (rows?.[0]?.history?.length !== largeHistory.length) throw new Error('large app-server response was not preserved')
+  if (serverError) throw serverError
   console.log('codex-app-server-long-thread: 12 MiB response accepted')
 } finally {
   await new Promise(resolve => server.close(resolve))
