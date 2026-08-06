@@ -58,6 +58,29 @@ tool) and retain the signed/public-key evidence in the deployment record. Never
 proceed on an npub string copied from an unverified screen. The repository does
 not treat a URI parse as proof that the URI controls the intended identity.
 
+Install only the two non-secret Bunker artifacts into the broker's credential
+directory. Do this on the broker host as the operator; do not paste either
+value into a chat, shell history, manifest, issue, or PR:
+
+```sh
+install -d -m 0700 /etc/nvoy/credentials
+umask 077
+install -m 0600 /path/to/claude-<owner>.bunker-uri \
+  /etc/nvoy/credentials/claude-<owner>.bunker-uri
+install -m 0600 /path/to/claude-<owner>.nip46-client \
+  /etc/nvoy/credentials/claude-<owner>.nip46-client
+stat -c '%n %U:%G %a' \
+  /etc/nvoy/credentials/claude-<owner>.bunker-uri \
+  /etc/nvoy/credentials/claude-<owner>.nip46-client
+```
+
+The expected result is two `0600` files readable only by the broker's
+credential handoff. A Bunker key without these two instance-specific artifacts
+is not a paired runtime. After installation, run the instance/manifest doctor
+and compare the Bunker-derived public key to the manifest again. Delete the
+staged identity nsec only after both comparisons succeed; the broker must never
+receive a copy of it.
+
 ## 3. Create the isolated instance
 
 The manifest fixes the identity, grantor, carrier, channel, relays, and local
