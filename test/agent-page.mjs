@@ -34,7 +34,9 @@ const ok = (name, fn) => {
 const els = new Map()
 const mk = (doc, id = '') => {
   const t = {
-    id, style: {}, dataset: {}, hidden: false, textContent: '', innerHTML: '', value: '', disabled: false,
+    // `style` needs setProperty: the plane switcher sets a per-app accent as a CSS custom property.
+    id, style: { setProperty() {}, removeProperty() {}, getPropertyValue: () => '' },
+    dataset: {}, hidden: false, textContent: '', innerHTML: '', value: '', disabled: false,
     classList: { toggle() {}, add() {}, remove() {}, contains: () => false },
     append() {}, appendChild() {}, addEventListener() {}, insertAdjacentHTML() {},
     setAttribute() {}, removeAttribute() {}, getAttribute: () => null,

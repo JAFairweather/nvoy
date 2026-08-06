@@ -107,5 +107,26 @@ for (const f of files) {
 ok('no console module calls another module\'s export without importing it', fail === 0,
   'see the failures above')
 
+
+// ── token hygiene: the transitional alias stays gone (Wave 5) ────────────────
+//
+// `--panel2` was a NEAR-MISS of the system's `--panel-2`: two silently separate variables, so this
+// console fell back to unset for that surface and nothing complained. It was aliased for one deploy —
+// deliberately, because a token change that also moves markup is unreviewable — and Wave 5 removed the
+// alias after renaming the rulesets.
+//
+// Asserted rather than trusted because the failure is invisible: a re-introduced `var(--panel2)` renders
+// as "no background" on a dark surface, which looks like a design choice.
+{
+  const offenders = []
+  for (const f of readdirSync(dir).filter(f => f.endsWith('.mjs') || f.endsWith('.html'))) {
+    const src = readFileSync(join(dir, f), 'utf8')
+    // Only the USE and the DECLARATION, never prose: the history of this bug is recorded in a comment
+    // in index.html and must stay readable.
+    for (const m of src.matchAll(/var\(\s*--panel2\s*\)|--panel2\s*:/g)) offenders.push(`${f}: ${m[0]}`)
+  }
+  ok('the --panel2 alias has not returned', offenders.length === 0, offenders.join(' | '))
+}
+
 console.log(`\n${pass}/${pass + fail} passed`)
 process.exit(fail ? 1 : 0)
