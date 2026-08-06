@@ -4,6 +4,10 @@ This is the implementation contract for Nvoy #44. A participant is not a
 configuration convention: it is one immutable identity, one supervised runtime, and one
 separate security domain. This applies equally to Claude and Codex workers.
 
+For the cross-system map, deployment inventory and shipped-versus-pending status, begin with
+[Nostr agent architecture](NOSTR_AGENT_ARCHITECTURE.md). This document is the lower-level runtime
+and filesystem contract.
+
 ## Process boundary
 
 ```

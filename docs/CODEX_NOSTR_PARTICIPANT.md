@@ -17,6 +17,13 @@ or redirect a task. If the selected task is active, delivery uses `turn/steer` a
 current turn. If it is idle, delivery starts the next turn. A second interactive client must not
 independently run the same task; the local App Server control plane is the sole delivery edge.
 
+This interaction pipe is only one half of the client integration. The same isolated identity
+runtime can expose the fixed-instance `codex-channel-mcp.mjs` read/reply plane from Nvoy #115 / PR
+#118 over its broker-admitted queue. The App Server binder wakes and addresses the exact task; MCP
+lets that task deliberately inspect the exact envelope and verified authority. Neither browser
+inspection nor screen automation is a substitute for MCP. See
+[Nostr agent architecture](NOSTR_AGENT_ARCHITECTURE.md).
+
 ## Select an existing task
 
 Use the task ID shown by Codex for the project conversation you want Nostr to reach, and record its
@@ -72,3 +79,7 @@ mention, a turn containing the exact envelope marker in the manifest-bound task,
 one signed Nostr reply, and the Waggle reaction receipt. Unauthorized authors, admitted-only
 authors without task authority, wrong carriers/channels, stale/replayed sources, and wrong task or
 recipient bindings must all fail closed.
+
+Also prove that the MCP tools are attached to this same task and can read the exact delivered
+envelope. MCP clients load toolsets at task/session lifecycle boundaries; “server deployed” and
+“tools visible in this task” are separate states.
