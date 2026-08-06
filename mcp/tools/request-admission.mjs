@@ -1,18 +1,23 @@
-// request-admission.mjs — a Claude session mints an EPHEMERAL key and asks the maintainer to
-// admit it to a waggle channel (waggle#141, the mint→request→approve→burn flow).
+// request-admission.mjs — a participant asks the maintainer to admit its identity to a waggle
+// channel. By default it mints an EPHEMERAL key (waggle#141). A standing participant may instead
+// name its already-created mode-0600 nsec file with --key; the secret is never printed.
 //
-// Why this exists: instead of a session holding a persistent Claude key (the §3.1 exposure #135
-// removes), each session generates a throwaway key, gets it a maintainer-approved NIP-DA grant,
-// acts, and discards it. Nothing valuable persists, so nothing needs a remote signer to protect.
+// Why this exists: an interactive session normally generates a throwaway key, gets a
+// maintainer-approved NIP-DA grant, acts, and discards it. A standing participant has a different
+// bootstrap lifecycle: it is minted once, requests admission under that same identity, then moves
+// signing into its dedicated Bunker runtime. --key supports that bootstrap without minting a
+// second, incorrect identity.
 //
-// SECURITY POSTURE — the nsec never enters the agent's transcript. This tool WRITES the fresh nsec
-// to a 0600 tmpfile and prints only its PATH + the public npub. The session then chats with
+// SECURITY POSTURE — the nsec never enters the agent's transcript. This tool either writes a fresh
+// nsec to a 0600 tmpfile or descriptor-pins a caller-selected 0600 nsec file, then prints only its
+// PATH + the public npub. The session then chats with
 //   NVOY_NSEC=$(cat <path>) node tools/relay-send.mjs        (shell substitutes it; agent never reads it)
 // and burns it with `shred -u <path>` (or `rm`) on exit. This mirrors how claude-identity.env is
 // used: the value goes file → env → tool, never through the model's eyes.
 //
 // Usage:
 //   node tools/request-admission.mjs --purpose "review #140 with the crew"
+//   node tools/request-admission.mjs --key /absolute/path/identity.nsec --purpose "Claude runtime"
 //   node tools/request-admission.mjs --channel <uuid> --maintainer <npub|hex> --purpose "…"
 //   DRY_RUN=1 node tools/request-admission.mjs --purpose "…"     # mint + build, publish nothing
 //
@@ -27,7 +32,7 @@
 import { getPublicKey, getEventHash, finalizeEvent, generateSecretKey } from 'nostr-tools/pure'
 import * as nip19 from 'nostr-tools/nip19'
 import * as nip44 from 'nostr-tools/nip44'
-import { writeFileSync, mkdtempSync } from 'node:fs'
+import { writeFileSync, mkdtempSync, openSync, fstatSync, readFileSync, closeSync, constants } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import WebSocket from 'ws'
@@ -38,12 +43,40 @@ const MAINT_RAW = flag('--maintainer', process.env.WAGGLE_MAINTAINER_NPUB ||
   '4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b287ea84d')
 const MAINT = MAINT_RAW.startsWith('npub1') ? nip19.decode(MAINT_RAW).data : MAINT_RAW.toLowerCase()
 const PURPOSE = flag('--purpose', '(unspecified)')
+const EXISTING_KEY = flag('--key', null)
 const RELAYS = (process.env.RELAY_RELAYS || 'wss://nos.lol,wss://relay.primal.net')
   .split(',').map(s => s.trim()).filter(Boolean)
 const DRY = !!process.env.DRY_RUN
 
-// 1. Mint the ephemeral session key.
-const sk = generateSecretKey()
+function loadSecret(path) {
+  const absolute = resolve(path)
+  let fd
+  try { fd = openSync(absolute, constants.O_RDONLY | constants.O_NOFOLLOW) }
+  catch { throw new Error('--key must name a readable regular, non-symlink file') }
+  let encoded
+  try {
+    const stat = fstatSync(fd)
+    if (!stat.isFile()) throw new Error('--key must name a regular file')
+    if ((stat.mode & 0o077) !== 0) throw new Error('--key file must be mode 0600 (not group/world accessible)')
+    if (stat.size < 60 || stat.size > 256) throw new Error('--key file has an invalid size')
+    encoded = readFileSync(fd, 'utf8').trim()
+  } finally { closeSync(fd) }
+  let decoded
+  try { decoded = nip19.decode(encoded) } catch { throw new Error('--key file must contain one valid nsec') }
+  if (decoded.type !== 'nsec' || !(decoded.data instanceof Uint8Array) || decoded.data.length !== 32) {
+    throw new Error('--key file must contain one valid nsec')
+  }
+  return { sk: decoded.data, path: absolute }
+}
+
+// 1. Reuse the explicitly assigned participant key, or mint an ephemeral session key.
+let sk, keyPath, ephemeral = false
+if (EXISTING_KEY) {
+  ({ sk, path: keyPath } = loadSecret(EXISTING_KEY))
+} else {
+  sk = generateSecretKey()
+  ephemeral = true
+}
 const pk = getPublicKey(sk)
 const npub = nip19.npubEncode(pk)
 
@@ -61,12 +94,14 @@ const wsk = generateSecretKey()
 const wrap = finalizeEvent({ kind: 1059, created_at: now, tags: [['p', MAINT]], content: nip44.encrypt(JSON.stringify(seal), nip44.getConversationKey(wsk, MAINT)) }, wsk)
 
 // 3. Stash the nsec in a 0600 tmpfile — NOT stdout. The agent references it by path only.
-const dir = mkdtempSync(resolve(tmpdir(), 'waggle-session-'))
-const keyPath = resolve(dir, 'session.nsec')
-writeFileSync(keyPath, nip19.nsecEncode(sk), { mode: 0o600 })
+if (ephemeral) {
+  const dir = mkdtempSync(resolve(tmpdir(), 'waggle-session-'))
+  keyPath = resolve(dir, 'session.nsec')
+  writeFileSync(keyPath, nip19.nsecEncode(sk), { mode: 0o600 })
+}
 
-console.error(`request-admission: minted session npub ${npub}`)
-console.error(`  session key (0600, path only — do NOT cat into your context): ${keyPath}`)
+console.error(`request-admission: ${ephemeral ? 'minted session' : 'existing participant'} npub ${npub}`)
+console.error(`  participant key (0600, path only — do NOT cat into your context): ${keyPath}`)
 console.error(`  request: admit to channel ${CHANNEL.slice(0, 8)}…  purpose: ${PURPOSE}`)
 console.error(`  to the maintainer ${MAINT.slice(0, 8)}…  (wrap ${wrap.id.slice(0, 12)}…, ${JSON.stringify(wrap).length}B)`)
 
@@ -89,7 +124,7 @@ for (const url of RELAYS) {
 }
 console.error(`request-admission: request delivered to ${ok}/${RELAYS.length} relay(s).`)
 console.error(`  next: ask the maintainer to run  grant.mjs issue --to ${npub} --channel ${CHANNEL} --cap admit`)
-console.error(`  then chat:  NVOY_NSEC=$(cat ${keyPath}) node tools/relay-send.mjs   ·   burn:  shred -u ${keyPath}`)
+console.error(`  then chat:  NVOY_NSEC=$(cat ${keyPath}) node tools/relay-send.mjs${ephemeral ? `   ·   burn:  shred -u ${keyPath}` : ''}`)
 // The ONLY thing on stdout is the key path — safe to capture, never the key itself.
 console.log(keyPath)
 process.exit(ok ? 0 : 1)

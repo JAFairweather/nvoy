@@ -36,7 +36,8 @@ Nvoy also supplies isolated participant runtimes that make persistent Codex and 
 first-class Nostr identities. This is not the same service as the general scoped-data MCP above:
 each participant gets its own watcher, Bunker-backed broker, keyless adapter, MCP endpoint and
 fixed model-session binding. See
-[`docs/NOSTR_AGENT_ARCHITECTURE.md`](docs/NOSTR_AGENT_ARCHITECTURE.md).
+[`docs/AGENT_RUNTIME_HANDOFF.md`](docs/AGENT_RUNTIME_HANDOFF.md) for the successor runbook and
+[`docs/NOSTR_AGENT_ARCHITECTURE.md`](docs/NOSTR_AGENT_ARCHITECTURE.md) for the canonical design.
 
 ## The nvoy terms extension
 
