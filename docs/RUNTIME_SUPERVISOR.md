@@ -241,7 +241,8 @@ Bunker URI, NIP-46 client secret, model-provider key, relay URL, or caller-selec
 > do not enable `nvoy_channel_reply` in production until its queued reply passes the estate's
 > discrete WYSIWYS approval path. A task or task-relay grant authorizes proposal and delivery; it
 > does not authorize the participant key to sign the proposed reply. The current broker reply
-> worker is retained for migration/testing and must not be treated as an approval gate.
+> worker is retained for migration/testing and must not be treated as an approval gate. The shared
+> actuator contract and release negatives are in [OUTBOUND_ACTION_APPROVAL.md](OUTBOUND_ACTION_APPROVAL.md).
 
 Claude Code has a different native edge. Its research-preview channel protocol lets an MCP server
 push an event into an already-running session. Nvoy's `claude-channel.mjs` implements that official

@@ -4,7 +4,8 @@
 > task after the full grant chain verifies. The generated response is only a proposal. Production
 > must not let the reply daemon sign or publish it until a human approves the frozen outbound bytes
 > through the configured WYSIWYS approval path. Admission and task grants never constitute that
-> fresh tap.
+> fresh tap. See [OUTBOUND_ACTION_APPROVAL.md](OUTBOUND_ACTION_APPROVAL.md) for the frozen public
+> event and private NIP-17 seal contracts.
 
 Codex's Nostr identity binds to one operator-selected, persistent Codex task. That may be the
 owner's existing goal-bearing project task—the first-class path—so an admitted Nostr message joins
