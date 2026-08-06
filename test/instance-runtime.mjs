@@ -82,6 +82,10 @@ const liveImport = runImport(importRecord(historicalEnvelope) + importRecord(liv
 const replayImport = runImport(importRecord(liveEnvelope))
 const desktopQueue = join(root, 'run-desktop', 'admitted-tasks.jsonl')
 ok('remote Codex queue install baselines history, imports only a later unseen envelope, and deduplicates replay', baselineImport.status === 0 && liveImport.status === 0 && replayImport.status === 0 && readFileSync(desktopQueue, 'utf8').trim().split('\n').length === 1 && readFileSync(desktopQueue, 'utf8').includes(liveEnvelope) && !readFileSync(desktopQueue, 'utf8').includes(historicalEnvelope))
+const appServerBaseline = spawnSync(process.execPath, ['mcp/tools/codex-app-server-adapter.mjs', '--instance', 'codex-desktop', '--baseline'], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
+ok('switching a remote Desktop binding to app-server delivery baselines every existing local envelope without starting a turn',
+  appServerBaseline.status === 0 && JSON.parse(appServerBaseline.stdout).baselined === 1 &&
+  readFileSync(join(root, 'run-desktop', 'codex-app-server-baseline.jsonl'), 'utf8').includes(liveEnvelope))
 const wrongInstance = JSON.stringify({ type: 'admitted-task', instance: 'claude-other', envelope: '7'.repeat(64), messages: [{ from: 'a'.repeat(64), at: 1, content: 'cross-instance attempt' }] }) + '\n'
 const deniedImport = runImport(wrongInstance)
 ok('remote Codex queue import refuses a record for another identity', deniedImport.status !== 0 && /invalid admitted record/.test(deniedImport.stderr))

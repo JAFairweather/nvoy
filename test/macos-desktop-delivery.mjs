@@ -33,10 +33,11 @@ ok('project-qualified sidebar task and active header are independently required'
   /let projectChats = named\.filter/.test(nativeSource) && /let active = named\.compactMap/.test(nativeSource))
 ok('selected-project proof precedes every native binder invocation',
   adapterSource.indexOf('verifySelectedDesktopProject({') < adapterSource.indexOf('spawnSync(manifest.codexUiDriver'))
-ok('native binder revalidates selected project after staging and before Send', (() => {
+ok('native binder revalidates selected project after staging and before its one submit mutation', (() => {
   const checks = [...nativeSource.matchAll(/selectedProjectIsBound\(request\)/g)].map(match => match.index)
-  return checks.length === 2 && checks[0] < nativeSource.indexOf('request.text as CFTypeRef') &&
-    checks[1] > nativeSource.indexOf('let send = ready.filter') && checks[1] < nativeSource.indexOf('kAXPressAction')
+  const stage = nativeSource.indexOf('request.text as CFTypeRef')
+  const targetedPost = nativeSource.indexOf('postToPid(app.processIdentifier)')
+  return checks.length >= 3 && checks[0] < stage && checks.some(index => index > stage && index < targetedPost)
 })())
 ok('native selection proof is itself descriptor-pinned and no-follow',
   /Darwin\.open\(request\.codex_state_path, O_RDONLY \| O_NOFOLLOW\)/.test(nativeSource) &&
@@ -50,6 +51,46 @@ ok('Electron semantic accessibility is enabled before the focused window is insp
   const inspect = nativeSource.indexOf('kAXFocusedWindowAttribute')
   return enable >= 0 && inspect > enable && nativeSource.includes('usleep(500_000)')
 })())
+ok('background delivery requires one Codex process but never steals or requires OS focus',
+  nativeSource.includes('apps.count == 1') &&
+  !nativeSource.includes('frontmostApplication') && !nativeSource.includes('app.isActive') &&
+  !nativeSource.includes('activate(options:'))
+ok('whitespace-only AX composer state is empty without permitting draft overwrite',
+  nativeSource.includes('trimmingCharacters(in: .whitespacesAndNewlines)') &&
+  nativeSource.includes('let composerIsEmpty = normalizedComposer.isEmpty'))
+ok('an AX value equal to its non-empty native placeholder is not mistaken for a user draft',
+  nativeSource.includes('!composerPlaceholder.isEmpty && composerValue == composerPlaceholder'))
+ok('Chromium semantic placeholder values are accepted only when they equal the composer description',
+  nativeSource.includes('!composerDescription.isEmpty && normalizedComposer == composerDescription'))
+ok('background delivery posts one Return pair only to the verified Codex PID and has no global or timed fallback',
+  !nativeSource.includes('kAXPressAction') && !nativeSource.includes('kAXConfirmAction') &&
+  (nativeSource.match(/postToPid\(app\.processIdentifier\)/g) || []).length === 2 &&
+  nativeSource.includes('kAXFocusedAttribute') && !nativeSource.includes('.post(tap:') &&
+  !nativeSource.includes('usleep(300_000)'))
+const submitInvariant = source => {
+  const stage = source.indexOf('let setResult = AXUIElementSetAttributeValue')
+  const submit = source.indexOf('// Submit through one process-targeted', stage)
+  const rebind = source.indexOf('selectedProjectIsBound(request)', submit)
+  const reinspect = source.indexOf('let rebound = inspect()', rebind)
+  const sameComposer = source.indexOf('CFEqual(rebound.2[0].element, composers[0].element)', reinspect)
+  const exactValue = source.indexOf('value(rebound.2[0]) == request.text', sameComposer)
+  const confirm = source.indexOf('postToPid(app.processIdentifier)', exactValue)
+  return stage >= 0 && submit > stage && rebind > submit && reinspect > rebind && sameComposer > reinspect &&
+    exactValue > sameComposer && confirm > exactValue
+}
+ok('single submit re-proves project, active chat, same composer, and exact staged bytes',
+  submitInvariant(nativeSource))
+ok('NEGATIVE CONTROL — removing the pre-submit project proof breaks the submit invariant',
+  !submitInvariant(nativeSource.replace('guard selectedProjectIsBound(request) else {\n  clearExactStagedText()', 'guard true else {\n  clearExactStagedText()')))
+const noReceipt = nativeSource.indexOf('guard matches == 1 else')
+const cleanup = nativeSource.slice(nativeSource.indexOf('func clearExactStagedText()'), nativeSource.indexOf('// Submit through exactly ONE'))
+ok('a no-receipt timeout invokes target-revalidated exact-text cleanup before failing',
+  noReceipt >= 0 && nativeSource.indexOf('clearExactStagedText()', noReceipt) > noReceipt &&
+  /selectedProjectIsBound\(request\)/.test(cleanup) && /let rebound = inspect\(\)/.test(cleanup) &&
+  /CFEqual\(rebound\.2\[0\]\.element, composers\[0\]\.element\)/.test(cleanup) &&
+  /value\(rebound\.2\[0\]\) == request\.text/.test(cleanup) &&
+  nativeSource.indexOf('fail("one exact visible receipt was not observed")', noReceipt) >
+    nativeSource.indexOf('clearExactStagedText()', noReceipt))
 for (const [name, mutate] of [
   ['wrong app fails closed', x => { x.app_bundle_id = 'com.apple.TextEdit' }],
   ['wrong project fails closed', x => { x.project_label = 'other' }],

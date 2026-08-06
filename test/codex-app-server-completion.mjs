@@ -6,7 +6,8 @@ import { appServerCall } from '../mcp/tools/codex_app_server.mjs'
 
 const root = mkdtempSync(join(tmpdir(), 'nvoy-codex-completion-'))
 const socket = join(root, 'control.sock'), thread = '019fce57-063d-7f50-b837-967d33ee384a', turn = '019fd200-0000-7000-8000-000000000001'
-let started = 0, reads = 0
+const staleTurn = '019fd100-0000-7000-8000-000000000002'
+let started = 0, reads = 0, steerAttempts = 0, steered = 0, steeredInput = '', ownerFinalEmitted = 0
 const frame = value => {
   const body = Buffer.from(JSON.stringify(value)); let head
   if (body.length < 126) head = Buffer.from([0x81, body.length])
@@ -41,26 +42,36 @@ const server = net.createServer(stream => {
       if (request.method === 'initialize') stream.write(frame({ id: request.id, result: {} }))
       if (request.method === 'thread/read') {
         reads++
-        const turns = reads < 3 ? [] : [{ id: turn, status: 'completed', items: [
+        const turns = reads === 1 ? [{ id: turn, status: 'inProgress', items: [] }, { id: staleTurn, status: 'inProgress', items: [] }] : reads < 3 ? [] : [{ id: turn, status: 'completed', items: [
           { type: 'userMessage', content: [{ type: 'text', text: 'NVOY_ENVELOPE_ID=' + 'c'.repeat(64) }] },
           { type: 'agentMessage', phase: 'commentary', text: 'Never publish recovered commentary.' },
         ] }]
-        stream.write(frame({ id: request.id, result: { thread: { id: thread, turns } } }))
+        stream.write(frame({ id: request.id, result: { thread: { id: thread, status: { type: reads === 1 ? 'active' : 'idle' }, turns } } }))
       }
       if (request.method === 'thread/resume') stream.write(frame({ id: request.id, result: { thread: { id: thread } } }))
       if (request.method === 'turn/start') {
         started++
         stream.write(frame({ id: request.id, result: { turn: { id: turn } } }))
         stream.write(frame({ method: 'item/completed', params: { threadId: thread, turnId: turn, completedAtMs: Date.now(), item: { id: 'comment', type: 'agentMessage', phase: 'commentary', text: 'Still working.' } } }))
-        if (started === 1) {
-          stream.write(frame({ method: 'item/completed', params: { threadId: thread, turnId: turn, completedAtMs: Date.now(), item: { id: 'msg', type: 'agentMessage', phase: 'final_answer', text: 'WAKE proof acknowledged once.' } } }))
-          // Deliberately omit turn/completed: the live secondary control-socket subscriber can
-          // miss it even though the explicitly phased final item is durable in the thread.
-        } else {
-          stream.write(frame({ method: 'turn/completed', params: { threadId: thread, turn: { id: turn, status: 'completed', items: [
-            { id: 'comment', type: 'agentMessage', phase: 'commentary', text: 'Never publish live commentary.' },
-          ] } } }))
+        stream.write(frame({ method: 'turn/completed', params: { threadId: thread, turn: { id: turn, status: 'completed', items: [
+          { id: 'comment', type: 'agentMessage', phase: 'commentary', text: 'Never publish live commentary.' },
+        ] } } }))
+      }
+      if (request.method === 'turn/steer') {
+        steerAttempts++
+        if (request.params.threadId !== thread) throw new Error('steer escaped the exact thread')
+        if (request.params.expectedTurnId === staleTurn) {
+          stream.write(frame({ id: request.id, error: { message: `expected active turn id \`${staleTurn}\` but found \`${turn}\`` } }))
+          continue
         }
+        if (request.params.expectedTurnId !== turn) throw new Error('steer was not reconciled to the exact active turn')
+        steered++
+        steeredInput = request.params.input?.[0]?.text || ''
+        stream.write(frame({ id: request.id, result: { turnId: turn } }))
+        setTimeout(() => {
+          ownerFinalEmitted++
+          stream.write(frame({ method: 'item/completed', params: { threadId: thread, turnId: turn, item: { id: 'owner-final', type: 'agentMessage', phase: 'final_answer', text: 'Owner goal final answer — never export this.' } } }))
+        }, 20)
       }
     }
   })
@@ -68,9 +79,16 @@ const server = net.createServer(stream => {
 
 try {
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(socket, resolve) })
+  const snapshot = await appServerCall({ socketPath: socket, threadId: thread, readOnly: true, timeoutMs: 10_000 })
+  if (snapshot?.id !== thread || snapshot.status?.type !== 'active' || started !== 0 || steered !== 0) throw new Error('read-only probe mutated the active thread')
+  reads = 0
   const result = await appServerCall({ socketPath: socket, threadId: thread, input: 'wake', clientUserMessageId: 'nvoy:test',
-    dedupeToken: 'NVOY_ENVELOPE_ID=' + 'a'.repeat(64), waitForCompletion: true, timeoutMs: 10_000 })
-  if (result.turnId !== turn || result.finalText !== 'WAKE proof acknowledged once.') throw new Error('completed response was not bound and captured')
+    dedupeToken: 'NVOY_ENVELOPE_ID=' + 'a'.repeat(64), waitForCompletion: true, steerActive: true, timeoutMs: 10_000 })
+  if (result.turnId !== turn || result.finalText || result.replyEligible !== false || !result.steered ||
+      steerAttempts !== 2 || steered !== 1 || started !== 0 || steeredInput !== 'wake')
+    throw new Error('steered owner turn was not delivered as explicitly non-replyable')
+  await new Promise(resolve => setTimeout(resolve, 40))
+  if (ownerFinalEmitted !== 1) throw new Error('negative control did not emit the owner turn final answer')
   let liveRefused = false, recoveryRefused = false
   try {
     await appServerCall({ socketPath: socket, threadId: thread, input: 'wake again', clientUserMessageId: 'nvoy:test-2',
@@ -81,7 +99,7 @@ try {
       dedupeToken: 'NVOY_ENVELOPE_ID=' + 'c'.repeat(64), waitForCompletion: true, timeoutMs: 10_000 })
   } catch (error) { recoveryRefused = /not complete with a final assistant message/.test(error.message) }
   if (!liveRefused || !recoveryRefused) throw new Error('phased commentary became a live or recovered reply')
-  console.log('codex-app-server-completion: commentary ignored and exact final item captured without turn/completed')
+  console.log('codex-app-server-completion: exact turn steered; owner final answer is never an envelope reply')
 } finally {
   await new Promise(resolve => server.close(resolve))
   rmSync(root, { recursive: true, force: true })

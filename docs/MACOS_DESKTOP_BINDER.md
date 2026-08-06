@@ -1,73 +1,110 @@
-# macOS visible Desktop binder (V1)
+# Codex macOS session binder (V1)
 
-## Outcome
+## Supported outcome
 
-An owner-authorized Nostr instruction appears as a real user message in one explicitly bound
-Codex Desktop chat. The Desktop-owned turn produces the response. Nvoy observes that exact turn,
-publishes its final answer once, and only then acknowledges the admitted envelope.
+An owner-authorized Nostr instruction can enter one immutable Codex project/thread as a genuine
+user turn or steer. A response is returned only through a receipt-bound Nostr path. The supported V1
+uses Codex App Server protocol through the local control socket; it does not automate the Desktop
+composer.
 
-App Server is an observer after visible submission. It must never create a background turn.
+The owner binds the exact persistent task already used for the project. It may remain open in
+Codex Desktop; no Accessibility automation, pasted composer text, foreground focus, or second CLI
+client is required. For an active turn Nvoy calls
+`turn/steer` with the exact current `expectedTurnId`; for an idle thread it calls `turn/start`.
+The immutable manifest chooses the thread. No inbound event may choose a project, thread,
+recipient, signer, or reply channel.
 
-## Fixed path
-
-```text
-signed channel event
-  -> Waggle verifies source and carries it
-  -> Nvoy broker decrypts and verifies task + task-relay grants
-  -> keyless local queue import
-  -> macOS binder verifies app + project + chat + composer
-  -> binder sets the composer directly (no clipboard) and submits
-  -> binder confirms the exact visible user bubble
-  -> App Server observes the Desktop-owned turn by envelope token
-  -> final answer is queued for the identity signer
-  -> reply is published once
-```
-
-## Security invariants
-
-1. The binder accepts only `validateAdmittedTask(...).trustedInstruction === true` records.
-   A notification, malformed record, participant without task authority, or carrier without
-   task-relay authority never reaches Accessibility.
-2. The manifest fixes the app bundle id, project label, chat label, and Codex thread id. Network
-   input cannot select any of them.
-3. ChatGPT must be frontmost, unlocked, showing exactly the configured project and chat, with one
-   enabled message composer. Any ambiguity fails closed.
-4. Plaintext travels over a local stdin pipe. It is never an argument, environment variable,
-   clipboard value, temporary file, log line, or delivery journal field.
-5. The visible message contains a short receipt marker derived from the authenticated envelope.
-   The marker binds UI confirmation and the later durable Codex turn to the same delivery.
-6. Delivery is not acknowledged when text is merely placed in the composer. The exact visible
-   user bubble and receipt marker must appear after submission.
-7. The binder never reads or stores ChatGPT credentials and never signs a Nostr event.
-8. A response is accepted only from the Desktop-owned turn containing the exact receipt marker.
-   Background `turn/start` is forbidden.
-9. The reply request is durably queued before the delivery journal advances. Both deduplicate by
-   the 64-hex envelope id.
-10. Accessibility denial, screen lock, wrong chat, app update, missing composer, duplicate bubble,
-    timeout, or uncertain response ownership leaves the envelope pending and emits no reply.
-
-## Visible message
-
-The authenticated sender's words remain first:
+## Proven path
 
 ```text
-<exact signed message>
-
-—
-Verified Nostr instruction from <sender-short> via Waggle/Nvoy.
-[nvoy:<envelope-first-16>]
+signed Nostr/Buzz channel event
+  -> Waggle verifies and carries the original signed source
+  -> Nvoy broker verifies the sender task grant and separate carrier task-relay grant
+  -> restricted SSH forced command exports only admitted records
+  -> keyless macOS bridge imports and deduplicates the envelope
+  -> App Server adapter reads the fixed thread
+       active: turn/steer(expectedTurnId), delivery-only
+       idle:   turn/start, whose final answer is receipt-bound
+  -> an eligible final answer or explicit receipt-bound reply is durably queued
+  -> remote broker revalidates authority and signs/publishes one reply
+  -> Waggle reacts 👍 to the original user message after relay acceptance
 ```
 
-The full envelope stays in the local admitted queue and is used for cryptographic/durable binding;
-the UI marker is deliberately short and non-secret.
+The 2026-08-05 shared-thread experiment was **not** an end-to-end proof. App Server accepted a
+`turn/steer` for the development task, but a competing CLI client was also resumed against that
+task and a blind nonce did not return from model context. The correction is one control-plane
+client bound to the existing goal task—not silently substituting a separate background agent.
+Release remains unproven until a fresh wrapped mention visibly joins that task and completes the
+acceptance path below. Historical queue entries must be baselined rather than replayed.
 
-## V1 operating boundary
+## Security boundary
 
-V1 requires the Mac to be awake and unlocked, ChatGPT frontmost, and the configured chat visible.
-It does not navigate between chats. This is intentional: automatic navigation could deliver an
-instruction into the wrong context after a layout or title change. A later version may add a
-separately reviewed navigation state machine.
+1. The remote broker alone decrypts and verifies live grants. The Mac receives only
+   broker-admitted records.
+2. A channel carry requires both the original author's live `task` authority and the configured
+   carrier's distinct `task-relay` authority. The carrier never becomes the author.
+3. The desktop manifest fixes one participant identity, broker endpoint, pinned SSH host key,
+   local control socket, and full Codex thread id.
+4. The SSH key is restricted server-side to one forced sync command. It is not a shell, signer,
+   relay credential, or decryption capability.
+5. The local bridge and App Server adapter hold no nsec, Bunker URI, NIP-46 client secret, or
+   recipient-selection capability.
+6. Every envelope has one durable import cursor, one delivery record, and at most one reply
+   request. A crash retries from those records rather than inventing a second identity or turn.
+7. Only the final answer from a new envelope-owned protocol turn is automatically eligible for
+   reply. A steer joins a pre-existing owner turn, so its eventual final answer is never
+   auto-exported; replying to a steer requires a separate explicit receipt-bound reply action.
+   Commentary and tool events are never published.
+8. A durable task may retain stale historical `inProgress` rows. If `expectedTurnId` rejects one,
+   the adapter may reconcile exactly once to the server-reported active id only when that id was
+   also present as in-progress in the same immutable task snapshot. The failed first steer is
+   non-mutating; another race fails closed for a fresh read.
+9. A verified notification without task authority remains data-only and cannot acquire a reply
+   capability.
+10. The reply broker rechecks the live admission chain before signing. Revocation therefore closes
+   the path even after observation.
+11. The confirmation reaction belongs only on the original user event, after relay acceptance;
+    Waggle must not react to its own carried message.
 
-The supported long-term target remains scoped headless Remote Control ingress. V1 is a local
-Accessibility binder because Codex App Server does not make turns created by a separate client
-appear in the existing Desktop client's visible stream.
+## Desktop manifest
+
+```json
+{
+  "version": 1,
+  "id": "codex-jaf",
+  "pubkey": "<Codex 64-hex pubkey>",
+  "broker_mode": "remote",
+  "delivery_mode": "codex_app_server",
+  "worker_enabled": false,
+  "codex_thread_id": "<operator-selected-project-task-id>",
+  "codex_transport": "local_control_socket",
+  "codex_app_server_socket": "/Users/you/.codex/app-server-control/app-server-control.sock",
+  "ssh_target": "nvoy-sync@broker.example",
+  "ssh_identity_file": "/Users/you/.nvoy/desktop/id_ed25519",
+  "ssh_known_hosts_file": "/Users/you/.nvoy/desktop/known_hosts",
+  "ssh_known_hosts_sha256": "<64-hex sha256>"
+}
+```
+
+Run `codex-remote-bridge.mjs --baseline` once before live delivery. Then install the per-identity
+LaunchAgent with `install-codex-bridge-launchagent.mjs`; it runs the same keyless bridge with only
+`HOME`, `PATH`, and `NVOY_INSTANCE_ROOT` in its environment.
+
+## Why Accessibility is not V1
+
+Live experiments showed that Electron Accessibility calls can report success while leaving text
+staged in the composer. Background `AXConfirm`, semantic Send, process-targeted Return, focus
+changes, and AppleScript did not provide reliable proof that a turn entered the intended Codex
+conversation. Those experiments are removed from the release path. UI automation is not delivery
+evidence and must not acknowledge an envelope.
+
+The local managed App Server control socket is the native protocol edge used by V1. A separate
+CLI resume remains useful for an intentionally isolated headless participant, but it must not be
+opened concurrently against an already active Desktop task.
+
+## Claude Code parallel
+
+Claude Code should implement the same authority, queue, deduplication, fixed-session, and
+receipt-bound reply contracts. Its preferred ingress is the official Claude Code Channel/MCP
+notification mechanism, not terminal or UI automation. See the Claude channel section in
+`RUNTIME_SUPERVISOR.md`; a live same-session proof is still required before declaring parity.

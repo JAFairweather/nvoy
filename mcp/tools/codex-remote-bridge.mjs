@@ -58,8 +58,9 @@ function cycle() {
       { cwd: repoRoot, encoding: 'utf8', env: childEnv, maxBuffer: 1024 * 1024 })
     if (delivered.status !== 0) throw new Error(String(delivered.stderr || 'Codex delivery failed').trim())
     if (delivered.stdout) process.stdout.write(delivered.stdout)
-  } else if (manifest.deliveryMode === 'macos_desktop') {
-    const localBaseline = spawnSync(process.execPath, [resolve(repoRoot, 'mcp/tools/codex-macos-desktop-adapter.mjs'), '--instance', manifest.id, '--baseline'],
+  } else {
+    const baselineAdapter = manifest.deliveryMode === 'macos_desktop' ? 'codex-macos-desktop-adapter.mjs' : 'codex-app-server-adapter.mjs'
+    const localBaseline = spawnSync(process.execPath, [resolve(repoRoot, `mcp/tools/${baselineAdapter}`), '--instance', manifest.id, '--baseline'],
       { cwd: repoRoot, encoding: 'utf8', env: childEnv, maxBuffer: 1024 * 1024 })
     if (localBaseline.status !== 0) throw new Error(String(localBaseline.stderr || 'local Desktop baseline failed').trim())
     if (localBaseline.stdout) process.stdout.write(localBaseline.stdout)

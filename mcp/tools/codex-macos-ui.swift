@@ -148,7 +148,7 @@ guard request.version == 1,
 
 guard AXIsProcessTrusted() else { fail("Accessibility permission is not enabled") }
 let apps = NSRunningApplication.runningApplications(withBundleIdentifier: request.app_bundle_id)
-guard apps.count == 1, let app = apps.first, app.isActive else { fail("Codex must be the single frontmost application") }
+guard apps.count == 1, let app = apps.first else { fail("Codex must be the single running application") }
 let application = AXUIElementCreateApplication(app.processIdentifier)
 // Electron exposes only its native window chrome until an assistive client requests the
 // Chromium accessibility tree.  The setter may return kAXErrorCannotComplete even when the
@@ -181,32 +181,61 @@ guard projectChats.count == 1 else { fail("configured chat is absent or ambiguou
 guard chats.count == 1, let conversationRoot else { fail("configured chat does not uniquely own the composer") }
 guard composers.count == 1 else { fail("composer is absent or ambiguous") }
 guard selectedProjectIsBound(request) else { fail("configured thread is not in the selected project") }
-guard value(composers[0]).isEmpty else { fail("composer is not empty") }
+let composerValue = value(composers[0])
+let composerPlaceholder = placeholder(composers[0])
+let normalizedComposer = composerValue.trimmingCharacters(in: .whitespacesAndNewlines)
+let composerDescription = description(composers[0]).trimmingCharacters(in: .whitespacesAndNewlines)
+let composerIsEmpty = normalizedComposer.isEmpty ||
+  (!composerPlaceholder.isEmpty && composerValue == composerPlaceholder) ||
+  (!composerDescription.isEmpty && normalizedComposer == composerDescription)
+guard composerIsEmpty else {
+  fail("composer is not empty (value \(composerValue.utf8.count) bytes; placeholder \(composerPlaceholder.utf8.count) bytes; equal \(composerValue == composerPlaceholder))")
+}
 guard !tree(window).contains(where: { role($0) == kAXButtonRole && description($0) == "Stop" }) else {
   fail("Codex is still producing a turn")
 }
 
 let setResult = AXUIElementSetAttributeValue(composers[0].element, kAXValueAttribute as CFString, request.text as CFTypeRef)
 guard setResult == .success, value(composers[0]) == request.text else { fail("could not set the exact composer value") }
+func clearExactStagedText() {
+  // Cleanup is a mutation too. Never clear through a stale cached AX reference: re-prove the
+  // selected project, unique active conversation, and identical composer immediately first.
+  guard selectedProjectIsBound(request) else { return }
+  let rebound = inspect()
+  guard rebound.1.count == 1, rebound.2.count == 1, rebound.3 != nil,
+        CFEqual(rebound.2[0].element, composers[0].element),
+        value(rebound.2[0]) == request.text else { return }
+  _ = AXUIElementSetAttributeValue(rebound.2[0].element, kAXValueAttribute as CFString, "" as CFTypeRef)
+}
 
-// Re-read after setting text because the Send button is rendered dynamically.
-let ready = tree(window)
-let send = ready.filter { role($0) == kAXButtonRole && description($0) == "Send" }
-guard send.count == 1 else {
-  _ = AXUIElementSetAttributeValue(composers[0].element, kAXValueAttribute as CFString, "" as CFTypeRef)
-  fail("Send control is absent or ambiguous")
-}
-// Close the project-switch race across AX activation and composer mutation. Revalidate after
-// discovering the dynamic Send control and immediately before pressing it; if selection changed,
-// remove the staged text and leave no instruction behind.
+// Submit through one process-targeted Return keystroke. Electron's composer reports AXConfirm as
+// successful without dispatching the form, while a global CGEvent could land in another app. Bind
+// keyboard focus to the exact re-proved composer, then post the key pair only to this Codex PID.
+// The visible receipt below—not event delivery—is still the proof that submission occurred.
 guard selectedProjectIsBound(request) else {
-  _ = AXUIElementSetAttributeValue(composers[0].element, kAXValueAttribute as CFString, "" as CFTypeRef)
-  fail("selected project changed before send")
+  clearExactStagedText()
+  fail("selected project changed before confirm")
 }
-guard AXUIElementPerformAction(send[0].element, kAXPressAction as CFString) == .success else {
-  _ = AXUIElementSetAttributeValue(composers[0].element, kAXValueAttribute as CFString, "" as CFTypeRef)
-  fail("Send control refused AXPress")
+let rebound = inspect()
+guard rebound.1.count == 1, rebound.2.count == 1, rebound.3 != nil,
+      CFEqual(rebound.2[0].element, composers[0].element),
+      value(rebound.2[0]) == request.text else {
+  clearExactStagedText()
+  fail("configured chat no longer uniquely owns the staged composer")
 }
+guard AXUIElementSetAttributeValue(rebound.2[0].element, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success,
+      attribute(rebound.2[0].element, kAXFocusedAttribute as CFString) as? Bool == true else {
+  clearExactStagedText()
+  fail("bound composer refused process-local focus")
+}
+guard let source = CGEventSource(stateID: .privateState),
+      let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: true),
+      let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: false) else {
+  clearExactStagedText()
+  fail("could not construct process-targeted Return")
+}
+keyDown.postToPid(app.processIdentifier)
+keyUp.postToPid(app.processIdentifier)
 
 let deadline = Date().addingTimeInterval(15)
 var matches = 0
@@ -220,7 +249,10 @@ repeat {
   matches = seen.count
 } while matches == 0 && Date() < deadline
 
-guard matches == 1 else { fail("one exact visible receipt was not observed") }
+guard matches == 1 else {
+  clearExactStagedText()
+  fail("one exact visible receipt was not observed")
+}
 let evidence = Evidence(status: "visible", envelope: request.envelope, app_bundle_id: request.app_bundle_id,
   project_label: request.project_label, chat_label: request.chat_label, thread_id: request.thread_id, receipt: request.receipt,
   message_sha256: request.message_sha256, project_chat_count: projectChats.count,
