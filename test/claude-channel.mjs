@@ -27,7 +27,15 @@ const task = { type: 'admitted-task', instance: manifest.id, envelope,
   authority: { version: 1, type: 'scoped-instruction', sender: '4'.repeat(64), grant_id: '5'.repeat(64),
     grantor: manifest.grantors[0], cap: 'task', scope_subject: manifest.pubkey, policy_checked_at: Date.now() },
   messages: [{ from: '4'.repeat(64), at: 1785880000, content: 'inspect the queue' }] }
-writeFileSync(join(runtime, 'admitted-tasks.jsonl'), JSON.stringify(task) + '\n', { mode: 0o600 })
+const notificationEnvelope = '7'.repeat(64)
+const notification = { type: 'verified-notification', instance: manifest.id, envelope: notificationEnvelope,
+  notification: { version: 1, type: 'verified-channel-activity', source_author: '6'.repeat(64),
+    source_event: '5'.repeat(64), source_channel: 'a8186b53-537d-46ad-a7e7-b6486c58970e',
+    carrier: '4'.repeat(64), carrier_grant_id: '3'.repeat(64), carrier_grantor: manifest.grantors[0],
+    reason: 'mention', observed_at: Date.now() } }
+manifest.task_carriers = [{ pubkey: notification.notification.carrier, channels: [notification.notification.source_channel] }]
+writeFileSync(join(manifests, 'claude-test.json'), JSON.stringify(manifest))
+writeFileSync(join(runtime, 'admitted-tasks.jsonl'), JSON.stringify(task) + '\n' + JSON.stringify(notification) + '\n', { mode: 0o600 })
 mkdirSync(join(runtime, 'claude-channel-state'))
 writeFileSync(join(runtime, 'reply-requests.jsonl'), '', { mode: 0o640 })
 
@@ -38,17 +46,18 @@ const client = new Client({ name: 'claude-channel-test', version: '0.1.0' })
 const Channel = z.object({ method: z.literal('notifications/claude/channel'), params: z.object({
   content: z.string(), meta: z.record(z.string()),
 }) })
-let wake
+const wakes = []
 const arrived = new Promise(resolveWake => client.setNotificationHandler(Channel, notification => {
-  wake = notification.params; resolveWake()
+  wakes.push(notification.params); resolveWake()
 }))
 
 try {
   await client.connect(transport)
   await Promise.race([arrived, new Promise((_, reject) => setTimeout(() => reject(new Error('channel notification timed out')), 4000))])
   ok('the channel emits only an opaque marker, never sender or message content',
-    wake?.meta?.envelope === envelope && wake?.meta?.instance === manifest.id &&
-    !JSON.stringify(wake).includes(task.messages[0].content) && !JSON.stringify(wake).includes(task.messages[0].from))
+    wakes.length >= 1 && wakes.every(wake => wake?.meta?.instance === manifest.id &&
+      [envelope, notificationEnvelope].includes(wake?.meta?.envelope) &&
+      !JSON.stringify(wake).includes(task.messages[0].content) && !JSON.stringify(wake).includes(task.messages[0].from)))
   const tools = (await client.listTools()).tools.map(tool => tool.name)
   ok('Claude receives one explicit read tool and one receipt-bound reply tool',
     tools.length === 2 && tools.includes('nvoy_channel_read') && tools.includes('nvoy_channel_reply'))
@@ -60,6 +69,13 @@ try {
   const body = JSON.parse(read.content[0].text)
   ok('the exact marker reads only its broker-validated task and authority',
     body.envelope === envelope && body.authority.sender === task.authority.sender && body.messages[0].content === task.messages[0].content)
+  const noticeRead = await client.callTool({ name: 'nvoy_channel_read', arguments: { envelope: notificationEnvelope } })
+  const noticeBody = JSON.parse(noticeRead.content[0].text)
+  ok('a content-free verified notification remains readable without acquiring instruction authority',
+    noticeBody.envelope === notificationEnvelope && noticeBody.authority === null &&
+    noticeBody.notification.source_event === notification.notification.source_event && !('messages' in noticeBody))
+  const noticeReply = await client.callTool({ name: 'nvoy_channel_reply', arguments: { envelope: notificationEnvelope, text: 'cannot reply' } })
+  ok('a content-free activity notification cannot acquire reply authority', noticeReply.isError === true)
   const unknown = await client.callTool({ name: 'nvoy_channel_read', arguments: { envelope: '9'.repeat(64) } })
   ok('an envelope that was not delivered through this channel is unreadable', unknown.isError === true)
   const reply = await client.callTool({ name: 'nvoy_channel_reply', arguments: { envelope, text: 'queue inspected' } })

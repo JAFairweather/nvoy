@@ -12,7 +12,7 @@ import { appendFileSync, chmodSync, closeSync, existsSync, lstatSync, openSync, 
 import { randomBytes } from 'node:crypto'
 import { resolve } from 'node:path'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
-import { validateAdmittedTask } from './admitted_task.mjs'
+import { validateDesktopDelivery } from './admitted_task.mjs'
 
 const die = message => { console.error(`nvoy-claude-channel: ${message}`); process.exit(1) }
 const flag = name => { const i = process.argv.indexOf(name); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -86,7 +86,7 @@ function tasks() {
     if (Buffer.byteLength(line) > 1024 * 1024) throw new Error('admitted record exceeds its 1 MiB bound')
     let record
     try { record = JSON.parse(line) } catch { throw new Error('admitted queue contains malformed JSON') }
-    validateAdmittedTask(record, { instance: manifest.id, scopeSubject: manifest.pubkey,
+    validateDesktopDelivery(record, { instance: manifest.id, scopeSubject: manifest.pubkey,
       grantors: manifest.grantors, carriers: manifest.carriers })
     return record
   })
@@ -174,12 +174,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async request => {
         chmodSync(readPath, 0o600)
       } catch (error) { return toolResult({ code: 'NVOY_READ_LOG_FAILED', message: error.message }, true) }
     }
-    return toolResult({ envelope, authority: task.authority || null, messages: task.messages })
+    return task.type === 'verified-notification'
+      ? toolResult({ envelope, authority: null, notification: task.notification })
+      : toolResult({ envelope, authority: task.authority || null, messages: task.messages })
   }
   if (request.params.name !== 'nvoy_channel_reply') return toolResult({ code: 'NVOY_UNKNOWN_TOOL' }, true)
   const content = String(args.text || '').trim()
   if (!content || Buffer.byteLength(content) > 4000) return toolResult({ code: 'NVOY_BAD_REPLY' }, true)
-  if (task.messages.length !== 1) return toolResult({ code: 'NVOY_REPLY_REQUIRES_ONE_SENDER' }, true)
+  if (task.type !== 'admitted-task' || task.messages.length !== 1) {
+    return toolResult({ code: 'NVOY_REPLY_REQUIRES_ONE_SENDER' }, true)
+  }
   try {
     const prior = lines(replyPath, 'Desktop reply queue').map(line => { try { return JSON.parse(line) } catch { throw new Error('Desktop reply queue contains malformed JSON') } })
     if (prior.some(item => item?.receipt === envelope)) return toolResult({ code: 'NVOY_ALREADY_REPLIED', envelope }, true)
