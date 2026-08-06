@@ -15,6 +15,7 @@ import { state, $, esc, short, fmtWhen, agentName, agentsOf, load, RELAYS, showT
 import { buildExternalRevocation } from './capgrants.mjs'
 import { childrenOf, coverageNote, unrenderedLineage, parentKey } from './lineage.mjs'
 import { settleAgentOutputs } from './output-state.mjs'
+import { bucketGrantees, granteeKind, KIND_LABEL, KIND_NOTE } from './grantee-kind.mjs'
 
 // Ledger organization (a grant has three axes — who / what / state).
 let groupBy = 'agent'           // primary axis — see GROUP_OPTS
@@ -104,6 +105,7 @@ const LEDGER_STYLE = `<style>
 #ledger .lg-super-name{font-size:11px;text-transform:uppercase;letter-spacing:.11em;color:var(--accent);font-weight:700}
 #ledger .lg-super-count{font-family:var(--mono);font-size:11.5px;color:var(--dim)}
 #ledger .lg-super-body{padding-left:2px}
+#ledger .lg-super-note{margin:2px 2px 12px;line-height:1.55;max-width:70ch}
 #ledger .lg-super-bar{height:1px;background:linear-gradient(to right,var(--line),transparent);margin:2px 0 18px}
 /* grantee avatar in the group header */
 #ledger .lg-avatar{width:22px;height:22px;border-radius:6px;flex:none;object-fit:cover;background:#0b0906}
@@ -281,10 +283,13 @@ function delegationCard(d, i) {
 
 export function renderLedger() {
   const all = state.delegations
-  // Registered agents vs. other identities: a grantee is an "agent" iff it's in
-  // the Nvoy registry; anything else that holds a grant is an "identity".
+  // FOUR kinds of grantee, not two. The old split asked only "is this in nvoy_agents?", which put a
+  // community member holding a waggle admission, an unregistered agent runtime, and the DIRECTOR HIMSELF
+  // under one heading — three different facts, so the heading meant nothing. See grantee-kind.mjs for
+  // the two judgement calls behind the split.
   const agentPubs = new Set((state.index.nvoy_agents ?? []).map(a => a.pub))
-  const isAgent = pub => agentPubs.has(pub)
+  const kindOpts = { me: state.me, registered: agentPubs, rows: all }
+  const isAgent = pub => granteeKind(pub, kindOpts) === 'agent'
   const t = computeTotals(all, state.index.nvoy_ledger ?? [], undefined, agentPubs)
   const next = nextExpiry(state.index)
 
@@ -432,11 +437,15 @@ export function renderLedger() {
           // Grantee grouping: two collapsible super-sections — Agents (open by
           // default) above Other identities (collapsed), with a divider between.
           ? (() => {
-              const agentKeys = groupKeys.filter(isAgent), identityKeys = groupKeys.filter(k => !isAgent(k))
               const total = ks => ks.reduce((n, k) => n + groups.get(k).length, 0)
-              return (agentKeys.length ? superHtml('agents', 'Agents', agentKeys, total(agentKeys), groupHtml) : '')
-                + (agentKeys.length && identityKeys.length ? `<div class="lg-super-bar"></div>` : '')
-                + (identityKeys.length ? superHtml('identities', 'Other identities', identityKeys, total(identityKeys), groupHtml) : '')
+              const buckets = bucketGrantees(groupKeys, kindOpts)
+              // Each heading carries the sentence it owes the reader. `unregistered` is the only one that
+              // names a defect, and it says whose defect it is: issuing a grant does not register its
+              // grantee, so nothing reading the registry knows these keys exist.
+              return [...buckets].map(([kind, keys], i) =>
+                (i ? '<div class="lg-super-bar"></div>' : '')
+                + superHtml(kind, KIND_LABEL[kind], keys, total(keys), groupHtml, KIND_NOTE[kind])
+              ).join('')
             })()
           : groupKeys.map(groupHtml).join('')
         ) : `<div class="empty">
