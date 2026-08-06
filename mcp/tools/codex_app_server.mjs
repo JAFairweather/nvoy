@@ -38,6 +38,28 @@ export function finalAgentText(items = []) {
   return [...candidates].reverse().find(item => item.text.trim())?.text || ''
 }
 
+// A long-running goal can keep one Codex turn inProgress across many user/assistant exchanges.
+// In that shape, "the final answer of the turn" is both unavailable and too broad: a later
+// owner exchange must never become the reply to an earlier Nostr receipt. Bind recovery to the
+// exact broker-owned envelope marker in a user item and accept only the first explicit final
+// answer before the next user boundary.
+export function finalAgentTextAfterReceipt(items = [], receipt = '') {
+  const marker = String(receipt || '')
+  if (!marker) return ''
+  const userIndexes = items.flatMap((item, index) =>
+    item?.type === 'userMessage' && JSON.stringify(item).includes(marker) ? [index] : [])
+  if (userIndexes.length !== 1) return ''
+  const agents = []
+  for (let index = userIndexes[0] + 1; index < items.length; index++) {
+    const item = items[index]
+    if (item?.type === 'userMessage') break
+    if (item?.type === 'agentMessage' && typeof item.text === 'string' && item.text.trim()) agents.push(item)
+  }
+  const phased = agents.filter(item => typeof item.phase === 'string' && item.phase.length > 0)
+  const candidates = phased.length ? phased.filter(item => item.phase === 'final_answer') : agents
+  return [...candidates].reverse().find(item => item.text.trim())?.text || ''
+}
+
 // Minimal RFC 6455 client for the documented Unix app-server transport. `ws` does not reliably
 // route Unix sockets on every supported Node build; keeping the transport here also means a
 // desktop adapter has no HTTP listener and no path supplied by an incoming notification.
@@ -139,9 +161,9 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
             if (captureSteeredCompletion && startedTurn) {
               const steered = (message.result.thread.turns || []).find(turn => turn?.id === startedTurn)
               if (!steered) return finish(new Error('the receipt-bound steered turn disappeared from the exact thread'))
-              const completedText = finalAgentText(steered.items || [])
-              if (steered.status === 'completed' && completedText.trim())
-                return finish(null, { threadId: id, turnId: startedTurn, recovered: true, steered: true, finalText: completedText })
+              const receiptText = finalAgentTextAfterReceipt(steered.items || [], dedupeToken)
+              if (receiptText.trim())
+                return finish(null, { threadId: id, turnId: startedTurn, recovered: true, steered: true, finalText: receiptText })
               if (steered.status !== 'inProgress') return finish(new Error('the receipt-bound steered turn ended without a final assistant message'))
               return setTimeout(() => request('thread/read', 2, { threadId: id, includeTurns: true }), 250)
             }
@@ -154,8 +176,8 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
               return exact === expectedUserText && createHash('sha256').update(exact).digest('hex') === expectedUserSha256
             }))
             if (prior?.id) {
-              const recoveredText = finalAgentText(prior.items || [])
-              if (waitForCompletion && prior.status === 'completed' && recoveredText.trim()) return finish(null, { threadId: id, turnId: prior.id, recovered: true, finalText: recoveredText })
+              const receiptText = finalAgentTextAfterReceipt(prior.items || [], dedupeToken)
+              if (waitForCompletion && receiptText.trim()) return finish(null, { threadId: id, turnId: prior.id, recovered: true, finalText: receiptText })
               if (observeOnly || (captureSteeredCompletion && prior.status === 'inProgress')) {
                 startedTurn = prior.id
                 return setTimeout(() => request('thread/read', 2, { threadId: id, includeTurns: true }), 250)
