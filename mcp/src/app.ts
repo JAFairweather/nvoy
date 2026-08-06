@@ -4,7 +4,7 @@
 // instance for stdio, one per Streamable HTTP session — so notifications go
 // to the right client while grants/cache/revocations stay process-wide.
 //
-// Tools (spec §6.2): nvoy_whoami, nvoy_grants_list, nvoy_scope_read,
+// Tools (spec §6.2): nvoy_whoami, nvoy_grants_list, nvoy_capabilities_list, nvoy_scope_read,
 // nvoy_scope_subscribe, nvoy_outbox_write, nvoy_request_access,
 // nvoy_grant_relinquish.
 // Resources: nvoy://{author_npub}/{d} — one per active held grant.
@@ -26,6 +26,7 @@ import { DraftDesk } from './drafts.js'
 import { sendAccessRequest, sendRelinquishNotice } from './notices.js'
 import { registerChatTools } from './chat.js'
 import { cascadeDerivedRevocation, issueDerivedGrant, RedelegationForbidden } from './subgrants.js'
+import { readHeldCapabilities } from './capabilities.js'
 
 export interface NvoyContext {
   identity: Identity
@@ -209,6 +210,17 @@ export function createNvoyServer(ctx: NvoyContext): NvoyServerHandle {
       const grants = await ctx.grantStore.list()
       return json({ grants: grants.map(grantSummary) })
     },
+  )
+
+  server.registerTool(
+    'nvoy_capabilities_list',
+    {
+      title: 'List held capability grants',
+      description:
+        'Keyless cold read of public NIP-DA capability grants naming this identity, including channel admission and task authority. ' +
+        'Verifies grant signatures, resolves same-author public 441 revocations, reports relay EOSE coverage, and returns an explicit unverifiable state rather than an empty list when no relay answers.',
+    },
+    async () => json(await readHeldCapabilities(ctx.relays, ctx.identity.pubkey)),
   )
 
   server.registerTool(

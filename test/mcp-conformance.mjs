@@ -18,7 +18,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { ResourceUpdatedNotificationSchema } from '@modelcontextprotocol/sdk/types.js'
-import { generateSecretKey, getPublicKey, nip19 } from 'nostr-tools'
+import { finalizeEvent, generateSecretKey, getPublicKey, nip19 } from 'nostr-tools'
 import { unwrapEvent } from 'nostr-tools/nip59'
 import { newScopeKey, publishScope, rotateScope, fetchScope, loadGrantIndex } from '../lib/nipxx.mjs'
 import { LocalRelay } from '../lib/liverelay.mjs'
@@ -39,7 +39,7 @@ const check = (name, cond) => {
 const textJson = (result) => JSON.parse(result.content.find(c => c.type === 'text').text)
 
 const TOOLS = [
-  'nvoy_whoami', 'nvoy_grants_list', 'nvoy_scope_read', 'nvoy_scope_subscribe',
+  'nvoy_whoami', 'nvoy_grants_list', 'nvoy_capabilities_list', 'nvoy_scope_read', 'nvoy_scope_subscribe',
   'nvoy_derived_grant_issue',
   'nvoy_outbox_write', 'nvoy_draft_publish', 'nvoy_draft_withdraw',
   'nvoy_request_access', 'nvoy_grant_relinquish',
@@ -58,6 +58,12 @@ const agentSk = generateSecretKey()
 const agentNpub = nip19.npubEncode(getPublicKey(agentSk))
 const leafSk = generateSecretKey()
 const leafPub = getPublicKey(leafSk)
+
+const publicAdmission = finalizeEvent({
+  kind: 440, created_at: Math.floor(Date.now() / 1000), content: '',
+  tags: [['p', getPublicKey(agentSk)], ['da-scope', 'a'.repeat(64), 'b'.repeat(32)], ['da-cap', 'admit']],
+}, delegatorSk)
+await seedRelay.publish(publicAdmission)
 
 const scopeId = opaqueScopeId()
 const scopeKey = newScopeKey()
@@ -170,6 +176,15 @@ try {
   check('grants_list status: active', lg.status === 'active')
   check('grants_list status: expired grant flagged (soft expiry honored)',
     list.grants?.find(g => g.d === expiredScopeId)?.status === 'expired')
+
+  // ---------------------------------------------------- capabilities_list
+  const capabilities = textJson(await client.callTool({ name: 'nvoy_capabilities_list' }))
+  check('nvoy_capabilities_list: cold-reads this identity\'s public channel admission',
+    capabilities.capabilities?.length === 1 && capabilities.capabilities[0].cap === 'admit' &&
+    capabilities.capabilities[0].status === 'active')
+  check('nvoy_capabilities_list: reports completed relay queries',
+    capabilities.verification?.status === 'verified' && capabilities.verification.grant_query_answered === 1 &&
+    capabilities.verification.revocation_query_answered === 1)
 
   // ------------------------------------------------------------ scope_read
   const read = textJson(await client.callTool({
@@ -451,9 +466,10 @@ try {
   // -------------------------------------- adversarial observer, real relay
   const view = ws.store.observerView()
   const kinds = new Set(view.map(e => e.kind))
-  check('observer: relay saw only 30440 + 1059 + 10440 (no grant kind, no naked 441/notices)',
-    !kinds.has(440) && !kinds.has(441) && !kinds.has(KIND_NVOY_MSG)
-    && [...kinds].every(k => [30440, 1059, 10440].includes(k)))
+  const public440s = view.filter(event => event.kind === 440)
+  check('observer: only the deliberately public capability 440 is visible; data grants and notices stay wrapped',
+    public440s.length === 1 && !kinds.has(441) && !kinds.has(KIND_NVOY_MSG)
+    && [...kinds].every(k => [30440, 1059, 10440, 440].includes(k)))
   const blob = JSON.stringify(ws.store.events)
   check('observer: no delegation metadata, reasons, outputs, or requests in stored content',
     !blob.includes('aisle') && !blob.includes(purpose) && !blob.includes(reason)
