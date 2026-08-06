@@ -85,9 +85,10 @@ try {
   if (snapshot?.id !== thread || snapshot.status?.type !== 'active' || started !== 0 || steered !== 0) throw new Error('read-only probe mutated the active thread')
   reads = 0
   const notice = await appServerCall({ socketPath: socket, threadId: thread, input: 'content-free notice', clientUserMessageId: 'nvoy:notice',
-    dedupeToken: 'NVOY_ENVELOPE_ID=' + 'd'.repeat(64), waitForCompletion: false, steerActive: true, timeoutMs: 10_000 })
-  if (notice.turnId !== turn || notice.replyEligible !== false || !notice.steered)
-    throw new Error('notification-only active steer became replyable')
+    dedupeToken: 'NVOY_ENVELOPE_ID=' + 'd'.repeat(64), waitForCompletion: false, steerActive: true,
+    directExpectedTurnId: staleTurn, timeoutMs: 10_000 })
+  if (notice.turnId !== turn || notice.replyEligible !== false || !notice.steered || reads !== 0)
+    throw new Error('notification-only direct active steer became replyable or replayed history')
   await new Promise(resolve => setTimeout(resolve, 40))
   reads = 0; steerAttempts = 0; steered = 0; steeredInput = ''
   const result = await appServerCall({ socketPath: socket, threadId: thread, input: 'wake', clientUserMessageId: 'nvoy:test',

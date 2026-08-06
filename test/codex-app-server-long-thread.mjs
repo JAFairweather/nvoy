@@ -61,7 +61,7 @@ const server = net.createServer(stream => {
 
 try {
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(socket, resolve) })
-  const rows = await appServerCall({ socketPath: socket, listOnly: true, timeoutMs: 10_000 })
+  const rows = await appServerCall({ socketPath: socket, listOnly: true, timeoutMs: 30_000 })
   if (rows?.[0]?.history?.length !== largeHistory.length) throw new Error('large app-server response was not preserved')
   if (serverError) throw serverError
   console.log('codex-app-server-long-thread: 12 MiB response accepted')

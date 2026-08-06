@@ -63,7 +63,7 @@ export function finalAgentTextAfterReceipt(items = [], receipt = '') {
 // Minimal RFC 6455 client for the documented Unix app-server transport. `ws` does not reliably
 // route Unix sockets on every supported Node build; keeping the transport here also means a
 // desktop adapter has no HTTP listener and no path supplied by an incoming notification.
-export function appServerCall({ socketPath, threadId, input, clientUserMessageId = null, listOnly = false, readOnly = false, bootstrap = null, dedupeToken = '', waitForCompletion = false, observeOnly = false, steerActive = false, captureSteeredCompletion = false, expectedUserText = '', expectedUserSha256 = '', timeoutMs = 30000 }) {
+export function appServerCall({ socketPath, threadId, input, clientUserMessageId = null, listOnly = false, readOnly = false, bootstrap = null, dedupeToken = '', waitForCompletion = false, observeOnly = false, steerActive = false, captureSteeredCompletion = false, expectedUserText = '', expectedUserSha256 = '', includeTurns = true, listIncludeTurns = false, directExpectedTurnId = '', timeoutMs = 30000 }) {
   const socket = localControlSocket(socketPath)
   const id = listOnly || bootstrap ? null : codexThreadId(threadId)
   if ([listOnly, readOnly, Boolean(bootstrap)].filter(Boolean).length > 1) throw new Error('Codex app-server call cannot combine list, read, and bootstrap modes')
@@ -139,10 +139,13 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
         if (message.id === 1) {
           if (message.error) return finish(new Error(`Codex initialize failed: ${message.error.message || 'unknown error'}`))
           send({ method: 'initialized', params: {} })
-          if (listOnly) request('thread/list', 2, { limit: 50, sortKey: 'recency_at', sortDirection: 'desc' })
+          if (listOnly) request('thread/list', 2, { limit: 50, sortKey: 'recency_at', sortDirection: 'desc', includeTurns: listIncludeTurns })
           else if (bootstrap) request('thread/list', 2, { limit: 50, searchTerm: bootstrap.name, cwd: bootstrap.cwd, sourceKinds: ['appServer'] })
-          else if (readOnly) request('thread/read', 2, { threadId: id, includeTurns: true })
-          else if (dedupeToken) request('thread/read', 2, { threadId: id, includeTurns: true })
+          else if (readOnly) request('thread/read', 2, { threadId: id, includeTurns })
+          else if (dedupeToken && directExpectedTurnId) {
+            requestThree = 'steer'
+            request('turn/steer', 3, { threadId: id, input: [{ type: 'text', text: String(input || '') }], expectedTurnId: directExpectedTurnId })
+          } else if (dedupeToken) request('thread/read', 2, { threadId: id, includeTurns })
           else request('thread/resume', 2, { threadId: id })
         } else if (message.id === 2) {
           if (message.error) return finish(new Error(`Codex ${listOnly || bootstrap ? 'thread/list' : readOnly || dedupeToken ? 'thread/read' : 'thread/resume'} failed: ${message.error.message || 'unknown error'}`))
@@ -229,7 +232,10 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
               // response. For that explicitly requested path, wait for the final answer from the
               // exact preconditioned turn and bind it to this envelope. Notification deliveries
               // leave captureSteeredCompletion false and still finish as non-replyable.
-              if (captureSteeredCompletion) return setTimeout(() => request('thread/read', 2, { threadId: id, includeTurns: true }), 250)
+              // The socket is already subscribed to item/completed and turn/completed. Waiting
+              // on those events preserves the receipt-bound final answer without replaying the
+              // entire durable Desktop thread.
+              if (captureSteeredCompletion) return
               return finish(null, { threadId: id, turnId: startedTurn, recovered: false, steered: true, replyEligible: false })
             }
             if (message.error) return finish(new Error(`Codex thread/resume failed: ${message.error.message || 'unknown error'}`))
@@ -260,7 +266,9 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
           if (!message.result?.turnId || message.result.turnId !== reconciledTurn)
             return finish(new Error('Codex reconciled turn/steer returned an invalid acknowledgement'))
           startedTurn = message.result.turnId
-          if (captureSteeredCompletion) return setTimeout(() => request('thread/read', 2, { threadId: id, includeTurns: true }), 250)
+          // Capture the final answer from the completion notifications on this socket; never
+          // issue a full thread/read against a potentially enormous long-lived thread.
+          if (captureSteeredCompletion) return
           return finish(null, { threadId: id, turnId: startedTurn, recovered: false, steered: true, reconciled: true, replyEligible: false })
         }
       }
