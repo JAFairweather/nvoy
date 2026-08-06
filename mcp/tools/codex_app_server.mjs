@@ -55,7 +55,7 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
   return new Promise((resolveCall, rejectCall) => {
     const stream = net.createConnection({ path: socket })
     let buffer = Buffer.alloc(0), upgraded = false, finished = false, startedTurn = '', finalText = '', sawPhasedAgent = false, requestThree = '', bootstrappedThread = ''
-    let inProgressTurnIds = new Set(), steerReconciled = false
+    let steerReconciled = false, reconciledTurn = ''
     const finish = (error, value) => {
       if (finished) return
       finished = true; clearTimeout(timer)
@@ -167,9 +167,6 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
             const active = steerActive && message.result.thread.status?.type === 'active'
               ? [...(message.result.thread.turns || [])].reverse().find(turn => turn?.status === 'inProgress' && typeof turn.id === 'string')
               : null
-            inProgressTurnIds = new Set((message.result.thread.turns || [])
-              .filter(turn => turn?.status === 'inProgress' && typeof turn.id === 'string')
-              .map(turn => turn.id))
             if (active) {
               requestThree = 'steer'
               request('turn/steer', 3, { threadId: id, input: [{ type: 'text', text: String(input || '') }], expectedTurnId: active.id })
@@ -191,12 +188,15 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
               if (message.error) {
                 // Durable Desktop histories can retain stale inProgress records. The protocol's
                 // expectedTurnId mismatch names the control plane's actual active turn. Reconcile
-                // once only when that exact id was present as inProgress in the same thread/read;
-                // the failed first steer mutated nothing. A second race remains a hard failure.
+                // once to the exact active id returned by that failed compare-and-swap. The
+                // thread/read snapshot can lag this control-plane response; requiring the fresh
+                // id to occur in the stale snapshot makes a legitimate active turn undeliverable.
+                // The failed first steer mutated nothing. A second race remains a hard failure.
                 const mismatch = String(message.error.message || '').match(/expected active turn id `[^`]+` but found `([^`]+)`/)
                 const actual = mismatch?.[1] || ''
-                if (!steerReconciled && inProgressTurnIds.has(actual)) {
+                if (!steerReconciled && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(actual)) {
                   steerReconciled = true
+                  reconciledTurn = actual
                   return request('turn/steer', 6, { threadId: id, input: [{ type: 'text', text: String(input || '') }], expectedTurnId: actual })
                 }
                 return finish(new Error(`Codex turn/steer failed: ${message.error.message || 'unknown error'}`))
@@ -235,7 +235,7 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
           return finish(null, { version: 1, created: true, thread_id: bootstrappedThread, name: bootstrap.name, cwd: bootstrap.cwd })
         } else if (message.id === 6 && requestThree === 'steer') {
           if (message.error) return finish(new Error(`Codex reconciled turn/steer failed: ${message.error.message || 'unknown error'}`))
-          if (!message.result?.turnId || !inProgressTurnIds.has(message.result.turnId))
+          if (!message.result?.turnId || message.result.turnId !== reconciledTurn)
             return finish(new Error('Codex reconciled turn/steer returned an invalid acknowledgement'))
           startedTurn = message.result.turnId
           if (captureSteeredCompletion) return setTimeout(() => request('thread/read', 2, { threadId: id, includeTurns: true }), 250)
