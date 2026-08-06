@@ -41,7 +41,7 @@ export function finalAgentText(items = []) {
 // Minimal RFC 6455 client for the documented Unix app-server transport. `ws` does not reliably
 // route Unix sockets on every supported Node build; keeping the transport here also means a
 // desktop adapter has no HTTP listener and no path supplied by an incoming notification.
-export function appServerCall({ socketPath, threadId, input, clientUserMessageId = null, listOnly = false, dedupeToken = '', waitForCompletion = false, observeOnly = false, expectedUserText = '', expectedUserSha256 = '', timeoutMs = 30000 }) {
+export function appServerCall({ socketPath, threadId, input, clientUserMessageId = null, listOnly = false, dedupeToken = '', waitForCompletion = false, observeOnly = false, steerActive = false, expectedUserText = '', expectedUserSha256 = '', timeoutMs = 30000 }) {
   const socket = localControlSocket(socketPath)
   const id = listOnly ? null : codexThreadId(threadId)
   if (observeOnly && (!dedupeToken || !waitForCompletion || listOnly || !expectedUserText ||
@@ -50,7 +50,7 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
   }
   return new Promise((resolveCall, rejectCall) => {
     const stream = net.createConnection({ path: socket })
-    let buffer = Buffer.alloc(0), upgraded = false, finished = false, startedTurn = '', finalText = '', sawPhasedAgent = false
+    let buffer = Buffer.alloc(0), upgraded = false, finished = false, startedTurn = '', finalText = '', sawPhasedAgent = false, requestThree = ''
     const finish = (error, value) => {
       if (finished) return
       finished = true; clearTimeout(timer)
@@ -136,10 +136,26 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
               return finish(null, { threadId: id, turnId: prior.id, recovered: true })
             }
             if (observeOnly) return setTimeout(() => request('thread/read', 2, { threadId: id, includeTurns: true }), 250)
-            request('thread/resume', 3, { threadId: id })
+            const active = steerActive && message.result.thread.status?.type === 'active'
+              ? [...(message.result.thread.turns || [])].reverse().find(turn => turn?.status === 'inProgress' && typeof turn.id === 'string')
+              : null
+            if (active) {
+              requestThree = 'steer'
+              request('turn/steer', 3, { threadId: id, input: [{ type: 'text', text: String(input || '') }], expectedTurnId: active.id })
+            } else {
+              requestThree = 'resume'
+              request('thread/resume', 3, { threadId: id })
+            }
           } else request('turn/start', 3, { threadId: id, input: [{ type: 'text', text: String(input || '') }], clientUserMessageId })
         } else if (message.id === 3) {
           if (dedupeToken) {
+            if (requestThree === 'steer') {
+              if (message.error) return finish(new Error(`Codex turn/steer failed: ${message.error.message || 'unknown error'}`))
+              if (!message.result?.turnId) return finish(new Error('Codex turn/steer returned an invalid acknowledgement'))
+              startedTurn = message.result.turnId
+              if (!waitForCompletion) return finish(null, { threadId: id, turnId: startedTurn, recovered: false, steered: true })
+              continue
+            }
             if (message.error) return finish(new Error(`Codex thread/resume failed: ${message.error.message || 'unknown error'}`))
             if (message.result?.thread?.id !== id) return finish(new Error('Codex app-server resumed an unexpected thread'))
             request('turn/start', 4, { threadId: id, input: [{ type: 'text', text: String(input || '') }], clientUserMessageId })

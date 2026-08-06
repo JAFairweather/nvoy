@@ -93,7 +93,8 @@ async function deliver(task) {
   if (manifest.codexTransport !== 'local_control_socket') return { turnId: await deliverSpawn(task), finalText: '' }
   const result = await appServerCall({ socketPath: manifest.codexSocketPath, threadId: manifest.codexThreadId,
     input: prompt(task), clientUserMessageId: userMessageId(task), dedupeToken: `NVOY_ENVELOPE_ID=${task.envelope}`,
-    waitForCompletion: task.type === 'admitted-task', timeoutMs: task.type === 'admitted-task' ? 10 * 60 * 1000 : 30000 })
+    waitForCompletion: task.type === 'admitted-task', steerActive: true,
+    timeoutMs: task.type === 'admitted-task' ? 10 * 60 * 1000 : 30000 })
   return result
 }
 function queueReply(task, content) {
