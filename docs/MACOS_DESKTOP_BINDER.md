@@ -53,11 +53,15 @@ acceptance path below. Historical queue entries must be baselined rather than re
    request. A crash retries from those records rather than inventing a second identity or turn.
 7. Only the final answer from the exact protocol turn is eligible for reply. Commentary and tool
    events are not published.
-8. A verified notification without task authority remains data-only and cannot acquire a reply
+8. A durable task may retain stale historical `inProgress` rows. If `expectedTurnId` rejects one,
+   the adapter may reconcile exactly once to the server-reported active id only when that id was
+   also present as in-progress in the same immutable task snapshot. The failed first steer is
+   non-mutating; another race fails closed for a fresh read.
+9. A verified notification without task authority remains data-only and cannot acquire a reply
    capability.
-9. The reply broker rechecks the live admission chain before signing. Revocation therefore closes
+10. The reply broker rechecks the live admission chain before signing. Revocation therefore closes
    the path even after observation.
-10. The confirmation reaction belongs only on the original user event, after relay acceptance;
+11. The confirmation reaction belongs only on the original user event, after relay acceptance;
     Waggle must not react to its own carried message.
 
 ## Desktop manifest

@@ -6,7 +6,8 @@ import { appServerCall } from '../mcp/tools/codex_app_server.mjs'
 
 const root = mkdtempSync(join(tmpdir(), 'nvoy-codex-completion-'))
 const socket = join(root, 'control.sock'), thread = '019fce57-063d-7f50-b837-967d33ee384a', turn = '019fd200-0000-7000-8000-000000000001'
-let started = 0, reads = 0, steered = 0, steeredInput = ''
+const staleTurn = '019fd100-0000-7000-8000-000000000002'
+let started = 0, reads = 0, steerAttempts = 0, steered = 0, steeredInput = ''
 const frame = value => {
   const body = Buffer.from(JSON.stringify(value)); let head
   if (body.length < 126) head = Buffer.from([0x81, body.length])
@@ -41,7 +42,7 @@ const server = net.createServer(stream => {
       if (request.method === 'initialize') stream.write(frame({ id: request.id, result: {} }))
       if (request.method === 'thread/read') {
         reads++
-        const turns = reads === 1 ? [{ id: turn, status: 'inProgress', items: [] }] : reads < 3 ? [] : [{ id: turn, status: 'completed', items: [
+        const turns = reads === 1 ? [{ id: turn, status: 'inProgress', items: [] }, { id: staleTurn, status: 'inProgress', items: [] }] : reads < 3 ? [] : [{ id: turn, status: 'completed', items: [
           { type: 'userMessage', content: [{ type: 'text', text: 'NVOY_ENVELOPE_ID=' + 'c'.repeat(64) }] },
           { type: 'agentMessage', phase: 'commentary', text: 'Never publish recovered commentary.' },
         ] }]
@@ -57,8 +58,14 @@ const server = net.createServer(stream => {
         ] } } }))
       }
       if (request.method === 'turn/steer') {
+        steerAttempts++
+        if (request.params.threadId !== thread) throw new Error('steer escaped the exact thread')
+        if (request.params.expectedTurnId === staleTurn) {
+          stream.write(frame({ id: request.id, error: { message: `expected active turn id \`${staleTurn}\` but found \`${turn}\`` } }))
+          continue
+        }
+        if (request.params.expectedTurnId !== turn) throw new Error('steer was not reconciled to the exact active turn')
         steered++
-        if (request.params.expectedTurnId !== turn || request.params.threadId !== thread) throw new Error('steer was not bound to the exact active turn')
         steeredInput = request.params.input?.[0]?.text || ''
         stream.write(frame({ id: request.id, result: { turnId: turn } }))
         stream.write(frame({ method: 'item/completed', params: { threadId: thread, turnId: turn, item: { id: 'steered-final', type: 'agentMessage', phase: 'final_answer', text: 'Steered wake acknowledged.' } } }))
@@ -74,7 +81,7 @@ try {
   reads = 0
   const result = await appServerCall({ socketPath: socket, threadId: thread, input: 'wake', clientUserMessageId: 'nvoy:test',
     dedupeToken: 'NVOY_ENVELOPE_ID=' + 'a'.repeat(64), waitForCompletion: true, steerActive: true, timeoutMs: 10_000 })
-  if (result.turnId !== turn || result.finalText !== 'Steered wake acknowledged.' || steered !== 1 || started !== 0 || steeredInput !== 'wake') throw new Error('active response was not steered with exact input into the exact turn')
+  if (result.turnId !== turn || result.finalText !== 'Steered wake acknowledged.' || steerAttempts !== 2 || steered !== 1 || started !== 0 || steeredInput !== 'wake') throw new Error('stale active metadata was not reconciled once with exact input into the exact turn')
   let liveRefused = false, recoveryRefused = false
   try {
     await appServerCall({ socketPath: socket, threadId: thread, input: 'wake again', clientUserMessageId: 'nvoy:test-2',
@@ -85,7 +92,7 @@ try {
       dedupeToken: 'NVOY_ENVELOPE_ID=' + 'c'.repeat(64), waitForCompletion: true, timeoutMs: 10_000 })
   } catch (error) { recoveryRefused = /not complete with a final assistant message/.test(error.message) }
   if (!liveRefused || !recoveryRefused) throw new Error('phased commentary became a live or recovered reply')
-  console.log('codex-app-server-completion: active turn steered; commentary ignored and exact final item captured')
+  console.log('codex-app-server-completion: stale active metadata reconciled once; exact turn steered and commentary ignored')
 } finally {
   await new Promise(resolve => server.close(resolve))
   rmSync(root, { recursive: true, force: true })
