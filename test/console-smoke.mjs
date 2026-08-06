@@ -53,7 +53,9 @@ ok('every routed tab has a pane in the page',
 // ── the graph evaluates against a minimal DOM ─────────────────────────────────
 const mk = (doc) => {
   const t = {
-    style: {}, dataset: {}, hidden: false, textContent: '', innerHTML: '', value: '', disabled: false,
+    // `style` needs setProperty: the plane switcher sets a per-app accent as a CSS custom property.
+    style: { setProperty() {}, removeProperty() {}, getPropertyValue: () => '' },
+    dataset: {}, hidden: false, textContent: '', innerHTML: '', value: '', disabled: false,
     classList: { toggle() {}, add() {}, remove() {}, contains: () => false },
     append() {}, appendChild() {}, addEventListener() {}, insertAdjacentHTML() {},
     setAttribute() {}, removeAttribute() {}, getAttribute: () => null,
