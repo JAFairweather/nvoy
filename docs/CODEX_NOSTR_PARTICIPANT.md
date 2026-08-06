@@ -1,5 +1,11 @@
 # Bind a Codex task as a Nostr participant
 
+> **Outbound-action hold (AD-12 / #111):** inbound wrapped mentions may wake and steer this fixed
+> task after the full grant chain verifies. The generated response is only a proposal. Production
+> must not let the reply daemon sign or publish it until a human approves the frozen outbound bytes
+> through the configured WYSIWYS approval path. Admission and task grants never constitute that
+> fresh tap.
+
 Codex's Nostr identity binds to one operator-selected, persistent Codex task. That may be the
 owner's existing goal-bearing project task—the first-class path—so an admitted Nostr message joins
 the same context that is already doing the work. A separate participant task is an optional
