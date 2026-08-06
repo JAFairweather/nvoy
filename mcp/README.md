@@ -125,6 +125,7 @@ transport, launch with `NVOY_HTTP_PORT=3000` and point the client at
 | :-- | :-- | :-- |
 | `nvoy_whoami` | — | agent npub, relay set, kind-0 metadata if published |
 | `nvoy_grants_list` | — | held grants: `{ d, author_npub, scope_name, purpose, expires_at, terms, v, status }` (`status`: `active` \| `expired` \| `revoked-detected` \| `relinquished`) |
+| `nvoy_capabilities_list` | — | keyless cold read of public capability grants naming this identity, with verified signatures, same-author revocations, expiry, and per-phase relay EOSE coverage; returns `capabilities: null` when current authority cannot be verified |
 | `nvoy_scope_read` | `{ d, author_npub, max_age? }` | decrypted scope JSON + `{ v, fetched_at, terms, nvoy_no_persist }`. `max_age: 0` forces a fresh fetch (bypasses the 60s cache) |
 | `nvoy_scope_subscribe` | `{ d, author_npub }` | on HTTP: streams `notifications/resources/updated`; on stdio: arms cache invalidation so the next read is fresh |
 | `nvoy_outbox_write` | `{ payload, delegator_npub? }` | upserts the agent's own 30440 and grants it back to the delegator (bidirectional flow, §6.5) |

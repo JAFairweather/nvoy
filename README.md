@@ -20,7 +20,7 @@ no admin panel, no ACL. Nobody in the OAuth world can show that.
 ## Two components
 
 - **`mcp/`** — the Nvoy MCP server (Node/TypeScript). Holds the agent's key;
-  serves `nvoy_whoami` / `nvoy_grants_list` / `nvoy_scope_read` /
+  serves `nvoy_whoami` / `nvoy_grants_list` / `nvoy_capabilities_list` / `nvoy_scope_read` /
   `nvoy_scope_subscribe` / `nvoy_outbox_write` / `nvoy_request_access` /
   `nvoy_grant_relinquish`, plus scopes as MCP resources. stdio **and**
   Streamable HTTP transports. Stateless dereference: delegated data is working
