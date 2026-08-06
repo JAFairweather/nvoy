@@ -116,5 +116,43 @@ t('the decision depends ONLY on the tool name and the per-call approval', () => 
   assert.deepEqual(a, b)
 })
 
+// ── both tools are wired to the gate, asserted at the source ────────────────
+//
+// The module can be perfect and unreached. That is not hypothetical here: the gate landed on main inside a
+// PR titled "Four kinds of grantee" because `git add -A` swept it in, and its own test was never wired into
+// `npm test` — so a behavioural change to a live signing tool shipped both undisclosed and unexercised.
+// These assertions are the cheap guard against the reached-ness half.
+{
+  const chat = readFileSync(new URL('../mcp/src/chat.ts', import.meta.url), 'utf8')
+  for (const tool of ['nvoy_chat_post', 'nvoy_dm_send']) {
+    t(`${tool} consults the gate`, () => {
+      assert.match(chat, new RegExp(`decideTap\\('${tool}'`), 'the tool must call decideTap')
+    })
+    t(`${tool} accepts a per-call approval`, () => {
+      // Without the parameter the gate can only ever draft, which would make the tool unusable rather than
+      // gated — and someone would then add an env var to "fix" it.
+      const block = chat.slice(chat.indexOf(`'${tool}'`), chat.indexOf(`'${tool}'`) + 2600)
+      assert.match(block, /approval: z\.string\(\)\.optional\(\)/)
+    })
+    t(`${tool} refuses a malformed approval instead of publishing`, () => {
+      const block = chat.slice(chat.indexOf(`decideTap('${tool}'`))
+      assert.match(block.slice(0, 400), /mode === 'refuse'/)
+    })
+  }
+  t('the DM draft carries its recipient — a desk cannot judge a DM without knowing who it is for', () => {
+    assert.match(chat, /dm_to: nip19\.npubEncode\(recipient\)/)
+  })
+  t('neither tool signs before the gate has answered', () => {
+    // Order matters: a signEvent above the decision would make the gate decorative.
+    for (const tool of ['nvoy_chat_post', 'nvoy_dm_send']) {
+      const from = chat.indexOf(`'${tool}'`)
+      const block = chat.slice(from, chat.indexOf('server.registerTool', from + 10) + 1 || undefined)
+      const gate = block.indexOf('decideTap')
+      const sign = block.search(/signEvent|sealAndWrap/)
+      assert.ok(gate > -1 && (sign === -1 || gate < sign), `${tool} signs before it asks`)
+    }
+  })
+}
+
 console.log(`\n${pass}/${pass + fail} passed`)
 process.exit(fail ? 1 : 0)
