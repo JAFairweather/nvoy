@@ -8,6 +8,8 @@ import { nip19 } from 'nostr-tools'
 import { newScopeKey, publishScope, saveGrantIndex, toIssuedEntry } from '../lib/nipxx.mjs'
 import { grantWithTerms, opaqueScopeId, TEMPLATES } from './nvoygrant.mjs'
 import { appendLedger, grantedEvent } from './ledgerlog.mjs'
+import { closeDrawer } from './main.mjs'
+import { openDelegationInLedger } from './ledger.mjs'
 import { state, $, esc, agentsOf, agentName, load, RELAYS } from './main.mjs'
 
 const emptyDraft = () => ({    // survives tab switches until issued
@@ -42,7 +44,7 @@ export function prefillDelegate({ agent, purpose, name, payload }) {
   }
 }
 
-export function renderDelegate() {
+export function renderDelegate(agentPub = null) {
   const agents = agentsOf()
   const isCred = isCredName(draft.name)
   const options = agents.map(a =>
@@ -276,7 +278,11 @@ export function renderDelegate() {
       draft = emptyDraft()
       msg.textContent = `delegated — scope ${scopeId} to ${agentName(agent)}. See the Ledger.`
       await load()
-      $('dg-msg').textContent = `delegated — scope ${scopeId} to ${agentName(agent)}. See the Ledger.`
+      // A composer is a drawer over the list it writes to, so the last step lands ON the new row
+      // rather than on a form you then have to leave. Closing and opening the grant in the Ledger
+      // is what makes "recording in your Grant Index…" mean something you can see.
+      closeDrawer()
+      openDelegationInLedger(scopeId, agent)
     } catch (err) { msg.textContent = err.message }
   }
 }

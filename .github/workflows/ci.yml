@@ -1,0 +1,66 @@
+name: CI
+
+# Run the suite on every PR and on pushes to main.
+#
+# WHY THIS DID NOT EXIST, AND WHAT IT COSTS. Until now nothing ran `npm test` except whoever
+# remembered to. `gh pr view --json statusCheckRollup` returned `checks=none` for every PR in this
+# repo, so the only gates were a local run and a human reading a diff. On 2026-08-05 that let two
+# defects through review in one day:
+#
+#   · console/ledger.mjs referenced `childrenOf` and `coverageNote` with no import for either. Every
+#     focused suite was green — they import the pure modules directly — while the Ledger would have
+#     thrown ReferenceError on the first card render, taking the whole screen down. The console is
+#     unbundled ES modules the browser resolves at load, so nothing between an editor and production
+#     ever resolved those names.
+#   · test/lineage.mjs and test/console-smoke.mjs were not in the `test` script at all, so a suite
+#     written specifically to catch a class of bug would not have run even once in CI.
+#
+# Reviewers also reported "package-wide green remains the PR's reported evidence because this
+# disposable checkout lacks tsc" — i.e. they could not independently verify the build. A CI run they
+# can read is the fix for that: it turns the author's claim into a check anybody can open.
+#
+# Deliberately no suite count or roster here. package.json's `test` script is the only place that
+# knows it, and a restated count goes stale silently.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: npm test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22' # matches the deployed runtime
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            mcp/package-lock.json
+
+      - name: Install from lockfile
+        run: npm ci --no-audit --no-fund
+
+      - name: Install the MCP server's deps
+        # `npm test` starts with `npm run build`, which is `npm --prefix mcp run build` → tsc. The
+        # root install does not reach mcp/ (it is a separate package with its own lockfile), so
+        # without this the very first step of the suite fails on a missing tsc — which is exactly the
+        # gap reviewers hit in disposable checkouts.
+        run: npm ci --no-audit --no-fund --prefix mcp
+
+      - name: Test
+        # The suite is side-effect-free: no relay is contacted, every signer is stubbed or generated,
+        # and the env vars the tests read (NVOY_NSEC, NVOY_RELAYS, …) are all optional — the suite
+        # provides its own fixtures when they are absent. Container-dependent paths gate themselves
+        # behind NVOY_CONTAINER_TEST, which is unset here, so they skip rather than fail.
+        run: npm test

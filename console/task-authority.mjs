@@ -10,7 +10,7 @@ import { buildTaskAuthority, parseTaskAuthorityPrefill, signPublishTaskAuthority
 const npub = (hexPub) => nip19.npubEncode(hexPub)
 const option = (agent) => `<option value="${esc(npub(agent.pub))}">${esc(agent.name || agent.display_name || short(agent.pub))}</option>`
 
-export function renderTaskAuthority() {
+export function renderTaskAuthority(agentPub = null) {
   const agentOptions = (state.index.nvoy_agents || []).map(option).join('')
   $('authority').innerHTML = `
     <div class="card">
@@ -21,6 +21,7 @@ export function renderTaskAuthority() {
       <div class="note">The agent identity is cryptographically bound into a salted scope hash, so this approval cannot be replayed to a different agent. Your signer creates the authority; this page never receives an nsec.</div>
       <div class="actions"><button class="primary" id="ta-issue">Review and sign authority</button><span class="msg" id="ta-msg"></span></div>
     </div>`
+  if (agentPub && $('ta-agent')) $('ta-agent').value = npub(agentPub)
   $('ta-issue').onclick = issue
   const prefill = parseTaskAuthorityPrefill(location.search)
   if (prefill) {

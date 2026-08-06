@@ -44,6 +44,28 @@ export function childrenOf(index, parentScope, parentPublisher = null) {
     .sort((a, b) => (a.issued_at || 0) - (b.issued_at || 0))
 }
 
+/**
+ * Every child this key derived TO one grantee, whatever parent it came from.
+ *
+ * The agent page asks a different question than the Ledger does. The Ledger asks "what came out of
+ * THIS scope"; the agent page asks "what does THIS agent hold that I derived." Answering the second
+ * with the first requires a wildcard parent, and `childrenOf(index, null, selfPub)` does not mean
+ * that — `wellFormed` guarantees `parent.scope` is a string, so `r.parent.scope === null` is always
+ * false and the section silently renders nothing. That is what the agent page shipped with.
+ *
+ * Note there is no publisher filter and there must not be one. Every row on this index is one this
+ * key wrote (`saveLineage` writes through its own signer), while `parent.publisher` is the UPSTREAM
+ * delegator — so filtering by `selfPub` would drop exactly the first-hop derivations, which is the
+ * same mistake corrected in the Ledger.
+ */
+export function childrenTo(index, granteePub) {
+  const rows = Array.isArray(index?.nvoy_derived_children) ? index.nvoy_derived_children : []
+  return rows
+    .filter(wellFormed)
+    .filter(r => r.child.grantee === granteePub)
+    .sort((a, b) => (a.issued_at || 0) - (b.issued_at || 0))
+}
+
 /** The join key for a parent identity. A scope `d` is only unique per publisher. */
 export const parentKey = (publisher, scope) => `${publisher}:${scope}`
 

@@ -20,6 +20,8 @@ import { renderDelegate } from './delegate.mjs'
 import { renderLedger } from './ledger.mjs'
 import { renderSettings } from './settings.mjs'
 import { renderTaskAuthority } from './task-authority.mjs'
+import { renderRequests } from './requests.mjs'
+import { renderAgentPage, agentFromHash, openAgentPage, wireComposer } from './agent-page.mjs'
 
 export const config = loadConfig()
 export const RELAYS = config.relays
@@ -61,17 +63,56 @@ export function parsePub(input) {
   return data
 }
 
-const TABS = { agents: renderAgents, delegate: renderDelegate, ledger: renderLedger, authority: renderTaskAuthority, settings: renderSettings }
+// Four tabs, plus the agent page — which is a PANE, not a tab: it is reached by clicking a
+// roster row or by `#agent/<npub>` from any surface, so the join key is the deep link (AD-12).
+const TABS = { agents: renderAgents, requests: renderRequests, ledger: renderLedger, settings: renderSettings }
+const PANES = { ...TABS, agent: renderAgentPage }
 let current = 'agents'
 export function showTab(t) {
   current = t
+  // The agent page belongs to no tab, so nothing is marked active while it is open — a lit tab
+  // would claim you are somewhere you are not.
   for (const b of document.querySelectorAll('.tab')) b.classList.toggle('active', b.dataset.tab === t)
-  for (const id of Object.keys(TABS)) $(id).style.display = t === id ? '' : 'none'
-  TABS[t]()
-  location.hash = t
+  for (const id of Object.keys(PANES)) $(id).style.display = t === id ? '' : 'none'
+  PANES[t]()
+  if (t !== 'agent') location.hash = t     // the agent page owns its own deeper hash
 }
 for (const b of document.querySelectorAll('.tab')) b.onclick = () => showTab(b.dataset.tab)
-export const rerender = () => TABS[current]()
+
+// ── the composer drawer ──────────────────────────────────────────────────────
+// No composer is a destination. Both write to lists that live elsewhere, so they open OVER the
+// list and closing returns you to it — which is also what makes the stepped progress ("publishing
+// scope… → recording in your Grant Index…") land visibly on the row it just created.
+const DRAWERS = {
+  delegate: { title: 'New data grant', render: renderDelegate },
+  authority: { title: 'Give task authority', render: renderTaskAuthority },
+}
+export function openDrawer(which, agentPub = null) {
+  const d = DRAWERS[which]
+  if (!d) return
+  $('drawer-title').textContent = d.title
+  for (const id of Object.keys(DRAWERS)) $(id).style.display = which === id ? '' : 'none'
+  $('drawer').hidden = false
+  d.render(agentPub)
+}
+export function closeDrawer() { $('drawer').hidden = true }
+$('drawer-close').onclick = closeDrawer
+$('drawer').addEventListener('click', (e) => { if (e.target === $('drawer')) closeDrawer() })
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('drawer').hidden) closeDrawer() })
+wireComposer(openDrawer)
+
+export { openAgentPage }
+export const rerender = () => PANES[current]()
+
+// The badge law, in one place: it counts requests awaiting a decision and is hidden at zero, so
+// its presence always means something is waiting rather than merely that a feature exists.
+export function refreshRequestBadge() {
+  const n = state.requests.length
+  const b = $('req-badge')
+  if (!b) return
+  b.textContent = String(n)
+  b.hidden = n === 0
+}
 
 export async function login(signer, remember) {
   state.signer = signer
@@ -91,7 +132,9 @@ export async function login(signer, remember) {
     npub: nip19.npubEncode(state.me), kind: signer.kind,
     onRefresh: () => load(), onLogout: logout,
   })
-  showTab(Object.keys(TABS).includes(location.hash.slice(1)) ? location.hash.slice(1) : 'agents')
+  const deep = agentFromHash()
+  if (deep) openAgentPage(deep)
+  else showTab(Object.keys(TABS).includes(location.hash.slice(1)) ? location.hash.slice(1) : 'agents')
   if (remember && parseSession(remember)?.kind === 'local') offerProtect(remember)
   load()
 }
@@ -205,6 +248,7 @@ export async function load() {
     state.requests = notices.accessRequests.filter(r => !dismissed.has(r.id))
     // nvoy#9 mechanism 2: an inbox that LOOKS empty because the signer refused
     // bulk decryption must say so — silence here hid real access requests.
+    refreshRequestBadge()
     state.unwrapWarning = noticeStats.undecryptable
       ? `${noticeStats.undecryptable} of ${noticeStats.wraps} inbox wrap(s) could not be opened — check your signer (it may be rate-limiting or awaiting a decrypt approval), then Refresh.`
       : null

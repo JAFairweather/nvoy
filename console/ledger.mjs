@@ -7,13 +7,14 @@
 // and the honest TTL banner (§6.4.3 — hard expiry runs while this is open).
 // Revoke-now (§6.4.5) shares the rotation spine in ttl.mjs.
 
-import { fetchScope, saveGrantIndex } from '../lib/nipxx.mjs'
+import { saveGrantIndex } from '../lib/nipxx.mjs'
 import { sendRevocationNotice, grantWithTerms } from './nvoygrant.mjs'
 import { revokedEvent, rotatedEvent, grantedEvent, appendLedger, eventsFor, computeTotals, fmtCountdown } from './ledgerlog.mjs'
 import { rotateDropping, runRelinquishRotation, nextExpiry } from './ttl.mjs'
 import { state, $, esc, short, fmtWhen, agentName, agentsOf, load, RELAYS, showTab } from './main.mjs'
 import { buildExternalRevocation } from './capgrants.mjs'
 import { childrenOf, coverageNote, unrenderedLineage, parentKey } from './lineage.mjs'
+import { settleAgentOutputs } from './output-state.mjs'
 
 // Ledger organization (a grant has three axes — who / what / state).
 let groupBy = 'agent'           // primary axis — see GROUP_OPTS
@@ -278,25 +279,6 @@ function delegationCard(d, i) {
   </div>`
 }
 
-/** Fill an output panel: find the agent's outbox grant among the gift wraps
- *  addressed to us and dereference it NOW — a read, never a stored copy. */
-async function fillOutput(el, agentPub) {
-  const grant = state.received
-    .filter(g => g.publisher === agentPub)
-    .sort((a, b) => b.issuedAt - a.issuedAt)[0]
-  if (!grant) { el.innerHTML = '<span class="msg">no output yet — the agent has not written its outbox</span>'; return }
-  try {
-    const res = await fetchScope(state.relay, grant)
-    if (res.status === 'ok') {
-      const { updated_at, ...data } = res.data
-      el.innerHTML = `<pre class="outjson">${esc(JSON.stringify(data, null, 2))}</pre>
-        <span class="meta">v${res.generation}${updated_at ? ` · updated ${fmtWhen(updated_at)}` : ''} · scope ${esc(grant.scopeId)}</span>`
-    } else {
-      el.innerHTML = `<span class="msg">output scope ${res.status === 'stale' ? 'was rotated by the agent' : 'not found on the relays'}</span>`
-    }
-  } catch (err) { el.innerHTML = `<span class="msg">${esc(err.message)}</span>` }
-}
-
 export function renderLedger() {
   const all = state.delegations
   // Registered agents vs. other identities: a grantee is an "agent" iff it's in
@@ -527,8 +509,6 @@ export function renderLedger() {
     if (btn) btn.onclick = () => revoke(d, msg)
     const rel = card.querySelector('.rel-confirm')
     if (rel) rel.onclick = () => confirmRelinquish(d, msg)
-    const out = card.querySelector('.outbox')
-    if (out) fillOutput(out, out.dataset.agent)
     const addg = card.querySelector('.addg')
     if (addg) addg.onclick = () => {
       const entry = (state.index.issued ?? []).find(e => e.scope === d.scope)
@@ -540,6 +520,7 @@ export function renderLedger() {
       ui.querySelector('.addg-go').onclick = () => addGrantee(d, ui.querySelector('.addg-sel').value, msg)
     }
   }
+  void settleAgentOutputs($('ledger'), { relay: state.relay, grants: state.received, formatWhen: fmtWhen })
 
   // Consume a pending "open this delegation" from the Agents tab (nvoy#17/#20).
   // The scroll is DEFERRED to a frame: showTab() calls renderLedger() and THEN
