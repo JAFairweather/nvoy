@@ -59,6 +59,12 @@ export function readManifest(root, requestedId) {
   const relays = (Array.isArray(raw.relays) ? raw.relays : []).map(String).filter(v => /^wss:\/\//.test(v))
   if (!valid(pubkey) || !grantors.length || !grantors.every(valid) || !relays.length) die('manifest requires pubkey, grantors, and wss relays')
   if (new Set(carriers.map(entry => entry.pubkey)).size !== carriers.length) die('task_carrier pubkeys must be distinct')
+  const approvalEndpoint = String(raw.approval_endpoint || raw.approvalEndpoint || '')
+  if (approvalEndpoint) {
+    let parsed
+    try { parsed = new URL(approvalEndpoint) } catch { die('approval_endpoint must be an HTTPS origin') }
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.search || parsed.hash || parsed.pathname !== '/') die('approval_endpoint must be an HTTPS origin')
+  }
   const rawStateDir = String(raw.state_dir || raw.stateDir || '')
   const rawRuntimeDir = String(raw.runtime_dir || raw.runtimeDir || '')
   const rawSpoolDir = String(raw.spool_dir || raw.spoolDir || '')
@@ -141,7 +147,7 @@ export function readManifest(root, requestedId) {
   }
   return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, carriers: Object.freeze(carriers), relays, stateDir, runtimeDir, spoolDir,
     brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath, codexAppBundleId, codexProjectLabel, codexChatLabel, codexUiDriver,
-    sshTarget, sshIdentityFile, sshKnownHostsFile, sshKnownHostsSha256 })
+    sshTarget, sshIdentityFile, sshKnownHostsFile, sshKnownHostsSha256, approvalEndpoint: approvalEndpoint.replace(/\/$/, '') })
 }
 
 // Supervisor preflight: a second identity must never accidentally share a state or runtime

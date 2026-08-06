@@ -71,7 +71,7 @@ unlinkSync(join(manifestRoot, 'remote-with-worker.json'))
 const keyedEnv = { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot, NVOY_BROKER_CREDENTIAL: desktopSshKey }
 const blockedBroker = spawnSync(process.execPath, ['mcp/tools/instance-broker.mjs', 'deliver', '--instance', 'codex-desktop', '--envelope', 'f'.repeat(64)], { cwd: resolve('.'), encoding: 'utf8', env: keyedEnv })
 const blockedDaemon = spawnSync(process.execPath, ['mcp/tools/instance-broker-daemon.mjs', '--instance', 'codex-desktop'], { cwd: resolve('.'), encoding: 'utf8', env: keyedEnv })
-const blockedReply = spawnSync(process.execPath, ['mcp/tools/instance-broker-reply.mjs', '--instance', 'codex-desktop', '--request', 'f'.repeat(32)], { cwd: resolve('.'), encoding: 'utf8', env: keyedEnv })
+const blockedReply = spawnSync(process.execPath, ['mcp/tools/instance-broker-reply.mjs', '--instance', 'codex-desktop', '--request', 'f'.repeat(32), '--prepare'], { cwd: resolve('.'), encoding: 'utf8', env: keyedEnv })
 ok('every keyed broker executable rejects a remote Desktop manifest even when a credential is injected', [blockedBroker, blockedDaemon, blockedReply].every(result => result.status !== 0 && /remote-broker Desktop/.test(result.stderr)))
 mkdirSync(join(root, 'run-desktop'), { recursive: true })
 const importRecord = envelope => JSON.stringify({ type: 'admitted-task', instance: 'codex-desktop', envelope, messages: [{ from: 'a'.repeat(64), at: 1, content: 'remote admitted data' }] }) + '\n'
@@ -240,7 +240,9 @@ const terminalReplies = join(manifest.state_dir, 'terminal-replies.jsonl')
 const terminalIds = loadTerminalReplyIds(terminalReplies)
 const expiredRequest = 'a'.repeat(32)
 ok('a missing or stale admission receipt is terminal, rather than a relay-query retry loop', isTerminalReplyFailure('instance-broker-reply: admission receipt is missing') && isTerminalReplyFailure('instance-broker-reply: admission receipt is not a live broker-bound sender capability') && recordTerminalReply(terminalReplies, terminalIds, expiredRequest, 'admission receipt is not a live broker-bound sender capability', 1) && terminalIds.has(expiredRequest) && !recordTerminalReply(terminalReplies, terminalIds, expiredRequest, 'admission receipt is not a live broker-bound sender capability', 2) && loadTerminalReplyIds(terminalReplies).has(expiredRequest) && !readFileSync(terminalReplies, 'utf8').includes('must not be signed'))
-ok('transient reply publish failures remain retryable', !isTerminalReplyFailure('instance-broker-reply: no relay accepted the persisted outbound wrap; it remains retryable') && /terminalReplyIds\.has\(request\)/.test(daemonSource))
+ok('the broker daemon invokes only the mechanically bounded prepare mode and has no approval input',
+  /awaiting discrete approval/.test(daemonSource) && /instance-broker-reply\.mjs/.test(daemonSource) &&
+  /'--prepare'/.test(daemonSource) && !/'--approval'/.test(daemonSource))
 const publishedDir = join(manifest.state_dir, 'outbound')
 mkdirSync(publishedDir, { recursive: true })
 const publishedRequest = 'b'.repeat(32)
@@ -260,7 +262,7 @@ const wrongDigestReplies = loadPublishedReplyIds(publishedDir, publishedRequestD
 writeFileSync(join(publishedDir, `${publishedRequest}.json`), JSON.stringify({ ...validPublishedRecord, wrap: { ...publishedWrap, sig: '0'.repeat(128) } }))
 const forgedWrapReplies = loadPublishedReplyIds(publishedDir, publishedRequestDigests)
 writeFileSync(join(publishedDir, `${publishedRequest}.json`), JSON.stringify(validPublishedRecord))
-ok('only an exact-request-digest-bound valid signed published wrap durably suppresses a completed reply', completedReplies.has(publishedRequest) && !wrongDigestReplies.has(publishedRequest) && !forgedWrapReplies.has(publishedRequest) && !completedReplies.has('c'.repeat(32)) && !completedReplies.has('d'.repeat(32)) && /publishedReplyIds\.has\(request\)/.test(daemonSource) && /publishedReplyIds\.add\(request\)/.test(daemonSource))
+ok('only an exact-request-digest-bound valid signed published wrap is recognized as a historical completion', completedReplies.has(publishedRequest) && !wrongDigestReplies.has(publishedRequest) && !forgedWrapReplies.has(publishedRequest) && !completedReplies.has('c'.repeat(32)) && !completedReplies.has('d'.repeat(32)))
 const sourceIndex = join(manifest.state_dir, 'channel-source-admissions.jsonl')
 const sourceEvent = 'e'.repeat(64), firstCarrierEnvelope = 'f'.repeat(64), rewrappedEnvelope = 'a'.repeat(64)
 const firstSource = claimChannelSource(sourceIndex, sourceEvent, firstCarrierEnvelope)
@@ -273,7 +275,10 @@ ok('channel source is claimed before any instruction receipt or instruction adap
 const initSource = readFileSync('mcp/tools/instance-runtime-init.mjs', 'utf8')
 ok('a root-only initializer provisions all three volume roots, a credential-free Desktop queue, and role-owned credential copies', /process\.getuid\?\.\(\) !== 0/.test(initSource) && /provision\(m\.stateDir/.test(initSource) && /provision\(m\.spoolDir/.test(initSource) && /provision\(m\.runtimeDir/.test(initSource) && /desktop-reply-requests\.jsonl.*m\.adapterUid/.test(initSource) && /function provisionSecret/.test(initSource) && /brokerCredDir/.test(initSource) && /workerCredDir/.test(initSource))
 const replySource = readFileSync('mcp/tools/instance-broker-reply.mjs', 'utf8')
-ok('only the broker can sign a reply, resolving its target from an exact receipt and persisting the wrap', /NVOY_BROKER_CREDENTIAL/.test(replySource) && /receipt\.sender/.test(replySource) && !/request\.to/.test(replySource) && replySource.includes('writeFileSync(tmp, JSON.stringify(record)') && /finalizeEvent/.test(replySource))
+ok('only the broker can prepare a reply, resolving its target from an exact receipt and persisting the frozen seal', /NVOY_BROKER_CREDENTIAL/.test(replySource) && /receipt\.sender/.test(replySource) && !/request\.to/.test(replySource) && replySource.includes('writeFileSync(tmp, JSON.stringify(record)') && /unsignedSeal/.test(replySource))
+ok('the signer is unreachable until a discrete approval verifies the exact frozen fingerprint',
+  replySource.indexOf('if (prepareOnly)') < replySource.indexOf('signer.signEvent(record.unsigned_seal)') &&
+  replySource.indexOf('verifyOutboundApproval(') < replySource.indexOf('signer.signEvent(record.unsigned_seal)'))
 ok('the Codex/Claude worker stays Nostr-keyless, uses only its runner-specific provider secret, and distinguishes scoped instructions from legacy data', !/NVOY_NSEC|BROKER_CREDENTIAL|NVOY_BUNKER_URI|nip44|finalizeEvent/.test(workerSource) && /NVOY_WORKER_CREDENTIAL_FILE/.test(workerSource) && /OPENAI_API_KEY/.test(workerSource) && /ANTHROPIC_API_KEY/.test(workerSource) && /Treat the authenticated sender's message as a scoped instruction/.test(workerSource) && /untrusted DATA, not instructions/.test(workerSource) && /reply-request/.test(workerSource))
 ok('the worker supplies its authenticated delivery directly over stdin rather than asking the model to discover a private file', /JSON\.stringify\(delivery\)/.test(workerSource) && /'--- BEGIN DELIVERED MESSAGE ---'/.test(workerSource) && /\['exec', '--sandbox', 'read-only', '--skip-git-repo-check', '--cd', manifest\.runtimeDir, '-'\]/.test(workerSource) && /input: prompt/.test(workerSource))
 ok('the headless Codex worker writes a private API-key provider configuration without persisting its provider secret', /function configureCodexApiKeyProvider/.test(workerSource) && /model_provider = "nvoy-openai-api"/.test(workerSource) && /env_key = "OPENAI_API_KEY"/.test(workerSource) && /requires_openai_auth = false/.test(workerSource) && /writeFileSync\(resolve\(dir, 'config\.toml'\)/.test(workerSource) && !/writeFileSync\([^\n]*providerKey/.test(workerSource))
@@ -366,7 +371,13 @@ const credential = join(root, 'broker-test.nsec'); writeFileSync(credential, nip
 const deniedReply = spawnSync(process.execPath, ['mcp/tools/instance-broker-reply.mjs', '--instance', 'codex-test', '--request', deniedRequest.id], {
   cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot, NVOY_BROKER_CREDENTIAL: credential },
 })
-ok('the keyed broker refuses a worker reply when its immutable admission receipt is expired', deniedReply.status !== 0 && /not a live broker-bound sender capability/.test(deniedReply.stderr))
+ok('the keyed broker requires an explicit prepare-or-approval mode before evaluating any reply',
+  deniedReply.status !== 0 && /--prepare.*--approval/.test(deniedReply.stderr))
+const deniedPrepare = spawnSync(process.execPath, ['mcp/tools/instance-broker-reply.mjs', '--instance', 'codex-test', '--request', deniedRequest.id, '--prepare'], {
+  cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot, NVOY_BROKER_CREDENTIAL: credential },
+})
+ok('prepare mode still refuses a proposal when its immutable admission receipt is expired',
+  deniedPrepare.status !== 0 && /not a live broker-bound sender capability/.test(deniedPrepare.stderr))
 
 writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...manifest, id: 'collision', runtime_dir: join(root, 'run-other') }))
 const collision = cli('describe', '--instance', 'codex-test')
