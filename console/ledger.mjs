@@ -16,6 +16,7 @@ import { buildExternalRevocation } from './capgrants.mjs'
 import { childrenOf, coverageNote, unrenderedLineage, parentKey } from './lineage.mjs'
 import { settleAgentOutputs } from './output-state.mjs'
 import { bucketGrantees, granteeKind, KIND_LABEL, KIND_NOTE } from './grantee-kind.mjs'
+import { enrol } from './registry.mjs'
 
 // Ledger organization (a grant has three axes — who / what / state).
 let groupBy = 'agent'           // primary axis — see GROUP_OPTS
@@ -365,9 +366,15 @@ export function renderLedger() {
           : `<span class="lg-grantee-badge identity" title="identity — holds a grant but is not an agent">${PERSON_ICON}</span>`)
         + avatarFor(k)
       : ''
+    // The way OUT of the unregistered bucket, on the row that names the problem. One key per tap and
+    // never a sweep: some of these are people who hold an admission, and registering a person as an
+    // agent corrupts the roster every slice projects. Offered only where the fix applies.
+    const canRegister = groupBy === 'agent' && granteeKind(k, kindOpts) === 'unregistered'
     return `<details class="lg-group" data-gkey="${esc(String(k))}"${openGroups.has(k) ? ' open' : ''}>
       <summary><span class="lg-gname">${mark}${esc(labelOf(k))}</span>
         <span class="lg-gcount">${items.length} grant${items.length === 1 ? '' : 's'}${activeN !== items.length ? ` · ${activeN} active` : ''}</span>
+        ${canRegister ? `<button type="button" class="chip lg-register" data-pub="${esc(String(k))}"
+          title="add this key to your agent registry, so Nact and your slices know it exists. This grants nothing and changes no access.">Register as agent</button>` : ''}
         <span class="lg-pips">${pips}</span></summary>
       <div class="lg-chain">${items.map(({ d, i }) => delegationCard(d, i)).join('')}</div>
     </details>`
@@ -376,10 +383,19 @@ export function renderLedger() {
   // A super-section wrapping the grantee groups of one kind. `id` ∈
   // {'agents','identities'}; open state persists in openSupers (agents open,
   // identities collapsed by default — seeded at the module level).
-  const superHtml = (id, label, keys, grantN, gh) =>
+  //
+  // `note` is the sixth argument the caller has been passing since the four-kinds split, and it was
+  // SILENTLY DROPPED: this parameter list stopped at `gh`, and JavaScript discards an extra argument
+  // without a word. The stylesheet has carried `.lg-super-note` the whole time with no markup to
+  // style. So every heading here has been a bare label, and the sentence each kind owes the reader —
+  // including the only one that names a defect — has never rendered once. Same shape as the
+  // childrenOf wildcard and the missing ledger import: correct code, never reached, an absence for
+  // a symptom.
+  const superHtml = (id, label, keys, grantN, gh, note = '') =>
     `<details class="lg-super" data-super="${id}"${openSupers.has(id) ? ' open' : ''}>
       <summary><span class="lg-super-name">${esc(label)}</span>
         <span class="lg-super-count">${keys.length} grantee${keys.length === 1 ? '' : 's'} · ${grantN} grant${grantN === 1 ? '' : 's'}</span></summary>
+      ${note ? `<div class="lg-super-note msg">${esc(note)}</div>` : ''}
       <div class="lg-super-body">${keys.map(gh).join('')}</div>
     </details>`
 
@@ -526,6 +542,23 @@ export function renderLedger() {
   for (const det of document.querySelectorAll('#ledger .lg-super')) det.addEventListener('toggle', () => {
     det.open ? openSupers.add(det.dataset.super) : openSupers.delete(det.dataset.super)
   })
+  // Register a grantee that predates enrolment-on-issue. `stopPropagation` because the button lives
+  // in a <summary>: without it, registering also toggles the group you were reading.
+  for (const btn of document.querySelectorAll('#ledger .lg-register')) btn.onclick = async (e) => {
+    e.stopPropagation(); e.preventDefault()
+    const pub = btn.dataset.pub
+    const enrolled = enrol(state.index, pub, { me: state.me, now: Math.floor(Date.now() / 1000) })
+    if (!enrolled.added) { btn.textContent = enrolled.reason === 'duplicate' ? 'already registered' : 'cannot register'; return }
+    btn.disabled = true; btn.textContent = 'registering…'
+    try {
+      state.index.nvoy_agents = enrolled.agents
+      await saveGrantIndex(state.relay, state.signer, state.index)
+      await load()          // it moves out of this bucket, and its kind-0 comes in for display
+    } catch (err) {
+      // The house prefix: a failed write says nothing changed, so nobody has to guess.
+      btn.disabled = false; btn.textContent = `nothing changed: ${err.message}`
+    }
+  }
   // Live search: the whole tab re-renders per keystroke (house pattern), so
   // restore focus + caret into the fresh input or typing would drop after one
   // character.
