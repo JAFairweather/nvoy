@@ -2,7 +2,7 @@ import net from 'node:net'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { appServerCall } from '../mcp/tools/codex_app_server.mjs'
+import { appServerCall, finalAgentTextAfterReceipt } from '../mcp/tools/codex_app_server.mjs'
 
 const root = mkdtempSync(join(tmpdir(), 'nvoy-codex-completion-'))
 const socket = join(root, 'control.sock'), thread = '019fce57-063d-7f50-b837-967d33ee384a', turn = '019fd200-0000-7000-8000-000000000001'
@@ -42,7 +42,9 @@ const server = net.createServer(stream => {
       if (request.method === 'initialize') stream.write(frame({ id: request.id, result: {} }))
       if (request.method === 'thread/read') {
         reads++
-        const turns = reads === 1 ? [{ id: turn, status: 'inProgress', items: [] }, { id: staleTurn, status: 'inProgress', items: [] }] : reads < 3 ? [] : [{ id: turn, status: 'completed', items: [
+        // Deliberately omit the actual active turn from the stale first snapshot. The failed
+        // conditional steer is the fresh control-plane read and returns its exact current id.
+        const turns = reads === 1 ? [{ id: staleTurn, status: 'inProgress', items: [] }] : reads < 3 ? [] : [{ id: turn, status: 'completed', items: [
           { type: 'userMessage', content: [{ type: 'text', text: 'NVOY_ENVELOPE_ID=' + 'c'.repeat(64) }] },
           { type: 'agentMessage', phase: 'commentary', text: 'Never publish recovered commentary.' },
         ] }]
@@ -96,6 +98,25 @@ try {
     throw new Error('steered owner turn did not return its exact final answer')
   await new Promise(resolve => setTimeout(resolve, 40))
   if (ownerFinalEmitted !== 2) throw new Error('active-turn final-answer controls did not both fire')
+  const receipt = 'NVOY_ENVELOPE_ID=' + 'd'.repeat(64)
+  const activeItems = [
+    { type: 'agentMessage', phase: 'final_answer', text: 'Older owner answer — never export this.' },
+    { type: 'userMessage', content: [{ type: 'text', text: `authorized instruction\n${receipt}` }] },
+    { type: 'agentMessage', phase: 'commentary', text: 'Receipt work in progress.' },
+    { type: 'agentMessage', phase: 'final_answer', text: 'Receipt-bound answer.' },
+    { type: 'userMessage', content: [{ type: 'text', text: 'Later owner instruction.' }] },
+    { type: 'agentMessage', phase: 'final_answer', text: 'Later owner answer — never export this.' },
+  ]
+  if (finalAgentTextAfterReceipt(activeItems, receipt) !== 'Receipt-bound answer.')
+    throw new Error('active-turn recovery escaped the exact receipt-to-next-user segment')
+  const twoFinals = activeItems.toSpliced(4, 0,
+    { type: 'agentMessage', phase: 'final_answer', text: 'Later same-segment answer — never substitute this.' })
+  if (finalAgentTextAfterReceipt(twoFinals, receipt) !== 'Receipt-bound answer.')
+    throw new Error('a later final answer substituted for the first receipt-bound answer')
+  if (finalAgentTextAfterReceipt([...activeItems, activeItems[1]], receipt))
+    throw new Error('an ambiguous duplicate receipt became replyable')
+  if (finalAgentTextAfterReceipt(activeItems.map(item => item.text === 'Receipt-bound answer.' ? { ...item, phase: 'commentary' } : item), receipt))
+    throw new Error('receipt commentary became a reply')
   let liveRefused = false, recoveryRefused = false
   try {
     await appServerCall({ socketPath: socket, threadId: thread, input: 'wake again', clientUserMessageId: 'nvoy:test-2',
