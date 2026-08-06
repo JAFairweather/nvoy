@@ -10,6 +10,7 @@ import { nip19 } from 'nostr-tools'
 import { saveGrantIndex } from '../lib/nipxx.mjs'
 import { state, $, esc, short, fmtWhen, load, parsePub, agentsOf, agentName, openAgentPage } from './main.mjs'
 import { openDelegationInLedger } from './ledger.mjs'
+import { REGISTRY_SCOPE, buildProjection, projectionChanged } from './registry.mjs'
 
 // Copy an npub to the clipboard with visual feedback, degrading gracefully:
 // async clipboard API → execCommand → (both blocked) select nothing and just
@@ -80,6 +81,61 @@ function agentCard(a, i) {
   </div>`
 }
 
+/**
+ * The registry projection panel.
+ *
+ * A headless slice — the Nactor, the waggle bridge — cannot read this roster: it lives on the
+ * Director's kind-10440, NIP-44-encrypted to himself. That is exactly why an agent could exist here
+ * and be invisible in Nact, with an ABSENCE as the only symptom. nact#57 made both sides key on the
+ * hex pubkey; a join still needs two sets, and this is how the second one gets there.
+ *
+ * Publishing it is a grant, not an export: revoking a slice's view is then a scope-key rotation, a
+ * mechanism that already exists and is already audited (AD-6 — roster content is sensitive and the
+ * bridge is off-box, so grant-to-app).
+ */
+function registryPanel() {
+  const { payload, dropped } = buildProjection(state.index, { now: Math.floor(Date.now() / 1000) })
+  const published = state.index?.nvoy_registry_projection || null   // { scope, generation, at, agents }
+  const changed = !published || projectionChanged(published.payload, payload)
+  const when = published?.at ? fmtWhen(published.at) : null
+  return `<div class="card" style="margin-top:18px">
+    <div class="sect2">Registry projection — <code>${esc(REGISTRY_SCOPE)}</code></div>
+    <div class="msg" style="margin:6px 0 10px">A runtime cannot read this roster: it is encrypted to you.
+      Publishing it as a scoped dataset is what lets Nact say <b>“known only to Nvoy”</b> instead of
+      showing nothing — an absence nobody can see is the bug the Director reported. Revoking a slice's
+      view is then a key rotation, not a new mechanism.</div>
+    <div class="chips">
+      <span class="chip">${payload.agents.length} agent${payload.agents.length === 1 ? '' : 's'}</span>
+      ${dropped ? `<span class="chip warn" title="rows in your registry that are not a valid 64-hex pubkey. They are NOT projected — a slice must not receive a roster quietly shorter than yours without being told.">${dropped} unprojectable</span>` : ''}
+      ${published
+        ? `<span class="chip" title="the generation a grantee must be able to read">v${esc(String(published.generation ?? '?'))}</span>
+           <span class="chip${changed ? ' warn' : ''}">${changed ? 'roster changed since publish' : `published ${esc(when || '')}`}</span>`
+        : '<span class="chip warn">never published — no runtime can verify this roster</span>'}
+    </div>
+    <div class="actions" style="margin-top:10px">
+      <button class="primary" id="reg-publish"${changed ? '' : ' disabled title="The roster has not changed. Republishing rotates the scope key and costs every grantee a re-delivery, so it is refused rather than done quietly."'}>
+        ${published ? 'Republish projection' : 'Publish projection'}</button>
+      <span class="msg" id="reg-msg"></span>
+    </div>
+    <div class="msg" style="margin-top:8px">Publishing signs a 30440 and rotates its key. Each runtime that
+      should see the roster needs a read grant on this scope — grant it from the Ledger like any other
+      dataset. <b>The projection is a copy and can be stale</b>, so it carries its own
+      <code>generated_at</code> and a consumer must render that age rather than implying it is live.</div>
+  </div>`
+}
+
+function wireRegistryPanel() {
+  const btn = $('reg-publish'); if (!btn) return
+  const msg = $('reg-msg')
+  btn.onclick = async () => {
+    // Not wired to a publish path in this change: signing a 30440 and rotating its key belongs with
+    // the grant flow, and a button that appeared to publish while doing nothing is the defect this
+    // whole wave has been removing. It states that plainly rather than failing silently.
+    msg.textContent = 'nothing changed: publishing the projection is not wired yet — '
+      + 'the scope + rotation path lands with the read grant, and nothing was signed.'
+  }
+}
+
 export function renderAgents() {
   const agents = agentsOf()
   $('agents').innerHTML = `
@@ -91,8 +147,10 @@ export function renderAgents() {
     ${agents.map(agentCard).join('') || `<div class="empty">
       No agents yet. An agent is a keypair held by an Nvoy MCP server —
       boot one with <code>node mcp/dist/server.js --ephemeral</code> and paste its npub above.<br>
-      You delegate scopes of data to it; it dereferences them live and loses access when you revoke.</div>`}`
+      You delegate scopes of data to it; it dereferences them live and loses access when you revoke.</div>`}
+    ${registryPanel()}`
 
+  wireRegistryPanel()
   const msg = $('ag-msg')
   $('ag-add').onclick = async () => {
     let pub
