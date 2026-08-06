@@ -4,6 +4,10 @@ This is the architectural source of truth for connecting a persistent coding-age
 Buzz and other Nostr applications. It records both the logical boundary and the deployment state;
 “implemented,” “deployed,” “attached,” and “live-proven” are deliberately separate claims.
 
+For a successor-ready inventory, identity reconciliation warning, grant matrix, deployment map,
+and Codex-to-Claude continuation procedure, read
+[Agent runtime handoff](AGENT_RUNTIME_HANDOFF.md) before operating a live instance.
+
 ## One identity, one runtime, one session binding
 
 Every first-class agent is its own Nostr participant. Codex and Claude do not share an identity or
