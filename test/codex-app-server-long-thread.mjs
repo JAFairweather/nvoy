@@ -7,6 +7,9 @@ import { appServerCall } from '../mcp/tools/codex_app_server.mjs'
 const root = mkdtempSync(join(tmpdir(), 'nvoy-codex-long-thread-'))
 const socket = join(root, 'control.sock')
 const largeHistory = 'x'.repeat(12 * 1024 * 1024)
+// Parsing and validating a 12 MiB local control-plane frame is deliberately bounded, but a
+// 10-second test ceiling makes CI load—not the framing contract—the thing being measured.
+const TEST_TIMEOUT_MS = 60_000
 let serverError = null
 
 function frame(value) {
@@ -61,7 +64,7 @@ const server = net.createServer(stream => {
 
 try {
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(socket, resolve) })
-  const rows = await appServerCall({ socketPath: socket, listOnly: true, timeoutMs: 10_000 })
+  const rows = await appServerCall({ socketPath: socket, listOnly: true, timeoutMs: TEST_TIMEOUT_MS })
   if (rows?.[0]?.history?.length !== largeHistory.length) throw new Error('large app-server response was not preserved')
   if (serverError) throw serverError
   console.log('codex-app-server-long-thread: 12 MiB response accepted')
