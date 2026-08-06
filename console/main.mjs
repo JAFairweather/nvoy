@@ -38,6 +38,10 @@ export const state = {
   delegations: [],                       // derived rows: deriveDelegations(index)
   profiles: new Map(),                   // pubkey → kind-0 metadata
   received: [],                          // grants TO me (agent outboxes, §6.5)
+  // Runtime manifests by agent pubkey, or NULL until an authenticated endpoint fills them. Null means
+  // SILENT — "the endpoint did not answer" — never "no runtime". Being unable to ask a box is not
+  // evidence that nothing runs on it, and an empty object would claim it is (runtime-facts.mjs).
+  runtimeManifests: null,
   requests: [],                          // pending access requests (§6.2)
   pendingRelinquish: [],                 // relinquish notices awaiting one-tap confirm (§6.6)
 }

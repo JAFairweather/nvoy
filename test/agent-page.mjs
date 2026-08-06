@@ -180,5 +180,36 @@ ok('opening the page sets an #agent/<npub> hash, so the link lands from any surf
   assert.match(globalThis.location.hash, /^agent\/npub1/)
 })
 
+// ── Where it runs: the runtime manifest panel (Wave 5) ──────────────────────
+ok('with no endpoint, the runtime panel is SILENT and refuses the wrong conclusion', () => {
+  const html = render()
+  assert.match(html, /Where it runs/)
+  assert.match(html, /runtime endpoint did not answer/)
+  // Escape-tolerant: the note goes through esc(), so a literal " arrives as &quot;.
+  assert.match(html, /not the same as (?:"|&quot;)this agent has no runtime\./)
+})
+ok('THE LEAK TEST: with a real manifest, nothing sensitive reaches the page', () => {
+  // Rendered, not just projected. A leak through the RENDERER would pass a projection-only test, and
+  // this manifest carries every category STANDARDS forbids in a UI.
+  state.runtimeManifests = { [AGENT]: {
+    instance: 'codex-test', agent_pub: AGENT, broker_mode: 'grant', delivery_mode: 'ssh',
+    worker_runner: 'codex', worker_enabled: true, relays: ['wss://nos.lol'], updated_at: 1785900000,
+    state_dir: '/srv/nvoy/state', key_ref: '/etc/nvoy/credentials/x.nsec', ssh_target: 'deploy@10.0.0.4',
+    worker_image: 'reg/w@sha256:' + 'd'.repeat(64), watcher_uid: 41011, broker_uid: 41012, cwd: '/srv/nvoy',
+  } }
+  const html = render()
+  for (const secret of ['/etc/nvoy', '/srv/nvoy', '10.0.0.4', 'deploy@', '41011', '41012', 'sha256:', '.nsec'])
+    assert.ok(!html.includes(secret), `the rendered page leaked ${secret}`)
+  assert.match(html, /codex-test/, 'the safe facts must still be shown')
+  assert.match(html, /deliberately not shown/, 'and the withholding must be disclosed')
+  state.runtimeManifests = null
+})
+ok('a reachable endpoint with no manifest says a grant is not a process', () => {
+  state.runtimeManifests = {}
+  const html = render()
+  assert.match(html, /a grant is authority, not a process/)
+  state.runtimeManifests = null
+})
+
 console.log(`\n${pass}/${pass + fail} passed`)
 process.exit(fail ? 1 : 0)
