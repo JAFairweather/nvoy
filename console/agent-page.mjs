@@ -29,6 +29,7 @@ import { capLabel, capLimit } from '../lib/nave-cap.mjs'
 import { state, $, esc, short, fmtWhen, agentName, agentsOf, showTab } from './main.mjs'
 import { scopeKind } from './scope-facet.mjs'
 import { childrenTo, coverageNote } from './lineage.mjs'
+import { projectManifest, withheldNote, runtimeState } from './runtime-facts.mjs'
 import { openDelegationInLedger } from './ledger.mjs'
 import { settleAgentOutputs } from './output-state.mjs'
 
@@ -169,6 +170,16 @@ export function renderAgentPage() {
     : ''
 
   // ── liveness: promoted from three levels deep in a collapsed Ledger card ────
+  // The runtime manifest, projected. It is READ-ONLY and an ALLOWLIST: STANDARDS forbids credential
+  // locations, host addresses and service-account ids in a UI, and this manifest is full of all three, so
+  // a field added upstream stays hidden until someone admits it on purpose (runtime-facts.mjs).
+  //
+  // `state.runtimeManifests` is null until an authenticated endpoint exists to fill it — and null means
+  // SILENT, not "no runtime". Being unable to ask a box is not evidence that nothing runs there.
+  const manifests = state.runtimeManifests ?? null
+  const rt = runtimeState(manifests ? (manifests[pub] ?? null) : null, { reachable: manifests !== null })
+  const proj = rt.state === 'answered' ? projectManifest(manifests[pub]) : null
+
   const wantsOutput = held.some(d => d.terms?.reply_scope_requested) || state.received.some(g => g.publisher === pub)
   const liveNote = wantsOutput
     ? sourceNote({ store: 'this agent\'s outbox', count: null })
@@ -189,6 +200,21 @@ export function renderAgentPage() {
     ${sect('Key custody', custodyNote, '')}
     ${sect('Approval path', pathNote, '')}
     ${sect('Where it acts', sliceNote, '', '', sliceBody)}
+    ${(() => {
+      // "Where does it run" is a different question from "what did it produce" — the outbox panel below
+      // answers the second. Decision D7 in the spec had no surface at all before this.
+      const note = rt.state === 'answered'
+        ? sourceNote({ store: 'this agent\'s runtime manifest', count: proj.fields.length, unit: 'fact' })
+        : { state: rt.state, stamp: rt.state === 'silent' ? 'the runtime endpoint did not answer' : 'no runtime manifest', body: rt.note }
+      const body = rt.state === 'answered'
+        ? `<div class="ap-rows">${proj.fields.map(f => `<div class="ap-row">
+            <span class="ap-name">${esc(String(f.value))}</span>
+            <span class="msg">${esc(f.meaning)}</span></div>`).join('')}</div>`
+        : ''
+      const held = rt.state === 'answered' ? withheldNote(proj.withheld) : null
+      return sect('Where it runs', note, body, '',
+        held ? `<div class="msg ap-body">${esc(held)}</div>` : '')
+    })()}
     ${sect('Running now', liveNote, liveBody)}
     ${coverage ? `<div class="card ap-sect"><div class="msg ap-body">${esc(coverage)}</div></div>` : ''}
     <div class="actions ap-foot">
