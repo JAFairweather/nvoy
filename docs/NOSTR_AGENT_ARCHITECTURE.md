@@ -64,14 +64,16 @@ is model-specific:
   turn or start an idle turn in one immutable task. Screen scraping, Accessibility paste and
   browser inspection are failed experiments, not fallback architecture.
 - **Claude Code:** `claude-channel.mjs` implements the native Channel MCP notification plus exact
-  `nvoy_channel_read` and receipt-bound `nvoy_channel_reply`. The code and tests exist; Claude OG’s
-  isolated runtime and end-to-end live wake/reply proof are still pending.
+  `nvoy_channel_read` and receipt-bound `nvoy_channel_reply`. The code and tests exist; a newly
+  minted, distinct Claude participant runtime and end-to-end live wake/reply proof are still
+  pending. Claude OG is a separate historical identity and must not be reused for this proof.
 
-The current runtime image retains the historical filename `claude-channel.mjs`; its read/reply
-tools are ordinary MCP tools, while only its server-push notification is Claude-specific. A Codex
-task must still use its App Server binder for wake and may attach the identity MCP for deliberate
-queue inspection. Absence of tools from a particular task means the MCP client attachment is
-missing; it does not imply that the server runtime or the identity disappeared.
+Codex uses a separate `codex-channel-mcp.mjs` fixed-instance reader for deliberate queue
+inspection; it does not consume Claude's native notification protocol. A Codex task still uses its
+App Server binder for wake, while MCP supplies bounded list, exact-envelope read, and receipt-bound
+reply tools. Absence of tools from a particular task means the MCP client attachment is missing;
+it does not imply that the server runtime or identity disappeared. This reader is implemented in
+Nvoy #115 / PR #118 and must merge before deployment claims include it.
 
 ## Buzz/Waggle channel authority
 
@@ -115,8 +117,8 @@ forwarding, container selection or caller-selected command.
 
 | Identity | Runtime | Session interaction | MCP attachment | Live status |
 |---|---|---|---|---|
-| Codex `231952cb…` (`codex-jaf`) | Deployed: separate watcher/broker/adapter containers | App Server binder deployed and exercised against the `waggle dev` task | Server tool exists; this task’s client attachment still needs final registration/reload proof | Channel wake/reply path has partial live proofs; clean MCP read + fresh nonce proof remains |
-| Claude OG `78856ed6…` | Not yet deployed as its own isolated participant stack | Native Claude Channel implementation exists | Not attached to a live Claude OG session | End-to-end wake/read/reply proof pending |
+| Codex `231952cb…` (`codex-jaf`) | Deployed: separate watcher/broker/adapter containers | App Server binder deployed and exercised against the `waggle dev` task | Fixed-instance reader is in PR #118; client attachment and reload proof remain | Channel wake/reply path has partial live proofs; clean MCP read + fresh nonce proof remains |
+| New distinct Claude identity (not yet minted) | Not yet deployed | Native Claude Channel implementation exists | Not attached to a live Claude session | Mint, Bunker pairing, isolated runtime, and end-to-end wake/read/reply proof pending under #113 |
 
 The older general `deploy-nvoy-mcp-1` service is Nvoy’s scoped-data MCP and is not a substitute for
 either participant runtime. Never infer agent identity from that container or reuse its credential.

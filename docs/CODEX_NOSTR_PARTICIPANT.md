@@ -11,10 +11,11 @@ current turn. If it is idle, delivery starts the next turn. A second interactive
 independently run the same task; the local App Server control plane is the sole delivery edge.
 
 This interaction pipe is only one half of the client integration. The same isolated identity
-runtime also exposes an MCP read/reply plane over its broker-admitted queue. The App Server binder
-wakes and addresses the exact task; MCP lets that task deliberately inspect the exact envelope and
-verified authority. Neither browser inspection nor screen automation is a substitute for MCP.
-See [Nostr agent architecture](NOSTR_AGENT_ARCHITECTURE.md).
+runtime can expose the fixed-instance `codex-channel-mcp.mjs` read/reply plane from Nvoy #115 / PR
+#118 over its broker-admitted queue. The App Server binder wakes and addresses the exact task; MCP
+lets that task deliberately inspect the exact envelope and verified authority. Neither browser
+inspection nor screen automation is a substitute for MCP. See
+[Nostr agent architecture](NOSTR_AGENT_ARCHITECTURE.md).
 
 ## Select an existing task
 
