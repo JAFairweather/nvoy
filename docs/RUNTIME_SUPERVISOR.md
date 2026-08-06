@@ -235,6 +235,39 @@ The generated plist is mode `0600`, fixes the repository bridge, manifest root, 
 and carries only `HOME`, a bounded `PATH`, and `NVOY_INSTANCE_ROOT`. It contains no Nostr key,
 Bunker URI, NIP-46 client secret, model-provider key, relay URL, or caller-selected thread.
 
+### Reading authenticated channel feedback from Codex
+
+The Desktop wake binding deliberately injects only task-authorized instructions. Reviews and
+other authenticated channel activity may instead remain data-only. `codex-channel-mcp.mjs` gives
+the fixed Codex project a deliberate read surface for that queue without making the MCP process a
+second authority verifier:
+
+- `nvoy_channel_list` returns only envelope, record type, receipt time, message count, read state,
+  and whether the broker attached scoped instruction authority. It returns no sender or content.
+- `nvoy_channel_read` accepts one exact 64-hex envelope and returns only the broker-admitted
+  record. A null authority remains data; reading it never promotes it to an instruction.
+- `nvoy_channel_reply` is available only for a single-sender `admitted-task` carrying broker-
+  attested scoped authority. It writes envelope plus bounded text; the Bunker broker rechecks the
+  live grant and chooses the recipient. Data-only activity cannot acquire reply authority.
+
+Run one MCP server per participant identity through a dedicated SSH key. Generate the server-side
+forced command with:
+
+```sh
+NVOY_INSTANCE_ROOT=/etc/nvoy/instances \
+  node mcp/tools/instance-codex-channel-authorized-key.mjs \
+  --instance codex-jaf --public-key-file /etc/nvoy/keys/codex-jaf-reader.pub \
+  --container nvoy-codex-jaf-adapter
+```
+
+Install that exact `restrict,command=...` line for a dedicated account. The command fixes the
+container, worker UID/GID, executable, and instance and grants no shell, PTY, forwarding, signer,
+relay query, adapter UID, or caller-selected argument. Configure the Codex project MCP entry as a
+stdio SSH command using `-F /dev/null`, `-T`, `BatchMode=yes`, `IdentitiesOnly=yes`, strict pinned
+known hosts, `ClearAllForwardings=yes`, and that one mode-0600 identity key. Reattaching the project
+reopens the same identity-local read journal; unread queue entries remain listable and an exact
+envelope is acknowledged durably only after a successful read.
+
 ### Running Claude Code channel adapter
 
 Claude Code has a different native edge. Its research-preview channel protocol lets an MCP server
