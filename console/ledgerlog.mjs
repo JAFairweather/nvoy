@@ -12,6 +12,10 @@
 //       agent-initiated (§6.6): the runtime destroyed its key and told us
 //   { t: 'expired-rotated', at, scope, from_v, to_v, expired, survivors }
 //       the TTL scheduler's hard expiry (§6.4.3): expired = count dropped
+//   { t: 'consumed', at, scope, publisher, name, outcome, noteId }
+//       THE ONLY INBOUND EVENT: the Director acted on a grant he RECEIVED (Ngage posting a draft in
+//       his own hand, or passing on it). `publisher` is the agent that issued it, never him — see
+//       consumedEvent() for why this is not a `granted`.
 // Append-only, capped at LEDGER_CAP (oldest trimmed) to keep the 10440 sane.
 //
 // DOM-free on purpose — test/ledger.mjs drives this module in Node.
@@ -43,6 +47,52 @@ export const relinquishedEvent = ({ scope, agent, v, reason, destroyed_at, at = 
 
 export const expiredRotatedEvent = ({ scope, from_v, to_v, expired, survivors, at = nowSec() }) =>
   ({ t: 'expired-rotated', at, scope, from_v, to_v, expired, survivors })
+
+/**
+ * The Director acted on a grant he RECEIVED. A new direction in this log, and that is why it needs its
+ * own event rather than reusing `granted`.
+ *
+ * Every event above describes something the Director ISSUED. An inbound `draft:` grant is the opposite:
+ * an agent granted it TO him, and he consumed it by posting the note in his own hand or passing on it.
+ * Ngage recorded that only in `localStorage`, so half of what the desk did was invisible in the one
+ * console that claims to be the source of truth for all grants — invisible BY CONSTRUCTION, which is the
+ * same class of defect as the agent that showed in Nvoy and not in Nact.
+ *
+ * Filing it as `granted` would have been the easy fix and the wrong one: it would claim the Director
+ * granted something he received, inverting the direction of authority in the audit log to avoid adding a
+ * word. `publisher` is therefore the agent that issued it — never the Director.
+ *
+ * @param outcome 'posted' (signed and published in his own hand) | 'passed' (declined)
+ */
+export const consumedEvent = ({ scope, publisher, name, outcome, noteId = null, at = nowSec() }) =>
+  ({ t: 'consumed', at, scope, publisher, name: name ?? null, outcome, noteId })
+
+/**
+ * Every received grant this key has acted on, newest first.
+ *
+ * Deliberately NOT folded into `deriveDelegations`: that answers "what did I grant, and to whom", and an
+ * inbound grant has no place in that answer. A reader who saw a received draft in the delegations list
+ * would reasonably conclude the Director had delegated something. Two questions, two readers.
+ *
+ * A malformed row is dropped and COUNTED — a consumption the Director cannot see is precisely what this
+ * event was added to end, so losing one silently would reintroduce the defect at a new layer.
+ */
+export function receivedActions(index) {
+  const log = Array.isArray(index?.nvoy_ledger) ? index.nvoy_ledger : []
+  const rows = []
+  let dropped = 0
+  for (const ev of log) {
+    if (ev?.t !== 'consumed') continue
+    if (typeof ev.scope !== 'string' || typeof ev.publisher !== 'string'
+      || (ev.outcome !== 'posted' && ev.outcome !== 'passed')) { dropped++; continue }
+    rows.push({
+      scope: ev.scope, publisher: ev.publisher, name: ev.name ?? ev.scope,
+      outcome: ev.outcome, noteId: ev.noteId ?? null, at: Number.isFinite(ev.at) ? ev.at : null,
+    })
+  }
+  rows.sort((a, b) => (b.at || 0) - (a.at || 0))
+  return { rows, dropped }
+}
 
 /**
  * Derive the delegation list the ledger renders: one row per (scope, agent)

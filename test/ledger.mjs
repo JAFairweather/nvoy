@@ -17,6 +17,7 @@ import {
 import {
   appendLedger, grantedEvent, rotatedEvent, revokedEvent,
   deriveDelegations, eventsFor, computeTotals, fmtCountdown, LEDGER_CAP,
+  consumedEvent, receivedActions,
 } from '../console/ledgerlog.mjs'
 import { expiryRotationPlan, nextExpiry, runExpiryRotation, relinquishPlan, runRelinquishRotation } from '../console/ttl.mjs'
 import { sanitizeConfig, DEFAULT_RELAYS } from '../console/config.mjs'
@@ -297,6 +298,48 @@ check('observer: no access requests, relinquishes, or agent output in stored con
   && !blob.includes('until friday') && !blob.includes('expired-rotated'))
 check('observer: wrap senders are ephemeral (delegator never linked to agents)',
   inMem.query({ kinds: [1059] }).every(w => ![delegatorPub, agentAPub, agentBPub].includes(w.pubkey)))
+
+
+// ── the INBOUND direction (Wave 4): what this key did with grants it RECEIVED ──
+//
+// Every other event in this log describes something the Director issued. Ngage recorded a consumed
+// draft in localStorage only, so half of that desk was invisible in the console that claims to be the
+// source of truth for all grants — invisible BY CONSTRUCTION, the same class of defect as the agent
+// that showed in Nvoy and not in Nact.
+//
+// The decision worth pinning is that this is NOT an issued entry. Filing it as `granted` would have
+// been the easy fix and the wrong one: it inverts the direction of authority to avoid defining a word,
+// and a reader would conclude the Director delegated something an agent granted TO him.
+{
+  const AGENT = 'a'.repeat(64)
+  const ix = (log) => ({ issued: [], received: [], nvoy_ledger: log })
+  const ev = consumedEvent({ scope: 'draft:post/x', publisher: AGENT, name: 'a note', outcome: 'posted', noteId: 'n1', at: 100 })
+
+  check('a consumed grant reads back with its direction intact',
+    receivedActions(ix([ev])).rows[0].publisher === AGENT)
+  check('…and it is NEVER a delegation — deriveDelegations answers a different question',
+    deriveDelegations(ix([ev])).length === 0)
+  check('a decline is recorded too — choosing not to sign is worth auditing',
+    receivedActions(ix([consumedEvent({ scope: 'y', publisher: AGENT, outcome: 'passed', at: 1 })])).rows[0].outcome === 'passed')
+  check('records read newest-first',
+    receivedActions(ix([
+      consumedEvent({ scope: 'a', publisher: AGENT, outcome: 'posted', at: 10 }),
+      consumedEvent({ scope: 'b', publisher: AGENT, outcome: 'passed', at: 20 }),
+    ])).rows.map(r => r.scope).join() === 'b,a')
+  check('a malformed record is dropped and COUNTED, never silently lost',
+    (() => { const r = receivedActions(ix([ev, { t: 'consumed', scope: 5, publisher: AGENT, outcome: 'posted' },
+      { t: 'consumed', scope: 'x', publisher: AGENT, outcome: 'shredded' }]))
+      return r.rows.length === 1 && r.dropped === 2 })())
+  check('an unknown outcome does not read back at all',
+    receivedActions(ix([consumedEvent({ scope: 'x', publisher: AGENT, outcome: 'shredded' })])).rows.length === 0)
+  check('a missing log is not an error', receivedActions(undefined).rows.length === 0)
+  check('a consumption alongside a real delegation disturbs neither',
+    (() => {
+      const index = { issued: [{ scope: 'hs', scope_name: 'hs', grantees: [AGENT] }], received: [],
+        nvoy_ledger: [{ t: 'granted', at: 1, scope: 'hs', agent: AGENT, v: 1, terms: null, name: 'hs' }, ev] }
+      return deriveDelegations(index).length === 1 && receivedActions(index).rows.length === 1
+    })())
+}
 
 console.log(failed ? '\nLEDGER: FAIL' : `\nLEDGER: ALL ${n} PASS`)
 process.exit(failed)
