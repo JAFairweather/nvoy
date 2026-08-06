@@ -332,6 +332,14 @@ export function readManifest(root, requestedId) {
 
 // Supervisor preflight: a second identity must never accidentally share a state or runtime
 // root. This is intentionally fail-closed rather than silently picking one manifest.
+// Every credential path one manifest names: the Nostr signer, the model worker, the harness, the wake
+// webhook, the channel door and the SSH identity. assertNoCollisions refuses any of them shared across
+// instances, whichever field each instance names it in (My Dude, PR 366 review).
+export function credentialRefs(m) {
+  return [m.keyRef, m.bunkerUriRef, m.bunkerClientRef, m.workerCredentialRef, m.harness?.credentialRef,
+    m.wakeWebhook?.urlRef, m.wakeWebhook?.headersRef, m.channelDoor?.tokenHashRef, m.sshIdentityFile].filter(Boolean)
+}
+
 export function assertNoCollisions(root, candidate) {
   const canonicalRoot = realpathSync(root)
   const seen = new Map()
@@ -340,10 +348,21 @@ export function assertNoCollisions(root, candidate) {
     const id = name.slice(0, -5)
     let m
     try { m = readManifest(canonicalRoot, id) } catch (e) { die(`invalid manifest ${name}: ${e.message}`) }
-    for (const [field, value] of [['pubkey', m.pubkey], ['stateDir', m.stateDir], ['runtimeDir', m.runtimeDir], ['spoolDir', m.spoolDir],
-      ...(m.mayRecall?.gatewayGid ? [['recallGatewayGid', m.mayRecall.gatewayGid]] : [])]) {
-      const key = `${field}:${value}`
-      if (seen.has(key)) die(`${field} collision between ${seen.get(key)} and ${m.id}`)
+    // Isolation is by resource class, not by field name. A second instance cannot use the first
+    // instance's watcher UID as its broker UID, its state root as a runtime root, or its Bunker
+    // URI as a client credential. Any of those aliases crosses the instance boundary. Every
+    // credential path a manifest can name is one class, whichever field names it.
+    const resources = [
+      ['pubkey', 'pubkey', m.pubkey], ['service user', 'service-user', m.serviceUser],
+      ['filesystem root', 'path', m.stateDir], ['filesystem root', 'path', m.runtimeDir], ['filesystem root', 'path', m.spoolDir],
+      ['service UID', 'uid', m.watcherUid], ['service UID', 'uid', m.brokerUid], ['service UID', 'uid', m.adapterUid], ['service UID', 'uid', m.workerUid],
+      ['service GID', 'gid', m.brokerAdapterGid], ['service GID', 'gid', m.workerHandoffGid], ['service GID', 'gid', m.mayRecall?.gatewayGid],
+      ...credentialRefs(m).map(ref => ['credential reference', 'credential', ref]),
+    ]
+    for (const [label, kind, value] of resources) {
+      if (value === '' || value == null) continue
+      const key = `${kind}:${value}`
+      if (seen.has(key)) die(`${label} collision between ${seen.get(key)} and ${m.id}`)
       seen.set(key, m.id)
     }
   }
