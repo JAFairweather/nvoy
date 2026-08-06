@@ -13,16 +13,16 @@ writeFileSync(identity, 'PRIVATE-CONTENT-MUST-NEVER-PRINT\n', { mode: 0o600 })
 writeFileSync(known, 'broker.example ssh-ed25519 AAAAC3NzaTest\n', { mode: 0o644 })
 const makeClaude = version => { writeFileSync(claude, `#!/bin/sh\necho '${version}'\n`, { mode: 0o700 }); chmodSync(claude, 0o700) }
 const client = ({ claudeFile = claude, identityFile = identity, knownHostsFile = known, target = 'nvoy-channel@broker.example', cwd } = {}) => spawnSync(process.execPath,
-  [tool, '--mode', 'client', '--server', 'nvoy-codex-jaf', '--claude', claudeFile,
+  [tool, '--mode', 'client', '--server', 'nvoy-claude-jaf', '--claude', claudeFile,
     '--identity-file', identityFile, '--known-hosts-file', knownHostsFile, '--ssh-target', target], { encoding: 'utf8', cwd })
 
 makeClaude('2.1.80 (Claude Code)')
 const good = client(), description = JSON.parse(good.stdout || '{}')
 ok('client doctor accepts the minimum native Channel version', good.status === 0 && description.claudeVersion === '2.1.80')
-ok('client doctor renders a closed, host-pinned, identity-scoped stdio tunnel', description.mcpConfig?.mcpServers?.['nvoy-codex-jaf']?.args?.join(' ').includes('StrictHostKeyChecking=yes') && description.mcpConfig.mcpServers['nvoy-codex-jaf'].args.includes('-F') && description.mcpConfig.mcpServers['nvoy-codex-jaf'].args.includes('/dev/null'))
-ok('client doctor emits the exact native Channel opt-in', description.launch?.at(-1) === 'server:nvoy-codex-jaf')
+ok('client doctor renders a closed, host-pinned, identity-scoped stdio tunnel', description.mcpConfig?.mcpServers?.['nvoy-claude-jaf']?.args?.join(' ').includes('StrictHostKeyChecking=yes') && description.mcpConfig.mcpServers['nvoy-claude-jaf'].args.includes('-F') && description.mcpConfig.mcpServers['nvoy-claude-jaf'].args.includes('/dev/null'))
+ok('client doctor emits the exact native Channel opt-in', description.launch?.at(-1) === 'server:nvoy-claude-jaf')
 ok('client doctor never prints private credential contents', !good.stdout.includes('PRIVATE-CONTENT-MUST-NEVER-PRINT'))
-ok('client doctor renders canonical absolute paths only', description.launch?.[0] === realpathSync(claude) && description.mcpConfig.mcpServers['nvoy-codex-jaf'].args.includes(realpathSync(identity)) && description.mcpConfig.mcpServers['nvoy-codex-jaf'].args.some(arg => arg === `UserKnownHostsFile=${realpathSync(known)}`))
+ok('client doctor renders canonical absolute paths only', description.launch?.[0] === realpathSync(claude) && description.mcpConfig.mcpServers['nvoy-claude-jaf'].args.includes(realpathSync(identity)) && description.mcpConfig.mcpServers['nvoy-claude-jaf'].args.some(arg => arg === `UserKnownHostsFile=${realpathSync(known)}`))
 
 const relativeClaude = client({ claudeFile: 'claude', cwd: root })
 ok('client doctor refuses a relative Claude executable even when it resolves in cwd', relativeClaude.status !== 0 && /path must be absolute/.test(relativeClaude.stderr))
