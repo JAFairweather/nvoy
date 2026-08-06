@@ -42,7 +42,9 @@ const server = net.createServer(stream => {
       if (request.method === 'initialize') stream.write(frame({ id: request.id, result: {} }))
       if (request.method === 'thread/read') {
         reads++
-        const turns = reads === 1 ? [{ id: turn, status: 'inProgress', items: [] }, { id: staleTurn, status: 'inProgress', items: [] }] : reads < 3 ? [] : [{ id: turn, status: 'completed', items: [
+        // Deliberately omit the actual active turn from the stale first snapshot. The failed
+        // conditional steer is the fresh control-plane read and returns its exact current id.
+        const turns = reads === 1 ? [{ id: staleTurn, status: 'inProgress', items: [] }] : reads < 3 ? [] : [{ id: turn, status: 'completed', items: [
           { type: 'userMessage', content: [{ type: 'text', text: 'NVOY_ENVELOPE_ID=' + 'c'.repeat(64) }] },
           { type: 'agentMessage', phase: 'commentary', text: 'Never publish recovered commentary.' },
         ] }]
