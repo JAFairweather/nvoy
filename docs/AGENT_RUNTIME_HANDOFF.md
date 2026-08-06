@@ -76,20 +76,14 @@ The four values below are public identifiers, not credentials:
 |---|---|---|---|
 | Codex - 231952cb | `231952cb5eb0652c04075f6a1b93e727819ed2ac0bf5238a96c6d2ca51617edd` | `npub1yvv49j67kpjjcpq8ta4phyl8y7qea54vp06j8z5kcmfv55tp0mws3cc0v4` | assigned to runtime `codex-jaf` and Codex task `waggle dev` |
 | Claude - OG | `78856ed6c671b816290e3b390c9ab180933e33ba99125ce2f71aaf399904e148` | `npub10zzka4kxwxupv2gw8vusex43szfnuva6nyf9echhr2hnnxgyu9yqrkf56w` | historical Claude persona; user prefers this visible identity for Claude, but it is not automatically assigned to a new runtime |
-| new Claude participant | `89ca35f0b4a3d10a23d75e8e67aeca34dcb45b2869284d64f33d2011b70eb6c5` | `npub1389rtu9550gs5g7ht68x0tk2xnwtgkegdy5y6e8n85sprdcwkmzsadwpsw` | kind:0/10002/10050 published; admission and runtime deployment pending |
-| existing local `claude-jaf` manifest | `ad05b00ee49200d5bd2788fba480621ba6009224f01e48b3e9bce10100421d5c` | `npub145zmqrhyjgqdt0f83ra6fqrzrwnqpy3y7q0y3vlfhnsszqzzr4wqtqq92y` | configuration artifact; do not treat as the selected Claude identity without reconciliation |
+| superseded Claude staging candidate | `89ca35f0b4a3d10a23d75e8e67aeca34dcb45b2869284d64f33d2011b70eb6c5` | `npub1389rtu9550gs5g7ht68x0tk2xnwtgkegdy5y6e8n85sprdcwkmzsadwpsw` | historical staging reference; do not admit, pair, or deploy |
+| Claude participant (`claude-jaf`) | `ad05b00ee49200d5bd2788fba480621ba6009224f01e48b3e9bce10100421d5c` | `npub145zmqrhyjgqdt0f83ra6fqrzrwnqpy3y7q0y3vlfhnsszqzzr4wqtqq92y` | current distinct Claude identity; kind:0/10002 published; admission and isolated runtime deployment pending |
 
-This is an unresolved operator decision, not an implementation detail. Before deploying Claude,
-James must choose exactly one of these two safe paths:
-
-1. assign the newly minted `89ca35f0…` identity and keep Claude OG historical; or
-2. explicitly migrate Claude OG into a dedicated Bunker-held, isolated `claude-jaf` runtime,
-   rotating/revoking any older raw-key deployment and reissuing its grants.
-
-Never read, copy, print, or use Claude OG's nsec merely because its public identity is desired.
-The currently checked-in architecture treats Claude OG as historical until the operator performs
-that explicit migration. The local `claude-jaf` manifest's `ad05b00e…` mismatch must be resolved
-before starting it.
+The current release assignment is `ad05b00e…`; `89ca35f0…` is retained only as a superseded
+staging reference and must not be admitted or paired. Claude OG remains historical and is not
+part of this runtime. Never read, copy, print, or use Claude OG's nsec merely because its public
+identity is desired. Before starting `claude-jaf`, verify the Bunker-derived public key equals
+`ad05b00e…` and record that evidence; do not proceed on a manifest or UI label alone.
 
 ## 4. One identity means one complete security domain
 
@@ -230,7 +224,7 @@ For each identity use a fresh nonce and retain event, envelope, turn, reply, and
 ## 10. Immediate continuation order
 
 1. Preserve and finish any already-open exact-head PRs; do not duplicate them.
-2. Reconcile the three Claude identity references and record James's explicit assignment.
+2. Verify the Bunker pairing for the assigned `ad05b00e…` Claude identity; keep `89ca…` staging-only.
 3. Finish the Codex same-task MCP + fresh-nonce proof with one responder.
 4. Deploy the selected Claude identity as a separate runtime and run the same proof through the
    Claude Code Channel edge.
@@ -244,4 +238,3 @@ Start with the private `~/.buzz/GUIDES/LAUNCH_PROMPT.md`, then read this file an
 files in section 8. Inspect live manifests and public grant state before making claims. Never
 print or move a secret during orientation. If local MCP tools are absent, distinguish “client not
 attached to this task” from “server/runtime does not exist”; do not fall back to screen reading.
-
