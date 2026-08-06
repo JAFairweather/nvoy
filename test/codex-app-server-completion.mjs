@@ -68,6 +68,9 @@ const server = net.createServer(stream => {
 
 try {
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(socket, resolve) })
+  const snapshot = await appServerCall({ socketPath: socket, threadId: thread, readOnly: true, timeoutMs: 10_000 })
+  if (snapshot?.id !== thread || snapshot.status?.type !== 'active' || started !== 0 || steered !== 0) throw new Error('read-only probe mutated the active thread')
+  reads = 0
   const result = await appServerCall({ socketPath: socket, threadId: thread, input: 'wake', clientUserMessageId: 'nvoy:test',
     dedupeToken: 'NVOY_ENVELOPE_ID=' + 'a'.repeat(64), waitForCompletion: true, steerActive: true, timeoutMs: 10_000 })
   if (result.turnId !== turn || result.finalText !== 'Steered wake acknowledged.' || steered !== 1 || started !== 0) throw new Error('active response was not steered into the exact turn')

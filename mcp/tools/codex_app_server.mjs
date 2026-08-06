@@ -41,9 +41,10 @@ export function finalAgentText(items = []) {
 // Minimal RFC 6455 client for the documented Unix app-server transport. `ws` does not reliably
 // route Unix sockets on every supported Node build; keeping the transport here also means a
 // desktop adapter has no HTTP listener and no path supplied by an incoming notification.
-export function appServerCall({ socketPath, threadId, input, clientUserMessageId = null, listOnly = false, dedupeToken = '', waitForCompletion = false, observeOnly = false, steerActive = false, expectedUserText = '', expectedUserSha256 = '', timeoutMs = 30000 }) {
+export function appServerCall({ socketPath, threadId, input, clientUserMessageId = null, listOnly = false, readOnly = false, dedupeToken = '', waitForCompletion = false, observeOnly = false, steerActive = false, expectedUserText = '', expectedUserSha256 = '', timeoutMs = 30000 }) {
   const socket = localControlSocket(socketPath)
   const id = listOnly ? null : codexThreadId(threadId)
+  if (listOnly && readOnly) throw new Error('Codex app-server call cannot list and read a thread simultaneously')
   if (observeOnly && (!dedupeToken || !waitForCompletion || listOnly || !expectedUserText ||
       createHash('sha256').update(expectedUserText).digest('hex') !== expectedUserSha256)) {
     throw new Error('observeOnly requires one exact receipt-and-message-bound completed turn')
@@ -113,11 +114,13 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
           if (message.error) return finish(new Error(`Codex initialize failed: ${message.error.message || 'unknown error'}`))
           send({ method: 'initialized', params: {} })
           if (listOnly) request('thread/list', 2, { limit: 50, sortKey: 'recency_at', sortDirection: 'desc' })
+          else if (readOnly) request('thread/read', 2, { threadId: id, includeTurns: true })
           else if (dedupeToken) request('thread/read', 2, { threadId: id, includeTurns: true })
           else request('thread/resume', 2, { threadId: id })
         } else if (message.id === 2) {
-          if (message.error) return finish(new Error(`Codex ${listOnly ? 'thread/list' : dedupeToken ? 'thread/read' : 'thread/resume'} failed: ${message.error.message || 'unknown error'}`))
+          if (message.error) return finish(new Error(`Codex ${listOnly ? 'thread/list' : readOnly || dedupeToken ? 'thread/read' : 'thread/resume'} failed: ${message.error.message || 'unknown error'}`))
           if (listOnly) return finish(null, message.result?.data || [])
+          if (readOnly) return finish(null, message.result?.thread)
           if (message.result?.thread?.id !== id) return finish(new Error('Codex app-server returned an unexpected thread'))
           if (dedupeToken) {
             const userText = item => (item?.content || []).map(part => typeof part === 'string' ? part :
