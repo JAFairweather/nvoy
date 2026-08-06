@@ -18,6 +18,98 @@ signs replies. Claude Code receives an opaque wake marker, then explicitly
 reads the broker-admitted envelope with `nvoy_channel_read`. A notification is
 not authorization by itself.
 
+## Operator quick path: the existing `claude-jaf` identity
+
+This section is the concrete path for the identity already created for issue
+#113. Run the shell commands on the owner's Mac unless the heading says
+**broker host**. The Bunker import and the console grants are UI operations;
+they cannot be replaced by a local `node` command.
+
+```sh
+export NV_INSTANCE=claude-jaf
+export NV_HOME="$HOME/.nvoy/desktop/$NV_INSTANCE"
+export WAGGLE_ROOT="$HOME/.buzz/REPOS/waggle"
+export CLAUDE_PUBKEY=ad05b00ee49200d5bd2788fba480621ba6009224f01e48b3e9bce10100421d5c
+export CLAUDE_NPUB=npub145zmqrhyjgqdt0f83ra6fqrzrwnqpy3y7q0y3vlfhnsszqzzr4wqtqq92y
+export BUZZ_CHANNEL=a8186b53-537d-46ad-a7e7-b6486c58970e
+
+test -f "$NV_HOME/identity.nsec" || { echo "missing Claude identity" >&2; exit 1; }
+test "$(stat -f '%Lp' "$NV_HOME/identity.nsec")" = 600 || {
+  echo "identity.nsec must be mode 600" >&2; exit 1;
+}
+printf 'identity path: %s\npublic key: %s\nchannel: %s\n' \
+  "$NV_HOME/identity.nsec" "$CLAUDE_PUBKEY" "$BUZZ_CHANNEL"
+```
+
+The command above intentionally does not print or read the nsec contents.
+
+### A. Owner Mac — import the existing identity into Bunker
+
+Copy the nsec to the clipboard without displaying it:
+
+```sh
+pbcopy < "$NV_HOME/identity.nsec"
+```
+
+In `https://bunker.nave.pub`:
+
+1. Import the clipboard as a new identity named `Claude - ad05b00e`.
+2. Confirm the Bunker shows public key `$CLAUDE_PUBKEY` (not merely the npub).
+3. Create a dedicated NIP-46 connection for `claude-jaf`.
+4. Copy the URI and the separate NIP-46 client credential; do not paste either
+   into chat or a PR.
+
+Save the two returned values locally, one value per file. This opens a local
+editor; it does not print the values:
+
+```sh
+install -d -m 700 "$NV_HOME/credentials"
+umask 077
+${EDITOR:-vi} "$NV_HOME/credentials/bunker-uri"
+${EDITOR:-vi} "$NV_HOME/credentials/bunker-client"
+chmod 600 "$NV_HOME/credentials/bunker-uri" \
+  "$NV_HOME/credentials/bunker-client"
+stat -f '%N %Su:%Sg mode=%Lp size=%z' \
+  "$NV_HOME/credentials/bunker-uri" \
+  "$NV_HOME/credentials/bunker-client"
+```
+
+Do not delete `identity.nsec` yet. Pairing is not proven until the Bunker
+public key and the manifest public key match and the runtime doctor accepts the
+two credential references.
+
+### B. Owner Console — admit and authorize the identity
+
+In the Waggle Console's Access page:
+
+1. Add/admit this exact npub:
+   `npub145zmqrhyjgqdt0f83ra6fqrzrwnqpy3y7q0y3vlfhnsszqzzr4wqtqq92y`
+2. Select channel UUID:
+   `a8186b53-537d-46ad-a7e7-b6486c58970e`
+3. Issue the scoped `admit` grant.
+4. In Nvoy Console, create exactly these two grants:
+   - James Fairweather → Claude: `task`
+   - Waggle carrier → Claude: `task-relay`
+5. Verify the grants are attached to `claude-jaf`, not Codex, Claude OG, or a
+   burner identity.
+
+The Nvoy grants authorize the already-admitted participant; they do not grant
+general authority and cannot be replaced by channel membership alone.
+
+### C. Verification checkpoint before deployment
+
+On the Mac, confirm only metadata and file permissions:
+
+```sh
+node -e 'const fs=require("node:fs"); for (const p of process.argv.slice(1)) { const s=fs.statSync(p); console.log(p, (s.mode&0o777).toString(8), s.size) }' \
+  "$NV_HOME/credentials/bunker-uri" \
+  "$NV_HOME/credentials/bunker-client"
+```
+
+Expected output: both files have mode `600`, and neither file is empty. Never
+use `cat` on either file. Continue to the generic deployment steps only after
+this checkpoint and the Bunker public-key comparison succeed.
+
 ## 1. Create and publish the identity
 
 Mint the identity in a private directory. The command writes the nsec to a
