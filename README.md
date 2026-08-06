@@ -63,6 +63,11 @@ npm run console       # delegator console at http://localhost:4443/
 Then point an MCP client at the server — see [`mcp/README.md`](mcp/README.md)
 and [`examples/claude-desktop.json`](examples/claude-desktop.json).
 
+For first-class Nostr participants, use the supervised runtime contract in
+[`docs/RUNTIME_SUPERVISOR.md`](docs/RUNTIME_SUPERVISOR.md). The Claude Code channel path is
+documented separately in [`docs/CLAUDE_CODE_NOSTR_PARTICIPANT.md`](docs/CLAUDE_CODE_NOSTR_PARTICIPANT.md);
+the Codex desktop/App Server path is in [`docs/MACOS_DESKTOP_BINDER.md`](docs/MACOS_DESKTOP_BINDER.md).
+
 ## Tests
 
 ```
