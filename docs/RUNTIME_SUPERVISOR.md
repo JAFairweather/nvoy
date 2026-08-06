@@ -260,12 +260,33 @@ principal and install the unmodified output of
 the manifest worker UID and handoff GID; it grants no shell, forwarding, PTY, signer, adapter UID,
 or caller-selected command. The Claude-side MCP entry is then only that restricted stdio tunnel:
 
+Run `claude-channel-doctor.mjs` on both sides before installing it. The broker pass validates the
+fixed `notify_only` identity and renders its baseline and forced-key commands. The client pass
+requires Claude Code 2.1.80 or newer, a mode-0600 non-symlink identity, a non-writable pinned
+`known_hosts`, and a fixed `user@host`; it renders the exact MCP JSON and launch arguments without
+reading or printing private-key contents:
+
+```sh
+node mcp/tools/claude-channel-doctor.mjs --mode broker --instance codex-jaf \
+  --public-key-file /etc/nvoy/keys/codex-jaf-channel.pub --container nvoy-adapter-1
+
+node mcp/tools/claude-channel-doctor.mjs --mode client --server nvoy-codex-jaf \
+  --claude /usr/local/bin/claude --identity-file /absolute/path/codex-jaf-channel \
+  --known-hosts-file /absolute/path/nvoy-channel-known-hosts \
+  --ssh-target nvoy-channel@broker.example
+```
+
+For Team or Enterprise, the owner must also confirm that an administrator has enabled Claude Code
+Channels. That organization setting cannot be inferred safely by a local installer.
+
 ```json
 {
   "mcpServers": {
     "nvoy-codex-jaf": {
       "command": "/usr/bin/ssh",
-      "args": ["-T", "-o", "BatchMode=yes", "-o", "ClearAllForwardings=yes",
+      "args": ["-F", "/dev/null", "-T", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+        "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=/absolute/path/to/known_hosts",
+        "-o", "GlobalKnownHostsFile=/dev/null", "-o", "ClearAllForwardings=yes",
         "-i", "/absolute/path/to/identity-scoped-ssh-key", "nvoy-channel@broker.example"]
     }
   }
