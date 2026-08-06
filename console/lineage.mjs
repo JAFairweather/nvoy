@@ -10,9 +10,9 @@
 // enforces; the labels now say "derived". Filed as the fourth path in nvoy#111.
 //
 // `mcp/src/subgrants.ts` records every derived grant it mints as an `nvoy_derived_children`
-// row, and cascades revocation recursively when a parent dies. Nothing has ever read it back,
-// so attenuation — the one mechanism that lets authority NARROW as it spreads — has been
-// invisible even to the party who performed it.
+// row, and cascades revocation recursively when a parent dies. Nothing has ever read it back, so
+// re-delegation — the mechanism INTENDED to let authority narrow as it spreads — has been invisible
+// even to the party who performed it. "Intended" is doing real work in that sentence: see the header.
 //
 // WHOSE LINEAGE THIS IS, AND WHY IT CANNOT BE ANYONE ELSE'S. `saveLineage` writes through the
 // sub-issuer's own signer, and `loadGrantIndex` reads `{ kinds:[10440], authors:[own pubkey] }`
