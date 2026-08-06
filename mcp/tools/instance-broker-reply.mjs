@@ -25,6 +25,10 @@ const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 let manifest
 try { manifest = readManifest(root, instanceId(id)); assertNoCollisions(root, manifest) } catch (e) { die(e.message) }
 if (manifest.brokerMode !== 'local') die('remote-broker Desktop manifests cannot sign locally')
+// AD-12 migration hold. This keyed executable used to treat a queued model result as standing
+// authority to sign. Keep the old actuator unreachable until the replacement verifies a discrete
+// approval bound to the exact frozen event fingerprint.
+die('outbound action is awaiting discrete approval; automatic signing is disabled')
 
 function regular(path, label) {
   let st; try { st = lstatSync(path) } catch { die(`${label} is missing`) }

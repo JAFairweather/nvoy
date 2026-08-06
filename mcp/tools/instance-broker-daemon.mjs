@@ -8,7 +8,6 @@ import { readdirSync, renameSync, readFileSync, lstatSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
-import { isTerminalReplyFailure, loadPublishedReplyIds, loadReplyRequestDigests, loadTerminalReplyIds, recordTerminalReply } from './reply_retry.mjs'
 
 const die = m => { console.error(`instance-broker-daemon: ${m}`); process.exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -20,23 +19,10 @@ try { manifest = readManifest(root, instanceId(id)); assertNoCollisions(root, ma
 if (manifest.brokerMode !== 'local') die('remote-broker Desktop manifests cannot start a local broker daemon')
 if (!process.env.NVOY_BROKER_CREDENTIAL) die('broker credential path is unavailable')
 const broker = resolve(new URL('.', import.meta.url).pathname, 'instance-broker.mjs')
-const reply = resolve(new URL('.', import.meta.url).pathname, 'instance-broker-reply.mjs')
 const childEnv = { PATH: process.env.PATH || '', NVOY_INSTANCE_ROOT: root, NVOY_BROKER_CREDENTIAL: process.env.NVOY_BROKER_CREDENTIAL,
   ...(process.env.NVOY_BUNKER_URI_FILE ? { NVOY_BUNKER_URI_FILE: process.env.NVOY_BUNKER_URI_FILE } : {}) }
-const terminalRepliesPath = resolve(manifest.stateDir, 'terminal-replies.jsonl')
-let terminalReplyIds
-let publishedReplyIds
 const retryAfter = new Map()
-try { terminalReplyIds = loadTerminalReplyIds(terminalRepliesPath) }
-catch (e) { die(`cannot load terminal reply log: ${e.message || e}`) }
-try {
-  const requestDigests = loadReplyRequestDigests([
-    resolve(manifest.runtimeDir, 'reply-requests.jsonl'),
-    resolve(manifest.runtimeDir, 'desktop-reply-requests.jsonl'),
-  ], manifest.id)
-  publishedReplyIds = loadPublishedReplyIds(resolve(manifest.stateDir, 'outbound'), requestDigests)
-}
-catch (e) { die(`cannot load published reply records: ${e.message || e}`) }
+const announcedProposals = new Set()
 
 function recover() {
   let names = []
@@ -72,8 +58,9 @@ function drain() {
       console.error(`instance-broker-daemon: ${item.envelope.slice(0, 12)}… held for retry: ${String(r.stderr || '').trim()}`)
     } else retryAfter.delete(item.envelope)
   }
-  // The adapter-owned queue is append-only.  A reply tool receives only a 32-hex request id;
-  // it reopens this fixed queue, then binds the request to the broker-authored admission receipt.
+  // AD-12: adapter/worker output is a proposal, never standing authority to sign. The daemon may
+  // announce a queued proposal, but it must not invoke the keyed reply actuator. A separate,
+  // discrete approval path will bind an exact frozen fingerprint before opening the signer.
   for (const [source, filename] of [['worker', 'reply-requests.jsonl'], ['desktop', 'desktop-reply-requests.jsonl']]) {
     const replyQueue = resolve(manifest.runtimeDir, filename)
     try {
@@ -84,17 +71,10 @@ function drain() {
         try { const x = JSON.parse(line); if (/^[0-9a-f]{32}$/.test(String(x.id || ''))) ids.add(x.id) } catch { /* trailing partial line */ }
       }
       for (const request of ids) {
-        if (terminalReplyIds.has(request) || publishedReplyIds.has(request)) continue
-        const r = spawnSync(process.execPath, [reply, '--instance', manifest.id, '--request', request, '--source', source], { env: childEnv, encoding: 'utf8', timeout: 90000 })
-        if (r.status !== 0) {
-          const stderr = String(r.stderr || '').trim()
-          if (isTerminalReplyFailure(stderr)) {
-            try {
-              if (recordTerminalReply(terminalRepliesPath, terminalReplyIds, request, stderr))
-                console.error(`instance-broker-daemon: reply ${request.slice(0, 12)}… terminal — its receipt is no longer live`)
-            } catch (e) { console.error(`instance-broker-daemon: cannot record terminal reply ${request.slice(0, 12)}…: ${e.message || e}`) }
-          } else console.error(`instance-broker-daemon: reply ${request.slice(0, 12)}… held for retry: ${stderr}`)
-        } else publishedReplyIds.add(request)
+        const key = `${source}:${request}`
+        if (announcedProposals.has(key)) continue
+        announcedProposals.add(key)
+        console.log(`instance-broker-daemon: ${source} reply proposal ${request.slice(0, 12)}… awaiting discrete approval`)
       }
     } catch (e) { if (e.code !== 'ENOENT') console.error(`instance-broker-daemon: ${source} reply queue unavailable: ${e.message}`) }
   }
