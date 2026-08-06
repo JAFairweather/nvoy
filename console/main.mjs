@@ -9,7 +9,7 @@ import * as nip49 from 'nostr-tools/nip49'
 import { LiveRelay } from '../lib/liverelay.mjs'
 import { localSigner, loadGrantIndex, latestGrants } from '../lib/nipxx.mjs'
 import { nip07Signer, nip46Signer, serializeSession, parseSession, signerFromSession } from '../lib/nave-connect.mjs'
-import { renderTitlebar, updateTitlebar } from '../lib/nave-titlebar.mjs'
+import { renderTitlebar, updateTitlebar, NAVE_PLANES } from '../lib/nave-titlebar.mjs'
 import { loadConfig } from './config.mjs'
 import { deriveDelegations } from './ledgerlog.mjs'
 import { readCapabilityGrants } from './capgrants.mjs'
@@ -396,7 +396,14 @@ const NVOY_SEAL = `<svg viewBox="0 0 32 32" aria-hidden="true">
   <rect x="1" y="1" width="30" height="30" rx="7" fill="#0b0906" stroke="#6fa8a0" stroke-opacity=".5" stroke-width="1.2"/>
   <g transform="translate(4 4)" fill="none" stroke="#6fa8a0" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12 H16"/><path d="M12 7 L17 12 L12 17"/><circle cx="20" cy="12" r="1.6" fill="#6fa8a0" stroke="none"/></g>
 </svg>`
-renderTitlebar('#titlebar', { appName: 'Nvoy', tagline: 'delegator console', sealSvg: NVOY_SEAL })
+// The plane switcher goes live now that every destination is genuinely navigable: nact has hash
+// routing, ngage has #draft/<scopeId>, waggle has #routing. NAVE_PLANES is the ONE roster, exported from
+// the vendored titlebar so a new app appears in every menu at once (AD-11) — nave-drift compares it
+// against VENDOR.json so the two cannot silently disagree.
+//
+// Tagline is the verb, per the plan: this plane answers what your agents may SEE.
+renderTitlebar('#titlebar', { appName: 'Nvoy', tagline: 'what your agents may see', sealSvg: NVOY_SEAL,
+  planes: NAVE_PLANES, activePlane: 'nvoy' })
 
 // Boot order: any tab-session sign-in first (nave-connect parses all three
 // kinds — a bare-hex legacy remember still reads as `local`), then a
