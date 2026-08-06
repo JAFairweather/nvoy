@@ -43,7 +43,7 @@ keyless admitted queue              authenticated plaintext + authority attestat
     v
 model interaction plane
     +--> Codex App Server: fixed project + fixed task
-    +--> Claude Channel MCP: fixed Claude session (live proof pending)
+    +--> Claude Code Channel MCP: fixed Claude session (live proof pending)
     |
     | bounded reply request names only the admitted receipt
     v
@@ -66,14 +66,29 @@ is model-specific:
 - **Claude Code:** `claude-channel.mjs` implements the native Channel MCP notification plus exact
   `nvoy_channel_read` and receipt-bound `nvoy_channel_reply`. The code and tests exist; a newly
   minted, distinct Claude participant runtime and end-to-end live wake/reply proof are still
-  pending. Claude OG is a separate historical identity and must not be reused for this proof.
+  pending. The proof uses a newly assigned Claude participant. Claude OG is a separate historical
+  identity and must not be reused for this proof.
 
 Codex uses a separate `codex-channel-mcp.mjs` fixed-instance reader for deliberate queue
 inspection; it does not consume Claude's native notification protocol. A Codex task still uses its
 App Server binder for wake, while MCP supplies bounded list, exact-envelope read, and receipt-bound
 reply tools. Absence of tools from a particular task means the MCP client attachment is missing;
-it does not imply that the server runtime or identity disappeared. This reader is implemented in
-Nvoy #115 / PR #118 and must merge before deployment claims include it.
+it does not imply that the server runtime or identity disappeared. The reader shipped in Nvoy
+#115 / PR #118. A task opened before client registration must be reloaded before its tool list can
+contain the new server.
+
+## Four identifiers, four boundaries
+
+An operator and an implementation must distinguish:
+
+1. the **participant pubkey**, which authors Nostr replies;
+2. the **runtime instance**, which owns one admitted queue and policy boundary;
+3. the **model session id**, which fixes where an instruction may start a turn;
+4. the **carrier pubkey**, which may transport but never inherit participant authority.
+
+Human-readable profile names are presentation only. They never select credentials, runtimes or
+sessions. In particular, “Claude OG” names one historical participant; it is not a shared Claude
+service account. Provisioning always starts from an explicit identity assignment.
 
 ## Buzz/Waggle channel authority
 
@@ -117,8 +132,8 @@ forwarding, container selection or caller-selected command.
 
 | Identity | Runtime | Session interaction | MCP attachment | Live status |
 |---|---|---|---|---|
-| Codex `231952cb…` (`codex-jaf`) | Deployed: separate watcher/broker/adapter containers | App Server binder deployed and exercised against the `waggle dev` task | Fixed-instance reader is in PR #118; client attachment and reload proof remain | Channel wake/reply path has partial live proofs; clean MCP read + fresh nonce proof remains |
-| New distinct Claude identity (not yet minted) | Not yet deployed | Native Claude Channel implementation exists | Not attached to a live Claude session | Mint, Bunker pairing, isolated runtime, and end-to-end wake/read/reply proof pending under #113 |
+| Codex `231952cb…` (`codex-jaf`) | Deployed: separate watcher/broker/adapter containers | App Server binder deployed and exercised against the `waggle dev` task | Fixed-instance reader shipped and its server handshake is proven; the exact task still needs reload/attachment proof | Channel wake/reply has partial live proofs; clean same-task MCP read + fresh nonce proof remains |
+| Claude `89ca35f0…` (distinct from Claude OG) | Identity minted; kind:0/10002/10050 published; runtime not yet deployed | Native Claude Code Channel implementation exists | Not attached to a live Claude session | Admission, Bunker pairing, isolated runtime, and end-to-end wake/read/reply proof pending under #113 |
 
 The older general `deploy-nvoy-mcp-1` service is Nvoy’s scoped-data MCP and is not a substitute for
 either participant runtime. Never infer agent identity from that container or reuse its credential.
