@@ -199,9 +199,11 @@ export function createNvoyServer(ctx: NvoyContext): NvoyServerHandle {
   server.registerTool(
     'nvoy_grants_list',
     {
-      title: 'List held grants',
+      title: 'List held data grants',
       description:
-        'All data grants this agent holds: scope id (d), author, purpose, terms, key generation (v), and status (active | expired per expires_at | revoked-detected after a verified key rotation | relinquished after this agent destroyed its own key).',
+        'DATA grants only. Every NIP-DA data grant this agent holds: scope id (d), author, purpose, terms, key generation (v), and status (active | expired per expires_at | revoked-detected after a verified key rotation | relinquished after this agent destroyed its own key). ' +
+        'It does NOT report capability grants: a channel admission or a tasking authority is a PUBLIC kind-440 carrying a da-cap tag, which this tool cannot see. ' +
+        'So an empty result means "no data grants", never "no authority" — an agent can hold live admissions and still read [] here. To answer "am I still admitted?", read the public 440s naming your key off the relays; that check needs no key at all.',
     },
     async () => {
       const grants = await ctx.grantStore.list()

@@ -40,5 +40,24 @@ const directPartition = partitionInboxMessages([direct], { trusted: { [author]: 
 ok('a non-carrier trusted sender remains in the explicit direct partition',
   directPartition.trustedDirect[0] === direct && directPartition.rejectedCarrier.length === 0)
 
+// A carrier's own notices are not carries. Filing a successful delivery receipt under
+// "rejected carrier" states a verdict its contents contradict, and it left the verified
+// partition permanently empty. The split must not restore any authority.
+const receipt = { from: carrier, at: source.created_at + 2,
+  content: JSON.stringify({ ok: true, channel, buzz_event_id: 'b761fd29', ts: source.created_at + 2 }) }
+const relayed = { from: carrier, at: source.created_at + 3,
+  content: '📥 **claude** — you were replied to in the community.\n\n> BLOCK on the gate placement.' }
+const notices = partitionInboxMessages([receipt, relayed, malformedCarrier], {
+  trusted: { [carrier]: 'waggle' }, carriers: [carrier],
+})
+ok('a delivery receipt is a carrier notice, not a rejected carry',
+  notices.carrierNotice.includes(receipt) && !notices.rejectedCarrier.includes(receipt))
+ok('a relayed non-JSON reply is a carrier notice, not a rejected carry',
+  notices.carrierNotice.includes(relayed) && !notices.rejectedCarrier.includes(relayed))
+ok('a payload that CLAIMED to be a typed carry and failed still lands in rejected carrier',
+  notices.rejectedCarrier[0] === malformedCarrier && !notices.carrierNotice.includes(malformedCarrier))
+ok('the carrier-notice split grants no direct authority, even with a trusted-senders overlap',
+  notices.trustedDirect.length === 0 && notices.verified.length === 0)
+
 console.log(`\n${pass}/${pass + fail} passed`)
 process.exit(fail ? 1 : 0)
