@@ -65,8 +65,8 @@ editor; it does not print the values:
 ```sh
 install -d -m 700 "$NV_HOME/credentials"
 umask 077
-${EDITOR:-vi} "$NV_HOME/credentials/bunker-uri"
-${EDITOR:-vi} "$NV_HOME/credentials/bunker-client"
+nano "$NV_HOME/credentials/bunker-uri"
+nano "$NV_HOME/credentials/bunker-client"
 chmod 600 "$NV_HOME/credentials/bunker-uri" \
   "$NV_HOME/credentials/bunker-client"
 stat -f '%N %Su:%Sg mode=%Lp size=%z' \
