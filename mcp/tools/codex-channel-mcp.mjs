@@ -74,10 +74,13 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [
 mcp.setRequestHandler(CallToolRequestSchema, async request => {
   let all, read
   try { all = records(); read = readIds() } catch (error) { return result({ code: 'NVOY_QUEUE_INVALID', message: error.message }, true) }
-  if (request.params.name === 'nvoy_channel_list') return result({ instance: manifest.id, records: all.map(row => ({
+  if (request.params.name === 'nvoy_channel_list') {
+    const visible = all.slice(-500)
+    return result({ instance: manifest.id, total: all.length, truncated: all.length > visible.length, records: visible.map(row => ({
     envelope: row.envelope, type: row.type, received_at: row.received_at || null,
     message_count: row.messages?.length || 0, trusted_instruction: !!row.authority, read: read.has(row.envelope),
-  })) })
+    })) })
+  }
   const envelope = String(request.params.arguments?.envelope || '').toLowerCase()
   if (!HEX64.test(envelope)) return result({ code: 'NVOY_BAD_ENVELOPE' }, true)
   const record = all.find(row => row.envelope === envelope)
@@ -87,7 +90,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async request => {
       try { appendFileSync(statePath, JSON.stringify({ version: 1, instance: manifest.id, envelope, read_at: Date.now() }) + '\n', { mode: 0o600 }); chmodSync(statePath, 0o600) }
       catch (error) { return result({ code: 'NVOY_READ_LOG_FAILED', message: error.message }, true) }
     }
-    return result({ envelope, type: record.type, authority: record.authority || null, messages: record.messages })
+    return record.type === 'verified-notification'
+      ? result({ envelope, type: record.type, authority: null, notification: record.notification })
+      : result({ envelope, type: record.type, authority: record.authority || null, messages: record.messages })
   }
   if (request.params.name !== 'nvoy_channel_reply') return result({ code: 'NVOY_UNKNOWN_TOOL' }, true)
   if (record.type !== 'admitted-task' || !record.authority || record.messages.length !== 1) return result({ code: 'NVOY_REPLY_NOT_AUTHORIZED', envelope }, true)
