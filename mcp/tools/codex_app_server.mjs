@@ -57,7 +57,7 @@ export function finalAgentTextAfterReceipt(items = [], receipt = '') {
   }
   const phased = agents.filter(item => typeof item.phase === 'string' && item.phase.length > 0)
   const candidates = phased.length ? phased.filter(item => item.phase === 'final_answer') : agents
-  return [...candidates].reverse().find(item => item.text.trim())?.text || ''
+  return candidates.find(item => item.text.trim())?.text || ''
 }
 
 // Minimal RFC 6455 client for the documented Unix app-server transport. `ws` does not reliably

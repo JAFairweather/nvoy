@@ -109,6 +109,10 @@ try {
   ]
   if (finalAgentTextAfterReceipt(activeItems, receipt) !== 'Receipt-bound answer.')
     throw new Error('active-turn recovery escaped the exact receipt-to-next-user segment')
+  const twoFinals = activeItems.toSpliced(4, 0,
+    { type: 'agentMessage', phase: 'final_answer', text: 'Later same-segment answer — never substitute this.' })
+  if (finalAgentTextAfterReceipt(twoFinals, receipt) !== 'Receipt-bound answer.')
+    throw new Error('a later final answer substituted for the first receipt-bound answer')
   if (finalAgentTextAfterReceipt([...activeItems, activeItems[1]], receipt))
     throw new Error('an ambiguous duplicate receipt became replyable')
   if (finalAgentTextAfterReceipt(activeItems.map(item => item.text === 'Receipt-bound answer.' ? { ...item, phase: 'commentary' } : item), receipt))
