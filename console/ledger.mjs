@@ -160,7 +160,7 @@ const LEDGER_STYLE = `<style>
 const termChips = (t) => !t ? '<span class="chip warn" title="granted without an nvoy terms object — a vanilla NIP-DA grant">vanilla grant · no terms</span>' : [
   t.no_persist ? '<span class="chip term" title="runtime serves this to model context only — no disk, no logs">no_persist</span>' : '',
   t.redelegate === false ? '<span class="chip term" title="audit term: runtime refuses to re-wrap keys for third parties">no redelegate</span>' : '',
-  t.redelegate === true ? '<span class="chip warn" title="you allowed the holder to derive attenuated children from this grant. Their derivations are recorded on THEIR own encrypted index, so any descendants are not visible in this ledger — publishing that chain would link you to every leaf.">redelegate allowed</span>' : '',
+  t.redelegate === true ? '<span class="chip warn" title="you allowed the holder to derive children from this grant. ATTENUATION IS NOT ENFORCED ON CONTENT: subgrants.ts bounds a child\'s TERMS (it cannot outlive the parent, and a no_persist parent cannot be stored) but the child\'s payload is supplied by the holder and published verbatim — nothing checks it against this scope. Their derivations are also recorded on THEIR own encrypted index, so descendants are not visible here; publishing that chain would link you to every leaf.">redelegate allowed</span>' : '',
   t.reply_scope_requested ? '<span class="chip term" title="agent grants results back via its outbox (§6.5) — see the output panel below">reply requested</span>' : '',
   t.auto_relinquish ? '<span class="chip term" title="agent destroys key + cache on completion / at expiry (§6.6)">auto-relinquish</span>' : '',
 ].filter(Boolean).join('')
@@ -266,7 +266,7 @@ function delegationCard(d, i) {
       const kids = childrenOf(state.index, d.scope, state.me)
       const note = coverageNote(d, state.index, state.me)
       if (!kids.length && !note) return ''
-      return `<div class="sect2">granted onward (attenuated children you issued)</div>` +
+      return `<div class="sect2">granted onward (children you issued from this scope)</div>` +
         (kids.length ? kidList(kids) : '') +
         (note ? `<div class="msg lg-coverage">${esc(note)}</div>` : '')
     })()}
@@ -487,7 +487,7 @@ export function renderLedger() {
         ${onward.length ? `<div class="lg-onward">
           <div class="lg-onward-h">granted onward from grants you hold</div>
           <div class="lg-onward-p">You derived ${onward.reduce((n, g) => n + g.children.length, 0)}
-            attenuated grant${onward.reduce((n, g) => n + g.children.length, 0) === 1 ? '' : 's'} from
+            derived grant${onward.reduce((n, g) => n + g.children.length, 0) === 1 ? '' : 's'} from
             ${onward.length} grant${onward.length === 1 ? '' : 's'} <b>issued to you by someone else</b>.
             Those parents are not delegations you made, so they have no card above — but the children are
             recorded on your own index and are yours to answer for.</div>
