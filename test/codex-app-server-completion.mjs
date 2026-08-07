@@ -7,7 +7,39 @@ import { appServerCall, finalAgentTextAfterReceipt } from '../mcp/tools/codex_ap
 const root = mkdtempSync(join(tmpdir(), 'nvoy-codex-completion-'))
 const socket = join(root, 'control.sock'), thread = '019fce57-063d-7f50-b837-967d33ee384a', turn = '019fd200-0000-7000-8000-000000000001'
 const staleTurn = '019fd100-0000-7000-8000-000000000002'
+// This is an integration-style control-plane fixture, not a unit-test clock. On a busy CI
+// runner the socket can be scheduled behind the rest of the suite for several seconds; a
+// 10-second ceiling made the test measure runner load rather than the completion contract.
+const TEST_TIMEOUT_MS = 60_000
 let started = 0, reads = 0, steerAttempts = 0, steered = 0, steeredInput = '', ownerFinalEmitted = 0
+
+// WHY THE SNAPSHOT AND THE SLEEPS CHANGED TOO (nvoy#133, on top of the ceiling above).
+//
+// A bigger ceiling does not reach the failure this fixture could actually produce, because that
+// failure was not a timeout. `captureSteeredCompletion` polls `thread/read` 250ms after a steer is
+// acknowledged (codex_app_server.mjs:232,262) — the control plane is allowed to answer late — while
+// the emission below is on a 20ms timer. The answer normally wins. When the timer slipped, the poll
+// landed first and this fixture's snapshot DID NOT CONTAIN THE TURN IT HAD JUST ACKNOWLEDGED
+// STEERING, so the client failed with "the receipt-bound steered turn disappeared from the exact
+// thread". The client is right to treat a vanished steered turn as fatal; the fixture was lying.
+//
+// So: once a steer is acknowledged, report that turn as `inProgress` — what a real app-server does.
+// The poll then loops instead of racing, and the 20ms timer can slip as far as it likes. Forced by
+// negative control: delay the emission to 400ms so the poll always wins, and the old fixture exits 1
+// on that exact message while this one passes.
+//
+// `phase` replaces the read COUNTER for the same reason one layer down. Keying the script off how
+// many times the client happened to read made every later expectation depend on client polling, so
+// one extra poll shifted the whole script.
+let phase = 'stale-active'
+
+/** Wait for a fixture-side fact, with a ceiling far above any plausible scheduling delay. Returns
+ *  rather than throws: the assertions below own the failure messages, and a bare timeout here would
+ *  replace a precise one with a vague one. */
+const until = async (ready, ceilingMs = 5000) => {
+  const deadline = Date.now() + ceilingMs
+  while (!ready() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5))
+}
 const frame = value => {
   const body = Buffer.from(JSON.stringify(value)); let head
   if (body.length < 126) head = Buffer.from([0x81, body.length])
@@ -30,6 +62,10 @@ function requests(buffer) {
 }
 const server = net.createServer(stream => {
   let upgraded = false, buffer = Buffer.alloc(0)
+  // The notification-only path closes its client socket as soon as the steer is acknowledged.
+  // The fixture still schedules the simulated final item, so never write that late item into a
+  // closed socket: a test of bounded delivery must not manufacture an unrelated EPIPE failure.
+  stream.on('error', () => {})
   stream.on('data', chunk => {
     buffer = Buffer.concat([buffer, chunk])
     if (!upgraded) {
@@ -42,13 +78,17 @@ const server = net.createServer(stream => {
       if (request.method === 'initialize') stream.write(frame({ id: request.id, result: {} }))
       if (request.method === 'thread/read') {
         reads++
-        // Deliberately omit the actual active turn from the stale first snapshot. The failed
-        // conditional steer is the fresh control-plane read and returns its exact current id.
-        const turns = reads === 1 ? [{ id: staleTurn, status: 'inProgress', items: [] }] : reads < 3 ? [] : [{ id: turn, status: 'completed', items: [
-          { type: 'userMessage', content: [{ type: 'text', text: 'NVOY_ENVELOPE_ID=' + 'c'.repeat(64) }] },
-          { type: 'agentMessage', phase: 'commentary', text: 'Never publish recovered commentary.' },
-        ] }]
-        stream.write(frame({ id: request.id, result: { thread: { id: thread, status: { type: reads === 1 ? 'active' : 'idle' }, turns } } }))
+        // Deliberately omit the actual active turn from the STALE snapshot: the failed conditional
+        // steer is the fresh control-plane read, and it names the exact current id in its error.
+        // Once a steer has been acknowledged, though, that turn is real — report it.
+        const turns = phase === 'stale-active'
+          ? [{ id: staleTurn, status: 'inProgress', items: [] },
+             ...(steered ? [{ id: turn, status: 'inProgress', items: [] }] : [])]
+          : phase === 'idle' ? [] : [{ id: turn, status: 'completed', items: [
+              { type: 'userMessage', content: [{ type: 'text', text: 'NVOY_ENVELOPE_ID=' + 'c'.repeat(64) }] },
+              { type: 'agentMessage', phase: 'commentary', text: 'Never publish recovered commentary.' },
+            ] }]
+        stream.write(frame({ id: request.id, result: { thread: { id: thread, status: { type: phase === 'stale-active' ? 'active' : 'idle' }, turns } } }))
       }
       if (request.method === 'thread/resume') stream.write(frame({ id: request.id, result: { thread: { id: thread } } }))
       if (request.method === 'turn/start') {
@@ -72,7 +112,8 @@ const server = net.createServer(stream => {
         stream.write(frame({ id: request.id, result: { turnId: turn } }))
         setTimeout(() => {
           ownerFinalEmitted++
-          stream.write(frame({ method: 'item/completed', params: { threadId: thread, turnId: turn, item: { id: 'owner-final', type: 'agentMessage', phase: 'final_answer', text: 'Steered Nostr answer.' } } }))
+          if (!stream.destroyed && stream.writable)
+            stream.write(frame({ method: 'item/completed', params: { threadId: thread, turnId: turn, item: { id: 'owner-final', type: 'agentMessage', phase: 'final_answer', text: 'Steered Nostr answer.' } } }))
         }, 20)
       }
     }
@@ -81,22 +122,22 @@ const server = net.createServer(stream => {
 
 try {
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(socket, resolve) })
-  const snapshot = await appServerCall({ socketPath: socket, threadId: thread, readOnly: true, timeoutMs: 10_000 })
+  const snapshot = await appServerCall({ socketPath: socket, threadId: thread, readOnly: true, timeoutMs: TEST_TIMEOUT_MS })
   if (snapshot?.id !== thread || snapshot.status?.type !== 'active' || started !== 0 || steered !== 0) throw new Error('read-only probe mutated the active thread')
   reads = 0
   const notice = await appServerCall({ socketPath: socket, threadId: thread, input: 'content-free notice', clientUserMessageId: 'nvoy:notice',
-    dedupeToken: 'NVOY_ENVELOPE_ID=' + 'd'.repeat(64), waitForCompletion: false, steerActive: true, timeoutMs: 10_000 })
+    dedupeToken: 'NVOY_ENVELOPE_ID=' + 'd'.repeat(64), waitForCompletion: false, steerActive: true, timeoutMs: TEST_TIMEOUT_MS })
   if (notice.turnId !== turn || notice.replyEligible !== false || !notice.steered)
     throw new Error('notification-only active steer became replyable')
-  await new Promise(resolve => setTimeout(resolve, 40))
+  await until(() => ownerFinalEmitted === 1)
   reads = 0; steerAttempts = 0; steered = 0; steeredInput = ''
   const result = await appServerCall({ socketPath: socket, threadId: thread, input: 'wake', clientUserMessageId: 'nvoy:test',
     dedupeToken: 'NVOY_ENVELOPE_ID=' + 'a'.repeat(64), waitForCompletion: true, steerActive: true,
-    captureSteeredCompletion: true, timeoutMs: 10_000 })
+    captureSteeredCompletion: true, timeoutMs: TEST_TIMEOUT_MS })
   if (result.turnId !== turn || result.finalText !== 'Steered Nostr answer.' || result.replyEligible === false ||
       steerAttempts !== 2 || steered !== 1 || started !== 0 || steeredInput !== 'wake')
     throw new Error('steered owner turn did not return its exact final answer')
-  await new Promise(resolve => setTimeout(resolve, 40))
+  await until(() => ownerFinalEmitted === 2)
   if (ownerFinalEmitted !== 2) throw new Error('active-turn final-answer controls did not both fire')
   const receipt = 'NVOY_ENVELOPE_ID=' + 'd'.repeat(64)
   const activeItems = [
@@ -118,13 +159,15 @@ try {
   if (finalAgentTextAfterReceipt(activeItems.map(item => item.text === 'Receipt-bound answer.' ? { ...item, phase: 'commentary' } : item), receipt))
     throw new Error('receipt commentary became a reply')
   let liveRefused = false, recoveryRefused = false
+  phase = 'idle'   // the steered turn is done; the next delivery starts one of its own
   try {
     await appServerCall({ socketPath: socket, threadId: thread, input: 'wake again', clientUserMessageId: 'nvoy:test-2',
-      dedupeToken: 'NVOY_ENVELOPE_ID=' + 'b'.repeat(64), waitForCompletion: true, timeoutMs: 10_000 })
+      dedupeToken: 'NVOY_ENVELOPE_ID=' + 'b'.repeat(64), waitForCompletion: true, timeoutMs: TEST_TIMEOUT_MS })
   } catch (error) { liveRefused = /without a final assistant message/.test(error.message) }
+  phase = 'completed-receipt'   // that turn is now durable history, and carries only commentary
   try {
     await appServerCall({ socketPath: socket, threadId: thread, input: 'recover', clientUserMessageId: 'nvoy:test-3',
-      dedupeToken: 'NVOY_ENVELOPE_ID=' + 'c'.repeat(64), waitForCompletion: true, timeoutMs: 10_000 })
+      dedupeToken: 'NVOY_ENVELOPE_ID=' + 'c'.repeat(64), waitForCompletion: true, timeoutMs: TEST_TIMEOUT_MS })
   } catch (error) { recoveryRefused = /not complete with a final assistant message/.test(error.message) }
   if (!liveRefused || !recoveryRefused) throw new Error('phased commentary became a live or recovered reply')
   console.log('codex-app-server-completion: exact active turn steered and its final answer is receipt-bound')
