@@ -243,6 +243,12 @@ ok('a missing or stale admission receipt is terminal, rather than a relay-query 
 ok('the broker daemon invokes only the mechanically bounded prepare mode and has no approval input',
   /awaiting discrete approval/.test(daemonSource) && /instance-broker-reply\.mjs/.test(daemonSource) &&
   /'--prepare'/.test(daemonSource) && !/'--approval'/.test(daemonSource))
+// Assert the wiring, not just the module. The isolated reply_retry assertions above pass identically
+// whether or not the daemon ever calls them — which is exactly how the Aug 6 rewrite dropped these
+// call sites with a green suite. A component test cannot fail when the component is unplugged.
+ok('the broker daemon actually consults and records terminal replies rather than re-proposing forever',
+  /terminalReplyIds\.has\(request\)/.test(daemonSource) && /isTerminalReplyFailure\(/.test(daemonSource) &&
+  /recordTerminalReply\(/.test(daemonSource) && /loadTerminalReplyIds\(/.test(daemonSource))
 const publishedDir = join(manifest.state_dir, 'outbound')
 mkdirSync(publishedDir, { recursive: true })
 const publishedRequest = 'b'.repeat(32)

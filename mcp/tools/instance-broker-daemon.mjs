@@ -8,6 +8,7 @@ import { readdirSync, renameSync, readFileSync, lstatSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
+import { isTerminalReplyFailure, loadTerminalReplyIds, recordTerminalReply } from './reply_retry.mjs'
 
 const die = m => { console.error(`instance-broker-daemon: ${m}`); process.exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -18,6 +19,12 @@ let manifest
 try { manifest = readManifest(root, instanceId(id)); assertNoCollisions(root, manifest) } catch (e) { die(e.message) }
 if (manifest.brokerMode !== 'local') die('remote-broker Desktop manifests cannot start a local broker daemon')
 if (!process.env.NVOY_BROKER_CREDENTIAL) die('broker credential path is unavailable')
+// A proposal whose admission receipt has died can never be revived, so re-proposing it re-queries
+// relays once per tick forever. Terminal ids are durable: a restart must not resurrect the loop.
+const terminalRepliesPath = resolve(manifest.stateDir, 'terminal-replies.jsonl')
+let terminalReplyIds
+try { terminalReplyIds = loadTerminalReplyIds(terminalRepliesPath) }
+catch (e) { die(`cannot load terminal reply log: ${e.message || e}`) }
 const broker = resolve(new URL('.', import.meta.url).pathname, 'instance-broker.mjs')
 const childEnv = { PATH: process.env.PATH || '', NVOY_INSTANCE_ROOT: root, NVOY_BROKER_CREDENTIAL: process.env.NVOY_BROKER_CREDENTIAL,
   ...(process.env.NVOY_BUNKER_URI_FILE ? { NVOY_BUNKER_URI_FILE: process.env.NVOY_BUNKER_URI_FILE } : {}) }
@@ -74,12 +81,21 @@ function drain() {
       for (const request of ids) {
         const key = `${source}:${request}`
         if (announcedProposals.has(key)) continue
+        if (terminalReplyIds.has(request)) continue
         if ((proposalRetryAfter.get(key) || 0) > Date.now()) continue
         const proposed = spawnSync(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-reply.mjs'),
           '--instance', manifest.id, '--request', request, '--source', source, '--prepare'], { env: childEnv, encoding: 'utf8', timeout: 90000 })
         if (proposed.status !== 0) {
+          const stderr = String(proposed.stderr || '').trim()
+          if (isTerminalReplyFailure(stderr)) {
+            try {
+              if (recordTerminalReply(terminalRepliesPath, terminalReplyIds, request, stderr))
+                console.error(`instance-broker-daemon: ${source} reply proposal ${request.slice(0, 12)}… terminal — its receipt is no longer live`)
+            } catch (e) { console.error(`instance-broker-daemon: cannot record terminal reply ${request.slice(0, 12)}…: ${e.message || e}`) }
+            continue
+          }
           proposalRetryAfter.set(key, Date.now() + 5000)
-          console.error(`instance-broker-daemon: ${source} reply proposal ${request.slice(0, 12)}… held: ${String(proposed.stderr || '').trim()}`)
+          console.error(`instance-broker-daemon: ${source} reply proposal ${request.slice(0, 12)}… held: ${stderr}`)
           continue
         }
         proposalRetryAfter.delete(key)
