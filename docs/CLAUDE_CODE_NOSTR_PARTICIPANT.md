@@ -56,29 +56,68 @@ pbcopy < "$NV_HOME/identity.nsec"
 In `https://bunker.nave.pub`:
 
 1. Import the clipboard as a new identity named `Claude - ad05b00e`.
-2. Confirm the Bunker shows public key `$CLAUDE_PUBKEY` (not merely the npub).
+2. Confirm the Bunker shows this identity. Comparing the npub is fine — bech32
+   carries a checksum — but compare the **whole string**, not a prefix. Flipping
+   the final nibble of this key yields an npub sharing 51 leading characters and
+   differing only in the tail, so prefix-matching cannot distinguish the
+   assigned identity from a neighbouring one. Prefer pasting into a comparison
+   over reading it off the screen.
 3. Create a dedicated NIP-46 connection for `claude-jaf`.
-4. Copy the URI and the separate NIP-46 client credential; do not paste either
-   into chat or a PR.
+4. Copy the `bunker://…` URI. Do not paste it into chat or a PR.
 
-Save the two returned values locally, one value per file. This opens a local
-editor; it does not print the values:
+**Only one of the two credential files comes from Bunker.** They have different
+origins, and treating them alike sends you hunting for a value the Bunker never
+displays:
+
+| File | Contents | Origin |
+|---|---|---|
+| `bunker-uri` | `bunker://<64-hex>?relay=wss://…&secret=…` | Bunker displays it; paste it |
+| `bunker-client` | an `nsec1…` NIP-46 **client transport key** | generated locally; Bunker never shows it |
+
+The client transport key is a separate keypair used only to encrypt the NIP-46
+conversation with the Bunker (`nip46-signer.mjs` derives a nip44 conversation
+key from it and the Bunker pubkey, authenticating with the URI's `secret`). It
+is **not** the participant identity nsec — that stays in the Bunker — and it
+must be **stable** across restarts, because the Bunker binds the connection to
+the client pubkey. A freshly generated key each boot presents as an unknown
+client and the connection hangs.
+
+Paste the URI:
 
 ```sh
-install -d -m 700 "$NV_HOME/credentials"
+install -d -m 700 "${NV_HOME:?}/credentials"
 umask 077
-nano "$NV_HOME/credentials/bunker-uri"
-nano "$NV_HOME/credentials/bunker-client"
-chmod 600 "$NV_HOME/credentials/bunker-uri" \
-  "$NV_HOME/credentials/bunker-client"
-stat -f '%N %Su:%Sg mode=%Lp size=%z' \
-  "$NV_HOME/credentials/bunker-uri" \
-  "$NV_HOME/credentials/bunker-client"
+nano "${NV_HOME:?}/credentials/bunker-uri"
 ```
+
+Generate the client transport key. This prints only the public half:
+
+```sh
+node --input-type=module -e '
+import { generateSecretKey, getPublicKey, nip19 } from "nostr-tools";
+import { writeFileSync } from "node:fs";
+const sk = generateSecretKey();
+writeFileSync(process.argv[1], nip19.nsecEncode(sk) + "\n", { mode: 0o600 });
+console.log("client transport pubkey:", getPublicKey(sk));
+' "${NV_HOME:?}/credentials/bunker-client"
+
+chmod 600 "${NV_HOME:?}/credentials/bunker-uri" \
+  "${NV_HOME:?}/credentials/bunker-client"
+stat -f '%N %Su:%Sg mode=%Lp size=%z' \
+  "${NV_HOME:?}/credentials/bunker-uri" \
+  "${NV_HOME:?}/credentials/bunker-client"
+```
+
+Use `${NV_HOME:?}` rather than `$NV_HOME` throughout. In a shell where the
+variable is unset the plain form expands to nothing and `install -d
+"/credentials"` acts on the filesystem root; the `:?` form aborts instead. On
+macOS the read-only root catches this, which is luck, not a safeguard.
 
 Do not delete `identity.nsec` yet. Pairing is not proven until the Bunker
 public key and the manifest public key match and the runtime doctor accepts the
-two credential references.
+two credential references. A Bunker that *displays* a public key has not yet
+demonstrated that it can *sign* for it; control is proven when the broker's
+first NIP-46 signature recovers the expected pubkey.
 
 ### B. Owner Console — admit and authorize the identity
 
