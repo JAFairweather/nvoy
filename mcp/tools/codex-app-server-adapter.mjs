@@ -35,6 +35,10 @@ function records(path) {
   const st = lstatSync(path); if (!st.isFile() || st.isSymbolicLink()) die('desktop queue must be a regular non-symlink file')
   return readFileSync(path, 'utf8').split('\n').flatMap(line => { try { return [JSON.parse(line)] } catch { return [] } })
 }
+function latestTurnId(rows) {
+  return [...rows].reverse().find(row => row?.thread_id === manifest.codexThreadId &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(row?.turn_id || ''))?.turn_id || ''
+}
 function prompt(task) {
   if (task.type === 'verified-notification') return [
     'Nvoy notification: verified signed channel activity is waiting in the configured read plane.',
@@ -92,10 +96,21 @@ function deliverSpawn(task) {
 }
 async function deliver(task) {
   if (manifest.codexTransport !== 'local_control_socket') return { turnId: await deliverSpawn(task), finalText: '' }
+  // A long-lived Desktop thread can be hundreds of MiB. The local delivery journal already
+  // contains the last exact turn accepted by this adapter, so use it as a conditional-steer
+  // hint instead of asking app-server to replay the whole thread. If the visible UI advanced
+  // the turn, app-server rejects this compare-and-swap and the client reconciles once to the
+  // returned active id. Missing state deliberately falls back to the legacy bounded path.
+  const expectedTurnId = latestTurnId(records(deliveredPath))
   const result = await appServerCall({ socketPath: manifest.codexSocketPath, threadId: manifest.codexThreadId,
     input: prompt(task), clientUserMessageId: userMessageId(task), dedupeToken: `NVOY_ENVELOPE_ID=${task.envelope}`,
     waitForCompletion: task.type === 'admitted-task', steerActive: true,
     captureSteeredCompletion: task.type === 'admitted-task',
+    directExpectedTurnId: expectedTurnId,
+    // Receipt deduplication is journal-owned. A missing cached turn must not trigger a
+    // complete read of the bound Desktop thread; app-server metadata is enough to fail closed
+    // or take the normal resume path.
+    includeTurns: false,
     timeoutMs: task.type === 'admitted-task' ? 10 * 60 * 1000 : 30000 })
   return result
 }
