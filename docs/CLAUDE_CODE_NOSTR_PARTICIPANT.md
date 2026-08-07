@@ -129,12 +129,53 @@ In the Waggle Console's Access page:
    `a8186b53-537d-46ad-a7e7-b6486c58970e`
 3. Issue the scoped `admit` grant. **Done — live since 2026-08-06**, confirmed
    by cold read of the public kind:440 off the configured relays.
-4. In Nvoy Console, create exactly these two grants. **Neither exists yet**;
-   a cold read filtered to `ad05b00e…` as agent subject returns nothing:
+4. On the **same Waggle Access page**, issue the two agent-scoped grants —
+   **not** in the Nvoy console, which cannot issue them (see below):
    - James Fairweather → Claude: `task`
-   - Waggle carrier → Claude: `task-relay`
+   - Waggle carrier `84753207…` → Claude: `task-relay`
 5. Verify the grants are attached to `claude-jaf`, not Codex, Claude OG, or a
    burner identity.
+
+**Issue them in the Waggle console, not Nvoy's.** Nvoy's grant plane renders a
+"Grant task authority" panel, but it states plainly that issuing "is not wired
+to a runtime endpoint yet, so this console will not pretend to do it," and that
+admissions are not issuable there either. The Waggle Access page is the only
+working surface; `tools/grant.mjs` is the equivalent CLI, and the two offer
+identical capability sets by design so they cannot disagree about what is
+grantable.
+
+**The capability dropdown is driven by the *subject* field**, which is the part
+that reliably costs an operator several attempts:
+
+| "What are they getting access to?" | Capabilities offered |
+|---|---|
+| a channel UUID | `admit` only |
+| an **agent npub** | `task`, `task+act`, `task-relay` |
+
+Entering the channel UUID when you want a task grant silently produces yet
+another `admit`. Put the *participant's* npub in the subject field. In both
+agent grants Claude is the subject and never the grantee.
+
+The UI shows intent, not protocol vocabulary. The mapping (`console/index.html`
+`CAP_LABEL`) is:
+
+| Dropdown label | Capability |
+|---|---|
+| Post into the channel | `admit` |
+| Take tasks from you | `task` |
+| Take tasks, and act on them | `task+act` |
+| Carry signed instructions | `task-relay` |
+
+Choose *Carry signed instructions* for the carrier, never *Take tasks, and act
+on them*: the carrier is transport and must never be an instructor.
+
+Equivalent CLI, if you prefer it — two invocations, because `--to` batches only
+across a shared capability:
+
+```sh
+node tools/grant.mjs issue --to <owner-npub>   --agent <claude-npub> --cap task
+node tools/grant.mjs issue --to <carrier-npub> --agent <claude-npub> --cap task-relay
+```
 
 Confirm step 4 the same way, from waggle:
 
@@ -147,10 +188,27 @@ the scope tag is a salted hash, so a filter that silently matches nothing is
 indistinguishable from a correct empty result unless you have seen it return a
 known-good row.
 
-The Nvoy grants authorize the already-admitted participant; they do not grant
-general authority and cannot be replaced by channel membership alone. Until
-both exist, an authorised mention produces no invocation and no reply — the
-designed default-closed behaviour, not a fault to debug.
+The agent-scoped grants authorize the already-admitted participant; they do not
+grant general authority and cannot be replaced by channel membership alone.
+Until both exist, an authorised mention produces no invocation and no reply —
+the designed default-closed behaviour, not a fault to debug.
+
+The Access page's note "Checked by the agent's runtime" is exact and worth
+reading. This bridge enforces only `admit` and `admit+read`; the whole task
+family is enforced on the agent side by its own invocation policy. Issuing them
+is therefore necessary but not sufficient — the participant runtime must be
+deployed and attached before they change any behaviour.
+
+**These grants do not expire.** `grant.mjs` writes only the `p`, scope, and
+capability tags; there is no expiry tag, so a grant lives until an explicit
+`441` revocation. Revocation is the only off-switch. Related trap: a subject can
+accumulate more than one grant of the same capability — during this deployment
+the participant ended up with two live `admit` grants, and revoking one would
+have left the lane open while appearing to close it. Enumerate before revoking:
+
+```sh
+node tools/grant.mjs list --grantor "$OWNER_PUBKEY" | grep "$CLAUDE_PUBKEY"
+```
 
 ### C. Verification checkpoint before deployment
 

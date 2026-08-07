@@ -19,8 +19,8 @@ organization setting, relay, or live recipient has been configured.
 | Full Nvoy suite | `npm test` | Passed locally; Docker-only container test is host-dependent |
 | Codex/Claude operator documentation | `docs/MACOS_DESKTOP_BINDER.md`, `docs/CLAUDE_CODE_NOSTR_PARTICIPANT.md`, `docs/RUNTIME_SUPERVISOR.md` | Published in this release branch |
 | Fresh live Codex wrapped mention | requires the configured Mac App Server session, grants, and relay path | Live operator proof required |
-| Claude channel `admit` grant | cold-read of the public kind:440 off the configured relays, 2026-08-06 | Live, verified |
-| Claude participant-scoped `task` / `task-relay` grants | same cold read, filtered to `ad05b00e…` as agent subject | **Absent** — `admit` alone cannot wake; wake path fails closed until both are issued |
+| Claude channel `admit` grant | cold-read of the public kind:440 off the configured relays, 2026-08-06 | Live, verified (two live admits exist; revoking one does not close the lane) |
+| Claude participant-scoped `task` / `task-relay` grants | same cold read filtered to `ad05b00e…` as agent subject, with codex-jaf as positive control and an all-zeros subject as negative control, 2026-08-07 | Live, verified — full authority chain now present |
 | Claude Bunker pairing | derived public key compared against `ad05b00e…` | Not proven; dedicated NIP-46 client credential not yet created |
 | Fresh live Claude wrapped mention | requires the grants above, Claude Code Channels enabled by the organization, and a running session | Live operator proof required |
 | Independent tripwire delivery | requires Bunker pairing, root installation, and recipient cold-read drill | Live host proof required |

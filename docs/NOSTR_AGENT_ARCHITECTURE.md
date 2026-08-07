@@ -140,12 +140,17 @@ forwarding, container selection or caller-selected command.
 | Codex `231952cb…` (`codex-jaf`) | Deployed: separate watcher/broker/adapter containers | App Server binder deployed and exercised against the `waggle dev` task | Fixed-instance reader shipped and its server handshake is proven; the exact task still needs reload/attachment proof | Channel wake/reply has partial live proofs; clean same-task MCP read + fresh nonce proof remains |
 | Claude `ad05b00e…` (distinct from Claude OG) | Identity minted; kind:0 and kind:10002 published to the configured relays; channel `admit` grant live, cold-read from relays 2026-08-06; runtime not yet deployed | Native Claude Code Channel implementation exists | Not attached to a live Claude session | Bunker pairing, the participant-scoped `task` and `task-relay` grants, isolated runtime, and end-to-end wake/read/reply proof all pending — tracked in JAFairweather/waggle#308 |
 
-Claude's `admit` is live but its two wake authorities are not: no grant is scoped to `ad05b00e…`
-as agent subject. Per the grant separation above, `admit` alone cannot wake a participant, so an
-authorised mention today correctly produces no invocation and no reply. Read that state with
-waggle's `tools/grant.mjs list --grantor <owner> --agent <subject>`, which needs no signer — and
-run it against a known-good subject as well as the one under test, because a scope filter that
-matches nothing looks identical to one that is broken.
+Claude's full authority chain is live as of 2026-08-07: the channel `admit`, plus `task` to the
+owner and `task-relay` to the Waggle carrier, both scoped to `ad05b00e…` as agent subject. Read
+that state with waggle's `tools/grant.mjs list --grantor <owner> --agent <subject>`, which needs
+no signer — and run it against a known-good subject as well as the one under test, because a
+scope filter that matches nothing looks identical to one that is broken.
+
+Authority is not attachment. The grants are enforced on the agent side by the participant
+runtime's invocation policy, which is not yet deployed, so a mention still produces no invocation.
+Issue these grants in the **Waggle** console or `tools/grant.mjs`; Nvoy's grant plane renders a
+task-authority panel but states that issuing is not wired to a runtime endpoint, and it cannot
+issue admissions either.
 
 The older general `deploy-nvoy-mcp-1` service is Nvoy’s scoped-data MCP and is not a substitute for
 either participant runtime. Never infer agent identity from that container or reuse its credential.
