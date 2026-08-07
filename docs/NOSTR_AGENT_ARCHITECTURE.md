@@ -138,7 +138,7 @@ forwarding, container selection or caller-selected command.
 | Identity | Runtime | Session interaction | MCP attachment | Live status |
 |---|---|---|---|---|
 | Codex `231952cb…` (`codex-jaf`) | Deployed: separate watcher/broker/adapter containers | App Server binder deployed and exercised against the `waggle dev` task | Fixed-instance reader shipped and its server handshake is proven; the exact task still needs reload/attachment proof | Channel wake/reply has partial live proofs; clean same-task MCP read + fresh nonce proof remains |
-| Claude `ad05b00e…` (distinct from Claude OG) | Identity minted; kind:0 and kind:10002 published to the configured relays; channel `admit` grant live, cold-read from relays 2026-08-06; runtime not yet deployed | Native Claude Code Channel implementation exists | Not attached to a live Claude session | Bunker pairing, the participant-scoped `task` and `task-relay` grants, isolated runtime, and end-to-end wake/read/reply proof all pending |
+| Claude `ad05b00e…` (distinct from Claude OG) | Identity minted; kind:0 and kind:10002 published to the configured relays; channel `admit` grant live, cold-read from relays 2026-08-06; runtime not yet deployed | Native Claude Code Channel implementation exists | Not attached to a live Claude session | Bunker pairing, the participant-scoped `task` and `task-relay` grants, isolated runtime, and end-to-end wake/read/reply proof all pending — tracked in JAFairweather/waggle#308 |
 
 Claude's `admit` is live but its two wake authorities are not: no grant is scoped to `ad05b00e…`
 as agent subject. Per the grant separation above, `admit` alone cannot wake a participant, so an

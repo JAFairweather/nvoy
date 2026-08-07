@@ -21,9 +21,9 @@ not authorization by itself.
 ## Operator quick path: the existing `claude-jaf` identity
 
 This section is the concrete path for the identity already created for the
-Claude participant release. (Earlier drafts cited waggle #113 as the tracker;
-that is an unrelated closed issue and was a mis-citation.) Run the shell
-commands on the owner's Mac unless the heading says
+Claude participant release, tracked in JAFairweather/waggle#308. (Earlier
+drafts cited waggle #113; that is an unrelated closed issue and was a
+mis-citation.) Run the shell commands on the owner's Mac unless the heading says
 **broker host**. The Bunker import and the console grants are UI operations;
 they cannot be replaced by a local `node` command.
 
