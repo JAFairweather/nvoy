@@ -15,6 +15,7 @@ import { sourceNote } from '../lib/nave-source-note.mjs'
 import { state, $, esc, short, fmtWhen, load, agentsOf, agentName, dismissRequest,
          openDrawer, refreshRequestBadge } from './main.mjs'
 import { prefillDelegate } from './delegate.mjs'
+import { enrol } from './registry.mjs'
 
 function requestCard(r, i) {
   // The grantee is the credential's OWNER when the runtime named one — it proposes on the
@@ -68,8 +69,9 @@ export function renderRequests() {
     row.querySelector('.req-approve').onclick = async () => {
       const grantee = r.owner || r.from
       const msg = row.querySelector('.reqacts')
-      if (!agentsOf().some(a => a.pub === grantee)) {
-        state.index.nvoy_agents = [...agentsOf(), { pub: grantee, added_at: Math.floor(Date.now() / 1000) }]
+      const enrolled = enrol(state.index, grantee, { me: state.me, now: Math.floor(Date.now() / 1000) })
+      if (enrolled.added) {
+        state.index.nvoy_agents = enrolled.agents
         try { await saveGrantIndex(state.relay, state.signer, state.index) }
         catch (err) { msg.insertAdjacentHTML('beforeend', `<span class="msg">${esc(err.message)}</span>`); return }
       }

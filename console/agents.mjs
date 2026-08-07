@@ -10,7 +10,7 @@ import { nip19 } from 'nostr-tools'
 import { saveGrantIndex } from '../lib/nipxx.mjs'
 import { state, $, esc, short, fmtWhen, load, parsePub, agentsOf, agentName, openAgentPage } from './main.mjs'
 import { openDelegationInLedger } from './ledger.mjs'
-import { REGISTRY_SCOPE, buildProjection, projectionChanged } from './registry.mjs'
+import { REGISTRY_SCOPE, buildProjection, projectionChanged, enrol } from './registry.mjs'
 
 // Copy an npub to the clipboard with visual feedback, degrading gracefully:
 // async clipboard API → execCommand → (both blocked) select nothing and just
@@ -156,11 +156,18 @@ export function renderAgents() {
     let pub
     try { pub = parsePub($('ag-npub').value) }
     catch { msg.textContent = 'expected an npub1… or 64-char hex pubkey'; return }
-    if (pub === state.me) { msg.textContent = 'that is your own key — agents have their own'; return }
-    if (agentsOf().some(a => a.pub === pub)) { msg.textContent = 'already in the registry'; return }
+    // One enrolment rule, three doors into it: here, approving a request, and issuing a grant.
+    // Each keeps its own wording — the codes exist so they can.
+    const enrolled = enrol(state.index, pub, { me: state.me, now: Math.floor(Date.now() / 1000) })
+    if (!enrolled.added) {
+      msg.textContent = { self: 'that is your own key — agents have their own',
+                          duplicate: 'already in the registry',
+                          malformed: 'expected an npub1… or 64-char hex pubkey' }[enrolled.reason]
+      return
+    }
     msg.textContent = 'saving to your Grant Index…'
     try {
-      state.index.nvoy_agents = [...agentsOf(), { pub, added_at: Math.floor(Date.now() / 1000) }]
+      state.index.nvoy_agents = enrolled.agents
       await saveGrantIndex(state.relay, state.signer, state.index)
       $('ag-npub').value = ''
       await load()                                   // fetch its kind-0 for display

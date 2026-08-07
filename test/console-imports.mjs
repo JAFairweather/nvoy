@@ -128,5 +128,59 @@ ok('no console module calls another module\'s export without importing it', fail
   ok('the --panel2 alias has not returned', offenders.length === 0, offenders.join(' | '))
 }
 
+// ── styled but never emitted: a class with a rule and no markup ──────────────
+//
+// WHY THIS EXISTS. `ledger.mjs` styled `.lg-super-note` and never wrote it. The caller had been
+// passing the note as a SIXTH argument to a five-parameter arrow, and JavaScript drops an extra
+// argument without a word — so every grantee heading rendered as a bare label and the sentence each
+// kind owes the reader, including the only one naming a defect, never appeared. Nothing caught it:
+// the code was correct, the call was correct, and the symptom was an absence.
+//
+// A CSS rule is a claim that some markup exists. This checks the claim. It looks across ALL console
+// modules, not just the declaring one, because a style block in one module legitimately dresses
+// markup built in another.
+//
+// Classes only ever added at runtime via classList have no literal anywhere, so they are named here
+// rather than silently tolerated — an allowlist that must be read is better than a check that quietly
+// permits the bug it exists for.
+{
+  const RUNTIME_ONLY = new Set(['lg-focused'])
+  // COMMENTS ARE STRIPPED, and this is load-bearing. The first version of this guard passed its own
+  // negative control: the fix commit explained itself with a comment naming `.lg-super-note`, and
+  // prose mentioning a class satisfied the search for markup emitting it. A guard that a sentence can
+  // satisfy is a guard against writing about the bug, not against having it. Template literals stay,
+  // because they are where the markup lives.
+  const decomment = (s) => s.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/^\s*\/\/.*$/gm, ' ')
+  // Both the stylesheet and the haystack come from the SAME decommented text. The second version of
+  // this guard also passed its own control: it cut the style block out of the raw source but searched
+  // the decommented source, so the two strings never matched, the stylesheet was never removed, and
+  // every class was "emitted" by its own CSS rule. Two false greens in a row from a check that reads
+  // correctly — which is the argument for running the control, not for reading the code again.
+  const decommented = new Map(files.map(f => [f, decomment(readFileSync(join(dir, f), 'utf8'))]))
+  const offenders = []
+  for (const f of files) {
+    const src = decommented.get(f)
+    for (const block of src.matchAll(/const\s+[A-Z0-9_]*STYLE\s*=\s*`([\s\S]*?)`/g)) {
+      const style = block[1]
+      const rest = files.map(g => g === f ? src.split(style).join(' ') : decommented.get(g)).join('\n')
+      for (const sel of new Set(style.match(/\.[a-z][a-z0-9-]*/g) || [])) {
+        const cls = sel.slice(1)
+        if (RUNTIME_ONLY.has(cls)) continue
+        if (!cls.includes('-')) continue               // single words collide with prose and CSS idents
+        if (rest.includes(cls)) continue
+        // A whole FAMILY is often emitted by interpolation — `class="card st-${d.status}"` styles
+        // .st-active and its siblings without ever writing them out. So a literal miss is retried
+        // against each hyphen prefix followed by a template hole. Without this the guard reports four
+        // healthy status classes, and a check that cries wolf gets deleted rather than read.
+        const parts = cls.split('-')
+        const prefixes = parts.slice(0, -1).map((_, i) => parts.slice(0, i + 1).join('-') + '-')
+        if (prefixes.some(p => rest.includes(p + '${'))) continue
+        offenders.push(`${f}: .${cls}`)
+      }
+    }
+  }
+  ok('no console class is styled but never emitted', offenders.length === 0, offenders.join(' | '))
+}
+
 console.log(`\n${pass}/${pass + fail} passed`)
 process.exit(fail ? 1 : 0)

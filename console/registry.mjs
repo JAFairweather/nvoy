@@ -136,3 +136,37 @@ export function divergenceNote(kind) {
       return 'unrecognised state'
   }
 }
+
+/**
+ * The roster after enrolling `pub`, and whether that changed anything.
+ *
+ * WHY THIS EXISTS. Only two paths ever appended to `nvoy_agents` — approving an access request and
+ * pasting an npub — and the grant composer was not one of them. So the most direct way to give an
+ * agent authority, issuing it a data grant, did not make it an agent: it appeared in the Ledger as a
+ * grantee and nowhere in the roster. That is the "OTHER IDENTITIES · 21 grantees" the Director
+ * reported, and it is AD-12 ruling (g) unimplemented — Nvoy is the front door and the only place an
+ * Agent is created, but its front door did not write the register.
+ *
+ * Pure, and it does not save. The caller folds the returned roster into the SAME `saveGrantIndex`
+ * call as the grant it came from. A second write that can fail on its own would reintroduce exactly
+ * the divergence this closes, one layer up.
+ *
+ * `added: false` always carries a `reason` CODE — `malformed` · `self` · `duplicate` — because the
+ * three ways to change nothing are not alike: a duplicate is success, your own key is a category
+ * error, and a malformed key is a bug upstream. A caller that can only show "added" or silence
+ * cannot tell the Director which happened. A code and not a sentence, on purpose: the copy belongs
+ * to the surface, which is why the composer and the roster word `duplicate` differently.
+ */
+export const ENROL_REASONS = ['malformed', 'self', 'duplicate']
+
+export function enrol(index, pub, { me = null, now = 0 } = {}) {
+  const agents = Array.isArray(index?.nvoy_agents) ? index.nvoy_agents : []
+  const key = typeof pub === 'string' ? pub.toLowerCase() : ''
+  const unchanged = (reason) => ({ agents, added: false, reason })
+  if (!HEX64.test(key)) return unchanged('malformed')
+  // One key, one Agent (ruling 1) — and the Director is not one of his own agents.
+  if (me && key === String(me).toLowerCase()) return unchanged('self')
+  if (agents.some(a => typeof a?.pub === 'string' && a.pub.toLowerCase() === key))
+    return unchanged('duplicate')
+  return { agents: [...agents, { pub: key, added_at: now || 0 }], added: true, reason: '' }
+}

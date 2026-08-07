@@ -60,8 +60,15 @@ ok('KIND_ORDER covers every label and note', KIND_ORDER.every(k => KIND_LABEL[k]
 // ── the judgement calls, pinned as prose a later change has to argue with ──
 ok('the admitted note REFUSES to register humans, and says why',
   /NOT agents/.test(KIND_NOTE.admitted) && /corrupt the roster/.test(KIND_NOTE.admitted))
-ok('the unregistered note names the defect as the composer\'s, not the reader\'s',
-  /does not register its grantee/.test(KIND_NOTE.unregistered) && /ruling 7/.test(KIND_NOTE.unregistered))
+// This assertion USED to require the note to say "issuing a grant does not register its grantee", and
+// to cite ruling 7. That was right while the composer did not enrol. It is now a false statement, and
+// a test pinning stale copy turns a fix into a failure — so what is required is what the note still
+// owes the reader: that these keys are invisible to anything reading the registry, and that
+// registering one is not granting it anything.
+ok('the unregistered note says why it matters, and that registering grants nothing',
+  /knows they exist/.test(KIND_NOTE.unregistered) && /registering is not granting/.test(KIND_NOTE.unregistered))
+ok('…and no longer claims the composer fails to register, which it now does',
+  !/does not register its grantee/.test(KIND_NOTE.unregistered))
 ok('the self note explains why the Director is separated rather than hidden',
   /you are the grantor/.test(KIND_NOTE.self))
 ok('no heading is "Other identities" any more — the word did too much work',

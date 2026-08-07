@@ -68,9 +68,15 @@ export const KIND_NOTE = {
   admitted: 'These hold a capability over one of your apps — posting in a community, being mirrored. '
     + 'They are NOT agents and are deliberately not registered as such: they do not act on your behalf, '
     + 'and registering a person as an agent would corrupt the roster every slice projects.',
+  // This sentence USED to say "issuing a grant does not register its grantee today" — describing the
+  // defect rather than fixing it. The composer now enrols on issue, so what is left here is the
+  // backlog: keys granted before that, or granted from somewhere else. Registering them is one tap
+  // per key and never a sweep — some of these are people, not agents, and the roster is what every
+  // slice projects.
   unregistered: 'These hold grants you issued and are absent from your agent registry, so nothing that '
-    + 'reads the registry — Nact, a slice — knows they exist. Issuing a grant does not register its '
-    + 'grantee today (AD-12 ruling 7 says it should).',
+    + 'reads the registry — Nact, a slice — knows they exist. New grants register their grantee; these '
+    + 'predate that or came from elsewhere. Register the ones that are yours, one at a time — '
+    + 'registering is not granting, and it changes no access.',
 }
 
 /** Render order: you, then agents, then admitted parties, then the gap that needs attention. */
