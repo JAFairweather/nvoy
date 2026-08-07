@@ -65,51 +65,83 @@ In `https://bunker.nave.pub`:
 3. Create a dedicated NIP-46 connection for `claude-jaf`.
 4. Copy the `bunker://…` URI. Do not paste it into chat or a PR.
 
-**Both credential values come from Bunker.** Capture them together when you
-create the connection — the client credential is not recoverable afterwards
-without creating a new connection:
+**Bunker displays only the `bunker://…` URL.** The client transport key is a
+separate keypair minted on this machine, which binds to the connection during
+the NIP-46 `connect` using the secret carried in that URL:
 
 | File | Contents | Origin |
 |---|---|---|
-| `bunker-uri` | `bunker://<64-hex>?relay=wss://…&secret=…` | Bunker displays it |
-| `bunker-client` | an `nsec1…` NIP-46 **client transport key** | Bunker displays it |
+| `bunker-uri` | `bunker://<64-hex>?relay=wss://…&secret=…` | Bunker displays it; paste it |
+| `bunker-client` | an `nsec1…` NIP-46 **client transport key** | generated here; binds at `connect` |
 
-The client transport key is a separate keypair used only to encrypt the NIP-46
-conversation with the Bunker (`nip46-signer.mjs` derives a nip44 conversation
-key from it and the Bunker pubkey, authenticating with the URI's `secret`). It
-is **not** the participant identity nsec — that stays in the Bunker.
+The client transport key encrypts the NIP-46 conversation with the Bunker
+(`nip46-signer.mjs` derives a nip44 conversation key from it and the Bunker
+pubkey). It is **not** the participant identity nsec — that stays in the Bunker
+— and it must be **stable** once bound, because the Bunker binds the connection
+to the client pubkey.
 
-**Do not generate this key locally.** It is tempting, because the standard
-NIP-46 `bunker://` flow lets a client mint its own keypair and bind it during
-`connect` using the URI's secret. This Bunker does not work that way: it issues
-the client keypair with the connection and recognises no other. A locally
-generated key is rejected at `connect` with `Unknown client`, and because
-`nip46-signer.mjs` swallows the `connect` failure —
+**The pairing secret is effectively single-use, and a spent one fails as
+`Unknown client`.** This is the failure that costs the most time here, because
+nothing in the message points at staleness:
 
-```js
-const ready = () => (connected ??= rpc('connect', [pubkey, secret], 15000).catch(() => 'active'))
-```
+- the error names the *client*, so the client key looks guilty;
+- `nip46-signer.mjs` swallows the `connect` failure —
+  ```js
+  const ready = () => (connected ??= rpc('connect', [pubkey, secret], 15000).catch(() => 'active'))
+  ```
+  so it surfaces on the following `get_public_key`, pointing at the wrong step;
+- running a known-good pair (Codex's) through the same signer returns its
+  expected pubkey, proving signer, Bunker and relays are all sound. That control
+  is worth running, but do not over-read it: it narrows the fault to the client
+  credential without distinguishing *wrong key* from *stale secret*. Reading it
+  as "the key must be wrong" leads to inventing a mechanism where Bunker issues
+  the client key. It does not.
 
-— the error surfaces later on `get_public_key` instead, pointing at the wrong
-step. If you see `Unknown client`, the client credential is the suspect, not the
-URI. Confirm by running a known-good pair (Codex's) through the same signer: if
-that returns its expected pubkey, the signer, Bunker and relays are all fine and
-only the client key is wrong.
-
-Save both values, one per file:
+**The fix is a fresh connection, used promptly.** Delete the old connection in
+Bunker if it is listed, create a new one, paste the new URL, then mint the
+client key and connect with no gap in between:
 
 ```sh
 install -d -m 700 "${NV_HOME:?}/credentials"
 umask 077
 nano "${NV_HOME:?}/credentials/bunker-uri"
-nano "${NV_HOME:?}/credentials/bunker-client"
+```
 
+Then, in one step — generating and connecting together so the secret cannot go
+stale, and printing only public values:
+
+```sh
+node --input-type=module -e '
+import { readFileSync, writeFileSync } from "node:fs";
+import { generateSecretKey, getPublicKey, nip19 } from "nostr-tools";
+import { makeBunkerSigner } from "./mcp/tools/nip46-signer.mjs";
+const dir = process.argv[1];
+const sk = generateSecretKey();
+writeFileSync(dir + "/bunker-client", nip19.nsecEncode(sk) + "\n", { mode: 0o600 });
+console.log("client pubkey:", getPublicKey(sk));
+const signer = makeBunkerSigner(readFileSync(dir + "/bunker-uri", "utf8").trim(), nip19.nsecEncode(sk));
+console.log("bunker returned:", await signer.getPublicKey());
+process.exit(0);
+' "${NV_HOME:?}/credentials"
+```
+
+The returned pubkey must equal the assigned identity. That single result is the
+proof of **control** — not merely of possession — that a Bunker UI display
+cannot give you.
+
+Confirm permissions and that neither file is empty. A `nano` session closed
+without pasting leaves a 1-byte file, which fails later as `file is empty` from
+`readPrivateFile` rather than at the point of the mistake:
+
+```sh
 chmod 600 "${NV_HOME:?}/credentials/bunker-uri" \
   "${NV_HOME:?}/credentials/bunker-client"
 stat -f '%N %Su:%Sg mode=%Lp size=%z' \
   "${NV_HOME:?}/credentials/bunker-uri" \
   "${NV_HOME:?}/credentials/bunker-client"
 ```
+
+A correct `bunker-client` is 64 bytes (a 63-character `nsec1…` plus newline).
 
 Use `${NV_HOME:?}` rather than `$NV_HOME` throughout. In a shell where the
 variable is unset the plain form expands to nothing and `install -d
