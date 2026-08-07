@@ -96,19 +96,60 @@ function record(id) {
   child.unref()
   return true
 }
+// A subscription can die while its TCP socket stays ESTABLISHED: the host sleeps, the relay
+// drops the REQ, a middlebox half-opens the connection — no close, no error, just silence.
+// From the outside that is indistinguishable from a quiet channel, and it has already cost this
+// watcher live wake envelopes. So liveness is proven rather than assumed: ping on an interval
+// and terminate a socket that stops answering, and recycle every connection periodically, so a
+// relay that answers pings while serving nothing cannot keep us subscribed to nothing. Replay
+// after a refresh is bounded by the `#p` filter and deduplicated by `seen`, so it cannot
+// manufacture a second wake for an envelope already recorded.
+// Overridable so the reconnect behaviour can be exercised in seconds by a test rather than
+// asserted by reading the source; neither value carries authority over what is delivered.
+const interval = (name, fallback) => { const v = Number(process.env[name]); return Number.isFinite(v) && v >= 100 ? v : fallback }
+const PING_MS = interval('WAKE_PING_MS', 30_000)
+const REFRESH_MS = interval('WAKE_REFRESH_MS', 20 * 60 * 1000)
 function connect(url) {
-  let ws
+  const relay = url.replace(/^wss?:\/\//, '')
   const open = () => {
-    try { ws = new WebSocket(url) } catch { return setTimeout(open, 10_000) }
-    ws.on('open', () => ws.send(JSON.stringify(['REQ', 'wake', { kinds: [1059], '#p': [recipient], since: Math.floor(Date.now() / 1000) - 172920 } ])))
-    ws.on('message', data => { try {
-      const m = JSON.parse(data.toString())
-      if (m[0] === 'EOSE') return finishBaseline(url)
-      if (m[0] !== 'EVENT' || !m[2]?.id || seen.has(m[2].id)) return
-      if (baselineRelays?.has(url)) baseline(m[2].id)
-      else if (record(m[2].id)) mark(m[2].id)
-    } catch {} })
-    ws.on('close', () => setTimeout(open, 10_000)); ws.on('error', () => {})
+    let ws, alive = true, retired = false, planned = false
+    const timers = []
+    // 'close' follows 'error', and a terminate() scheduled here lands there too, so the
+    // reconnect must be single-shot or every fault doubles the number of live sockets.
+    // A planned refresh reconnects at once: backing off would leave the watcher deaf for ten
+    // seconds every refresh, which is the very failure this recycle exists to prevent.
+    const reopen = reason => {
+      if (retired) return
+      retired = true
+      timers.forEach(clearInterval)
+      const delay = planned ? 250 : 10_000
+      console.error(`keyless-wake: ${relay} ${reason} — reconnecting in ${delay}ms`)
+      setTimeout(open, delay)
+    }
+    try { ws = new WebSocket(url) } catch (e) { return reopen(`could not be opened (${e.message})`) }
+    ws.on('open', () => {
+      ws.send(JSON.stringify(['REQ', 'wake', { kinds: [1059], '#p': [recipient], since: Math.floor(Date.now() / 1000) - 172920 } ]))
+      timers.push(setInterval(() => {
+        if (!alive) return ws.terminate()   // the previous ping went unanswered
+        alive = false
+        try { ws.ping() } catch { ws.terminate() }
+      }, PING_MS))
+      // Baselining is a one-shot pass that exits on EOSE; recycling it would re-arm its timeout.
+      if (!baselineRelays) timers.push(setInterval(() => { console.log(`keyless-wake: ${relay} refreshing subscription`); planned = true; ws.terminate() }, REFRESH_MS))
+    })
+    ws.on('pong', () => { alive = true })
+    ws.on('message', data => {
+      alive = true
+      try {
+        const m = JSON.parse(data.toString())
+        if (m[0] === 'EOSE') return finishBaseline(url)
+        if (m[0] !== 'EVENT' || !m[2]?.id || seen.has(m[2].id)) return
+        if (baselineRelays?.has(url)) baseline(m[2].id)
+        else if (record(m[2].id)) mark(m[2].id)
+      } catch {}
+    })
+    ws.on('close', () => reopen('closed'))
+    ws.on('error', e => console.error(`keyless-wake: ${relay} socket error: ${e.message}`))
   }
   open()
 }
