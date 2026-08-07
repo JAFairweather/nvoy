@@ -15,6 +15,12 @@
 // layer, no longer the only one.
 //
 //   NVOY_NSEC=<nsec|hex> GRANTORS=<hex,hex> node tools/attention.mjs [--since-min 240] [--json]
+//   NVOY_BUNKER_URI_FILE=/path/uri NVOY_NIP46_CLIENT_NSEC_FILE=/path/client \
+//     GRANTORS=<hex,hex> node tools/attention.mjs [--since-min 240] [--json]
+//
+// Prefer the credential-file form. A path in the environment keeps the secret out of argv,
+// out of the environment block, and out of shell history; `NVOY_NSEC=$(cat key)` puts it in
+// all three, and a local `ps` reads argv of every process on the box.
 //
 // Authority model — three layers, in order:
 //   1. The grant (signed by the maintainer, revocable by a 441)  = authenticated policy
@@ -43,15 +49,31 @@ const toHex = (s) => String(s).startsWith('npub1') ? decode(s).data : String(s).
 
 // The broker normally reaches the identity through Bunker/NIP-46. Local-key support remains
 // only for existing development fixtures; production manifests select the Bunker path.
-const bunkerUri = process.env.NVOY_BUNKER_URI || ''
+// A credential file is read here rather than taken as a value, so callers never have to place a
+// secret in argv or the environment. Both spellings of the client-credential variable are accepted:
+// src/identity.ts uses NVOY_NIP46_CLIENT_NSEC_FILE, while inbox/relay-send use NVOY_NIP46_CLIENT_FILE,
+// and a tool that silently ignores the name it was not expecting pushes the caller back onto a raw key.
+const credential = (path, label) => {
+  if (!path) return ''
+  let value
+  try { value = readFileSync(path, 'utf8').trim() } catch { die(`cannot read ${label} at ${path}`) }
+  // An editor closed without pasting leaves an empty file; failing here names the real fault
+  // rather than surfacing it later as an unexplained signer error.
+  if (!value) die(`${label} at ${path} is empty`)
+  return value
+}
+const bunkerUri = credential(process.env.NVOY_BUNKER_URI_FILE, 'Bunker URI credential') || process.env.NVOY_BUNKER_URI || ''
+const clientFile = credential(process.env.NVOY_NIP46_CLIENT_NSEC_FILE || process.env.NVOY_NIP46_CLIENT_FILE, 'Bunker client credential')
 let ME, decrypt
 if (bunkerUri) {
-  const clientNsec = process.env.NVOY_NIP46_CLIENT_NSEC || die('set NVOY_NIP46_CLIENT_NSEC for the Bunker connection')
+  const clientNsec = clientFile || process.env.NVOY_NIP46_CLIENT_NSEC ||
+    die('set NVOY_NIP46_CLIENT_NSEC_FILE (preferred) or NVOY_NIP46_CLIENT_NSEC for the Bunker connection')
   const signer = makeBunkerSigner(bunkerUri, clientNsec)
   ME = await signer.getPublicKey()
   decrypt = (peer, ciphertext) => signer.nip44Decrypt(peer, ciphertext)
 } else {
-  const raw = process.env.NVOY_NSEC || die('set NVOY_NSEC or NVOY_BUNKER_URI')
+  const raw = credential(process.env.NVOY_NSEC_FILE, 'local identity credential') || process.env.NVOY_NSEC ||
+    die('set NVOY_NSEC_FILE (preferred), NVOY_NSEC, or the Bunker credential-file pair')
   const sk = raw.startsWith('nsec1') ? decode(raw).data : Uint8Array.from(Buffer.from(raw, 'hex'))
   ME = getPublicKey(sk)
   decrypt = async (peer, ciphertext) => nip44.decrypt(ciphertext, nip44.getConversationKey(sk, peer))
