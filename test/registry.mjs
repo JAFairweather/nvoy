@@ -14,8 +14,8 @@
 
 import assert from 'node:assert'
 import {
-  REGISTRY_SCOPE, REGISTRY_VERSION, buildProjection, projectionChanged, diffRosters, divergenceNote,
-  enrol, ENROL_REASONS,
+  REGISTRY_SCOPE, REGISTRY_VERSION, REGISTRY_PROJECTION_FIELD, buildProjection, projectionChanged,
+  planProjectionPublish, granteesOf, diffRosters, divergenceNote, enrol, ENROL_REASONS,
 } from '../console/registry.mjs'
 
 let pass = 0, fail = 0
@@ -151,6 +151,94 @@ t('both stores empty is a clean, verified answer', () => {
 })
 t('an unrecognised state does not get a reassuring sentence', () => {
   assert.match(divergenceNote('whatever'), /unrecognised/)
+})
+
+// ── planning the publish: the survivor list is the dangerous part ───────────
+//
+// A republish is a ROTATION. If it re-grants the wrong set, a runtime silently loses its view of the
+// roster — and the symptom of that is Nact quietly losing the ability to check, which looks exactly
+// like the bug this projection exists to fix. So every branch is pinned, including the refusals.
+
+const published = (rec, issued = []) => ({ [REGISTRY_PROJECTION_FIELD]: rec, issued })
+const roster = (...pubs) => buildProjection(idx(pubs.map(pub => ({ pub }))), { now: 1 }).payload
+
+t('never published: the plan is a first publish at generation 1 with no holders', () => {
+  const p = planProjectionPublish({}, roster(A))
+  assert.equal(p.action, 'publish')
+  assert.equal(p.generation, 1)
+  assert.deepEqual(p.grantees, [])
+})
+
+t('an UNCHANGED roster is refused, and the refusal says what republishing would cost', () => {
+  const payload = roster(A)
+  const p = planProjectionPublish(published({ scopeId: 's1', payload }, [{ scope: 's1', v: 1 }]), payload)
+  assert.equal(p.action, 'none')
+  assert.match(p.why, /rotates the scope key|re-delivery/)
+})
+
+t('a CHANGED roster rotates to the next generation and re-grants every current holder', () => {
+  const idxs = published({ scopeId: 's1', payload: roster(A) }, [{ scope: 's1', v: 4, grantees: [B, C] }])
+  const p = planProjectionPublish(idxs, roster(A, B))
+  assert.equal(p.action, 'rotate')
+  assert.equal(p.scopeId, 's1')
+  assert.deepEqual([p.from, p.to], [4, 5])
+  assert.deepEqual(p.grantees, [B, C].sort())
+})
+
+t('THE GENERATION COMES FROM THE ISSUED ENTRY, because that is what holds the key', () => {
+  // If the publish record and the issued entry disagree, a rotation ordered against the record would
+  // land at or below a generation a holder already has, and NIP-01 replacement would drop it.
+  const idxs = published({ scopeId: 's1', generation: 2, payload: roster(A) },
+    [{ scope: 's1', v: 7, grantees: [B] }])
+  const p = planProjectionPublish(idxs, roster(A, B))
+  assert.deepEqual([p.from, p.to], [7, 8], 'the plan followed the record instead of the key')
+})
+
+t('BLOCKED, not attempted, when the scope key cannot be recovered', () => {
+  // The issued entry is the only place the scope key lives. Rotating without it would publish a new
+  // generation that NO holder can read — cutting every runtime off while reporting success.
+  const p = planProjectionPublish(published({ scopeId: 's1', payload: roster(A) }, []), roster(A, B))
+  assert.equal(p.action, 'blocked')
+  assert.match(p.why, /not in your issued list/)
+  assert.match(p.why, /[Nn]othing was signed/)
+})
+
+t('BLOCKED when the publish record names no scope, and it says nothing was signed', () => {
+  const p = planProjectionPublish(published({ payload: roster(A) }), roster(A, B))
+  assert.equal(p.action, 'blocked')
+  assert.match(p.why, /[Nn]othing was signed/)
+})
+
+t('BLOCKED on an unusable generation rather than rotating from a guess', () => {
+  for (const v of [undefined, 0, -1, 'four', null]) {
+    const p = planProjectionPublish(
+      published({ scopeId: 's1', payload: roster(A) }, [{ scope: 's1', v, grantees: [B] }]), roster(A, B))
+    assert.equal(p.action, 'blocked', `v=${v} should not have produced ${p.action}`)
+  }
+})
+
+t('every plan carries exactly one recognised action — no silent fallthrough', () => {
+  const seen = new Set(['publish', 'none', 'rotate', 'blocked'])
+  const plans = [
+    planProjectionPublish({}, roster(A)),
+    planProjectionPublish(published({ scopeId: 's1', payload: roster(A) }, [{ scope: 's1', v: 1 }]), roster(A)),
+    planProjectionPublish(published({ scopeId: 's1', payload: roster(A) }, [{ scope: 's1', v: 1 }]), roster(A, B)),
+    planProjectionPublish(published({ payload: roster(A) }), roster(A, B)),
+  ]
+  for (const p of plans) assert.ok(seen.has(p.action), `unrecognised action ${p.action}`)
+  // A refusal must always carry its reason, or the console has nothing honest to print.
+  for (const p of plans) if (p.action === 'none' || p.action === 'blocked') assert.ok(p.why?.length > 20)
+})
+
+// ── the holder list, normalised ─────────────────────────────────────────────
+t('holders normalise to the join key, dedupe, and drop non-keys', () => {
+  // A non-key in this list becomes a FAILED DELIVERY mid-rotation — after some holders have been
+  // re-granted and some have not — which is the worst moment for it to be discovered.
+  assert.deepEqual(granteesOf({ grantees: [A.toUpperCase(), A, 'nope', null, 42, B] }), [A, B].sort())
+})
+t('a missing or malformed grantee list is an empty one, never a throw', () => {
+  for (const e of [null, undefined, {}, { grantees: null }, { grantees: 'B' }])
+    assert.deepEqual(granteesOf(e), [])
 })
 
 // ── the acceptance test, stated so it can fail ─────────────────────────────

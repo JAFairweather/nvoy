@@ -7,10 +7,15 @@
 // per load for display only — never stored, always current.
 
 import { nip19 } from 'nostr-tools'
-import { saveGrantIndex } from '../lib/nipxx.mjs'
-import { state, $, esc, short, fmtWhen, load, parsePub, agentsOf, agentName, openAgentPage } from './main.mjs'
+import { saveGrantIndex, newScopeKey, publishScope, fetchScope, toIssuedEntry } from '../lib/nipxx.mjs'
+import { state, $, esc, short, fmtWhen, load, parsePub, agentsOf, agentName, openAgentPage, RELAYS } from './main.mjs'
 import { openDelegationInLedger } from './ledger.mjs'
-import { REGISTRY_SCOPE, buildProjection, projectionChanged, enrol } from './registry.mjs'
+import { grantWithTerms, rotateWithTerms, opaqueScopeId, sendRevocationNotice } from './nvoygrant.mjs'
+import { appendLedger, grantedEvent, rotatedEvent, revokedEvent } from './ledgerlog.mjs'
+import {
+  REGISTRY_SCOPE, REGISTRY_PROJECTION_FIELD, buildProjection, projectionChanged,
+  planProjectionPublish, granteesOf, enrol,
+} from './registry.mjs'
 
 // Copy an npub to the clipboard with visual feedback, degrading gracefully:
 // async clipboard API → execCommand → (both blocked) select nothing and just
@@ -93,11 +98,43 @@ function agentCard(a, i) {
  * mechanism that already exists and is already audited (AD-6 — roster content is sensitive and the
  * bridge is off-box, so grant-to-app).
  */
+/**
+ * The terms the registry read grant carries.
+ *
+ * `purpose` is the line the Ledger holds you to, so it says what the grant is FOR rather than what it
+ * is — a runtime reading this roster is doing one specific job and the Ledger row should say which.
+ * `redelegate: false` because a projection is already a copy: a copy of a copy has no generation to
+ * rotate and no way to be revoked.
+ */
+const registryTerms = () => ({
+  purpose: 'read your agent registry, so this runtime can say “known only to Nvoy” instead of showing nothing',
+  no_persist: true,
+  redelegate: false,
+  contact: nip19.npubEncode(state.me),
+})
+
+/** The issued entry for the projection scope, or null. The key lives here; nothing else holds it. */
+function registryIssued() {
+  const scopeId = state.index?.[REGISTRY_PROJECTION_FIELD]?.scopeId
+  if (!scopeId) return null
+  return (state.index.issued ?? []).find(e => e?.scope === scopeId) ?? null
+}
+
 function registryPanel() {
   const { payload, dropped } = buildProjection(state.index, { now: Math.floor(Date.now() / 1000) })
-  const published = state.index?.nvoy_registry_projection || null   // { scope, generation, at, agents }
-  const changed = !published || projectionChanged(published.payload, payload)
+  const published = state.index?.[REGISTRY_PROJECTION_FIELD] || null
+  const plan = planProjectionPublish(state.index, payload)
+  const issued = registryIssued()
+  const holders = granteesOf(issued)
   const when = published?.at ? fmtWhen(published.at) : null
+
+  // A holder can only read the generation it was granted. If the issued entry has moved past the
+  // recorded publish, some holder is reading an older roster than the one you last signed — which is
+  // the projection's own staleness failure, and it must be visible here rather than inferred there.
+  const unverified = published && published.verified === false
+
+  const grantable = agentsOf().map(a => a.pub).filter(p => !holders.includes(p))
+
   return `<div class="card" style="margin-top:18px">
     <div class="sect2">Registry projection — <code>${esc(REGISTRY_SCOPE)}</code></div>
     <div class="msg" style="margin:6px 0 10px">A runtime cannot read this roster: it is encrypted to you.
@@ -108,31 +145,192 @@ function registryPanel() {
       <span class="chip">${payload.agents.length} agent${payload.agents.length === 1 ? '' : 's'}</span>
       ${dropped ? `<span class="chip warn" title="rows in your registry that are not a valid 64-hex pubkey. They are NOT projected — a slice must not receive a roster quietly shorter than yours without being told.">${dropped} unprojectable</span>` : ''}
       ${published
-        ? `<span class="chip" title="the generation a grantee must be able to read">v${esc(String(published.generation ?? '?'))}</span>
-           <span class="chip${changed ? ' warn' : ''}">${changed ? 'roster changed since publish' : `published ${esc(when || '')}`}</span>`
+        ? `<span class="chip" title="the generation a holder must be able to read">v${esc(String(issued?.v ?? published.generation ?? '?'))}</span>
+           ${unverified
+             ? '<span class="chip warn" title="the relay accepted the 30440 but it did not read back, so no runtime is known to be able to read it. Publish again.">published, but not readable back</span>'
+             : plan.action === 'none'
+               ? `<span class="chip">published ${esc(when || '')}</span>`
+               : '<span class="chip warn">roster changed since publish</span>'}`
         : '<span class="chip warn">never published — no runtime can verify this roster</span>'}
     </div>
     <div class="actions" style="margin-top:10px">
-      <button class="primary" id="reg-publish"${changed ? '' : ' disabled title="The roster has not changed. Republishing rotates the scope key and costs every grantee a re-delivery, so it is refused rather than done quietly."'}>
+      <button class="primary" id="reg-publish"${plan.action === 'none' ? ` disabled title="${esc(plan.why)}"` : ''}>
         ${published ? 'Republish projection' : 'Publish projection'}</button>
       <span class="msg" id="reg-msg"></span>
     </div>
-    <div class="msg" style="margin-top:8px">Publishing signs a 30440 and rotates its key. Each runtime that
-      should see the roster needs a read grant on this scope — grant it from the Ledger like any other
-      dataset. <b>The projection is a copy and can be stale</b>, so it carries its own
-      <code>generated_at</code> and a consumer must render that age rather than implying it is live.</div>
+
+    ${published ? `<div class="sect2" style="margin-top:16px">Who can read it</div>
+      <div class="msg" style="margin:4px 0 8px">A published projection nobody holds is still unreadable —
+        publishing and granting are two steps, and only the second one lets a runtime answer.
+        ${holders.length ? '' : '<b>No runtime holds this grant, so Nact cannot check any key against your registry yet.</b>'}</div>
+      ${holders.map(pub => `<div class="frow reg-holder" data-pub="${esc(pub)}">
+          <span>${esc(agentName(pub))} <span class="meta">${esc(short(nip19.npubEncode(pub)))}</span></span>
+          <button class="reg-revoke" title="Rotates the scope key and re-grants everyone else. This runtime keeps whatever roster it already read — unavoidable, and honest to say so — and is cut off from every update after this.">Revoke read</button>
+        </div>`).join('')}
+      <div class="newbar" style="margin-top:10px">
+        <select id="reg-grantee"${grantable.length ? '' : ' disabled'}>
+          ${grantable.length
+            ? grantable.map(p => `<option value="${esc(p)}">${esc(agentName(p))} — ${esc(short(nip19.npubEncode(p)))}</option>`).join('')
+            : '<option>every registered agent already holds it</option>'}
+        </select>
+        <button id="reg-grant"${grantable.length ? '' : ' disabled'}>Grant read</button>
+      </div>
+      <div class="msg" id="reg-hmsg" style="margin-top:6px"></div>` : ''}
+
+    <div class="msg" style="margin-top:12px">Publishing signs a 30440; republishing rotates its key and
+      re-delivers to every holder above. <b>The projection is a copy and can be stale</b>, so it carries
+      its own <code>generated_at</code> and a consumer must render that age rather than implying it is
+      live.</div>
   </div>`
 }
 
+/**
+ * Publish the projection for real.
+ *
+ * THE ORDER HERE IS THE POINT. Sign → record → verify → report, and the verification result is STORED,
+ * not just displayed. A relay can accept a 30440 that no relay will then serve back; if that happens,
+ * the roster is not readable by anybody and saying "published" would be a fabricated success on the
+ * exact surface whose job is to make an invisible absence visible (AD-11).
+ *
+ * The record is written BEFORE verification because it is bookkeeping of what was signed, and that did
+ * happen — losing it would strand the scope key and make the next rotation impossible. What must never
+ * be claimed is readability, so `verified` is a stored field and the chip renders it.
+ */
 function wireRegistryPanel() {
-  const btn = $('reg-publish'); if (!btn) return
+  const btn = $('reg-publish')
+  if (!btn) return
   const msg = $('reg-msg')
+
   btn.onclick = async () => {
-    // Not wired to a publish path in this change: signing a 30440 and rotating its key belongs with
-    // the grant flow, and a button that appeared to publish while doing nothing is the defect this
-    // whole wave has been removing. It states that plainly rather than failing silently.
-    msg.textContent = 'nothing changed: publishing the projection is not wired yet — '
-      + 'the scope + rotation path lands with the read grant, and nothing was signed.'
+    const stop = (why) => { msg.textContent = `nothing changed: ${why}` }
+    const now = () => Math.floor(Date.now() / 1000)
+    const { payload } = buildProjection(state.index, { now: now() })
+    const plan = planProjectionPublish(state.index, payload)
+    if (plan.action === 'none' || plan.action === 'blocked') return stop(plan.why)
+
+    btn.disabled = true
+    try {
+      let scopeId, generation, scopeKey
+      if (plan.action === 'publish') {
+        // Opaque, like every other scope in the estate: a semantic `d` tag would tell any relay that
+        // this pubkey maintains an agent roster and how often it changes. The grantee learns the name
+        // from `scope_name` inside its gift-wrapped grant, which is the channel that is actually private.
+        scopeId = opaqueScopeId(); generation = 1; scopeKey = newScopeKey()
+        msg.textContent = 'publishing the projection (30440)…'
+        await publishScope(state.relay, state.signer, { scopeId, generation, scopeKey, payload })
+      } else {
+        scopeId = plan.scopeId
+        msg.textContent = plan.grantees.length
+          ? `rotating to v${plan.to} and re-delivering to ${plan.grantees.length} holder(s)…`
+          : `rotating to v${plan.to}…`
+        const rot = await rotateWithTerms(state.relay, state.signer, {
+          scopeId, generation: plan.from, payload, scopeName: REGISTRY_SCOPE,
+          survivors: plan.grantees.map(pub => ({ pub, terms: registryTerms() })), relayHint: RELAYS[0],
+        })
+        generation = rot.generation; scopeKey = rot.scopeKey
+      }
+
+      msg.textContent = 'recording in your Grant Index…'
+      const others = (state.index.issued ?? []).filter(e => e?.scope !== scopeId)
+      state.index.issued = [...others,
+        toIssuedEntry({ scopeId, scopeName: REGISTRY_SCOPE, generation, scopeKey }, plan.grantees)]
+      state.index[REGISTRY_PROJECTION_FIELD] = {
+        scopeId, scopeName: REGISTRY_SCOPE, generation, at: now(), payload, verified: false,
+      }
+      if (plan.action === 'rotate') {
+        state.index.nvoy_ledger = appendLedger(state.index,
+          rotatedEvent({ scope: scopeId, from_v: plan.from, to_v: generation, survivors: plan.grantees }))
+      }
+      await saveGrantIndex(state.relay, state.signer, state.index)
+
+      // Read-back, the house pattern: a relay acknowledgement is not evidence that anyone can read it.
+      msg.textContent = 'verifying the projection reads back…'
+      const back = await fetchScope(state.relay, { publisher: state.me, scopeId, generation, scopeKey })
+      if (back.status === 'ok') {
+        state.index[REGISTRY_PROJECTION_FIELD].verified = true
+        await saveGrantIndex(state.relay, state.signer, state.index)
+        msg.textContent = `published v${generation} — ${payload.agents.length} agent(s), read back and verified.`
+          + (plan.grantees.length ? '' : ' No runtime holds it yet — grant read below.')
+      } else {
+        msg.textContent = `the relay accepted v${generation} but it did not read back (${back.status}), `
+          + 'so nothing is claimed as readable. Your scope key is recorded — publish again.'
+      }
+      await load()
+    } catch (err) {
+      stop(err.message)
+    } finally {
+      btn.disabled = false
+    }
+  }
+
+  wireRegistryHolders()
+}
+
+/** Grant and revoke the projection read. Both are the existing mechanisms, on the existing key. */
+function wireRegistryHolders() {
+  const msg = $('reg-hmsg')
+  const grant = $('reg-grant')
+
+  if (grant) grant.onclick = async () => {
+    const pub = $('reg-grantee')?.value
+    const issued = registryIssued()
+    if (!pub) return
+    if (!issued) { msg.textContent = 'nothing changed: the projection scope is not in your issued list, so its key cannot be recovered.'; return }
+    grant.disabled = true
+    try {
+      const scopeKey = Uint8Array.from(atob(issued.key), c => c.charCodeAt(0))   // the SAME key — same value, no rotation
+      const terms = registryTerms()
+      msg.textContent = `granting read to ${agentName(pub)} (v${issued.v}, same value)…`
+      await grantWithTerms(state.relay, state.signer, pub, {
+        scopeId: issued.scope, generation: issued.v, scopeKey, scopeName: REGISTRY_SCOPE,
+        relayHint: RELAYS[0], terms,
+      })
+      issued.grantees = [...granteesOf(issued), pub]
+      state.index.nvoy_ledger = appendLedger(state.index, grantedEvent({
+        scope: issued.scope, agent: pub, v: issued.v, terms: { nvoy: 1, ...terms }, name: REGISTRY_SCOPE,
+      }))
+      await saveGrantIndex(state.relay, state.signer, state.index)
+      await load()
+    } catch (err) { msg.textContent = `nothing changed: ${err.message}` }
+    finally { grant.disabled = false }
+  }
+
+  for (const row of document.querySelectorAll('#agents .reg-holder')) {
+    const pub = row.dataset.pub
+    const btn = row.querySelector('.reg-revoke')
+    if (!btn) continue
+    btn.onclick = async () => {
+      const issued = registryIssued()
+      if (!issued) { msg.textContent = 'nothing changed: the projection scope is not in your issued list.'; return }
+      btn.disabled = true
+      try {
+        // Revocation IS the rotation — the claim this panel's own header makes. Survivors are everyone
+        // else; the revoked runtime keeps whatever roster it already read and gets nothing after this.
+        const survivors = granteesOf(issued).filter(p => p !== pub)
+        const from = Number(issued.v)
+        msg.textContent = `rotating past ${agentName(pub)} and re-delivering to ${survivors.length} holder(s)…`
+        const { payload } = buildProjection(state.index, { now: Math.floor(Date.now() / 1000) })
+        const rot = await rotateWithTerms(state.relay, state.signer, {
+          scopeId: issued.scope, generation: from, payload, scopeName: REGISTRY_SCOPE,
+          survivors: survivors.map(p => ({ pub: p, terms: registryTerms() })), relayHint: RELAYS[0],
+        })
+        await sendRevocationNotice(state.relay, state.signer, pub, {
+          scopeId: issued.scope, reason: 'the registry projection read was revoked',
+        })
+        issued.v = rot.generation
+        issued.key = btoa(String.fromCharCode(...rot.scopeKey))
+        issued.grantees = survivors
+        const rec = state.index[REGISTRY_PROJECTION_FIELD]
+        if (rec) { rec.generation = rot.generation; rec.at = Math.floor(Date.now() / 1000); rec.payload = payload }
+        state.index.nvoy_ledger = appendLedger(state.index, revokedEvent({
+          scope: issued.scope, agent: pub, v: rot.generation,
+          reason: 'the registry projection read was revoked', notice: null,
+        }))
+        await saveGrantIndex(state.relay, state.signer, state.index)
+        await load()
+      } catch (err) { msg.textContent = `nothing changed: ${err.message}` }
+      finally { btn.disabled = false }
+    }
   }
 }
 
