@@ -20,8 +20,10 @@ not authorization by itself.
 
 ## Operator quick path: the existing `claude-jaf` identity
 
-This section is the concrete path for the identity already created for issue
-#113. Run the shell commands on the owner's Mac unless the heading says
+This section is the concrete path for the identity already created for the
+Claude participant release. (Earlier drafts cited waggle #113 as the tracker;
+that is an unrelated closed issue and was a mis-citation.) Run the shell
+commands on the owner's Mac unless the heading says
 **broker host**. The Bunker import and the console grants are UI operations;
 they cannot be replaced by a local `node` command.
 
@@ -86,15 +88,30 @@ In the Waggle Console's Access page:
    `npub145zmqrhyjgqdt0f83ra6fqrzrwnqpy3y7q0y3vlfhnsszqzzr4wqtqq92y`
 2. Select channel UUID:
    `a8186b53-537d-46ad-a7e7-b6486c58970e`
-3. Issue the scoped `admit` grant.
-4. In Nvoy Console, create exactly these two grants:
+3. Issue the scoped `admit` grant. **Done — live since 2026-08-06**, confirmed
+   by cold read of the public kind:440 off the configured relays.
+4. In Nvoy Console, create exactly these two grants. **Neither exists yet**;
+   a cold read filtered to `ad05b00e…` as agent subject returns nothing:
    - James Fairweather → Claude: `task`
    - Waggle carrier → Claude: `task-relay`
 5. Verify the grants are attached to `claude-jaf`, not Codex, Claude OG, or a
    burner identity.
 
+Confirm step 4 the same way, from waggle:
+
+```sh
+node tools/grant.mjs list --grantor "$OWNER_PUBKEY" --agent "$CLAUDE_PUBKEY"
+```
+
+`list` reads relays and takes no signer. Run it against Codex's pubkey too:
+the scope tag is a salted hash, so a filter that silently matches nothing is
+indistinguishable from a correct empty result unless you have seen it return a
+known-good row.
+
 The Nvoy grants authorize the already-admitted participant; they do not grant
-general authority and cannot be replaced by channel membership alone.
+general authority and cannot be replaced by channel membership alone. Until
+both exist, an authorised mention produces no invocation and no reply — the
+designed default-closed behaviour, not a fault to debug.
 
 ### C. Verification checkpoint before deployment
 

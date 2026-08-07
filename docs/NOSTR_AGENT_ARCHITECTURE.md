@@ -69,9 +69,10 @@ is model-specific:
   browser inspection are failed experiments, not fallback architecture.
 - **Claude Code:** `claude-channel.mjs` implements the native Channel MCP notification plus exact
   `nvoy_channel_read` and receipt-bound `nvoy_channel_reply`. The code and tests exist; the
-  distinct Claude participant (`ad05b00e…`) has been minted and published, but its isolated
-  runtime and end-to-end live wake/reply proof are still pending. Claude OG is a separate
-  historical identity and must not be reused for this proof.
+  distinct Claude participant (`ad05b00e…`) has been minted, published and admitted to the
+  channel, but its Bunker pairing, isolated runtime, wake authorities and end-to-end live
+  wake/reply proof are still pending. Claude OG is a separate historical identity and must not be
+  reused for this proof.
 
 Codex uses a separate `codex-channel-mcp.mjs` fixed-instance reader for deliberate queue
 inspection; it does not consume Claude's native notification protocol. A Codex task still uses its
@@ -137,7 +138,14 @@ forwarding, container selection or caller-selected command.
 | Identity | Runtime | Session interaction | MCP attachment | Live status |
 |---|---|---|---|---|
 | Codex `231952cb…` (`codex-jaf`) | Deployed: separate watcher/broker/adapter containers | App Server binder deployed and exercised against the `waggle dev` task | Fixed-instance reader shipped and its server handshake is proven; the exact task still needs reload/attachment proof | Channel wake/reply has partial live proofs; clean same-task MCP read + fresh nonce proof remains |
-| Claude `ad05b00e…` (distinct from Claude OG) | Identity minted; kind:0 and kind:10002 published to the configured relays; runtime not yet deployed | Native Claude Code Channel implementation exists | Not attached to a live Claude session | Admission, Bunker pairing, isolated runtime, and end-to-end wake/read/reply proof pending under #113 |
+| Claude `ad05b00e…` (distinct from Claude OG) | Identity minted; kind:0 and kind:10002 published to the configured relays; channel `admit` grant live, cold-read from relays 2026-08-06; runtime not yet deployed | Native Claude Code Channel implementation exists | Not attached to a live Claude session | Bunker pairing, the participant-scoped `task` and `task-relay` grants, isolated runtime, and end-to-end wake/read/reply proof all pending |
+
+Claude's `admit` is live but its two wake authorities are not: no grant is scoped to `ad05b00e…`
+as agent subject. Per the grant separation above, `admit` alone cannot wake a participant, so an
+authorised mention today correctly produces no invocation and no reply. Read that state with
+waggle's `tools/grant.mjs list --grantor <owner> --agent <subject>`, which needs no signer — and
+run it against a known-good subject as well as the one under test, because a scope filter that
+matches nothing looks identical to one that is broken.
 
 The older general `deploy-nvoy-mcp-1` service is Nvoy’s scoped-data MCP and is not a substitute for
 either participant runtime. Never infer agent identity from that container or reuse its credential.
