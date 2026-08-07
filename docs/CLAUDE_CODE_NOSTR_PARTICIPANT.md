@@ -65,41 +65,44 @@ In `https://bunker.nave.pub`:
 3. Create a dedicated NIP-46 connection for `claude-jaf`.
 4. Copy the `bunker://…` URI. Do not paste it into chat or a PR.
 
-**Only one of the two credential files comes from Bunker.** They have different
-origins, and treating them alike sends you hunting for a value the Bunker never
-displays:
+**Both credential values come from Bunker.** Capture them together when you
+create the connection — the client credential is not recoverable afterwards
+without creating a new connection:
 
 | File | Contents | Origin |
 |---|---|---|
-| `bunker-uri` | `bunker://<64-hex>?relay=wss://…&secret=…` | Bunker displays it; paste it |
-| `bunker-client` | an `nsec1…` NIP-46 **client transport key** | generated locally; Bunker never shows it |
+| `bunker-uri` | `bunker://<64-hex>?relay=wss://…&secret=…` | Bunker displays it |
+| `bunker-client` | an `nsec1…` NIP-46 **client transport key** | Bunker displays it |
 
 The client transport key is a separate keypair used only to encrypt the NIP-46
 conversation with the Bunker (`nip46-signer.mjs` derives a nip44 conversation
 key from it and the Bunker pubkey, authenticating with the URI's `secret`). It
-is **not** the participant identity nsec — that stays in the Bunker — and it
-must be **stable** across restarts, because the Bunker binds the connection to
-the client pubkey. A freshly generated key each boot presents as an unknown
-client and the connection hangs.
+is **not** the participant identity nsec — that stays in the Bunker.
 
-Paste the URI:
+**Do not generate this key locally.** It is tempting, because the standard
+NIP-46 `bunker://` flow lets a client mint its own keypair and bind it during
+`connect` using the URI's secret. This Bunker does not work that way: it issues
+the client keypair with the connection and recognises no other. A locally
+generated key is rejected at `connect` with `Unknown client`, and because
+`nip46-signer.mjs` swallows the `connect` failure —
+
+```js
+const ready = () => (connected ??= rpc('connect', [pubkey, secret], 15000).catch(() => 'active'))
+```
+
+— the error surfaces later on `get_public_key` instead, pointing at the wrong
+step. If you see `Unknown client`, the client credential is the suspect, not the
+URI. Confirm by running a known-good pair (Codex's) through the same signer: if
+that returns its expected pubkey, the signer, Bunker and relays are all fine and
+only the client key is wrong.
+
+Save both values, one per file:
 
 ```sh
 install -d -m 700 "${NV_HOME:?}/credentials"
 umask 077
 nano "${NV_HOME:?}/credentials/bunker-uri"
-```
-
-Generate the client transport key. This prints only the public half:
-
-```sh
-node --input-type=module -e '
-import { generateSecretKey, getPublicKey, nip19 } from "nostr-tools";
-import { writeFileSync } from "node:fs";
-const sk = generateSecretKey();
-writeFileSync(process.argv[1], nip19.nsecEncode(sk) + "\n", { mode: 0o600 });
-console.log("client transport pubkey:", getPublicKey(sk));
-' "${NV_HOME:?}/credentials/bunker-client"
+nano "${NV_HOME:?}/credentials/bunker-client"
 
 chmod 600 "${NV_HOME:?}/credentials/bunker-uri" \
   "${NV_HOME:?}/credentials/bunker-client"
