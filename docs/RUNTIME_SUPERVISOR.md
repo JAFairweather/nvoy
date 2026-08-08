@@ -437,12 +437,13 @@ connect to the adapter socket, replace the adapter socket, or forge the admitted
 `NVOY_BOUNDARY_TEST` overrides the *path* to that script; it does not enable it. There is no
 environment variable that turns the gate off.
 
-`test/instance-runtime-container.mjs` is **not** the production gate and must not be read as one. It
-is a near-duplicate that never executes: it is skip-guarded on `NVOY_CONTAINER_TEST`, which nothing
-in this repo sets, so on every CI run it prints a skip line and passes. It does still carry two
-assertions the live gate does not make — that the worker cannot *replace* the admitted queue, and
-that it can write only its own bounded reply queue — so it should not simply be deleted until those
-are ported across. See #153.
+There is no second boundary artifact. `test/instance-runtime-container.mjs` used to sit beside this
+one as a near-duplicate that never executed — skip-guarded on `NVOY_CONTAINER_TEST`, which nothing in
+this repo set, so it printed a skip line and passed on every CI run. Its three genuinely distinct
+assertions were ported into the gate above and the file was removed (#153); a permanently-skipped
+near-duplicate of a live gate is what caused the gate to be misattributed in this document in the
+first place. Add boundary assertions to `deploy/runtime-image-boundary.py`, where they will actually
+run, and never behind an opt-in variable.
 
 The rendered Compose file is root-owned `0644`. The credential remains host-local, mode `0600`,
 and mounts only into the broker.
