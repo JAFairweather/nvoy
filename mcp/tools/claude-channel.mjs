@@ -37,7 +37,16 @@ const channelStateDir = resolve(manifest.runtimeDir, 'claude-channel-state')
 const readPath = resolve(channelStateDir, 'read.jsonl')
 const replyPath = resolve(manifest.runtimeDir, 'reply-requests.jsonl')
 const HEX64 = /^[0-9a-f]{64}$/
-const notifiedThisRun = new Set()
+// Claude Code has no notification acknowledgement, and a session that is not yet accepting
+// injections drops what it is sent without telling anyone. Notifying once therefore loses the
+// wake permanently: the queue record is present, the client reports the channel registered, and
+// nothing ever appears — observed, on the wire, with the frame delivered 4ms after the client's
+// own `initialized`. So an unread envelope is announced again on an interval until it is read.
+// The announcement carries no message body and the envelope is the same each time, so a repeat
+// is idempotent; `nvoy_channel_read` is the only thing that stops it.
+const renotifyMs = Number(flag('--renotify-ms') || 30000)
+if (!Number.isInteger(renotifyMs) || renotifyMs < 1000 || renotifyMs > 600000) die('--renotify-ms must be 1000..600000')
+const notifiedThisRun = new Map()
 
 // One participant identity may bind one live Claude channel only. A second session would receive
 // the same marker and become a duplicate responder. Reclaim only a lock whose recorded PID is
@@ -195,19 +204,31 @@ mcp.setRequestHandler(CallToolRequestSchema, async request => {
   } catch (error) { return toolResult({ code: 'NVOY_REPLY_QUEUE_FAILED', message: error.message }, true) }
 })
 
+// connect() resolves as soon as the pipe is up, which is BEFORE the client has initialised the
+// session and registered its channel handler. A notification sent in that window is discarded
+// by the client — and because the envelope is already in `notifiedThisRun`, it is never sent
+// again. The wake is then lost in silence, which is precisely the failure this channel exists
+// to prevent: the queue record is present, the client reports the channel registered, and
+// nothing ever appears. So no notification leaves this process until the client says it is
+// ready, and the first poll is driven by that signal rather than by the transport.
+let initialized = false
+mcp.oninitialized = () => { initialized = true; void poll() }
 await mcp.connect(new StdioServerTransport())
 let polling = false
 async function poll() {
-  if (polling) return
+  if (!initialized || polling) return
   polling = true
   try {
     const read = readIds()
+    const now = Date.now()
     for (const task of tasks()) {
-      if (read.has(task.envelope) || notifiedThisRun.has(task.envelope)) continue
-      // Claude Code has no notification acknowledgement. Mark in memory before writing so a
-      // fast tool call can read immediately; a process restart intentionally re-notifies every
-      // envelope that never reached nvoy_channel_read.
-      notifiedThisRun.add(task.envelope)
+      if (read.has(task.envelope)) { notifiedThisRun.delete(task.envelope); continue }
+      // Mark in memory before writing so a fast tool call can read immediately, and re-announce
+      // only after the interval — an envelope nobody has read is worth repeating, but not once
+      // per poll.
+      const last = notifiedThisRun.get(task.envelope)
+      if (last !== undefined && now - last < renotifyMs) continue
+      notifiedThisRun.set(task.envelope, now)
       try {
         await mcp.notification({ method: 'notifications/claude/channel', params: {
           content: 'A broker-admitted Nostr envelope is ready. Read it with nvoy_channel_read before deciding whether to act.',
@@ -218,5 +239,4 @@ async function poll() {
   } catch (error) { console.error(`nvoy-claude-channel: poll failed: ${error.message || error}`) }
   finally { polling = false }
 }
-await poll()
 setInterval(() => void poll(), pollMs)
