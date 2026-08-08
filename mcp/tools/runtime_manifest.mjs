@@ -96,6 +96,16 @@ export function readManifest(root, requestedId) {
   const workerUid = Number(raw.worker_uid ?? raw.workerUid)
   if (![watcherUid, brokerUid, adapterUid, workerUid].every(v => Number.isInteger(v) && v > 0)) die('manifest requires positive watcher_uid, broker_uid, adapter_uid, and worker_uid')
   if (new Set([watcherUid, brokerUid, adapterUid, workerUid]).size !== 4) die('watcher_uid, broker_uid, adapter_uid, and worker_uid must be distinct')
+  // The channel forced command has to name the adapter container exactly. Left to Compose that
+  // name is *derived* — project prefix, service, replica index — so renaming the project or
+  // changing the stack layout silently retargets an installed principal at a container that no
+  // longer exists, and the only symptom is a channel that goes quiet (#154).
+  //
+  // Declaring it here gives the Compose file and the principal one authority to read. The default
+  // is byte-for-byte what Compose already generates, replica suffix included, so pinning it
+  // renames nothing on a running stack — it only stops the name being able to move.
+  const adapterContainer = String(raw.adapter_container || raw.adapterContainer || '') || `nvoy-${id}-adapter-1`
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(adapterContainer)) die('adapter_container must be a valid Docker container name')
   const workerImage = String(raw.worker_image || raw.workerImage || '')
   const workerRunner = String(raw.worker_runner || raw.workerRunner || '')
   const workerCredentialRef = String(raw.worker_credential_ref || raw.workerCredentialRef || '')
@@ -146,7 +156,7 @@ export function readManifest(root, requestedId) {
     }
   }
   return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, carriers: Object.freeze(carriers), relays, stateDir, runtimeDir, spoolDir,
-    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath, codexAppBundleId, codexProjectLabel, codexChatLabel, codexUiDriver,
+    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, adapterContainer, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath, codexAppBundleId, codexProjectLabel, codexChatLabel, codexUiDriver,
     sshTarget, sshIdentityFile, sshKnownHostsFile, sshKnownHostsSha256, approvalEndpoint: approvalEndpoint.replace(/\/$/, '') })
 }
 
