@@ -18,7 +18,7 @@ import { spawnSync } from 'node:child_process'
 import { lstatSync, readFileSync, writeFileSync } from 'node:fs'
 import { resolve, join } from 'node:path'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
-import { principalLine, principalComment, forcedCommand, verifyPrincipal, parsePrincipal } from './participant_unit.mjs'
+import { principalLine, principalComment, forcedCommand, verifyPrincipal, parsePrincipal, volumeLifecycle } from './participant_unit.mjs'
 
 const TOOL = 'instance-unit'
 const die = m => { console.error(`${TOOL}: ${m}`); process.exit(1) }
@@ -27,9 +27,11 @@ const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : proce
 const has = n => process.argv.includes(n)
 
 const verb = process.argv[2] || ''
-if (!['render', 'verify'].includes(verb)) {
-  die('usage: instance-unit.mjs render --instance <id> --image <ref> [--public-key-file <p>] [--out-dir <d>]\n' +
-      '       instance-unit.mjs verify --instance <id> --authorized-keys <path>')
+if (!['render', 'verify', 'restart', 'destroy'].includes(verb)) {
+  die('usage: instance-unit.mjs render  --instance <id> --image <ref> [--public-key-file <p>] [--out-dir <d>]\n' +
+      '       instance-unit.mjs verify  --instance <id> --authorized-keys <path>\n' +
+      '       instance-unit.mjs restart --instance <id> --compose-file <path> [--dry-run]\n' +
+      '       instance-unit.mjs destroy --instance <id> --compose-file <path> --i-understand-this-destroys <id> [--dry-run]')
 }
 const id = flag('--instance')
 if (!id) die('--instance is required')
@@ -91,6 +93,56 @@ if (verb === 'render') {
   console.log(`  adapter container: ${manifest.adapterContainer}`)
   if (!principal) console.error(`${TOOL}: no --public-key-file given, so the unit's access surface was NOT rendered`)
   process.exit(0)
+}
+
+if (verb === 'restart' || verb === 'destroy') {
+  // Two named verbs instead of one flag. `docker compose down` and `docker compose down -v` differ
+  // by one character and by whether the identity survives, so the difference is put in the verb
+  // where it cannot be fat-fingered, and the cost is printed at the point of use rather than left
+  // in a document someone is expected to have read (#155).
+  const composeFile = flag('--compose-file')
+  if (!composeFile) die(`--compose-file <path> is required to ${verb} the unit`)
+  const compose = boundedFile(composeFile, 'compose file', 1024 * 1024)
+  if (compose.missing) die(`compose file ${composeFile} does not exist`)
+  const docker = process.env.NVOY_DOCKER || 'docker'
+  const dryRun = has('--dry-run')
+  const lifecycle = volumeLifecycle(manifest)
+
+  if (verb === 'restart') {
+    // Containers are cattle: recreate them and keep every volume. Nothing here may take `-v`.
+    const args = ['compose', '-f', resolve(composeFile), 'up', '-d', '--force-recreate']
+    console.log(`${TOOL}: restart ${manifest.id} — recreates containers, KEEPS all ${lifecycle.length} volumes`)
+    for (const v of lifecycle) console.log(`  keep ${v.volume}`)
+    console.log(`  ${docker} ${args.join(' ')}`)
+    if (dryRun) process.exit(0)
+    const result = spawnSync(docker, args, { stdio: 'inherit', env: process.env })
+    process.exit(result.status === 0 ? 0 : 1)
+  }
+
+  // destroy — the irreversible one.
+  console.error(`${TOOL}: destroy ${manifest.id} would DROP ${lifecycle.length} volume(s):`)
+  for (const v of lifecycle) {
+    console.error(`  ${v.volume}`)
+    console.error(`    holds: ${v.holds}`)
+    console.error(`    losing it: ${v.losing}`)
+  }
+  const unrecoverable = lifecycle.filter(v => !v.reRenderable)
+  if (unrecoverable.length) {
+    console.error(`${TOOL}: ${unrecoverable.length} of these CANNOT be re-rendered from the manifest:`)
+    for (const v of unrecoverable) console.error(`  ${v.volume}`)
+    console.error(`${TOOL}: this is destroying an identity, not restarting compute. Use \`restart\` to recreate containers.`)
+  }
+  // The token has to be the instance id, so an operator cannot confirm a destroy they were not
+  // looking at — a bare --yes would confirm whichever unit the shell history happened to name.
+  const token = flag('--i-understand-this-destroys')
+  if (token !== manifest.id) {
+    die(`refusing to destroy ${manifest.id}: pass --i-understand-this-destroys ${manifest.id}`)
+  }
+  const args = ['compose', '-f', resolve(composeFile), 'down', '-v']
+  console.error(`  ${docker} ${args.join(' ')}`)
+  if (dryRun) { console.error(`${TOOL}: --dry-run, nothing was destroyed`); process.exit(0) }
+  const result = spawnSync(docker, args, { stdio: 'inherit', env: process.env })
+  process.exit(result.status === 0 ? 0 : 1)
 }
 
 // verify

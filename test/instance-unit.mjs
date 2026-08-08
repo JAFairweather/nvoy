@@ -12,7 +12,7 @@ import { spawnSync } from 'node:child_process'
 import { generateSecretKey, getPublicKey } from 'nostr-tools/pure'
 import * as nip19 from 'nostr-tools/nip19'
 import { readManifest } from '../mcp/tools/runtime_manifest.mjs'
-import { forcedCommand, principalLine, parsePrincipal, verifyPrincipal } from '../mcp/tools/participant_unit.mjs'
+import { forcedCommand, principalLine, parsePrincipal, verifyPrincipal, volumeLifecycle } from '../mcp/tools/participant_unit.mjs'
 
 let fails = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); if (!value) fails++ }
@@ -134,6 +134,56 @@ ok('the forced command names the manifest container, uid, gid and instance', (()
   const c = forcedCommand(m)
   return c.includes('nvoy-claude-test-adapter-1') && c.includes('--user 41014:41002') && c.endsWith('--instance claude-test')
 })())
+
+// ---- restart vs destroy: one verb each, never one flag ----
+// docker is stubbed so the verbs can be driven without a daemon. The property under test is which
+// command each verb WOULD run: `-v` is the whole difference between restarting compute and
+// destroying an identity.
+const bin = join(root, 'bin')
+mkdirSync(bin)
+const calls = join(root, 'docker-calls.log')
+const fakeDocker = join(bin, 'fake-docker')
+writeFileSync(fakeDocker, `#!/bin/sh\nprintf 'docker %s\\n' "$*" >> ${JSON.stringify(calls)}\nexit 0\n`, { mode: 0o755 })
+const composeFile = join(root, 'claude-test.compose.yml')
+writeFileSync(composeFile, 'name: nvoy-claude-test\nservices: {}\n')
+const dockerEnv = { ...env, NVOY_DOCKER: fakeDocker }
+const lifecycle = volumeLifecycle(m)
+const run = (...args) => spawnSync(process.execPath, ['mcp/tools/instance-unit.mjs', ...args], { cwd: resolve('.'), encoding: 'utf8', env: dockerEnv })
+const readCalls = () => (existsSync(calls) ? readFileSync(calls, 'utf8') : '')
+
+ok('a worker-disabled identity has four volumes, not five — the worker credential belongs to a worker', lifecycle.length === 4 && !lifecycle.some(v => v.suffix === 'worker_credentials'))
+ok('the Bunker credential volume is marked as NOT re-renderable from the manifest', lifecycle.find(v => v.suffix === 'broker_credentials')?.reRenderable === false)
+
+const restartDry = run('restart', '--instance', 'claude-test', '--compose-file', composeFile, '--dry-run')
+ok('restart names every volume it will keep', restartDry.status === 0 && /KEEPS all 4 volumes/.test(restartDry.stdout) && /keep nvoy-claude-test_broker_credentials/.test(restartDry.stdout))
+ok('restart would force-recreate the containers', /up -d --force-recreate/.test(restartDry.stdout))
+ok('restart NEVER offers to drop a volume — the one-flag difference cannot be reached from this verb', !/ -v\b/.test(restartDry.stdout) && !/\bdown\b/.test(restartDry.stdout))
+ok('a dry run executes no docker at all', readCalls() === '')
+
+const restartReal = run('restart', '--instance', 'claude-test', '--compose-file', composeFile)
+ok('restart actually invokes compose up, not down', restartReal.status === 0 && /compose -f .* up -d --force-recreate/.test(readCalls()) && !/down/.test(readCalls()))
+
+writeFileSync(calls, '')
+const noToken = run('destroy', '--instance', 'claude-test', '--compose-file', composeFile)
+ok('destroy without the confirmation token refuses', noToken.status === 1 && /refusing to destroy claude-test/.test(noToken.stderr))
+ok('destroy states the Bunker re-pair cost BEFORE it refuses, so the operator learns it from the tool', /BUNKER RE-PAIR/.test(noToken.stderr))
+ok('destroy names which volumes cannot be re-rendered from the manifest', /CANNOT be re-rendered/.test(noToken.stderr) && /nvoy-claude-test_broker_credentials/.test(noToken.stderr))
+ok('destroy says plainly that this is destroying an identity rather than restarting compute', /destroying an identity, not restarting compute/.test(noToken.stderr))
+ok('a refused destroy runs no docker', readCalls() === '')
+
+const wrongToken = run('destroy', '--instance', 'claude-test', '--compose-file', composeFile, '--i-understand-this-destroys', 'some-other-id')
+ok('a confirmation token naming a DIFFERENT unit is refused — you cannot confirm a destroy you were not looking at', wrongToken.status === 1 && /refusing to destroy claude-test/.test(wrongToken.stderr))
+ok('a mis-confirmed destroy runs no docker', readCalls() === '')
+
+const destroyDry = run('destroy', '--instance', 'claude-test', '--compose-file', composeFile, '--i-understand-this-destroys', 'claude-test', '--dry-run')
+ok('a correctly confirmed destroy is accepted, so the guard is not simply refusing everything', destroyDry.status === 0 && /nothing was destroyed/.test(destroyDry.stderr))
+ok('a dry-run destroy still runs no docker', readCalls() === '')
+
+const destroyReal = run('destroy', '--instance', 'claude-test', '--compose-file', composeFile, '--i-understand-this-destroys', 'claude-test')
+ok('a confirmed destroy invokes compose down WITH -v', destroyReal.status === 0 && /compose -f .* down -v/.test(readCalls()))
+
+const missingCompose = run('restart', '--instance', 'claude-test', '--compose-file', join(root, 'no-such.yml'))
+ok('a missing compose file is refused rather than passed to docker', missingCompose.status === 1 && /does not exist/.test(missingCompose.stderr))
 
 console.log(fails ? `\ninstance-unit: ${fails} FAILED` : '\nall passed')
 process.exit(fails ? 1 : 0)
