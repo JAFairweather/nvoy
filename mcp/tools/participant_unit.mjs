@@ -19,6 +19,39 @@ const NODE = '/usr/local/bin/node'
 const DOCKER = '/usr/bin/docker'
 const TOOL = '/srv/nvoy/mcp/tools/claude-channel.mjs'
 
+// The containers of a participant stack are genuinely disposable — a read-only rootfs with only /tmp
+// as tmpfs, so all state is forced into named volumes. The containers are cattle; these volumes are
+// pets, and `docker compose down` and `docker compose down -v` differ by one flag and by everything
+// else (#155).
+//
+// `reRenderable: false` marks what a manifest CANNOT reconstitute. That is the whole reason a
+// participant is stateful rather than declarative, and it was previously discoverable only by
+// getting it wrong.
+export const VOLUMES = Object.freeze([
+  Object.freeze({ suffix: 'watcher_spool', reRenderable: true,
+    holds: 'keyless-wake-seen.log, the wake queue, and retired envelope markers',
+    losing: 'the watcher re-scans its 48h relay window and re-records envelopes whose markers were already retired — downstream dedup should absorb it, which makes dedup load-bearing for a routine operation' }),
+  Object.freeze({ suffix: 'broker_state', reRenderable: true,
+    holds: 'receipts/, outbound/, terminal-replies.jsonl, and channel-source admissions',
+    losing: 'the signing audit trail, and terminal classification — so retry loops that #145 killed can resurrect' }),
+  Object.freeze({ suffix: 'adapter_runtime', reRenderable: true,
+    holds: 'admitted-tasks.jsonl, the adapter socket, and the channel read cursor',
+    losing: 'unread wakes; and because #149 re-announces until read, a lost read cursor re-steers the agent on mail it has already handled' }),
+  Object.freeze({ suffix: 'broker_credentials', reRenderable: false,
+    holds: 'the Bunker URI and NIP-46 client credential',
+    losing: 'a BUNKER RE-PAIR — the NIP-46 pairing secret is effectively single-use, and a spent one presents as `Unknown client`, which blames the client key rather than the secret' }),
+  Object.freeze({ suffix: 'worker_credentials', reRenderable: false,
+    holds: 'the model-provider key',
+    losing: 'the provider key must be re-seated by the operator' }),
+])
+
+// Compose namespaces named volumes with the project name, which the renderer binds to the instance.
+export function volumeLifecycle(manifest) {
+  return VOLUMES
+    .filter(v => v.suffix !== 'worker_credentials' || manifest.workerEnabled)
+    .map(v => Object.freeze({ ...v, volume: `nvoy-${manifest.id}_${v.suffix}` }))
+}
+
 // The exact remote process an inbound channel connection is allowed to become. It runs as
 // workerUid:workerHandoffGid — admitted tasks read-only, only the bounded channel cursor and reply
 // queue writable — and it takes no argument from the caller.
