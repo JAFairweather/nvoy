@@ -99,6 +99,32 @@ function drain() {
           continue
         }
         proposalRetryAfter.delete(key)
+        // The actuator decides which path applies and says so; the daemon never infers it from the
+        // manifest or the instance name. A public event waits for a discrete approval. A private
+        // channel-carry reply is enacted now, on the live grant chain that already admitted it —
+        // and `--direct` re-checks that for itself, so a wrong answer here cannot open the signer.
+        let verdict = null
+        try { verdict = JSON.parse(String(proposed.stdout || '')) } catch { verdict = null }
+        if (verdict?.approval_required === false && verdict?.action === 'nostr-private-reply') {
+          const enacted = spawnSync(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-reply.mjs'),
+            '--instance', manifest.id, '--request', request, '--source', source, '--direct'], { env: childEnv, encoding: 'utf8', timeout: 90000 })
+          if (enacted.status !== 0) {
+            const stderr = String(enacted.stderr || '').trim()
+            if (isTerminalReplyFailure(stderr)) {
+              try {
+                if (recordTerminalReply(terminalRepliesPath, terminalReplyIds, request, stderr))
+                  console.error(`instance-broker-daemon: ${source} reply ${request.slice(0, 12)}… terminal — its receipt is no longer live`)
+              } catch (e) { console.error(`instance-broker-daemon: cannot record terminal reply ${request.slice(0, 12)}…: ${e.message || e}`) }
+            } else {
+              proposalRetryAfter.set(key, Date.now() + 5000)
+              console.error(`instance-broker-daemon: ${source} reply ${request.slice(0, 12)}… held for retry: ${stderr}`)
+            }
+            continue
+          }
+          announcedProposals.add(key)
+          console.log(`instance-broker-daemon: ${source} reply ${request.slice(0, 12)}… enacted on its live grant chain`)
+          continue
+        }
         announcedProposals.add(key)
         console.log(`instance-broker-daemon: ${source} reply proposal ${request.slice(0, 12)}… awaiting discrete approval`)
       }
