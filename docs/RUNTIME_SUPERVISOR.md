@@ -299,10 +299,42 @@ protocol without weakening the broker boundary:
 Register one server per identity in the Claude Code MCP configuration. Do not point Claude at the
 Node script directly under the interactive user's UID. On the broker host, create a dedicated SSH
 principal and install the unmodified output of
-`instance-claude-channel-authorized-key.mjs --instance <id> --public-key-file <key.pub>
---container <fixed-adapter-container>`. Its `restrict` forced command runs only the channel under
-the manifest worker UID and handoff GID; it grants no shell, forwarding, PTY, signer, adapter UID,
-or caller-selected command. The Claude-side MCP entry is then only that restricted stdio tunnel:
+
+```sh
+node mcp/tools/instance-unit.mjs render --instance <id> --image <digest> \
+  --public-key-file <key.pub> --out-dir /etc/nvoy/instances
+```
+
+which renders the Compose stack **and** the principal from the one manifest, so the identity is a
+single artifact rather than an artifact plus a step someone has to remember (#154). Its `restrict`
+forced command runs only the channel under the manifest worker UID and handoff GID; it grants no
+shell, forwarding, PTY, signer, adapter UID, or caller-selected command.
+
+The forced command `docker exec`s a container named by the manifest's **`adapter_container`**, not by
+Compose's project/service/index rule. That name is what the adapter service pins as its
+`container_name`, so the principal and the stack cannot disagree. Its default is exactly the name
+Compose already generates — `nvoy-<id>-adapter-1`, replica suffix included — so declaring it renames
+nothing on a running stack; it only stops the name being able to move underneath an installed
+principal. If it did move, the only symptom would be a channel that went quiet.
+
+After installing, prove what is actually installed rather than assuming it:
+
+```sh
+node mcp/tools/instance-unit.mjs verify --instance <id> \
+  --authorized-keys /home/<channel-account>/.ssh/authorized_keys
+```
+
+`verify` checks the installed principal against the manifest field by field — `restrict` intact, no
+restricted capability re-enabled, correct UID/GID, correct container, correct instance, correct tool
+— and treats a principal that is **absent** as a failure, not a pass. It exits `0` verified, `1` on a
+real mismatch, and `3` INCONCLUSIVE when it could not read the file at all. `claude-channel-doctor.mjs`
+remains the check for the *client* end; this is the host-side equivalent for what is installed.
+
+The single-argument form `instance-claude-channel-authorized-key.mjs --instance <id>
+--public-key-file <key.pub>` still emits just the principal. `--container` is now only an assertion:
+name one and it must equal the manifest's, so a hand-supplied name can no longer quietly win.
+
+The Claude-side MCP entry is then only that restricted stdio tunnel:
 
 The Claude participant must have its **own Nostr identity and its own manifest**. Do not reuse the
 Codex participant, Claude OG, a burner, or another Claude session merely because that identity

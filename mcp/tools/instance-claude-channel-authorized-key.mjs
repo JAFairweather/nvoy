@@ -5,12 +5,13 @@
 
 import { lstatSync, readFileSync } from 'node:fs'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
+import { principalLine } from './participant_unit.mjs'
 
 const die = message => { console.error(`instance-claude-channel-authorized-key: ${message}`); process.exit(1) }
 const flag = name => { const i = process.argv.indexOf(name); return i < 0 ? '' : process.argv[i + 1] || '' }
 const id = flag('--instance'), keyFile = flag('--public-key-file'), container = flag('--container')
-if (!id || !keyFile || !/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(container)) {
-  die('usage: --instance <id> --public-key-file <OpenSSH-public-key> --container <fixed-adapter-container>')
+if (!id || !keyFile) {
+  die('usage: --instance <id> --public-key-file <OpenSSH-public-key> [--container <expected-adapter-container>]')
 }
 const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 let manifest
@@ -23,5 +24,10 @@ try { stat = lstatSync(keyFile) } catch { die('public key file is missing') }
 if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 16 * 1024) die('public key must be a bounded regular non-symlink file')
 const fields = readFileSync(keyFile, 'utf8').trim().split(/\s+/)
 if (!/^(ssh-ed25519|ecdsa-sha2-nistp256)$/.test(fields[0] || '') || !/^[A-Za-z0-9+/]+={0,2}$/.test(fields[1] || '')) die('unsupported or malformed OpenSSH public key')
-const command = `/usr/bin/docker exec -i --user ${manifest.workerUid}:${manifest.workerHandoffGid} ${container} /usr/local/bin/node /srv/nvoy/mcp/tools/claude-channel.mjs --instance ${manifest.id}`
-console.log(`restrict,command="${command}" ${fields[0]} ${fields[1]} nvoy-claude-channel-${manifest.id}`)
+// The container is the manifest's to declare, not the caller's to supply — a hand-passed name is
+// how the installed principal drifted from the stack in the first place (#154). `--container` is
+// kept as an assertion for existing call sites: if you name one, it must be the manifest's.
+if (container && container !== manifest.adapterContainer) {
+  die(`--container ${container} does not match the manifest adapter_container ${manifest.adapterContainer}`)
+}
+console.log(principalLine(manifest, fields[0], fields[1]))

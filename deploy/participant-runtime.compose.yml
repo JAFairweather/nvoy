@@ -122,6 +122,9 @@ services:
 
   adapter:
     image: ${NVOY_IMAGE:?set NVOY_IMAGE}
+    # Declared, not derived. The installed channel forced command must `docker exec` this exact
+    # name, so it comes from the manifest rather than Compose's project/service/index rule (#154).
+    container_name: ${ADAPTER_CONTAINER:?}
     user: "${ADAPTER_UID:?}:${BROKER_ADAPTER_GID:?}"
     group_add: ["${WORKER_HANDOFF_GID:?}"]
     read_only: true
