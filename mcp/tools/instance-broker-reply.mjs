@@ -22,8 +22,16 @@ const die = m => { console.error(`instance-broker-reply: ${m}`); process.exit(1)
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
 const id = flag('--instance'), requestId = flag('--request').toLowerCase(), source = flag('--source') || 'worker', approvalPath = flag('--approval')
 const prepareOnly = process.argv.includes('--prepare')
-if (!id || !/^[0-9a-f]{32}$/.test(requestId) || !['worker', 'desktop'].includes(source) || prepareOnly === !!approvalPath) {
-  die('usage: --instance <id> --request <32-hex-id> [--source worker|desktop] (--prepare | --approval <signed-event.json>)')
+// AD-12 distinguishes two actuators. A public event is permanent and world-readable, so it is
+// enacted only by a discrete signed approval. A private channel-carry reply is a sealed answer into
+// a channel the owner already admitted this identity to, enacted by the live admit/task/task-relay
+// chain that is rechecked below. `--direct` is that second path, and the check that it IS that path
+// lives here rather than in the caller — a mistaken daemon must not be able to talk the signer into
+// enacting a public event without approval.
+const direct = process.argv.includes('--direct')
+if (!id || !/^[0-9a-f]{32}$/.test(requestId) || !['worker', 'desktop'].includes(source) ||
+    [prepareOnly, !!approvalPath, direct].filter(Boolean).length !== 1) {
+  die('usage: --instance <id> --request <32-hex-id> [--source worker|desktop] (--prepare | --direct | --approval <signed-event.json>)')
 }
 const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 let manifest
@@ -135,29 +143,47 @@ if (existsSync(recordPath)) {
   try { writeFileSync(tmp, JSON.stringify(record), { mode: 0o600 }); renameSync(tmp, recordPath) } catch (e) { die(`cannot persist outbound record: ${e.message}`) }
 }
 
+// Which actuator applies is a property of the receipt, decided here so the daemon never infers it.
+// `channelCarry` was already validated above against an allowed carrier and an allowed channel.
+const action = channelCarry ? 'nostr-private-reply' : 'nostr-public-event'
 if (prepareOnly) {
-  console.log(JSON.stringify({ request: requestId, receipt: request.receipt, status: 'awaiting-approval', fingerprint: record.fingerprint }))
+  console.log(JSON.stringify({ request: requestId, receipt: request.receipt, action,
+    status: channelCarry ? 'enactable' : 'awaiting-approval',
+    approval_required: !channelCarry, fingerprint: record.fingerprint }))
   process.exit(0)
 }
-regular(approvalPath, 'approval event')
-let approvalEvent
-try { approvalEvent = JSON.parse(readFileSync(approvalPath, 'utf8')) } catch { die('approval event is invalid JSON') }
-let approval
-try {
-  approval = verifyOutboundApproval(approvalEvent, { instance: manifest.id, proposalId: requestId,
-    fingerprint: record.fingerprint, approvers: manifest.grantors,
-    ...(record.approval_id ? { maxAgeMs: Number.MAX_SAFE_INTEGER } : {}) })
-} catch (e) { die(e.message) }
-if (record.approval_id && record.approval_id !== approval.eventId) die('outbound proposal is already bound to another approval')
+let approval = null
+if (direct) {
+  // The whole argument for this path: waggle carries across the boundary, and the identity is
+  // already an admitted member of the destination channel. The admit/task/task-relay chain checked
+  // live above IS the authorisation to post — there is no second thing for a human to approve.
+  // It stays confined to that case: a public event is permanent and world-readable, so it keeps
+  // its discrete approval.
+  if (!channelCarry) die('direct enactment is permitted only for a private channel-carry reply; a public event requires a discrete approval')
+  if (record.approval_id) die('this proposal is already bound to an approval and cannot be enacted directly')
+} else {
+  regular(approvalPath, 'approval event')
+  let approvalEvent
+  try { approvalEvent = JSON.parse(readFileSync(approvalPath, 'utf8')) } catch { die('approval event is invalid JSON') }
+  try {
+    approval = verifyOutboundApproval(approvalEvent, { instance: manifest.id, proposalId: requestId,
+      fingerprint: record.fingerprint, approvers: manifest.grantors,
+      ...(record.approval_id ? { maxAgeMs: Number.MAX_SAFE_INTEGER } : {}) })
+  } catch (e) { die(e.message) }
+  if (record.approval_id && record.approval_id !== approval.eventId) die('outbound proposal is already bound to another approval')
+}
 if (!record.wrap) {
   const seal = await signer.signEvent(record.unsigned_seal)
-  if (seal.id !== record.fingerprint || getEventHash(seal) !== record.fingerprint || !verifyEvent(JSON.parse(JSON.stringify(seal)))) die('signer changed or invalidly signed the approved frozen seal')
+  if (seal.id !== record.fingerprint || getEventHash(seal) !== record.fingerprint || !verifyEvent(JSON.parse(JSON.stringify(seal)))) die('signer changed or invalidly signed the frozen seal')
   const peer = channelCarry ? receipt.carrier : receipt.sender
   const wrapSk = generateSecretKey()
   const backdated = () => Math.floor(Date.now() / 1000 - Math.random() * 2 * 24 * 60 * 60)
   record.wrap = finalizeEvent({ kind: 1059, created_at: backdated(), tags: [['p', peer]],
     content: nip44.encrypt(JSON.stringify(seal), nip44.getConversationKey(wrapSk, peer)) }, wrapSk)
-  record.approval_id = approval.eventId
+  // Record which actuator opened the signer, so an audit of this file can tell a legitimate direct
+  // private reply from a record that lost its approval. validateOutboundRecord enforces exactly one.
+  if (direct) record.enactment = 'channel-carry-direct'
+  else record.approval_id = approval.eventId
   const tmp = `${recordPath}.${process.pid}.approved.tmp`
   try { writeFileSync(tmp, JSON.stringify(record), { mode: 0o600 }); renameSync(tmp, recordPath) } catch (e) { die(`cannot persist approved outbound record: ${e.message}`) }
 }

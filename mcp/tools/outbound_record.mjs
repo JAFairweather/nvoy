@@ -12,7 +12,11 @@ export function replyRequestDigest(request) {
 
 export function validateOutboundRecord(record, { requestId = '', requestDigest = '' } = {}) {
   if (record?.version === 2) {
-    const allowed = new Set(['version', 'request_digest', 'request_id', 'fingerprint', 'unsigned_seal', 'wrap', 'approval_id', 'published', 'published_at', 'accepted'])
+    // `enactment` records WHICH actuator opened the signer. A public event is enacted by a signed
+    // approval; a private channel-carry reply is enacted by the already-verified grant chain that
+    // admitted it. Recording it explicitly keeps "no approval id" from being ambiguous between a
+    // legitimate private reply and a record that lost its approval.
+    const allowed = new Set(['version', 'request_digest', 'request_id', 'fingerprint', 'unsigned_seal', 'wrap', 'approval_id', 'enactment', 'published', 'published_at', 'accepted'])
     if (!record || typeof record !== 'object' || Array.isArray(record) || Object.keys(record).some(key => !allowed.has(key)) ||
         !HEX32.test(String(record.request_id || '')) || !HEX64.test(String(record.request_digest || '')) ||
         !HEX64.test(String(record.fingerprint || '')) || typeof record.published !== 'boolean' ||
@@ -28,12 +32,20 @@ export function validateOutboundRecord(record, { requestId = '', requestDigest =
       throw new Error('outbound proposal does not contain the exact frozen kind:13 seal')
     }
     if (record.wrap == null) {
-      if (record.approval_id != null || record.published) throw new Error('unsigned outbound proposal claims enactment')
+      if (record.approval_id != null || record.enactment != null || record.published) throw new Error('unsigned outbound proposal claims enactment')
       return record
     }
     let validWrap = false
     try { validWrap = record.wrap.kind === 1059 && verifyEvent(JSON.parse(JSON.stringify(record.wrap))) } catch { validWrap = false }
-    if (!validWrap || !HEX64.test(String(record.approval_id || ''))) throw new Error('enacted outbound proposal lacks a valid wrap or approval')
+    if (!validWrap) throw new Error('enacted outbound proposal lacks a valid wrap')
+    // Exactly one enactment path — never both, never neither. Accepting an approval id alongside a
+    // direct enactment would let a private reply launder an unverified approval; accepting neither
+    // restores the hole this field exists to close.
+    const directEnactment = record.enactment === 'channel-carry-direct'
+    if (record.enactment != null && !directEnactment) throw new Error('enacted outbound proposal names an unknown enactment path')
+    if (directEnactment === HEX64.test(String(record.approval_id || ''))) {
+      throw new Error('enacted outbound proposal lacks a valid approval or names two enactment paths')
+    }
     if (record.published && (!Number.isInteger(record.accepted) || record.accepted < 1 ||
         !Number.isFinite(Number(record.published_at)) || Number(record.published_at) <= 0)) {
       throw new Error('published outbound record has no verified completion evidence')
