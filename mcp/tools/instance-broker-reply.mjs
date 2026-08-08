@@ -119,6 +119,16 @@ if (!policy.policyUsable || !liveAdmission || liveAdmission.from !== receipt.sen
   (channelCarry && (liveAdmission.mode !== 'channel-carry' || liveAdmission.carrier !== receipt.carrier ||
     liveAdmission.carrier_grant_id !== receipt.carrier_grant_id || liveAdmission.reply_channel !== receipt.reply_channel ||
     liveAdmission.source_event !== receipt.source_event))) die('admission receipt no longer has a live matching grant chain')
+// Claim before stamping. The stamp below writes to `receiptPath`, which is still `receiptBase`
+// until this rename — so stamping first RE-CREATES a receipt another invocation has already
+// claimed, its rename then succeeds, and two different replies get signed from one single-use
+// admission. Claiming first makes the stamp land on the inflight path this invocation owns. A
+// crash between the two leaves a claimed-but-unstamped receipt, which is harmless now that
+// `expires_at` is an audit trail rather than a gate.
+if (receiptPath === receiptBase) {
+  try { renameSync(receiptBase, receiptInflight); receiptPath = receiptInflight }
+  catch (e) { die(`cannot atomically claim one-use admission receipt: ${e.message}`) }
+}
 // The chain was just re-derived from live relays, so record when that happened and move the
 // window forward. `expires_at` is now an audit trail of the last live validation rather than a
 // gate — a stale value on disk would misreport how fresh this authorisation actually is.
@@ -126,10 +136,6 @@ receipt.revalidated_at = Date.now()
 receipt.expires_at = receipt.revalidated_at + 5 * 60 * 1000
 try { writeFileSync(receiptPath, JSON.stringify(receipt), { mode: 0o600 }) }
 catch (e) { die(`cannot record receipt revalidation: ${e.message}`) }
-if (receiptPath === receiptBase) {
-  try { renameSync(receiptBase, receiptInflight); receiptPath = receiptInflight }
-  catch (e) { die(`cannot atomically claim one-use admission receipt: ${e.message}`) }
-}
 
 const outboundDir = resolve(manifest.stateDir, 'outbound')
 mkdirSync(outboundDir, { recursive: true, mode: 0o700 })
