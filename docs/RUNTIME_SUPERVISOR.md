@@ -484,6 +484,43 @@ The Compose `init` service is a one-shot root-only provisioner, not a long-runni
 sidecar. It reads the manifest and creates/verifies the three named-volume roots with exactly the
 declared owner, group, and mode before the non-root services can start. It has no credential mount.
 
+### Volume lifecycle: restart versus destroy
+
+**Containers are cattle; these volumes are pets.** The rootfs is read-only with only `/tmp` as
+tmpfs, so nothing can be written to the container layer and all state is forced into named volumes.
+The deploy runner recreates all three containers routinely and loses nothing.
+
+What is *not* intuitive is which volumes are safe to drop. `docker compose down` and
+`docker compose down -v` differ by one flag and by whether the identity survives (#155):
+
+| volume | holds | dropping it costs |
+|---|---|---|
+| `nvoy-<id>_watcher_spool` | `keyless-wake-seen.log`, the wake queue, retired envelope markers | the watcher re-scans its 48h relay window and re-records envelopes whose markers were already retired. Downstream dedup should absorb it — which makes dedup **load-bearing for a routine operation** |
+| `nvoy-<id>_broker_state` | `receipts/`, `outbound/`, `terminal-replies.jsonl`, channel-source admissions | the signing audit trail, and terminal classification — so retry loops that #145 killed **can resurrect** |
+| `nvoy-<id>_adapter_runtime` | `admitted-tasks.jsonl`, the adapter socket, the channel read cursor | unread wakes. And because #149 re-announces until read, a lost read cursor **re-steers the agent on mail it has already handled** |
+| `nvoy-<id>_broker_credentials` | Bunker URI + NIP-46 client | a **Bunker re-pair**. The pairing secret is effectively single-use, and a spent one presents as `Unknown client`, which blames the client key rather than the secret |
+| `nvoy-<id>_worker_credentials` | the model-provider key | the provider key must be re-seated (worker-enabled identities only) |
+
+The last two are the sharp ones: **everything else about an identity can be re-rendered from its
+manifest, but the Bunker pairing cannot.** That single fact is what makes a participant genuinely
+stateful rather than declarative.
+
+So the difference is a **verb, not a flag** — you cannot fat-finger your way from one to the other:
+
+```sh
+# recreate the compute, keep every volume
+node mcp/tools/instance-unit.mjs restart --instance <id> --compose-file <path>
+
+# destroy the identity's state, including the Bunker pairing
+node mcp/tools/instance-unit.mjs destroy --instance <id> --compose-file <path> \
+  --i-understand-this-destroys <id>
+```
+
+`destroy` prints the table above for the identity in question **before** it does anything, and
+refuses unless the confirmation token is that exact instance id — so an operator cannot confirm a
+destroy they were not looking at. Both verbs take `--dry-run`, which prints the exact `docker`
+command and runs nothing. `restart` has no path to `-v` at all.
+
 ### Automatic verified releases
 
 Routine releases are pull-based; an operator must not copy source or hand-edit image tags. The
