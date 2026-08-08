@@ -64,8 +64,20 @@ if (existsSync(receiptUsed)) { console.log(JSON.stringify({ request: requestId, 
 let receiptPath = existsSync(receiptInflight) ? receiptInflight : receiptBase
 regular(receiptPath, 'admission receipt')
 let receipt; try { receipt = JSON.parse(readFileSync(receiptPath, 'utf8')) } catch { die('admission receipt is invalid') }
+// The receipt establishes WHICH envelope, sender and grant are being answered, and the one-use
+// rename below stops it being replayed. What it must not do is decide whether the answer is
+// still authorised — the present-tense policy re-check further down does that, re-deriving the
+// whole chain from live relays and requiring every field here to match it.
+//
+// It used to also carry a five-minute deadline started at ADMISSION. But admission and delivery
+// are deliberately decoupled: a wake exists precisely so a session can read an envelope later.
+// That clock therefore ran almost entirely before the agent could act, and any wake not answered
+// inside it became permanently unanswerable — still queued, grant chain still live, readable in
+// full, and impossible to reply to. Three replies died that way in one evening (#150).
+//
+// The deadline is no longer a gate. Nothing is loosened: authorisation was never coming from it.
 if (![1, 2].includes(receipt.version) || receipt.instance !== manifest.id || receipt.broker !== manifest.pubkey || receipt.envelope !== request.receipt ||
-  !/^[0-9a-f]{64}$/.test(String(receipt.sender || '')) || !Number.isFinite(receipt.expires_at) || Date.now() > receipt.expires_at) {
+  !/^[0-9a-f]{64}$/.test(String(receipt.sender || '')) || !Number.isFinite(receipt.expires_at)) {
   die('admission receipt is not a live broker-bound sender capability')
 }
 const channelCarry = receipt.version === 2 && receipt.mode === 'channel-carry'
@@ -107,6 +119,13 @@ if (!policy.policyUsable || !liveAdmission || liveAdmission.from !== receipt.sen
   (channelCarry && (liveAdmission.mode !== 'channel-carry' || liveAdmission.carrier !== receipt.carrier ||
     liveAdmission.carrier_grant_id !== receipt.carrier_grant_id || liveAdmission.reply_channel !== receipt.reply_channel ||
     liveAdmission.source_event !== receipt.source_event))) die('admission receipt no longer has a live matching grant chain')
+// The chain was just re-derived from live relays, so record when that happened and move the
+// window forward. `expires_at` is now an audit trail of the last live validation rather than a
+// gate — a stale value on disk would misreport how fresh this authorisation actually is.
+receipt.revalidated_at = Date.now()
+receipt.expires_at = receipt.revalidated_at + 5 * 60 * 1000
+try { writeFileSync(receiptPath, JSON.stringify(receipt), { mode: 0o600 }) }
+catch (e) { die(`cannot record receipt revalidation: ${e.message}`) }
 if (receiptPath === receiptBase) {
   try { renameSync(receiptBase, receiptInflight); receiptPath = receiptInflight }
   catch (e) { die(`cannot atomically claim one-use admission receipt: ${e.message}`) }
