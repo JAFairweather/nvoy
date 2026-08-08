@@ -424,11 +424,26 @@ docker build -f deploy/nvoy-runtime.Dockerfile -t nvoy-runtime:codex-jaf .
 docker image inspect --format '{{index .RepoDigests 0}}' nvoy-runtime:codex-jaf
 ```
 
-`test/instance-runtime-container.mjs` is the deployment-host boundary check. With
-`NVOY_CONTAINER_TEST=1 NVOY_RUNTIME_IMAGE=<digest-or-local-test-image>`, it provisions a disposable
-four-UID runtime and proves the worker cannot connect to, replace, or unlink the adapter socket or
-queue while the broker can connect. It is intentionally skipped on development hosts without Docker;
-the production release check runs it on the Docker host before an instance is admitted.
+[`deploy/runtime-image-boundary.py`](../deploy/runtime-image-boundary.py) is the deployment-host
+boundary check, and it is an **unconditional promotion gate**, not a procedure someone is trusted to
+remember: [`runtime-deploy-runner.py`](../deploy/runtime-deploy-runner.py) calls it from
+`boundary_test()` before any instance is written, and it runs the script under `check=True`, so a
+non-zero exit raises and a failing boundary blocks the deploy rather than warning about it. It
+provisions a disposable four-UID runtime against the candidate image and proves the worker cannot
+connect to the adapter socket, replace the adapter socket, or forge the admitted queue — with
+`broker group can connect to adapter socket` as the **positive control**, so a boundary that refuses
+*everything* stays distinguishable from one that refuses the right things.
+
+`NVOY_BOUNDARY_TEST` overrides the *path* to that script; it does not enable it. There is no
+environment variable that turns the gate off.
+
+There is no second boundary artifact. `test/instance-runtime-container.mjs` used to sit beside this
+one as a near-duplicate that never executed — skip-guarded on `NVOY_CONTAINER_TEST`, which nothing in
+this repo set, so it printed a skip line and passed on every CI run. Its three genuinely distinct
+assertions were ported into the gate above and the file was removed (#153); a permanently-skipped
+near-duplicate of a live gate is what caused the gate to be misattributed in this document in the
+first place. Add boundary assertions to `deploy/runtime-image-boundary.py`, where they will actually
+run, and never behind an opt-in variable.
 
 The rendered Compose file is root-owned `0644`. The credential remains host-local, mode `0600`,
 and mounts only into the broker.

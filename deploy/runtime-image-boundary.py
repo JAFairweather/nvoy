@@ -62,6 +62,8 @@ try:
     expect("candidate image renders its Compose contract", rendered)
     if "name: nvoy-boundary-test" not in rendered.stdout:
         raise RuntimeError("rendered Compose did not bind the instance id")
+    if f'target: "{manifest["runtime_dir"]}"' not in rendered.stdout:
+        raise RuntimeError("rendered Compose did not produce YAML-safe volume targets")
 
     base = ["--rm", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges:true",
             "--tmpfs", "/tmp:mode=1777", *mount("instances", "/etc/nvoy/instances:ro")]
@@ -87,6 +89,15 @@ try:
     queue_probe = "const fs=require('node:fs');try{fs.appendFileSync('/run/nvoy/boundary-test/admitted-tasks.jsonl','forged\\n');process.exit(9)}catch(e){process.exit(['EACCES','EPERM'].includes(e.code)?0:8)}"
     expect("worker cannot forge admitted queue", docker(["run", *base, "--user", "41014:41002",
         *mount("runtime", manifest["runtime_dir"]), IMAGE, "node", "-e", queue_probe]))
+    unlink_probe = "const fs=require('node:fs');try{fs.unlinkSync('/run/nvoy/boundary-test/admitted-tasks.jsonl');process.exit(9)}catch(e){process.exit(['EACCES','EPERM'].includes(e.code)?0:8)}"
+    expect("worker cannot replace admitted queue", docker(["run", *base, "--user", "41014:41002",
+        *mount("runtime", manifest["runtime_dir"]), IMAGE, "node", "-e", unlink_probe]))
+    # Positive control on the worker itself. The three refusals above cannot distinguish "the worker
+    # is confined to its own lane" from "the worker can write nothing at all" — and a runtime where
+    # the worker cannot lodge a reply request is broken in a way every refusal above still passes.
+    reply_probe = "const fs=require('node:fs');try{fs.appendFileSync('/run/nvoy/boundary-test/reply-requests.jsonl','');process.exit(0)}catch(e){process.exit(8)}"
+    expect("worker can write only its bounded reply queue", docker(["run", *base, "--user", "41014:41002",
+        *mount("runtime", manifest["runtime_dir"]), IMAGE, "node", "-e", reply_probe]))
     broker_probe = "const net=require('node:net');const c=net.createConnection('/run/nvoy/boundary-test/adapter.sock');c.on('connect',()=>process.exit(0));c.on('error',()=>process.exit(8));setTimeout(()=>process.exit(7),1500)"
     expect("broker group can connect to adapter socket", docker(["run", *base, "--user", "41012:41001",
         *mount("runtime", manifest["runtime_dir"]), IMAGE, "node", "-e", broker_probe]))

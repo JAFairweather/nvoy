@@ -61,6 +61,7 @@ jobs:
       - name: Test
         # The suite is side-effect-free: no relay is contacted, every signer is stubbed or generated,
         # and the env vars the tests read (NVOY_NSEC, NVOY_RELAYS, …) are all optional — the suite
-        # provides its own fixtures when they are absent. Container-dependent paths gate themselves
-        # behind NVOY_CONTAINER_TEST, which is unset here, so they skip rather than fail.
+        # provides its own fixtures when they are absent. No suite here depends on Docker: the
+        # container boundary is proven by deploy/runtime-image-boundary.py, which the deploy runner
+        # calls unconditionally before every promotion — not by anything in this job.
         run: npm test

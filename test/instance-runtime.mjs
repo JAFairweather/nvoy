@@ -292,8 +292,7 @@ ok('the deployed worker stays awake to drain later admitted tasks instead of rel
 const workerDockerfile = readFileSync('deploy/nvoy-worker.Dockerfile', 'utf8')
 ok('the reproducible worker image installs trusted CA roots and both declared runner CLIs but bakes no Nostr credential', /apt-get install -y --no-install-recommends ca-certificates/.test(workerDockerfile) && /@openai\/codex@\$\{CODEX_VERSION\}/.test(workerDockerfile) && /@anthropic-ai\/claude-code@\$\{CLAUDE_VERSION\}/.test(workerDockerfile) && !/NVOY_NSEC|BUNKER_URI|bunker:\/\//i.test(workerDockerfile))
 const runtimeDockerfile = readFileSync('deploy/nvoy-runtime.Dockerfile', 'utf8')
-const testDockerfile = readFileSync('deploy/nvoy-runtime-test.Dockerfile', 'utf8')
-ok('every runtime/test base image is digest-pinned, so a source-identical build has stable base provenance', /FROM node:22-bookworm-slim@sha256:[0-9a-f]{64}/.test(runtimeDockerfile) && /FROM node:22-bookworm-slim@sha256:[0-9a-f]{64}/.test(workerDockerfile) && /FROM docker:29-cli@sha256:[0-9a-f]{64}/.test(testDockerfile) && /FROM node:22-bookworm-slim@sha256:[0-9a-f]{64}/.test(testDockerfile))
+ok('every runtime base image is digest-pinned, so a source-identical build has stable base provenance', /FROM node:22-bookworm-slim@sha256:[0-9a-f]{64}/.test(runtimeDockerfile) && /FROM node:22-bookworm-slim@sha256:[0-9a-f]{64}/.test(workerDockerfile))
 
 const blocked = cli('attention', '--instance', 'codex-test')
 ok('an adapter cannot invoke the keyed attention path', blocked.status !== 0 && /usage/.test(blocked.stderr))
