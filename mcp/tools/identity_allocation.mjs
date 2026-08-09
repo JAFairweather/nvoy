@@ -134,10 +134,12 @@ export function allocateIdentityBlock(manifests, { id, uidBase = UID_BASE, gidBa
  * Build the manifest body for a Claude-channel participant.
  *
  * Returns the object only — writing it is the caller's business, and deliberately NOT into the live
- * instance root: `runtime-deploy-runner.py` globs that directory every tick and starts whatever it
- * finds, so installing a manifest IS the deploy trigger. A manifest that lands before its
- * credentials exist fails to start, and a failed start rolls back every identity touched in that
- * tick — including healthy ones. The ordering is the safety property, so the tool stages.
+ * instance root. `runtime-deploy-runner.py` gates on the release SHA and returns early when it is
+ * already current, but it health-checks every globbed manifest before doing so; one with no compose
+ * file beside it fails that check and forces an estate-wide reconcile on the next tick. So a
+ * manifest that lands before its credentials exist fails to start, and that failure rolls back every
+ * identity touched in the reconcile — including healthy ones. The ordering is the safety property,
+ * so the tool stages. See the header of instance-identity.mjs for the mechanism in full.
  */
 export function buildParticipantManifest(allocation, { pubkey, grantors, relays, taskCarriers = [], credentialDir = '/etc/nvoy/credentials' } = {}) {
   if (!allocation || allocation.version !== ALLOCATION_VERSION) fail('a valid allocation is required')
@@ -206,7 +208,7 @@ export function seatingPlan(manifest) {
       why: 'Possessing a URI is not proof of control. This signs nothing and publishes nothing. Note that Bunker permissions are per-method — a sign_event denial is byte-identical to an empty inbox (nvoy#142).' }),
     Object.freeze({ step: 4, actor: 'operator', automatable: true,
       what: `Install the staged manifest at /etc/nvoy/instances/${id}.json (root:root 0644)`,
-      why: 'THIS STARTS THE DEPLOY. The runner globs that directory every tick (<=3 min) and starts what it finds. If this identity fails to start, every identity touched in that tick is rolled back — including healthy ones. Do not place it until steps 2 and 3 are done.' }),
+      why: 'THIS STARTS THE DEPLOY, on the next tick (<=3.5 min) and indirectly: the runner health-checks every manifest it globs, and one with no compose file beside it fails that check and forces an estate-wide reconcile. If this identity then fails to start, every identity touched in that reconcile is rolled back — including healthy ones. Do not place it until steps 2 and 3 are done.' }),
     Object.freeze({ step: 5, actor: 'operator', automatable: true,
       what: `Render and install the SSH principal, then verify it landed`,
       why: 'The renderer writes a .authorized_key file; nothing installs it. Verify reports an absent principal as FAIL rather than pass, and matches on the comment so a drifted one is reported wrong rather than missing.' }),

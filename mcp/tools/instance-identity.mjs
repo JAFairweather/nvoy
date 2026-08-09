@@ -9,10 +9,25 @@
 // reads manifests and prints; it decides nothing.
 //
 // `allocate` writes the manifest to a STAGING directory and never to the live instance root. That is
-// the safety property, not a convenience: `runtime-deploy-runner.py` globs the instance root every
-// tick and starts whatever it finds, so installing a manifest IS the deploy trigger. A manifest that
-// lands before its credentials exist fails to start — and a failed start rolls back every identity
-// touched in that tick, including healthy ones. The operator installs it, after the credentials.
+// the safety property, not a convenience — though the mechanism is worth stating exactly, because an
+// earlier draft of this comment described a simpler one that does not exist.
+//
+// `runtime-deploy-runner.py` does NOT glob the instance root and start what it finds. It gates on
+// the release SHA and returns early when the deployed SHA already matches. But inside that early
+// return it first calls `verify_running` for EVERY manifest it globbed, and a manifest with no
+// compose file beside it makes `docker compose -f <missing> ps` exit nonzero. That throws, the
+// health check reports the release unhealthy, and the runner reconciles — which is what renders and
+// starts the new identity. Installing a manifest is therefore a deploy trigger INDIRECTLY, on the
+// next tick (<=3.5 min), by failing a health check rather than by being discovered.
+//
+// The conclusion is unchanged and the reconcile is estate-wide, so it matters more, not less: the
+// reconcile renders and verifies compose for every identity, then brings each up in turn, recording
+// each one as changed BEFORE its `up` so a half-started identity is still rolled back. If the new
+// identity fails — which is what a manifest landing before its credentials does — every identity
+// touched in that tick is restored from backup, healthy ones included. The operator installs it,
+// after the credentials.
+//
+// Observed on the live host 2026-08-09 while deploying a second identity, not inferred.
 //
 // It never reads, writes, prints or transmits credential material. It emits credential PATHS.
 //
