@@ -4,7 +4,7 @@
 // crash-left `.inflight` markers are requeued at boot and are harmless because the adapter queue
 // deduplicates on envelope before ACKing.
 
-import { readdirSync, renameSync, readFileSync, lstatSync } from 'node:fs'
+import { closeSync, openSync, readdirSync, renameSync, readFileSync, lstatSync, unlinkSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
@@ -19,6 +19,43 @@ let manifest
 try { manifest = readManifest(root, instanceId(id)); assertNoCollisions(root, manifest) } catch (e) { die(e.message) }
 if (manifest.brokerMode !== 'local') die('remote-broker Desktop manifests cannot start a local broker daemon')
 if (!process.env.NVOY_BROKER_CREDENTIAL) die('broker credential path is unavailable')
+// One identity may have exactly one live draining daemon. Two drain the same spool without either
+// objecting: duplicated proposal announcements, doubled relay queries per tick, and two writers
+// appending to one terminal-reply log. The child broker's own lock serialises the decrypt/sign path,
+// but that is a downstream accident, not a property this process provides.
+//
+// Claimed BEFORE recover() and before the terminal-reply log is opened, because both touch state a
+// second daemon must not be racing us on. Reclaim only a lock whose recorded pid is demonstrably
+// gone — a stale lock from a killed process must not become its own outage — and fail closed on a
+// malformed or foreign lock. This is the shape claude-channel.mjs already uses.
+const lockPath = resolve(manifest.stateDir, 'broker-daemon.lock')
+function claimLock() {
+  try {
+    const fd = openSync(lockPath, 'wx', 0o600)
+    writeFileSync(fd, JSON.stringify({ version: 1, instance: manifest.id, pid: process.pid, started_at: Date.now() }))
+    closeSync(fd)
+    return
+  } catch (error) { if (error.code !== 'EEXIST') throw error }
+  let prior
+  try {
+    const stat = lstatSync(lockPath)
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('broker daemon lock is not a regular file')
+    prior = JSON.parse(readFileSync(lockPath, 'utf8'))
+  } catch (error) { throw new Error(`cannot validate existing broker daemon lock: ${error.message}`) }
+  if (prior?.version !== 1 || prior?.instance !== manifest.id || !Number.isInteger(prior?.pid) || prior.pid < 1) {
+    throw new Error('broker daemon lock does not bind this instance')
+  }
+  // EPERM means the pid exists under another uid — a live holder we cannot signal, so fail closed.
+  try { process.kill(prior.pid, 0); throw new Error(`broker daemon already runs as pid ${prior.pid} for instance ${manifest.id}`) }
+  catch (error) { if (error.code !== 'ESRCH') throw error }
+  unlinkSync(lockPath)
+  claimLock()
+}
+// Refusing is correct; refusing SILENTLY is the failure mode this exists to prevent, so the reason
+// goes to stderr and the exit status is non-zero.
+try { claimLock() } catch (error) { die(error.message) }
+process.on('exit', () => { try { unlinkSync(lockPath) } catch {} })
+
 // A proposal whose admission receipt has died can never be revived, so re-proposing it re-queries
 // relays once per tick forever. Terminal ids are durable: a restart must not resurrect the loop.
 const terminalRepliesPath = resolve(manifest.stateDir, 'terminal-replies.jsonl')
