@@ -381,8 +381,18 @@ ok('the keyed broker requires an explicit prepare-or-approval mode before evalua
 const deniedPrepare = spawnSync(process.execPath, ['mcp/tools/instance-broker-reply.mjs', '--instance', 'codex-test', '--request', deniedRequest.id, '--prepare'], {
   cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot, NVOY_BROKER_CREDENTIAL: credential },
 })
-ok('prepare mode still refuses a proposal when its immutable admission receipt is expired',
-  deniedPrepare.status !== 0 && /not a live broker-bound sender capability/.test(deniedPrepare.stderr))
+// This receipt is long expired AND has no live grant behind it. It must still be refused — but
+// #150 moved the reason. The deadline started at admission, ran out before the agent could act,
+// and made legitimate wakes permanently unanswerable; authorisation now comes from the
+// present-tense policy re-check, which re-derives the chain from live relays. So assert the
+// property that matters — nothing is signed without a live matching chain — and assert the
+// refusal is NOT the clock, or this test would keep passing for a reason that no longer
+// protects anything.
+ok('prepare mode still refuses a proposal with no live matching grant chain',
+  deniedPrepare.status !== 0 &&
+  /no longer has a live matching grant chain|could not recheck live grant policy/.test(deniedPrepare.stderr))
+ok('...and it is refused by present-tense policy rather than by an expiry clock',
+  !/not a live broker-bound sender capability/.test(deniedPrepare.stderr))
 
 writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...manifest, id: 'collision', runtime_dir: join(root, 'run-other') }))
 const collision = cli('describe', '--instance', 'codex-test')
