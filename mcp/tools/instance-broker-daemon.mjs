@@ -6,6 +6,7 @@
 
 import { appendFileSync, existsSync, readdirSync, renameSync, readFileSync, lstatSync, rmSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { claimPidLock } from './pid_lock.mjs'
 import { spawn, spawnSync } from 'node:child_process'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { isTerminalReplyFailure, loadTerminalReplyIds, recordTerminalReply, terminalReplyReason } from './reply_retry.mjs'
@@ -22,6 +23,27 @@ let manifest
 try { manifest = readManifest(root, instanceId(id)); assertNoCollisions(root, manifest) } catch (e) { die(e.message) }
 if (manifest.brokerMode !== 'local') die('remote-broker Desktop manifests cannot start a local broker daemon')
 if (!process.env.NVOY_BROKER_CREDENTIAL) die('broker credential path is unavailable')
+// One identity may have exactly one live draining daemon. Two drain the same spool without either
+// objecting: duplicated proposal announcements, doubled relay queries per tick, and two writers
+// appending to one terminal-reply log. The child broker's own lock serialises the decrypt/sign path,
+// but that is a downstream accident, not a property this process provides.
+//
+// Claimed BEFORE recover() and before the terminal-reply log is opened, because both touch state a
+// second daemon must not be racing us on. Reclaim only a lock whose recorded pid is demonstrably
+// gone — a stale lock from a killed process must not become its own outage — and fail closed on a
+// malformed or foreign lock. This is the shape claude-channel.mjs already uses.
+const lockPath = resolve(manifest.stateDir, 'broker-daemon.lock')
+// The repo's shared pid lock (pid_lock.mjs): exclusive create, reclaim only when the recorded pid is
+// demonstrably gone, fail closed on a malformed or foreign lock or an EPERM holder, and treat a lock
+// naming this very process as stale (a new container reuses pids, #217). `program` makes a recorded
+// pid that now runs something else a stranger, so a lock outliving its container cannot wedge us.
+//
+// Refusing is correct; refusing SILENTLY is the failure mode this exists to prevent, so the reason
+// goes to stderr and the exit status is non-zero.
+let releaseLock
+try { releaseLock = claimPidLock(lockPath, manifest.id, 'broker daemon', { program: 'instance-broker-daemon.mjs' }) } catch (error) { die(error.message) }
+process.on('exit', () => releaseLock())
+
 // A proposal whose admission receipt has died can never be revived, so re-proposing it re-queries
 // relays once per tick forever. Terminal ids are durable: a restart must not resurrect the loop.
 const terminalRepliesPath = resolve(manifest.stateDir, 'terminal-replies.jsonl')
