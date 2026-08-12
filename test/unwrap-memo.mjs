@@ -223,6 +223,27 @@ await t('…and the eviction is real: only the revoked wrap is decrypted again',
   await store.list({ maxAgeMs: 0 })
   assert.equal(signer.decrypts - before, 2,
     'exactly one wrap re-decrypted (seal + rumor) — beta and the junk stayed remembered')
+  // The count above proves the wrap is re-decrypted; it does not ask where the plaintext
+  // went. It went back into the memo: forgetMemoised is one-shot, applyRevocation is
+  // replayed every refresh. Without forgetAllDead() the eviction happens and is undone.
+  assert.equal(store.memo.has(alphaWrap.id), false, 'and the refresh did not put it back')
+  assert.equal(store.memo.has(betaWrap.id), true,
+    'while a LIVE grant is still memoised — the replay forgets the dead, not everything')
+})
+
+await t('…and a relinquished grant is not put back either — the key we said we destroyed', async () => {
+  // Sharper than revocation: relinquishGrant publishes a notice stating destroyed_at, so a
+  // memo refill leaves the process holding a live base64 copy of a key the delegator has
+  // been told is gone.
+  const relay = relayOf([alphaWrap, betaWrap, junkWrap])
+  const store = new GrantStore(relay, countingSigner())
+  await store.list()
+  store.markRelinquished(PUB, 'beta', 1, Math.floor(Date.now() / 1000), 'test')
+  assert.equal(store.memo.has(betaWrap.id), false, 'forgotten on the mark')
+
+  await store.list({ maxAgeMs: 0 })
+  assert.equal(store.memo.has(betaWrap.id), false, 'and still forgotten after a refresh')
+  assert.equal(store.memo.has(alphaWrap.id), true, 'and only that one — alpha is untouched')
 })
 
 await t('find() forcing a refresh is not a race with the millisecond clock', async () => {

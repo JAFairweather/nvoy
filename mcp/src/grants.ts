@@ -282,6 +282,7 @@ export class GrantStore {
       this.cache = latestGrants(await receiveGrants(this.relay, this.key, this.memo))
       this.fetchedAt = Date.now()
       for (const g of this.cache) this.applyRevocation(g)
+      this.forgetAllDead()
     }
     return this.cache
   }
@@ -358,6 +359,37 @@ export class GrantStore {
       if (r.tags?.find?.((t: string[]) => t[0] === 'a')?.[1] !== address) return false
       return Number(r.tags.find((t: string[]) => t[0] === 'v')?.[1] ?? 0) <= generation
     })
+  }
+
+  /**
+   * Replay the revoked/relinquished ledger onto the memo, exactly as `applyRevocation`
+   * is replayed onto the cache directly above.
+   *
+   * `forgetMemoised` alone is one-shot: it runs inside `markRevoked`/`markRelinquished`,
+   * but the wrap is still on the relay, so the next refresh re-decrypts it and
+   * `unwrapRumors` memoises the outcome unconditionally — putting the base64 `scope_key`
+   * of a dead grant straight back, for the life of the process. The `Uint8Array` stays
+   * zeroized; the memo did not. For a relinquished grant that is a key we have already
+   * told the delegator we destroyed.
+   *
+   * Cost is one re-decrypt per dead grant per refresh, dropped the same tick — bounded by
+   * dead grants, not by mailbox size, so #170 stays fixed.
+   */
+  private forgetAllDead(): void {
+    // Split at the FIRST colon: the publisher is a 64-hex pubkey and cannot contain one,
+    // but a scope id may — `split(':')` destructuring would silently truncate it.
+    const parts = (key: string): [string, string] => {
+      const i = key.indexOf(':')
+      return [key.slice(0, i), key.slice(i + 1)]
+    }
+    for (const [key, rec] of this.revocations) {
+      const [publisher, scopeId] = parts(key)
+      this.forgetMemoised(publisher, scopeId, rec.generation)
+    }
+    for (const [key, rec] of this.relinquishments) {
+      const [publisher, scopeId] = parts(key)
+      this.forgetMemoised(publisher, scopeId, rec.generation)
+    }
   }
 
   /** Zeroize every held scope key (shutdown path — spec §5). */

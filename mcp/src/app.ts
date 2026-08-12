@@ -93,7 +93,7 @@ const eventGeneration = (ev: { tags: string[][] } | undefined) =>
  * cached plaintext.
  */
 export async function detectRevocation(ctx: NvoyContext, g: HeldGrant) {
-  const found = await findRevocationNotice(ctx.relay, ctx.identity.signer, g.publisher, g.scopeId).catch(() => null)
+  const found = await findRevocationNotice(ctx.relay, ctx.identity.signer, g.publisher, g.scopeId, ctx.grantStore.memo).catch(() => null)
   const record = ctx.grantStore.markRevoked(g.publisher, g.scopeId, g.generation, found?.content ?? null)
   ctx.scopeCache.zeroize(g.publisher, g.scopeId)
   // This identity may have issued attenuated descendants of the dead grant.  Cascading is
@@ -304,7 +304,7 @@ export function createNvoyServer(ctx: NvoyContext): NvoyServerHandle {
         // 'missing' is ambiguous: scope deleted (NIP-09 after tombstone) or
         // relay flake. A 441 notice disambiguates to revocation; otherwise
         // stay honest with UNAVAILABLE.
-        const found = await findRevocationNotice(ctx.relay, ctx.identity.signer, grant.publisher, d).catch(() => null)
+        const found = await findRevocationNotice(ctx.relay, ctx.identity.signer, grant.publisher, d, ctx.grantStore.memo).catch(() => null)
         if (found) {
           const record = await detectRevocation(ctx, grant)
           return revokedError(grant, record.notice)
