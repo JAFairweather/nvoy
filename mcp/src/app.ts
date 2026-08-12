@@ -145,10 +145,18 @@ export async function relinquishGrant(
  * auto_relinquish and whose expires_at has passed. Called at boot and on an
  * interval while the runtime is up — the runtime-side half of expiry; the
  * delegator's TTL rotation is the cryptographic half.
+ *
+ * Reads only what is already held (peek), never the relay. See below.
  */
 export async function sweepAutoRelinquish(ctx: NvoyContext): Promise<number> {
   let done = 0
-  const grants = await ctx.grantStore.list().catch(() => [] as HeldGrant[])
+  // peek(), not list(): this sweep destroys key material this process is HOLDING, and
+  // what it holds is exactly what has already been materialized. Refreshing the whole
+  // mailbox on a timer to look for grants we hold no key for bought nothing, and it
+  // turned an idle server into permanent bunker load — 2N remote decrypts a minute,
+  // forever, growing with the mailbox (#170). A grant that arrives later is
+  // materialized by the tool call that wants it, and swept on the tick after that.
+  const grants = ctx.grantStore.peek()
   for (const g of grants) {
     if (g.revoked || g.relinquished) continue
     if (!g.terms?.auto_relinquish) continue
