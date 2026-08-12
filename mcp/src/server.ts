@@ -23,7 +23,7 @@ import { randomUUID } from 'node:crypto'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { LiveRelay } from '../lib/liverelay.mjs'
-import { loadIdentity, loadRelays } from './identity.js'
+import { bindIdentity, loadIdentity, loadRelays } from './identity.js'
 import { GrantStore } from './grants.js'
 import { ScopeCache } from './scopes.js'
 import { Outbox } from './outbox.js'
@@ -32,7 +32,10 @@ import { createNvoyServer, sweepAutoRelinquish, type NvoyContext, type NvoyServe
 
 const log = (...args: unknown[]) => console.error('[nvoy]', ...args)
 
-const identity = loadIdentity()
+// Confirm which identity this process actually holds BEFORE anything can sign or answer whoami
+// (#338). Top-level await: ES2022 + NodeNext. A failure here is a refusal to start, deliberately —
+// a server that cannot confirm its own identity must not act as any identity.
+const identity = await bindIdentity(loadIdentity())
 const relays = loadRelays()
 const relay = new LiveRelay(relays)
 const httpPort = process.env.NVOY_HTTP_PORT
@@ -50,7 +53,7 @@ const ctx: NvoyContext = {
   log,
 }
 
-log(`agent ${identity.npub} (key source: ${identity.source})`)
+log(`agent ${identity.npub} (key source: ${identity.source}, identity confirmed with the signer)`)
 log(`relays: ${relays.join(', ')}`)
 
 // ---------------------------------------------------------------- lifecycle

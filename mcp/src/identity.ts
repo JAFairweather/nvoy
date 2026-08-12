@@ -179,8 +179,24 @@ function makeNip46(bunkerUri: string, env: NodeJS.ProcessEnv = process.env): { s
   // auto-creates the connection), an established one answers RPCs without it —
   // a stale secret must never block an ACTIVE pairing.
   const ready = () => (connectedP ??= rpc('connect', [pubkey, secret], 15_000).catch(() => 'ack'))
+  // get_public_key is asked ONCE per pairing. The answer cannot change for the life of
+  // the connection, and every gift-wrap unwrap used to pay a bunker round trip for it
+  // (#170). Deliberately NOT seeded from the URI-parsed `pubkey` above: that value is
+  // the unverified claim #338 exists to check, and seeding it would make the check
+  // compare the claim against itself. The first caller is bindIdentity at boot, so what
+  // gets memoised is the confirmed answer. A FAILED call is not cached — a bunker that
+  // was briefly unreachable must not leave the process permanently unable to ask.
+  let publicKeyP: Promise<string> | null = null
   const signer: Signer = {
-    getPublicKey: async () => { await ready(); return rpc('get_public_key', []) },
+    getPublicKey: async () => {
+      publicKeyP ??= (async () => { await ready(); return rpc('get_public_key', []) })()
+      try {
+        return await publicKeyP
+      } catch (e) {
+        publicKeyP = null
+        throw e
+      }
+    },
     signEvent: async (event) => { await ready(); return JSON.parse(await rpc('sign_event', [JSON.stringify(event)])) },
     nip44Encrypt: async (pk, pt) => { await ready(); return rpc('nip44_encrypt', [pk, pt]) },
     nip44Decrypt: async (pk, ct) => { await ready(); return rpc('nip44_decrypt', [pk, ct]) },
@@ -227,6 +243,70 @@ export function loadIdentity(
   const pubkey = getPublicKey(secretKey)
   const signer = nipxxLocalSigner(secretKey) as Signer
   return { signer, secretKey, pubkey, npub: nip19.npubEncode(pubkey), source }
+}
+
+/**
+ * Bind the process to the identity it is ALLOWED to be, before it can act (#338).
+ *
+ * Two identity claims exist and nothing compared them:
+ *
+ *   1. `identity.pubkey` — for a bunker, PARSED OUT OF THE URI. It is a claim made by a
+ *      configuration file, and `nvoy_whoami` reports it verbatim.
+ *   2. what the signer actually signs as — the bunker's own `get_public_key`.
+ *
+ * When a shared server's credential env points at one identity while a session believes it is
+ * another, whoami answers with #1 and every signature is authored by #2. That is #338 exactly: a
+ * remote agent's whoami returned a DIFFERENT agent's identity. Nothing was broken enough to fail;
+ * the two answers simply came from different places.
+ *
+ * So: ask the signer who it is and refuse if it disagrees with the claim. This is a cold read-back
+ * of identity — the same discipline as reading a published event back rather than trusting the OK.
+ *
+ * `NVOY_EXPECTED_PUBKEY` is the second half, and it is what makes a shared server safe to register
+ * per-agent: the operator DECLARES which identity this process may be, and a process that resolves
+ * to anyone else refuses to start rather than acting as them.
+ *
+ * It throws rather than warning. A server that cannot confirm which identity it holds must not act
+ * as any of them — being unable to check is not the same as being fine.
+ */
+export async function bindIdentity(
+  identity: Identity,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<Identity> {
+  const claimed = String(identity.pubkey || '').toLowerCase()
+  if (!HEX64.test(claimed)) throw new Error('identity has no usable public key; refusing to act')
+
+  let resolved: string
+  try {
+    resolved = String(await identity.signer.getPublicKey() || '').toLowerCase()
+  } catch (e) {
+    // Do NOT fall through to the claim. An unreachable bunker means the identity is unconfirmed,
+    // and an unconfirmed identity is the precise condition this check exists to refuse.
+    throw new Error(
+      `could not ask the signer which identity it holds (${(e as Error).message}) — refusing to act ` +
+      'as an unconfirmed identity',
+    )
+  }
+  if (!HEX64.test(resolved)) throw new Error('signer did not report a public key; refusing to act')
+  if (resolved !== claimed) {
+    throw new Error(
+      `identity mismatch: configuration claims ${claimed.slice(0, 12)}… but the signer signs as ` +
+      `${resolved.slice(0, 12)}…. whoami would report one and every signature would carry the ` +
+      'other (#338). Refusing to act.',
+    )
+  }
+
+  const declared = String(env.NVOY_EXPECTED_PUBKEY || '').trim().toLowerCase()
+  if (declared) {
+    if (!HEX64.test(declared)) throw new Error('NVOY_EXPECTED_PUBKEY must be a 64-character hex public key')
+    if (declared !== resolved) {
+      throw new Error(
+        `bound to ${declared.slice(0, 12)}… but this signer is ${resolved.slice(0, 12)}… — ` +
+        'refusing to act as another agent',
+      )
+    }
+  }
+  return identity
 }
 
 /** Default relay set; override with NVOY_RELAYS (comma-separated). */
