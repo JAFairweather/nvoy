@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, symlinkSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, symlinkSync, openSync, ftruncateSync, closeSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { realpathSync } from 'node:fs'
@@ -34,6 +34,43 @@ const writableClaude = join(root, 'writable-claude'); writeFileSync(writableClau
 const writableExecutable = client({ claudeFile: writableClaude })
 ok('client doctor refuses a group/world-writable Claude executable', writableExecutable.status !== 0 && /not group\/world writable/.test(writableExecutable.stderr))
 
+// #186. The doctor never READS the Claude executable — it stats it, checks its mode bits and spawns
+// it with `--version` — so the 64 MB cap guarded nothing and refused every shipped binary (2.1.229
+// is 281 MB). Client mode could not succeed for anyone. This is the load-bearing assertion: it is
+// the case that was broken in production, and it must be a real oversized file, not a mock.
+//
+// Sparse, so the 70 MB is apparent size and ~4 KB on disk. lstat reports the apparent size, which
+// is what the cap compared against.
+const bigClaude = join(root, 'big-claude')
+writeFileSync(bigClaude, '#!/bin/sh\necho "2.2.0 (Claude Code)"\nexit 0\n', { mode: 0o700 })
+{ const fd = openSync(bigClaude, 'r+'); ftruncateSync(fd, 70 * 1024 * 1024); closeSync(fd) }
+chmodSync(bigClaude, 0o700)
+const big = client({ claudeFile: bigClaude })
+ok('client doctor accepts a Claude executable larger than the old 64 MB cap (#186)',
+  big.status === 0 && JSON.parse(big.stdout || '{}').claudeVersion === '2.2.0')
+
+// The three conditions `regular()` used to collapse into one string. Asserting only that each is
+// REFUSED cannot tell a correct refusal from a correct refusal with a misleading explanation — and
+// that is precisely what cost an hour here: the oversized binary is a regular non-symlink file, but
+// the message said "must be a bounded regular non-symlink file", and `claude` on PATH genuinely IS
+// an nvm symlink, so the most legible word in the refusal confirmed the wrong hypothesis.
+const bigKnown = join(root, 'big-known-hosts')
+writeFileSync(bigKnown, `${'broker.example ssh-ed25519 AAAAC3NzaTest\n'.repeat(8000)}`, { mode: 0o644 })
+const oversize = client({ knownHostsFile: bigKnown })
+ok('a file the doctor DOES read is still capped, and says so by name',
+  oversize.status !== 0 && /known_hosts file is \d+ bytes, above the 262144-byte limit/.test(oversize.stderr))
+ok('  …and names neither of the other two conditions', !/symlink|regular file/.test(oversize.stderr))
+
+const claudeDir = join(root, 'claude-dir'); mkdirSync(claudeDir, { mode: 0o755 })
+const notRegular = client({ claudeFile: claudeDir })
+ok('a non-regular path is refused for being non-regular, not for its size',
+  notRegular.status !== 0 && /Claude executable must be a regular file/.test(notRegular.stderr) && !/bytes|symlink/.test(notRegular.stderr))
+
+const claudeLink = join(root, 'claude-link'); symlinkSync(claude, claudeLink)
+const linkedClaude = client({ claudeFile: claudeLink })
+ok('a symlink is refused for being a symlink, not for its size',
+  linkedClaude.status !== 0 && /Claude executable must not be a symlink/.test(linkedClaude.stderr) && !/bytes|regular file/.test(linkedClaude.stderr))
+
 makeClaude('2.1.79 (Claude Code)')
 const old = client()
 ok('client doctor refuses Claude versions before native Channels', old.status !== 0 && /2\.1\.80 or newer/.test(old.stderr))
@@ -44,7 +81,7 @@ ok('client doctor refuses a group-readable SSH identity', loose.status !== 0 && 
 chmodSync(identity, 0o600)
 const identityLink = join(root, 'identity-link'); symlinkSync(identity, identityLink)
 const linked = client({ identityFile: identityLink })
-ok('client doctor refuses a symlink SSH identity', linked.status !== 0 && /non-symlink/.test(linked.stderr))
+ok('client doctor refuses a symlink SSH identity', linked.status !== 0 && /SSH identity file must not be a symlink/.test(linked.stderr))
 const hostile = client({ target: '-oProxyCommand=bad' })
 ok('client doctor refuses a caller-shaped SSH target', hostile.status !== 0 && /client usage/.test(hostile.stderr))
 const replaceable = join(root, 'replaceable'); mkdirSync(replaceable, { mode: 0o777 }); chmodSync(replaceable, 0o777)

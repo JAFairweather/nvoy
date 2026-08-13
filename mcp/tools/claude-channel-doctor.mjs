@@ -13,10 +13,20 @@ const die = message => { console.error(`claude-channel-doctor: ${message}`); pro
 const flag = name => { const i = process.argv.indexOf(name); return i < 0 ? '' : process.argv[i + 1] || '' }
 const mode = flag('--mode')
 
+// `max = null` means the file is never READ by this tool, only stat-ed and exec'd, so there is
+// nothing to bound. See the Claude executable in client() (#186).
+//
+// The three conditions are refused separately. Collapsed into one string they cost an operator an
+// hour: the Claude binary is a regular non-symlink file that merely exceeded the cap, and the
+// message said "must be a bounded regular non-symlink file" — with `claude` on PATH genuinely
+// being an nvm symlink, so the most legible word in the refusal confirmed the wrong hypothesis.
+// The size case prints both numbers, because "too big" without them sends you to the wrong file.
 function regular(path, label, max = 256 * 1024) {
   let st
   try { st = lstatSync(path) } catch { die(`${label} is missing`) }
-  if (!st.isFile() || st.isSymbolicLink() || st.size > max) die(`${label} must be a bounded regular non-symlink file`)
+  if (st.isSymbolicLink()) die(`${label} must not be a symlink`)
+  if (!st.isFile()) die(`${label} must be a regular file`)
+  if (max !== null && st.size > max) die(`${label} is ${st.size} bytes, above the ${max}-byte limit for a file this tool reads`)
   return st
 }
 
@@ -24,7 +34,7 @@ function fixedPath(path, label, max = 256 * 1024) {
   if (!isAbsolute(path)) die(`${label} path must be absolute`)
   let supplied
   try { supplied = lstatSync(path) } catch { die(`${label} is missing`) }
-  if (supplied.isSymbolicLink()) die(`${label} must be a bounded regular non-symlink file`)
+  if (supplied.isSymbolicLink()) die(`${label} must not be a symlink`)
   let canonical
   try { canonical = realpathSync(path) } catch { die(`${label} is missing`) }
   const st = regular(canonical, label, max)
@@ -66,7 +76,12 @@ function client() {
   if (!identityInput || !knownHostsInput || !/^[a-z_][a-z0-9_-]{0,31}@[a-z0-9.-]+$/i.test(target)) {
     die('client usage: --mode client --server <name> --claude <path> --identity-file <path> --known-hosts-file <path> --ssh-target <user@host>')
   }
-  const claudeChecked = fixedPath(claudeInput, 'Claude executable', 64 * 1024 * 1024)
+  // Unbounded, deliberately (#186). Every other `max` here guards a readFileSync; this one guarded
+  // nothing — the doctor stats this file, checks its mode bits, and spawns it with `--version`. It
+  // never reads it. The 64 MB cap therefore bought no safety and refused every shipped Claude Code
+  // binary: 2.1.229 is 281 MB, and the cap has been below the real size since well before the
+  // 2.1.80 floor this tool enforces, so client mode could not succeed for anyone.
+  const claudeChecked = fixedPath(claudeInput, 'Claude executable', null)
   if ((claudeChecked.stat.mode & 0o022) !== 0 || (claudeChecked.stat.mode & 0o111) === 0) {
     die('Claude executable must be executable and not group/world writable')
   }
