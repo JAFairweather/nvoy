@@ -16,7 +16,7 @@ export const isSignerFault = reason =>
 // Returns { code, inconclusive[], notes[] }. code is 0 or 3; the caller owns exit 1
 // (misconfiguration), which is decided long before anything here is known.
 export function inboxVerdict({
-  signerRefusals = [], envelopesSeen = 0, reachedWraps = [], relayCount = 0,
+  signerRefusals = [], envelopesSeen = 0, opened = 0, reachedWraps = [], relayCount = 0,
   unreachable = [], answered10050 = [], dmRelayLists = 0, total = 0,
 } = {}) {
   const inconclusive = [], notes = []
@@ -24,6 +24,25 @@ export function inboxVerdict({
   if (signerRefusals.length) {
     inconclusive.push(`the signer refused or failed on ${signerRefusals.length} of ${envelopesSeen} envelope(s), ` +
       `so an unknown number of messages were never opened — first: ${signerRefusals[0]}`)
+  }
+  // The classifier above matches three known shapes. There is a fourth it cannot match:
+  // nip46-signer.mjs rejects verbatim whatever `pool.publish` threw, and its `finalizeEvent` /
+  // `nip44.encrypt` calls sit outside that try, so an arbitrary "WebSocket is not open" rejects an
+  // RPC with no recognisable prefix. Every such failure was counted as somebody else's wrap and
+  // the run exited 0.
+  //
+  // This closes it without widening the classifier, because it does not read the error text at
+  // all. What makes it sound is the `#p` filter on the message query: everything counted here was
+  // ADDRESSED TO THIS KEY, so "all of it was unopenable" is a statement about this run, not about
+  // strangers' mail.
+  //
+  // Deliberate: an alarm, not a note, even though junk persistently p-tagged at the identity would
+  // fire it every run. Junk and an unrecognised signer fault are indistinguishable from here by
+  // construction, and that indistinguishability is precisely what exit 3 exists to report. If junk
+  // becomes chronic the remedy is to stop accepting it, not to stop saying so.
+  if (envelopesSeen && !opened && !signerRefusals.length) {
+    inconclusive.push(`${envelopesSeen} envelope(s) addressed to this key were read and none opened, ` +
+      'with no signer fault recognised — this is not an empty inbox')
   }
   if (!reachedWraps.length) {
     inconclusive.push(`no relay answered the message query, so nothing was read — ${unreachable.join('; ') || 'no relays configured'}`)
@@ -40,6 +59,12 @@ export function inboxVerdict({
   }
   if (total && answered10050.length && !dmRelayLists) {
     notes.push('no kind:10050 for this identity, yet messages arrived — senders are reaching you by some other route')
+  }
+  // `answered10050` gates both branches above, so when nobody answers that query the whole
+  // reachability question was skipped — and said nothing, which is pass-by-silence one level up.
+  // A note rather than exit 3: the doubt is about the check, not about the inbox.
+  if (reachedWraps.length && !answered10050.length) {
+    notes.push('no relay answered the kind:10050 query, so DM reachability was not checked')
   }
 
   return { code: inconclusive.length ? 3 : 0, inconclusive, notes }
