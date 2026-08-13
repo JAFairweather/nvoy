@@ -188,6 +188,41 @@ function makeNip46(bunkerUri: string, env: NodeJS.ProcessEnv = process.env): { s
   return { signer, pubkey }
 }
 
+/**
+ * The MCP path's EXPECT_PUBKEY. `relay-send`, `inbox` and the profile publishers all refuse before
+ * signing when the resolved key is not the one expected; loading an identity had no such assertion,
+ * so a server whose env pointed at another agent's credentials came up AS that agent — answering
+ * `whoami`, signing and reading their sealed inbox, all silently, because a wrong-identity pairing
+ * works perfectly (waggle#338, two live sightings two days apart).
+ *
+ * Opt-in, matching EXPECT_PUBKEY. A malformed value is an error rather than "no expectation": a
+ * typo'd guard that silently disables itself is worse than no guard, because it reads as protection.
+ */
+function assertExpectedPubkey(identity: Identity, env: NodeJS.ProcessEnv): Identity {
+  const raw = (env.NVOY_EXPECTED_PUBKEY || '').trim()
+  if (!raw) return identity
+  let expected = ''
+  try {
+    if (raw.startsWith('npub1')) {
+      const { type, data } = nip19.decode(raw)
+      if (type === 'npub') expected = String(data)
+    } else {
+      expected = raw.toLowerCase()
+    }
+  } catch { expected = '' }
+  if (!/^[0-9a-f]{64}$/.test(expected)) {
+    throw new Error('NVOY_EXPECTED_PUBKEY must be an npub or a 64-character hex pubkey')
+  }
+  if (identity.pubkey !== expected) {
+    // Name BOTH keys. "Identity mismatch" alone sends the reader to the wrong credential.
+    throw new Error(
+      `identity mismatch: resolved ${nip19.npubEncode(identity.pubkey)} but NVOY_EXPECTED_PUBKEY is ` +
+      `${nip19.npubEncode(expected)} — refusing to start rather than act as the wrong agent (waggle#338)`,
+    )
+  }
+  return identity
+}
+
 export function loadIdentity(
   argv: string[] = process.argv.slice(2),
   env: NodeJS.ProcessEnv = process.env,
@@ -200,7 +235,7 @@ export function loadIdentity(
   if (wantsNip46) {
     if (!bunkerUri) throw new Error('NVOY_SIGNER=nip46 requires NVOY_BUNKER_URI_FILE (or legacy NVOY_BUNKER_URI)')
     const { signer, pubkey } = makeNip46(bunkerUri, env)
-    return { signer, pubkey, npub: nip19.npubEncode(pubkey), source: 'nip46' }
+    return assertExpectedPubkey({ signer, pubkey, npub: nip19.npubEncode(pubkey), source: 'nip46' }, env)
   }
 
   let secretKey: Uint8Array
@@ -226,7 +261,7 @@ export function loadIdentity(
 
   const pubkey = getPublicKey(secretKey)
   const signer = nipxxLocalSigner(secretKey) as Signer
-  return { signer, secretKey, pubkey, npub: nip19.npubEncode(pubkey), source }
+  return assertExpectedPubkey({ signer, secretKey, pubkey, npub: nip19.npubEncode(pubkey), source }, env)
 }
 
 /** Default relay set; override with NVOY_RELAYS (comma-separated). */
