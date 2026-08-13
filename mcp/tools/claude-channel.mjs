@@ -7,7 +7,7 @@
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
+import { CallToolRequestSchema, EmptyResultSchema, ErrorCode, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { appendFileSync, chmodSync, closeSync, existsSync, lstatSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { resolve } from 'node:path'
@@ -47,6 +47,20 @@ const HEX64 = /^[0-9a-f]{64}$/
 const renotifyMs = Number(flag('--renotify-ms') || 30000)
 if (!Number.isInteger(renotifyMs) || renotifyMs < 1000 || renotifyMs > 600000) die('--renotify-ms must be 1000..600000')
 const notifiedThisRun = new Map()
+
+// The transport cannot tell us the client is gone. The sanctioned remote path is an SSH forced
+// command that `docker exec -i`s this process, and when that SSH session drops, the shim keeps the
+// stdin pipe's write end open: no EOF arrives, this process sleeps forever, and the lock above is
+// held by a PID that really is alive — so the liveness reclaim correctly refuses, and the lane is
+// bricked until an operator kills it by hand (#168).
+//
+// An idle timer is the wrong instrument: a real session is legitimately silent for hours, and
+// killing it would trade a stuck lane for a lane that vanishes under a working user. So ask
+// instead. A client that is present answers a ping; one whose carrier is gone never answers.
+const heartbeatMs = Number(flag('--heartbeat-ms') || 60000)
+const heartbeatMisses = Number(flag('--heartbeat-misses') || 3)
+if (!Number.isInteger(heartbeatMs) || heartbeatMs < 1000 || heartbeatMs > 3600000) die('--heartbeat-ms must be 1000..3600000')
+if (!Number.isInteger(heartbeatMisses) || heartbeatMisses < 1 || heartbeatMisses > 100) die('--heartbeat-misses must be 1..100')
 
 // One participant identity may bind one live Claude channel only. A second session would receive
 // the same marker and become a duplicate responder. Reclaim only a lock whose recorded PID is
@@ -240,3 +254,35 @@ async function poll() {
   finally { polling = false }
 }
 setInterval(() => void poll(), pollMs)
+
+// Two ways to be abandoned, and the second is the one seen in production.
+//
+//   1. The client initialised and later went away. Ping it: a peer that is present answers.
+//   2. Nothing ever spoke MCP at all — the forced command ran with no client behind it (a probe,
+//      a health check, a paste). `oninitialized` never fires, there is nothing to ping, and the
+//      process holds the lock forever. This is what stranded pid 14 on `claude-jaf`.
+//
+// A ping that comes back as a JSON-RPC *error* still proves the peer is there, so only a timeout
+// or a closed connection may count as a miss. Treating "answered, unhappily" as absence would
+// evict a live session, which is the worse failure of the two.
+let misses = 0
+let heartbeats = 0
+async function heartbeat() {
+  if (!initialized) {
+    // Nothing has ever spoken to us. Give a real client the same grace a live one gets to miss.
+    if (++heartbeats < heartbeatMisses) return
+    console.error(`nvoy-claude-channel: no MCP client initialised within ${heartbeatMs * heartbeatMisses}ms; releasing the channel lock`)
+    process.exit(0)
+  }
+  try {
+    await mcp.request({ method: 'ping' }, EmptyResultSchema, { timeout: heartbeatMs })
+    misses = 0
+  } catch (error) {
+    const code = error?.code
+    if (code !== ErrorCode.RequestTimeout && code !== ErrorCode.ConnectionClosed) { misses = 0; return }
+    if (++misses < heartbeatMisses) return
+    console.error(`nvoy-claude-channel: client unreachable after ${misses} ping(s); releasing the channel lock`)
+    process.exit(0)
+  }
+}
+setInterval(() => void heartbeat(), heartbeatMs)

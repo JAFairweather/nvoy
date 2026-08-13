@@ -1,7 +1,7 @@
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { z } from 'zod'
@@ -97,6 +97,48 @@ const readLog = readFileSync(join(runtime, 'claude-channel-state', 'read.jsonl')
 ok('one-time baseline records an old queue entry without launching a channel or reply',
   baseline.status === 0 && /baselined 1 existing/.test(baseline.stdout) && readLog.includes(historicalEnvelope) &&
   readFileSync(join(runtime, 'reply-requests.jsonl'), 'utf8').trim().split('\n').length === 1)
+
+// #168 — a channel whose client is gone must release the lock by itself. The production case is an
+// SSH forced command `docker exec -i`ing this process: when the SSH session drops, the shim holds
+// the stdin pipe open, so no EOF ever arrives and the PID stays genuinely alive. The lock's
+// liveness reclaim is therefore correct and useless, and the lane stays bricked until an operator
+// intervenes. Both halves are asserted, because a fix that only evicts is a fix that evicts
+// everyone.
+const lockPath = join(runtime, 'claude-channel-state', 'channel.lock')
+const abandoned = spawn(process.execPath, [resolve('mcp/tools/claude-channel.mjs'), '--instance', manifest.id,
+  '--poll-ms', '250', '--heartbeat-ms', '1000', '--heartbeat-misses', '2'],
+  { env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stdio: ['pipe', 'pipe', 'pipe'] })
+let abandonedStderr = ''
+abandoned.stderr.on('data', chunk => { abandonedStderr += chunk })
+const abandonedExit = await Promise.race([
+  new Promise(resolveExit => abandoned.on('exit', code => resolveExit(code))),
+  new Promise(resolveExit => setTimeout(() => resolveExit('TIMEOUT'), 8000)),
+])
+if (abandonedExit === 'TIMEOUT') abandoned.kill('SIGKILL')
+ok('a channel that no MCP client ever spoke to releases its lock instead of stranding the lane',
+  abandonedExit === 0 && /no MCP client initialised/.test(abandonedStderr) && !existsSync(lockPath))
+
+// Negative control. Without this, "releases the lock" is indistinguishable from "exits on a timer",
+// which would replace a stuck lane with one that dies under a working session — a real session is
+// legitimately silent for hours, so silence must never be the eviction signal. A live client is
+// silent here for well past heartbeat-ms × heartbeat-misses and must survive on ping alone.
+const liveTransport = new StdioClientTransport({ command: process.execPath,
+  args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', manifest.id,
+    '--poll-ms', '250', '--heartbeat-ms', '1000', '--heartbeat-misses', '2'],
+  env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stderr: 'pipe' })
+const liveClient = new Client({ name: 'claude-channel-heartbeat', version: '0.1.0' })
+// An evicted session makes listTools() throw rather than return, so the failure has to be caught
+// and reported. Letting it propagate would abort the run with no verdict printed for this case —
+// a suite that says nothing about the property it exists to defend.
+try {
+  await liveClient.connect(liveTransport)
+  await new Promise(done => setTimeout(done, 3500))
+  const stillThere = (await liveClient.listTools()).tools.map(tool => tool.name)
+  ok('a client that is merely idle answers the ping and is never evicted',
+    stillThere.includes('nvoy_channel_read') && existsSync(lockPath))
+} catch (error) {
+  ok(`a client that is merely idle answers the ping and is never evicted (evicted: ${error.message})`, false)
+} finally { try { await liveClient.close() } catch { /* already gone */ } }
 
 console.log(`\n${passed}/${passed + failed} passed`)
 process.exit(failed ? 1 : 0)
