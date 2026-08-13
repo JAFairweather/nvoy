@@ -80,6 +80,14 @@ const wsk = generateSecretKey()
 const wrap = finalizeEvent({ kind: 1059, created_at: now, tags: [['p', BRIDGE]],
   content: nip44.encrypt(JSON.stringify(seal), nip44.getConversationKey(wsk, BRIDGE)) }, wsk)
 
+// #382: name the resolved identity on SUCCESS, not only on mismatch. EXPECT_PUBKEY is enforced
+// correctly above and then says nothing, which is indistinguishable from the flag not existing —
+// the only way to learn which key signed is to get it wrong. #338 was precisely a session acting
+// as the wrong key, so a send that succeeds under an unnamed identity is the one thing that
+// should not be possible. Say whether the identity was CHECKED, too: "signing as X" with no
+// EXPECT_PUBKEY set is a statement about this process's own belief, not a verified fact.
+console.error(`relay-send: signing as ${nip19.npubEncode(pk)}` +
+  (expectedRaw ? ' — matches EXPECT_PUBKEY' : ' — EXPECT_PUBKEY not set, identity NOT verified'))
 console.error(`relay-send: sealed wrap ${wrap.id.slice(0, 12)}… (${JSON.stringify(wrap).length}B) ` +
   `-> waggle ${BRIDGE.slice(0, 8)}… for channel ${CHANNEL.slice(0, 8)}…  [${body.length}B body]`)
 if (DRY) { console.error('relay-send: DRY_RUN — nothing published'); process.exit(0) }
@@ -100,5 +108,13 @@ for (const url of RELAYS) {
   })
 }
 console.error(`relay-send: accepted by ${ok}/${RELAYS.length} relay(s).` +
-  (ok ? '  Verify with inbox.mjs — replies return sealed to your key.' : '  NOT sent — no relay accepted.'))
+  (ok ? '  Relay OK is an ACKNOWLEDGEMENT, not delivery — read the id above back from a fresh connection.'
+      : '  NOT sent — no relay accepted.'))
+// #182: everything above is a human-readable summary on stderr, and the wrap id in it is cut to 12
+// of 64 characters so the line stays readable. That left the operator unable to do the one check
+// this repo insists on — a publish is proven by fetching it back BY ID — because 12 characters is
+// not an id. The full id goes to stdout, alone, so `ID=$(… | relay-send.mjs)` works while the
+// summary still reads well in a terminal. Printed only after a relay accepted: an id for an event
+// that was never published is worse than no id.
+if (ok) console.log(wrap.id)
 process.exit(ok ? 0 : 1)
