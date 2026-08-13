@@ -34,6 +34,29 @@ const healthy = { reachedWraps: ['wss://a'], relayCount: 1, answered10050: ['wss
 const clean = inboxVerdict(healthy)
 ok('a reachable identity with an empty inbox is a RESULT, not a doubt', clean.code === 0 && !clean.inconclusive.length)
 
+// ---- the fourth signer shape, which the classifier cannot see (review of #183) ------------------
+//
+// nip46-signer.mjs rejects verbatim whatever `pool.publish` threw, and its finalizeEvent /
+// nip44.encrypt calls sit outside that try. "WebSocket is not open" matches none of the three
+// shapes, so a signer failing that way looked exactly like an empty inbox. This is caught without
+// reading the error at all — the envelopes were `#p`-filtered to this key, so none of them opening
+// is a fact about this run.
+const unopenable = inboxVerdict({ ...healthy, envelopesSeen: 5, opened: 0 })
+ok('envelopes addressed to this key that NONE opened is inconclusive, with no fault recognised',
+  unopenable.code === 3)
+ok('  …and the reason counts them and refuses the "empty inbox" reading',
+  /5 envelope\(s\) addressed to this key/.test(unopenable.inconclusive[0]) &&
+  /this is not an empty inbox/.test(unopenable.inconclusive[0]))
+// Both directions, and these are the ones that stop it becoming "always inconclusive".
+ok('opening even one of them is a RESULT', inboxVerdict({ ...healthy, envelopesSeen: 5, opened: 1 }).code === 0)
+ok('seeing no envelopes at all is a genuinely empty inbox, not a doubt',
+  inboxVerdict({ ...healthy, envelopesSeen: 0, opened: 0 }).code === 0)
+// A wrap can open cleanly and still be filtered out by --since-min, so `opened` must be counted
+// before that filter and must NOT be inferred from the printed total. If it were, a healthy read
+// of nothing but older mail would report as a failure to open anything.
+ok('a wrap that opened but fell outside the window is not reported as unopenable',
+  inboxVerdict({ ...healthy, envelopesSeen: 3, opened: 3, total: 0 }).code === 0)
+
 const noRelay = inboxVerdict({ ...healthy, reachedWraps: [], unreachable: ['wss://a — timed out after 8s'] })
 ok('no relay answering is inconclusive', noRelay.code === 3)
 ok('  …and the reason says nothing was read, naming the relay',
@@ -57,6 +80,14 @@ ok('  …and the reason counts the envelopes and quotes the first refusal',
 const arrivedAnyway = inboxVerdict({ ...healthy, dmRelayLists: 0, total: 2 })
 ok('messages that arrived without a kind:10050 are a NOTE, not an alarm',
   arrivedAnyway.code === 0 && arrivedAnyway.notes.some(n => /some other route/.test(n)))
+
+// `answered10050` gates both 10050 branches, so nobody answering that query skipped the whole
+// reachability question silently — pass-by-silence inside the PR about pass-by-silence.
+const noAnswer = inboxVerdict({ ...healthy, answered10050: [] })
+ok('an unanswered kind:10050 query says so rather than skipping the question',
+  noAnswer.notes.some(n => /DM reachability was not checked/.test(n)))
+ok('  …as a note, not an alarm — the doubt is about the check, not the inbox', noAnswer.code === 0)
+ok('  …and it stays quiet when the query WAS answered', !clean.notes.some(n => /was not checked/.test(n)))
 
 const partial = inboxVerdict({ ...healthy, relayCount: 3, unreachable: ['wss://b — connection error'] })
 ok('partial reach stays conclusive but is said out loud',
@@ -115,6 +146,21 @@ relay.store.publish(finalizeEvent({ kind: 1059, created_at: now, tags: [['p', pk
 const delivered = await runInbox(base)
 ok('an inbox holding a real sealed message exits 0', delivered.status === 0)
 ok('  …and prints the message body it opened', delivered.stdout.includes('a message that really arrived'))
+
+// The fourth-shape hole, live and without a signer: a wrap p-tagged at this key whose content is
+// not openable at all. envelopesSeen goes up, opened does not, and no error shape is recognised —
+// which is exactly what an unrecognised signer fault looks like from here.
+const junkRelay = await startWsRelay(0)
+const junkKey = generateSecretKey()
+junkRelay.store.publish(finalizeEvent({ kind: 1059, created_at: Math.floor(Date.now() / 1000),
+  tags: [['p', pk]], content: 'not nip44 ciphertext at all' }, junkKey))
+junkRelay.store.publish(finalizeEvent({ kind: 10050, created_at: Math.floor(Date.now() / 1000),
+  tags: [['relay', junkRelay.url]], content: '' }, sk))
+const unopened = await runInbox({ NVOY_NSEC: nsec, NVOY_RELAYS: junkRelay.url })
+ok('a live wrap addressed here that cannot be opened exits 3, not 0', unopened.status === 3)
+ok('  …and says so without blaming the signer, which reported nothing',
+  /addressed to this key were read and none opened/.test(unopened.stderr) && !/signer refused/.test(unopened.stderr))
+await junkRelay.close()
 
 await relay.close()
 

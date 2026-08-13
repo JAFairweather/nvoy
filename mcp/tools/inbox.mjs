@@ -137,6 +137,7 @@ await Promise.all(RELAYS.map(url => new Promise(res => {
 
 const msgs = []
 const signerRefusals = []
+let opened = 0
 const selectedWraps = [...wraps.values()].sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0)).slice(0, maxWraps)
 for (const w of selectedWraps) {
   try {
@@ -146,7 +147,13 @@ for (const w of selectedWraps) {
     const plain = signer ? await signer.nip44Decrypt(seal.pubkey, seal.content) : nip44.decrypt(seal.content, nip44.getConversationKey(sk, seal.pubkey))
     const rumor = JSON.parse(plain)
     const rawMessage = verifyInboxEnvelope({ wrap: w, seal, rumor, recipient: pk })
-    if (!rawMessage || rawMessage.at < since || rawMessage.from === pk) continue
+    if (!rawMessage) continue
+    // Counted BEFORE the window and self filters, and deliberately not derived from the printed
+    // total: a wrap that opened cleanly but fell outside --since-min is `continue`d below, so
+    // using the total as a proxy for "opened" would report a healthy read of older mail as a
+    // failure to open anything.
+    opened++
+    if (rawMessage.at < since || rawMessage.from === pk) continue
     const carried = verifyChannelDataCarry(rawMessage, { channels: CARRY_CHANNELS, carriers: CARRY_CARRIERS })
     if (carried) msgs.push({ ...carried.message, verifiedData: true, provenance: carried.provenance })
     else msgs.push(rawMessage)
@@ -209,7 +216,7 @@ console.log(U.length ? U.map(line).join('\n\n') : '  (none)')
 // evidently works, and the absent list is a separate oddity that gets said out loud rather than
 // turned into an alarm.
 const { code, inconclusive, notes } = inboxVerdict({
-  signerRefusals, envelopesSeen: selectedWraps.length, reachedWraps, relayCount: RELAYS.length,
+  signerRefusals, envelopesSeen: selectedWraps.length, opened, reachedWraps, relayCount: RELAYS.length,
   unreachable, answered10050, dmRelayLists: dmRelayLists.size,
   total: V.length + TD.length + RC.length + CN.length + U.length,
 })
