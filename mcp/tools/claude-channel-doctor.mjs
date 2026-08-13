@@ -111,14 +111,27 @@ function broker() {
   if ((st.mode & 0o022) !== 0) die('public key file must not be group/world writable')
   const fields = readFileSync(publicKey, 'utf8').trim().split(/\s+/)
   if (!/^(ssh-ed25519|ecdsa-sha2-nistp256)$/.test(fields[0] || '') || !/^[A-Za-z0-9+/]+={0,2}$/.test(fields[1] || '')) die('unsupported or malformed OpenSSH public key')
+  // Both paths are inside the adapter image, never on the host — see authorizedKeyRenderer below.
   const tool = '/srv/nvoy/mcp/tools/claude-channel.mjs'
+  const renderer = '/srv/nvoy/mcp/tools/instance-claude-channel-authorized-key.mjs'
   console.log(JSON.stringify({
     ok: true,
     mode: 'broker',
     instance: manifest.id,
     recipient: manifest.pubkey,
     baseline: ['/usr/bin/docker', 'exec', '--user', `${manifest.workerUid}:${manifest.workerHandoffGid}`, container, '/usr/local/bin/node', tool, '--instance', manifest.id, '--baseline'],
-    authorizedKeyRenderer: ['/usr/local/bin/node', '/srv/nvoy/mcp/tools/instance-claude-channel-authorized-key.mjs', '--instance', manifest.id, '--public-key-file', publicKey, '--container', container],
+    // Wrapped in `docker exec` for the same reason `baseline` is: `/usr/local/bin/node` and
+    // `/srv/nvoy` exist inside the adapter image and NOT on the container host, so the unwrapped
+    // form fails with `node: command not found` on the very host it names. Invariant 3 below asks
+    // the owner to install this output UNMODIFIED — a command they must guess how to wrap is one
+    // they will wrap differently each time, on the step where "unmodified" is the safety property.
+    //
+    // Same worker identity as `baseline`, for a weaker reason than baseline's. This tool only
+    // reads the manifest and a public key and prints a line, so it does not NEED the worker's
+    // privileges — it runs as the worker so that it cannot need more than baseline does, and the
+    // container's default root would be more. Measured on the live adapter: 41024:42022 reads the
+    // manifest (mode 0644) and executes node.
+    authorizedKeyRenderer: ['/usr/bin/docker', 'exec', '--user', `${manifest.workerUid}:${manifest.workerHandoffGid}`, container, '/usr/local/bin/node', renderer, '--instance', manifest.id, '--public-key-file', publicKey, '--container', container],
     invariants: ['Run baseline before installing or enabling the client key.', 'Install the renderer output unmodified for the dedicated SSH principal.', 'No shell, PTY, forwarding, signer, or model-worker credential is granted.']
   }, null, 2))
 }

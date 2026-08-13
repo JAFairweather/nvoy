@@ -63,6 +63,37 @@ const broker = spawnSync(process.execPath, [tool, '--mode', 'broker', '--instanc
 const brokerDescription = JSON.parse(broker.stdout || '{}')
 ok('broker doctor validates and binds a notify-only identity', broker.status === 0 && brokerDescription.instance === 'claude-test' && brokerDescription.recipient === '1'.repeat(64))
 ok('broker doctor emits the exact worker UID/GID baseline before key installation', brokerDescription.baseline?.includes('41014:42012') && /baseline before/.test(brokerDescription.invariants?.[0] || ''))
+// Every command the broker output hands an owner must be runnable in the environment it names.
+// `/usr/local/bin/node` and `/srv/nvoy` live inside the adapter image, not on the container host —
+// verified on nave.pub, where the host has neither — so a command referencing them and NOT wrapped
+// in `docker exec` fails with `node: command not found` on the host. authorizedKeyRenderer was
+// unwrapped, and nothing asserted it, so it was the second line of a two-line procedure the owner
+// is told to run verbatim.
+{
+  const cmds = { baseline: brokerDescription.baseline, authorizedKeyRenderer: brokerDescription.authorizedKeyRenderer }
+  for (const [name, cmd] of Object.entries(cmds)) {
+    const needsContainer = (cmd || []).some(a => typeof a === 'string' && (a.startsWith('/srv/nvoy/') || a === '/usr/local/bin/node'))
+    ok(`${name} names a container-only path, so it must be wrapped in docker exec`,
+      !needsContainer || (cmd[0] === '/usr/bin/docker' && cmd[1] === 'exec'))
+    ok(`  …and ${name} runs as the worker identity, never the container's default root`,
+      !needsContainer || (cmd.includes('--user') && cmd[cmd.indexOf('--user') + 1] === '41014:42012'))
+    ok(`  …and ${name} names the container it was given`, !needsContainer || cmd.includes('nvoy-claude-1'))
+  }
+  // NEGATIVE CONTROL. Every assertion above is satisfied by wrapping something in docker exec; none
+  // of them checks the wrapped command still does its job. These pin what each one actually runs,
+  // so a future edit cannot satisfy the shape while pointing at the wrong tool.
+  ok('NEGATIVE CONTROL — baseline still invokes claude-channel.mjs with --baseline',
+    brokerDescription.baseline?.includes('/srv/nvoy/mcp/tools/claude-channel.mjs') && brokerDescription.baseline?.includes('--baseline'))
+  ok('NEGATIVE CONTROL — the renderer still invokes the authorized-key tool, not the channel tool',
+    brokerDescription.authorizedKeyRenderer?.includes('/srv/nvoy/mcp/tools/instance-claude-channel-authorized-key.mjs') &&
+    !brokerDescription.authorizedKeyRenderer?.includes('--baseline'))
+  // The CANONICAL path: fixedPath resolves through realpathSync before emitting, which on macOS
+  // turns /var/… into /private/var/…. Comparing against the path as supplied fails here for a
+  // reason that has nothing to do with the tool.
+  ok('  …and still carries the public key it was asked about, canonicalised',
+    brokerDescription.authorizedKeyRenderer?.includes(realpathSync(publicKey)))
+}
+
 const relativePublic = spawnSync(process.execPath, [tool, '--mode', 'broker', '--instance', 'claude-test', '--public-key-file', 'channel.pub', '--container', 'nvoy-claude-1'], { encoding: 'utf8', cwd: root, env: { ...process.env, NVOY_INSTANCE_ROOT: manifests } })
 ok('broker doctor refuses a relative public-key path', relativePublic.status !== 0 && /path must be absolute/.test(relativePublic.stderr))
 const wrongManifest = { ...manifest, id: 'claude-wrong', pubkey: '3'.repeat(64), state_dir: join(root, 'wrong-state'), runtime_dir: join(root, 'wrong-runtime'), spool_dir: join(root, 'wrong-spool'), delivery_mode: 'headless', worker_enabled: false }
