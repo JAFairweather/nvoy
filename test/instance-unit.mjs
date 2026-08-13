@@ -11,7 +11,7 @@ import { join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { generateSecretKey, getPublicKey } from 'nostr-tools/pure'
 import * as nip19 from 'nostr-tools/nip19'
-import { readManifest } from '../mcp/tools/runtime_manifest.mjs'
+import { readManifest, assertNoCollisions } from '../mcp/tools/runtime_manifest.mjs'
 import { forcedCommand, principalLine, parsePrincipal, verifyPrincipal, volumeLifecycle } from '../mcp/tools/participant_unit.mjs'
 
 let fails = 0
@@ -184,6 +184,74 @@ ok('a confirmed destroy invokes compose down WITH -v', destroyReal.status === 0 
 
 const missingCompose = run('restart', '--instance', 'claude-test', '--compose-file', join(root, 'no-such.yml'))
 ok('a missing compose file is refused rather than passed to docker', missingCompose.status === 1 && /does not exist/.test(missingCompose.stderr))
+
+
+// UID AND GID COLLISIONS ACROSS MANIFESTS (#177).
+//
+// This is a credential boundary, not tidiness. instance-runtime-init.mjs provisions the Bunker URI
+// and NIP-46 client key to brokerUid:brokerAdapterGid at mode 0400 — owner-read only. There is no
+// useradd in that path, so a duplicate uid is not a name clash that fails loudly; it is a second
+// instance whose broker runs as the same OS user and can read the first one's credentials.
+//
+// Every refusal below is paired with a value that must still pass, because a checker that refused
+// every second manifest would satisfy the refusals alone. And each asserts the REASON: the
+// operator's next move is to renumber one specific block, which "collision" alone does not locate.
+const freshKey = () => nip19.npubEncode(getPublicKey(generateSecretKey()))
+const collide = (name, a, b) => {
+  const dir = join(root, `collide-${name}`)
+  mkdirSync(dir)
+  // A distinct pubkey per fixture: `base` carries one, and two manifests sharing it would trip the
+  // pubkey check first and report a pass/refusal that says nothing about uids.
+  write(`alpha-${name}`, { pubkey: freshKey(), ...a }, dir)
+  write(`beta-${name}`, { pubkey: freshKey(), ...b }, dir)
+  try { assertNoCollisions(dir, null); return null } catch (e) { return e.message || String(e) }
+}
+
+const cleanPair = collide('clean',
+  { watcher_uid: 41111, broker_uid: 41112, adapter_uid: 41113, worker_uid: 41114, broker_adapter_gid: 42111, worker_handoff_gid: 42112 },
+  { watcher_uid: 41121, broker_uid: 41122, adapter_uid: 41123, worker_uid: 41124, broker_adapter_gid: 42121, worker_handoff_gid: 42122 })
+ok('two fully distinct manifests still pass — the check is not refusing every second identity', cleanPair === null, String(cleanPair))
+
+const sameRole = collide('samerole',
+  { watcher_uid: 41211, broker_uid: 41212, adapter_uid: 41213, worker_uid: 41214, broker_adapter_gid: 42211, worker_handoff_gid: 42212 },
+  { watcher_uid: 41221, broker_uid: 41212, adapter_uid: 41223, worker_uid: 41224, broker_adapter_gid: 42221, worker_handoff_gid: 42222 })
+ok('a shared broker_uid is refused — the second broker would read the first one\'s Bunker credential',
+  sameRole !== null, String(sameRole))
+ok('  ...and the reason names broker_uid and both instances, so the operator knows which block to renumber',
+  /broker_uid collision between alpha-samerole and beta-samerole/.test(sameRole || ''), String(sameRole))
+
+// The case that keying by ROLE would have missed: same number, different role. Still one OS user.
+const crossRole = collide('crossrole',
+  { watcher_uid: 41311, broker_uid: 41312, adapter_uid: 41313, worker_uid: 41314, broker_adapter_gid: 42311, worker_handoff_gid: 42312 },
+  { watcher_uid: 41321, broker_uid: 41322, adapter_uid: 41323, worker_uid: 41311, broker_adapter_gid: 42321, worker_handoff_gid: 42322 })
+ok('one instance\'s worker_uid equal to another\'s watcher_uid is refused — it is the same OS user either way',
+  crossRole !== null, String(crossRole))
+ok('  ...and the reason names BOTH roles and the number, because they differ',
+  /uid 41311 collision between alpha-crossrole \(watcher_uid\) and beta-crossrole \(worker_uid\)/.test(crossRole || ''),
+  String(crossRole))
+
+const sameGid = collide('samegid',
+  { watcher_uid: 41411, broker_uid: 41412, adapter_uid: 41413, worker_uid: 41414, broker_adapter_gid: 42411, worker_handoff_gid: 42412 },
+  { watcher_uid: 41421, broker_uid: 41422, adapter_uid: 41423, worker_uid: 41424, broker_adapter_gid: 42411, worker_handoff_gid: 42422 })
+ok('a shared broker_adapter_gid is refused too', sameGid !== null, String(sameGid))
+ok('  ...naming the gid field', /broker_adapter_gid collision/.test(sameGid || ''), String(sameGid))
+
+// Over-broad is its own failure. A uid and a gid are different namespaces on the box, so the same
+// NUMBER used as a uid here and a gid there is not a collision and must not be reported as one.
+const uidGid = collide('uidgid',
+  { watcher_uid: 41511, broker_uid: 41512, adapter_uid: 41513, worker_uid: 41514, broker_adapter_gid: 42511, worker_handoff_gid: 42512 },
+  { watcher_uid: 41521, broker_uid: 41522, adapter_uid: 41523, worker_uid: 41524, broker_adapter_gid: 41511, worker_handoff_gid: 42522 })
+ok('a number used as a uid in one manifest and a gid in another is NOT a collision — separate namespaces',
+  uidGid === null, String(uidGid))
+
+// The deployed fleet must still start. These are the two live allocations as installed — the
+// convention this check turns into an invariant. A new rule that rejected the running configuration
+// would be found at the worst possible moment, so it is asserted here rather than discovered there.
+const live = collide('live',
+  { watcher_uid: 41011, broker_uid: 41012, adapter_uid: 41013, worker_uid: 41014, broker_adapter_gid: 42011, worker_handoff_gid: 42012 },
+  { watcher_uid: 41021, broker_uid: 41022, adapter_uid: 41023, worker_uid: 41024, broker_adapter_gid: 42021, worker_handoff_gid: 42022 })
+ok('the two allocations currently deployed still pass — this rule breaks nothing already running',
+  live === null, String(live))
 
 console.log(fails ? `\ninstance-unit: ${fails} FAILED` : '\nall passed')
 process.exit(fails ? 1 : 0)

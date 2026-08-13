@@ -162,6 +162,16 @@ export function readManifest(root, requestedId) {
 
 // Supervisor preflight: a second identity must never accidentally share a state or runtime
 // root. This is intentionally fail-closed rather than silently picking one manifest.
+//
+// THE UIDS AND GIDS ARE CHECKED HERE TOO (#177), and they are the reason this is a security check
+// rather than a tidiness one. `instance-runtime-init.mjs` provisions the Bunker URI and the NIP-46
+// client key to `brokerUid:brokerAdapterGid` at mode 0400 — owner-read only, which is correct and
+// which depends entirely on that owner being unique to the instance. There is no `useradd` anywhere
+// in this path: a uid is a number that gets chowned, so a duplicate is not a name clash that fails
+// loudly, it is a second instance whose broker runs as the same OS user and can read the first
+// instance's credentials. Within one manifest the four uids are already required to be distinct
+// (see above); between manifests nothing enforced it, and the live root's non-overlapping blocks
+// were a convention held by hand.
 export function assertNoCollisions(root, candidate) {
   const canonicalRoot = realpathSync(root)
   const seen = new Map()
@@ -170,10 +180,27 @@ export function assertNoCollisions(root, candidate) {
     const id = name.slice(0, -5)
     let m
     try { m = readManifest(canonicalRoot, id) } catch (e) { die(`invalid manifest ${name}: ${e.message}`) }
-    for (const [field, value] of [['pubkey', m.pubkey], ['stateDir', m.stateDir], ['runtimeDir', m.runtimeDir], ['spoolDir', m.spoolDir]]) {
-      const key = `${field}:${value}`
-      if (seen.has(key)) die(`${field} collision between ${seen.get(key)} and ${m.id}`)
-      seen.set(key, m.id)
+    // `namespace` is what is compared; `field` is only what the message calls it. Every uid shares
+    // ONE namespace, and so does every gid, because the hazard is two instances resolving to the
+    // same OS user or group — not two instances using the same number for the same role. Keying by
+    // role would let this instance's watcher_uid equal that instance's broker_uid and call it clean,
+    // which is the same user with a different label on it.
+    for (const [namespace, field, value] of [
+      ['pubkey', 'pubkey', m.pubkey], ['stateDir', 'stateDir', m.stateDir],
+      ['runtimeDir', 'runtimeDir', m.runtimeDir], ['spoolDir', 'spoolDir', m.spoolDir],
+      ['uid', 'watcher_uid', m.watcherUid], ['uid', 'broker_uid', m.brokerUid],
+      ['uid', 'adapter_uid', m.adapterUid], ['uid', 'worker_uid', m.workerUid],
+      ['gid', 'broker_adapter_gid', m.brokerAdapterGid], ['gid', 'worker_handoff_gid', m.workerHandoffGid]]) {
+      const key = `${namespace}:${value}`
+      const prior = seen.get(key)
+      // The message names both roles when they differ, because "uid collision between a and b" sends
+      // the operator looking at the wrong four numbers when it is a's worker and b's watcher.
+      if (prior) {
+        die(prior.field === field
+          ? `${field} collision between ${prior.id} and ${m.id}`
+          : `${namespace} ${value} collision between ${prior.id} (${prior.field}) and ${m.id} (${field})`)
+      }
+      seen.set(key, { id: m.id, field })
     }
   }
   if (!candidate || !contained(canonicalRoot, candidate.path)) return
