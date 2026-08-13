@@ -57,7 +57,10 @@ const publicKey = join(root, 'channel.pub'); writeFileSync(publicKey, 'ssh-ed255
 const manifest = { version: 1, id: 'claude-test', pubkey: '1'.repeat(64), grantors: ['2'.repeat(64)], relays: ['wss://nos.lol'],
   state_dir: join(root, 'state'), runtime_dir: join(root, 'runtime'), spool_dir: join(root, 'spool'), key_ref: '/run/secrets/claude-test',
   broker_adapter_gid: 42011, worker_handoff_gid: 42012, watcher_uid: 41011, broker_uid: 41012, adapter_uid: 41013, worker_uid: 41014,
-  broker_mode: 'local', worker_enabled: false, delivery_mode: 'notify_only' }
+  broker_mode: 'local', worker_enabled: false, delivery_mode: 'notify_only',
+  // Named explicitly rather than left to the nvoy-<id>-adapter-1 default, so the fixture exercises
+  // the manifest field the doctor now checks --container against (#188).
+  adapter_container: 'nvoy-claude-1' }
 writeFileSync(join(manifests, 'claude-test.json'), JSON.stringify(manifest))
 const broker = spawnSync(process.execPath, [tool, '--mode', 'broker', '--instance', 'claude-test', '--public-key-file', publicKey, '--container', 'nvoy-claude-1'], { encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifests } })
 const brokerDescription = JSON.parse(broker.stdout || '{}')
@@ -87,11 +90,57 @@ ok('broker doctor emits the exact worker UID/GID baseline before key installatio
   ok('NEGATIVE CONTROL — the renderer still invokes the authorized-key tool, not the channel tool',
     brokerDescription.authorizedKeyRenderer?.includes('/srv/nvoy/mcp/tools/instance-claude-channel-authorized-key.mjs') &&
     !brokerDescription.authorizedKeyRenderer?.includes('--baseline'))
-  // The CANONICAL path: fixedPath resolves through realpathSync before emitting, which on macOS
-  // turns /var/… into /private/var/…. Comparing against the path as supplied fails here for a
-  // reason that has nothing to do with the tool.
-  ok('  …and still carries the public key it was asked about, canonicalised',
-    brokerDescription.authorizedKeyRenderer?.includes(realpathSync(publicKey)))
+  // #188. Wrapping the command in `docker exec` is what created the next problem: everything after
+  // the container name runs INSIDE the image, so a host path in that tail resolves to nothing. The
+  // doctor validated the public key on the host and then handed the path to a container process,
+  // which died with "public key file is missing" on the live adapter — on the step invariant 2
+  // tells the owner to run unmodified.
+  //
+  // The container shares exactly two paths with the host (`/etc/nvoy/instances` bind, the
+  // `/run/nvoy/<id>` volume), its rootfs is read-only so `docker cp` is refused, and everything
+  // else it can reach is in-image. So the rule is about the boundary, not about this one flag.
+  const renderCmd = brokerDescription.authorizedKeyRenderer || []
+  const inContainer = renderCmd.slice(renderCmd.indexOf('nvoy-claude-1') + 1)
+  const CONTAINER_VISIBLE = ['/srv/nvoy/', '/usr/local/bin/', '/etc/nvoy/instances/', '/run/nvoy/']
+  const hostPaths = inContainer.filter(a => typeof a === 'string' && a.startsWith('/') && !CONTAINER_VISIBLE.some(p => a.startsWith(p)))
+  ok('every absolute path the renderer runs WITH is one the container can see (#188)',
+    inContainer.length > 0 && hostPaths.length === 0)
+  ok('  …and the test can tell: the fixture key really does live on a host-only path',
+    !CONTAINER_VISIBLE.some(p => realpathSync(publicKey).startsWith(p)))
+
+  // By value, so nothing has to cross the boundary. A public key is not a secret.
+  ok('  …so the key travels as its two parsed fields, not as a path',
+    inContainer.includes('--public-key-type') && inContainer.includes('ssh-ed25519') &&
+    inContainer.includes('--public-key-body') && inContainer.includes('AAAAC3NzaC1lZDI1NTE5AAAAITestOnly') &&
+    !inContainer.includes('--public-key-file'))
+
+  // The assertions above are all about shape. This one runs the renderer through the arguments the
+  // doctor actually emitted — the whole point being that a command can be well-shaped and still not
+  // work. `docker exec … <container> /usr/local/bin/node <renderer>` is stripped because the test
+  // host has neither the container nor that node; the ARGUMENTS are what is under test.
+  const rendererArgs = inContainer.slice(inContainer.indexOf('/usr/local/bin/node') + 2)
+  const rendered = spawnSync(process.execPath, [resolve('mcp/tools/instance-claude-channel-authorized-key.mjs'), ...rendererArgs],
+    { encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifests } })
+  ok('the emitted arguments actually drive the renderer to a principal line',
+    rendered.status === 0 && /^restrict,command="/.test(rendered.stdout.trim()))
+  ok('  …and that line is the forced command, bound to the worker identity and taking no caller argument',
+    /command="\/usr\/bin\/docker exec -i --user 41014:42012 nvoy-claude-1 \/usr\/local\/bin\/node \/srv\/nvoy\/mcp\/tools\/claude-channel\.mjs --instance claude-test"/.test(rendered.stdout))
+  ok('  …and it carries the key the doctor was asked about',
+    rendered.stdout.includes('ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestOnly'))
+
+  // NEGATIVE CONTROL for the renderer's new branch. It must not accept a key by value that it would
+  // have refused from a file, or "by value" is a way around the validation rather than a way around
+  // the filesystem.
+  const malformed = spawnSync(process.execPath, [resolve('mcp/tools/instance-claude-channel-authorized-key.mjs'),
+    '--instance', 'claude-test', '--public-key-type', 'ssh-rsa', '--public-key-body', 'AAAAB3NzaC1yc2E'],
+    { encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifests } })
+  ok('NEGATIVE CONTROL — a key supplied by value is validated exactly as one read from a file',
+    malformed.status !== 0 && /unsupported or malformed OpenSSH public key/.test(malformed.stderr))
+  const bothWays = spawnSync(process.execPath, [resolve('mcp/tools/instance-claude-channel-authorized-key.mjs'),
+    '--instance', 'claude-test', '--public-key-file', publicKey, '--public-key-type', 'ssh-ed25519', '--public-key-body', 'AAAAC3NzaC1lZDI1NTE5AAAAITestOnly'],
+    { encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifests } })
+  ok('  …and supplying both forms is refused rather than one silently winning',
+    bothWays.status !== 0 && /not both/.test(bothWays.stderr))
 }
 
 const relativePublic = spawnSync(process.execPath, [tool, '--mode', 'broker', '--instance', 'claude-test', '--public-key-file', 'channel.pub', '--container', 'nvoy-claude-1'], { encoding: 'utf8', cwd: root, env: { ...process.env, NVOY_INSTANCE_ROOT: manifests } })
@@ -100,5 +149,19 @@ const wrongManifest = { ...manifest, id: 'claude-wrong', pubkey: '3'.repeat(64),
 writeFileSync(join(manifests, 'claude-wrong.json'), JSON.stringify(wrongManifest))
 const wrong = spawnSync(process.execPath, [tool, '--mode', 'broker', '--instance', 'claude-wrong', '--public-key-file', publicKey, '--container', 'nvoy-claude-1'], { encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifests } })
 ok('broker doctor refuses a non-notify-only identity', wrong.status !== 0 && /notify_only/.test(wrong.stderr))
+
+// #188, third leg. The doctor echoed `--container` into both emitted commands without checking it,
+// and the renderer asserts it against the manifest. So naming any container other than the
+// instance's adapter produced a well-formed command that died on the step the owner is told to run
+// unmodified, and a `baseline` aimed at a container that may not be theirs. It went unnoticed
+// because the value that was tried happened to equal the nvoy-<id>-adapter-1 default.
+const wrongContainer = spawnSync(process.execPath, [tool, '--mode', 'broker', '--instance', 'claude-test', '--public-key-file', publicKey, '--container', 'nvoy-somebody-elses-1'], { encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifests } })
+ok('broker doctor refuses a --container that is not this instance\'s adapter, instead of emitting a command that fails later',
+  wrongContainer.status !== 0 && /is not this instance's adapter/.test(wrongContainer.stderr))
+ok('  …and names both what was asked for and what the manifest declares',
+  /nvoy-somebody-elses-1/.test(wrongContainer.stderr) && /nvoy-claude-1/.test(wrongContainer.stderr))
+// The control: the check refuses the wrong container rather than refusing every container. Asserted
+// by the successful run at the top of this section, named here so the pairing is not accidental.
+ok('  NEGATIVE CONTROL — the manifest\'s own adapter is still accepted', broker.status === 0)
 
 if (fails) process.exit(1)
