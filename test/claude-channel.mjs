@@ -106,7 +106,7 @@ ok('one-time baseline records an old queue entry without launching a channel or 
 // everyone.
 const lockPath = join(runtime, 'claude-channel-state', 'channel.lock')
 const abandoned = spawn(process.execPath, [resolve('mcp/tools/claude-channel.mjs'), '--instance', manifest.id,
-  '--poll-ms', '250', '--heartbeat-ms', '1000', '--heartbeat-misses', '2'],
+  '--poll-ms', '250', '--handshake-ms', '1000', '--heartbeat-ms', '1000', '--heartbeat-misses', '2'],
   { env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stdio: ['pipe', 'pipe', 'pipe'] })
 let abandonedStderr = ''
 abandoned.stderr.on('data', chunk => { abandonedStderr += chunk })
@@ -122,22 +122,38 @@ ok('a channel that no MCP client ever spoke to releases its lock instead of stra
 // which would replace a stuck lane with one that dies under a working session — a real session is
 // legitimately silent for hours, so silence must never be the eviction signal. A live client is
 // silent here for well past heartbeat-ms × heartbeat-misses and must survive on ping alone.
+//
+// Surviving is necessary but NOT sufficient, and asserting only survival is how this test read
+// before review: the code resets `misses` on any non-timeout error, so a build whose ping
+// round-trip was wholly broken — capability rejection, schema drift, a client with no ping at all —
+// would take that same branch and pass under a name claiming the pong arrived. The pong is
+// therefore observed directly, on stderr, as well as the survival.
+//
+// `--handshake-ms 1000` is deliberately shorter than the wait: a client that DID initialise must
+// not be caught by the handshake arm, which is the whole point of splitting the two knobs.
 const liveTransport = new StdioClientTransport({ command: process.execPath,
   args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', manifest.id,
-    '--poll-ms', '250', '--heartbeat-ms', '1000', '--heartbeat-misses', '2'],
+    '--poll-ms', '250', '--handshake-ms', '1000', '--heartbeat-ms', '1000', '--heartbeat-misses', '2'],
   env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stderr: 'pipe' })
 const liveClient = new Client({ name: 'claude-channel-heartbeat', version: '0.1.0' })
 // An evicted session makes listTools() throw rather than return, so the failure has to be caught
 // and reported. Letting it propagate would abort the run with no verdict printed for this case —
 // a suite that says nothing about the property it exists to defend.
+let liveStderr = ''
 try {
   await liveClient.connect(liveTransport)
+  liveTransport.stderr?.on('data', chunk => { liveStderr += chunk })
   await new Promise(done => setTimeout(done, 3500))
   const stillThere = (await liveClient.listTools()).tools.map(tool => tool.name)
   ok('a client that is merely idle answers the ping and is never evicted',
     stillThere.includes('nvoy_channel_read') && existsSync(lockPath))
+  ok('the pong is OBSERVED, not merely survived — a broken round-trip cannot pass as a live one',
+    /answered the first heartbeat ping/.test(liveStderr))
+  ok('an initialised client is not caught by the handshake arm', !/no MCP client initialised/.test(liveStderr))
 } catch (error) {
   ok(`a client that is merely idle answers the ping and is never evicted (evicted: ${error.message})`, false)
+  ok('the pong is OBSERVED, not merely survived — a broken round-trip cannot pass as a live one', false)
+  ok('an initialised client is not caught by the handshake arm', false)
 } finally { try { await liveClient.close() } catch { /* already gone */ } }
 
 console.log(`\n${passed}/${passed + failed} passed`)
