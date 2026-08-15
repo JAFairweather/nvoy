@@ -18,6 +18,7 @@ export const isSignerFault = reason =>
 export function inboxVerdict({
   signerRefusals = [], envelopesSeen = 0, opened = 0, reachedWraps = [], relayCount = 0,
   unreachable = [], answered10050 = [], dmRelayLists = 0, total = 0,
+  unopened = 0, unopenedByRank = {},
 } = {}) {
   const inconclusive = [], notes = []
 
@@ -53,6 +54,29 @@ export function inboxVerdict({
   if (!total && answered10050.length && !dmRelayLists) {
     inconclusive.push('this identity publishes no kind:10050 DM relay list, so a sender has nowhere to deliver to. ' +
       'That is not an empty inbox, it is an unreachable one')
+  }
+  // #195: the decrypt budget ran out on envelopes that could be in the window. This is the
+  // decisive half of that fix — ranking makes the budget go further, but no ranking can make it
+  // sufficient, because within the undecidable band the only signal left is the field NIP-59
+  // randomizes. If anything in rank 0 or rank 1 went unopened, some unknown subset of this
+  // identity's recent mail was not read, and printing "(none)" under every heading would be a
+  // claim this run cannot support. That is what exit 3 is for.
+  //
+  // On 2026-08-15 this was the whole failure: eleven messages, two of them 9 KB reviews, absent
+  // from a read that exited 0. The operator's conclusion was "the crew did not reply".
+  //
+  // `presumedOld` is excluded on purpose. Those wraps cannot carry an in-window rumor unless a
+  // sender fuzzed further back than the NIP allows, so counting them would fire the alarm on every
+  // mailbox that has ever received mail — the always-firing alarm this repo keeps warning about.
+  // They are still reported below, and still opened if the budget reaches them.
+  const missed = (unopenedByRank.certain ?? 0) + (unopenedByRank.possible ?? 0)
+  if (missed) {
+    inconclusive.push(`--max-wraps left ${missed} envelope(s) unopened that could be inside the window ` +
+      `(${unopenedByRank.certain ?? 0} certainly, ${unopenedByRank.possible ?? 0} possibly) — ` +
+      'this is a partial view of the inbox, not an empty one; raise --max-wraps')
+  }
+  if (unopened && !missed) {
+    notes.push(`${unopened} envelope(s) left unopened by --max-wraps, none of which can be inside the window`)
   }
   if (reachedWraps.length && unreachable.length) {
     notes.push(`partial reach: ${reachedWraps.length}/${relayCount} relay(s) answered — ${unreachable.join('; ')}`)
