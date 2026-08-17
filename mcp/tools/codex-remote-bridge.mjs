@@ -37,6 +37,14 @@ const sshArgs = ['-i', identity, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=ye
 // credentials leak into either parser or the Codex delivery adapter merely because the bridge
 // was launched from an interactive terminal.
 const childEnv = { HOME: process.env.HOME || '', PATH: process.env.PATH || '', NVOY_INSTANCE_ROOT: root }
+function runBounded(command, args, options, label, timeout = 90_000) {
+  const result = spawnSync(command, args, { ...options, timeout })
+  if (result.error?.code === 'ETIMEDOUT' || result.signal) {
+    const why = result.error?.code === 'ETIMEDOUT' ? `exceeded ${timeout}ms` : `was killed by signal ${result.signal}`
+    throw new Error(`${label} ${why}; refusing to stall the bridge poll loop`)
+  }
+  return result
+}
 function cycle() {
   // No remote command is supplied. authorized_keys must force the single worker-UID sync command;
   // a server that offers an interactive shell is a deployment error, not a supported mode.
@@ -47,21 +55,21 @@ function cycle() {
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 16 * 1024 * 1024) throw new Error('local reply queue is not a bounded regular file')
     replies = readFileSync(replyQueue, 'utf8')
   }
-  const pulled = spawnSync('ssh', sshArgs, { encoding: 'utf8', input: replies, maxBuffer: 64 * 1024 * 1024 })
+  const pulled = runBounded('ssh', sshArgs, { encoding: 'utf8', input: replies, maxBuffer: 64 * 1024 * 1024 }, 'restricted queue export', 60_000)
   if (pulled.status !== 0) throw new Error(`restricted queue export failed (${pulled.status}): ${String(pulled.stderr || '').trim()}`)
-  const imported = spawnSync(process.execPath, [resolve(repoRoot, 'mcp/tools/instance-admitted-import.mjs'), '--instance', manifest.id, ...(baseline ? ['--baseline'] : [])],
-    { cwd: repoRoot, encoding: 'utf8', input: pulled.stdout, env: childEnv, maxBuffer: 64 * 1024 * 1024 })
+  const imported = runBounded(process.execPath, [resolve(repoRoot, 'mcp/tools/instance-admitted-import.mjs'), '--instance', manifest.id, ...(baseline ? ['--baseline'] : [])],
+    { cwd: repoRoot, encoding: 'utf8', input: pulled.stdout, env: childEnv, maxBuffer: 64 * 1024 * 1024 }, 'admitted import', 60_000)
   if (imported.status !== 0) throw new Error(String(imported.stderr || 'admitted import failed').trim())
   if (!baseline) {
     const adapter = manifest.deliveryMode === 'macos_desktop' ? 'codex-macos-desktop-adapter.mjs' : 'codex-app-server-adapter.mjs'
-    const delivered = spawnSync(process.execPath, [resolve(repoRoot, `mcp/tools/${adapter}`), '--instance', manifest.id, '--once'],
-      { cwd: repoRoot, encoding: 'utf8', env: childEnv, maxBuffer: 1024 * 1024 })
+    const delivered = runBounded(process.execPath, [resolve(repoRoot, `mcp/tools/${adapter}`), '--instance', manifest.id, '--once'],
+      { cwd: repoRoot, encoding: 'utf8', env: childEnv, maxBuffer: 1024 * 1024 }, `${adapter} delivery`, 90_000)
     if (delivered.status !== 0) throw new Error(String(delivered.stderr || 'Codex delivery failed').trim())
     if (delivered.stdout) process.stdout.write(delivered.stdout)
   } else {
     const baselineAdapter = manifest.deliveryMode === 'macos_desktop' ? 'codex-macos-desktop-adapter.mjs' : 'codex-app-server-adapter.mjs'
-    const localBaseline = spawnSync(process.execPath, [resolve(repoRoot, `mcp/tools/${baselineAdapter}`), '--instance', manifest.id, '--baseline'],
-      { cwd: repoRoot, encoding: 'utf8', env: childEnv, maxBuffer: 1024 * 1024 })
+    const localBaseline = runBounded(process.execPath, [resolve(repoRoot, `mcp/tools/${baselineAdapter}`), '--instance', manifest.id, '--baseline'],
+      { cwd: repoRoot, encoding: 'utf8', env: childEnv, maxBuffer: 1024 * 1024 }, `${baselineAdapter} baseline`, 90_000)
     if (localBaseline.status !== 0) throw new Error(String(localBaseline.stderr || 'local Desktop baseline failed').trim())
     if (localBaseline.stdout) process.stdout.write(localBaseline.stdout)
   }

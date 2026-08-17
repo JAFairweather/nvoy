@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, appendFileSync, readFileSync } from 'node:fs'
+import { mkdtempSync, appendFileSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { readWakeBatch, runWakeCycle, WakeCircuit, wakePrompt } from '../mcp/tools/codex-wake-adapter.mjs'
@@ -21,6 +21,10 @@ assert.equal(JSON.parse(readFileSync(cursor, 'utf8')).offset, frames.next)
 const replay = await runWakeCycle({ spoolPath: spool, cursorPath: cursor, dispatch: async () => { throw new Error('must not replay') } })
 assert.equal(replay.accepted, 0)
 
+const regressedCursor = join(root, 'regressed-cursor.json')
+writeFileSync(regressedCursor, JSON.stringify({ version: 1, offset: 999999 }) + '\n')
+await assert.rejects(() => runWakeCycle({ spoolPath: spool, cursorPath: regressedCursor, dispatch: async () => { throw new Error('must not dispatch') } }), /beyond .*spool\.jsonl size/)
+
 const failCursor = join(root, 'fail-cursor.json'), failCalls = []
 await assert.rejects(() => runWakeCycle({ spoolPath: spool, cursorPath: failCursor, dispatch: async record => { failCalls.push(record.id); throw new Error('app-server unavailable') } }), /app-server unavailable/)
 assert.equal(failCalls[0], idB)
@@ -29,5 +33,11 @@ assert.equal(JSON.parse(readFileSync(failCursor, 'utf8')).offset, frames.records
 const circuit = new WakeCircuit({ maxPerWindow: 1, failureLimit: 2, cooldownMs: 1000 })
 assert.equal(circuit.allow(0), true); circuit.accepted(0); assert.equal(circuit.allow(1), false)
 circuit.failed(2000); circuit.failed(2000); assert.equal(circuit.allow(2001), false)
-assert.match(wakePrompt({ id: idB, wake: true, content: 'quoted' }, 'dj-codex'), /NVOY_WAKE_RECORD=/)
+const prompt = wakePrompt({ id: idB, wake: true, content: 'quoted' }, 'dj-codex')
+assert.match(prompt, new RegExp(`NVOY_WAKE_RECORD_ID=${idB}`))
+assert.match(prompt, /NVOY_WAKE_RECORD=/)
+const source = readFileSync(new URL('../mcp/tools/codex-wake-adapter.mjs', import.meta.url), 'utf8')
+assert.match(source, /let inFlight = null/)
+assert.match(source, /if \(inFlight\) return inFlight/)
+assert.match(source, /finally \{ inFlight = null \}/)
 console.log('codex-wake-adapter: all checks passed')

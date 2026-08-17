@@ -21,11 +21,17 @@ const manifest = { version: 1, id: 'codex-test', pubkey: '2'.repeat(64), broker_
   ssh_known_hosts_sha256: createHash('sha256').update(readFileSync(known)).digest('hex'), grantors: ['4'.repeat(64)],
   task_carriers: [{ pubkey: '5'.repeat(64), channels: ['a8186b53-537d-46ad-a7e7-b6486c58970e'] }], relays: ['wss://nos.lol'] }
 writeFileSync(join(instances, 'codex-test.json'), JSON.stringify(manifest))
+const env = { HOME: base, PATH: process.env.PATH, NVOY_INSTANCE_ROOT: instances }
 const run = spawnSync(process.execPath, ['mcp/tools/install-codex-bridge-launchagent.mjs', '--instance', 'codex-test', '--print'],
-  { cwd: resolve('.'), encoding: 'utf8', env: { HOME: base, PATH: process.env.PATH, NVOY_INSTANCE_ROOT: instances } })
+  { cwd: resolve('.'), encoding: 'utf8', env })
 if (run.status !== 0) console.error(run.stderr)
 ok('renderer accepts one immutable keyless Codex binding', run.status === 0 && run.stdout.includes('pub.nave.nvoy.codex-test.codex-bridge'))
 ok('LaunchAgent fixes the instance, interval, repository bridge, and manifest root', run.stdout.includes('codex-remote-bridge.mjs') && run.stdout.includes('<string>codex-test</string>') && run.stdout.includes('<string>2000</string>') && run.stdout.includes(instances))
 ok('LaunchAgent contains no Nostr, Bunker, provider, relay, or inbound-selected authority', !/nsec|bunker|nip46|OPENAI_API_KEY|ANTHROPIC_API_KEY|wss:\/\//i.test(run.stdout))
 ok('LaunchAgent has supervised startup and bounded environment', run.stdout.includes('<key>RunAtLoad</key><true/>') && run.stdout.includes('<key>KeepAlive</key><true/>') && !run.stdout.includes(process.env.NVOY_NSEC || 'never-present-secret'))
+const wake = spawnSync(process.execPath, ['mcp/tools/install-codex-bridge-launchagent.mjs', '--instance', 'codex-test', '--wake-adapter', '--print'],
+  { cwd: resolve('.'), encoding: 'utf8', env })
+if (wake.status !== 0) console.error(wake.stderr)
+ok('wake adapter LaunchAgent is a separate supervised job for the same immutable instance', wake.status === 0 && wake.stdout.includes('pub.nave.nvoy.codex-test.codex-wake') && wake.stdout.includes('codex-wake-adapter.mjs') && wake.stdout.includes('<string>codex-test</string>'))
+ok('wake adapter LaunchAgent does not run the broker bridge interval loop', !wake.stdout.includes('codex-remote-bridge.mjs') && !wake.stdout.includes('<string>--interval-ms</string>'))
 process.exitCode = fails ? 1 : 0

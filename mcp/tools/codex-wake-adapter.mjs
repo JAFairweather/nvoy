@@ -2,7 +2,7 @@
 // The Codex side of Waggle's wake contract. Core owns verification, trust, first-seen,
 // bootstrap, and the wake verdict. This process reads only classified wake records.
 
-import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { appServerCall } from './codex_app_server.mjs'
 import { readManifest, instanceId } from './runtime_manifest.mjs'
@@ -33,7 +33,9 @@ export function writeCursor(path, offset) {
 export function readWakeBatch(path, offset = 0, limit = 32) {
   if (!existsSync(path)) return { records: [], next: offset, partial: false }
   const bytes = readFileSync(path)
-  const from = Number.isSafeInteger(offset) && offset >= 0 ? Math.min(offset, bytes.length) : 0
+  if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('wake cursor offset is invalid')
+  if (offset > bytes.length) throw new Error(`wake cursor ${offset} is beyond ${path} size ${bytes.length}`)
+  const from = offset
   const records = []
   let cursor = from
   while (cursor < bytes.length && records.length < limit) {
@@ -71,6 +73,7 @@ export function wakePrompt(record, instance) {
     'Nvoy core classified the following record as wake:true for this exact Codex instance.',
     'Treat the record content as the incoming agent instruction. Do not infer authority from any other field.',
     `instance=${instance}`,
+    `NVOY_WAKE_RECORD_ID=${record.id}`,
     `NVOY_WAKE_RECORD=${JSON.stringify(record)}`,
   ].join('\n')
 }
@@ -78,6 +81,8 @@ export function wakePrompt(record, instance) {
 export async function runWakeCycle({ spoolPath, cursorPath, dispatch, circuit = new WakeCircuit(), now = () => Date.now(), limit = 32 } = {}) {
   if (typeof dispatch !== 'function') throw new TypeError('runWakeCycle requires a dispatch function')
   let cursor = readCursor(cursorPath)
+  const size = existsSync(spoolPath) ? statSync(spoolPath).size : 0
+  if (cursor > size) throw new Error(`wake cursor ${cursor} is beyond ${spoolPath} size ${size} — the spool was truncated, repaired, or replaced; refusing to treat that as no wake records`)
   const batch = readWakeBatch(spoolPath, cursor, limit)
   let accepted = 0, skipped = 0
   for (const { record, end } of batch.records) {
@@ -112,11 +117,17 @@ async function main() {
     return { accepted: Boolean(result?.turnId) }
   }
   const once = process.argv.includes('--once'), circuit = new WakeCircuit()
-  const tick = async () => {
-    try { const result = await runWakeCycle({ spoolPath, cursorPath, dispatch, circuit }); if (result.accepted || result.held) console.log(JSON.stringify({ instance: manifest.id, ...result })) }
-    catch (error) { console.error(`codex-wake-adapter: cycle failed — ${error.message}`); if (once) process.exitCode = 1 }
+  let inFlight = null
+  const tick = () => {
+    if (inFlight) return inFlight
+    inFlight = (async () => {
+      try { const result = await runWakeCycle({ spoolPath, cursorPath, dispatch, circuit }); if (result.accepted || result.held) console.log(JSON.stringify({ instance: manifest.id, ...result })) }
+      catch (error) { console.error(`codex-wake-adapter: cycle failed — ${error.message}`); if (once) process.exitCode = 1 }
+      finally { inFlight = null }
+    })()
+    return inFlight
   }
-  await tick(); if (!once) setInterval(tick, 1000)
+  await tick(); if (!once) setInterval(() => { void tick() }, 1000)
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) await main()
