@@ -9,7 +9,8 @@ const die = message => { console.error(`install-codex-bridge-launchagent: ${mess
 const flag = name => { const i = process.argv.indexOf(name); return i < 0 ? '' : process.argv[i + 1] || '' }
 const id = flag('--instance')
 const printOnly = process.argv.includes('--print')
-if (!id) die('usage: --instance <id> [--print]')
+const wakeAdapter = process.argv.includes('--wake-adapter')
+if (!id) die('usage: --instance <id> [--wake-adapter] [--print]')
 const root = resolve(process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances')
 let manifest
 try { manifest = readManifest(root, instanceId(id)) } catch (error) { die(error.message) }
@@ -17,17 +18,17 @@ if (manifest.brokerMode !== 'remote' || manifest.deliveryMode !== 'codex_app_ser
   die('instance must be a keyless remote-broker codex_app_server binding')
 }
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
-const bridge = resolve(repoRoot, 'mcp/tools/codex-remote-bridge.mjs')
-const logs = resolve(manifest.runtimeDir, 'launchagent')
-const label = `pub.nave.nvoy.${manifest.id}.codex-bridge`
+const tool = wakeAdapter ? resolve(repoRoot, 'mcp/tools/codex-wake-adapter.mjs') : resolve(repoRoot, 'mcp/tools/codex-remote-bridge.mjs')
+const logs = resolve(manifest.runtimeDir, wakeAdapter ? 'wake-launchagent' : 'launchagent')
+const label = `pub.nave.nvoy.${manifest.id}.${wakeAdapter ? 'codex-wake' : 'codex-bridge'}`
 const esc = value => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
-const values = [process.execPath, bridge, manifest.id, root, logs]
+const values = [process.execPath, tool, manifest.id, root, logs]
 if (values.some(value => /[\n\r\0]/.test(value))) die('manifest paths contain an unsafe control character')
 const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>${esc(label)}</string>
-<key>ProgramArguments</key><array><string>${esc(process.execPath)}</string><string>${esc(bridge)}</string><string>--instance</string><string>${esc(manifest.id)}</string><string>--interval-ms</string><string>2000</string></array>
+<key>ProgramArguments</key><array><string>${esc(process.execPath)}</string><string>${esc(tool)}</string><string>--instance</string><string>${esc(manifest.id)}</string>${wakeAdapter ? '' : '<string>--interval-ms</string><string>2000</string>'}</array>
 <key>EnvironmentVariables</key><dict><key>HOME</key><string>${esc(homedir())}</string><key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin</string><key>NVOY_INSTANCE_ROOT</key><string>${esc(root)}</string></dict>
 <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
 <key>StandardOutPath</key><string>${esc(resolve(logs, 'stdout.log'))}</string>
