@@ -2,6 +2,7 @@
 // Verify the Codex Desktop shared-daemon topology for one manifest-bound task.
 // Exit codes: 0 = owner match; 1 = definite split-owner/failure; 3 = inconclusive/unreadable.
 
+import { existsSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { readManifest, instanceId } from './runtime_manifest.mjs'
 import { appServerCall } from './codex_app_server.mjs'
@@ -38,11 +39,12 @@ function daemonPid() {
   return match[1]
 }
 function lockHolders(lockPath) {
+  if (!existsSync(lockPath)) die('lock file absent — INCONCLUSIVE (the turn never opened the thread)', 3)
   let out = ''
-  try { out = execFileSync('/usr/sbin/lsof', ['-t', lockPath], { encoding: 'utf8' }) }
-  catch { die('lock file absent or unreadable — INCONCLUSIVE', 3) }
+  try { out = execFileSync('/usr/sbin/lsof', ['-t', lockPath], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) }
+  catch { out = '' }
   const holders = out.split('\n').map(s => s.trim()).filter(Boolean)
-  if (!holders.length) die('lock exists with no holder — the turn did not run', 3)
+  if (!holders.length) die('lock exists with no holder — the turn did not run — INCONCLUSIVE', 3)
   if (!holders.every(pid => /^\d+$/.test(pid))) die(`lock holder PID unreadable: ${holders.join(' ')}`, 3)
   if (holders.length !== 1) die(`multiple holders: ${holders.join(' ')}`, 1)
   return holders[0]
