@@ -56,6 +56,7 @@ function cycle() {
     const adapter = manifest.deliveryMode === 'macos_desktop' ? 'codex-macos-desktop-adapter.mjs' : 'codex-app-server-adapter.mjs'
     const delivered = spawnSync(process.execPath, [resolve(repoRoot, `mcp/tools/${adapter}`), '--instance', manifest.id, '--once'],
       { cwd: repoRoot, encoding: 'utf8', env: childEnv, maxBuffer: 1024 * 1024 })
+    if (delivered.stderr) process.stderr.write(delivered.stderr)
     if (delivered.status !== 0) throw new Error(String(delivered.stderr || 'Codex delivery failed').trim())
     if (delivered.stdout) process.stdout.write(delivered.stdout)
   } else {
