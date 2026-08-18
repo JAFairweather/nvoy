@@ -4,6 +4,7 @@
 
 import { existsSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
+import { join } from 'node:path'
 import { readManifest, instanceId } from './runtime_manifest.mjs'
 import { appServerCall } from './codex_app_server.mjs'
 
@@ -14,18 +15,37 @@ const has = name => process.argv.includes(name)
 const id = flag('--instance')
 const label = flag('--label') || labelDefault
 const timeoutMs = Number(flag('--timeout-ms') || 120000)
+const explicitRoot = flag('--root')
 const noDrive = has('--no-drive')
 if (!id || has('--help') || has('-h')) {
-  console.error('usage: codex-shared-daemon-canary --instance <id> [--label <launchd-label>] [--timeout-ms <ms>] [--no-drive]')
+  console.error('usage: codex-shared-daemon-canary --instance <id> [--root <instance-root>] [--label <launchd-label>] [--timeout-ms <ms>] [--no-drive]')
   process.exit(id ? 0 : 1)
 }
 if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) die('--timeout-ms must be a positive number', 3)
 
 const uid = process.getuid?.()
 if (!Number.isInteger(uid)) die('cannot determine uid', 3)
-const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
+function defaultRoot(instance) {
+  if (explicitRoot) return explicitRoot
+  if (process.env.NVOY_INSTANCE_ROOT) return process.env.NVOY_INSTANCE_ROOT
+  const home = process.env.HOME || ''
+  if (process.platform === 'darwin' && home) {
+    for (const candidate of [
+      join(home, '.nvoy', 'codex-desktop', instance, 'instances'),
+      join(home, '.nvoy', 'desktop', instance, 'instances'),
+    ]) if (existsSync(candidate)) return candidate
+  }
+  return '/etc/nvoy/instances'
+}
+const root = defaultRoot(id)
 let manifest
-try { manifest = readManifest(root, instanceId(id)) } catch (error) { die(error.message, 3) }
+try { manifest = readManifest(root, instanceId(id)) }
+catch (error) {
+  if (/ENOENT|no such file or directory|is missing/.test(error.message || '')) {
+    die(`instance root not found at ${root} — set NVOY_INSTANCE_ROOT or pass --root`, 3)
+  }
+  die(error.message, 3)
+}
 if (manifest.deliveryMode !== 'codex_app_server' || manifest.codexTransport !== 'local_control_socket') {
   die('manifest is not a local-control codex_app_server binding', 3)
 }
@@ -42,7 +62,10 @@ function lockHolders(lockPath) {
   if (!existsSync(lockPath)) die('lock file absent — INCONCLUSIVE (the turn never opened the thread)', 3)
   let out = ''
   try { out = execFileSync('/usr/sbin/lsof', ['-t', lockPath], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) }
-  catch { out = '' }
+  catch (error) {
+    if (error.status === 1) out = String(error.stdout || '')
+    else die(`lsof failed while checking lock holders — INCONCLUSIVE: ${error.message || error}`, 3)
+  }
   const holders = out.split('\n').map(s => s.trim()).filter(Boolean)
   if (!holders.length) die('lock exists with no holder — the turn did not run — INCONCLUSIVE', 3)
   if (!holders.every(pid => /^\d+$/.test(pid))) die(`lock holder PID unreadable: ${holders.join(' ')}`, 3)
