@@ -31,7 +31,7 @@ let started = 0, reads = 0, steerAttempts = 0, steered = 0, steeredInput = '', o
 // `phase` replaces the read COUNTER for the same reason one layer down. Keying the script off how
 // many times the client happened to read made every later expectation depend on client polling, so
 // one extra poll shifted the whole script.
-let phase = 'stale-active'
+let phase = 'stale-active', resumeActiveWriterOnce = false
 
 /** Wait for a fixture-side fact, with a ceiling far above any plausible scheduling delay. Returns
  *  rather than throws: the assertions below own the failure messages, and a bare timeout here would
@@ -90,7 +90,12 @@ const server = net.createServer(stream => {
             ] }]
         stream.write(frame({ id: request.id, result: { thread: { id: thread, status: { type: phase === 'stale-active' ? 'active' : 'idle' }, turns } } }))
       }
-      if (request.method === 'thread/resume') stream.write(frame({ id: request.id, result: { thread: { id: thread } } }))
+      if (request.method === 'thread/resume') {
+        if (resumeActiveWriterOnce) {
+          resumeActiveWriterOnce = false
+          stream.write(frame({ id: request.id, error: { message: `thread ${thread} already has an active writer` } }))
+        } else stream.write(frame({ id: request.id, result: { thread: { id: thread } } }))
+      }
       if (request.method === 'turn/start') {
         started++
         stream.write(frame({ id: request.id, result: { turn: { id: turn } } }))
@@ -158,6 +163,12 @@ try {
     throw new Error('an ambiguous duplicate receipt became replyable')
   if (finalAgentTextAfterReceipt(activeItems.map(item => item.text === 'Receipt-bound answer.' ? { ...item, phase: 'commentary' } : item), receipt))
     throw new Error('receipt commentary became a reply')
+  phase = 'idle'
+  started = 0; resumeActiveWriterOnce = true
+  const daemonOwnedIdle = await appServerCall({ socketPath: socket, threadId: thread, input: 'daemon-owned idle wake', clientUserMessageId: 'nvoy:daemon-idle',
+    dedupeToken: 'NVOY_ENVELOPE_ID=' + 'e'.repeat(64), waitForCompletion: false, steerActive: true, timeoutMs: TEST_TIMEOUT_MS })
+  if (daemonOwnedIdle.turnId !== turn || daemonOwnedIdle.recovered || started !== 1)
+    throw new Error('daemon-owned idle thread did not fall through from active-writer resume to turn/start')
   let liveRefused = false, recoveryRefused = false
   phase = 'idle'   // the steered turn is done; the next delivery starts one of its own
   try {
