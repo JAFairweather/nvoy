@@ -129,13 +129,27 @@ function queueReply(task, content) {
     instance: manifest.id, receipt: task.envelope, content: body }
   appendFileSync(path, JSON.stringify(request) + '\n', { mode: 0o600 })
 }
+function failureKey(row) {
+  if (row?.version !== 1 || typeof row?.terminal !== 'boolean' || !/^[0-9a-f]{64}$/.test(row?.envelope || '')) {
+    throw new Error('Codex app-server failure ledger contains an invalid record')
+  }
+  return `${row.envelope}:${row.terminal ? 'terminal' : 'transient'}:${row.reason || ''}:${row.message || ''}`
+}
+function recordFailure(knownFailures, task, error, terminal) {
+  const row = { version: 1, envelope: task.envelope, thread_id: manifest.codexThreadId,
+    terminal, reason: error.reason || (terminal ? 'terminal_delivery_error' : 'transient_delivery_error'),
+    message: error.message || String(error), failed_at: Date.now() }
+  const key = failureKey(row)
+  if (knownFailures.has(key)) return
+  appendFileSync(failedPath, JSON.stringify(row) + '\n', { mode: 0o600 })
+  knownFailures.add(key)
+}
 async function drain() {
   const seen = new Set(records(deliveredPath).map(x => x.envelope).filter(v => /^[0-9a-f]{64}$/.test(v || '')))
+  const knownFailures = new Set()
   for (const row of records(failedPath)) {
-    if (row?.version !== 1 || row?.terminal !== true || !/^[0-9a-f]{64}$/.test(row?.envelope || '')) {
-      throw new Error('Codex app-server failure ledger contains an invalid record')
-    }
-    seen.add(row.envelope)
+    knownFailures.add(failureKey(row))
+    if (row.terminal === true) seen.add(row.envelope)
   }
   for (const row of records(baselinePath)) {
     if (row?.version !== 1 || row?.status !== 'baseline' || !/^[0-9a-f]{64}$/.test(row?.envelope || '')) {
@@ -143,9 +157,13 @@ async function drain() {
     }
     seen.add(row.envelope)
   }
-  const pending = records(queue).filter(x => { try { validateDesktopDelivery(x, { instance: manifest.id, scopeSubject: manifest.pubkey, grantors: manifest.grantors, carriers: manifest.carriers }); return !seen.has(x.envelope) } catch { return false } })
+  const pending = records(queue).filter(x => !seen.has(x?.envelope))
+  let attempted = 0
   for (const task of pending) {
     try {
+      try { validateDesktopDelivery(task, { instance: manifest.id, scopeSubject: manifest.pubkey, grantors: manifest.grantors, carriers: manifest.carriers }) }
+      catch (e) { throw terminalDeliveryError('invalid_admitted_delivery', e.message || String(e)) }
+      attempted++
       const result = await deliver(task)
       // Queue the receipt-bound response before marking the turn delivered. A crash in between is
       // safe: thread/read recovers the exact completed turn and queueReply deduplicates by receipt.
@@ -157,14 +175,21 @@ async function drain() {
       seen.add(task.envelope)
       console.log(`codex-app-server-adapter: delivered ${task.envelope.slice(0, 12)}… to ${manifest.codexThreadId}`)
     } catch (error) {
-      if (!error.terminal) throw error
-      appendFileSync(failedPath, JSON.stringify({ version: 1, envelope: task.envelope, thread_id: manifest.codexThreadId,
-        terminal: true, reason: error.reason || 'terminal_delivery_error', message: error.message, failed_at: Date.now() }) + '\n', { mode: 0o600 })
-      seen.add(task.envelope)
-      console.error(`codex-app-server-adapter: terminal delivery failure for ${task.envelope.slice(0, 12)}… — ${error.message}`)
+      if (!/^[0-9a-f]{64}$/.test(task?.envelope || '')) {
+        console.error(`codex-app-server-adapter: invalid admitted row — ${error.message || error}`)
+        continue
+      }
+      const terminal = error.terminal === true
+      recordFailure(knownFailures, task, error, terminal)
+      if (terminal) {
+        seen.add(task.envelope)
+        console.error(`codex-app-server-adapter: terminal delivery failure for ${task.envelope.slice(0, 12)}… — ${error.message}`)
+      } else {
+        console.error(`codex-app-server-adapter: transient delivery failure for ${task.envelope.slice(0, 12)}… — ${error.message || error}`)
+      }
     }
   }
-  return pending.length
+  return attempted
 }
 function baselineQueue() {
   const seen = new Set(records(baselinePath).map(row => row?.envelope).filter(value => /^[0-9a-f]{64}$/.test(value || '')))
