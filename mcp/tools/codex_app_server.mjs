@@ -232,7 +232,14 @@ export function appServerCall({ socketPath, threadId, input, clientUserMessageId
               if (captureSteeredCompletion) return setTimeout(() => request('thread/read', 2, { threadId: id, includeTurns: true }), 250)
               return finish(null, { threadId: id, turnId: startedTurn, recovered: false, steered: true, replyEligible: false })
             }
-            if (message.error) return finish(new Error(`Codex thread/resume failed: ${message.error.message || 'unknown error'}`))
+            if (message.error) {
+              const msg = message.error.message || 'unknown error'
+              if (/already has an active writer/.test(msg)) {
+                request('turn/start', 4, { threadId: id, input: [{ type: 'text', text: String(input || '') }], clientUserMessageId })
+                continue
+              }
+              return finish(new Error(`Codex thread/resume failed: ${msg}`))
+            }
             if (message.result?.thread?.id !== id) return finish(new Error('Codex app-server resumed an unexpected thread'))
             request('turn/start', 4, { threadId: id, input: [{ type: 'text', text: String(input || '') }], clientUserMessageId })
           } else {
