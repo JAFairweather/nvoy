@@ -28,6 +28,7 @@ if (manifest.deliveryMode !== 'codex_app_server') die('manifest delivery_mode is
 
 const queue = resolve(manifest.runtimeDir, 'admitted-tasks.jsonl')
 const deliveredPath = resolve(manifest.runtimeDir, 'codex-app-server-delivered.jsonl')
+const failedPath = resolve(manifest.runtimeDir, 'codex-app-server-failed.jsonl')
 const baselinePath = resolve(manifest.runtimeDir, 'codex-app-server-baseline.jsonl')
 const lockPath = resolve(manifest.runtimeDir, 'codex-app-server-adapter.lock')
 function records(path) {
@@ -91,7 +92,7 @@ function deliverSpawn(task) {
   })
 }
 async function deliver(task) {
-  if (manifest.codexTransport !== 'local_control_socket') return { turnId: await deliverSpawn(task), finalText: '' }
+  if (manifest.codexTransport !== 'local_control_socket') return { turnId: await deliverSpawn(task), finalText: '', replyEligible: false }
   const result = await appServerCall({ socketPath: manifest.codexSocketPath, threadId: manifest.codexThreadId,
     input: prompt(task), clientUserMessageId: userMessageId(task), dedupeToken: `NVOY_ENVELOPE_ID=${task.envelope}`,
     waitForCompletion: task.type === 'admitted-task', steerActive: true,
@@ -99,10 +100,28 @@ async function deliver(task) {
     timeoutMs: task.type === 'admitted-task' ? 10 * 60 * 1000 : 30000 })
   return result
 }
+function terminalDeliveryError(reason, message) {
+  const error = new Error(message)
+  error.terminal = true
+  error.reason = reason
+  return error
+}
+function fitReplyBound(body) {
+  const limit = 4000
+  const bytes = Buffer.byteLength(body)
+  if (bytes <= limit) return body
+  const suffix = `\n\n…(truncated, original response was ${bytes} bytes; Nostr reply bound is ${limit} bytes)`
+  const suffixBytes = Buffer.byteLength(suffix)
+  if (suffixBytes >= limit) throw terminalDeliveryError('reply_bound_marker_too_large', 'Codex reply truncation marker exceeds the Nostr reply bound')
+  let out = body
+  while (Buffer.byteLength(out) + suffixBytes > limit) out = out.slice(0, -1)
+  return out.trimEnd() + suffix
+}
 function queueReply(task, content) {
   if (task.type !== 'admitted-task') return
-  const body = String(content || '').trim()
-  if (!body || Buffer.byteLength(body) > 4000) throw new Error('Codex final response is empty or exceeds the 4000-byte Nostr reply bound')
+  const raw = String(content || '').trim()
+  if (!raw) throw terminalDeliveryError('empty_final_response', 'Codex final response is empty')
+  const body = fitReplyBound(raw)
   const path = resolve(manifest.runtimeDir, 'reply-requests.jsonl')
   const prior = records(path)
   if (prior.some(record => record?.receipt === task.envelope)) return
@@ -112,6 +131,12 @@ function queueReply(task, content) {
 }
 async function drain() {
   const seen = new Set(records(deliveredPath).map(x => x.envelope).filter(v => /^[0-9a-f]{64}$/.test(v || '')))
+  for (const row of records(failedPath)) {
+    if (row?.version !== 1 || row?.terminal !== true || !/^[0-9a-f]{64}$/.test(row?.envelope || '')) {
+      throw new Error('Codex app-server failure ledger contains an invalid record')
+    }
+    seen.add(row.envelope)
+  }
   for (const row of records(baselinePath)) {
     if (row?.version !== 1 || row?.status !== 'baseline' || !/^[0-9a-f]{64}$/.test(row?.envelope || '')) {
       throw new Error('Codex app-server baseline contains an invalid record')
@@ -120,16 +145,24 @@ async function drain() {
   }
   const pending = records(queue).filter(x => { try { validateDesktopDelivery(x, { instance: manifest.id, scopeSubject: manifest.pubkey, grantors: manifest.grantors, carriers: manifest.carriers }); return !seen.has(x.envelope) } catch { return false } })
   for (const task of pending) {
-    const result = await deliver(task)
-    // Queue the receipt-bound response before marking the turn delivered. A crash in between is
-    // safe: thread/read recovers the exact completed turn and queueReply deduplicates by receipt.
-    // Reversing this order could strand a visible response forever after a one-line journal write.
-    if (result.replyEligible !== false && result.finalText) queueReply(task, result.finalText)
-    // Only acknowledge permanent local delivery after the target thread accepted the turn and
-    // any required outbound reply is durably queued.
-    appendFileSync(deliveredPath, JSON.stringify({ version: 1, envelope: task.envelope, thread_id: manifest.codexThreadId, turn_id: result.turnId, delivered_at: Date.now() }) + '\n', { mode: 0o600 })
-    seen.add(task.envelope)
-    console.log(`codex-app-server-adapter: delivered ${task.envelope.slice(0, 12)}… to ${manifest.codexThreadId}`)
+    try {
+      const result = await deliver(task)
+      // Queue the receipt-bound response before marking the turn delivered. A crash in between is
+      // safe: thread/read recovers the exact completed turn and queueReply deduplicates by receipt.
+      // Reversing this order could strand a visible response forever after a one-line journal write.
+      if (result.replyEligible !== false) queueReply(task, result.finalText)
+      // Only acknowledge permanent local delivery after the target thread accepted the turn and
+      // any required outbound reply is durably queued.
+      appendFileSync(deliveredPath, JSON.stringify({ version: 1, envelope: task.envelope, thread_id: manifest.codexThreadId, turn_id: result.turnId, delivered_at: Date.now() }) + '\n', { mode: 0o600 })
+      seen.add(task.envelope)
+      console.log(`codex-app-server-adapter: delivered ${task.envelope.slice(0, 12)}… to ${manifest.codexThreadId}`)
+    } catch (error) {
+      if (!error.terminal) throw error
+      appendFileSync(failedPath, JSON.stringify({ version: 1, envelope: task.envelope, thread_id: manifest.codexThreadId,
+        terminal: true, reason: error.reason || 'terminal_delivery_error', message: error.message, failed_at: Date.now() }) + '\n', { mode: 0o600 })
+      seen.add(task.envelope)
+      console.error(`codex-app-server-adapter: terminal delivery failure for ${task.envelope.slice(0, 12)}… — ${error.message}`)
+    }
   }
   return pending.length
 }
