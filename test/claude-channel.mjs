@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
@@ -59,8 +59,9 @@ try {
       [envelope, notificationEnvelope].includes(wake?.meta?.envelope) &&
       !JSON.stringify(wake).includes(task.messages[0].content) && !JSON.stringify(wake).includes(task.messages[0].from)))
   const tools = (await client.listTools()).tools.map(tool => tool.name)
-  ok('Claude receives one explicit read tool and one receipt-bound reply tool',
-    tools.length === 2 && tools.includes('nvoy_channel_read') && tools.includes('nvoy_channel_reply'))
+  ok('Claude receives an explicit read tool, a receipt-bound reply tool, and a body-free discovery tool',
+    tools.length === 3 && tools.includes('nvoy_channel_read') && tools.includes('nvoy_channel_reply') &&
+    tools.includes('nvoy_channel_list'))
   const duplicateProcess = spawnSync(process.execPath, [resolve('mcp/tools/claude-channel.mjs'), '--instance', manifest.id, '--baseline'],
     { encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifests } })
   ok('a second Claude session cannot bind the same participant identity',
@@ -155,6 +156,111 @@ try {
   ok('the pong is OBSERVED, not merely survived — a broken round-trip cannot pass as a live one', false)
   ok('an initialised client is not caught by the handshake arm', false)
 } finally { try { await liveClient.close() } catch { /* already gone */ } }
+
+// `nvoy_channel_list` exists for harnesses that never receive `notifications/claude/channel` — the
+// only source of an envelope marker until now, which left a non-Claude-Code client blind by
+// construction. These cases run on their own instance so the lock, the queue and the in-memory
+// disclosure state are all independent of the assertions above.
+const listId = 'claude-list-test'
+const listRuntime = join(root, 'list-runtime')
+mkdirSync(listRuntime); mkdirSync(join(listRuntime, 'claude-channel-state'))
+const listPubkey = 'd'.repeat(64)
+const listManifest = { ...manifest, id: listId, pubkey: listPubkey, runtime_dir: listRuntime,
+  state_dir: join(root, 'list-state'), spool_dir: join(root, 'list-spool') }
+// Each instance is a distinct identity and the tool refuses a shared pubkey, so the task authority
+// is re-scoped to the new subject rather than copied wholesale.
+const listTask = { ...task, instance: listId, authority: { ...task.authority, scope_subject: listPubkey } }
+writeFileSync(join(manifests, `${listId}.json`), JSON.stringify(listManifest))
+const seeded = 'b'.repeat(64), unlisted = 'c'.repeat(64)
+writeFileSync(join(listRuntime, 'admitted-tasks.jsonl'),
+  JSON.stringify({ ...listTask, envelope: seeded }) + '\n', { mode: 0o600 })
+writeFileSync(join(listRuntime, 'reply-requests.jsonl'), '', { mode: 0o640 })
+
+// A 60s poll means the initial `oninitialized` poll is the ONLY announcement in this window, so an
+// envelope appended after connect cannot reach `notifiedThisRun`. That is what isolates the
+// disclosure arm: without it the read below would pass on the notification path and prove nothing.
+const discoverTransport = new StdioClientTransport({ command: process.execPath,
+  args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', listId, '--poll-ms', '60000'],
+  env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stderr: 'pipe' })
+const discoverClient = new Client({ name: 'claude-channel-list', version: '0.1.0' })
+// `connect()` resolves on the initialize RESPONSE, but the server's first poll is driven by the
+// client's `initialized` NOTIFICATION, which lands a moment later. Appending before that poll has
+// run lets it announce the new envelope, and the disclosure arm is then never exercised — the case
+// passes on the notification path while claiming to prove discovery. Wait for the seeded
+// announcement, which is the observable proof the initial poll is done; the next one is 60s away.
+const seededSeen = new Promise(resolve => discoverClient.setNotificationHandler(Channel,
+  note => { if (note.params?.meta?.envelope === seeded) resolve() }))
+let discoverStderr = ''
+discoverTransport.stderr?.on('data', chunk => { discoverStderr += chunk })
+try {
+  await discoverClient.connect(discoverTransport)
+  await Promise.race([seededSeen,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('initial poll never announced the seeded envelope')), 4000))])
+  appendFileSync(join(listRuntime, 'admitted-tasks.jsonl'),
+    JSON.stringify({ ...listTask, envelope: unlisted }) + '\n', { mode: 0o600 })
+  const blocked = await discoverClient.callTool({ name: 'nvoy_channel_read', arguments: { envelope: unlisted } })
+  ok('an envelope that was never announced is unreadable before it is listed',
+    blocked.isError === true && /NVOY_NOT_DELIVERED/.test(blocked.content[0].text))
+  const listed = await discoverClient.callTool({ name: 'nvoy_channel_list', arguments: {} })
+  const markers = JSON.parse(listed.content[0].text)
+  ok('a no-argument list dispatches above the envelope validation instead of being refused',
+    listed.isError !== true && Array.isArray(markers.envelopes))
+  ok('list returns opaque markers only — never a body, a sender, or an authority',
+    markers.envelopes.includes(unlisted) &&
+    !JSON.stringify(markers).includes(task.messages[0].content) &&
+    !JSON.stringify(markers).includes(task.messages[0].from) && !JSON.stringify(markers).includes('authority'))
+  const afterList = await discoverClient.callTool({ name: 'nvoy_channel_read', arguments: { envelope: unlisted } })
+  ok('a listed marker becomes readable without ever having been announced',
+    afterList.isError !== true && JSON.parse(afterList.content[0].text).envelope === unlisted)
+  const relisted = await discoverClient.callTool({ name: 'nvoy_channel_list', arguments: {} })
+  ok('list omits an envelope once it has been read', !JSON.parse(relisted.content[0].text).envelopes.includes(unlisted))
+  ok('list still offers the envelope that has not been read', JSON.parse(relisted.content[0].text).envelopes.includes(seeded))
+} catch (error) {
+  ok(`nvoy_channel_list discovery path (threw: ${error.message}) STDERR=${discoverStderr}`, false)
+} finally { try { await discoverClient.close() } catch { /* already gone */ } }
+
+// The regression this guards is the tempting one-line version of the fix: registering listed ids in
+// `notifiedThisRun`. That map ALSO drives the re-announce throttle, so a list call arriving before
+// the first poll would suppress the first notification for `renotifyMs` — silently, on every seat
+// that depends on the notification to wake at all. `--renotify-ms 600000` makes that suppression
+// permanent for the length of this test, so the mutation cannot pass by being merely slow.
+const throttleRuntime = join(root, 'throttle-runtime')
+const throttleId = 'claude-throttle-test'
+const throttlePubkey = 'e'.repeat(64)
+mkdirSync(throttleRuntime); mkdirSync(join(throttleRuntime, 'claude-channel-state'))
+writeFileSync(join(manifests, `${throttleId}.json`), JSON.stringify({ ...manifest, id: throttleId, pubkey: throttlePubkey, runtime_dir: throttleRuntime,
+  state_dir: join(root, 'throttle-state'), spool_dir: join(root, 'throttle-spool') }))
+const throttleTask = { ...task, instance: throttleId, authority: { ...task.authority, scope_subject: throttlePubkey } }
+writeFileSync(join(throttleRuntime, 'admitted-tasks.jsonl'), '', { mode: 0o600 })
+writeFileSync(join(throttleRuntime, 'reply-requests.jsonl'), '', { mode: 0o640 })
+const throttleTransport = new StdioClientTransport({ command: process.execPath,
+  args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', throttleId, '--poll-ms', '250', '--renotify-ms', '600000'],
+  env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stderr: 'pipe' })
+const throttleClient = new Client({ name: 'claude-channel-throttle', version: '0.1.0' })
+const announced = new Set()
+throttleClient.setNotificationHandler(Channel, note => { announced.add(note.params?.meta?.envelope) })
+try {
+  await throttleClient.connect(throttleTransport)
+  // The list call must land before the poll sees the new envelope, or the case cannot discriminate.
+  // A 250ms tick makes that overwhelmingly likely but not certain, so the precondition is asserted
+  // rather than assumed, and a lost race is retried on a fresh marker instead of scoring a pass.
+  let raced = true, subject = null
+  for (let attempt = 0; attempt < 5 && raced; attempt++) {
+    subject = `${attempt}`.repeat(64)
+    appendFileSync(join(throttleRuntime, 'admitted-tasks.jsonl'),
+      JSON.stringify({ ...throttleTask, envelope: subject }) + '\n', { mode: 0o600 })
+    await throttleClient.callTool({ name: 'nvoy_channel_list', arguments: {} })
+    raced = announced.has(subject)
+  }
+  ok('the throttle case reached its precondition — listed before the poll announced', !raced)
+  const deadline = Date.now() + 4000
+  while (!announced.has(subject) && Date.now() < deadline) await new Promise(done => setTimeout(done, 100))
+  ok('listing an envelope does not suppress its first notification to a client that wakes on them',
+    announced.has(subject))
+} catch (error) {
+  ok(`the throttle case reached its precondition — listed before the poll announced (threw: ${error.message})`, false)
+  ok('listing an envelope does not suppress its first notification to a client that wakes on them', false)
+} finally { try { await throttleClient.close() } catch { /* already gone */ } }
 
 console.log(`\n${passed}/${passed + failed} passed`)
 process.exit(failed ? 1 : 0)
