@@ -271,7 +271,10 @@ async function poll() {
     const read = readIds()
     const now = Date.now()
     for (const task of tasks()) {
-      if (read.has(task.envelope)) { notifiedThisRun.delete(task.envelope); continue }
+      // Both run-state structures are dropped once the envelope is read. Neither is load-bearing
+      // after that — the read arm of the guard carries it — and this process is meant to run for
+      // the life of a seat, so an unpruned Set is an unbounded one.
+      if (read.has(task.envelope)) { notifiedThisRun.delete(task.envelope); listedThisRun.delete(task.envelope); continue }
       // Mark in memory before writing so a fast tool call can read immediately, and re-announce
       // only after the interval — an envelope nobody has read is worth repeating, but not once
       // per poll.

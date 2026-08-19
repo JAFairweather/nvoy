@@ -262,5 +262,42 @@ try {
   ok('listing an envelope does not suppress its first notification to a client that wakes on them', false)
 } finally { try { await throttleClient.close() } catch { /* already gone */ } }
 
+// The `!task` arm of the read guard, which nothing above drives. Dropping it — the tempting
+// `if (!(read || notifiedThisRun.has(envelope) || listedThisRun.has(envelope)))` — passes the rest
+// of this suite, and the resulting failure is worse than a plain refusal: `read.jsonl` is
+// append-only while `tasks()` re-reads a queue that is trimmed and rotated, so the two genuinely
+// diverge; the guard would then admit an envelope with no record behind it and throw on
+// `task.type`, after the read append has already advanced the cursor. Seed exactly that divergence
+// — a read id with no queue entry — and require the refusal, not an exception.
+const trimId = 'claude-trim-test'
+const trimRuntime = join(root, 'trim-runtime')
+const trimPubkey = 'f'.repeat(64)
+mkdirSync(trimRuntime); mkdirSync(join(trimRuntime, 'claude-channel-state'))
+writeFileSync(join(manifests, `${trimId}.json`), JSON.stringify({ ...manifest, id: trimId, pubkey: trimPubkey,
+  runtime_dir: trimRuntime, state_dir: join(root, 'trim-state'), spool_dir: join(root, 'trim-spool') }))
+const trimmed = '1'.repeat(63) + '2'
+writeFileSync(join(trimRuntime, 'admitted-tasks.jsonl'), '', { mode: 0o600 })
+writeFileSync(join(trimRuntime, 'reply-requests.jsonl'), '', { mode: 0o640 })
+writeFileSync(join(trimRuntime, 'claude-channel-state', 'read.jsonl'),
+  JSON.stringify({ version: 1, instance: trimId, envelope: trimmed, read_at: Date.now() }) + '\n', { mode: 0o600 })
+const trimTransport = new StdioClientTransport({ command: process.execPath,
+  args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', trimId, '--poll-ms', '60000'],
+  env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stderr: 'pipe' })
+const trimClient = new Client({ name: 'claude-channel-trim', version: '0.1.0' })
+try {
+  await trimClient.connect(trimTransport)
+  const gone = await trimClient.callTool({ name: 'nvoy_channel_read', arguments: { envelope: trimmed } })
+  ok('an envelope read but no longer in the queue is refused, not dereferenced',
+    gone.isError === true && /NVOY_NOT_DELIVERED/.test(gone.content[0].text))
+  // The refusal has to be the guard's, not a dead session's: a server that crashed on the call
+  // above would fail the next one too, and the assertion would read as a pass for the wrong reason.
+  const alive = (await trimClient.listTools()).tools.map(tool => tool.name)
+  ok('the refusal left the session alive — the throw was prevented, not merely caught',
+    alive.includes('nvoy_channel_read') && alive.includes('nvoy_channel_list'))
+} catch (error) {
+  ok(`an envelope read but no longer in the queue is refused, not dereferenced (threw: ${error.message})`, false)
+  ok('the refusal left the session alive — the throw was prevented, not merely caught', false)
+} finally { try { await trimClient.close() } catch { /* already gone */ } }
+
 console.log(`\n${passed}/${passed + failed} passed`)
 process.exit(failed ? 1 : 0)
