@@ -5,8 +5,8 @@
 # so the runtime UID/GID, instance paths, and credential reference all come
 # from the one validated manifest. Do not put an nsec in `environment`; Docker
 # mounts source credentials only into the root-only initializer. It creates
-# role-owned copies in separate private volumes: Bunker credentials for the broker,
-# and the model-provider credential for the worker.
+# role-owned copies in separate private volumes: Bunker credentials for the broker, and,
+# on a worker-enabled instance only, the model-provider credential for the worker.
 
 # Renderer binds this Compose project name to the immutable instance ID. Named volumes are then
 # namespaced per identity even when every rendered file is launched from the same directory.
@@ -184,9 +184,9 @@ secrets:
     file: ${BUNKER_URI_FILE:?}
   nvoy_bunker_client:
     file: ${BUNKER_CLIENT_FILE:?}
+  # @worker-begin
   # This is a model-provider credential (for example a dedicated OPENAI_API_KEY), not a
   # Nostr identity key. It is mounted only into the keyless worker and never into the broker.
-  # @worker-begin
   nvoy_worker_provider:
     file: ${WORKER_CREDENTIAL_FILE:?}
   # @worker-end
