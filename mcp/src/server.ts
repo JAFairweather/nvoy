@@ -33,6 +33,12 @@ import { createNvoyServer, sweepAutoRelinquish, type NvoyContext, type NvoyServe
 const log = (...args: unknown[]) => console.error('[nvoy]', ...args)
 
 const identity = loadIdentity()
+// Say which identity came up, every time. waggle#338 went unnoticed because nothing announced it:
+// two sessions answered whoami with a third agent's key, and the only way to find out was to call
+// a tool and read the answer. "pinned" distinguishes an asserted identity from one that is merely
+// whatever the env resolved to — an unpinned server is not wrong, but it is unguarded.
+log(`identity ${identity.npub} (source ${identity.source}, ` +
+  `${process.env.NVOY_EXPECTED_PUBKEY ? 'pinned by NVOY_EXPECTED_PUBKEY' : 'NOT pinned — set NVOY_EXPECTED_PUBKEY to assert it'})`)
 const relays = loadRelays()
 const relay = new LiveRelay(relays)
 const httpPort = process.env.NVOY_HTTP_PORT
