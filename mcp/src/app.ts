@@ -93,7 +93,7 @@ const eventGeneration = (ev: { tags: string[][] } | undefined) =>
  * cached plaintext.
  */
 export async function detectRevocation(ctx: NvoyContext, g: HeldGrant) {
-  const found = await findRevocationNotice(ctx.relay, ctx.identity.signer, g.publisher, g.scopeId).catch(() => null)
+  const found = await findRevocationNotice(ctx.relay, ctx.identity.signer, g.publisher, g.scopeId, ctx.grantStore.memo).catch(() => null)
   const record = ctx.grantStore.markRevoked(g.publisher, g.scopeId, g.generation, found?.content ?? null)
   ctx.scopeCache.zeroize(g.publisher, g.scopeId)
   // This identity may have issued attenuated descendants of the dead grant.  Cascading is
@@ -145,10 +145,18 @@ export async function relinquishGrant(
  * auto_relinquish and whose expires_at has passed. Called at boot and on an
  * interval while the runtime is up — the runtime-side half of expiry; the
  * delegator's TTL rotation is the cryptographic half.
+ *
+ * Reads only what is already held (peek), never the relay. See below.
  */
 export async function sweepAutoRelinquish(ctx: NvoyContext): Promise<number> {
   let done = 0
-  const grants = await ctx.grantStore.list().catch(() => [] as HeldGrant[])
+  // peek(), not list(): this sweep destroys key material this process is HOLDING, and
+  // what it holds is exactly what has already been materialized. Refreshing the whole
+  // mailbox on a timer to look for grants we hold no key for bought nothing, and it
+  // turned an idle server into permanent bunker load — 2N remote decrypts a minute,
+  // forever, growing with the mailbox (#170). A grant that arrives later is
+  // materialized by the tool call that wants it, and swept on the tick after that.
+  const grants = ctx.grantStore.peek()
   for (const g of grants) {
     if (g.revoked || g.relinquished) continue
     if (!g.terms?.auto_relinquish) continue
@@ -296,7 +304,7 @@ export function createNvoyServer(ctx: NvoyContext): NvoyServerHandle {
         // 'missing' is ambiguous: scope deleted (NIP-09 after tombstone) or
         // relay flake. A 441 notice disambiguates to revocation; otherwise
         // stay honest with UNAVAILABLE.
-        const found = await findRevocationNotice(ctx.relay, ctx.identity.signer, grant.publisher, d).catch(() => null)
+        const found = await findRevocationNotice(ctx.relay, ctx.identity.signer, grant.publisher, d, ctx.grantStore.memo).catch(() => null)
         if (found) {
           const record = await detectRevocation(ctx, grant)
           return revokedError(grant, record.notice)

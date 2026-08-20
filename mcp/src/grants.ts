@@ -66,36 +66,117 @@ export interface HeldGrant {
 const b64decode = (s: string) => Uint8Array.from(atob(s), c => c.charCodeAt(0))
 
 /**
+ * Remembers what a gift wrap unwrapped to, keyed on the wrap's event id.
+ *
+ * A gift wrap is immutable and addressed to exactly one key, so its plaintext cannot
+ * change — re-decrypting one is pure waste. Under a NIP-46 bunker it is not cheap
+ * waste: each unwrap is TWO remote signing calls, so an idle server was spending 2N
+ * bunker RPCs a minute for the life of the process, where N is every wrap the identity
+ * had ever received and only grows (#170).
+ *
+ * It holds plaintext, so it lives under the same no_persist rule as everything else
+ * (spec §5): in memory only, never written — and, the part that actually matters,
+ * evicted the moment the grant it carries is revoked or relinquished. A zeroized
+ * scopeKey sitting next to a live base64 copy of the same key in a cache is a
+ * zeroization that does not zeroize.
+ */
+export class UnwrapMemo {
+  /** wrap id → the authenticated rumor, or null for "this wrap yields nothing". */
+  private byWrap = new Map<string, any | null>()
+
+  constructor(private limit = 2_000) {}
+
+  has(wrapId: string): boolean {
+    return this.byWrap.has(wrapId)
+  }
+
+  get(wrapId: string): any | null {
+    return this.byWrap.get(wrapId) ?? null
+  }
+
+  set(wrapId: string, rumor: any | null): void {
+    // Crude bound, deliberately: overflowing costs one re-unwrap cycle, whereas a memo
+    // that grows without limit is a slower version of the defect it was written to fix.
+    if (this.byWrap.size >= this.limit) this.byWrap.clear()
+    this.byWrap.set(wrapId, rumor)
+  }
+
+  /** Drop every remembered rumor the predicate matches. Returns how many went. */
+  forget(match: (rumor: any) => boolean): number {
+    let dropped = 0
+    for (const [id, rumor] of this.byWrap) {
+      if (rumor && match(rumor)) {
+        this.byWrap.delete(id)
+        dropped++
+      }
+    }
+    return dropped
+  }
+
+  clear(): void {
+    this.byWrap.clear()
+  }
+
+  get size(): number {
+    return this.byWrap.size
+  }
+}
+
+/**
  * Unwrap every gift wrap addressed to this key and return the authenticated
  * rumors of the wanted kinds. Malformed or unauthenticated wraps are skipped,
  * never fatal — anyone can address a 1059 to us.
  */
-async function unwrapRumors(relay: RelayLike, key: KeyOrSigner, kinds: number[]): Promise<any[]> {
+async function unwrapRumors(
+  relay: RelayLike,
+  key: KeyOrSigner,
+  kinds: number[],
+  memo?: UnwrapMemo,
+): Promise<any[]> {
   const signer = toSigner(key)
   const pub = await signer.getPublicKey()
   const wraps = await relay.query({ kinds: [1059], '#p': [pub] })
 
   const rumors: any[] = []
   for (const wrap of wraps) {
+    const id = typeof wrap.id === 'string' ? wrap.id : null
+    if (id && memo?.has(id)) {
+      const known = memo.get(id)
+      if (known && kinds.includes(known.kind)) rumors.push(known)
+      continue
+    }
+
+    let rumor: any = null
     try {
       // Signer-driven unwrap: nip44Decrypt handles the conversation key (a raw
       // key locally, a remote NIP-46 call under a bunker signer). Matches the
       // nipxx giftUnwrap ceremony.
       const seal = JSON.parse(await signer.nip44Decrypt(wrap.pubkey, wrap.content))
-      if (seal.kind !== 13 || !verifyEvent(seal)) continue // unauthenticated seal
-      const rumor = JSON.parse(await signer.nip44Decrypt(seal.pubkey, seal.content))
-      if (rumor.pubkey !== seal.pubkey) continue // sender impersonation
-      if (kinds.includes(rumor.kind)) rumors.push(rumor)
+      if (seal.kind === 13 && verifyEvent(seal)) {
+        // unauthenticated seals fall through as null
+        const inner = JSON.parse(await signer.nip44Decrypt(seal.pubkey, seal.content))
+        if (inner.pubkey === seal.pubkey) rumor = inner // else: sender impersonation
+      }
     } catch {
-      continue
+      rumor = null
     }
+
+    // Remember the OUTCOME, whether or not this caller wanted the kind. The two callers
+    // want different kinds out of the same mailbox, so a memo that only remembered
+    // wanted rumors would leave whichever ran second re-decrypting everything.
+    if (id) memo?.set(id, rumor)
+    if (rumor && kinds.includes(rumor.kind)) rumors.push(rumor)
   }
   return rumors
 }
 
 /** Collect, authenticate, and parse all grants gift-wrapped to this key. */
-export async function receiveGrants(relay: RelayLike, key: KeyOrSigner): Promise<HeldGrant[]> {
-  const rumors = await unwrapRumors(relay, key, [KIND_GRANT])
+export async function receiveGrants(
+  relay: RelayLike,
+  key: KeyOrSigner,
+  memo?: UnwrapMemo,
+): Promise<HeldGrant[]> {
+  const rumors = await unwrapRumors(relay, key, [KIND_GRANT], memo)
   const grants: HeldGrant[] = []
   for (const rumor of rumors) {
     try {
@@ -133,9 +214,10 @@ export async function findRevocationNotice(
   key: KeyOrSigner,
   publisher: string,
   scopeId: string,
+  memo?: UnwrapMemo,
 ): Promise<{ content: unknown; noticed_at: number } | null> {
   const address = `${KIND_DATA_SET}:${publisher}:${scopeId}`
-  const rumors = await unwrapRumors(relay, key, [KIND_REVOCATION])
+  const rumors = await unwrapRumors(relay, key, [KIND_REVOCATION], memo)
   let best: { content: unknown; noticed_at: number } | null = null
   for (const rumor of rumors) {
     if (rumor.pubkey !== publisher) continue
@@ -181,6 +263,8 @@ export class GrantStore {
   private fetchedAt = 0
   private revocations = new Map<string, RevocationRecord>()
   private relinquishments = new Map<string, RelinquishRecord>()
+  /** Shared by every unwrap this store drives, so one mailbox is decrypted once (#170). */
+  readonly memo = new UnwrapMemo()
 
   constructor(
     private relay: RelayLike,
@@ -190,12 +274,30 @@ export class GrantStore {
 
   async list(opts: { maxAgeMs?: number } = {}): Promise<HeldGrant[]> {
     const maxAge = opts.maxAgeMs ?? this.ttlMs
-    if (this.cache === null || Date.now() - this.fetchedAt > maxAge) {
-      this.cache = latestGrants(await receiveGrants(this.relay, this.key))
+    // `maxAge <= 0` is tested separately, not left to the subtraction: find() passes 0 to
+    // MEAN "do not use the cache", and within the same millisecond `Date.now() - fetchedAt
+    // > 0` is false — so the forced refresh silently did not happen for any caller quick
+    // enough to hit the same tick, and a grant that had just arrived stayed unfound.
+    if (this.cache === null || maxAge <= 0 || Date.now() - this.fetchedAt > maxAge) {
+      this.cache = latestGrants(await receiveGrants(this.relay, this.key, this.memo))
       this.fetchedAt = Date.now()
       for (const g of this.cache) this.applyRevocation(g)
+      this.forgetAllDead()
     }
     return this.cache
+  }
+
+  /**
+   * The grants this process is holding RIGHT NOW: no relay query, no unwrap, no bunker.
+   *
+   * For callers that act on held key material rather than on the delegator's current
+   * intent — the auto_relinquish sweeper is the one. Relinquishment destroys the local
+   * copy of a scope key, and this cache IS the local copy: a grant that has never been
+   * unwrapped is one this process holds no key for, so there is nothing to destroy.
+   * Paying a full mailbox unwrap on a timer to rediscover that, forever, was #170.
+   */
+  peek(): HeldGrant[] {
+    return this.cache ?? []
   }
 
   /** Find one grant; on a miss, force one refresh (it may have just arrived). */
@@ -220,6 +322,7 @@ export class GrantStore {
         : { generation, notice, detected_at: Math.floor(Date.now() / 1000) }
     this.revocations.set(key, record)
     for (const g of this.cache ?? []) this.applyRevocation(g)
+    this.forgetMemoised(publisher, scopeId, record.generation)
     return record
   }
 
@@ -239,13 +342,61 @@ export class GrantStore {
         : { generation, destroyed_at: destroyedAt, ...(reason ? { reason } : {}) }
     this.relinquishments.set(key, record)
     for (const g of this.cache ?? []) this.applyRevocation(g)
+    this.forgetMemoised(publisher, scopeId, record.generation)
     return record
+  }
+
+  /**
+   * Drop the remembered plaintext of a grant whose key material was just zeroized.
+   * Without this the memo would still hold the base64 scope_key for a grant whose
+   * Uint8Array we had just filled with zeros — a zeroization that does not zeroize.
+   * The wrap stays on the relay either way; what we control is our own copy.
+   */
+  private forgetMemoised(publisher: string, scopeId: string, generation: number): void {
+    const address = `${KIND_DATA_SET}:${publisher}:${scopeId}`
+    this.memo.forget(r => {
+      if (r.kind !== KIND_GRANT || r.pubkey !== publisher) return false
+      if (r.tags?.find?.((t: string[]) => t[0] === 'a')?.[1] !== address) return false
+      return Number(r.tags.find((t: string[]) => t[0] === 'v')?.[1] ?? 0) <= generation
+    })
+  }
+
+  /**
+   * Replay the revoked/relinquished ledger onto the memo, exactly as `applyRevocation`
+   * is replayed onto the cache directly above.
+   *
+   * `forgetMemoised` alone is one-shot: it runs inside `markRevoked`/`markRelinquished`,
+   * but the wrap is still on the relay, so the next refresh re-decrypts it and
+   * `unwrapRumors` memoises the outcome unconditionally — putting the base64 `scope_key`
+   * of a dead grant straight back, for the life of the process. The `Uint8Array` stays
+   * zeroized; the memo did not. For a relinquished grant that is a key we have already
+   * told the delegator we destroyed.
+   *
+   * Cost is one re-decrypt per dead grant per refresh, dropped the same tick — bounded by
+   * dead grants, not by mailbox size, so #170 stays fixed.
+   */
+  private forgetAllDead(): void {
+    // Split at the FIRST colon: the publisher is a 64-hex pubkey and cannot contain one,
+    // but a scope id may — `split(':')` destructuring would silently truncate it.
+    const parts = (key: string): [string, string] => {
+      const i = key.indexOf(':')
+      return [key.slice(0, i), key.slice(i + 1)]
+    }
+    for (const [key, rec] of this.revocations) {
+      const [publisher, scopeId] = parts(key)
+      this.forgetMemoised(publisher, scopeId, rec.generation)
+    }
+    for (const [key, rec] of this.relinquishments) {
+      const [publisher, scopeId] = parts(key)
+      this.forgetMemoised(publisher, scopeId, rec.generation)
+    }
   }
 
   /** Zeroize every held scope key (shutdown path — spec §5). */
   zeroizeAll(): void {
     for (const g of this.cache ?? []) g.scopeKey.fill(0)
     this.cache = null
+    this.memo.clear() // plaintext lives here too — shutdown must not leave it behind
   }
 
   private applyRevocation(g: HeldGrant): void {
