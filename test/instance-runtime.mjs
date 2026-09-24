@@ -231,7 +231,11 @@ ok('watcher cooldown coalesces notifications but never skips durable queueing', 
 const brokerSource = readFileSync('mcp/tools/instance-broker.mjs', 'utf8')
 ok('an unverifiable live policy requeues the opaque marker instead of consuming it as a denial', /if \(!report\.policyUsable\)[\s\S]*renameSync\(markerPath, pendingMarker\)[\s\S]*process\.exit\(75\)/.test(brokerSource) && !/!report\.policyUsable \|\|/.test(brokerSource))
 ok('broker atomically claims the exact pending marker before decrypting', /renameSync\(pendingMarker, markerPath\)/.test(brokerSource) && /--envelope', envelope/.test(brokerSource))
-ok('a broker claims a per-state exclusive lock before decrypting', /openSync\(lockPath, 'wx'/.test(brokerSource) && /process\.kill\(prior\.pid, 0\)/.test(brokerSource))
+const lockSource = readFileSync('mcp/tools/broker_lock.mjs', 'utf8')
+const nativeBrokerSource = readFileSync('mcp/tools/instance-broker-native.mjs', 'utf8')
+ok('a broker claims a per-state exclusive lock before decrypting', /openSync\(lockPath, 'wx'/.test(lockSource) && /process\.kill\(prior\.pid, 0\)/.test(lockSource) &&
+  /claimBrokerLock\(manifest, die\)[\s\S]*renameSync\(pendingMarker, markerPath\)/.test(brokerSource) &&
+  /claimBrokerLock\(manifest, die\)[\s\S]*renameSync\(pendingMarker, markerPath\)/.test(nativeBrokerSource))
 ok('the broker records an identity-bound, expiry-limited admission receipt before any keyless worker can request a reply', /broker: manifest\.pubkey, envelope/.test(brokerSource) && /sender: String\(admission\.from\)/.test(brokerSource) && /grant_id: String\(admission\.grant_id\)/.test(brokerSource) && /expires_at: Date\.now\(\) \+ 5 \* 60 \* 1000/.test(brokerSource))
 ok('the broker carries its verified task authority into Desktop delivery instead of downgrading it to generic data',
   /type: 'scoped-instruction'/.test(brokerSource) && /scope_subject: manifest\.pubkey/.test(brokerSource) &&
@@ -243,7 +247,7 @@ ok('the Desktop adapter gives each admitted envelope a stable app-server user-me
   /clientUserMessageId: userMessageId\(task\)/.test(codexDesktopSource) &&
   /clientUserMessageId/.test(codexTransportSource))
 const daemonSource = readFileSync('mcp/tools/instance-broker-daemon.mjs', 'utf8')
-ok('the broker daemon rate-limits retries after transient policy failures', /retryAfter\.get\(item\.envelope\)/.test(daemonSource) && /Date\.now\(\) \+ 5000/.test(daemonSource))
+ok('the broker daemon rate-limits retries after transient policy failures', /retryAfter\.get\(key\)/.test(daemonSource) && /const key = `\$\{item\.native \? 'buzz:' : ''\}\$\{item\.envelope\}`/.test(daemonSource) && /Date\.now\(\) \+ 5000/.test(daemonSource))
 ok('broker restart requeues only interrupted inflight markers and prioritizes the newest opaque observation', /\.inflight/.test(daemonSource) && /\.pending/.test(daemonSource) && /marker\.observed_at/.test(daemonSource) && /b\.observed - a\.observed/.test(daemonSource) && /setInterval\(drain, 1000\)/.test(daemonSource))
 mkdirSync(manifest.state_dir, { recursive: true })
 const terminalReplies = join(manifest.state_dir, 'terminal-replies.jsonl')

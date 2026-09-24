@@ -9,6 +9,7 @@ import { lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs'
 import { resolve, dirname, relative, sep } from 'node:path'
 import { decode } from 'nostr-tools/nip19'
 import { codexThreadId as validCodexThreadId, localControlSocket } from './codex_app_server.mjs'
+import { normalizeBuzzRelay } from './buzz_native.mjs'
 
 const die = message => { throw new Error(message) }
 const hex = value => String(value || '').toLowerCase()
@@ -57,6 +58,16 @@ export function readManifest(root, requestedId) {
     return Object.freeze({ pubkey, channels: Object.freeze(channels) })
   })
   const relays = (Array.isArray(raw.relays) ? raw.relays : []).map(String).filter(v => /^wss:\/\//.test(v))
+  // Optional native Buzz participation: the community relay this identity is a member of, and the
+  // channels it listens and answers in. Absent means the identity has no native ears or mouth.
+  let buzz = null
+  if (raw.buzz != null) {
+    const channels = (Array.isArray(raw.buzz?.channels) ? raw.buzz.channels : []).map(value => String(value || '').toLowerCase())
+    let relay
+    try { relay = normalizeBuzzRelay(raw.buzz?.relay) } catch (e) { die(`buzz.relay: ${e.message}`) }
+    if (!channels.length || !channels.every(validChannel) || new Set(channels).size !== channels.length) die('buzz requires distinct channel UUIDs')
+    buzz = Object.freeze({ relay, channels: Object.freeze(channels) })
+  }
   if (!valid(pubkey) || !grantors.length || !grantors.every(valid) || !relays.length) die('manifest requires pubkey, grantors, and wss relays')
   if (new Set(carriers.map(entry => entry.pubkey)).size !== carriers.length) die('task_carrier pubkeys must be distinct')
   const approvalEndpoint = String(raw.approval_endpoint || raw.approvalEndpoint || '')
@@ -155,7 +166,7 @@ export function readManifest(root, requestedId) {
       die('a remote broker manifest requires fixed ssh_target, absolute SSH files, and ssh_known_hosts_sha256')
     }
   }
-  return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, carriers: Object.freeze(carriers), relays, stateDir, runtimeDir, spoolDir,
+  return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, carriers: Object.freeze(carriers), buzz, relays, stateDir, runtimeDir, spoolDir,
     brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, adapterContainer, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath, codexAppBundleId, codexProjectLabel, codexChatLabel, codexUiDriver,
     sshTarget, sshIdentityFile, sshKnownHostsFile, sshKnownHostsSha256, approvalEndpoint: approvalEndpoint.replace(/\/$/, '') })
 }

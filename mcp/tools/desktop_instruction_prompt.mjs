@@ -18,7 +18,9 @@ export function desktopInstructionPrompt(task, policy = {}) {
   const carried = task.authority.version === 2
   const provenance = carried
     ? `Verified Nostr instruction from ${task.authority.sender}. Nvoy verified the original signed channel event, a live ${task.authority.cap} grant for that sender, and a separate task-relay grant for carrier ${task.authority.carrier}. The carrier transported this message; it did not author the instruction.`
-    : `Verified Nostr instruction from ${task.authority.sender}. Nvoy verified a live ${task.authority.cap} grant from ${task.authority.grantor} for this Codex identity.`
+    : task.authority.version === 3
+      ? `Verified Buzz instruction from ${task.authority.sender}. Nvoy verified the author's own signature on the channel message and a live ${task.authority.cap} grant from ${task.authority.grantor} for this identity. No carrier was involved.`
+      : `Verified Nostr instruction from ${task.authority.sender}. Nvoy verified a live ${task.authority.cap} grant from ${task.authority.grantor} for this Codex identity.`
   return [
     ...bodies,
     '',

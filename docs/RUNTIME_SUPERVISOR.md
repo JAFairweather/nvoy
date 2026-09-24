@@ -144,6 +144,53 @@ session-binding contract before they are called a wake mechanism.
    retry republishes the same event rather than authoring another reply. The worker never sees the
    Nostr credential.
 
+## Native Buzz ears and mouth (optional)
+
+A manifest may add a `buzz` block. When it does, the identity also takes part in that Buzz
+community directly, as its own key, with no carrier:
+
+```json
+"buzz": { "relay": "wss://<community host>", "channels": ["<channel uuid>"] }
+```
+
+Absent, nothing below runs, and the runtime behaves exactly as before.
+
+```
+Buzz relay ──kind:9 #h #p──> keyless buzz watcher ──<event>.buzz.pending──> broker
+     ▲                              │                                            │
+     │                     NIP-42 AUTH, signed by                re-fetch by id, nativeMention,
+     │                     the broker's AUTH oracle              author's live task grant
+     │                                                                            │
+     └──────────── kind:9 reply, signed by the broker ◀── reply-request ◀── adapter
+```
+
+- **Login without a key.** Buzz serves nothing to a connection that has not answered its NIP-42
+  challenge as a member. The broker daemon supervises `instance-broker-auth.mjs`, which listens on
+  `<spool>/buzz-auth.sock` (broker-owned, broker-adapter group, `0660`; the adapter does not mount
+  the spool). For each request it signs only what `checkAuthTemplate` accepts: a fresh kind 22242
+  for this relay with exactly the `relay` and `challenge` tags. It rate-limits requests and never
+  signs a second template on the same connection.
+- **Hearing.** `instance-runtime watch` also starts `buzz-wake-watcher.mjs`. It subscribes to
+  `{kinds:[9], #h: channels, #p: [self]}` and writes an opaque `<event>.buzz.pending` marker for
+  each event that `nativeMention` accepts. The marker holds `{envelope, observed_at}` only. It
+  keeps `buzz-wake-seen.log` and a `buzz-wake-since` watermark: the last moment it was known to be
+  caught up. A restart therefore replays the gap it was down for, with ten minutes of overlap for
+  author clock skew. A first run starts at "now" and never turns channel history into tasks.
+  If either watcher exits, both stop, so the supervisor restarts the whole unit.
+- **Admission.** The daemon drains `.buzz.pending` markers through
+  `instance-broker-native.mjs`, under the same broker lock as wrapped mail. It re-fetches the event
+  by id from the configured channels, re-verifies it, and asks attention (`--policy-only`) for the
+  live grant set. It admits only when the **author** holds `task` or `task+act`. A message from
+  anyone else is terminal and stays data. No answer from the grant relays is not a denial: the
+  marker is requeued (exit 75). One signed message is admitted once across native and carried
+  routes, through the shared channel-source index.
+- **Authority v3** is v1 plus `source_event` and `reply_channel`, with no carrier fields. The
+  envelope *is* the source event, there is exactly one kind-9 message, its author is the sender,
+  and the channel must be in the manifest's `buzz.channels`.
+- **Replying** uses the same `reply-request` queue. For a v3 receipt the actuator rechecks the
+  author's grant live, freezes the kind-9 reply, signs it, and publishes it to the community relay
+  (see OUTBOUND_ACTION_APPROVAL, "Channel replies enacted on the live grant chain").
+
 ## Required negative tests
 
 - duplicate pubkey, state root, runtime root, or service user is refused;
@@ -495,7 +542,7 @@ What is *not* intuitive is which volumes are safe to drop. `docker compose down`
 
 | volume | holds | dropping it costs |
 |---|---|---|
-| `nvoy-<id>_watcher_spool` | `keyless-wake-seen.log`, the wake queue, retired envelope markers | the watcher re-scans its 48h relay window and re-records envelopes whose markers were already retired. Downstream dedup should absorb it — which makes dedup **load-bearing for a routine operation** |
+| `nvoy-<id>_watcher_spool` | `keyless-wake-seen.log`, the wake queue, retired envelope markers; with a `buzz` block also `buzz-wake-seen.log`, `buzz-wake-since` and `buzz-auth.sock` | the watcher re-scans its 48h relay window and re-records envelopes whose markers were already retired. Downstream dedup should absorb it — which makes dedup **load-bearing for a routine operation** |
 | `nvoy-<id>_broker_state` | `receipts/`, `outbound/`, `terminal-replies.jsonl`, channel-source admissions | the signing audit trail, and terminal classification — so retry loops that #145 killed **can resurrect** |
 | `nvoy-<id>_adapter_runtime` | `admitted-tasks.jsonl`, the adapter socket, the channel read cursor | unread wakes. And because #149 re-announces until read, a lost read cursor **re-steers the agent on mail it has already handled** |
 | `nvoy-<id>_broker_credentials` | Bunker URI + NIP-46 client | a **Bunker re-pair**. The pairing secret is effectively single-use, and a spent one presents as `Unknown client`, which blames the client key rather than the secret |

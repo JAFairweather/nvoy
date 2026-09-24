@@ -202,6 +202,16 @@ const TASK_CARRIERS = (() => {
   return out
 })()
 
+// Policy only: the live grants, and nothing from the inbox. A message heard natively on a Buzz
+// relay was signed by its author and never wrapped, so the broker needs only this answer — who
+// holds which live grant for this identity — and must not pay for, or be confused by, a 1059 read.
+if (process.argv.includes('--policy-only')) {
+  console.log(JSON.stringify({ me: ME, policyUsable: relaysAnswered > 0, relaysAnswered,
+    grants: [...permitted.entries()].flatMap(([pk, caps]) => [...caps.values()].map(g =>
+      ({ pubkey: pk, cap: g.cap, grant_id: g.grantId, grantor: String(g.grantor).toLowerCase() }))) }))
+  process.exit(0)
+}
+
 // --- 2. Read the inbox. ----------------------------------------------------------------------
 const wraps = new Map()
 for (const url of RELAYS) {

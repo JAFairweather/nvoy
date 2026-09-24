@@ -17,6 +17,7 @@ import * as nip44 from 'nostr-tools/nip44'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { makeBunkerSigner } from './nip46-signer.mjs'
 import { verifyOutboundApproval } from './outbound_approval.mjs'
+import { channelReply, openBuzzSession } from './buzz_native.mjs'
 
 const die = m => { console.error(`instance-broker-reply: ${m}`); process.exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -76,7 +77,7 @@ let receipt; try { receipt = JSON.parse(readFileSync(receiptPath, 'utf8')) } cat
 // full, and impossible to reply to. Three replies died that way in one evening (#150).
 //
 // The deadline is no longer a gate. Nothing is loosened: authorisation was never coming from it.
-if (![1, 2].includes(receipt.version) || receipt.instance !== manifest.id || receipt.broker !== manifest.pubkey || receipt.envelope !== request.receipt ||
+if (![1, 2, 3].includes(receipt.version) || receipt.instance !== manifest.id || receipt.broker !== manifest.pubkey || receipt.envelope !== request.receipt ||
   !/^[0-9a-f]{64}$/.test(String(receipt.sender || '')) || !Number.isFinite(receipt.expires_at)) {
   die('admission receipt is not a live broker-bound sender capability')
 }
@@ -86,6 +87,14 @@ if (receipt.version === 2 && (!channelCarry || !/^[0-9a-f]{64}$/.test(String(rec
   !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(String(receipt.reply_channel || '')) ||
   !manifest.carriers.some(entry => entry.pubkey === receipt.carrier && entry.channels.includes(receipt.reply_channel)))) {
   die('channel-carry receipt is not bound to an allowed carrier and channel')
+}
+// v3: heard natively on the Buzz relay, so the answer is a kind:9 in the same channel, signed by
+// this identity and published on the community relay it is a member of.
+const buzzNative = receipt.version === 3 && receipt.mode === 'buzz-native'
+if (receipt.version === 3 && (!buzzNative || !manifest.buzz || !/^[0-9a-f]{64}$/.test(String(receipt.source_event || '')) ||
+  receipt.source_event !== receipt.envelope || !/^[0-9a-f]{64}$/.test(String(receipt.reply_root || '')) ||
+  !manifest.buzz.channels.includes(receipt.reply_channel))) {
+  die('native Buzz receipt is not bound to a configured channel')
 }
 const credential = process.env.NVOY_BROKER_CREDENTIAL
 if (!credential || !existsSync(credential)) die('broker credential file is unavailable')
@@ -110,15 +119,23 @@ const attention = resolve(new URL('.', import.meta.url).pathname, 'attention.mjs
 const checkEnv = { HOME: manifest.stateDir, PATH: process.env.PATH || '', NVOY_RELAYS: manifest.relays.join(','),
   GRANTORS: manifest.grantors.join(','), NVOY_TASK_CARRIERS: JSON.stringify(manifest.carriers) }
 if (bunkerUri) { checkEnv.NVOY_BUNKER_URI = bunkerUri; checkEnv.NVOY_NIP46_CLIENT_NSEC = raw } else checkEnv.NVOY_NSEC = raw
-const checked = spawnSync(process.execPath, [attention, '--json', '--envelope', receipt.envelope], { env: checkEnv, encoding: 'utf8', timeout: 60000 })
+// A native receipt has no wrap to re-open: the author signed the channel message itself. What must
+// still hold is the same thing admission required — the author's own task grant, live now.
+const checked = spawnSync(process.execPath, [attention, ...(buzzNative ? ['--policy-only'] : ['--json', '--envelope', receipt.envelope])],
+  { env: checkEnv, encoding: 'utf8', timeout: 60000 })
 if (![0, 10].includes(checked.status)) die('could not recheck live grant policy')
 let policy; try { policy = JSON.parse(checked.stdout) } catch { die('live grant policy result is invalid') }
+if (buzzNative) {
+  const live = (Array.isArray(policy.grants) ? policy.grants : []).find(g => g?.pubkey === receipt.sender &&
+    g.grant_id === receipt.grant_id && ['task', 'task+act'].includes(g.cap) && manifest.grantors.includes(g.grantor))
+  if (policy.me !== manifest.pubkey || !policy.policyUsable || !live) die('admission receipt no longer has a live matching grant chain')
+}
 const current = Array.isArray(policy.admissions) ? policy.admissions : []
 const liveAdmission = current.length === 1 ? current[0] : null
-if (!policy.policyUsable || !liveAdmission || liveAdmission.from !== receipt.sender || liveAdmission.grant_id !== receipt.grant_id ||
+if (!buzzNative && (!policy.policyUsable || !liveAdmission || liveAdmission.from !== receipt.sender || liveAdmission.grant_id !== receipt.grant_id ||
   (channelCarry && (liveAdmission.mode !== 'channel-carry' || liveAdmission.carrier !== receipt.carrier ||
     liveAdmission.carrier_grant_id !== receipt.carrier_grant_id || liveAdmission.reply_channel !== receipt.reply_channel ||
-    liveAdmission.source_event !== receipt.source_event))) die('admission receipt no longer has a live matching grant chain')
+    liveAdmission.source_event !== receipt.source_event)))) die('admission receipt no longer has a live matching grant chain')
 // Claim before stamping. The stamp below writes to `receiptPath`, which is still `receiptBase`
 // until this rename — so stamping first RE-CREATES a receipt another invocation has already
 // claimed, its rename then succeeds, and two different replies get signed from one single-use
@@ -146,12 +163,22 @@ if (existsSync(recordPath)) {
   regular(recordPath, 'outbound record')
   try { record = JSON.parse(readFileSync(recordPath, 'utf8')) } catch { die('outbound record is invalid') }
   try { validateOutboundRecord(record, { requestId, requestDigest: digest }) } catch (e) { die(e.message) }
-  if (record.version !== 2) die('legacy signed reply record has no discrete approval and cannot be resumed')
+  if (record.version !== (buzzNative ? 3 : 2)) die('outbound record does not match this receipt\'s reply path, or is a legacy record with no discrete approval')
   if (record.published === true) {
     try { renameSync(receiptInflight, receiptUsed) } catch (e) { die(`could not finalize one-use receipt: ${e.message}`) }
     console.log(JSON.stringify({ request: requestId, receipt: request.receipt, accepted: record.accepted || 0, replay: true }))
     process.exit(0)
   }
+} else if (buzzNative) {
+  // Freeze the exact kind:9 before the signer opens, as the seal is frozen for a wrapped reply: the
+  // fingerprint is its id, and a retry republishes this event rather than authoring a second one.
+  const parent = { id: receipt.source_event, pubkey: receipt.sender,
+    tags: receipt.reply_root !== receipt.source_event ? [['e', receipt.reply_root, '', 'root']] : [] }
+  const unsignedEvent = { pubkey: manifest.pubkey, ...channelReply({ channel: receipt.reply_channel, parent, content: request.content }) }
+  record = { version: 3, request_digest: digest, request_id: requestId,
+    fingerprint: getEventHash(unsignedEvent), unsigned_event: unsignedEvent, event: null, published: false }
+  const tmp = `${recordPath}.${process.pid}.tmp`
+  try { writeFileSync(tmp, JSON.stringify(record), { mode: 0o600 }); renameSync(tmp, recordPath) } catch (e) { die(`cannot persist outbound record: ${e.message}`) }
 } else {
   const now = Math.floor(Date.now() / 1000)
   const peer = channelCarry ? receipt.carrier : receipt.sender
@@ -170,11 +197,12 @@ if (existsSync(recordPath)) {
 
 // Which actuator applies is a property of the receipt, decided here so the daemon never infers it.
 // `channelCarry` was already validated above against an allowed carrier and an allowed channel.
-const action = channelCarry ? 'nostr-private-reply' : 'nostr-public-event'
+const channelReplyPath = channelCarry || buzzNative
+const action = buzzNative ? 'buzz-channel-reply' : channelCarry ? 'nostr-private-reply' : 'nostr-public-event'
 if (prepareOnly) {
   console.log(JSON.stringify({ request: requestId, receipt: request.receipt, action,
-    status: channelCarry ? 'enactable' : 'awaiting-approval',
-    approval_required: !channelCarry, fingerprint: record.fingerprint }))
+    status: channelReplyPath ? 'enactable' : 'awaiting-approval',
+    approval_required: !channelReplyPath, fingerprint: record.fingerprint }))
   process.exit(0)
 }
 let approval = null
@@ -183,8 +211,10 @@ if (direct) {
   // already an admitted member of the destination channel. The admit/task/task-relay chain checked
   // live above IS the authorisation to post — there is no second thing for a human to approve.
   // It stays confined to that case: a public event is permanent and world-readable, so it keeps
-  // its discrete approval.
-  if (!channelCarry) die('direct enactment is permitted only for a private channel-carry reply; a public event requires a discrete approval')
+  // its discrete approval. A native Buzz reply is the same act by a shorter route — the identity
+  // is itself a member of the channel it was addressed in, and the audience is that channel's
+  // membership, exactly as for a carried reply — so it is enacted on the same live chain.
+  if (!channelReplyPath) die('direct enactment is permitted only for a channel reply; a public event requires a discrete approval')
   if (record.approval_id) die('this proposal is already bound to an approval and cannot be enacted directly')
 } else {
   regular(approvalPath, 'approval event')
@@ -197,7 +227,15 @@ if (direct) {
   } catch (e) { die(e.message) }
   if (record.approval_id && record.approval_id !== approval.eventId) die('outbound proposal is already bound to another approval')
 }
-if (!record.wrap) {
+if (buzzNative && !record.event) {
+  const ev = await signer.signEvent(record.unsigned_event)
+  if (ev.id !== record.fingerprint || getEventHash(ev) !== record.fingerprint || !verifyEvent(JSON.parse(JSON.stringify(ev)))) die('signer changed or invalidly signed the frozen channel reply')
+  record.event = ev
+  if (direct) record.enactment = 'buzz-native-direct'
+  else record.approval_id = approval.eventId
+  const tmp = `${recordPath}.${process.pid}.approved.tmp`
+  try { writeFileSync(tmp, JSON.stringify(record), { mode: 0o600 }); renameSync(tmp, recordPath) } catch (e) { die(`cannot persist approved outbound record: ${e.message}`) }
+} else if (!buzzNative && !record.wrap) {
   const seal = await signer.signEvent(record.unsigned_seal)
   if (seal.id !== record.fingerprint || getEventHash(seal) !== record.fingerprint || !verifyEvent(JSON.parse(JSON.stringify(seal)))) die('signer changed or invalidly signed the frozen seal')
   const peer = channelCarry ? receipt.carrier : receipt.sender
@@ -225,8 +263,18 @@ async function publish(url) {
   })
 }
 let accepted = 0
-for (const relay of manifest.relays) if (await publish(relay)) accepted++
-if (!accepted) die('no relay accepted the persisted outbound wrap; it remains retryable')
+if (buzzNative) {
+  // The community relay is the only place this reply means anything; its refusal is reported verbatim.
+  try {
+    const session = await openBuzzSession({ relay: manifest.buzz.relay, signer })
+    try { const ok = await session.publishSigned(record.event); if (ok.accepted) accepted = 1; else console.error(`instance-broker-reply: Buzz refused the reply: ${ok.message}`) }
+    finally { session.close() }
+  } catch (e) { console.error(`instance-broker-reply: Buzz relay unavailable: ${e.message}`) }
+  if (!accepted) die('the Buzz relay did not accept the persisted channel reply; it remains retryable')
+} else {
+  for (const relay of manifest.relays) if (await publish(relay)) accepted++
+  if (!accepted) die('no relay accepted the persisted outbound wrap; it remains retryable')
+}
 record.published = true; record.published_at = Date.now(); record.accepted = accepted
 try { writeFileSync(recordPath, JSON.stringify(record), { mode: 0o600 }) } catch (e) { die(`published but could not finalize record: ${e.message}`) }
 try { renameSync(receiptInflight, receiptUsed) } catch (e) { die(`published but could not finalize one-use receipt: ${e.message}`) }
