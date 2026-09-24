@@ -62,16 +62,30 @@ def release_sha() -> str:
     # assertion against GitHub's latest successful main workflow, never an authorization bypass.
     if ENV.get("NVOY_TEST_RELEASE_SHA"):
         return ENV["NVOY_TEST_RELEASE_SHA"].lower()
-    url = f"https://api.github.com/repos/{SLUG}/actions/workflows/{WORKFLOW}/runs?branch=main&status=success&per_page=1"
-    body = github_json(url)
-    release = (body.get("workflow_runs") or [None])[0]
-    if not release or release.get("status") != "completed" or release.get("conclusion") != "success" or release.get("head_branch") != "main":
+    # Unfiltered, newest first, and chosen here: GitHub's status=success filter is served from a
+    # search index that silently omits runs — on 2026-09-24 it returned 4 of ~60 successful ones,
+    # one of them a release older than this runner, which is how the Aug 28 downgrade happened.
+    url = f"https://api.github.com/repos/{SLUG}/actions/workflows/{WORKFLOW}/runs?branch=main&per_page=30"
+    release = pick_release(github_json(url).get("workflow_runs") or [])
+    if not release:
         raise RuntimeError("no completed successful main release workflow")
     sha = str(release.get("head_sha", "")).lower()
     expected = ENV.get("NVOY_RELEASE_SHA", "").lower()
     if expected and expected != sha:
         raise RuntimeError(f"launcher SHA {expected} is not the latest successful release {sha}")
     return sha
+
+
+def pick_release(runs: list[dict]) -> dict | None:
+    return next((r for r in runs if r.get("status") == "completed" and r.get("conclusion") == "success"
+                 and r.get("head_branch") == "main"), None)
+
+
+def is_ancestor(older: str, newer: str) -> bool:
+    result = subprocess.run([GIT, "-C", str(HUB), "merge-base", "--is-ancestor", older, newer], env=ENV)
+    if result.returncode not in (0, 1):
+        raise RuntimeError(f"git could not compare {older[:12]} with {newer[:12]}")
+    return result.returncode == 0
 
 
 def canonical_digest(tag: str) -> str:
@@ -168,13 +182,24 @@ def main() -> None:
     except FileExistsError:
         log("another deploy tick is active — leaving it to finish")
         return
+    restore_to = None
     try:
         sha = release_sha()
         if not HEX40.fullmatch(sha):
             raise RuntimeError(f"release workflow returned invalid SHA {sha}")
         deployed_file = STATE / "DEPLOYED_SHA"
+        deployed = deployed_file.read_text().strip() if deployed_file.exists() else ""
         identity_list = instances()
-        if deployed_file.exists() and deployed_file.read_text().strip() == sha:
+        # Releases only move forward. An older answer from the release lookup keeps the deployed
+        # release (and still health-checks it); a release off the deployed line is refused.
+        if HEX40.fullmatch(deployed) and sha != deployed:
+            run([GIT, "-C", str(HUB), "fetch", "--quiet", "origin", "main"])
+            if is_ancestor(sha, deployed):
+                log(f"release lookup named {sha[:12]}, older than the deployed {deployed[:12]} — keeping the deployed release")
+                sha = deployed
+            elif not is_ancestor(deployed, sha):
+                raise RuntimeError(f"release {sha[:12]} does not descend from the deployed {deployed[:12]} — refusing")
+        if deployed == sha:
             try:
                 for instance in identity_list:
                     verify_running(ROOT / f"{instance['id']}.compose.yml", instance)
@@ -186,6 +211,12 @@ def main() -> None:
         run([GIT, "-C", str(HUB), "fetch", "--quiet", "origin", "main"])
         run([GIT, "-C", str(HUB), "cat-file", "-e", f"{sha}^{{commit}}"])
         run([GIT, "-C", str(HUB), "merge-base", "--is-ancestor", sha, "origin/main"])
+        # This runner executes from the checkout it moves. Until the release is promoted, any exit
+        # puts it back — a failed candidate must never leave the host running someone else's runner.
+        previous = run([GIT, "-C", str(HUB), "rev-parse", "HEAD"], capture=True)
+        if not HEX40.fullmatch(previous):
+            raise RuntimeError(f"cannot read the deployer's own checkout (got {previous[:40]!r})")
+        restore_to = previous
         run([GIT, "-C", str(HUB), "checkout", "--quiet", "--detach", sha])
 
         runtime_ref = canonical_digest(f"ghcr.io/jafairweather/nvoy-runtime:sha-{sha}")
@@ -241,8 +272,14 @@ def main() -> None:
         atomic_write(STATE / "DEPLOYED_RUNTIME_IMAGE", runtime_ref + "\n")
         atomic_write(STATE / "DEPLOYED_WORKER_IMAGE", worker_ref + "\n")
         atomic_write(deployed_file, sha + "\n")
+        restore_to = None
         log(f"deploy OK — {len(identity_list)} identity(s) verified at {sha[:12]}")
     finally:
+        if restore_to and restore_to != sha:
+            try:
+                run([GIT, "-C", str(HUB), "checkout", "--quiet", "--detach", restore_to])
+            except Exception as error:
+                alarm(f"could not return the deployer's checkout to {restore_to[:12]}: {error}")
         shutil.rmtree(lock, ignore_errors=True)
 
 
