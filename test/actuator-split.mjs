@@ -55,8 +55,9 @@ ok('an enacted record with an invalid wrap is refused regardless of enactment',
 // Asserted against the source, because the branch that matters is the one that refuses to enact a
 // public event without approval, and it must live in the signer rather than in its caller.
 const replySource = readFileSync('mcp/tools/instance-broker-reply.mjs', 'utf8')
-ok('the actuator refuses direct enactment for anything that is not a channel-carry reply',
-  /if \(!channelCarry\) die\('direct enactment is permitted only for a private channel-carry reply/.test(replySource))
+ok('the actuator refuses direct enactment for anything that is not a channel reply',
+  /const channelReplyPath = channelCarry \|\| buzzNative\n/.test(replySource) &&
+  /if \(!channelReplyPath\) die\('direct enactment is permitted only for a channel reply; a public event requires a discrete approval/.test(replySource))
 
 ok('the actuator refuses direct enactment of a proposal already bound to an approval',
   /if \(record\.approval_id\) die\('this proposal is already bound to an approval/.test(replySource))
@@ -65,12 +66,13 @@ ok('exactly one of --prepare, --direct and --approval is accepted',
   /\[prepareOnly, !!approvalPath, direct\]\.filter\(Boolean\)\.length !== 1/.test(replySource))
 
 ok('the actuator reports which actuator applies rather than leaving the daemon to infer it',
-  /approval_required: !channelCarry/.test(replySource) && /nostr-private-reply/.test(replySource) && /nostr-public-event/.test(replySource))
+  /approval_required: !channelReplyPath/.test(replySource) && /nostr-private-reply/.test(replySource) &&
+  /buzz-channel-reply/.test(replySource) && /nostr-public-event/.test(replySource))
 
 // --- the daemon: acts on the actuator's verdict, and only the permissive one is narrow ---------
 const daemonSource = readFileSync('mcp/tools/instance-broker-daemon.mjs', 'utf8')
-ok('the daemon enacts directly only when the actuator reports a private reply needing no approval',
-  /verdict\?\.approval_required === false && verdict\?\.action === 'nostr-private-reply'/.test(daemonSource))
+ok('the daemon enacts directly only when the actuator reports a channel reply needing no approval',
+  /verdict\?\.approval_required === false && \['nostr-private-reply', 'buzz-channel-reply'\]\.includes\(verdict\?\.action\)/.test(daemonSource))
 
 ok('the daemon still announces and waits for anything else',
   /awaiting discrete approval/.test(daemonSource))

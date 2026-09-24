@@ -16,6 +16,8 @@
 //     a filter locally rather than wait for nothing.
 
 import WebSocket from 'ws'
+import net from 'node:net'
+import { chmodSync, chownSync, unlinkSync } from 'node:fs'
 import { verifyEvent } from 'nostr-tools/pure'
 
 const HEX64 = /^[0-9a-f]{64}$/
@@ -93,27 +95,36 @@ export function nativeMention(ev, { me, channels, now = Math.floor(Date.now() / 
 
 // One authenticated connection. `signer` is { getPublicKey(), signEvent(template) }; the pubkey
 // is resolved BEFORE the socket opens, both to warm a Bunker inside the 5s window and so a
-// signer that answers for a different key is caught before anything is sent.
-export async function openBuzzSession({ relay, signer, timeoutMs = 10000, WS = WebSocket }) {
+// signer that answers for a different key is caught before anything is sent. `pingMs` makes a
+// long-lived session prove it is alive: a socket that stops answering pings is terminated, so a
+// half-open connection surfaces as `closed` instead of as a quiet channel.
+export async function openBuzzSession({ relay, signer, timeoutMs = 10000, pingMs = 0, WS = WebSocket }) {
   const url = normalizeBuzzRelay(relay)
   const me = String(await signer.getPublicKey()).toLowerCase()
   if (!HEX64.test(me)) throw new Error('signer returned no usable pubkey')
   const ws = new WS(url)
-  const waiters = new Map(), subs = new Map()
-  let challenge, onChallenge, closedWith
+  const waiters = new Map(), subs = new Map(), live = new Map()
+  let challenge, onChallenge, closedWith, pinger, resolveClosed
+  const closed = new Promise(resolve => { resolveClosed = resolve })
   const fail = reason => {
     closedWith ??= reason
+    clearInterval(pinger)
     for (const w of waiters.values()) w.reject(new Error(closedWith))
     for (const s of subs.values()) s.reject(new Error(closedWith))
-    waiters.clear(); subs.clear(); onChallenge?.reject(new Error(closedWith))
+    waiters.clear(); subs.clear(); live.clear(); onChallenge?.reject(new Error(closedWith))
+    resolveClosed(closedWith)
   }
   ws.on('message', raw => {
     let m; try { m = JSON.parse(raw.toString()) } catch { return }
     if (m[0] === 'AUTH' && typeof m[1] === 'string') { challenge = m[1]; onChallenge?.resolve(m[1]) }
     else if (m[0] === 'OK') { const w = waiters.get(m[1]); if (w) { waiters.delete(m[1]); w.resolve({ accepted: m[2] === true, message: String(m[3] || '') }) } }
-    else if (m[0] === 'EVENT') subs.get(m[1])?.events.push(m[2])
-    else if (m[0] === 'EOSE') { const s = subs.get(m[1]); if (s) { subs.delete(m[1]); s.resolve(s.events) } }
-    else if (m[0] === 'CLOSED') { const s = subs.get(m[1]); if (s) { subs.delete(m[1]); s.reject(new Error(`subscription closed: ${m[2] || ''}`)) } }
+    else if (m[0] === 'EVENT') { const l = live.get(m[1]); if (l) l.onEvent(m[2]); else subs.get(m[1])?.events.push(m[2]) }
+    else if (m[0] === 'EOSE') { const l = live.get(m[1]); if (l) l.onEose?.(); else { const s = subs.get(m[1]); if (s) { subs.delete(m[1]); s.resolve(s.events) } } }
+    else if (m[0] === 'CLOSED') {
+      const l = live.get(m[1])
+      if (l) { live.delete(m[1]); l.onClosed?.(String(m[2] || '')) }
+      else { const s = subs.get(m[1]); if (s) { subs.delete(m[1]); s.reject(new Error(`subscription closed: ${m[2] || ''}`)) } }
+    }
   })
   ws.on('close', () => fail('relay closed the connection'))
   ws.on('error', e => fail(`relay connection error: ${e.message}`))
@@ -127,6 +138,7 @@ export async function openBuzzSession({ relay, signer, timeoutMs = 10000, WS = W
   // a timer behind when send throws on a closed socket — one that later rejects with no one listening.
   const sendAndAwaitOk = (frame, id) => { send(frame); return bounded(new Promise((resolve, reject) => waiters.set(id, { resolve, reject })), 'relay OK') }
   const close = () => { closedWith ??= 'session closed'; try { ws.close() } catch { /* already gone */ } }
+  const needsChannels = filters => !filters.length || filters.some(f => !Array.isArray(f?.['#h']) || !f['#h'].length || !f['#h'].every(validChannel))
 
   try {
     const c = challenge ?? await bounded(new Promise((resolve, reject) => { onChallenge = { resolve, reject } }), 'AUTH challenge')
@@ -136,24 +148,114 @@ export async function openBuzzSession({ relay, signer, timeoutMs = 10000, WS = W
     if (!verdict.accepted) throw new Error(`AUTH refused: ${verdict.message || '(no reason)'}`)
   } catch (error) { close(); throw error }
 
+  if (pingMs > 0) {
+    let alive = true
+    ws.on('pong', () => { alive = true })
+    pinger = setInterval(() => {
+      if (!alive) return ws.terminate()
+      alive = false
+      try { ws.ping() } catch { ws.terminate() }
+    }, pingMs)
+  }
+
   let n = 0
+  // Publish an event that is already signed. The caller persists it first, so a retry resends the
+  // same id instead of authoring a second message; resolves only on the relay's OK.
+  const publishSigned = async ev => {
+    if (ev?.pubkey !== me || !verified(ev)) throw new Error('refusing to publish an event that is not ours')
+    if (CHANNEL_KINDS.includes(ev.kind) && tagValues(ev, 'h').length !== 1) throw new Error('channel event needs exactly one h tag')
+    return { event: ev, ...(await sendAndAwaitOk(['EVENT', ev], ev.id)) }
+  }
   return Object.freeze({
-    pubkey: me, relay: url, close,
+    pubkey: me, relay: url, close, closed,
+    publishSigned,
     // Sign and publish; resolves only on the relay's OK, and reports its refusal verbatim.
-    async publish(template) {
-      const ev = await signer.signEvent(template)
-      if (ev?.pubkey !== me || !verified(ev)) throw new Error('signer returned an event that is not ours')
-      if (CHANNEL_KINDS.includes(ev.kind) && tagValues(ev, 'h').length !== 1) throw new Error('channel event needs exactly one h tag')
-      return { event: ev, ...(await sendAndAwaitOk(['EVENT', ev], ev.id)) }
-    },
+    async publish(template) { return publishSigned(await signer.signEvent(template)) },
     // Stored events up to EOSE. Every filter must name its channels, or Buzz answers with nothing.
     async fetch(...filters) {
-      if (!filters.length || filters.some(f => !Array.isArray(f?.['#h']) || !f['#h'].length || !f['#h'].every(validChannel)))
-        throw new Error('every Buzz filter needs #h channel UUIDs — without it the relay returns nothing')
+      if (needsChannels(filters)) throw new Error('every Buzz filter needs #h channel UUIDs — without it the relay returns nothing')
       const id = `q${++n}`
       send(['REQ', id, ...filters])
       const pending = bounded(new Promise((resolve, reject) => subs.set(id, { events: [], resolve, reject })), 'REQ')
       try { return await pending } finally { if (!closedWith) try { send(['CLOSE', id]) } catch { /* closing anyway */ } }
     },
+    // A subscription that stays open past EOSE. Events arrive unverified: the caller decides what
+    // an event means (nativeMention verifies it) — this only routes frames.
+    subscribe(filters, { onEvent, onEose, onClosed }) {
+      if (needsChannels(filters)) throw new Error('every Buzz filter needs #h channel UUIDs — without it the relay returns nothing')
+      const id = `s${++n}`
+      live.set(id, { onEvent, onEose, onClosed })
+      send(['REQ', id, ...filters])
+      return () => { if (live.delete(id) && !closedWith) try { send(['CLOSE', id]) } catch { /* closing anyway */ } }
+    },
+  })
+}
+
+// --- The AUTH oracle. ---------------------------------------------------------------------------
+// A keyless watcher must log in to the relay as the agent to hear its mentions, and a login is a
+// signature. The broker lends it exactly that and nothing more: one socket, one JSON line per
+// request, checkAuthTemplate on every template, and a rate bound. The watcher never sees a key or
+// a Bunker credential, and a template that is not a fresh 22242 for this relay is refused.
+export function serveAuthOracle({ socketPath, relay, signer, pubkey, gid = -1, maxPerMinute = 30, now = () => Math.floor(Date.now() / 1000) }) {
+  const want = normalizeBuzzRelay(relay)
+  if (!HEX64.test(String(pubkey))) throw new Error('oracle needs the manifest pubkey')
+  let windowStart = Date.now(), used = 0
+  const server = net.createServer(socket => {
+    let buffer = '', handled = false
+    socket.setEncoding('utf8')
+    socket.setTimeout(10000, () => socket.destroy())
+    socket.on('error', () => {})
+    socket.on('data', async chunk => {
+      if (handled) return
+      buffer += chunk
+      if (buffer.length > 4096) return socket.destroy()
+      if (!buffer.includes('\n')) return
+      handled = true // one request per connection: bytes after the first line are never a second template
+      const answer = obj => { try { socket.end(JSON.stringify(obj) + '\n') } catch { /* peer gone */ } }
+      let template; try { template = JSON.parse(buffer.split('\n')[0]) } catch { return answer({ error: 'malformed request' }) }
+      const refused = checkAuthTemplate(template, { relay: want, now: now() })
+      if (refused) return answer({ error: refused })
+      if (Date.now() - windowStart > 60000) { windowStart = Date.now(); used = 0 }
+      if (++used > maxPerMinute) return answer({ error: 'rate limited' })
+      try {
+        const ev = await signer.signEvent({ kind: 22242, created_at: template.created_at, content: '', tags: template.tags })
+        if (ev?.pubkey !== pubkey || ev.kind !== 22242 || JSON.stringify(ev.tags) !== JSON.stringify(template.tags) || !verified(ev)) return answer({ error: 'signer returned a different event' })
+        answer({ event: ev })
+      } catch (e) { answer({ error: `signer: ${e.message}` }) }
+    })
+  })
+  try { unlinkSync(socketPath) } catch { /* no stale socket */ }
+  return new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(socketPath, () => {
+      try { if (gid >= 0) chownSync(socketPath, -1, gid); chmodSync(socketPath, 0o660) } catch (e) { server.close(); return reject(e) }
+      resolve(server)
+    })
+  })
+}
+
+// The watcher's side: a signer that knows its own pubkey from the manifest and can obtain nothing
+// but an AUTH signature, by asking the broker's oracle.
+export function authOracleSigner({ socketPath, pubkey, timeoutMs = 4000 }) {
+  const me = String(pubkey).toLowerCase()
+  return Object.freeze({
+    getPublicKey: async () => me,
+    signEvent: template => new Promise((resolve, reject) => {
+      const socket = net.createConnection(socketPath)
+      let buffer = ''
+      const timer = setTimeout(() => { socket.destroy(); reject(new Error('AUTH oracle timed out')) }, timeoutMs)
+      socket.setEncoding('utf8')
+      socket.on('error', e => { clearTimeout(timer); reject(new Error(`AUTH oracle unavailable: ${e.message}`)) })
+      socket.on('connect', () => socket.write(JSON.stringify(template) + '\n'))
+      socket.on('data', chunk => {
+        buffer += chunk
+        if (!buffer.includes('\n')) return
+        clearTimeout(timer); socket.end()
+        let reply; try { reply = JSON.parse(buffer.split('\n')[0]) } catch { return reject(new Error('AUTH oracle reply is malformed')) }
+        if (reply.error) return reject(new Error(`AUTH oracle refused: ${reply.error}`))
+        if (reply.event?.pubkey !== me || !verified(reply.event)) return reject(new Error('AUTH oracle returned an event that is not ours'))
+        resolve(reply.event)
+      })
+    }),
   })
 }

@@ -42,5 +42,16 @@ if (command === 'watch' || command === 'baseline') {
     '--seen-path', resolve(manifest.spoolDir, 'keyless-wake-seen.log'), '--queue-path', resolve(manifest.spoolDir, 'keyless-wake-queue.jsonl'),
     '--marker-dir', manifest.spoolDir, '--marker-gid', String(manifest.brokerAdapterGid),
     ...(command === 'baseline' ? ['--baseline-existing', '--exit-after-baseline'] : [])], { env: baseEnv, stdio: 'inherit' })
-  child.on('exit', code => process.exit(code ?? 1))
+  let native = null
+  child.on('exit', code => { native?.kill(); process.exit(code ?? 1) })
+  // Native ears: with a buzz block the same keyless container also listens on the community relay.
+  // Either watcher exiting stops both, so the supervisor restarts a whole, not a half-deaf, watcher.
+  if (command === 'watch' && manifest.buzz) {
+    native = spawn(process.execPath, [tool('buzz-wake-watcher.mjs'), '--recipient', manifest.pubkey,
+      '--relay', manifest.buzz.relay, '--channels', manifest.buzz.channels.join(','),
+      '--auth-socket', resolve(manifest.spoolDir, 'buzz-auth.sock'),
+      '--marker-dir', manifest.spoolDir, '--marker-gid', String(manifest.brokerAdapterGid)],
+    { env: { HOME: manifest.stateDir, PATH: process.env.PATH || '' }, stdio: 'inherit' })
+    native.on('exit', code => { child.kill(); process.exit(code ?? 1) })
+  }
 }

@@ -6,7 +6,7 @@
 
 import { readdirSync, renameSync, readFileSync, lstatSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { isTerminalReplyFailure, loadTerminalReplyIds, recordTerminalReply } from './reply_retry.mjs'
 
@@ -26,6 +26,7 @@ let terminalReplyIds
 try { terminalReplyIds = loadTerminalReplyIds(terminalRepliesPath) }
 catch (e) { die(`cannot load terminal reply log: ${e.message || e}`) }
 const broker = resolve(new URL('.', import.meta.url).pathname, 'instance-broker.mjs')
+const nativeBroker = resolve(new URL('.', import.meta.url).pathname, 'instance-broker-native.mjs')
 const childEnv = { PATH: process.env.PATH || '', NVOY_INSTANCE_ROOT: root, NVOY_BROKER_CREDENTIAL: process.env.NVOY_BROKER_CREDENTIAL,
   ...(process.env.NVOY_BUNKER_URI_FILE ? { NVOY_BUNKER_URI_FILE: process.env.NVOY_BUNKER_URI_FILE } : {}) }
 const retryAfter = new Map()
@@ -36,9 +37,9 @@ function recover() {
   let names = []
   try { names = readdirSync(manifest.spoolDir) } catch (e) { die(`cannot read marker spool: ${e.message}`) }
   for (const name of names) {
-    const m = name.match(/^([0-9a-f]{64})\.inflight$/)
+    const m = name.match(/^([0-9a-f]{64})(\.buzz)?\.inflight$/)
     if (!m) continue
-    try { renameSync(resolve(manifest.spoolDir, name), resolve(manifest.spoolDir, `${m[1]}.pending`)) }
+    try { renameSync(resolve(manifest.spoolDir, name), resolve(manifest.spoolDir, `${m[1]}${m[2] || ''}.pending`)) }
     catch (e) { die(`cannot recover inflight marker ${m[1].slice(0, 12)}…: ${e.message}`) }
   }
 }
@@ -49,22 +50,27 @@ function drain() {
   // observation time. Prefer the newest first: a backlog after a broker outage must not turn
   // a live @mention into an hours-late task simply because its random Nostr id sorts last.
   const pending = names.flatMap(name => {
-    const m = name.match(/^([0-9a-f]{64})\.pending$/)
+    const m = name.match(/^([0-9a-f]{64})(\.buzz)?\.pending$/)
     if (!m) return []
+    // A `.buzz` marker was heard natively on the Buzz relay; it names a channel event, not a wrap.
+    if (m[2] && !manifest.buzz) return []
     let observed = 0
     try {
       const marker = JSON.parse(readFileSync(resolve(manifest.spoolDir, name), 'utf8'))
       if (String(marker.envelope || '').toLowerCase() === m[1] && Number.isFinite(Number(marker.observed_at))) observed = Number(marker.observed_at)
     } catch { /* broker deliver will validate this malformed marker before any decrypt */ }
-    return [{ envelope: m[1], observed }]
+    return [{ envelope: m[1], observed, native: Boolean(m[2]) }]
   }).sort((a, b) => b.observed - a.observed || a.envelope.localeCompare(b.envelope))
   for (const item of pending) {
-    if ((retryAfter.get(item.envelope) || 0) > Date.now()) continue
-    const r = spawnSync(process.execPath, [broker, 'deliver', '--instance', manifest.id, '--envelope', item.envelope], { env: childEnv, encoding: 'utf8', timeout: 90000 })
+    const key = `${item.native ? 'buzz:' : ''}${item.envelope}`
+    if ((retryAfter.get(key) || 0) > Date.now()) continue
+    const args = item.native ? [nativeBroker, 'deliver', '--instance', manifest.id, '--event', item.envelope]
+      : [broker, 'deliver', '--instance', manifest.id, '--envelope', item.envelope]
+    const r = spawnSync(process.execPath, args, { env: childEnv, encoding: 'utf8', timeout: 90000 })
     if (r.status !== 0) {
-      retryAfter.set(item.envelope, Date.now() + 5000)
+      retryAfter.set(key, Date.now() + 5000)
       console.error(`instance-broker-daemon: ${item.envelope.slice(0, 12)}… held for retry: ${String(r.stderr || '').trim()}`)
-    } else retryAfter.delete(item.envelope)
+    } else retryAfter.delete(key)
   }
   // AD-12: adapter/worker output is a proposal, never standing authority to sign. The daemon may
   // announce a queued proposal, but it must not invoke the keyed reply actuator. A separate,
@@ -105,7 +111,7 @@ function drain() {
         // and `--direct` re-checks that for itself, so a wrong answer here cannot open the signer.
         let verdict = null
         try { verdict = JSON.parse(String(proposed.stdout || '')) } catch { verdict = null }
-        if (verdict?.approval_required === false && verdict?.action === 'nostr-private-reply') {
+        if (verdict?.approval_required === false && ['nostr-private-reply', 'buzz-channel-reply'].includes(verdict?.action)) {
           const enacted = spawnSync(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-reply.mjs'),
             '--instance', manifest.id, '--request', request, '--source', source, '--direct'], { env: childEnv, encoding: 'utf8', timeout: 90000 })
           if (enacted.status !== 0) {
@@ -131,7 +137,20 @@ function drain() {
     } catch (e) { if (e.code !== 'ENOENT') console.error(`instance-broker-daemon: ${source} reply queue unavailable: ${e.message}`) }
   }
 }
+// The keyless Buzz watcher can log in only through this oracle. It is supervised here, beside the
+// drain, so it runs as the broker and holds the same credential; a crash is restarted with backoff.
+function superviseAuthOracle(delay = 1000) {
+  const child = spawn(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-auth.mjs'), '--instance', manifest.id],
+    { env: childEnv, stdio: ['ignore', 'inherit', 'inherit'] })
+  const started = Date.now()
+  child.on('exit', code => {
+    const next = Date.now() - started > 60000 ? 1000 : Math.min(delay * 2, 60000)
+    console.error(`instance-broker-daemon: AUTH oracle exited (${code ?? 'signal'}); restarting in ${next / 1000}s`)
+    setTimeout(() => superviseAuthOracle(next), next).unref?.()
+  })
+}
 recover()
+if (manifest.buzz) superviseAuthOracle()
 drain()
 setInterval(drain, 1000)
 console.log(`instance-broker-daemon: draining ${manifest.id}`)

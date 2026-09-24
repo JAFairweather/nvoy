@@ -119,7 +119,7 @@ function tasks() {
     let record
     try { record = JSON.parse(line) } catch { throw new Error('admitted queue contains malformed JSON') }
     validateDesktopDelivery(record, { instance: manifest.id, scopeSubject: manifest.pubkey,
-      grantors: manifest.grantors, carriers: manifest.carriers })
+      grantors: manifest.grantors, carriers: manifest.carriers, buzz: manifest.buzz })
     return record
   })
 }

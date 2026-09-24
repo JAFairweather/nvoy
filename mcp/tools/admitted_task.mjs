@@ -7,7 +7,7 @@ import { validateVerifiedNotification } from './verified_notification.mjs'
 const HEX64 = /^[0-9a-f]{64}$/
 const TASK_CAPS = new Set(['task', 'task+act'])
 
-export function validateAdmittedTask(record, { instance = '', scopeSubject = '', grantors = [], carriers = [] } = {}) {
+export function validateAdmittedTask(record, { instance = '', scopeSubject = '', grantors = [], carriers = [], buzz = null } = {}) {
   if (!record || typeof record !== 'object' || Array.isArray(record)) throw new Error('admitted task must be an object')
   const allowed = ['type', 'instance', 'envelope', 'messages', 'received_at', 'authority']
   if (Object.keys(record).some(key => !allowed.includes(key)) || record.type !== 'admitted-task' ||
@@ -23,9 +23,13 @@ export function validateAdmittedTask(record, { instance = '', scopeSubject = '',
   const a = record.authority
   const v1Keys = ['version', 'type', 'sender', 'grant_id', 'grantor', 'cap', 'scope_subject', 'policy_checked_at']
   const v2Keys = [...v1Keys, 'carrier', 'carrier_grant_id', 'carrier_grantor', 'source_event', 'reply_channel']
-  const authorityKeys = a.version === 2 ? v2Keys : v1Keys
+  // v3: heard natively on the Buzz relay. The author signed the channel message itself, so there is
+  // no carrier — the source event IS the envelope, and the reply channel must be one the manifest
+  // gave this identity.
+  const v3Keys = [...v1Keys, 'source_event', 'reply_channel']
+  const authorityKeys = a?.version === 3 ? v3Keys : a?.version === 2 ? v2Keys : v1Keys
   if (!a || typeof a !== 'object' || Array.isArray(a) || Object.keys(a).some(key => !authorityKeys.includes(key)) ||
-      ![1, 2].includes(a.version) || a.type !== 'scoped-instruction' || !HEX64.test(String(a.sender || '')) ||
+      ![1, 2, 3].includes(a.version) || a.type !== 'scoped-instruction' || !HEX64.test(String(a.sender || '')) ||
       !HEX64.test(String(a.grant_id || '')) || !HEX64.test(String(a.grantor || '')) ||
       !TASK_CAPS.has(a.cap) || !HEX64.test(String(a.scope_subject || '')) ||
       !Number.isFinite(Number(a.policy_checked_at)) || Number(a.policy_checked_at) <= 0 ||
@@ -41,6 +45,13 @@ export function validateAdmittedTask(record, { instance = '', scopeSubject = '',
         (grantors.length && !grantors.includes(a.carrier_grantor)) ||
         record.messages.some(message => message.event_id !== a.source_event || message.kind !== 9)) {
       throw new Error('invalid channel-carried authority')
+    }
+  }
+  if (a.version === 3) {
+    if (!HEX64.test(String(a.source_event || '')) || record.envelope !== a.source_event ||
+        !buzz?.channels?.includes(a.reply_channel) || record.messages.length !== 1 ||
+        record.messages.some(message => message.event_id !== a.source_event || message.kind !== 9)) {
+      throw new Error('invalid native Buzz authority')
     }
   }
   return { trustedInstruction: true, authority: a }

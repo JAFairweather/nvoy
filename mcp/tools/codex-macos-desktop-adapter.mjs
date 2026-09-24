@@ -28,7 +28,7 @@ const lockPath = resolve(manifest.runtimeDir, 'macos-desktop-adapter.lock')
 const codexStatePath = resolve(dirname(manifest.codexSocketPath), '..', '.codex-global-state.json')
 const binding = { appBundleId: manifest.codexAppBundleId, projectLabel: manifest.codexProjectLabel,
   chatLabel: manifest.codexChatLabel, threadId: manifest.codexThreadId, statePath: codexStatePath }
-const policy = { instance: manifest.id, scopeSubject: manifest.pubkey, grantors: manifest.grantors, carriers: manifest.carriers }
+const policy = { instance: manifest.id, scopeSubject: manifest.pubkey, grantors: manifest.grantors, carriers: manifest.carriers, buzz: manifest.buzz }
 
 function records(path) {
   if (!existsSync(path)) return []
