@@ -31,7 +31,14 @@ writeFileSync(join(instances, 'beta.json'), JSON.stringify({ ...base, id: 'beta'
   worker_enabled: false, delivery_mode: 'notify_only' }))
 
 const executable = (name, body) => writeFileSync(join(bin, name), `#!/bin/sh\nset -eu\n${body}\n`, { mode: 0o700 })
-executable('fake-git', `printf 'git %s\\n' "$*" >> ${JSON.stringify(calls)}`)
+// History is a line: FAKE_GIT_ORDER lists commits oldest first, so is-ancestor is a position test
+// and a SHA off the line is on a diverged branch. HEAD is FAKE_GIT_HEAD.
+executable('fake-git', `printf 'git %s\\n' "$*" >> ${JSON.stringify(calls)}
+at() { i=0; for s in \${FAKE_GIT_ORDER:-}; do [ "$s" = "$1" ] && { echo $i; return; }; i=$((i+1)); done; echo -1; }
+case "$3" in
+  rev-parse) echo "\${FAKE_GIT_HEAD:-}";;
+  merge-base) a=$(at "$5"); b=$(at "$6"); [ "$a" -ge 0 ] && [ "$b" -ge 0 ] && [ "$a" -le "$b" ] || exit 1;;
+esac`)
 executable('fake-npm', `printf 'npm %s\\n' "$*" >> ${JSON.stringify(calls)}`)
 writeFileSync(join(work, 'boundary.py'), `from pathlib import Path\nPath(${JSON.stringify(calls)}).open('a').write('boundary passed\\n')\n`)
 executable('fake-docker', `
@@ -86,13 +93,14 @@ if [ "$1" = compose ]; then
 fi
 exit 2`)
 
-const sha1 = '4'.repeat(40), sha2 = '5'.repeat(40), sha3 = '6'.repeat(40)
+const sha1 = '4'.repeat(40), sha2 = '5'.repeat(40), sha3 = '6'.repeat(40), head = '7'.repeat(40), stray = '8'.repeat(40)
 const invoke = (sha, extra = {}) => spawnSync('python3', ['deploy/runtime-deploy-runner.py'], {
   cwd: repo, encoding: 'utf8', env: { ...process.env, NVOY_RELEASE_SHA: sha,
     NVOY_TEST_RELEASE_SHA: sha,
     NVOY_INSTANCE_ROOT: instances, NVOY_DEPLOY_STATE: state, NVOY_DEPLOY_HUB: repo,
     NVOY_DOCKER: join(bin, 'fake-docker'), NVOY_GIT: join(bin, 'fake-git'), NVOY_NPM: join(bin, 'fake-npm'),
-    NVOY_BOUNDARY_TEST: join(work, 'boundary.py'), NVOY_SETTLE_MS: '0', ...extra },
+    NVOY_BOUNDARY_TEST: join(work, 'boundary.py'), NVOY_SETTLE_MS: '0',
+    FAKE_GIT_ORDER: [sha1, sha2, sha3, 'origin/main'].join(' '), FAKE_GIT_HEAD: head, ...extra },
 })
 
 try {
@@ -118,6 +126,9 @@ try {
   const failureCalls = readFileSync(calls, 'utf8')
   ok('a failed identity makes the release fail loudly', failed.status !== 0 && /services not running: broker/.test(failed.stderr))
   ok('a partial candidate restores every already-touched identity', (failureCalls.match(/docker compose .* up -d/g) || []).length >= 4)
+  ok('a failed release puts the deployer\'s own checkout back where it was',
+    failureCalls.indexOf(`checkout --quiet --detach ${sha2}`) > -1 &&
+    failureCalls.indexOf(`checkout --quiet --detach ${head}`) > failureCalls.indexOf(`checkout --quiet --detach ${sha2}`))
   ok('a failed release leaves the previous Compose set and verified SHA intact',
     readFileSync(join(instances, 'alpha.compose.yml'), 'utf8') === oldAlpha &&
     readFileSync(join(instances, 'beta.compose.yml'), 'utf8') === oldBeta &&
@@ -135,6 +146,40 @@ try {
     readFileSync(join(instances, 'beta.compose.yml'), 'utf8') === oldBeta &&
     readFileSync(join(state, 'DEPLOYED_SHA'), 'utf8').trim() === sha1)
   ok('the inter-process deploy lock is removed after success and failure', !existsSync(join(state, '.deploy-lock')))
+
+  writeFileSync(calls, '')
+  const forward = invoke(sha3)
+  const forwardCalls = readFileSync(calls, 'utf8')
+  ok('a newer release deploys, and the checkout stays on it', forward.status === 0 && /deploy OK/.test(forward.stdout) &&
+    readFileSync(join(state, 'DEPLOYED_SHA'), 'utf8').trim() === sha3 && !forwardCalls.includes(`checkout --quiet --detach ${head}`))
+
+  // The Aug 28 failure: the release lookup named a commit older than the one running.
+  writeFileSync(calls, '')
+  const backward = invoke(sha1)
+  const backwardCalls = readFileSync(calls, 'utf8')
+  ok('an older release is never deployed: the runner keeps the deployed one and health-checks it',
+    backward.status === 0 && /older than the deployed/.test(backward.stdout) && /already current and healthy at 666666/.test(backward.stdout) &&
+    !/checkout|docker pull| up -d/.test(backwardCalls) && readFileSync(join(state, 'DEPLOYED_SHA'), 'utf8').trim() === sha3)
+
+  writeFileSync(calls, '')
+  const diverged = invoke(stray)
+  ok('a release that does not descend from the deployed one is refused before anything moves',
+    diverged.status !== 0 && /does not descend/.test(diverged.stderr) && !/checkout|docker pull| up -d/.test(readFileSync(calls, 'utf8')) &&
+    readFileSync(join(state, 'DEPLOYED_SHA'), 'utf8').trim() === sha3)
+
+  // The lookup itself: choose from the unfiltered, newest-first list rather than trusting a filter.
+  const pick = spawnSync('python3', ['-c', `
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("runner", "deploy/runtime-deploy-runner.py")
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+runs = [{"status": "in_progress", "conclusion": None, "head_branch": "main", "head_sha": "c"},
+        {"status": "completed", "conclusion": "failure", "head_branch": "main", "head_sha": "b"},
+        {"status": "completed", "conclusion": "success", "head_branch": "feature", "head_sha": "f"},
+        {"status": "completed", "conclusion": "success", "head_branch": "main", "head_sha": "a"}]
+print(json.dumps([m.pick_release(runs)["head_sha"], m.pick_release(runs[:3])]))`], { cwd: repo, encoding: 'utf8' })
+  ok('the release is the newest completed, successful main run — never an in-progress, failed or branch run',
+    pick.status === 0 && pick.stdout.trim() === '["a", null]')
+  ok('the runner no longer asks GitHub to filter by status', !/runs\?[^"]*status=success/.test(readFileSync('deploy/runtime-deploy-runner.py', 'utf8')))
 
   const workflow = readFileSync('.github/workflows/publish-runtime-images.yml', 'utf8')
   ok('image publication is downstream of the complete test gate', /publish:\n\s+needs: test/.test(workflow) && /run: npm test/.test(workflow))
