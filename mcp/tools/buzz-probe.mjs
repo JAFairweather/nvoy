@@ -8,6 +8,10 @@
 //           FRESH connection return it under this key? (#399 Gate 0, write half)
 // No carrier, no waggle. The admin step before it is the OpenClaw one: add the pubkey as a
 // community member and give it the room's bot role (`buzz channels add-member --role bot`).
+// Or the key joins itself: BUZZ_INVITE=<invite link or code> makes it claim an admin-minted
+// invite first (NIP-98 signed by this key; the claim endpoint is exempt from the member gate).
+// If the community has join terms the probe stops and names them — agreeing is a human act,
+// done by re-running with --accept-policy <version> (plus --age-confirmed if the terms ask).
 //
 // Usage:
 //   BUZZ_RELAY=wss://<community host> BUZZ_CHANNEL=<uuid> NVOY_NSEC_FILE=/abs/test.nsec \
@@ -16,12 +20,16 @@
 //     node mcp/tools/buzz-probe.mjs --post --confirm      # + post and cold read-back
 //   NVOY_BUNKER_URI_FILE=… NVOY_NIP46_CLIENT_FILE=… instead of NVOY_NSEC_FILE signs via the Bunker.
 //
+//   echo "…" | BUZZ_INVITE='https://<host>/invite/v2.…' BUZZ_RELAY=… BUZZ_CHANNEL=… NVOY_NSEC_FILE=… \
+//     node mcp/tools/buzz-probe.mjs --post --confirm      # claim, then everything above
+//
 // Env: EXPECT_PUBKEY (npub or hex) pins the identity before anything is sent. --limit N bounds the
 // read (default 20). --post without --confirm builds and signs nothing, and says so.
 // Output: one JSON verdict on stdout. The key is read from a file and never printed; message
 // content is not printed either, only ids, authors (8-hex) and counts.
 
 import { readFileSync, statSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
 import { finalizeEvent, getPublicKey } from 'nostr-tools/pure'
 import * as nip19 from 'nostr-tools/nip19'
 import { makeBunkerSigner } from './nip46-signer.mjs'
@@ -38,6 +46,16 @@ if (!validChannel(CHANNEL)) die('set BUZZ_CHANNEL to the channel UUID')
 const LIMIT = Number(flag('--limit', 20))
 if (!Number.isInteger(LIMIT) || LIMIT < 1 || LIMIT > 500) die('--limit must be an integer from 1 to 500')
 const POST = has('--post'), CONFIRM = has('--confirm')
+const HTTP = RELAY.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:')
+// The invite code is a capability: accepted as a link or a bare code, never printed.
+const INVITE = (() => {
+  const raw = String(process.env.BUZZ_INVITE || '').trim()
+  if (!raw) return ''
+  const code = decodeURIComponent(raw.includes('/invite/') ? raw.split('/invite/')[1].split(/[?#]/)[0] : raw)
+  if (!/^[A-Za-z0-9._~-]{8,512}$/.test(code)) die('BUZZ_INVITE is not an invite link or code')
+  return code
+})()
+const ACCEPT_POLICY = flag('--accept-policy', null), AGE_CONFIRMED = has('--age-confirmed')
 
 const credential = (path, label, { privateFile = false } = {}) => {
   if (!path) return ''
@@ -87,7 +105,43 @@ if (POST) {
   if (/(^|\s)@\S/.test(body)) console.error('buzz-probe: note — @names in the body are plain text; Buzz routes mentions by p tag only, and this probe adds none')
 }
 
-const verdict = { relay: RELAY, channel: CHANNEL, npub: nip19.npubEncode(me), auth: null, read: null, post: null }
+const verdict = { relay: RELAY, channel: CHANNEL, npub: nip19.npubEncode(me), ...(INVITE ? { claim: null } : {}), auth: null, read: null, post: null }
+
+// POST to the community's HTTP API; NIP-98 signs it as this key when `signed`, binding the exact
+// URL, method and body hash so the request cannot be replayed elsewhere or with another body.
+const postJson = async (path, payload, signed) => {
+  const body = JSON.stringify(payload), headers = { 'content-type': 'application/json' }
+  if (signed) {
+    const auth = await signer.signEvent({ kind: 27235, created_at: Math.floor(Date.now() / 1000), content: '', tags: [
+      ['u', `${HTTP}${path}`], ['method', 'POST'], ['payload', createHash('sha256').update(body).digest('hex')], ['nonce', randomUUID()]] })
+    headers.authorization = `Nostr ${Buffer.from(JSON.stringify(auth)).toString('base64')}`
+  }
+  const res = await fetch(`${HTTP}${path}`, { method: 'POST', headers, body })
+  let json = {}
+  try { json = await res.json() } catch { /* judged by status */ }
+  return { status: res.status, json }
+}
+async function claimInvite() {
+  let policy
+  try { policy = (await (await fetch(`${HTTP}/api/join-policy`)).json())?.policy } catch (e) { return { ok: false, reason: `join-policy unreachable: ${e.message}` } }
+  let policy_receipt
+  if (policy) {
+    const version = String(policy.version)
+    if (ACCEPT_POLICY !== version || (policy.age_attestation_required && !AGE_CONFIRMED))
+      return { ok: false, reason: `this community has join terms (version ${version}). Read ${HTTP}/api/join-policy/terms and ${HTTP}/api/join-policy/privacy, then re-run with --accept-policy ${version}${policy.age_attestation_required ? ' --age-confirmed' : ''}` }
+    const accepted = await postJson('/api/invites/accept-policy', { code: INVITE, policy_version: version, age_confirmed: AGE_CONFIRMED }, false)
+    if (accepted.status !== 200 || typeof accepted.json.receipt !== 'string') return { ok: false, http: accepted.status, reason: accepted.json.error || 'policy acceptance refused' }
+    policy_receipt = accepted.json.receipt
+  }
+  const claimed = await postJson('/api/invites/claim', { code: INVITE, ...(policy_receipt ? { policy_receipt } : {}) }, true)
+  return claimed.status === 200 ? { ok: true, status: claimed.json.status, role: claimed.json.role }
+    : { ok: false, http: claimed.status, reason: claimed.json.error || '(no reason)' }
+}
+if (INVITE) {
+  try { verdict.claim = await claimInvite() } catch (e) { verdict.claim = { ok: false, reason: e.message } }
+  // Terms not yet agreed is a stop, not a failed login: say so and try nothing further.
+  if (!verdict.claim.ok && /join terms/.test(verdict.claim.reason || '')) { console.log(JSON.stringify(verdict, null, 2)); signer.close?.(); process.exit(10) }
+}
 const short = pk => `${String(pk).slice(0, 8)}…`
 const filter = extra => ({ kinds: [...CHANNEL_KINDS], '#h': [CHANNEL], ...extra })
 const finish = () => { console.log(JSON.stringify(verdict, null, 2)); signer.close?.(); process.exit(verdict.auth?.ok && verdict.read?.ok && (!POST || !CONFIRM || verdict.post?.readback) ? 0 : 10) }

@@ -5,6 +5,8 @@
 // shows up as a refusal here instead of silence on the live relay.
 import { WebSocketServer } from 'ws'
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { createServer } from 'node:http'
 import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -27,9 +29,34 @@ const local = sk => ({ getPublicKey: async () => getPublicKey(sk), signEvent: as
 // --- a Buzz-shaped relay ---
 const members = new Set([agent, human]), stored = [], sockets = []
 let deadlineMs = 1500
-const server = new WebSocketServer({ host: '127.0.0.1', port: 0 })
-await new Promise(r => server.on('listening', r))
-const RELAY = `ws://127.0.0.1:${server.address().port}`
+// The community's HTTP API: join terms and the NIP-98 invite claim, as block/buzz serves them.
+const INVITE_CODE = 'v2.Test-Invite_Code', seenAuth = new Set()
+let joinPolicy = null
+const http = createServer(async (req, res) => {
+  const reply = (status, json) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(json)) }
+  let raw = ''; for await (const chunk of req) raw += chunk
+  if (req.method === 'GET' && req.url === '/api/join-policy') return reply(200, joinPolicy ? { policy: joinPolicy } : {})
+  const body = raw ? JSON.parse(raw) : {}
+  if (req.method === 'POST' && req.url === '/api/invites/accept-policy')
+    return body.policy_version === joinPolicy?.version && (!joinPolicy.age_attestation_required || body.age_confirmed)
+      ? reply(200, { receipt: `receipt:${body.code}` }) : reply(400, { error: 'join_policy_not_accepted' })
+  if (req.method === 'POST' && req.url === '/api/invites/claim') {
+    let ev; try { ev = JSON.parse(Buffer.from(String(req.headers.authorization || '').replace(/^Nostr /, ''), 'base64').toString()) } catch { return reply(401, { error: 'invalid auth' }) }
+    const tag = n => ev.tags.find(t => t[0] === n)?.[1]
+    const valid = verifyEvent(ev) && ev.kind === 27235 && tag('u') === `${HTTP}/api/invites/claim` && tag('method') === 'POST' &&
+      tag('payload') === createHash('sha256').update(raw).digest('hex') && Math.abs(ev.created_at - now()) <= 60 && !seenAuth.has(ev.id)
+    if (!valid) return reply(401, { error: 'NIP-98 verification failed' })
+    seenAuth.add(ev.id)
+    if (body.code !== INVITE_CODE) return reply(403, { error: 'invite_invalid' })
+    if (joinPolicy && body.policy_receipt !== `receipt:${body.code}`) return reply(403, { error: 'join_policy_required' })
+    const already = members.has(ev.pubkey); members.add(ev.pubkey)
+    return reply(200, already ? { status: 'already_member' } : { status: 'joined', role: 'member' })
+  }
+  reply(404, { error: 'not found' })
+})
+await new Promise(r => http.listen(0, '127.0.0.1', r))
+const server = new WebSocketServer({ server: http })
+const RELAY = `ws://127.0.0.1:${http.address().port}`, HTTP = RELAY.replace(/^ws:/, 'http:')
 server.on('connection', ws => {
   sockets.push(ws)
   const challenge = Buffer.from(generateSecretKey()).toString('hex')
@@ -158,9 +185,30 @@ try {
   ok('a raw key in the environment is refused', rawEnv.code === 1 && /NVOY_NSEC is refused/.test(rawEnv.err) && !rawEnv.err.includes(nsec))
   const wrong = await probe([], { EXPECT_PUBKEY: 'f'.repeat(64) })
   ok('EXPECT_PUBKEY pins the identity before anything is sent', wrong.code === 1 && /identity mismatch/.test(wrong.err))
+
+  // --- joining by invite: the key claims its own membership ---
+  members.delete(agent)
+  const link = `${HTTP}/invite/${INVITE_CODE}`
+  const badInvite = await probe([], { BUZZ_INVITE: `${HTTP}/invite/v2.not-the-code` })
+  ok('a wrong invite is reported with the relay\'s reason, and login then fails', badInvite.code === 10 && badInvite.v?.claim?.reason === 'invite_invalid' && badInvite.v.auth?.ok === false)
+  const joined = await probe([], { BUZZ_INVITE: link })
+  ok('an invite link is claimed as this key, and the same run then logs in and reads', joined.code === 0 && joined.v?.claim?.status === 'joined' && joined.v.auth?.ok && joined.v.read?.ok)
+  ok('the invite code is never printed', !`${joined.out}${joined.err}${badInvite.out}`.includes('Test-Invite_Code') && !badInvite.out.includes('not-the-code'))
+  const again = await probe([], { BUZZ_INVITE: link })
+  ok('re-claiming is idempotent', again.code === 0 && again.v?.claim?.status === 'already_member')
+  members.delete(agent)
+  joinPolicy = { version: '2026-09', age_attestation_required: true }
+  const terms = await probe([], { BUZZ_INVITE: link })
+  ok('join terms stop the probe and name the version — nothing is agreed on the operator\'s behalf',
+    terms.code === 10 && /--accept-policy 2026-09 --age-confirmed/.test(terms.v?.claim?.reason || '') && terms.v.auth === null && !members.has(agent))
+  const halfAgreed = await probe(['--accept-policy', '2026-09'], { BUZZ_INVITE: link })
+  ok('agreeing to the terms without the required age confirmation still stops', halfAgreed.code === 10 && !members.has(agent))
+  const agreed = await probe(['--accept-policy', '2026-09', '--age-confirmed'], { BUZZ_INVITE: link })
+  ok('explicitly agreed terms produce a receipt and the claim succeeds', agreed.code === 0 && agreed.v?.claim?.status === 'joined' && agreed.v.auth?.ok)
+  joinPolicy = null
 } finally {
-  server.close()
   for (const ws of sockets) ws.terminate()
+  server.close(); http.close()
 }
 
 console.log(fails ? `\nbuzz-native: ${fails} FAILED` : '\nbuzz-native: all passed')
