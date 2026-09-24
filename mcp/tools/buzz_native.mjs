@@ -123,16 +123,16 @@ export async function openBuzzSession({ relay, signer, timeoutMs = 10000, WS = W
       .finally(() => clearTimeout(timer))
   }
   const send = frame => { if (closedWith) throw new Error(closedWith); ws.send(JSON.stringify(frame)) }
-  const awaitOk = id => bounded(new Promise((resolve, reject) => waiters.set(id, { resolve, reject })), 'relay OK')
+  // Send, THEN arm the wait: a reply can only arrive on a later tick, and arming first would leave
+  // a timer behind when send throws on a closed socket — one that later rejects with no one listening.
+  const sendAndAwaitOk = (frame, id) => { send(frame); return bounded(new Promise((resolve, reject) => waiters.set(id, { resolve, reject })), 'relay OK') }
   const close = () => { closedWith ??= 'session closed'; try { ws.close() } catch { /* already gone */ } }
 
   try {
     const c = challenge ?? await bounded(new Promise((resolve, reject) => { onChallenge = { resolve, reject } }), 'AUTH challenge')
     const auth = await signer.signEvent(authTemplate(url, c))
     if (auth?.pubkey !== me || auth.kind !== 22242 || !verified(auth)) throw new Error('signer returned an AUTH event that is not ours')
-    const pending = awaitOk(auth.id)
-    send(['AUTH', auth])
-    const verdict = await pending
+    const verdict = await sendAndAwaitOk(['AUTH', auth], auth.id)
     if (!verdict.accepted) throw new Error(`AUTH refused: ${verdict.message || '(no reason)'}`)
   } catch (error) { close(); throw error }
 
@@ -144,17 +144,15 @@ export async function openBuzzSession({ relay, signer, timeoutMs = 10000, WS = W
       const ev = await signer.signEvent(template)
       if (ev?.pubkey !== me || !verified(ev)) throw new Error('signer returned an event that is not ours')
       if (CHANNEL_KINDS.includes(ev.kind) && tagValues(ev, 'h').length !== 1) throw new Error('channel event needs exactly one h tag')
-      const pending = awaitOk(ev.id)
-      send(['EVENT', ev])
-      return { event: ev, ...(await pending) }
+      return { event: ev, ...(await sendAndAwaitOk(['EVENT', ev], ev.id)) }
     },
     // Stored events up to EOSE. Every filter must name its channels, or Buzz answers with nothing.
     async fetch(...filters) {
       if (!filters.length || filters.some(f => !Array.isArray(f?.['#h']) || !f['#h'].length || !f['#h'].every(validChannel)))
         throw new Error('every Buzz filter needs #h channel UUIDs — without it the relay returns nothing')
       const id = `q${++n}`
-      const pending = bounded(new Promise((resolve, reject) => subs.set(id, { events: [], resolve, reject })), 'REQ')
       send(['REQ', id, ...filters])
+      const pending = bounded(new Promise((resolve, reject) => subs.set(id, { events: [], resolve, reject })), 'REQ')
       try { return await pending } finally { if (!closedWith) try { send(['CLOSE', id]) } catch { /* closing anyway */ } }
     },
   })

@@ -150,7 +150,11 @@ try {
   ok('a signer that answers for another key is caught before AUTH is sent', await rejects(openBuzzSession({ relay: RELAY, signer: liar }), /not ours/))
   deadlineMs = 200
   const slow = { getPublicKey: async () => agent, signEvent: async t => { await sleep(500); return finalizeEvent(t, agentSk) } }
-  ok('a signer slower than the relay deadline fails loudly, not silently', await rejects(openBuzzSession({ relay: RELAY, signer: slow, timeoutMs: 2000 }), /closed|timed out/))
+  const stray = []
+  process.on('unhandledRejection', e => stray.push(e))
+  ok('a signer slower than the relay deadline fails loudly, not silently', await rejects(openBuzzSession({ relay: RELAY, signer: slow, timeoutMs: 300 }), /closed|timed out/))
+  await sleep(400)
+  ok('a session the relay already closed leaves no timer behind to crash the process later', stray.length === 0)
   deadlineMs = 1500
 
   // --- the join-test CLI ---
