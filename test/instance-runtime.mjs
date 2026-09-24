@@ -184,6 +184,16 @@ ok('Compose renderer rejects mutable image tags', taggedImage.status !== 0 && /c
 const servicePart = name => (rendered.stdout.match(new RegExp(`\\n  ${name}:[\\s\\S]*?(?=\\n  [a-z][a-z_]*:|\\nsecrets:|$)`)) || [''])[0]
 const initPart = servicePart('init'), brokerPart = servicePart('broker'), watcherPart = servicePart('watcher')
 const adapterPart = servicePart('adapter'), workerPart = servicePart('worker')
+// A service's groups are the primary GID in `user:` plus every `group_add:` entry, parsed rather
+// than substring-matched: the section also carries the random mkdtemp path, and a runner GID such
+// as 20 can occur inside it. Any `group_add` not in single-line flow form is refused, not skipped.
+const serviceGroups = part => {
+  const user = part.match(/^ {4}user: "\d+:(\d+)"$/m), adds = part.match(/^ {4}group_add:.*$/gm) || []
+  const lists = adds.map(line => line.match(/^ {4}group_add: \[(.*)\]$/))
+  if (!user || lists.some(m => !m)) return null
+  return [user[1], ...lists.flatMap(m => m[1].split(',').map(g => g.trim().replace(/^"(.*)"$/, '$1')).filter(Boolean))].map(Number)
+}
+const sameGroups = (part, groups) => JSON.stringify(serviceGroups(part)) === JSON.stringify(groups)
 ok('the root-only initializer copies sources into distinct role-owned volumes; worker gets only provider and broker only Bunker credentials', initPart.includes('nvoy_bunker_uri') && initPart.includes('nvoy_bunker_client') && initPart.includes('nvoy_worker_provider') && initPart.includes('broker_credentials') && initPart.includes('worker_credentials') && workerPart.includes('worker_credentials') && workerPart.includes('HOME: /tmp') && !workerPart.includes('broker_credentials') && !workerPart.includes('nvoy_bunker_uri') && !workerPart.includes('nvoy_bunker_client') && brokerPart.includes('broker_credentials') && !brokerPart.includes('worker_credentials') && !brokerPart.includes('nvoy_worker_provider') && !watcherPart.includes('credentials') && !adapterPart.includes('credentials'))
 
 const watcherSource = readFileSync('mcp/tools/instance-runtime.mjs', 'utf8')
@@ -193,7 +203,7 @@ ok('watcher writes the pending marker before advancing seen state, with millisec
 ok('a fresh identity can baseline existing backdated NIP-17 wraps without delivering them', /command === 'baseline'/.test(watcherSource) && /--baseline-existing/.test(watcherSource) && /m\[0\] === 'EOSE'/.test(wakeSource) && /baseline\(m\[2\]\.id\)/.test(wakeSource) && /baseline complete/.test(wakeSource))
 ok('the NIP-59 baseline cannot silently truncate at 5,000 ids', /SEEN_CAP = 100_000/.test(wakeSource) && /baseline exceeds/.test(wakeSource) && !/seen\.size > 5000/.test(wakeSource))
 ok('watcher markers and adapter socket are group-limited to the matching broker', /chmodSync\(p, 0o660\)/.test(wakeSource) && /manifest\.brokerAdapterGid/.test(readFileSync('mcp/tools/instance-adapter.mjs', 'utf8')) && /chmodSync\(socket, 0o660\)/.test(readFileSync('mcp/tools/instance-adapter.mjs', 'utf8')))
-ok('the worker has no adapter-socket group but has a separate read-only handoff group', manifest.broker_adapter_gid !== manifest.worker_handoff_gid && rendered.stdout.includes('group_add: ["' + manifest.worker_handoff_gid + '"]') && !workerPart.includes(String(manifest.broker_adapter_gid)))
+ok('the worker has no adapter-socket group but has a separate read-only handoff group', manifest.broker_adapter_gid !== manifest.worker_handoff_gid && sameGroups(adapterPart, [manifest.broker_adapter_gid, manifest.worker_handoff_gid]) && sameGroups(workerPart, [manifest.worker_handoff_gid]))
 const claudeChannelSource = readFileSync('mcp/tools/claude-channel.mjs', 'utf8')
 const runtimeInitSource = readFileSync('mcp/tools/instance-runtime-init.mjs', 'utf8')
 ok('the native Claude channel consumes as worker UID with read-only admission and separate writable state/reply paths',
