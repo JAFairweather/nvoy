@@ -18,7 +18,7 @@
 //   NVOY_NSEC              local identity (one of this or the Bunker pair is required)
 //   NVOY_BUNKER_URI_FILE   Bunker connection capability file
 //   NVOY_NIP46_CLIENT_FILE Bunker transport nsec file (not the identity nsec)
-//   WAGGLE_BRIDGE_PUBKEY   waggle's hex pubkey        (default: the live bridge key)
+//   WAGGLE_BRIDGE_PUBKEY   waggle's hex pubkey        (required)
 //   RELAY_CHANNEL          destination channel UUID   (default: #waggle-test)
 //   RELAY_RELAYS           comma-sep relays           (default: nos.lol, primal)
 //   EXPECT_PUBKEY          required signer identity (npub or 64-hex); mismatch fails before send
@@ -34,8 +34,8 @@ import * as nip44 from 'nostr-tools/nip44'
 import WebSocket from 'ws'
 import { makeBunkerSigner } from './nip46-signer.mjs'
 
-const BRIDGE = (process.env.WAGGLE_BRIDGE_PUBKEY ||
-  '84753207f2c6ae73af247da174e8e7c91a7d939a8eb0b4c2b98b54ea567786e6').toLowerCase()
+const BRIDGE = String(process.env.WAGGLE_BRIDGE_PUBKEY || '').toLowerCase()
+if (!/^[0-9a-f]{64}$/.test(BRIDGE)) { console.error('relay-send: set WAGGLE_BRIDGE_PUBKEY to waggle\'s 64-hex pubkey — there is no default recipient'); process.exit(1) }
 const CHANNEL = process.env.RELAY_CHANNEL || 'a8186b53-537d-46ad-a7e7-b6486c58970e'
 const RELAYS = (process.env.RELAY_RELAYS || 'wss://nos.lol,wss://relay.primal.net')
   .split(',').map(s => s.trim()).filter(Boolean)
