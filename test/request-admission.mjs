@@ -12,9 +12,10 @@ const sk = generateSecretKey()
 const key = join(dir, 'identity.nsec')
 writeFileSync(key, `${nip19.nsecEncode(sk)}\n`, { mode: 0o600 })
 
+const maintainer = getPublicKey(generateSecretKey())
 const run = (...args) => spawnSync(process.execPath, [TOOL, ...args], {
   cwd: ROOT,
-  env: { ...process.env, DRY_RUN: '1' },
+  env: { ...process.env, DRY_RUN: '1', WAGGLE_MAINTAINER_NPUB: maintainer },
   encoding: 'utf8',
 })
 
@@ -45,6 +46,9 @@ const linked = join(dir, 'linked.nsec')
 symlinkSync(malformed, linked)
 const symlinked = run('--key', linked)
 ok('a symlinked key fails closed', symlinked.status !== 0 && /non-symlink/.test(symlinked.stderr))
+
+const noMaintainer = spawnSync(process.execPath, [TOOL, '--key', key], { cwd: ROOT, env: { ...process.env, DRY_RUN: '1', WAGGLE_MAINTAINER_NPUB: '' }, encoding: 'utf8' })
+ok('there is no default maintainer', noMaintainer.status !== 0 && /no default grantor/.test(noMaintainer.stderr))
 
 console.log(fails ? `\nrequest-admission: ${fails} failed` : '\nrequest-admission: all checks passed')
 process.exit(fails ? 1 : 0)

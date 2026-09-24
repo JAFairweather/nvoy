@@ -18,7 +18,7 @@
 // Security recipe (all verified against the live Buzz Crew community, see
 // RESEARCH/CONCORD_PROTOCOL_SPEC_NOTES.md):
 //   - Invite provenance: the seal (kind 13) signature verifies, its signer is the expected
-//     sender (James), the rumor author matches the signer, and community_id self-certifies.
+//     sender (CONCORD_INVITER), the rumor author matches the signer, and community_id self-certifies.
 //     If zero or MORE THAN ONE invite passes, we refuse — never silently pick a credential.
 //   - Reads on auth-gated relays authenticate AS THE PLANE: a Concord plane key is a full
 //     keypair, so we sign the NIP-42 challenge with the derived plane secret.
@@ -40,12 +40,15 @@ const arg = (n, d) => { const i = process.argv.indexOf(n); return i === -1 ? d :
 const raw = process.env.NVOY_NSEC || die('set NVOY_NSEC (Claude identity that holds the invite)')
 const sk = raw.startsWith('nsec1') ? decode(raw).data : hex(raw)
 const ME = getPublicKey(sk)
-const JAMES = '4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b287ea84d'
+// The only key whose sealed invite is trusted. Required: never default to one owner's key.
+const INVITER_RAW = process.env.CONCORD_INVITER || die('set CONCORD_INVITER (npub or hex of the invite sender)')
+const INVITER = INVITER_RAW.startsWith('npub1') ? decode(INVITER_RAW).data : INVITER_RAW.toLowerCase()
+if (!/^[0-9a-f]{64}$/.test(INVITER)) die('CONCORD_INVITER must be an npub or 64-hex pubkey')
 
 // Known crew keys for friendlier rendering; unknown authors fall back to a short npub.
 const NAMES = {
   [ME]: 'Claude',
-  [JAMES]: 'James',
+  [INVITER]: 'Inviter',
   '0a8e0720c3ec52c6bfd9e2545d620cf58e2e8d371244255efce3ddd57ba0a32c': 'My Dude',
   '5d3848a699e82f81e218ce8b0e9b0f8c8f0e6c8e0a0c0e0a0c0e0a0c0e0a0c0e0': 'Neil?', // prefix-known only
 }
@@ -55,7 +58,6 @@ const who = (pk) => NAMES[pk] || (() => { try { const n = npubEncode(pk); return
 const RELAYS = [
   { url: 'wss://jskitty.com/nostr', auth: false },
   { url: 'wss://asia.vectorapp.io/nostr', auth: false },
-  { url: auth: false },
   { url: 'wss://relay.ditto.pub', auth: true },
   { url: 'wss://relay.dreamith.to', auth: true },
 ]
@@ -123,7 +125,7 @@ async function loadInvite() {
     const p = inv.payload
     let selfCert = false
     try { selfCert = lib.communityId(hex(p.owner), hex(p.owner_salt)) === p.community_id } catch { /* bad fields */ }
-    const ok = verifyEvent(inv.seal) && inv.seal.pubkey === JAMES && inv.rumor.pubkey === inv.seal.pubkey && selfCert
+    const ok = verifyEvent(inv.seal) && inv.seal.pubkey === INVITER && inv.rumor.pubkey === inv.seal.pubkey && selfCert
     if (ok) good.push(p)
   }
   if (good.length === 0) die(`no valid invite (${invites.length} kind:3313 seen, none passed provenance)`)

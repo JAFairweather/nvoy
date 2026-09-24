@@ -70,10 +70,9 @@ let trusted = {}
 const trustedPath = process.env.NVOY_TRUSTED_SENDERS_FILE || resolve(homedir(), '.nvoy', 'trusted-senders.json')
 try { trusted = JSON.parse(readFileSync(trustedPath, 'utf8')).trusted || {} } catch { console.error('WARNING: no trusted-senders.json — direct senders will read as UNTRUSTED') }
 
-const CARRY_CHANNELS = (process.env.NVOY_CHANNELS || process.env.RELAY_CHANNEL || 'a8186b53-537d-46ad-a7e7-b6486c58970e')
+const CARRY_CHANNELS = (process.env.NVOY_CHANNELS || process.env.RELAY_CHANNEL || '')
   .split(',').map(value => value.trim().toLowerCase()).filter(Boolean)
-const CARRY_CARRIERS = (process.env.NVOY_TASK_CARRIERS || process.env.WAGGLE_BRIDGE_PUBKEY ||
-  '84753207f2c6ae73af247da174e8e7c91a7d939a8eb0b4c2b98b54ea567786e6')
+const CARRY_CARRIERS = (process.env.NVOY_TASK_CARRIERS || process.env.WAGGLE_BRIDGE_PUBKEY || '')
   .split(',').map(value => value.trim().toLowerCase()).filter(Boolean)
 
 const RELAYS = (process.env.NVOY_RELAYS?.split(',') || [

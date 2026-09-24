@@ -64,8 +64,13 @@ if (arg('--notify', process.env.WAKE_NOTIFY || '') && !NOTIFY) {
   console.error('wake-watcher: --notify is not a valid npub or 64-hex key — refusing to start rather than run with delivery silently off')
   process.exit(1)
 }
-const GRANTORS = String(process.env.GRANTORS || '4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b287ea84d')
+// Whose grants count. No default: a hardcoded owner key would make every deployment trust it.
+const GRANTORS = String(process.env.GRANTORS || '')
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+if (!GRANTORS.length) {
+  console.error('wake-watcher: set GRANTORS (comma-separated hex) — refusing to start with no one able to grant')
+  process.exit(1)
+}
 
 const RELAYS = (process.env.NVOY_RELAYS?.split(',') || [
   'wss://nos.lol', 'wss://relay.primal.net', 'wss://relay.ditto.pub',

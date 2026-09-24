@@ -81,8 +81,9 @@ if (bunkerUri) {
 
 // Whose signature counts as policy. Not a default — an unset grantor list means nothing can be
 // authorised, which is the correct failure direction.
-const GRANTORS = String(process.env.GRANTORS || '4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b287ea84d')
+const GRANTORS = String(process.env.GRANTORS || '')
   .split(',').map(s => toHex(s.trim())).filter(Boolean)
+if (!GRANTORS.length) die('set GRANTORS (comma-separated npub or hex) — no grantor means nothing can be authorised')
 
 // Kind numbers and tag names mirror the bridge's admission tier so one vocabulary covers both.
 const KIND = { grant: 440, revocation: 441 }
