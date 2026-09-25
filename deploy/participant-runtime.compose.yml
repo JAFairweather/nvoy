@@ -31,6 +31,10 @@ services:
       # @harness-begin
       NVOY_HARNESS_CREDENTIAL_SOURCE: /run/secrets/harness-credential
       # @harness-end
+      # @webhook-begin
+      NVOY_WAKE_WEBHOOK_URL_SOURCE: /run/secrets/wake-webhook-url
+      NVOY_WAKE_WEBHOOK_HEADERS_SOURCE: /run/secrets/wake-webhook-headers
+      # @webhook-end
     command: ["node", "mcp/tools/instance-runtime-init.mjs", "--instance", "${INSTANCE_ID:?}"]
     volumes:
       - type: bind
@@ -62,6 +66,14 @@ services:
         source: harness_home
         target: /home/harness
       # @harness-end
+      # @webhook-begin
+      - type: volume
+        source: wake_webhook_credentials
+        target: /run/nvoy-wake-webhook-credentials
+      - type: volume
+        source: wake_webhook_state
+        target: ${WAKE_WEBHOOK_STATE_DIR:?}
+      # @webhook-end
     secrets:
       - source: nvoy_bunker_uri
         target: bunker-uri
@@ -75,6 +87,12 @@ services:
       - source: nvoy_harness_credential
         target: harness-credential
       # @harness-end
+      # @webhook-begin
+      - source: nvoy_wake_webhook_url
+        target: wake-webhook-url
+      - source: nvoy_wake_webhook_headers
+        target: wake-webhook-headers
+      # @webhook-end
     restart: "no"
 
   watcher:
@@ -233,6 +251,47 @@ services:
         condition: service_started
     restart: unless-stopped
   # @harness-end
+  # @webhook-begin
+  # The webhook wake for a harness hosted off the fleet that cannot hold an SSH stream. It POSTs one
+  # envelope id per new admitted envelope to the operator's HTTPS URL; the woken harness reads the
+  # message over its channel key. It runs as the worker UID, the one that can read both the admitted
+  # queue and the channel's read log, but it mounts the runtime read-only: it can write nothing there
+  # except its own cursor volume, so it cannot touch the reply queue. It holds no Nostr credential and
+  # no model login. Outbound HTTPS goes over the stack's default network.
+  notifier:
+    image: ${NVOY_IMAGE:?set NVOY_IMAGE}
+    user: "${WORKER_UID:?}:${WORKER_HANDOFF_GID:?}"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp:mode=1777]
+    environment:
+      NVOY_INSTANCE_ROOT: /etc/nvoy/instances
+      NVOY_WAKE_WEBHOOK_URL_FILE: /run/nvoy-wake-webhook-credentials/url
+      NVOY_WAKE_WEBHOOK_HEADERS_FILE: /run/nvoy-wake-webhook-credentials/headers
+    command: ["node", "mcp/tools/admitted-webhook-notify.mjs", "--instance", "${INSTANCE_ID:?}"]
+    volumes:
+      - type: bind
+        source: ${MANIFEST_DIR:?}
+        target: /etc/nvoy/instances
+        read_only: true
+      - type: volume
+        source: adapter_runtime
+        target: ${RUNTIME_DIR:?}
+        read_only: true
+      - type: volume
+        source: wake_webhook_state
+        target: ${WAKE_WEBHOOK_STATE_DIR:?}
+      - type: volume
+        source: wake_webhook_credentials
+        target: /run/nvoy-wake-webhook-credentials
+        read_only: true
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+  # @webhook-end
 
 secrets:
   nvoy_bunker_uri:
@@ -252,6 +311,14 @@ secrets:
   nvoy_harness_credential:
     file: ${HARNESS_CREDENTIAL_FILE:?}
   # @harness-end
+  # @webhook-begin
+  # The operator's webhook URL and auth headers. Neither is a Nostr key; each reaches only the
+  # notifier, as a worker-owned copy.
+  nvoy_wake_webhook_url:
+    file: ${WAKE_WEBHOOK_URL_FILE:?}
+  nvoy_wake_webhook_headers:
+    file: ${WAKE_WEBHOOK_HEADERS_FILE:?}
+  # @webhook-end
 
 volumes:
   watcher_spool: {}
@@ -267,3 +334,8 @@ volumes:
   # continuing session, not a fresh one per task.
   harness_home: {}
   # @harness-end
+  # @webhook-begin
+  wake_webhook_credentials: {}
+  # The notifier's envelope cursor, mounted over <runtime>/wake-webhook-state.
+  wake_webhook_state: {}
+  # @webhook-end

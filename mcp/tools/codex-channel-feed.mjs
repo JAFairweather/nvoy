@@ -20,11 +20,10 @@
 // that stops sending them is gone even when the carrier keeps the pipe open (#168), so the feed then
 // exits and frees the lock, and the supervisor reconnects from its cursor.
 
-import { closeSync, fstatSync, lstatSync, openSync, readSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { StringDecoder } from 'node:string_decoder'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { claimPidLock } from './pid_lock.mjs'
+import { admittedFollower } from './admitted_queue.mjs'
 
 const die = message => { console.error(`nvoy-codex-channel-feed: ${message}`); process.exit(1) }
 const flag = name => { const i = process.argv.indexOf(name); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -58,47 +57,10 @@ process.on('exit', () => release())
 for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => process.exit(0))
 process.stdout.on('error', () => process.exit(0))
 
-const MAX_RECORD = 1024 * 1024, MAX_QUEUE = 64 * 1024 * 1024, MAX_CLIENT_LINE = 4096
+const MAX_CLIENT_LINE = 4096
 const emit = row => process.stdout.write(JSON.stringify(row) + '\n')
 
-// Metadata only, built fresh: whatever else a queue line carries never reaches the wire.
-function meta(line) {
-  let row
-  try { row = JSON.parse(line) } catch { return null }
-  const envelope = String(row?.envelope || '')
-  if (!HEX64.test(envelope)) return null
-  const at = Number(row.received_at)
-  return { envelope, type: row.type === 'verified-notification' ? 'verified-notification' : 'admitted-task', at: Number.isFinite(at) ? at : null }
-}
-
-let offset = 0, partial = '', skipping = false, decoder = new StringDecoder('utf8')
-function readNew() {
-  let st
-  try { st = lstatSync(queuePath) } catch { return { rows: [], reset: false } }
-  if (!st.isFile() || st.isSymbolicLink()) throw new Error('admitted queue must be a regular non-symlink file')
-  if (st.size > MAX_QUEUE) throw new Error('admitted queue exceeds its 64 MiB bound')
-  const reset = st.size < offset
-  if (reset) { offset = 0; partial = ''; skipping = false; decoder = new StringDecoder('utf8') }
-  if (st.size === offset) return { rows: [], reset }
-  const fd = openSync(queuePath, 'r'), rows = []
-  try {
-    const size = Math.min(fstatSync(fd).size, MAX_QUEUE), chunk = Buffer.alloc(Math.min(size - offset, MAX_RECORD))
-    while (offset < size) {
-      const n = readSync(fd, chunk, 0, Math.min(chunk.length, size - offset), offset)
-      if (n <= 0) break
-      offset += n
-      const parts = (partial + decoder.write(chunk.subarray(0, n))).split('\n')
-      partial = parts.pop()
-      for (const line of parts) {
-        if (skipping) { skipping = false; continue }
-        if (line.trim() && Buffer.byteLength(line) <= MAX_RECORD) { const row = meta(line); if (row) rows.push(row) }
-      }
-      // A record over its bound is dropped whole, not split into lines that might parse.
-      if (Buffer.byteLength(partial) > MAX_RECORD) { partial = ''; skipping = true }
-    }
-  } finally { closeSync(fd) }
-  return { rows, reset }
-}
+const readNew = admittedFollower(queuePath)
 
 let cursor = null, started = false, lastClient = Date.now()
 function start(since) {

@@ -808,6 +808,72 @@ refuses unless the confirmation token is that exact instance id — so an operat
 destroy they were not looking at. Both verbs take `--dry-run`, which prints the exact `docker`
 command and runs nothing. `restart` has no path to `-v` at all.
 
+### Webhook wake for an off-fleet harness
+
+This is for a harness hosted where it cannot hold an SSH stream, such as a bot whose routine runs
+when an HTTPS webhook fires. The `notifier` service (`admitted-webhook-notify.mjs`) follows the
+admitted queue. For each new envelope it POSTs `{"instance", "envelope", "type", "at"}` to the
+operator's URL, and nothing else. The harness then drains over its channel key; see
+[Harness placement](HARNESS_PLACEMENT.md#webhook-wake-for-a-hosted-harness).
+
+```json
+"wake_webhook": { "url_ref": "/etc/nvoy/credentials/<id>.wake-webhook.url",
+                  "headers_ref": "/etc/nvoy/credentials/<id>.wake-webhook.headers" }
+```
+
+- **When it is valid.** Only on a local-broker, worker-disabled, `notify_only` manifest. Both
+  references must be absolute paths under `/etc/nvoy/credentials`. They must be two different
+  files, and neither may name a Nostr credential or the harness login.
+- **The two files.** The URL file holds one `https://` URL on one line. It may have a query, but
+  no user info and no fragment. The headers file holds one or more `Name: value` lines, the
+  `curl -H @file` format. It is refused if:
+  - a name is not an RFC 7230 token, or appears twice;
+  - it contains a carriage return or another control character;
+  - it sets a header the notifier owns: `Host`, `Content-Length`, `Content-Type`,
+    `Transfer-Encoding`, `Connection` or another framing header;
+  - it holds more than 16 headers or 8 KiB.
+
+  Each file must be owner-only.
+- **What it is.** The notifier uses the runtime image and runs as the worker UID with the handoff
+  group, the one UID that can read both the admitted queue and the channel's
+  `claude-channel-state/read.jsonl`. It is read-only, has no capabilities, and mounts the adapter
+  runtime **read-only**. So it cannot write the reply queue or anything else there. Its one
+  writable mount is its own `wake_webhook_state` volume, mounted over
+  `<runtime_dir>/wake-webhook-state`. The volume holds `state.json` (the envelope cursor and the
+  re-notify list) and `notifier.lock`. The init container copies the two files into a
+  worker-owned, `0400`, read-only `wake_webhook_credentials` volume, as it does for the harness
+  login. The notifier mounts no Nostr credential, no model login, no state and no spool. Its
+  outbound HTTPS goes over the stack's default network.
+- **Delivery.** The first start baselines at the queue end, so history is never posted.
+  - Envelopes go in queue order, one request in flight. Each POST gets a fresh connection and a
+    10 s timeout, and follows no redirect.
+  - A non-2xx answer or a network failure is retried with doubling backoff, starting at 2 s and
+    capped at 60 s. After 6 attempts it is logged and given up.
+  - The cursor then moves on. A notifier killed mid-POST posts that envelope again on restart.
+  - A rewritten queue is re-placed on the last envelope seen, or else continues from its end, as
+    the Codex wake feed does.
+  - An envelope already in the read log is not posted.
+- **Re-notify.** A harness woken while the fleet channel still holds an earlier session's lock
+  drains nothing. So an envelope that is absent from `read.jsonl` `--renotify-ms` after its last
+  POST is posted again, at most `--renotify-max` times. The defaults are 12 min (0.1 s to 24 h)
+  and 2 (0 to 10).
+- **Logs.** Only `POST <first 8 hex of the envelope> -> <status | error class>` lines, plus
+  give-up and re-notify notices. The URL, a header, a response body and message content are
+  never logged.
+
+Operator steps, on the fleet host:
+
+1. Write the two files, root-owned `0600`:
+   `install -m 600 /dev/null /etc/nvoy/credentials/<id>.wake-webhook.url`. Then do the same for
+   `.headers`, and fill both in an editor. Never paste them into a chat, a log or the manifest.
+2. Back up the manifest to `/root`, then add the `wake_webhook` block. The path watch reconciles
+   the identity at once.
+3. Confirm `deploy OK` in `journalctl -u nvoy-runtime-deploy`, and that `nvoy-<id>-notifier-1`
+   is running and logged `baselined at …`.
+
+Rotating either file does not by itself restart anything. The init container copies credentials
+only when the stack is recreated, so recreate the identity after a rotation.
+
 ### Automatic verified releases
 
 Routine releases are pull-based; an operator must not copy source or hand-edit image tags. The
@@ -819,7 +885,8 @@ digests, and renders every identity from its existing host-local manifest. It ne
 changes a Bunker URI, client credential, provider credential, grant, or routing policy.
 
 The runner validates each candidate Compose file before starting it. It then requires watcher,
-broker, adapter, and (where configured) worker to be running for every identity. The release SHA
+broker, adapter, and (where configured) worker, harness and notifier to be running for every
+identity. The release SHA
 and image digests are recorded only after all identities pass. If any identity fails, every
 already-touched identity is restored from the previous Compose set; the failed SHA remains
 unrecorded so the runner alarms rather than silently accepting a partial release. The same release

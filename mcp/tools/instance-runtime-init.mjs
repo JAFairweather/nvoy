@@ -50,6 +50,8 @@ if (m.workerEnabled) provision(`${m.runtimeDir}/worker-input`, m.adapterUid, m.w
 // UID can traverse and group-read the adapter queue, but cannot write or replace that queue.
 if (m.deliveryMode === 'notify_only') provision(`${m.runtimeDir}/claude-channel-state`, m.workerUid, m.workerUid, 0o700, 'Claude channel state')
 if (m.deliveryMode === 'notify_only') provision(`${m.runtimeDir}/codex-mcp-state`, m.workerUid, m.workerUid, 0o700, 'Codex MCP state')
+// The wake notifier's own volume, mounted over this path: the one place it may write.
+if (m.wakeWebhook) provision(`${m.runtimeDir}/wake-webhook-state`, m.workerUid, m.workerUid, 0o700, 'wake webhook state')
 
 // Compose file-backed secrets are bind-mounted as root-readable files even when a service uses
 // a non-root UID. Keep those host sources root:root 0600, then make one role-owned copy in a
@@ -71,6 +73,8 @@ const sources = {
   bunkerClient: process.env.NVOY_BUNKER_CLIENT_SOURCE || '',
   workerProvider: process.env.NVOY_WORKER_PROVIDER_SOURCE || '',
   harnessCredential: process.env.NVOY_HARNESS_CREDENTIAL_SOURCE || '',
+  wakeWebhookUrl: process.env.NVOY_WAKE_WEBHOOK_URL_SOURCE || '',
+  wakeWebhookHeaders: process.env.NVOY_WAKE_WEBHOOK_HEADERS_SOURCE || '',
 }
 const brokerSources = [sources.bunkerUri, sources.bunkerClient]
 if (brokerSources.some(Boolean)) {
@@ -100,5 +104,16 @@ if (m.harness) {
   provision('/home/harness', m.workerUid, m.workerUid, 0o700, 'harness home')
 } else if (sources.harnessCredential) {
   die('a runtime without a harness refuses a harness credential source')
+}
+// The wake notifier's webhook URL and auth headers: operator secrets for one outbound POST, copied
+// worker-owned into a volume only the notifier mounts.
+if (m.wakeWebhook) {
+  if (!sources.wakeWebhookUrl || !sources.wakeWebhookHeaders) die('a wake webhook runtime requires its URL and headers sources')
+  const webhookCredDir = '/run/nvoy-wake-webhook-credentials'
+  provision(webhookCredDir, 0, 0, 0o711, 'wake webhook credential directory')
+  provisionSecret(sources.wakeWebhookUrl, `${webhookCredDir}/url`, m.workerUid, m.workerUid, 'wake webhook URL')
+  provisionSecret(sources.wakeWebhookHeaders, `${webhookCredDir}/headers`, m.workerUid, m.workerUid, 'wake webhook headers')
+} else if (sources.wakeWebhookUrl || sources.wakeWebhookHeaders) {
+  die('a runtime without a wake webhook refuses webhook credential sources')
 }
 console.log(`instance-runtime-init: provisioned ${m.id}`)

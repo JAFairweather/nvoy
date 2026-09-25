@@ -173,6 +173,20 @@ export function readManifest(root, requestedId) {
     if (model && !/^[a-z0-9][a-z0-9.\-\[\]]{0,63}$/i.test(model)) die('harness model must be a model name or alias')
     harness = Object.freeze({ runner, credentialRef, model })
   }
+  // A wake webhook tells a harness hosted off the fleet (one that cannot hold an SSH stream) that an
+  // envelope is waiting. Its URL and auth headers are operator credentials, never Nostr ones, and
+  // only the envelope id crosses: the harness still reads the message over the channel key.
+  let wakeWebhook = null
+  if (raw.wake_webhook != null) {
+    const refs = ['url_ref', 'headers_ref'].map(name => String(raw.wake_webhook?.[name] || ''))
+    const underCredentials = ref => ref.startsWith('/etc/nvoy/credentials/') && resolve(ref) === ref && !/[\s\0]/.test(ref)
+    if (!refs.every(underCredentials)) die('wake_webhook requires url_ref and headers_ref as absolute paths under /etc/nvoy/credentials')
+    if (refs[0] === refs[1]) die('wake_webhook url_ref and headers_ref must be two files')
+    if (brokerMode !== 'local' || deliveryMode !== 'notify_only' || workerEnabled) die('a wake_webhook requires a local-broker, worker-disabled notify_only manifest')
+    if (refs.some(ref => [keyRef, bunkerUriRef, bunkerClientRef].includes(ref))) die('wake_webhook references must not name a Nostr credential')
+    if (harness && refs.includes(harness.credentialRef)) die('wake_webhook references must not name the harness credential')
+    wakeWebhook = Object.freeze({ urlRef: refs[0], headersRef: refs[1] })
+  }
   if (brokerMode === 'remote') {
     if (!['codex_app_server', 'macos_desktop'].includes(deliveryMode) || codexTransport !== 'local_control_socket') die('a remote broker is valid only for an exact local Codex Desktop binding')
     if (!/^[a-z_][a-z0-9_-]{0,31}@[a-z0-9.-]+$/i.test(sshTarget) || !sshIdentityFile.startsWith('/') ||
@@ -181,7 +195,7 @@ export function readManifest(root, requestedId) {
     }
   }
   return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, carriers: Object.freeze(carriers), buzz, relays, stateDir, runtimeDir, spoolDir,
-    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, adapterContainer, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath, codexAppBundleId, codexProjectLabel, codexChatLabel, codexUiDriver, harness,
+    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, adapterContainer, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath, codexAppBundleId, codexProjectLabel, codexChatLabel, codexUiDriver, harness, wakeWebhook,
     sshTarget, sshIdentityFile, sshKnownHostsFile, sshKnownHostsSha256, approvalEndpoint: approvalEndpoint.replace(/\/$/, '') })
 }
 

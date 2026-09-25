@@ -28,6 +28,8 @@ if (!m.workerEnabled) out = out.replace(/^\s*# @worker-begin\n[\s\S]*?^\s*# @wor
 else out = out.replace(/^\s*# @worker-(?:begin|end)\n?/gm, '')
 if (!m.harness) out = out.replace(/^\s*# @harness-begin\n[\s\S]*?^\s*# @harness-end\n?/gm, '')
 else out = out.replace(/^\s*# @harness-(?:begin|end)\n?/gm, '')
+if (!m.wakeWebhook) out = out.replace(/^\s*# @webhook-begin\n[\s\S]*?^\s*# @webhook-end\n?/gm, '')
+else out = out.replace(/^\s*# @webhook-(?:begin|end)\n?/gm, '')
 const replacements = {
   '${NVOY_IMAGE:?set NVOY_IMAGE}': JSON.stringify(image), '${WATCHER_UID:?}': String(m.watcherUid),
   '${BROKER_UID:?}': String(m.brokerUid), '${ADAPTER_UID:?}': String(m.adapterUid), '${WORKER_UID:?}': String(m.workerUid), '${BROKER_ADAPTER_GID:?}': String(m.brokerAdapterGid), '${WORKER_HANDOFF_GID:?}': String(m.workerHandoffGid),
@@ -37,8 +39,10 @@ const replacements = {
   '${BUNKER_URI_FILE:?}': JSON.stringify(m.bunkerUriRef), '${BUNKER_CLIENT_FILE:?}': JSON.stringify(m.bunkerClientRef),
   '${WORKER_IMAGE:?}': JSON.stringify(workerImage), '${WORKER_RUNNER:?}': m.workerRunner, '${WORKER_CREDENTIAL_FILE:?}': JSON.stringify(m.workerCredentialRef),
   '${HARNESS_CREDENTIAL_FILE:?}': JSON.stringify(m.harness?.credentialRef || ''),
+  '${WAKE_WEBHOOK_URL_FILE:?}': JSON.stringify(m.wakeWebhook?.urlRef || ''), '${WAKE_WEBHOOK_HEADERS_FILE:?}': JSON.stringify(m.wakeWebhook?.headersRef || ''),
+  '${WAKE_WEBHOOK_STATE_DIR:?}': JSON.stringify(`${m.runtimeDir}/wake-webhook-state`),
   '${BROKER_CREDENTIAL_FILE:?set BROKER_CREDENTIAL_FILE}': JSON.stringify(m.keyRef),
 }
 for (const [from, to] of Object.entries(replacements)) out = out.split(from).join(to)
-if (/\$\{(?:WATCHER_UID|BROKER_UID|ADAPTER_UID|WORKER_UID|BROKER_ADAPTER_GID|WORKER_HANDOFF_GID|INSTANCE_ID|MANIFEST_DIR|ADAPTER_CONTAINER|STATE_DIR|SPOOL_DIR|RUNTIME_DIR|BUNKER_URI_FILE|BUNKER_CLIENT_FILE|WORKER_IMAGE|WORKER_RUNNER|WORKER_CREDENTIAL_FILE|HARNESS_CREDENTIAL_FILE|BROKER_CREDENTIAL_FILE)/.test(out)) die('template retained an identity deployment variable')
+if (/\$\{(?:WATCHER_UID|BROKER_UID|ADAPTER_UID|WORKER_UID|BROKER_ADAPTER_GID|WORKER_HANDOFF_GID|INSTANCE_ID|MANIFEST_DIR|ADAPTER_CONTAINER|STATE_DIR|SPOOL_DIR|RUNTIME_DIR|BUNKER_URI_FILE|BUNKER_CLIENT_FILE|WORKER_IMAGE|WORKER_RUNNER|WORKER_CREDENTIAL_FILE|HARNESS_CREDENTIAL_FILE|WAKE_WEBHOOK_URL_FILE|WAKE_WEBHOOK_HEADERS_FILE|WAKE_WEBHOOK_STATE_DIR|BROKER_CREDENTIAL_FILE)/.test(out)) die('template retained an identity deployment variable')
 process.stdout.write(out)
