@@ -168,7 +168,9 @@ export function readManifest(root, requestedId) {
     if (runner !== 'claude' || !credentialRef.startsWith('/')) die('harness requires runner "claude" and an absolute credential_ref')
     if (brokerMode !== 'local' || deliveryMode !== 'notify_only' || workerEnabled) die('a harness requires a local-broker, worker-disabled notify_only manifest')
     if ([keyRef, bunkerUriRef, bunkerClientRef].includes(credentialRef)) die('harness credential_ref must not name a Nostr credential')
-    harness = Object.freeze({ runner, credentialRef })
+    const model = String(raw.harness?.model || '')
+    if (model && !/^[a-z0-9][a-z0-9.\-\[\]]{0,63}$/i.test(model)) die('harness model must be a Claude Code model name or alias')
+    harness = Object.freeze({ runner, credentialRef, model })
   }
   if (brokerMode === 'remote') {
     if (!['codex_app_server', 'macos_desktop'].includes(deliveryMode) || codexTransport !== 'local_control_socket') die('a remote broker is valid only for an exact local Codex Desktop binding')

@@ -77,7 +77,7 @@ async function start() {
   const resume = hasPriorSession(home, workdir)
   tmux(['kill-server'])
   const r = tmux(['-f', tmuxConf, 'new-session', '-d', '-s', 'harness', '-x', '200', '-y', '50', '-c', workdir,
-    'claude', ...claudeArgs({ server, mcpConfigPath, resume })], sessionEnv)
+    'claude', ...claudeArgs({ server, mcpConfigPath, resume, model: manifest.harness.model })], sessionEnv)
   if (r.status !== 0) throw new Error(`tmux would not start: ${(r.stderr || '').trim().slice(0, 200)}`)
   log(`${resume ? 'resuming' : 'starting'} the ${manifest.id} session with channel ${server}`)
   const answered = new Map()

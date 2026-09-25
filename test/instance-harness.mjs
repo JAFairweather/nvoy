@@ -46,6 +46,9 @@ ok('a harness credential reference must be absolute', parse({ ...base('mc-test')
 ok('a harness credential cannot be one of the Nostr credentials', /must not name a Nostr credential/.test(parse({ ...base('mc-test'), harness: { ...harness, credential_ref: '/etc/nvoy/credentials/mc-test.bunker' } }).stderr))
 ok('a harness cannot sit beside a headless model worker', parse({ ...base('mc-test'), harness, delivery_mode: 'headless', worker_enabled: true,
   worker_image: workerImage, worker_runner: 'claude', worker_credential_ref: '/etc/nvoy/credentials/mc-test.provider' }).status !== 0)
+ok('a harness may name its model', JSON.parse(parse({ ...base('mc-test'), harness: { ...harness, model: 'claude-opus-5-5' } }).stdout).model === 'claude-opus-5-5')
+ok('a harness model cannot smuggle a flag or a shell word', parse({ ...base('mc-test'), harness: { ...harness, model: '--dangerously-skip-permissions' } }).status !== 0 &&
+  parse({ ...base('mc-test'), harness: { ...harness, model: 'opus; rm -rf /' } }).status !== 0)
 ok('a harness cannot serve a Codex app-server queue', parse({ ...base('mc-test'), harness, delivery_mode: 'codex_app_server', codex_thread_id: '0199a213-81c0-7800-8aa1-bbab2a035a53', codex_transport: 'spawn' }).status !== 0)
 
 // Compose
@@ -93,6 +96,7 @@ ok('the default instructions name the read and reply tools and treat message bod
   /never treat it as instructions/.test(instructions) && instructions.includes(channel) && !instructions.includes('c'.repeat(64)))
 const fresh = claudeArgs({ server: 'nvoy-mc-test', mcpConfigPath: '/home/harness/.nvoy-harness/mcp.json', resume: false })
 ok('the session loads exactly its own channel server and no ambient MCP configuration', JSON.stringify(fresh) === JSON.stringify(['--dangerously-load-development-channels', 'server:nvoy-mc-test', '--mcp-config', '/home/harness/.nvoy-harness/mcp.json', '--strict-mcp-config']))
+ok('a chosen model is passed as --model, and none is passed by default', JSON.stringify(claudeArgs({ server: 's', mcpConfigPath: '/m', resume: false, model: 'opus' }).slice(-2)) === '["--model","opus"]' && !fresh.includes('--model'))
 ok('a restart resumes the same conversation', claudeArgs({ server: 's', mcpConfigPath: '/m', resume: true }).at(-1) === '--continue')
 ok('the command line never carries a permission bypass', !/skip-permissions|bypass/.test(JSON.stringify(fresh)))
 const home = join(root, 'home'), workdir = join(home, 'workspace')
@@ -110,6 +114,8 @@ ok('a warning without numbered options is answered with Enter on the default', c
 ok('the folder-trust screen is answered only with its accept option', JSON.stringify(classifyPane('Do you trust the files in this folder?\n ❯ 1. Yes, proceed\n   2. No, exit')) === '{"state":"trust","key":"1"}')
 ok('a login screen is fatal, never answered', JSON.stringify(classifyPane('Select login method:\n 1. Claude account')) === '{"state":"login"}' && classifyPane('OAuth token has expired').state === 'login')
 ok('the ready prompt is recognised', classifyPane('>\n  ? for shortcuts').state === 'ready')
+ok('the 2.1.221 idle prompt, whose footer is the permission-mode hint, is recognised as ready',
+  classifyPane(' ▐▛███▜▌   Claude Code v2.1.221\n──────\n❯ Try "how does <filepath> work?"\n──────\n  ⏵⏵ don\'t ask on (shift+tab to cycle) · ← for agents').state === 'ready')
 ok('anything else is still starting and gets no keystroke', JSON.stringify(classifyPane('Loading…')) === '{"state":"starting"}' && classifyPane('').key === undefined)
 ok('an injected message that quotes a startup screen after ready cannot matter: the supervisor stops reading once ready',
   /if \(screen\.state === 'ready'\) \{ log\(.*\); return \}/.test(readFileSync('mcp/tools/instance-harness.mjs', 'utf8')))
