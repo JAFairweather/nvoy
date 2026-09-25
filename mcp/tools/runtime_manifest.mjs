@@ -159,17 +159,18 @@ export function readManifest(root, requestedId) {
       die('macos_desktop requires the fixed Codex bundle, project/chat labels, and an absolute UI driver')
     }
   }
-  // A hosted harness is the agent's own Claude Code session, kept open beside the stack: the keyless
-  // Claude channel injects admitted envelopes into it, and it replies through the broker. It is the
-  // model-side consumer of a notify_only queue, so it can never coexist with a headless worker.
+  // A hosted harness is the agent's own coding-agent session (Claude Code, or one persistent Codex
+  // thread), kept open beside the stack: admitted envelopes are injected into it, and it replies
+  // through the broker. It is the model-side consumer of a notify_only queue, so it can never
+  // coexist with a headless worker.
   let harness = null
   if (raw.harness != null) {
     const runner = String(raw.harness?.runner || ''), credentialRef = String(raw.harness?.credential_ref || raw.harness?.credentialRef || '')
-    if (runner !== 'claude' || !credentialRef.startsWith('/')) die('harness requires runner "claude" and an absolute credential_ref')
+    if (!['claude', 'codex'].includes(runner) || !credentialRef.startsWith('/')) die('harness requires runner "claude" or "codex" and an absolute credential_ref')
     if (brokerMode !== 'local' || deliveryMode !== 'notify_only' || workerEnabled) die('a harness requires a local-broker, worker-disabled notify_only manifest')
     if ([keyRef, bunkerUriRef, bunkerClientRef].includes(credentialRef)) die('harness credential_ref must not name a Nostr credential')
     const model = String(raw.harness?.model || '')
-    if (model && !/^[a-z0-9][a-z0-9.\-\[\]]{0,63}$/i.test(model)) die('harness model must be a Claude Code model name or alias')
+    if (model && !/^[a-z0-9][a-z0-9.\-\[\]]{0,63}$/i.test(model)) die('harness model must be a model name or alias')
     harness = Object.freeze({ runner, credentialRef, model })
   }
   if (brokerMode === 'remote') {

@@ -82,6 +82,63 @@ export function hasPriorSession(home, workdir) {
   try { return readdirSync(dir).some(name => name.endsWith('.jsonl')) } catch { return false }
 }
 
+// Codex: one persistent thread behind `codex app-server`, which has no terminal and no channel
+// notification, so the supervisor itself injects each admitted envelope as a turn.
+
+// The API key reaches Codex only through the environment. A distinct Responses provider keeps
+// Codex from preferring an interactive login store the harness does not have. Nobody can answer
+// an approval, so none is asked for; shell commands stay read-only. The keyless channel tools
+// are the only MCP server.
+export function codexConfigToml({ manifest, root, model = '' }) {
+  const q = value => JSON.stringify(String(value))
+  return [
+    ...(model ? [`model = ${q(model)}`] : []),
+    'model_provider = "nvoy-openai-api"',
+    'approval_policy = "never"',
+    'sandbox_mode = "read-only"',
+    '',
+    '[model_providers.nvoy-openai-api]',
+    'name = "Nvoy OpenAI API"',
+    'base_url = "https://api.openai.com/v1"',
+    'wire_api = "responses"',
+    'env_key = "OPENAI_API_KEY"',
+    'requires_openai_auth = false',
+    '',
+    `[mcp_servers.${serverName(manifest)}]`,
+    'command = "node"',
+    `args = [${q('/srv/nvoy/mcp/tools/codex-channel-mcp.mjs')}, "--instance", ${q(manifest.id)}]`,
+    `env = { NVOY_INSTANCE_ROOT = ${q(root)} }`,
+    '',
+  ].join('\n')
+}
+
+// The turn carries only the opaque envelope and a dedupe marker. The message itself comes back
+// through nvoy_channel_read, as data with its broker-attested authority, never as turn text.
+export function codexTurnText(record) {
+  return [
+    `A message was admitted to your Nvoy channel: envelope ${record.envelope} (${record.type}).`,
+    'Read it with nvoy_channel_read. If it is an admitted task that asks for an answer, answer it',
+    'once with nvoy_channel_reply on the same envelope; otherwise, take no action.',
+    `NVOY_ENVELOPE_ID=${record.envelope}`,
+  ].join('\n')
+}
+
+// Admitted envelopes not yet injected, oldest first, each once. The channel tools validate a
+// record when it is read; here only the envelope id is trusted, and only when well formed.
+export function pendingEnvelopes(queueText, delivered) {
+  const seen = new Set(delivered), out = []
+  for (const line of String(queueText || '').split('\n')) {
+    if (!line.trim()) continue
+    let row
+    try { row = JSON.parse(line) } catch { continue }
+    const envelope = String(row?.envelope || '')
+    if (!/^[0-9a-f]{64}$/.test(envelope) || seen.has(envelope)) continue
+    seen.add(envelope)
+    out.push({ envelope, type: row.type === 'verified-notification' ? 'verified-notification' : 'admitted-task' })
+  }
+  return out
+}
+
 // The startup screens an unattended session can meet, most specific first. `key` is what to send:
 // the option's own number where the screen shows one, else Enter on the default.
 function optionKey(text, label) {

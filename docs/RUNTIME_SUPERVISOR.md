@@ -543,6 +543,44 @@ Turning it on for an identity (operator steps; none of this runs by itself):
 The first live check is a mention in the channel. The session reads it with `nvoy_channel_read`,
 and a kind:9 reply appears under the identity's own key.
 
+#### Codex harness
+
+`"runner": "codex"` gives the identity its own Codex thread on the broker host instead:
+
+```json
+"harness": { "runner": "codex", "credential_ref": "/etc/nvoy/credentials/dj-codex.openai-api-key" }
+```
+
+The manifest rules, the Compose service, the image and the mounts are the same as for Claude.
+The credential is an OpenAI API key.
+
+- **What it is.** The supervisor keeps one long-lived `codex app-server` on stdio and one thread.
+  - The thread id is kept in the persistent home (`~/.nvoy-harness/codex-thread.json`).
+  - A restart resumes that thread with `thread/resume`; it is not a stateless `codex exec` per
+    message.
+  - The optional `model` goes into the Codex config and onto `thread/start`.
+- **How messages reach it.** `codex app-server` has no terminal and no channel notification, so
+  the supervisor injects each new envelope in `admitted-tasks.jsonl` as a `turn/start`.
+  - The turn text is only the opaque envelope id and the instruction to read it with
+    `nvoy_channel_read` and answer once with `nvoy_channel_reply`. The supervisor never reads a
+    message body or a reply.
+  - Turns run one at a time, oldest first. Each is recorded in `~/.nvoy-harness/delivered.jsonl`
+    once Codex acknowledges it, so a restart never injects one twice.
+  - The first start baselines whatever the queue already holds, so no manual baseline is needed.
+- **Its tools.** Codex loads exactly one MCP server, `codex-channel-mcp.mjs` for this instance,
+  from `$CODEX_HOME/config.toml`. The supervisor rewrites that file owner-only on every start.
+  - The key reaches `codex app-server` only as `OPENAI_API_KEY`, in an environment holding just
+    `PATH`, `HOME` and `CODEX_HOME`, through a dedicated Responses provider with
+    `requires_openai_auth = false`.
+  - `approval_policy = "never"` and `sandbox_mode = "read-only"`. Any request Codex makes of the
+    client (an approval or an elicitation) is declined, because nobody is there to answer it.
+  - `workspace/AGENTS.md` is written from the default instructions only when it is missing.
+- **Retire the other Codex paths first.** Before turning this on, stop any Mac `codex_app_server`
+  binding, desktop adapter or remote bridge for the identity. The Codex channel tools hold no
+  lock, so a second consumer would answer the same envelope.
+- **Watching it:** `docker logs nvoy-<id>-harness-1` shows each injected envelope prefix and how
+  its turn ended.
+
 ### Docker reference deployment
 
 [`deploy/participant-runtime.compose.yml`](../deploy/participant-runtime.compose.yml) is the

@@ -194,10 +194,11 @@ services:
     restart: unless-stopped
   # @worker-end
   # @harness-begin
-  # The agent's own Claude Code session, held open in tmux. The keyless Claude channel runs as its
-  # MCP child under the worker UID and injects admitted envelopes; replies go back only as receipt
-  # ids through the reply queue, so the broker still rechecks the grant and signs. No Nostr
-  # credential reaches this container. Attach to watch it:
+  # The agent's own coding-agent session: Claude Code held open in tmux, or one persistent Codex
+  # thread behind `codex app-server`. The keyless channel runs as its MCP child under the worker UID
+  # and admitted envelopes are injected into the session; replies go back only as receipt ids
+  # through the reply queue, so the broker still rechecks the grant and signs. No Nostr credential
+  # reaches this container. Watch a Claude session with:
   #   docker exec -it <container> tmux -S /tmp/harness.sock attach -r
   harness:
     image: ${WORKER_IMAGE:?}
@@ -209,7 +210,7 @@ services:
     tmpfs: [/tmp:mode=1777]
     environment:
       NVOY_INSTANCE_ROOT: /etc/nvoy/instances
-      NVOY_HARNESS_CREDENTIAL_FILE: /run/nvoy-harness-credentials/claude-oauth-token
+      NVOY_HARNESS_CREDENTIAL_FILE: /run/nvoy-harness-credentials/credential
       HOME: /home/harness
     command: ["node", "mcp/tools/instance-harness.mjs", "--instance", "${INSTANCE_ID:?}"]
     volumes:
@@ -245,8 +246,9 @@ secrets:
     file: ${WORKER_CREDENTIAL_FILE:?}
   # @worker-end
   # @harness-begin
-  # A Claude Code login token (`claude setup-token`) for the hosted harness. It is not a Nostr key
-  # and reaches only the harness, as a worker-owned copy.
+  # The hosted harness's model login: a Claude Code token (`claude setup-token`) or, for a Codex
+  # harness, an OpenAI API key. It is not a Nostr key and reaches only the harness, as a
+  # worker-owned copy.
   nvoy_harness_credential:
     file: ${HARNESS_CREDENTIAL_FILE:?}
   # @harness-end
