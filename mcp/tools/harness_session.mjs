@@ -88,7 +88,10 @@ export function hasPriorSession(home, workdir) {
 // The API key reaches Codex only through the environment. A distinct Responses provider keeps
 // Codex from preferring an interactive login store the harness does not have. Nobody can answer
 // an approval, so none is asked for; shell commands stay read-only. The keyless channel tools
-// are the only MCP server.
+// are the only MCP server, and each is pre-approved: `approval_policy` does not cover MCP tool
+// calls, which Codex otherwise puts to the client as an elicitation the harness must decline
+// (DJ Codex, 2026-09-25). The broker still rechecks the grant before it signs any reply.
+export const CODEX_CHANNEL_TOOLS = ['nvoy_channel_list', 'nvoy_channel_read', 'nvoy_channel_reply']
 export function codexConfigToml({ manifest, root, model = '' }) {
   const q = value => JSON.stringify(String(value))
   return [
@@ -109,6 +112,7 @@ export function codexConfigToml({ manifest, root, model = '' }) {
     `args = [${q('/srv/nvoy/mcp/tools/codex-channel-mcp.mjs')}, "--instance", ${q(manifest.id)}]`,
     `env = { NVOY_INSTANCE_ROOT = ${q(root)} }`,
     '',
+    ...CODEX_CHANNEL_TOOLS.flatMap(tool => [`[mcp_servers.${serverName(manifest)}.tools.${tool}]`, 'approval_mode = "approve"', '']),
   ].join('\n')
 }
 

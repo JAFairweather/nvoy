@@ -6,7 +6,7 @@ import { appendFileSync, chmodSync, existsSync, mkdtempSync, mkdirSync, writeFil
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
-import { classifyPane, claudeArgs, codexConfigToml, codexTurnText, defaultInstructions, hasPriorSession, mcpConfig, pendingEnvelopes, seedClaudeJson, seedSettings, serverName } from '../mcp/tools/harness_session.mjs'
+import { CODEX_CHANNEL_TOOLS, classifyPane, claudeArgs, codexConfigToml, codexTurnText, defaultInstructions, hasPriorSession, mcpConfig, pendingEnvelopes, seedClaudeJson, seedSettings, serverName } from '../mcp/tools/harness_session.mjs'
 
 let fails = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); if (!value) fails++ }
@@ -154,12 +154,16 @@ ok('the fleet reconciler renders a harness with the release worker image and exp
 // Codex session files
 const codexManifest = { id: 'dj-test', pubkey: 'c'.repeat(64), buzz: { channels: [channel] } }
 const toml = codexConfigToml({ manifest: codexManifest, root: '/etc/nvoy/instances' })
-ok('the Codex config loads exactly the keyless Codex channel tools for this instance', (toml.match(/^\[mcp_servers\./gm) || []).length === 1 &&
+ok('the Codex config loads exactly the keyless Codex channel tools for this instance', (toml.match(/^\[mcp_servers\.[^.\]]+\]$/gm) || []).length === 1 &&
   toml.includes('[mcp_servers.nvoy-dj-test]') && toml.includes('args = ["/srv/nvoy/mcp/tools/codex-channel-mcp.mjs", "--instance", "dj-test"]') &&
   toml.includes('env = { NVOY_INSTANCE_ROOT = "/etc/nvoy/instances" }'))
 ok('the Codex config reads the API key from the environment and never asks for an approval', /^model_provider = "nvoy-openai-api"$/m.test(toml) &&
   /^env_key = "OPENAI_API_KEY"$/m.test(toml) && /^requires_openai_auth = false$/m.test(toml) && /^approval_policy = "never"$/m.test(toml) &&
   /^sandbox_mode = "read-only"$/m.test(toml) && !/danger|full-access|sk-/i.test(toml))
+ok('each keyless channel tool, and only those, is pre-approved so Codex never elicits one',
+  CODEX_CHANNEL_TOOLS.join() === 'nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply' &&
+  CODEX_CHANNEL_TOOLS.every(tool => toml.includes(`[mcp_servers.nvoy-dj-test.tools.${tool}]\napproval_mode = "approve"\n`)) &&
+  (toml.match(/^approval_mode = /gm) || []).length === 3 && (toml.match(/^\[mcp_servers\.nvoy-dj-test\.tools\./gm) || []).length === 3)
 ok('a Codex model is set only when chosen', !/^model = /m.test(toml) && /^model = "gpt-5\.5"$/m.test(codexConfigToml({ manifest: codexManifest, root: '/r', model: 'gpt-5.5' })))
 const turn = codexTurnText({ envelope: 'd'.repeat(64), type: 'admitted-task' })
 ok('an injected turn carries only the envelope marker and how to read and answer it', turn.includes('d'.repeat(64)) && /nvoy_channel_read/.test(turn) &&
