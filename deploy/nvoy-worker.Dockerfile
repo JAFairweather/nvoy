@@ -13,9 +13,10 @@ WORKDIR /srv/nvoy
 # roots.  bookworm-slim deliberately omits the OS trust store; without it a
 # keyless worker can receive an admitted task but cannot reach its provider.
 # Keep normal certificate validation ON — installing public roots is not a
-# request to bypass or disable TLS verification.
+# request to bypass or disable TLS verification.  tmux gives a hosted Claude Code
+# harness its terminal: the session is interactive, and nobody holds a TTY for it.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
+ && apt-get install -y --no-install-recommends ca-certificates tmux \
  && rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json ./

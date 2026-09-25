@@ -70,6 +70,7 @@ const sources = {
   bunkerUri: process.env.NVOY_BUNKER_URI_SOURCE || '',
   bunkerClient: process.env.NVOY_BUNKER_CLIENT_SOURCE || '',
   workerProvider: process.env.NVOY_WORKER_PROVIDER_SOURCE || '',
+  harnessCredential: process.env.NVOY_HARNESS_CREDENTIAL_SOURCE || '',
 }
 const brokerSources = [sources.bunkerUri, sources.bunkerClient]
 if (brokerSources.some(Boolean)) {
@@ -86,5 +87,16 @@ if (m.workerEnabled) {
   provisionSecret(sources.workerProvider, `${workerCredDir}/provider`, m.workerUid, m.workerHandoffGid, 'worker provider')
 } else if (sources.workerProvider) {
   die('worker-disabled runtime refuses a provider credential source')
+}
+// The harness is the worker UID's interactive Claude Code session: a private login token and a
+// private, persistent home. Neither is shared with any other role.
+if (m.harness) {
+  if (!sources.harnessCredential) die('a harness runtime requires its Claude login credential source')
+  const harnessCredDir = '/run/nvoy-harness-credentials'
+  provision(harnessCredDir, 0, 0, 0o711, 'harness credential directory')
+  provisionSecret(sources.harnessCredential, `${harnessCredDir}/claude-oauth-token`, m.workerUid, m.workerUid, 'harness credential')
+  provision('/home/harness', m.workerUid, m.workerUid, 0o700, 'harness home')
+} else if (sources.harnessCredential) {
+  die('a runtime without a harness refuses a harness credential source')
 }
 console.log(`instance-runtime-init: provisioned ${m.id}`)

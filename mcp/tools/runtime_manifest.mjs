@@ -159,6 +159,17 @@ export function readManifest(root, requestedId) {
       die('macos_desktop requires the fixed Codex bundle, project/chat labels, and an absolute UI driver')
     }
   }
+  // A hosted harness is the agent's own Claude Code session, kept open beside the stack: the keyless
+  // Claude channel injects admitted envelopes into it, and it replies through the broker. It is the
+  // model-side consumer of a notify_only queue, so it can never coexist with a headless worker.
+  let harness = null
+  if (raw.harness != null) {
+    const runner = String(raw.harness?.runner || ''), credentialRef = String(raw.harness?.credential_ref || raw.harness?.credentialRef || '')
+    if (runner !== 'claude' || !credentialRef.startsWith('/')) die('harness requires runner "claude" and an absolute credential_ref')
+    if (brokerMode !== 'local' || deliveryMode !== 'notify_only' || workerEnabled) die('a harness requires a local-broker, worker-disabled notify_only manifest')
+    if ([keyRef, bunkerUriRef, bunkerClientRef].includes(credentialRef)) die('harness credential_ref must not name a Nostr credential')
+    harness = Object.freeze({ runner, credentialRef })
+  }
   if (brokerMode === 'remote') {
     if (!['codex_app_server', 'macos_desktop'].includes(deliveryMode) || codexTransport !== 'local_control_socket') die('a remote broker is valid only for an exact local Codex Desktop binding')
     if (!/^[a-z_][a-z0-9_-]{0,31}@[a-z0-9.-]+$/i.test(sshTarget) || !sshIdentityFile.startsWith('/') ||
@@ -167,7 +178,7 @@ export function readManifest(root, requestedId) {
     }
   }
   return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, carriers: Object.freeze(carriers), buzz, relays, stateDir, runtimeDir, spoolDir,
-    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, adapterContainer, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath, codexAppBundleId, codexProjectLabel, codexChatLabel, codexUiDriver,
+    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, adapterContainer, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath, codexAppBundleId, codexProjectLabel, codexChatLabel, codexUiDriver, harness,
     sshTarget, sshIdentityFile, sshKnownHostsFile, sshKnownHostsSha256, approvalEndpoint: approvalEndpoint.replace(/\/$/, '') })
 }
 
