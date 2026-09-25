@@ -73,7 +73,9 @@ if (!Number.isInteger(handshakeMs) || handshakeMs < 1000 || handshakeMs > 360000
 
 // One participant identity may bind one live Claude channel only. A second session would receive
 // the same marker and become a duplicate responder. Reclaim only a lock whose recorded PID is
-// demonstrably gone; malformed/foreign locks fail closed.
+// demonstrably gone; malformed/foreign locks fail closed. A lock naming this very process is stale:
+// PIDs restart in a new container, so a restarted stack can hand the new channel the PID its
+// predecessor recorded, and "that PID is alive" is then only this process looking at itself.
 const lockPath = resolve(channelStateDir, 'channel.lock')
 function claimLock() {
   try {
@@ -89,7 +91,7 @@ function claimLock() {
     prior = JSON.parse(readFileSync(lockPath, 'utf8'))
   } catch (error) { throw new Error(`cannot validate existing channel lock: ${error.message}`) }
   if (prior?.version !== 1 || prior?.instance !== manifest.id || !Number.isInteger(prior?.pid) || prior.pid < 1) throw new Error('channel lock does not bind this instance')
-  try { process.kill(prior.pid, 0); throw new Error(`Claude channel already runs as pid ${prior.pid}`) }
+  if (prior.pid !== process.pid) try { process.kill(prior.pid, 0); throw new Error(`Claude channel already runs as pid ${prior.pid}`) }
   catch (error) { if (error.code !== 'ESRCH') throw error }
   unlinkSync(lockPath)
   claimLock()
