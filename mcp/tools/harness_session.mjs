@@ -4,12 +4,15 @@
 
 import { existsSync, readdirSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { sshChannelEntry } from './channel_client.mjs'
 
 export const serverName = manifest => `nvoy-${manifest.id}`
 
 // The channel runs as the session's own MCP child, under the same worker UID that the SSH forced
-// command would use, so it keeps exactly the queue permissions that path has.
-export function mcpConfig({ manifest, root }) {
+// command would use, so it keeps exactly the queue permissions that path has. Off the fleet it is
+// that SSH forced command, reached with the same entry claude-channel-doctor renders for a client.
+export function mcpConfig({ manifest, root, remote = null }) {
+  if (remote) return { mcpServers: { [serverName(manifest)]: sshChannelEntry(remote) } }
   return { mcpServers: { [serverName(manifest)]: {
     command: 'node',
     args: ['/srv/nvoy/mcp/tools/claude-channel.mjs', '--instance', manifest.id],
@@ -48,7 +51,7 @@ export function defaultInstructions(manifest) {
   return [
     `# ${manifest.id}`,
     '',
-    `You are the participant \`${manifest.id}\` (Nostr key \`${manifest.pubkey.slice(0, 12)}…\`), taking part in a group chat`,
+    `You are the participant \`${manifest.id}\`${manifest.pubkey ? ` (Nostr key \`${manifest.pubkey.slice(0, 12)}…\`)` : ''}, taking part in a group chat`,
     `with people and other agents${channels.length ? ` in Buzz channel ${channels.map(c => `\`${c}\``).join(', ')}` : ''}.`,
     '',
     'Messages reach you through the Nvoy channel as opaque envelope markers. Read each one with',
