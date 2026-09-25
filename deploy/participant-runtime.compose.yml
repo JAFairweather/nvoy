@@ -28,6 +28,9 @@ services:
       # @worker-begin
       NVOY_WORKER_PROVIDER_SOURCE: /run/secrets/worker-provider
       # @worker-end
+      # @harness-begin
+      NVOY_HARNESS_CREDENTIAL_SOURCE: /run/secrets/harness-credential
+      # @harness-end
     command: ["node", "mcp/tools/instance-runtime-init.mjs", "--instance", "${INSTANCE_ID:?}"]
     volumes:
       - type: bind
@@ -51,6 +54,14 @@ services:
         source: worker_credentials
         target: /run/nvoy-worker-credentials
       # @worker-end
+      # @harness-begin
+      - type: volume
+        source: harness_credentials
+        target: /run/nvoy-harness-credentials
+      - type: volume
+        source: harness_home
+        target: /home/harness
+      # @harness-end
     secrets:
       - source: nvoy_bunker_uri
         target: bunker-uri
@@ -60,6 +71,10 @@ services:
       - source: nvoy_worker_provider
         target: worker-provider
       # @worker-end
+      # @harness-begin
+      - source: nvoy_harness_credential
+        target: harness-credential
+      # @harness-end
     restart: "no"
 
   watcher:
@@ -178,6 +193,45 @@ services:
         condition: service_started
     restart: unless-stopped
   # @worker-end
+  # @harness-begin
+  # The agent's own Claude Code session, held open in tmux. The keyless Claude channel runs as its
+  # MCP child under the worker UID and injects admitted envelopes; replies go back only as receipt
+  # ids through the reply queue, so the broker still rechecks the grant and signs. No Nostr
+  # credential reaches this container. Attach to watch it:
+  #   docker exec -it <container> tmux -S /tmp/harness.sock attach -r
+  harness:
+    image: ${WORKER_IMAGE:?}
+    user: "${WORKER_UID:?}:${WORKER_HANDOFF_GID:?}"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp:mode=1777]
+    environment:
+      NVOY_INSTANCE_ROOT: /etc/nvoy/instances
+      NVOY_HARNESS_CREDENTIAL_FILE: /run/nvoy-harness-credentials/claude-oauth-token
+      HOME: /home/harness
+    command: ["node", "mcp/tools/instance-harness.mjs", "--instance", "${INSTANCE_ID:?}"]
+    volumes:
+      - type: bind
+        source: ${MANIFEST_DIR:?}
+        target: /etc/nvoy/instances
+        read_only: true
+      - type: volume
+        source: adapter_runtime
+        target: ${RUNTIME_DIR:?}
+      - type: volume
+        source: harness_credentials
+        target: /run/nvoy-harness-credentials
+        read_only: true
+      - type: volume
+        source: harness_home
+        target: /home/harness
+    depends_on:
+      adapter:
+        condition: service_started
+    restart: unless-stopped
+  # @harness-end
 
 secrets:
   nvoy_bunker_uri:
@@ -190,6 +244,12 @@ secrets:
   nvoy_worker_provider:
     file: ${WORKER_CREDENTIAL_FILE:?}
   # @worker-end
+  # @harness-begin
+  # A Claude Code login token (`claude setup-token`) for the hosted harness. It is not a Nostr key
+  # and reaches only the harness, as a worker-owned copy.
+  nvoy_harness_credential:
+    file: ${HARNESS_CREDENTIAL_FILE:?}
+  # @harness-end
 
 volumes:
   watcher_spool: {}
@@ -199,3 +259,9 @@ volumes:
   # @worker-begin
   worker_credentials: {}
   # @worker-end
+  # @harness-begin
+  harness_credentials: {}
+  # The session's home, conversation history included, survives restarts: this is one specific,
+  # continuing session, not a fresh one per task.
+  harness_home: {}
+  # @harness-end

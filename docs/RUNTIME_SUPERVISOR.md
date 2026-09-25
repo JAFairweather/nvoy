@@ -478,6 +478,69 @@ Legacy deliveries without that authority attestation remain **untrusted data, ne
 the runner can propose reply text but cannot select a recipient or sign. For a deterministic
 deployment test, `--reply 'text'` bypasses the LLM and proves the same brokered egress path.
 
+### Hosted Claude Code harness
+
+The channel above still needs someone to keep a Claude Code session open against it. A manifest
+with a `harness` block moves that session onto the broker host, as a `harness` service in the
+identity's own Compose stack. The agent that answers is that one persistent Claude Code session,
+with its own conversation, not a model call per message:
+
+```json
+"harness": { "runner": "claude", "credential_ref": "/etc/nvoy/credentials/claude-jaf.claude-oauth" }
+```
+
+- **When it is valid.** Only on a local-broker, worker-disabled, `notify_only` manifest. The
+  harness is the model-side consumer of that queue, so it never sits beside a headless worker or a
+  Codex app-server binding. `credential_ref` must be absolute and must not name a Nostr credential.
+- **What it is.** The harness uses the release worker image, which carries the pinned Claude Code
+  CLI and `tmux`, and it runs as the manifest's worker UID with the handoff group. It is read-only
+  and has no capabilities. It mounts the adapter runtime (the queue), a read-only copy of the
+  Claude login, and a persistent `harness_home` volume. It mounts no Nostr credential, no state
+  and no spool.
+- **How messages reach it.** `claude-channel.mjs` runs as the session's own MCP child, under the
+  same UID and GID as the SSH forced command, so it has exactly that path's queue permissions.
+  - The session starts with `--dangerously-load-development-channels server:nvoy-<id>`,
+    `--mcp-config` and `--strict-mcp-config`, so it loads that one server and no ambient MCP
+    configuration.
+  - An admitted envelope is injected into the session. The session reads it with
+    `nvoy_channel_read` and answers with `nvoy_channel_reply`.
+  - The broker still rechecks the grant, signs, and posts. The harness never signs.
+- **How it stays up.** `instance-harness.mjs` supervises the session.
+  - It writes the first-run and folder-trust flags, the permission settings, the MCP config, and
+    a default `workspace/CLAUDE.md` if none exists. Each file is owner-only.
+  - It starts `claude` in tmux, with the login token passed only in the tmux environment.
+  - It answers only the fixed startup screens: the development-channel warning, and folder trust
+    or theme if they appear. It stops reading the screen once the session is ready.
+  - A login screen is fatal and is logged. It is never answered.
+  - If the session exits, it is restarted with `--continue`, so it resumes the same conversation.
+    Restarts back off from 5 s to a 5 min cap.
+- **Permissions.** Nobody is at the keyboard, so a permission prompt would stall the session. The
+  seeded `~/.claude/settings.json` allows `mcp__nvoy-<id>` and sets `defaultMode: "dontAsk"`,
+  which refuses anything unlisted. The seed never grants a bypass mode, and it keeps any rules or
+  mode an operator has already put in that persistent file.
+- **Watching it, read-only:**
+  `docker exec -it nvoy-<id>-harness-1 tmux -S /tmp/harness.sock attach -r`
+
+Turning it on for an identity (operator steps; none of this runs by itself):
+
+1. **Create the login.** Run `claude setup-token` under the Claude account that should answer.
+   Channels need claude.ai or Console authentication. A Team or Enterprise organization must
+   also enable `channelsEnabled` in its managed settings.
+2. **Store the token on the broker host.** Save it as a root-owned `0600` file at the
+   `credential_ref` path. Never paste it into a chat, a log or the manifest.
+3. **Add the `harness` block to the manifest.**
+4. **Baseline the queue.** Do this once, before the first start, so records that are already
+   waiting are not injected as a burst. Use the `--baseline` command above.
+5. **Let the next release reconcile the stack**, or redeploy it. The init container copies the
+   token into the worker-owned credential volume. The reconciler renders the harness with the
+   release worker digest and expects its service to be running.
+6. **Retire the old remote clients.** Remove the SSH forced-command key and any desktop channel
+   configuration for this identity. The channel's PID lock refuses a second live session
+   anyway, so whichever holds the lock first answers.
+
+The first live check is a mention in the channel. The session reads it with `nvoy_channel_read`,
+and a kind:9 reply appears under the identity's own key.
+
 ### Docker reference deployment
 
 [`deploy/participant-runtime.compose.yml`](../deploy/participant-runtime.compose.yml) is the

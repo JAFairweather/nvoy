@@ -109,7 +109,7 @@ def instances() -> list[dict]:
         enabled = delivery == "headless" if configured is None else configured
         if not isinstance(enabled, bool):
             raise RuntimeError(f"{path.name}: worker_enabled must be boolean")
-        result.append({"id": raw["id"], "worker": enabled})
+        result.append({"id": raw["id"], "worker": enabled, "harness": raw.get("harness") is not None})
     if not result:
         raise RuntimeError(f"no instance manifests in {ROOT}")
     return result
@@ -124,13 +124,13 @@ def verify_compose(path: Path, instance: dict, runtime_ref: str, worker_ref: str
     rendered = compose(path, ["config"], True)
     if runtime_ref not in rendered:
         raise RuntimeError(f"{instance['id']}: rendered Compose lost runtime digest")
-    if instance["worker"] and worker_ref not in rendered:
+    if (instance["worker"] or instance["harness"]) and worker_ref not in rendered:
         raise RuntimeError(f"{instance['id']}: rendered Compose lost worker digest")
 
 
 def verify_running(path: Path, instance: dict) -> None:
     running = set(compose(path, ["ps", "--status", "running", "--services"], True).split())
-    expected = ["watcher", "broker", "adapter"] + (["worker"] if instance["worker"] else [])
+    expected = ["watcher", "broker", "adapter"] + (["worker"] if instance["worker"] else []) + (["harness"] if instance["harness"] else [])
     missing = [service for service in expected if service not in running]
     if missing:
         raise RuntimeError(f"{instance['id']}: services not running: {', '.join(missing)}")
@@ -164,7 +164,7 @@ def render(instance: dict, runtime_ref: str, worker_ref: str) -> str:
             "-e", f"NVOY_INSTANCE_ROOT={ROOT}", "-v", f"{ROOT}:{ROOT}:ro", runtime_ref,
             "node", "mcp/tools/render-instance-compose.mjs", "--instance", instance["id"],
             "--image", runtime_ref]
-    if instance["worker"]:
+    if instance["worker"] or instance["harness"]:
         args.extend(["--worker-image", worker_ref])
     return run(args, capture=True) + "\n"
 
