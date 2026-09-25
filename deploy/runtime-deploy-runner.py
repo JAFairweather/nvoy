@@ -4,10 +4,15 @@
 The host needs only Python, Git, Docker, and the Compose plugin. Node and application packages
 stay inside the candidate image. GitHub has no host credential; this runner pulls from main after
 the release workflow has passed, stages every identity, and rolls back the complete touched set.
+
+It runs on two events: a short timer tick, which asks GitHub for a release only while `main` has
+moved past the deployed commit, and a change under the manifest root (nvoy-runtime-deploy.path),
+which recreates the identity whose manifest changed.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -30,10 +35,39 @@ DRY_RUN = ENV.get("DRY_RUN") == "1"
 SETTLE_MS = int(ENV.get("NVOY_SETTLE_MS", "3000"))
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 IMAGE_REF = re.compile(r"^[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$", re.I)
+# The timer ticks every 30 s. A full release lookup still happens at least this often, so a re-run
+# release workflow is found even when `main` has not moved.
+LOOKUP_EVERY_S = int(ENV.get("NVOY_LOOKUP_EVERY_S", "600"))
+# GitHub creates a release run within seconds of a push; a commit outside the workflow's paths gets
+# none, so stop asking about it after this.
+NO_RELEASE_S = 120
+# A failed attempt at the same release and manifests is not retried every tick; a transient fault
+# (a registry blip) is retried after this, and any manifest edit or new release retries at once.
+RETRY_AFTER_S = int(ENV.get("NVOY_RETRY_AFTER_S", "600"))
 
 
 def log(message: str) -> None:
     print(f"nvoy-deploy: {message}", flush=True)
+
+
+def read_json(path: Path) -> dict | None:
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def write_json(path: Path, value: dict) -> None:
+    atomic_write(path, json.dumps(value, sort_keys=True) + "\n")
+
+
+# A 30 s tick must not fill the journal: an outcome is logged when it differs from the last one.
+def outcome(key: str, message: str) -> None:
+    last = STATE / "LAST_OUTCOME"
+    if (last.read_text().strip() if last.exists() else "") != key:
+        log(message)
+    atomic_write(last, key + "\n")
 
 
 def alarm(message: str) -> None:
@@ -57,28 +91,66 @@ def github_json(url: str) -> dict:
         return json.load(response)
 
 
-def release_sha() -> str:
+def release_sha() -> tuple[str, list[dict]]:
     # Test-only seam is deliberately named as such; production NVOY_RELEASE_SHA is only an
     # assertion against GitHub's latest successful main workflow, never an authorization bypass.
     if ENV.get("NVOY_TEST_RELEASE_SHA"):
-        return ENV["NVOY_TEST_RELEASE_SHA"].lower()
+        return ENV["NVOY_TEST_RELEASE_SHA"].lower(), []
     # Unfiltered, newest first, and chosen here: GitHub's status=success filter is served from a
     # search index that silently omits runs — on 2026-09-24 it returned 4 of ~60 successful ones,
     # one of them a release older than this runner, which is how the Aug 28 downgrade happened.
     url = f"https://api.github.com/repos/{SLUG}/actions/workflows/{WORKFLOW}/runs?branch=main&per_page=30"
-    release = pick_release(github_json(url).get("workflow_runs") or [])
+    runs = github_json(url).get("workflow_runs") or []
+    release = pick_release(runs)
     if not release:
         raise RuntimeError("no completed successful main release workflow")
     sha = str(release.get("head_sha", "")).lower()
     expected = ENV.get("NVOY_RELEASE_SHA", "").lower()
     if expected and expected != sha:
         raise RuntimeError(f"launcher SHA {expected} is not the latest successful release {sha}")
-    return sha
+    return sha, runs
 
 
 def pick_release(runs: list[dict]) -> dict | None:
     return next((r for r in runs if r.get("status") == "completed" and r.get("conclusion") == "success"
                  and r.get("head_branch") == "main"), None)
+
+
+# `git ls-remote` is not a GitHub API call, so it is cheap enough for every tick.
+def remote_main() -> str:
+    try:
+        words = run([GIT, "-C", str(HUB), "ls-remote", "origin", "refs/heads/main"], capture=True).split()
+    except subprocess.CalledProcessError:
+        return ""
+    head = words[0].lower() if words else ""
+    return head if HEX40.fullmatch(head) else ""
+
+
+# Whether asking GitHub about this `main` head can stop: its release run has finished, or none
+# came for it (a commit outside the release paths). Runs are newest first.
+def head_status(seen: dict, head: str, runs: list[dict], now: float) -> dict:
+    first = seen.get("first_seen", now) if seen.get("head") == head else now
+    mine = [r for r in runs if str(r.get("head_sha", "")).lower() == head and r.get("head_branch") == "main"]
+    finished = bool(mine) and mine[0].get("status") == "completed"
+    return {"head": head, "first_seen": first, "looked_up": now,
+            "settled": finished or (not mine and now - first > NO_RELEASE_S)}
+
+
+# A release is a main commit, so while `main` sits at the deployed commit, or at a head whose
+# release run has settled, there is nothing new to ask GitHub about.
+def current_release(deployed: str) -> str:
+    head, seen, now = remote_main(), read_json(STATE / "REMOTE_HEAD.json") or {}, time.time()
+    fresh = seen.get("head") == head and now - float(seen.get("looked_up", 0)) < LOOKUP_EVERY_S
+    if HEX40.fullmatch(deployed) and head and fresh and (head == deployed or seen.get("settled")):
+        return deployed
+    sha, runs = release_sha()
+    if head:
+        write_json(STATE / "REMOTE_HEAD.json", head_status(seen, head, runs, now))
+    return sha
+
+
+def manifest_digests() -> dict[str, str]:
+    return {path.stem: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(ROOT.glob("*.json"))}
 
 
 def is_ancestor(older: str, newer: str) -> bool:
@@ -183,13 +255,19 @@ def main() -> None:
         log("another deploy tick is active — leaving it to finish")
         return
     restore_to = None
+    attempt = ""
+    failed_file = STATE / "FAILED_ATTEMPT.json"
     try:
-        sha = release_sha()
-        if not HEX40.fullmatch(sha):
-            raise RuntimeError(f"release workflow returned invalid SHA {sha}")
         deployed_file = STATE / "DEPLOYED_SHA"
         deployed = deployed_file.read_text().strip() if deployed_file.exists() else ""
+        sha = current_release(deployed)
+        if not HEX40.fullmatch(sha):
+            raise RuntimeError(f"release workflow returned invalid SHA {sha}")
         identity_list = instances()
+        digests = manifest_digests()
+        manifests_file = STATE / "DEPLOYED_MANIFESTS.json"
+        recorded = read_json(manifests_file)
+        recreate: set[str] = set()
         # Releases only move forward. An older answer from the release lookup keeps the deployed
         # release (and still health-checks it); a release off the deployed line is refused.
         if HEX40.fullmatch(deployed) and sha != deployed:
@@ -203,10 +281,31 @@ def main() -> None:
             try:
                 for instance in identity_list:
                     verify_running(ROOT / f"{instance['id']}.compose.yml", instance)
-                log(f"already current and healthy at {sha[:12]}")
-                return
+                healthy = True
             except Exception as error:  # health fault must reconcile, not become a quiet no-op
                 print(f"nvoy-deploy: current release is unhealthy ({error}) — reconciling it", file=sys.stderr)
+                healthy = False
+            if healthy and recorded is None:
+                # A host upgrading to this runner has no record of what its stacks were started
+                # from; take today's manifests as that record rather than recreating everything.
+                write_json(manifests_file, digests)
+                log(f"already current and healthy at {sha[:12]} — manifest baseline recorded")
+                return
+            # The services read their manifest when they start, and an unchanged Compose file
+            # makes `up -d` a no-op, so an edited manifest's identity is recreated explicitly.
+            recreate = {i for i, d in digests.items() if recorded is not None and recorded.get(i) != d}
+            if healthy and not recreate:
+                outcome(f"current {sha}", f"already current and healthy at {sha[:12]}")
+                return
+            if recreate:
+                log(f"manifest changed for {', '.join(sorted(recreate))} — reconciling at {sha[:12]}")
+
+        attempt = f"{sha} {hashlib.sha256(json.dumps(digests, sort_keys=True).encode()).hexdigest()}"
+        failed = read_json(failed_file) or {}
+        if failed.get("attempt") == attempt and time.time() - float(failed.get("at", 0)) < RETRY_AFTER_S:
+            outcome(f"held {attempt}", f"{sha[:12]} with these manifests failed at {time.strftime('%H:%M:%S', time.localtime(float(failed['at'])))}"
+                    f" — retrying after {RETRY_AFTER_S}s, or at once on a manifest edit or a new release")
+            return
 
         run([GIT, "-C", str(HUB), "fetch", "--quiet", "origin", "main"])
         run([GIT, "-C", str(HUB), "cat-file", "-e", f"{sha}^{{commit}}"])
@@ -248,7 +347,8 @@ def main() -> None:
                 # Record the attempt before crossing that process boundary so rollback includes
                 # the identity whose `up` failed, not only earlier successful identities.
                 changed.append(instance)
-                compose(staged, ["up", "-d", "--remove-orphans"])
+                compose(staged, ["up", "-d", "--remove-orphans"]
+                        + (["--force-recreate"] if instance["id"] in recreate else []))
                 settle()
                 verify_running(staged, instance)
         except Exception as error:
@@ -272,8 +372,16 @@ def main() -> None:
         atomic_write(STATE / "DEPLOYED_RUNTIME_IMAGE", runtime_ref + "\n")
         atomic_write(STATE / "DEPLOYED_WORKER_IMAGE", worker_ref + "\n")
         atomic_write(deployed_file, sha + "\n")
+        write_json(manifests_file, digests)
+        failed_file.unlink(missing_ok=True)
+        (STATE / "LAST_OUTCOME").unlink(missing_ok=True)
         restore_to = None
         log(f"deploy OK — {len(identity_list)} identity(s) verified at {sha[:12]}")
+    except Exception:
+        if attempt:
+            write_json(failed_file, {"attempt": attempt, "at": time.time()})
+            (STATE / "LAST_OUTCOME").unlink(missing_ok=True)
+        raise
     finally:
         if restore_to and restore_to != sha:
             try:
