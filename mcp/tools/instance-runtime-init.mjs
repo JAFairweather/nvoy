@@ -4,7 +4,7 @@
 // credentials, copies them into separate role-owned volumes, and exits before watcher/broker/
 // adapter/worker start; each later role is non-root and gets only its own credential mount.
 
-import { mkdirSync, lstatSync, chownSync, chmodSync, statSync, openSync, closeSync, readFileSync, writeFileSync, renameSync } from 'node:fs'
+import { mkdirSync, lstatSync, chownSync, chmodSync, statSync, openSync, closeSync, readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 
 const die = m => { console.error(`instance-runtime-init: ${m}`); process.exit(1) }
@@ -91,10 +91,12 @@ if (m.workerEnabled) {
 // The harness is the worker UID's interactive Claude Code session: a private login token and a
 // private, persistent home. Neither is shared with any other role.
 if (m.harness) {
-  if (!sources.harnessCredential) die('a harness runtime requires its Claude login credential source')
+  if (!sources.harnessCredential) die('a harness runtime requires its model login credential source')
   const harnessCredDir = '/run/nvoy-harness-credentials'
   provision(harnessCredDir, 0, 0, 0o711, 'harness credential directory')
-  provisionSecret(sources.harnessCredential, `${harnessCredDir}/claude-oauth-token`, m.workerUid, m.workerUid, 'harness credential')
+  provisionSecret(sources.harnessCredential, `${harnessCredDir}/credential`, m.workerUid, m.workerUid, 'harness credential')
+  // The copy's name before it covered Codex keys; a leftover would be a stale login.
+  rmSync(`${harnessCredDir}/claude-oauth-token`, { force: true })
   provision('/home/harness', m.workerUid, m.workerUid, 0o700, 'harness home')
 } else if (sources.harnessCredential) {
   die('a runtime without a harness refuses a harness credential source')

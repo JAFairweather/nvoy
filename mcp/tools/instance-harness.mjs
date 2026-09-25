@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Keep one agent's own Claude Code session open, with the Nvoy channel loaded into it.
+// Keep one agent's own Claude Code session open, with the Nvoy channel loaded into it. A Codex
+// harness is the same idea behind `codex app-server`; see codex_harness.mjs.
 //
 // The session runs in tmux so it has a terminal and nobody has to hold one. It is the SAME session
 // across restarts: its home is a persistent volume, and it resumes with --continue. The supervisor
@@ -11,6 +12,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'n
 import { spawnSync } from 'node:child_process'
 import { resolve } from 'node:path'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
+import { runCodexHarness } from './codex_harness.mjs'
 import { classifyPane, claudeArgs, defaultInstructions, hasPriorSession, mcpConfig, seedClaudeJson, seedSettings, serverName } from './harness_session.mjs'
 
 const die = message => { console.error(`instance-harness: ${message}`); process.exit(1) }
@@ -27,8 +29,18 @@ if (process.getuid?.() !== manifest.workerUid) die('the harness must run as the 
 const home = process.env.HOME || ''
 if (!home.startsWith('/')) die('HOME must be the absolute, persistent harness home')
 let token
-try { token = readFileSync(process.env.NVOY_HARNESS_CREDENTIAL_FILE || '/run/nvoy-harness-credentials/claude-oauth-token', 'utf8').trim() } catch (error) { die(`Claude login credential unreadable: ${error.code || error.message}`) }
-if (!token || /\s/.test(token)) die('Claude login credential is empty or malformed')
+const credentialName = manifest.harness.runner === 'codex' ? 'OpenAI API key' : 'Claude login credential'
+try { token = readFileSync(process.env.NVOY_HARNESS_CREDENTIAL_FILE || '/run/nvoy-harness-credentials/credential', 'utf8').trim() } catch (error) { die(`${credentialName} unreadable: ${error.code || error.message}`) }
+if (!token || /\s/.test(token)) die(`${credentialName} is empty or malformed`)
+
+// Codex has no terminal session to hold: `codex app-server` keeps the thread, and the supervisor
+// injects each admitted envelope into it as a turn.
+if (manifest.harness.runner === 'codex') {
+  let stopping = false
+  for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => { stopping = true; process.exit(0) })
+  await runCodexHarness({ manifest, root, home, credential: token, log, stopping: () => stopping })
+  process.exit(0)
+}
 
 const server = serverName(manifest)
 const workdir = resolve(home, 'workspace')

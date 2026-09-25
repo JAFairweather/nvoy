@@ -1,11 +1,12 @@
-// Hosted Claude Code harness: the manifest block that turns it on, the Compose service it renders,
+// Hosted Claude Code and Codex harnesses: the manifest block that turns it on, the Compose service it renders,
 // the files that let one persistent session start unattended, and the supervisor's refusals.
-// tmux and Claude Code are not driven here; the first live session is the operator's check.
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
+// tmux and Claude Code are not driven here; a fake `codex app-server` drives the Codex supervisor.
+// The first live session is the operator's check.
+import { appendFileSync, chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { spawnSync } from 'node:child_process'
-import { classifyPane, claudeArgs, defaultInstructions, hasPriorSession, mcpConfig, seedClaudeJson, seedSettings, serverName } from '../mcp/tools/harness_session.mjs'
+import { spawn, spawnSync } from 'node:child_process'
+import { classifyPane, claudeArgs, codexConfigToml, codexTurnText, defaultInstructions, hasPriorSession, mcpConfig, pendingEnvelopes, seedClaudeJson, seedSettings, serverName } from '../mcp/tools/harness_session.mjs'
 
 let fails = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); if (!value) fails++ }
@@ -41,7 +42,9 @@ const parse = manifest => spawnSync(process.execPath, ['--input-type=module', '-
 const accepted = parse({ ...base('mc-test'), harness })
 ok('a local-broker, worker-disabled notify_only manifest accepts a Claude harness', accepted.status === 0 && JSON.parse(accepted.stdout).credentialRef === harness.credential_ref)
 ok('a manifest without a harness block has none', parse(base('mc-test')).stdout.trim() === 'null')
-ok('a harness must name the Claude runner', parse({ ...base('mc-test'), harness: { ...harness, runner: 'codex' } }).status !== 0)
+ok('a harness may name the Codex runner', JSON.parse(parse({ ...base('mc-test'), harness: { ...harness, runner: 'codex' } }).stdout).runner === 'codex')
+ok('a harness must name the Claude or Codex runner', parse({ ...base('mc-test'), harness: { ...harness, runner: 'gemini' } }).status !== 0 &&
+  parse({ ...base('mc-test'), harness: { ...harness, runner: '' } }).status !== 0)
 ok('a harness credential reference must be absolute', parse({ ...base('mc-test'), harness: { ...harness, credential_ref: 'claude-oauth' } }).status !== 0)
 ok('a harness credential cannot be one of the Nostr credentials', /must not name a Nostr credential/.test(parse({ ...base('mc-test'), harness: { ...harness, credential_ref: '/etc/nvoy/credentials/mc-test.bunker' } }).stderr))
 ok('a harness cannot sit beside a headless model worker', parse({ ...base('mc-test'), harness, delivery_mode: 'headless', worker_enabled: true,
@@ -126,19 +129,128 @@ ok('the supervisor refuses a manifest without a harness block', noHarness.status
 const wrongUid = run('instance-harness.mjs', { ...base('mc-test'), harness }, [], { HOME: join(root, 'h2') })
 ok('the supervisor refuses to run under any UID but the manifest-bound worker', wrongUid.status !== 0 && /worker user/.test(wrongUid.stderr))
 const supervisor = readFileSync('mcp/tools/instance-harness.mjs', 'utf8')
-ok('the login token reaches the session only through the tmux environment, never an argv or a log', /CLAUDE_CODE_OAUTH_TOKEN: token/.test(supervisor) &&
+ok('the login token reaches the session only through the tmux environment or the Codex supervisor, never an argv or a log', /CLAUDE_CODE_OAUTH_TOKEN: token/.test(supervisor) &&
   (() => {
     const uses = supervisor.split('\n').filter(line => /\btoken\b/.test(line) && !/^\s*\/\/|let token|token = readFileSync|!token/.test(line))
-    return uses.length === 1 && uses[0].includes('CLAUDE_CODE_OAUTH_TOKEN: token')
+    return uses.length === 2 && uses[0].includes('credential: token') && uses[1].includes('CLAUDE_CODE_OAUTH_TOKEN: token')
   })())
+const codexSupervisor = readFileSync('mcp/tools/codex_harness.mjs', 'utf8')
+ok('the Codex supervisor hands the API key only to the app-server environment', (() => {
+  const uses = codexSupervisor.split('\n').filter(line => /\bcredential\b/.test(line) && !/^\s*\/\//.test(line))
+  return uses.length === 2 && /runCodexHarness\(\{[^}]*credential,/.test(uses[0]) && uses[1].includes('OPENAI_API_KEY: credential')
+})())
 ok('the supervisor writes the session files owner-only', /writeFileSync\(path, value, \{ mode: 0o600 \}\); chmodSync\(path, 0o600\)/.test(supervisor))
 const init = readFileSync('mcp/tools/instance-runtime-init.mjs', 'utf8')
-ok('the initializer copies the login to a worker-owned file and refuses a stray login source', /provisionSecret\(sources\.harnessCredential, `\$\{harnessCredDir\}\/claude-oauth-token`, m\.workerUid, m\.workerUid/.test(init) &&
-  /a runtime without a harness refuses a harness credential source/.test(init))
+ok('the initializer copies the login to a worker-owned file, drops the pre-Codex copy, and refuses a stray login source', /provisionSecret\(sources\.harnessCredential, `\$\{harnessCredDir\}\/credential`, m\.workerUid, m\.workerUid/.test(init) &&
+  /a runtime without a harness refuses a harness credential source/.test(init) && /rmSync\(`\$\{harnessCredDir\}\/claude-oauth-token`, \{ force: true \}\)/.test(init))
 ok('the worker image carries tmux for the session terminal', /apt-get install -y --no-install-recommends ca-certificates tmux/.test(readFileSync('deploy/nvoy-worker.Dockerfile', 'utf8')))
 const runner = readFileSync('deploy/runtime-deploy-runner.py', 'utf8')
 ok('the fleet reconciler renders a harness with the release worker image and expects its service running', /"harness": raw\.get\("harness"\) is not None/.test(runner) &&
   /instance\["worker"\] or instance\["harness"\]/.test(runner) && /"harness"/.test(runner.slice(runner.indexOf('def verify_running'))))
+
+// Codex session files
+const codexManifest = { id: 'dj-test', pubkey: 'c'.repeat(64), buzz: { channels: [channel] } }
+const toml = codexConfigToml({ manifest: codexManifest, root: '/etc/nvoy/instances' })
+ok('the Codex config loads exactly the keyless Codex channel tools for this instance', (toml.match(/^\[mcp_servers\./gm) || []).length === 1 &&
+  toml.includes('[mcp_servers.nvoy-dj-test]') && toml.includes('args = ["/srv/nvoy/mcp/tools/codex-channel-mcp.mjs", "--instance", "dj-test"]') &&
+  toml.includes('env = { NVOY_INSTANCE_ROOT = "/etc/nvoy/instances" }'))
+ok('the Codex config reads the API key from the environment and never asks for an approval', /^model_provider = "nvoy-openai-api"$/m.test(toml) &&
+  /^env_key = "OPENAI_API_KEY"$/m.test(toml) && /^requires_openai_auth = false$/m.test(toml) && /^approval_policy = "never"$/m.test(toml) &&
+  /^sandbox_mode = "read-only"$/m.test(toml) && !/danger|full-access|sk-/i.test(toml))
+ok('a Codex model is set only when chosen', !/^model = /m.test(toml) && /^model = "gpt-5\.5"$/m.test(codexConfigToml({ manifest: codexManifest, root: '/r', model: 'gpt-5.5' })))
+const turn = codexTurnText({ envelope: 'd'.repeat(64), type: 'admitted-task' })
+ok('an injected turn carries only the envelope marker and how to read and answer it', turn.includes('d'.repeat(64)) && /nvoy_channel_read/.test(turn) &&
+  /nvoy_channel_reply/.test(turn) && turn.endsWith(`NVOY_ENVELOPE_ID=${'d'.repeat(64)}`))
+const queue = [JSON.stringify({ envelope: '1'.repeat(64), type: 'admitted-task', body: 'ignored' }), 'not json', JSON.stringify({ envelope: 'XYZ' }),
+  JSON.stringify({ envelope: '2'.repeat(64), type: 'verified-notification' }), JSON.stringify({ envelope: '1'.repeat(64), type: 'admitted-task' }),
+  JSON.stringify({ envelope: '3'.repeat(64), type: 'something-else' })].join('\n')
+ok('pending envelopes are well formed, oldest first, each once, and never repeat a delivered one',
+  JSON.stringify(pendingEnvelopes(queue, ['2'.repeat(64)])) === JSON.stringify([{ envelope: '1'.repeat(64), type: 'admitted-task' }, { envelope: '3'.repeat(64), type: 'admitted-task' }]) &&
+  pendingEnvelopes('', []).length === 0)
+
+// Codex supervisor, against a fake `codex app-server` that logs what it is sent
+const fakeBin = join(root, 'fake-bin')
+mkdirSync(fakeBin)
+writeFileSync(join(fakeBin, 'codex'), `#!/usr/bin/env node
+const { appendFileSync } = require('node:fs')
+const log = row => appendFileSync(process.env.CODEX_HOME + '/fake.jsonl', JSON.stringify(row) + '\\n')
+if (process.argv[2] !== 'app-server') process.exit(2)
+log({ start: true, keyed: process.env.OPENAI_API_KEY === 'sk-test-fake', env: Object.keys(process.env).sort() })
+const send = m => process.stdout.write(JSON.stringify(m) + '\\n')
+let turns = 0, buffer = ''
+process.stdin.on('end', () => process.exit(0))
+process.stdin.on('data', data => {
+  buffer += data
+  let at
+  while ((at = buffer.indexOf('\\n')) >= 0) {
+    const m = JSON.parse(buffer.slice(0, at)); buffer = buffer.slice(at + 1)
+    log(m)
+    if (m.method === 'initialize') send({ id: m.id, result: { userAgent: 'fake' } })
+    if (m.method === 'thread/start') send({ id: m.id, result: { thread: { id: '0199a213-81c0-7800-8aa1-bbab2a035a53' } } })
+    if (m.method === 'thread/resume') send({ id: m.id, result: { thread: { id: m.params.threadId } } })
+    if (m.method === 'turn/start') {
+      const id = 'turn-' + ++turns
+      send({ id: m.id, result: { turn: { id } } })
+      send({ id: 'srv-' + turns, method: 'item/tool/requestUserInput', params: {} })
+      setTimeout(() => send({ method: 'turn/completed', params: { threadId: m.params.threadId, turn: { id, status: 'completed', items: [] } } }), 20)
+    }
+  }
+})
+`)
+chmodSync(join(fakeBin, 'codex'), 0o755)
+const codexHarness = { runner: 'codex', credential_ref: '/etc/nvoy/credentials/dj-test.openai' }
+const djRoot = mkdtempSync(join(root, 'instances-'))
+const djManifest = { ...base('dj-test'), worker_uid: process.getuid(), harness: codexHarness }
+writeFileSync(join(djRoot, 'dj-test.json'), JSON.stringify(djManifest))
+mkdirSync(djManifest.runtime_dir, { recursive: true })
+const djQueue = join(djManifest.runtime_dir, 'admitted-tasks.jsonl')
+const envelope = n => String(n).repeat(64)
+writeFileSync(djQueue, JSON.stringify({ envelope: envelope(1), type: 'admitted-task' }) + '\n')
+writeFileSync(join(root, 'dj-cred'), 'sk-test-fake\n')
+const djHome = join(root, 'dj-home')
+const fakeLog = () => { try { return readFileSync(join(djHome, '.codex', 'fake.jsonl'), 'utf8').split('\n').filter(Boolean).map(JSON.parse) } catch { return [] } }
+const wait = ms => new Promise(done => setTimeout(done, ms))
+async function waitFor(test, ms = 10000) { const end = Date.now() + ms; while (Date.now() < end) { if (test()) return true; await wait(25) } return false }
+function startCodex() {
+  const child = spawn(process.execPath, ['mcp/tools/instance-harness.mjs', '--instance', 'dj-test'], { cwd: resolve('.'), env: { ...process.env,
+    NVOY_INSTANCE_ROOT: djRoot, HOME: djHome, NVOY_HARNESS_CREDENTIAL_FILE: join(root, 'dj-cred'), HARNESS_POLL_MS: '25', PATH: `${fakeBin}:${process.env.PATH}` } })
+  const run = { child, out: '' }
+  child.stdout.on('data', d => { run.out += d }); child.stderr.on('data', d => { run.out += d })
+  run.exited = new Promise(done => child.on('exit', done))
+  return run
+}
+const turnStarts = () => fakeLog().filter(m => m.method === 'turn/start')
+const first = startCodex()
+const firstReady = await waitFor(() => /session ready/.test(first.out))
+ok('the Codex supervisor starts a thread in the workspace, baselining what the queue already held', firstReady && /baselined 1 admitted/.test(first.out) &&
+  fakeLog().some(m => m.method === 'thread/start' && m.params.cwd === join(djHome, 'workspace')))
+appendFileSync(djQueue, JSON.stringify({ envelope: envelope(2), type: 'admitted-task' }) + '\n' + JSON.stringify({ envelope: envelope(3), type: 'verified-notification' }) + '\n')
+await waitFor(() => turnStarts().length >= 2 && /turn for 333333333333 ended: completed/.test(first.out))
+const injected = turnStarts()
+ok('each new admitted envelope is injected once, in order, as a turn on the same thread', injected.length === 2 &&
+  injected.every(m => m.params.threadId === '0199a213-81c0-7800-8aa1-bbab2a035a53') &&
+  injected[0].params.input[0].text === codexTurnText({ envelope: envelope(2), type: 'admitted-task' }) &&
+  injected[1].params.input[0].text === codexTurnText({ envelope: envelope(3), type: 'verified-notification' }) &&
+  injected[0].params.clientUserMessageId === `nvoy:${envelope(2)}` && !JSON.stringify(injected).includes(envelope(1)))
+ok('a request from Codex is declined, so nothing waits on a person', fakeLog().some(m => m.id === 'srv-1' && m.error && !m.result))
+const starts = fakeLog().filter(m => m.start)
+ok('the app-server gets the API key and a minimal environment', starts.length === 1 && starts[0].keyed &&
+  starts[0].env.filter(k => !/^(__CF|LC_|_$|SHLVL|PWD)/.test(k)).join(',') === 'CODEX_HOME,HOME,OPENAI_API_KEY,PATH')
+ok('the key reaches no log', !first.out.includes('sk-test-fake') && !readFileSync(join(djHome, '.nvoy-harness', 'delivered.jsonl'), 'utf8').includes('sk-test'))
+ok('the Codex config and instructions are written owner-only, and the instructions only when missing',
+  (statSync(join(djHome, '.codex', 'config.toml')).mode & 0o777) === 0o600 && existsSync(join(djHome, 'workspace', 'AGENTS.md')) &&
+  (statSync(join(djHome, '.nvoy-harness', 'codex-thread.json')).mode & 0o777) === 0o600)
+first.child.kill('SIGTERM'); await first.exited
+writeFileSync(join(djHome, 'workspace', 'AGENTS.md'), 'operator edit\n')
+const second = startCodex()
+await waitFor(() => /session ready/.test(second.out))
+appendFileSync(djQueue, JSON.stringify({ envelope: envelope(4), type: 'admitted-task' }) + '\n')
+await waitFor(() => turnStarts().length >= 3 && /turn for 444444444444 ended/.test(second.out))
+ok('a restart resumes the same thread and injects only what arrived since', /resumed the dj-test thread/.test(second.out) &&
+  fakeLog().some(m => m.method === 'thread/resume' && m.params.threadId === '0199a213-81c0-7800-8aa1-bbab2a035a53') &&
+  fakeLog().filter(m => m.method === 'thread/start').length === 1 && turnStarts().length === 3 && turnStarts()[2].params.input[0].text.includes(envelope(4)))
+ok('the operator\'s instructions survive a restart', readFileSync(join(djHome, 'workspace', 'AGENTS.md'), 'utf8') === 'operator edit\n')
+second.child.kill('SIGTERM'); await second.exited
 
 rmSync(root, { recursive: true, force: true })
 console.log(fails ? `\n${fails} FAILED` : '\nall passed')
