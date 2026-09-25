@@ -492,6 +492,8 @@ with its own conversation, not a model call per message:
 - **When it is valid.** Only on a local-broker, worker-disabled, `notify_only` manifest. The
   harness is the model-side consumer of that queue, so it never sits beside a headless worker or a
   Codex app-server binding. `credential_ref` must be absolute and must not name a Nostr credential.
+  An optional `model` (a Claude Code model name or alias, such as `claude-opus-5-5` or `opus`) is
+  passed as `--model`; without it the session uses Claude Code's default for that login.
 - **What it is.** The harness uses the release worker image, which carries the pinned Claude Code
   CLI and `tmux`, and it runs as the manifest's worker UID with the handoff group. It is read-only
   and has no capabilities. It mounts the adapter runtime (the queue), a read-only copy of the

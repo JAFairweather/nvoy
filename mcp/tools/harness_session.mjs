@@ -65,10 +65,11 @@ export function defaultInstructions(manifest) {
   ].join('\n')
 }
 
-export function claudeArgs({ server, mcpConfigPath, resume }) {
+export function claudeArgs({ server, mcpConfigPath, resume, model = '' }) {
   return [
     '--dangerously-load-development-channels', `server:${server}`,
     '--mcp-config', mcpConfigPath, '--strict-mcp-config',
+    ...(model ? ['--model', model] : []),
     ...(resume ? ['--continue'] : []),
   ]
 }
@@ -93,6 +94,7 @@ export function classifyPane(text) {
   if (/I am using this for local development/.test(s)) return { state: 'dev-channels', key: optionKey(s, 'I am using this for local development') }
   if (/trust the files in this folder|Quick safety check/i.test(s)) return { state: 'trust', key: optionKey(s, 'Yes, (?:I trust|proceed)') }
   if (/Choose the text style|text style that looks best/i.test(s)) return { state: 'theme', key: 'Enter' }
-  if (/\? for shortcuts/.test(s)) return { state: 'ready' }
+  // The idle prompt's footer: `? for shortcuts` up to 2.1.x, the permission-mode hint from 2.1.221.
+  if (/\? for shortcuts|\(shift\+tab to cycle\)/.test(s)) return { state: 'ready' }
   return { state: 'starting' }
 }
