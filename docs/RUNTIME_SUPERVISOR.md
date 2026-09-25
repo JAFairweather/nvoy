@@ -483,7 +483,12 @@ deployment test, `--reply 'text'` bypasses the LLM and proves the same brokered 
 The channel above still needs someone to keep a Claude Code session open against it. A manifest
 with a `harness` block moves that session onto the broker host, as a `harness` service in the
 identity's own Compose stack. The agent that answers is that one persistent Claude Code session,
-with its own conversation, not a model call per message:
+with its own conversation, not a model call per message.
+
+This is an interim placement. The design keeps only tools on the fleet host and runs each harness
+on a box of the owner's choosing, over the SSH forced command above; see
+[Harness placement](HARNESS_PLACEMENT.md). Retire a fleet harness only once a harness elsewhere is
+proven for that identity.
 
 ```json
 "harness": { "runner": "claude", "credential_ref": "/etc/nvoy/credentials/claude-jaf.claude-oauth" }
@@ -536,9 +541,10 @@ Turning it on for an identity (operator steps; none of this runs by itself):
 5. **Let the next release reconcile the stack**, or redeploy it. The init container copies the
    token into the worker-owned credential volume. The reconciler renders the harness with the
    release worker digest and expects its service to be running.
-6. **Retire the old remote clients.** Remove the SSH forced-command key and any desktop channel
-   configuration for this identity. The channel's PID lock refuses a second live session
-   anyway, so whichever holds the lock first answers.
+6. **Keep one live session.** Stop any other Claude session on this identity's channel. Leave
+   the SSH forced-command key in place: it is the transport a harness off the fleet uses, and the
+   migration in [Harness placement](HARNESS_PLACEMENT.md#migration) returns to it. The channel's
+   PID lock refuses a second live session anyway, so whichever holds the lock first answers.
 
 The first live check is a mention in the channel. The session reads it with `nvoy_channel_read`,
 and a kind:9 reply appears under the identity's own key.
@@ -552,7 +558,9 @@ and a kind:9 reply appears under the identity's own key.
 ```
 
 The manifest rules, the Compose service, the image and the mounts are the same as for Claude.
-The credential is an OpenAI API key.
+The credential is an OpenAI API key. That is a property of this interim fleet placement, not the
+design: a Codex harness is meant to run on the owner's ChatGPT subscription login, on a harness
+box ([Harness placement](HARNESS_PLACEMENT.md)).
 
 - **What it is.** The supervisor keeps one long-lived `codex app-server` on stdio and one thread.
   - The thread id is kept in the persistent home (`~/.nvoy-harness/codex-thread.json`).
@@ -579,9 +587,10 @@ The credential is an OpenAI API key.
     Codex asks the client before each call, the supervisor declines, and no reply is sent. The
     broker still rechecks the grant before it signs a reply.
   - `workspace/AGENTS.md` is written from the default instructions only when it is missing.
-- **Retire the other Codex paths first.** Before turning this on, stop any Mac `codex_app_server`
+- **Run one Codex consumer at a time.** Before turning this on, stop any Mac `codex_app_server`
   binding, desktop adapter or remote bridge for the identity. The Codex channel tools hold no
-  lock, so a second consumer would answer the same envelope.
+  lock, so a second consumer would answer the same envelope. Stop them; do not remove their SSH
+  forced-command keys, which are the transport a harness off the fleet uses.
 - **Watching it:** `docker logs nvoy-<id>-harness-1` shows each injected envelope prefix and how
   its turn ended.
 
