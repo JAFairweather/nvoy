@@ -44,7 +44,7 @@ export function connectWsPeer({ socketPath, onServerRequest = () => {}, timeoutM
       if (message.id != null && pending.has(message.id)) {
         const { resolve: done, reject } = pending.get(message.id)
         pending.delete(message.id)
-        return message.error ? reject(new Error(message.error.message || 'unknown error')) : done(message.result)
+        return message.error ? reject(Object.assign(new Error(message.error.message || 'unknown error'), { code: message.error.code })) : done(message.result)
       }
       if (message.method) for (const listener of listeners) listener(message)
     }

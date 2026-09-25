@@ -53,7 +53,7 @@ if (process.getuid?.() !== manifest.workerUid) die('Codex channel feed must run 
 
 const queuePath = resolve(manifest.runtimeDir, 'admitted-tasks.jsonl')
 let release
-try { release = claimPidLock(resolve(manifest.runtimeDir, 'codex-mcp-state', 'feed.lock'), manifest.id, 'Codex harness feed') } catch (error) { die(error.message) }
+try { release = claimPidLock(resolve(manifest.runtimeDir, 'codex-mcp-state', 'feed.lock'), manifest.id, 'Codex harness feed', { program: 'codex-channel-feed.mjs' }) } catch (error) { die(error.message) }
 process.on('exit', () => release())
 for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => process.exit(0))
 process.stdout.on('error', () => process.exit(0))

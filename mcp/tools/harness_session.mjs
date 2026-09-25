@@ -77,6 +77,30 @@ export function claudeArgs({ server, mcpConfigPath, resume, model = '' }) {
   ]
 }
 
+// Claude Code starts each MCP server once and never respawns it, so a channel whose process has
+// gone is gone for the session. `ps` is `pid ppid command` lines; the channel is a descendant of
+// the session's pane process whose command line ends with the channel entry's arguments.
+export function channelProcessUp(psText, rootPid, entryArgs) {
+  const tail = entryArgs.join(' '), children = new Map(), commands = new Map()
+  for (const line of String(psText || '').split('\n')) {
+    const match = line.match(/^\s*(\d+)\s+(\d+)\s(.*)$/)
+    if (!match) continue
+    const [, pid, ppid, command] = match
+    commands.set(pid, command.trim())
+    children.set(ppid, [...(children.get(ppid) || []), pid])
+  }
+  const queue = [...(children.get(String(rootPid)) || [])]
+  for (const seen = new Set(); queue.length;) {
+    const pid = queue.shift()
+    if (seen.has(pid)) continue
+    seen.add(pid)
+    const command = commands.get(pid)
+    if (command === tail || command.endsWith(` ${tail}`)) return true
+    queue.push(...(children.get(pid) || []))
+  }
+  return false
+}
+
 // Claude Code keeps each working directory's conversations under ~/.claude/projects/<cwd with
 // every non-alphanumeric replaced by '-'>. One there means `--continue` resumes this session.
 export function hasPriorSession(home, workdir) {

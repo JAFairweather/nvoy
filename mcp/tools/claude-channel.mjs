@@ -64,8 +64,14 @@ const listedThisRun = new Set()
 // An idle timer is the wrong instrument: a real session is legitimately silent for hours, and
 // killing it would trade a stuck lane for a lane that vanishes under a working user. So ask
 // instead. A client that is present answers a ping; one whose carrier is gone never answers.
-const heartbeatMs = Number(flag('--heartbeat-ms') || 60000)
-const heartbeatMisses = Number(flag('--heartbeat-misses') || 10)
+//
+// The window is also how long a restarted harness is refused: `docker exec` never passes on the
+// ssh session's end, so after a Ctrl-C the old channel keeps the lock until it evicts itself. At
+// 60s × 10 that was ten minutes (2026-09-25). 30s × 4 evicts in ~2¼ min. The cost is a laptop
+// asleep past that loses its channel; its ssh then closes on wake, and the portable supervisor
+// restarts the session, which reconnects.
+const heartbeatMs = Number(flag('--heartbeat-ms') || 30000)
+const heartbeatMisses = Number(flag('--heartbeat-misses') || 4)
 const handshakeMs = Number(flag('--handshake-ms') || 30000)
 if (!Number.isInteger(heartbeatMs) || heartbeatMs < 1000 || heartbeatMs > 3600000) die('--heartbeat-ms must be 1000..3600000')
 if (!Number.isInteger(heartbeatMisses) || heartbeatMisses < 1 || heartbeatMisses > 100) die('--heartbeat-misses must be 1..100')
@@ -304,8 +310,8 @@ setInterval(() => void poll(), pollMs)
 //
 // They get separate knobs because their risks are opposite. Nobody can be hurt by evicting (2) —
 // by construction no client is there, and a measured handshake against Claude Code completes in
-// ~16ms — so it is cheap and clears the lane fast. Evicting (1) kills a working session with no
-// recourse, and the realistic hazard is not a slow client (ping RTT measured at 1-6ms) but a
+// ~16ms — so it is cheap and clears the lane fast. Evicting (1) kills a working session that only
+// a supervising harness brings back, and the realistic hazard is not a slow client (ping RTT measured at 1-6ms) but a
 // SUSPENDED one: a closed laptop lid whose ssh connection survives. That arm wants minutes.
 //
 // A ping that comes back as a JSON-RPC *error* still proves the peer is there, so only a timeout
@@ -325,8 +331,8 @@ setTimeout(() => {
 // Measured on the wire at --heartbeat-ms 1000, a client that initialises and then never answers:
 // misses 2/3/5 exit at +2650/3656/5653ms, having sent exactly 2/3/5 pings. So the ping arm evicts
 // at `misses × heartbeatMs + pingTimeoutMs` — the trailing half-interval is inherent, since a ping
-// cannot be known to have failed before its own timeout elapses. Shipped default 60000 × 10 is
-// therefore ~10.5 min, and the handshake arm is exactly --handshake-ms (measured +2170ms at 2000).
+// cannot be known to have failed before its own timeout elapses. Shipped default 30000 × 4 is
+// therefore ~2¼ min, and the handshake arm is exactly --handshake-ms (measured +2170ms at 2000).
 const pingTimeoutMs = Math.max(500, Math.floor(heartbeatMs / 2))
 let misses = 0
 let pongs = 0

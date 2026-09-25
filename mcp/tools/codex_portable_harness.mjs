@@ -14,6 +14,13 @@
 //   is idle, and otherwise `thread/queue/add` (experimental API), which runs it after the current
 //   turn. Either way it carries `clientUserMessageId: nvoy:<envelope>` and is recorded once.
 //
+// The channel MCP is an ssh into the fleet's adapter container, which each release or manifest
+// change recreates. Codex never restarts a dead MCP server: every later tool call fails with
+// "Transport closed" (codex-cli 0.149.1, 2026-09-25). So the supervisor asks the channel itself,
+// with `mcpServer/tool/call`, before it declares the thread ready, before each injection, and
+// whenever the feed reconnects (the feed's ssh dies with the same container). A dead channel
+// restarts `codex app-server` once no turn is running, and the thread is resumed.
+//
 // Like the fleet form it never reads a message body or a reply: Codex does, through the keyless
 // channel tools, and the broker rechecks the grant before it signs.
 
@@ -23,7 +30,7 @@ import { homedir } from 'node:os'
 import { isAbsolute, resolve } from 'node:path'
 import { fixedPath, knownHostsFile, privateFile, sshChannelEntry, SSH, SSH_TARGET } from './channel_client.mjs'
 import { instanceId } from './runtime_manifest.mjs'
-import { codexConfigToml, codexTurnText, defaultInstructions } from './harness_session.mjs'
+import { codexConfigToml, codexTurnText, defaultInstructions, serverName } from './harness_session.mjs'
 import { openThread } from './codex_harness.mjs'
 import { connectWsPeer } from './codex_ws_peer.mjs'
 import { claimPidLock } from './pid_lock.mjs'
@@ -111,6 +118,8 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
   const KEEPALIVE_MS = Number(process.env.HARNESS_FEED_KEEPALIVE_MS || 20000)
   const SILENCE_MS = Number(process.env.HARNESS_FEED_SILENCE_MS || 90000)
   const FEED_RETRY_MAX_MS = Number(process.env.HARNESS_FEED_RETRY_MAX_MS || 60000)
+  const RETRY_MS = Number(process.env.HARNESS_RETRY_MS || 5000)
+  const PROBE_MS = Number(process.env.HARNESS_CHANNEL_PROBE_MS || 30000)
   const writePrivate = (path, value) => { writeFileSync(path, value, { mode: 0o600 }); chmodSync(path, 0o600) }
   for (const dir of [workdir, privateDir, ctlDir]) { mkdirSync(dir, { recursive: true, mode: 0o700 }); chmodSync(dir, 0o700) }
   const release = claimPidLock(resolve(privateDir, 'supervisor.lock'), config.id, 'portable Codex harness')
@@ -135,7 +144,7 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
 
   // Envelopes the feed has announced and the thread has not yet taken, oldest first.
   const pending = [], announced = new Set()
-  let wake = () => {}
+  let wake = () => {}, feeds = 0, recheck = false
   const offer = row => { if (announced.has(row.envelope)) return; announced.add(row.envelope); pending.push(row); wake() }
 
   async function feedOnce() {
@@ -162,6 +171,7 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
         if (event.event === 'hello') {
           if (event.instance !== config.id) return stop('feed answered for another instance')
           healthy = true
+          if (++feeds > 1) { recheck = true; wake() }
           const placed = event.cursor === null || HEX64.test(String(event.cursor)) ? event.cursor : null
           if (cursor === undefined) { saveCursor(placed); log(`first start: baselined the ${config.id} queue; later arrivals are live`) }
           else if (event.since_found === false) { saveCursor(placed); log(`the fleet queue no longer holds the saved cursor; resuming from now`) }
@@ -188,7 +198,7 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
   })()
 
   const env = { PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin', HOME: codexHome, CODEX_HOME: codexHome }
-  let delay = 5000
+  let delay = RETRY_MS
   while (!stopping()) {
     const startedAt = Date.now()
     let server = null, child = null
@@ -211,8 +221,20 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
       chmodSync(socket, 0o600)
       await server.request('initialize', { clientInfo: { name: 'nvoy-harness', title: 'Nvoy harness', version: '1' }, capabilities: { experimentalApi: true } })
       server.notify('initialized')
-      const { threadId, thread } = await openThread({ server, manifest, workdir, threadPath, log, writePrivate })
-      let busy = thread?.status?.type === 'active'
+      const { threadId, thread, saved } = await openThread({ server, manifest, workdir, threadPath, log, writePrivate })
+      // '' when the channel answered, null when this Codex cannot be asked, else why it is down.
+      // Any answer, a tool error included, is a live channel; only a failed call is a dead one. On
+      // 0.149.1 a server that has exited rejects with -32603 "Transport closed", an unknown method
+      // is -32600 "unknown variant" (-32601 by the JSON-RPC spec), and the call adds nothing to the
+      // thread's rollout, so probing never reaches the conversation the model sees.
+      const channelDown = async () => {
+        try { await server.request('mcpServer/tool/call', { threadId, server: serverName(manifest), tool: 'nvoy_channel_list', arguments: {} }, PROBE_MS); return '' }
+        catch (error) { if (server.closed) throw error; return error.code === -32601 || /unknown variant `mcpServer\/tool\/call`/.test(error.message) ? null : error.message }
+      }
+      const down0 = await channelDown()
+      if (down0) throw new Error(`the channel to the fleet did not answer: ${down0}`)
+      if (down0 === null) log('this Codex cannot be asked about its channel; a wake feed reconnect restarts it instead')
+      let busy = thread?.status?.type === 'active', attachable = saved, down = ''
       const ended = new Set(), turnEnvelope = new Map()
       server.on(message => {
         const p = message.params || {}
@@ -223,13 +245,26 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
           busy = false; ended.add(p.turn?.id)
           const envelope = turnEnvelope.get(p.turn?.id)
           log(`turn ${envelope ? `for ${envelope.slice(0, 12)} ` : ''}ended: ${p.turn?.status || 'unknown'}`)
+          // Codex writes a thread's rollout at its first turn; until then `codex resume` finds nothing (#218).
+          if (!attachable) { attachable = true; log(`attach: ${attachCommand({ codexHome, socket, threadId })}`) }
         }
+        if (!busy) wake()
       })
       log(`${config.id} session ready; admitted messages will be injected into the thread`)
-      log(`attach: ${attachCommand({ codexHome, socket, threadId })}`)
+      log(attachable ? `attach: ${attachCommand({ codexHome, socket, threadId })}` : 'attach: available after the thread\'s first turn, when Codex saves it; the command is printed then')
       while (!stopping() && !server.closed) {
+        if (down && !busy) { log(`restarting codex app-server to reconnect the channel (${down})`); break }
         const next = pending[0]
-        if (!next) { await Promise.race([new Promise(done => { wake = done }), server.exited]); continue }
+        if (down || (!next && !recheck)) { await Promise.race([new Promise(done => { wake = done }), server.exited]); continue }
+        const reconnected = recheck
+        recheck = false
+        const why = reconnected || !delivered.has(next.envelope) ? await channelDown() : ''
+        if (why || (why === null && reconnected)) {
+          down = why || 'the wake feed reconnected'
+          log(`the channel to the fleet is down (${down}); codex app-server restarts once no turn is running`)
+          continue
+        }
+        if (!next) continue
         if (!delivered.has(next.envelope)) {
           const input = [{ type: 'text', text: codexTurnText(next) }], clientUserMessageId = `nvoy:${next.envelope}`
           let turn = ''
@@ -260,7 +295,7 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
       if (child) { try { child.kill('SIGTERM') } catch {} children.delete(child) }
     }
     if (stopping()) break
-    if (Date.now() - startedAt > RETRY_MAX_MS) delay = 5000
+    if (Date.now() - startedAt > RETRY_MAX_MS) delay = RETRY_MS
     log(`next start in ${Math.round(delay / 1000)}s`)
     await sleep(delay)
     delay = Math.min(delay * 2, RETRY_MAX_MS)

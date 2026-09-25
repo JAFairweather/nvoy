@@ -60,13 +60,13 @@ function appServer({ env, log }) {
 
 // Resume the stored thread, or start one and store it. Shared by the fleet and portable supervisors.
 export async function openThread({ server, manifest, workdir, threadPath, log, writePrivate }) {
-  let threadId = '', thread = null
+  let threadId = '', thread = null, saved = false
   try { threadId = codexThreadId(JSON.parse(readFileSync(threadPath, 'utf8')).thread_id) } catch {}
   if (threadId) {
     try {
       const resumed = await server.request('thread/resume', { threadId })
       if (resumed?.thread?.id !== threadId) throw new Error('Codex resumed an unexpected thread')
-      thread = resumed.thread
+      thread = resumed.thread; saved = true
       log(`resumed the ${manifest.id} thread`)
     } catch (error) {
       // Codex saves a thread at its first turn, so a thread that never had one cannot be
@@ -83,7 +83,8 @@ export async function openThread({ server, manifest, workdir, threadPath, log, w
     writePrivate(threadPath, JSON.stringify({ version: 1, instance: manifest.id, thread_id: threadId }) + '\n')
     log(`started the ${manifest.id} thread`)
   }
-  return { threadId, thread }
+  // `saved`: Codex holds a rollout for the thread, so `codex resume` can find it.
+  return { threadId, thread, saved }
 }
 
 export async function runCodexHarness({ manifest, root, home, credential, log, stopping }) {
