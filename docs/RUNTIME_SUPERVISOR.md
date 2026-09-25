@@ -617,6 +617,85 @@ session runs with that directory as `HOME`, so your own `~/.claude` is never rea
 `model`, `pubkey` and `channels` are optional. The MCP entry is exactly the one `claude-channel-doctor
 --mode client` renders; the channel lock and queue stay on the fleet, so nothing local is cleared.
 
+#### Portable Codex harness (`codex-harness-portable.mjs`)
+
+The Codex form of the above: one persistent Codex thread on any box, a Mac included, billed to the
+owner's ChatGPT subscription rather than an API key, which a person can attach to, watch and join.
+
+- **Transport.** The supervisor runs `codex app-server --listen unix://<codex_home>/ctl/as.sock`
+  (owner-only) and drives it over WebSocket-on-Unix JSON-RPC. `codex resume <thread> --remote
+  unix://…` attaches a TUI to the same thread. Requests Codex makes of a client go to every attached
+  connection, and the supervisor answers none, so an attached person can.
+- **Wake source.** A second forced-command key runs `codex-channel-feed.mjs` on the fleet. It
+  streams one line per admitted envelope (id, type and time, never content) plus heartbeats. The
+  supervisor keeps an envelope cursor in `<codex_home>/nvoy/feed-cursor.json`, and reconnects from
+  it with backoff. It sends a keepalive line every 20s; a feed that hears none for two minutes exits.
+- **One consumer per identity.** The feed holds `codex-mcp-state/feed.lock` on the fleet, with the
+  channel lock's rules: reclaimed only when its PID is gone. A second harness for the identity,
+  on any box, is refused. A second supervisor on the same `codex_home` is refused locally.
+- **Injection.** When the thread is idle an envelope becomes `turn/start`. When a turn is running
+  (yours, typed in the TUI, or an earlier envelope's) it is queued with `thread/queue/add`, which
+  needs the experimental API. Each one carries `clientUserMessageId: nvoy:<envelope>` and is
+  recorded once in `<codex_home>/nvoy/delivered.jsonl`.
+- **Login.** `codex_home` is the harness's own `CODEX_HOME`, never `~/.codex`. Its `config.toml`
+  is rewritten on each start with `forced_login_method = "chatgpt"`,
+  `cli_auth_credentials_store = "file"`, no provider block, `approval_policy = "never"`,
+  `sandbox_mode = "read-only"`, and the channel key's ssh entry as its one MCP server, with the
+  three channel tools pre-approved. The supervisor refuses to start if `auth.json` is missing,
+  if its `auth_mode` is not `chatgpt`, if it holds an API key, or if `OPENAI_API_KEY` or
+  `CODEX_API_KEY` is set. It reads only those fields and prints none. Codex gets a built environment
+  of `PATH`, `HOME` and `CODEX_HOME` only.
+
+Owner steps, with placeholder paths:
+
+1. Make the harness's own Codex home, owner-only, and log in there with your ChatGPT account.
+   Device-code login must first be enabled in ChatGPT's security settings.
+
+   ```sh
+   mkdir -m 700 /absolute/path/codex-jaf-home
+   CODEX_HOME=/absolute/path/codex-jaf-home codex login --device-auth
+   ```
+
+2. Make two SSH keys, one for the channel and one for the feed, and install one forced-command
+   line for each on the fleet, for the identity's dedicated account:
+
+   ```sh
+   NVOY_INSTANCE_ROOT=/etc/nvoy/instances node mcp/tools/instance-codex-channel-authorized-key.mjs \
+     --instance codex-jaf --public-key-file /etc/nvoy/keys/codex-jaf-channel.pub --container nvoy-codex-jaf-adapter
+   NVOY_INSTANCE_ROOT=/etc/nvoy/instances node mcp/tools/instance-codex-channel-authorized-key.mjs \
+     --instance codex-jaf --public-key-file /etc/nvoy/keys/codex-jaf-feed.pub --container nvoy-codex-jaf-adapter --mode feed
+   ```
+
+3. Write the client config. It names paths only. The config and both private keys must be
+   owner-only, and it is refused if any field or value could carry a Nostr key, a Bunker
+   credential or an OpenAI API key:
+
+   ```json
+   { "instance": "codex-jaf", "ssh_target": "nvoy-codex@broker.example",
+     "identity_file": "/absolute/path/codex-jaf-channel", "feed_identity_file": "/absolute/path/codex-jaf-feed",
+     "known_hosts_file": "/absolute/path/nvoy-known-hosts", "codex_home": "/absolute/path/codex-jaf-home" }
+   ```
+
+   `model`, `pubkey` and `channels` are optional. Keep `codex_home` short: the socket path under it
+   must fit in 104 bytes.
+
+4. Retire any other Codex consumer for the identity (a Mac `codex_app_server` binding, the desktop
+   adapter or the remote bridge), then start the supervisor. The first start baselines the fleet
+   queue, and later arrivals are live.
+
+   ```sh
+   node mcp/tools/codex-harness-portable.mjs --instance codex-jaf --config /absolute/path/codex-jaf-harness.json
+   ```
+
+5. Attach to the thread with the command the supervisor prints once it is ready:
+
+   ```sh
+   CODEX_HOME=/absolute/path/codex-jaf-home codex resume <thread-id> --remote unix:///absolute/path/codex-jaf-home/ctl/as.sock
+   ```
+
+`--remote` and `thread/queue/add` were checked against codex-cli 0.149.1. Pin that version, or
+recheck both after an upgrade.
+
 ### Docker reference deployment
 
 [`deploy/participant-runtime.compose.yml`](../deploy/participant-runtime.compose.yml) is the
