@@ -585,6 +585,29 @@ The credential is an OpenAI API key.
 - **Watching it:** `docker logs nvoy-<id>-harness-1` shows each injected envelope prefix and how
   its turn ended.
 
+#### Portable Claude harness (`--remote`)
+
+The same supervisor runs on any box with `node`, `tmux`, `/usr/bin/ssh` and Claude Code, a Mac
+included, given the identity's forced-command channel key from the section above. A client config
+replaces the manifest; it names paths only and is refused if any field could carry a Nostr key or
+Bunker credential:
+
+```json
+{ "instance": "claude-jaf", "ssh_target": "nvoy-channel@broker.example",
+  "identity_file": "/absolute/path/claude-jaf-channel", "known_hosts_file": "/absolute/path/nvoy-channel-known-hosts",
+  "credential_file": "/absolute/path/claude-jaf-oauth-token", "home": "/absolute/path/.nvoy-harness/claude-jaf" }
+```
+
+```sh
+node mcp/tools/instance-harness.mjs --instance claude-jaf --remote /absolute/path/claude-jaf-harness.json
+```
+
+The key and login files must be owner-only (0600), and the config and `known_hosts` not writable
+by group or other. `home` defaults to `~/.nvoy-harness/<id>` and may not be your own home: the
+session runs with that directory as `HOME`, so your own `~/.claude` is never read or written.
+`model`, `pubkey` and `channels` are optional. The MCP entry is exactly the one `claude-channel-doctor
+--mode client` renders; the channel lock and queue stay on the fleet, so nothing local is cleared.
+
 ### Docker reference deployment
 
 [`deploy/participant-runtime.compose.yml`](../deploy/participant-runtime.compose.yml) is the

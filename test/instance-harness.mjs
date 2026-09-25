@@ -1,11 +1,13 @@
 // Hosted Claude Code and Codex harnesses: the manifest block that turns it on, the Compose service it renders,
 // the files that let one persistent session start unattended, and the supervisor's refusals.
-// tmux and Claude Code are not driven here; a fake `codex app-server` drives the Codex supervisor.
+// Claude Code is not driven here; a fake `codex app-server` drives the Codex supervisor, and a fake
+// tmux that only logs the session it is asked for drives the portable (--remote) Claude supervisor.
 // The first live session is the operator's check.
-import { appendFileSync, chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { appendFileSync, chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
+import { sshChannelEntry } from '../mcp/tools/channel_client.mjs'
 import { CODEX_CHANNEL_TOOLS, classifyPane, claudeArgs, codexConfigToml, codexTurnText, defaultInstructions, hasPriorSession, mcpConfig, pendingEnvelopes, seedClaudeJson, seedSettings, serverName } from '../mcp/tools/harness_session.mjs'
 
 let fails = 0
@@ -269,6 +271,84 @@ ok('a stored thread Codex never saved is replaced by a new one, not retried fore
   turnStarts()[3]?.params.threadId === '0199a213-81c0-7800-8aa1-cccccccccccc' &&
   JSON.parse(readFileSync(join(djHome, '.nvoy-harness', 'codex-thread.json'), 'utf8')).thread_id === '0199a213-81c0-7800-8aa1-cccccccccccc')
 third.child.kill('SIGTERM'); await third.exited
+
+// Portable harness: the same Claude supervisor off the fleet, driven by a client config instead of a manifest
+const remoteDir = mkdtempSync(join(root, 'remote-'))
+const ownHome = join(remoteDir, 'own-home'), harnessHome = join(ownHome, '.nvoy-harness', 'mac-test')
+mkdirSync(ownHome, { mode: 0o700 })
+const secretFile = (path, value, mode = 0o600) => { writeFileSync(path, value, { mode }); chmodSync(path, mode); return path }
+const keyFile = secretFile(join(remoteDir, 'channel-key'), 'PRIVATE-KEY-MUST-NEVER-PRINT\n')
+const knownFile = secretFile(join(remoteDir, 'known_hosts'), 'broker.example ssh-ed25519 AAAAC3NzaTest\n', 0o644)
+const loginFile = secretFile(join(remoteDir, 'claude-login'), 'sk-ant-oat-fake-login\n')
+const looseKey = secretFile(join(remoteDir, 'loose-key'), 'PRIVATE-KEY-MUST-NEVER-PRINT\n', 0o640)
+const fakeClaude = secretFile(join(remoteDir, 'claude'), "#!/bin/sh\necho '2.1.230 (Claude Code)'\n", 0o700)
+const client = { instance: 'mac-test', ssh_target: 'nvoy-channel@broker.example', identity_file: keyFile, known_hosts_file: knownFile, credential_file: loginFile }
+const clientConfig = (value, mode = 0o600) => secretFile(join(mkdtempSync(join(remoteDir, 'cfg-')), 'client.json'), JSON.stringify(value), mode)
+writeFileSync(join(fakeBin, 'tmux'), `#!/usr/bin/env node
+const { appendFileSync } = require('node:fs')
+const socket = process.argv[3]
+let rest = process.argv.slice(4)
+if (rest[0] === '-f') rest = rest.slice(2)
+const e = process.env
+if (rest[0] === 'new-session') appendFileSync(socket + '.log', JSON.stringify({ socket, args: rest, home: e.HOME, configDir: e.CLAUDE_CONFIG_DIR, root: e.NVOY_INSTANCE_ROOT, keyed: e.CLAUDE_CODE_OAUTH_TOKEN === 'sk-ant-oat-fake-login' }) + '\\n')
+if (rest[0] === 'display-message') console.log('0 ')
+if (rest[0] === 'capture-pane') console.log('  ? for shortcuts')
+`)
+chmodSync(join(fakeBin, 'tmux'), 0o755)
+const remoteEnv = { ...process.env, HOME: ownHome, CLAUDE_CONFIG_DIR: join(ownHome, '.claude'), PATH: `${fakeBin}:${process.env.PATH}`, HARNESS_POLL_MS: '25', HARNESS_WATCH_MS: '50' }
+const refused = (value, pattern, mode) => {
+  const r = spawnSync(process.execPath, ['mcp/tools/instance-harness.mjs', '--instance', 'mac-test', '--remote', clientConfig(value, mode)], { cwd: resolve('.'), encoding: 'utf8', env: remoteEnv, timeout: 10000 })
+  return r.status === 1 && pattern.test(r.stderr) && !/PRIVATE-KEY|sk-ant-oat/.test(r.stdout + r.stderr)
+}
+ok('a portable config that names a Nostr key or Bunker credential is refused, by field or by value', refused({ ...client, nsec_file: '/x' }, /must not name a Nostr key or Bunker credential/) &&
+  refused({ ...client, bunker_uri_ref: '/etc/nvoy/credentials/mac-test.bunker' }, /must not name a Nostr key or Bunker credential/) &&
+  refused({ ...client, model: 'nsec1' + 'q'.repeat(58) }, /must not name a Nostr key or Bunker credential/) &&
+  refused({ ...client, home: 'bunker://' + 'b'.repeat(64) }, /must not name a Nostr key or Bunker credential/))
+ok('a portable config refuses relative paths', refused({ ...client, identity_file: 'channel-key' }, /SSH identity file path must be absolute/) &&
+  refused({ ...client, known_hosts_file: 'known_hosts' }, /known_hosts file path must be absolute/) &&
+  refused({ ...client, credential_file: 'claude-login' }, /credential file path must be absolute/) && refused({ ...client, home: 'harness' }, /home path must be absolute/))
+ok('a portable config refuses an SSH key or login that group or other can read', refused({ ...client, identity_file: looseKey }, /SSH identity file must not be accessible by group or other/) &&
+  refused({ ...client, credential_file: looseKey }, /credential file must not be accessible by group or other/))
+ok('a portable config refuses another instance, an unknown field, a writable config, and the owner\'s own home', refused({ ...client, instance: 'other-test' }, /different instance/) &&
+  refused({ ...client, extra: 1 }, /unknown field extra/) && refused(client, /client config must not be group\/world writable/, 0o666) &&
+  refused({ ...client, home: ownHome }, /never your home/) && refused({ ...client, ssh_target: '-oProxyCommand=x@h' }, /fixed user@host/))
+const doctor = spawnSync(process.execPath, ['mcp/tools/claude-channel-doctor.mjs', '--mode', 'client', '--server', 'nvoy-mac-test', '--claude', fakeClaude,
+  '--identity-file', keyFile, '--known-hosts-file', knownFile, '--ssh-target', client.ssh_target], { cwd: resolve('.'), encoding: 'utf8' })
+const doctorConfig = JSON.parse(doctor.stdout || '{}').mcpConfig
+const pureRemote = mcpConfig({ manifest: { id: 'mac-test' }, root, remote: { identity: doctorConfig?.mcpServers['nvoy-mac-test'].args.at(-2), knownHosts: resolve(knownFile), target: client.ssh_target } })
+ok('the portable channel entry is the doctor\'s client entry, from the one shared function', doctor.status === 0 && Object.keys(pureRemote.mcpServers).length === 1 &&
+  JSON.stringify(pureRemote.mcpServers['nvoy-mac-test']) === JSON.stringify(sshChannelEntry({ identity: doctorConfig.mcpServers['nvoy-mac-test'].args.at(-2), knownHosts: resolve(knownFile), target: client.ssh_target })))
+const fleetRoot = mkdtempSync(join(root, 'instances-'))
+writeFileSync(join(fleetRoot, 'mac-test.json'), JSON.stringify({ ...base('mac-test'), harness }))
+const localLock = join(root, 'run-mac-test', 'claude-channel-state', 'channel.lock')
+mkdirSync(join(root, 'run-mac-test', 'claude-channel-state'), { recursive: true })
+writeFileSync(localLock, '99999\n')
+const portable = spawn(process.execPath, ['mcp/tools/instance-harness.mjs', '--instance', 'mac-test', '--remote', clientConfig(client)],
+  { cwd: resolve('.'), env: { ...remoteEnv, NVOY_INSTANCE_ROOT: fleetRoot } })
+let portableOut = ''
+portable.stdout.on('data', d => { portableOut += d }); portable.stderr.on('data', d => { portableOut += d })
+const portableExited = new Promise(done => portable.on('exit', done))
+ok('the portable supervisor starts its session and sees it ready', await waitFor(() => /mac-test session ready/.test(portableOut)))
+await wait(200)
+const readText = path => { try { return readFileSync(path, 'utf8') } catch { return '' } }
+const written = readText(join(harnessHome, '.nvoy-harness', 'mcp.json'))
+const writtenEntry = (() => { try { return JSON.parse(written).mcpServers['nvoy-mac-test'] } catch { return {} } })()
+ok('the portable session\'s MCP config is exactly the doctor\'s client config for this instance', !!written && JSON.stringify(JSON.parse(written)) === JSON.stringify(doctorConfig))
+ok('the portable entry is the hardened ssh tunnel and carries no secret value', writtenEntry.command === '/usr/bin/ssh' &&
+  ['-F /dev/null', 'BatchMode=yes', 'IdentitiesOnly=yes', 'StrictHostKeyChecking=yes', 'GlobalKnownHostsFile=/dev/null', 'ClearAllForwardings=yes', `UserKnownHostsFile=${realpathSync(knownFile)}`, `-i ${realpathSync(keyFile)}`]
+    .every(flag => writtenEntry.args.join(' ').includes(flag)) && !/PRIVATE-KEY|sk-ant-oat/.test(written + portableOut))
+const sessions = readText(join(harnessHome, '.nvoy-harness', 'tmux.sock.log')).split('\n').filter(Boolean).map(JSON.parse)
+ok('the portable session runs on its own tmux socket inside the harness home, with the channel loaded', sessions.length === 1 &&
+  sessions[0].socket === join(harnessHome, '.nvoy-harness', 'tmux.sock') && sessions[0].args.includes('claude') && sessions[0].args.includes('server:nvoy-mac-test') &&
+  sessions[0].args.includes(join(harnessHome, '.nvoy-harness', 'mcp.json')) && !JSON.stringify(sessions[0].args).includes('sk-ant-oat'))
+ok('the portable session gets the harness home and the login, and neither the owner\'s CLAUDE_CONFIG_DIR nor a fleet root', sessions[0]?.home === harnessHome &&
+  sessions[0].keyed && sessions[0].configDir === undefined && sessions[0].root === undefined)
+ok('the portable harness seeds its own home and never touches the owner\'s ~/.claude or ~/.claude.json', !existsSync(join(ownHome, '.claude')) && !existsSync(join(ownHome, '.claude.json')) &&
+  (statSync(join(harnessHome, '.claude.json')).mode & 0o777) === 0o600 &&
+  JSON.parse(readText(join(harnessHome, '.claude', 'settings.json'))).permissions.allow.includes('mcp__nvoy-mac-test') &&
+  !/Nostr key/.test(readText(join(harnessHome, 'workspace', 'CLAUDE.md'))))
+ok('the portable harness leaves every local channel lock alone: the lock is the fleet\'s', readText(localLock) === '99999\n')
+portable.kill('SIGTERM'); await portableExited
 
 rmSync(root, { recursive: true, force: true })
 console.log(fails ? `\n${fails} FAILED` : '\nall passed')

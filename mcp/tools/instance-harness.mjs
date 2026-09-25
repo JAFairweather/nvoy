@@ -7,11 +7,17 @@
 // answers only the fixed startup screens (the development-channel warning, and folder trust or
 // theme if they appear), then leaves the session alone and restarts it if it exits. It never reads
 // or logs the conversation, except the screen of a session that dies before it is ready.
+//
+// With --remote <client-config.json> the same supervisor runs on any box, a Mac included. The
+// config stands in for the manifest; the channel, its lock and its queue stay on the fleet, reached
+// through the identity's SSH forced-command key; and the session's home is the harness's own
+// directory, never the owner's, so their own Claude Code login and settings are not touched.
 
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { resolve } from 'node:path'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
+import { readClientConfig } from './channel_client.mjs'
 import { runCodexHarness } from './codex_harness.mjs'
 import { classifyPane, claudeArgs, defaultInstructions, hasPriorSession, mcpConfig, seedClaudeJson, seedSettings, serverName } from './harness_session.mjs'
 
@@ -19,18 +25,24 @@ const die = message => { console.error(`instance-harness: ${message}`); process.
 const log = message => console.log(`instance-harness: ${message}`)
 const flag = name => { const i = process.argv.indexOf(name); return i < 0 ? '' : process.argv[i + 1] || '' }
 const id = flag('--instance')
-if (!id) die('usage: --instance <id>')
+if (!id) die('usage: --instance <id> [--remote <client-config.json>]')
 const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
-let manifest
-try { manifest = readManifest(root, instanceId(id)); assertNoCollisions(root, manifest) } catch (error) { die(error.message) }
-if (!manifest.harness) die('manifest has no harness block')
-if (process.getuid?.() !== manifest.workerUid) die('the harness must run as the manifest-bound worker user')
+let manifest, remote = null
+if (process.argv.includes('--remote')) {
+  try { remote = readClientConfig(flag('--remote'), id) } catch (error) { die(error.message) }
+  manifest = { id: remote.id, pubkey: remote.pubkey, buzz: { channels: remote.channels }, harness: { runner: 'claude', model: remote.model } }
+} else {
+  try { manifest = readManifest(root, instanceId(id)); assertNoCollisions(root, manifest) } catch (error) { die(error.message) }
+  if (!manifest.harness) die('manifest has no harness block')
+  if (process.getuid?.() !== manifest.workerUid) die('the harness must run as the manifest-bound worker user')
+}
 
-const home = process.env.HOME || ''
+const home = remote ? remote.home : process.env.HOME || ''
 if (!home.startsWith('/')) die('HOME must be the absolute, persistent harness home')
 let token
 const credentialName = manifest.harness.runner === 'codex' ? 'OpenAI API key' : 'Claude login credential'
-try { token = readFileSync(process.env.NVOY_HARNESS_CREDENTIAL_FILE || '/run/nvoy-harness-credentials/credential', 'utf8').trim() } catch (error) { die(`${credentialName} unreadable: ${error.code || error.message}`) }
+const credentialFile = remote ? remote.credentialFile : process.env.NVOY_HARNESS_CREDENTIAL_FILE || '/run/nvoy-harness-credentials/credential'
+try { token = readFileSync(credentialFile, 'utf8').trim() } catch (error) { die(`${credentialName} unreadable: ${error.code || error.message}`) }
 if (!token || /\s/.test(token)) die(`${credentialName} is empty or malformed`)
 
 // Codex has no terminal session to hold: `codex app-server` keeps the thread, and the supervisor
@@ -46,7 +58,7 @@ const server = serverName(manifest)
 const workdir = resolve(home, 'workspace')
 const privateDir = resolve(home, '.nvoy-harness')
 const mcpConfigPath = resolve(privateDir, 'mcp.json')
-const socket = process.env.HARNESS_TMUX_SOCKET || '/tmp/harness.sock'
+const socket = process.env.HARNESS_TMUX_SOCKET || (remote ? resolve(privateDir, 'tmux.sock') : '/tmp/harness.sock')
 const tmuxConf = `${socket}.conf`
 const STARTUP_MS = Number(process.env.HARNESS_STARTUP_MS || 120000)
 const POLL_MS = Number(process.env.HARNESS_POLL_MS || 1000)
@@ -62,20 +74,22 @@ mkdirSync(resolve(home, '.claude'), { recursive: true, mode: 0o700 })
 writePrivate(resolve(home, '.claude.json'), JSON.stringify(seedClaudeJson(readJson(resolve(home, '.claude.json')), workdir), null, 2))
 const settingsPath = resolve(home, '.claude', 'settings.json')
 writePrivate(settingsPath, JSON.stringify(seedSettings(readJson(settingsPath), server), null, 2))
-writePrivate(mcpConfigPath, JSON.stringify(mcpConfig({ manifest, root }), null, 2))
+writePrivate(mcpConfigPath, JSON.stringify(mcpConfig({ manifest, root, remote }), null, 2))
 if (!existsSync(resolve(workdir, 'CLAUDE.md'))) writePrivate(resolve(workdir, 'CLAUDE.md'), defaultInstructions(manifest))
 // The channel lock lives on the runtime volume, so it outlives the container whose channel wrote it.
 // PIDs restart with the container, so its PID can name a live process here and the new channel
 // refuses to start, leaving a "ready" session with no ears (MC Claude, 2026-09-25 01:44 UTC).
-// Nothing can hold the lock before this harness starts its first session.
-rmSync(resolve(manifest.runtimeDir, 'claude-channel-state', 'channel.lock'), { force: true })
+// Nothing can hold the lock before this harness starts its first session. Off the fleet the lock
+// is the fleet's, behind the forced command, and there is none here to clear.
+if (!remote) rmSync(resolve(manifest.runtimeDir, 'claude-channel-state', 'channel.lock'), { force: true })
 // A dead pane stays readable, so a session that fails to start can say why.
 writeFileSync(tmuxConf, 'set -g remain-on-exit on\nset -g history-limit 5000\n')
 
-// The login token travels only in the tmux server's environment, never in an argv.
+// The login token travels only in the tmux server's environment, never in an argv. The environment
+// is built, not inherited, so an owner's own CLAUDE_CONFIG_DIR cannot pull the session back home.
 const sessionEnv = {
   PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin', HOME: home, TERM: 'xterm-256color', LANG: 'C.UTF-8',
-  NVOY_INSTANCE_ROOT: root, CLAUDE_CODE_OAUTH_TOKEN: token, DISABLE_AUTOUPDATER: '1',
+  ...(remote ? {} : { NVOY_INSTANCE_ROOT: root }), CLAUDE_CODE_OAUTH_TOKEN: token, DISABLE_AUTOUPDATER: '1',
 }
 const tmux = (args, env = process.env) => spawnSync('tmux', ['-S', socket, ...args], { encoding: 'utf8', env })
 const sleep = ms => new Promise(done => setTimeout(done, ms))
