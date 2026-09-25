@@ -574,6 +574,10 @@ The credential is an OpenAI API key.
     `requires_openai_auth = false`.
   - `approval_policy = "never"` and `sandbox_mode = "read-only"`. Any request Codex makes of the
     client (an approval or an elicitation) is declined, because nobody is there to answer it.
+  - `approval_policy` does not cover MCP tool calls, so each channel tool (`nvoy_channel_list`,
+    `nvoy_channel_read`, `nvoy_channel_reply`) carries `approval_mode = "approve"`. Without it,
+    Codex asks the client before each call, the supervisor declines, and no reply is sent. The
+    broker still rechecks the grant before it signs a reply.
   - `workspace/AGENTS.md` is written from the default instructions only when it is missing.
 - **Retire the other Codex paths first.** Before turning this on, stop any Mac `codex_app_server`
   binding, desktop adapter or remote bridge for the identity. The Codex channel tools hold no
