@@ -37,6 +37,7 @@ executable('fake-git', `printf 'git %s\\n' "$*" >> ${JSON.stringify(calls)}
 at() { i=0; for s in \${FAKE_GIT_ORDER:-}; do [ "$s" = "$1" ] && { echo $i; return; }; i=$((i+1)); done; echo -1; }
 case "$3" in
   rev-parse) echo "\${FAKE_GIT_HEAD:-}";;
+  ls-remote) [ -z "\${FAKE_REMOTE_HEAD:-}" ] || printf '%s\\trefs/heads/main\\n' "$FAKE_REMOTE_HEAD";;
   merge-base) a=$(at "$5"); b=$(at "$6"); [ "$a" -ge 0 ] && [ "$b" -ge 0 ] && [ "$a" -le "$b" ] || exit 1;;
 esac`)
 executable('fake-npm', `printf 'npm %s\\n' "$*" >> ${JSON.stringify(calls)}`)
@@ -99,7 +100,7 @@ const invoke = (sha, extra = {}) => spawnSync('python3', ['deploy/runtime-deploy
     NVOY_TEST_RELEASE_SHA: sha,
     NVOY_INSTANCE_ROOT: instances, NVOY_DEPLOY_STATE: state, NVOY_DEPLOY_HUB: repo,
     NVOY_DOCKER: join(bin, 'fake-docker'), NVOY_GIT: join(bin, 'fake-git'), NVOY_NPM: join(bin, 'fake-npm'),
-    NVOY_BOUNDARY_TEST: join(work, 'boundary.py'), NVOY_SETTLE_MS: '0',
+    NVOY_BOUNDARY_TEST: join(work, 'boundary.py'), NVOY_SETTLE_MS: '0', NVOY_RETRY_AFTER_S: '0',
     FAKE_GIT_ORDER: [sha1, sha2, sha3, 'origin/main'].join(' '), FAKE_GIT_HEAD: head, ...extra },
 })
 
@@ -116,8 +117,58 @@ try {
 
   writeFileSync(calls, '')
   const current = invoke(sha1)
-  const currentCalls = readFileSync(calls, 'utf8')
+  const currentCalls = readFileSync(calls, 'utf8').replace(/^git .* ls-remote .*$/gm, '')
   ok('an already-current tick health-checks but does not pull, render, or restart', current.status === 0 && /already current and healthy/.test(current.stdout) && /docker compose .* ps/.test(currentCalls) && !/docker pull| up -d|git |npm |boundary/.test(currentCalls))
+  const quiet = invoke(sha1)
+  ok('a second quiet tick logs nothing, so a 30 s timer does not flood the journal', quiet.status === 0 && quiet.stdout === '')
+
+  // A host upgrading to this runner has no manifest record: baseline it, recreate nothing.
+  const manifests = join(state, 'DEPLOYED_MANIFESTS.json')
+  ok('a promotion records a digest for every manifest', JSON.stringify(Object.keys(JSON.parse(readFileSync(manifests, 'utf8')))) === '["alpha","beta"]')
+  rmSync(manifests)
+  writeFileSync(calls, '')
+  const baseline = invoke(sha1)
+  ok('with no record, a healthy tick records the baseline and restarts nothing',
+    baseline.status === 0 && /manifest baseline recorded/.test(baseline.stdout) && existsSync(manifests) && !/ up -d|docker pull/.test(readFileSync(calls, 'utf8')))
+
+  // What nvoy-runtime-deploy.path starts: an edited manifest reconciles at the deployed release.
+  const betaManifest = join(instances, 'beta.json')
+  writeFileSync(betaManifest, JSON.stringify(JSON.parse(readFileSync(betaManifest, 'utf8')), null, 2))
+  writeFileSync(calls, '')
+  const edited = invoke(sha1)
+  const editedCalls = readFileSync(calls, 'utf8').split('\n')
+  ok('an edited manifest reconciles at once, at the deployed release',
+    edited.status === 0 && /manifest changed for beta — reconciling at 444444/.test(edited.stdout) && /deploy OK/.test(edited.stdout) &&
+    readFileSync(join(state, 'DEPLOYED_SHA'), 'utf8').trim() === sha1)
+  ok('only the edited identity is force-recreated',
+    editedCalls.some(l => /beta\.compose\.yml up -d --remove-orphans --force-recreate$/.test(l)) &&
+    editedCalls.some(l => /alpha\.compose\.yml up -d --remove-orphans$/.test(l)) && !editedCalls.some(l => /alpha.*--force-recreate/.test(l)))
+  writeFileSync(calls, '')
+  ok('once reconciled, the edit is not replayed', invoke(sha1).status === 0 && !/ up -d/.test(readFileSync(calls, 'utf8')))
+
+  // A failed attempt is held for the backoff instead of being retried every 30 s tick.
+  const alphaManifest = join(instances, 'alpha.json')
+  writeFileSync(alphaManifest, JSON.stringify(JSON.parse(readFileSync(alphaManifest, 'utf8')), null, 2))
+  const held = { FAKE_FAIL_INSTANCE: 'alpha.compose.yml', NVOY_RETRY_AFTER_S: '600' }
+  const firstTry = invoke(sha1, held)
+  writeFileSync(calls, '')
+  const secondTry = invoke(sha1, held)
+  ok('a failed reconcile is not retried inside the backoff',
+    firstTry.status !== 0 && secondTry.status === 0 && /retrying after 600s/.test(secondTry.stdout) && !/ up -d|docker pull/.test(readFileSync(calls, 'utf8')))
+  const recovered = invoke(sha1)
+  ok('after the backoff the same attempt is retried and clears the hold',
+    recovered.status === 0 && /deploy OK/.test(recovered.stdout) && !existsSync(join(state, 'FAILED_ATTEMPT.json')))
+
+  // The lookup gate: main at the deployed commit means no GitHub call, even if one would name more.
+  const remoteHead = join(state, 'REMOTE_HEAD.json')
+  invoke(sha1, { FAKE_REMOTE_HEAD: sha1 })
+  writeFileSync(calls, '')
+  const gated = invoke(sha2, { FAKE_REMOTE_HEAD: sha1 })
+  ok('while main sits on the deployed commit, the tick asks GitHub nothing',
+    gated.status === 0 && readFileSync(join(state, 'DEPLOYED_SHA'), 'utf8').trim() === sha1 && !/ up -d|docker pull|fetch/.test(readFileSync(calls, 'utf8')))
+  invoke(sha1, { FAKE_REMOTE_HEAD: sha2 })
+  ok('a moved main head is looked up and remembered', JSON.parse(readFileSync(remoteHead, 'utf8')).head === sha2)
+  rmSync(remoteHead)
 
   const oldAlpha = readFileSync(join(instances, 'alpha.compose.yml'), 'utf8')
   const oldBeta = readFileSync(join(instances, 'beta.compose.yml'), 'utf8')
@@ -179,6 +230,18 @@ runs = [{"status": "in_progress", "conclusion": None, "head_branch": "main", "he
 print(json.dumps([m.pick_release(runs)["head_sha"], m.pick_release(runs[:3])]))`], { cwd: repo, encoding: 'utf8' })
   ok('the release is the newest completed, successful main run — never an in-progress, failed or branch run',
     pick.status === 0 && pick.stdout.trim() === '["a", null]')
+  const settle = spawnSync('python3', ['-c', `
+import importlib.util, json
+spec = importlib.util.spec_from_file_location("runner", "deploy/runtime-deploy-runner.py")
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+run = lambda status: [{"status": status, "head_branch": "main", "head_sha": "h"}]
+print(json.dumps([m.head_status({}, "h", run("in_progress"), 1000)["settled"],
+                  m.head_status({}, "h", run("completed"), 1000)["settled"],
+                  m.head_status({"head": "h", "first_seen": 1000}, "h", [], 1060)["settled"],
+                  m.head_status({"head": "h", "first_seen": 1000}, "h", [], 1200)["settled"],
+                  m.head_status({"head": "g", "first_seen": 0}, "h", [], 1200)["settled"]]))`], { cwd: repo, encoding: 'utf8' })
+  ok('a main head settles when its release run finishes, or when no run has come for it after 120 s',
+    settle.status === 0 && settle.stdout.trim() === '[false, true, false, true, false]')
   ok('the runner no longer asks GitHub to filter by status', !/runs\?[^"]*status=success/.test(readFileSync('deploy/runtime-deploy-runner.py', 'utf8')))
 
   const workflow = readFileSync('.github/workflows/publish-runtime-images.yml', 'utf8')
@@ -191,6 +254,11 @@ print(json.dumps([m.pick_release(runs)["head_sha"], m.pick_release(runs[:3])]))`
     /Environment=HOME=\/tmp\/nvoy-home/.test(unit) &&
     /Environment=DOCKER_CONFIG=\/tmp\/nvoy-docker/.test(unit) &&
     /PrivateTmp=yes/.test(unit) && /ProtectHome=yes/.test(unit))
+  const timer = readFileSync('deploy/nvoy-runtime-deploy.timer', 'utf8')
+  const path = readFileSync('deploy/nvoy-runtime-deploy.path', 'utf8')
+  ok('a manifest edit starts the runner through the path unit, and the timer ticks every 30 s',
+    /^PathChanged=\/etc\/nvoy\/instances$/m.test(path) && /^Unit=nvoy-runtime-deploy\.service$/m.test(path) &&
+    /^OnUnitActiveSec=30s$/m.test(timer) && /^StartLimitIntervalSec=0$/m.test(unit))
 } finally { rmSync(work, { recursive: true, force: true }) }
 
 if (failures) process.exit(1)

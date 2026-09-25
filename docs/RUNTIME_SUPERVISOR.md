@@ -685,7 +685,28 @@ The runner validates each candidate Compose file before starting it. It then req
 broker, adapter, and (where configured) worker to be running for every identity. The release SHA
 and image digests are recorded only after all identities pass. If any identity fails, every
 already-touched identity is restored from the previous Compose set; the failed SHA remains
-unrecorded so the timer alarms and retries rather than silently accepting a partial release.
+unrecorded so the runner alarms rather than silently accepting a partial release. The same release
+with the same manifests is retried after `NVOY_RETRY_AFTER_S` (default 600 s); a manifest edit or a
+newer release retries at once.
+
+Deploys are event-driven, with no three-minute wait:
+
+- **A manifest edit.** `nvoy-runtime-deploy.path` starts the runner as soon as anything under
+  `/etc/nvoy/instances` changes. The runner keeps a sha256 of every manifest it last promoted
+  (`/var/lib/nvoy-deploy/DEPLOYED_MANIFESTS.json`). A changed or new manifest is re-rendered at
+  the deployed release and its identity is recreated with `--force-recreate`, because the
+  services read the manifest only when they start. The other identities are left running.
+  The first run on a host that has no record takes the current manifests as the baseline and
+  recreates nothing.
+- **A merge.** The timer ticks every 30 s. Each tick runs `git ls-remote` for `main`, which is not
+  a GitHub API call. The runner asks the Actions API for a release only while `main` sits on a
+  commit whose release run hasn't finished yet (a commit outside the workflow's paths gets no run
+  and stops being asked about after 120 s). It also asks every 10 minutes regardless, so a re-run
+  workflow is still found. So a merge deploys within about 30 s of its images being published,
+  well inside the unauthenticated 60-requests-per-hour API limit.
+
+A tick that finds nothing to do logs only when its outcome changes, so the journal doesn't gain a
+line every 30 s.
 
 Bootstrap once on the runtime host:
 
@@ -694,11 +715,16 @@ git clone https://github.com/JAFairweather/nvoy.git /opt/nvoy-hub
 install -d -m 0700 /var/lib/nvoy-deploy
 install -m 0644 /opt/nvoy-hub/deploy/nvoy-runtime-deploy.service /etc/systemd/system/
 install -m 0644 /opt/nvoy-hub/deploy/nvoy-runtime-deploy.timer /etc/systemd/system/
+install -m 0644 /opt/nvoy-hub/deploy/nvoy-runtime-deploy.path /etc/systemd/system/
 systemctl daemon-reload
 DRY_RUN=1 python3 /opt/nvoy-hub/deploy/runtime-deploy-runner.py
 systemctl start nvoy-runtime-deploy.service
-systemctl enable --now nvoy-runtime-deploy.timer
+systemctl enable --now nvoy-runtime-deploy.timer nvoy-runtime-deploy.path
 ```
+
+The unit files aren't deployed by a release, because the runner doesn't install them. After a
+release changes one, rerun the three `install` lines, then `systemctl daemon-reload`, then
+`systemctl restart nvoy-runtime-deploy.timer` and `systemctl enable --now nvoy-runtime-deploy.path`.
 
 The public repository and public GHCR packages require no token. A private fork may place a
 read-only `GH_TOKEN` in `/etc/nvoy/runtime-deploy.env` (root-owned mode `0600`). GitHub receives no

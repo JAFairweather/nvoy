@@ -1,0 +1,10 @@
+[Unit]
+Description=Nvoy runtime deploy — reconcile as soon as an identity manifest changes
+
+[Path]
+# The runner's own Compose writes land here too; they cost one quiet no-op run.
+PathChanged=/etc/nvoy/instances
+Unit=nvoy-runtime-deploy.service
+
+[Install]
+WantedBy=paths.target
