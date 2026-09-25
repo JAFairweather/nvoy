@@ -95,8 +95,31 @@ export function hasPriorSession(home, workdir) {
 // calls, which Codex otherwise puts to the client as an elicitation the harness must decline
 // (DJ Codex, 2026-09-25). The broker still rechecks the grant before it signs any reply.
 export const CODEX_CHANNEL_TOOLS = ['nvoy_channel_list', 'nvoy_channel_read', 'nvoy_channel_reply']
-export function codexConfigToml({ manifest, root, model = '' }) {
+//
+// `auth: 'chatgpt'` is the portable harness (codex_portable_harness.mjs): Codex on its owner's
+// ChatGPT login, stored as a file in a CODEX_HOME that is the harness's own. No provider block and
+// no key; `forced_login_method` stops Codex falling back to an API key it might find. The channel
+// is the SSH forced command, as for the portable Claude harness.
+export function codexConfigToml({ manifest, root, model = '', auth = 'api-key', remote = null }) {
   const q = value => JSON.stringify(String(value))
+  if (auth === 'chatgpt') {
+    if (!remote) throw new Error('a ChatGPT-login Codex config reaches its channel only through the SSH forced command')
+    const entry = sshChannelEntry(remote)
+    return [
+      ...(model ? [`model = ${q(model)}`] : []),
+      'forced_login_method = "chatgpt"',
+      'cli_auth_credentials_store = "file"',
+      'approval_policy = "never"',
+      'sandbox_mode = "read-only"',
+      '',
+      `[mcp_servers.${serverName(manifest)}]`,
+      `command = ${q(entry.command)}`,
+      `args = [${entry.args.map(q).join(', ')}]`,
+      '',
+      ...CODEX_CHANNEL_TOOLS.flatMap(tool => [`[mcp_servers.${serverName(manifest)}.tools.${tool}]`, 'approval_mode = "approve"', '']),
+    ].join('\n')
+  }
+  if (auth !== 'api-key') throw new Error(`unknown Codex auth mode ${auth}`)
   return [
     ...(model ? [`model = ${q(model)}`] : []),
     'model_provider = "nvoy-openai-api"',

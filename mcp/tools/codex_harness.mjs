@@ -58,6 +58,34 @@ function appServer({ env, log }) {
   }
 }
 
+// Resume the stored thread, or start one and store it. Shared by the fleet and portable supervisors.
+export async function openThread({ server, manifest, workdir, threadPath, log, writePrivate }) {
+  let threadId = '', thread = null
+  try { threadId = codexThreadId(JSON.parse(readFileSync(threadPath, 'utf8')).thread_id) } catch {}
+  if (threadId) {
+    try {
+      const resumed = await server.request('thread/resume', { threadId })
+      if (resumed?.thread?.id !== threadId) throw new Error('Codex resumed an unexpected thread')
+      thread = resumed.thread
+      log(`resumed the ${manifest.id} thread`)
+    } catch (error) {
+      // Codex saves a thread at its first turn, so a thread that never had one cannot be
+      // resumed after a restart. Retrying it can never succeed (DJ Codex, 2026-09-25).
+      if (!/no rollout found/i.test(error.message)) throw error
+      log(`Codex never saved the stored ${manifest.id} thread; starting a new one`)
+      threadId = ''
+    }
+  }
+  if (!threadId) {
+    const started = await server.request('thread/start', { cwd: workdir, serviceName: 'nvoy_harness', ...(manifest.harness.model ? { model: manifest.harness.model } : {}) })
+    threadId = codexThreadId(started?.thread?.id)
+    thread = started.thread
+    writePrivate(threadPath, JSON.stringify({ version: 1, instance: manifest.id, thread_id: threadId }) + '\n')
+    log(`started the ${manifest.id} thread`)
+  }
+  return { threadId, thread }
+}
+
 export async function runCodexHarness({ manifest, root, home, credential, log, stopping }) {
   const codexHome = resolve(home, '.codex'), workdir = resolve(home, 'workspace'), privateDir = resolve(home, '.nvoy-harness')
   const threadPath = resolve(privateDir, 'codex-thread.json'), deliveredPath = resolve(privateDir, 'delivered.jsonl')
@@ -91,27 +119,7 @@ export async function runCodexHarness({ manifest, root, home, credential, log, s
     try {
       await server.request('initialize', { clientInfo: { name: 'nvoy-harness', title: 'Nvoy harness', version: '1' }, capabilities: {} })
       server.notify('initialized')
-      let threadId = ''
-      try { threadId = codexThreadId(JSON.parse(readFileSync(threadPath, 'utf8')).thread_id) } catch {}
-      if (threadId) {
-        try {
-          const resumed = await server.request('thread/resume', { threadId })
-          if (resumed?.thread?.id !== threadId) throw new Error('Codex resumed an unexpected thread')
-          log(`resumed the ${manifest.id} thread`)
-        } catch (error) {
-          // Codex saves a thread at its first turn, so a thread that never had one cannot be
-          // resumed after a restart. Retrying it can never succeed (DJ Codex, 2026-09-25).
-          if (!/no rollout found/i.test(error.message)) throw error
-          log(`Codex never saved the stored ${manifest.id} thread; starting a new one`)
-          threadId = ''
-        }
-      }
-      if (!threadId) {
-        const started = await server.request('thread/start', { cwd: workdir, serviceName: 'nvoy_harness', ...(manifest.harness.model ? { model: manifest.harness.model } : {}) })
-        threadId = codexThreadId(started?.thread?.id)
-        writePrivate(threadPath, JSON.stringify({ version: 1, instance: manifest.id, thread_id: threadId }) + '\n')
-        log(`started the ${manifest.id} thread`)
-      }
+      const { threadId } = await openThread({ server, manifest, workdir, threadPath, log, writePrivate })
       log(`${manifest.id} session ready; admitted messages will be injected as turns`)
       while (!stopping()) {
         const next = pendingEnvelopes(queueText(), delivered() || [])[0]
