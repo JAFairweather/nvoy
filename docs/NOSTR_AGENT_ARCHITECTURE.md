@@ -132,6 +132,10 @@ The server-side `authorized_keys` entry uses `restrict` and an exact `docker exe
 <uid>:<gid> <container> <node> <tool> --instance <id>` command. It grants no shell, PTY,
 forwarding, container selection or caller-selected command.
 
+"Owner workstation" above is one instance of a harness box: the fleet holds tools only, and a
+harness may run on any box that holds the model login, the per-identity channel key and the pinned
+`known_hosts`. See [Harness placement](HARNESS_PLACEMENT.md).
+
 ## Current deployment state (2026-08-06)
 
 | Identity | Runtime | Session interaction | MCP attachment | Live status |
