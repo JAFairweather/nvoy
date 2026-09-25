@@ -175,7 +175,7 @@ ok('pending envelopes are well formed, oldest first, each once, and never repeat
 const fakeBin = join(root, 'fake-bin')
 mkdirSync(fakeBin)
 writeFileSync(join(fakeBin, 'codex'), `#!/usr/bin/env node
-const { appendFileSync } = require('node:fs')
+const { appendFileSync, existsSync } = require('node:fs')
 const log = row => appendFileSync(process.env.CODEX_HOME + '/fake.jsonl', JSON.stringify(row) + '\\n')
 if (process.argv[2] !== 'app-server') process.exit(2)
 log({ start: true, keyed: process.env.OPENAI_API_KEY === 'sk-test-fake', env: Object.keys(process.env).sort() })
@@ -189,8 +189,9 @@ process.stdin.on('data', data => {
     const m = JSON.parse(buffer.slice(0, at)); buffer = buffer.slice(at + 1)
     log(m)
     if (m.method === 'initialize') send({ id: m.id, result: { userAgent: 'fake' } })
-    if (m.method === 'thread/start') send({ id: m.id, result: { thread: { id: '0199a213-81c0-7800-8aa1-bbab2a035a53' } } })
-    if (m.method === 'thread/resume') send({ id: m.id, result: { thread: { id: m.params.threadId } } })
+    const unsaved = existsSync(process.env.CODEX_HOME + '/unsaved')
+    if (m.method === 'thread/start') send({ id: m.id, result: { thread: { id: unsaved ? '0199a213-81c0-7800-8aa1-cccccccccccc' : '0199a213-81c0-7800-8aa1-bbab2a035a53' } } })
+    if (m.method === 'thread/resume') send(unsaved ? { id: m.id, error: { code: -32600, message: 'no rollout found for thread id ' + m.params.threadId } } : { id: m.id, result: { thread: { id: m.params.threadId } } })
     if (m.method === 'turn/start') {
       const id = 'turn-' + ++turns
       send({ id: m.id, result: { turn: { id } } })
@@ -254,6 +255,16 @@ ok('a restart resumes the same thread and injects only what arrived since', /res
   fakeLog().filter(m => m.method === 'thread/start').length === 1 && turnStarts().length === 3 && turnStarts()[2].params.input[0].text.includes(envelope(4)))
 ok('the operator\'s instructions survive a restart', readFileSync(join(djHome, 'workspace', 'AGENTS.md'), 'utf8') === 'operator edit\n')
 second.child.kill('SIGTERM'); await second.exited
+writeFileSync(join(djHome, '.codex', 'unsaved'), '')
+const third = startCodex()
+await waitFor(() => /session ready/.test(third.out))
+appendFileSync(djQueue, JSON.stringify({ envelope: envelope(5), type: 'admitted-task' }) + '\n')
+await waitFor(() => turnStarts().length >= 4 && /turn for 555555555555 ended/.test(third.out))
+ok('a stored thread Codex never saved is replaced by a new one, not retried forever', /never saved the stored dj-test thread; starting a new one/.test(third.out) &&
+  !/next start in/.test(third.out) && fakeLog().filter(m => m.method === 'thread/start').length === 2 &&
+  turnStarts()[3]?.params.threadId === '0199a213-81c0-7800-8aa1-cccccccccccc' &&
+  JSON.parse(readFileSync(join(djHome, '.nvoy-harness', 'codex-thread.json'), 'utf8')).thread_id === '0199a213-81c0-7800-8aa1-cccccccccccc')
+third.child.kill('SIGTERM'); await third.exited
 
 rmSync(root, { recursive: true, force: true })
 console.log(fails ? `\n${fails} FAILED` : '\nall passed')
