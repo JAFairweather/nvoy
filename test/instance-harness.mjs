@@ -129,6 +129,9 @@ ok('the supervisor refuses a manifest without a harness block', noHarness.status
 const wrongUid = run('instance-harness.mjs', { ...base('mc-test'), harness }, [], { HOME: join(root, 'h2') })
 ok('the supervisor refuses to run under any UID but the manifest-bound worker', wrongUid.status !== 0 && /worker user/.test(wrongUid.stderr))
 const supervisor = readFileSync('mcp/tools/instance-harness.mjs', 'utf8')
+ok('a fresh harness clears the channel lock its previous container left, before any session starts',
+  supervisor.indexOf("rmSync(resolve(manifest.runtimeDir, 'claude-channel-state', 'channel.lock'), { force: true })") > -1 &&
+  supervisor.indexOf("rmSync(resolve(manifest.runtimeDir, 'claude-channel-state', 'channel.lock')") < supervisor.indexOf("'new-session'"))
 ok('the login token reaches the session only through the tmux environment or the Codex supervisor, never an argv or a log', /CLAUDE_CODE_OAUTH_TOKEN: token/.test(supervisor) &&
   (() => {
     const uses = supervisor.split('\n').filter(line => /\btoken\b/.test(line) && !/^\s*\/\/|let token|token = readFileSync|!token/.test(line))

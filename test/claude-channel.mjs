@@ -119,6 +119,14 @@ if (abandonedExit === 'TIMEOUT') abandoned.kill('SIGKILL')
 ok('a channel that no MCP client ever spoke to releases its lock instead of stranding the lane',
   abandonedExit === 0 && /no MCP client initialised/.test(abandonedStderr) && !existsSync(lockPath))
 
+// A restarted container reuses PIDs, so the lock left by the last channel can name this one. That is
+// not a live rival; `exec` keeps the shell's PID, so the lock is written with the channel's own.
+const selfLocked = spawnSync('sh', ['-c', 'printf \'{"version":1,"instance":"%s","pid":%s,"started_at":0}\' "$ID" "$$" > "$LOCK"; exec "$NODE" "$CHANNEL" --instance "$ID" --poll-ms 250 --handshake-ms 1000'],
+  { env: { ...process.env, NVOY_INSTANCE_ROOT: manifests, ID: manifest.id, LOCK: lockPath, NODE: process.execPath,
+    CHANNEL: resolve('mcp/tools/claude-channel.mjs') }, encoding: 'utf8', timeout: 8000, input: '' })
+ok('a lock naming the channel\'s own PID is stale, not a live rival',
+  selfLocked.status === 0 && !/already runs as pid/.test(selfLocked.stderr) && !existsSync(lockPath))
+
 // Negative control. Without this, "releases the lock" is indistinguishable from "exits on a timer",
 // which would replace a stuck lane with one that dies under a working session — a real session is
 // legitimately silent for hours, so silence must never be the eviction signal. A live client is

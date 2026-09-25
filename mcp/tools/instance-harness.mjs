@@ -8,7 +8,7 @@
 // theme if they appear), then leaves the session alone and restarts it if it exits. It never reads
 // or logs the conversation, except the screen of a session that dies before it is ready.
 
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { resolve } from 'node:path'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
@@ -64,6 +64,11 @@ const settingsPath = resolve(home, '.claude', 'settings.json')
 writePrivate(settingsPath, JSON.stringify(seedSettings(readJson(settingsPath), server), null, 2))
 writePrivate(mcpConfigPath, JSON.stringify(mcpConfig({ manifest, root }), null, 2))
 if (!existsSync(resolve(workdir, 'CLAUDE.md'))) writePrivate(resolve(workdir, 'CLAUDE.md'), defaultInstructions(manifest))
+// The channel lock lives on the runtime volume, so it outlives the container whose channel wrote it.
+// PIDs restart with the container, so its PID can name a live process here and the new channel
+// refuses to start, leaving a "ready" session with no ears (MC Claude, 2026-09-25 01:44 UTC).
+// Nothing can hold the lock before this harness starts its first session.
+rmSync(resolve(manifest.runtimeDir, 'claude-channel-state', 'channel.lock'), { force: true })
 // A dead pane stays readable, so a session that fails to start can say why.
 writeFileSync(tmuxConf, 'set -g remain-on-exit on\nset -g history-limit 5000\n')
 
