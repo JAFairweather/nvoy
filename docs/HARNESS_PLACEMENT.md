@@ -53,6 +53,28 @@ harness session on the fleet host. It is documented in
 placement. It breaks the rule that the fleet holds tools only, and the Codex variant runs on an
 OpenAI API key rather than the owner's subscription.
 
+## Webhook wake for a hosted harness
+
+Some harnesses are hosted bots that run a routine only when an HTTPS webhook fires. They cannot
+keep an SSH stream open, so the channel's native push and the Codex wake feed cannot reach them,
+and the fleet had no way to push to them. A manifest `wake_webhook` block adds a `notifier` service
+to the identity's stack for that case.
+
+- **What crosses the wire.** One HTTPS POST per new admitted envelope, with the body
+  `{"instance", "envelope", "type", "at"}`: the envelope id, its type and its receipt time. No
+  message, sender or authority is sent.
+- **What stays on the fleet.** The message. The woken harness connects over its channel key as
+  any other harness does, reads the envelope with `nvoy_channel_read` and answers with
+  `nvoy_channel_reply`. The webhook is a doorbell, not a second transport.
+- **What the fleet holds.** The webhook URL and its auth headers, as two operator files. They are
+  not Nostr keys, and only the notifier gets them.
+- **Re-notify.** A drain that starts while the channel still holds an earlier session's lock gets
+  nothing. So an envelope that is still unread 12 minutes after its POST is posted again, at most
+  twice.
+
+Setup is in
+[Webhook wake for an off-fleet harness](RUNTIME_SUPERVISOR.md#webhook-wake-for-an-off-fleet-harness).
+
 ## Migration
 
 For each identity, in this order:

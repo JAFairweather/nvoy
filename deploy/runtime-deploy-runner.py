@@ -181,7 +181,8 @@ def instances() -> list[dict]:
         enabled = delivery == "headless" if configured is None else configured
         if not isinstance(enabled, bool):
             raise RuntimeError(f"{path.name}: worker_enabled must be boolean")
-        result.append({"id": raw["id"], "worker": enabled, "harness": raw.get("harness") is not None})
+        result.append({"id": raw["id"], "worker": enabled, "harness": raw.get("harness") is not None,
+                       "notifier": raw.get("wake_webhook") is not None})
     if not result:
         raise RuntimeError(f"no instance manifests in {ROOT}")
     return result
@@ -202,7 +203,8 @@ def verify_compose(path: Path, instance: dict, runtime_ref: str, worker_ref: str
 
 def verify_running(path: Path, instance: dict) -> None:
     running = set(compose(path, ["ps", "--status", "running", "--services"], True).split())
-    expected = ["watcher", "broker", "adapter"] + (["worker"] if instance["worker"] else []) + (["harness"] if instance["harness"] else [])
+    expected = (["watcher", "broker", "adapter"] + (["worker"] if instance["worker"] else [])
+                + (["harness"] if instance["harness"] else []) + (["notifier"] if instance.get("notifier") else []))
     missing = [service for service in expected if service not in running]
     if missing:
         raise RuntimeError(f"{instance['id']}: services not running: {', '.join(missing)}")
