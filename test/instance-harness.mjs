@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { sshChannelEntry } from '../mcp/tools/channel_client.mjs'
-import { CODEX_CHANNEL_TOOLS, classifyPane, claudeArgs, codexConfigToml, codexTurnText, defaultInstructions, hasPriorSession, mcpConfig, pendingEnvelopes, seedClaudeJson, seedSettings, serverName } from '../mcp/tools/harness_session.mjs'
+import { CODEX_CHANNEL_TOOLS, channelProcessUp, classifyPane, claudeArgs, codexConfigToml, codexTurnText, defaultInstructions, hasPriorSession, mcpConfig, pendingEnvelopes, seedClaudeJson, seedSettings, serverName } from '../mcp/tools/harness_session.mjs'
 
 let fails = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); if (!value) fails++ }
@@ -123,7 +123,16 @@ ok('the 2.1.221 idle prompt, whose footer is the permission-mode hint, is recogn
   classifyPane(' ▐▛███▜▌   Claude Code v2.1.221\n──────\n❯ Try "how does <filepath> work?"\n──────\n  ⏵⏵ don\'t ask on (shift+tab to cycle) · ← for agents').state === 'ready')
 ok('anything else is still starting and gets no keystroke', JSON.stringify(classifyPane('Loading…')) === '{"state":"starting"}' && classifyPane('').key === undefined)
 ok('an injected message that quotes a startup screen after ready cannot matter: the supervisor stops reading once ready',
-  /if \(screen\.state === 'ready'\) \{ log\(.*\); return \}/.test(readFileSync('mcp/tools/instance-harness.mjs', 'utf8')))
+  /if \(screen\.state === 'ready'\) \{ if \(!watchChannel\) \{ log\(.*\); return \} readyAt = Date\.now\(\); continue \}/.test(readFileSync('mcp/tools/instance-harness.mjs', 'utf8')) &&
+  /if \(readyAt\) \{[^]*?continue\n    \}\n    const screen = classifyPane\(pane\(\)\)/.test(readFileSync('mcp/tools/instance-harness.mjs', 'utf8')))
+const sshArgs = sshChannelEntry({ identity: '/k/id', knownHosts: '/k/kh', target: 'nvoy-channel@broker.example' }).args
+const ps = rows => rows.map(([pid, ppid, command]) => `  ${pid}   ${ppid} ${command}`).join('\n')
+ok('the channel is the session\'s descendant whose command line ends with the channel entry', channelProcessUp(ps([[1, 0, 'launchd'], [100, 1, 'tmux'], [101, 100, 'claude --mcp-config /m'],
+  [102, 101, `/usr/bin/ssh ${sshArgs.join(' ')}`]]), 101, sshArgs) && channelProcessUp(ps([[101, 1, 'sh -c claude'], [102, 101, 'claude'], [103, 102, `/usr/bin/ssh ${sshArgs.join(' ')}`]]), 101, sshArgs) &&
+  channelProcessUp(ps([[7, 1, 'claude'], [8, 7, 'node /srv/nvoy/mcp/tools/claude-channel.mjs --instance mc-test']]), 7, ['/srv/nvoy/mcp/tools/claude-channel.mjs', '--instance', 'mc-test']))
+ok('another session\'s channel, a command that only mentions the entry, or no channel at all is not this session\'s channel',
+  !channelProcessUp(ps([[101, 1, 'claude'], [200, 1, 'claude'], [201, 200, `/usr/bin/ssh ${sshArgs.join(' ')}`]]), 101, sshArgs) &&
+  !channelProcessUp(ps([[101, 1, 'claude'], [102, 101, `grep ${sshArgs.join(' ')} x`]]), 101, sshArgs) && !channelProcessUp(ps([[101, 1, 'claude']]), 101, sshArgs) && !channelProcessUp('', 101, sshArgs))
 
 // Supervisor
 const noHarness = run('instance-harness.mjs', base('mc-test'), [], { HOME: join(root, 'h1') })
@@ -284,18 +293,44 @@ const looseKey = secretFile(join(remoteDir, 'loose-key'), 'PRIVATE-KEY-MUST-NEVE
 const fakeClaude = secretFile(join(remoteDir, 'claude'), "#!/bin/sh\necho '2.1.230 (Claude Code)'\n", 0o700)
 const client = { instance: 'mac-test', ssh_target: 'nvoy-channel@broker.example', identity_file: keyFile, known_hosts_file: knownFile, credential_file: loginFile }
 const clientConfig = (value, mode = 0o600) => secretFile(join(mkdtempSync(join(remoteDir, 'cfg-')), 'client.json'), JSON.stringify(value), mode)
+// The fake session is a real process tree: tmux runs a fake claude, which reads its MCP config the
+// way Claude Code does and runs the channel entry's arguments under a fake ssh, unless
+// <harness home>/.fake/nochannel exists. The fake ssh ends at once while .fake/refuse exists (the
+// fleet refusing the channel), and when .fake/drop appears (the fleet recreating the adapter).
+const fakeSsh = join(remoteDir, 'fake-ssh.cjs'), fakeClaudeSession = join(remoteDir, 'fake-claude.cjs')
+writeFileSync(fakeSsh, `const { existsSync, rmSync } = require('node:fs')
+const ctl = process.env.HOME + '/.fake/'
+if (existsSync(ctl + 'refuse')) setTimeout(() => process.exit(255), 100)
+setInterval(() => { if (existsSync(ctl + 'drop')) { rmSync(ctl + 'drop', { force: true }); process.exit(255) } }, 25)
+`)
+writeFileSync(fakeClaudeSession, `const { existsSync, mkdirSync, readFileSync, writeFileSync } = require('node:fs')
+const args = process.argv.slice(2)
+const entry = Object.values(JSON.parse(readFileSync(args[args.indexOf('--mcp-config') + 1], 'utf8')).mcpServers)[0]
+const saved = process.env.HOME + '/.claude/projects/' + (process.env.HOME + '/workspace').replace(/[^a-zA-Z0-9]/g, '-')
+mkdirSync(saved, { recursive: true }); writeFileSync(saved + '/fake.jsonl', '{}\\n')
+if (!existsSync(process.env.HOME + '/.fake/nochannel')) require('node:child_process').spawn(process.execPath, [${JSON.stringify(fakeSsh)}, ...entry.args], { stdio: 'ignore' })
+setInterval(() => {}, 1000)
+`)
 writeFileSync(join(fakeBin, 'tmux'), `#!/usr/bin/env node
-const { appendFileSync } = require('node:fs')
+const { appendFileSync, readFileSync, writeFileSync } = require('node:fs')
 const socket = process.argv[3]
 let rest = process.argv.slice(4)
 if (rest[0] === '-f') rest = rest.slice(2)
 const e = process.env
-if (rest[0] === 'new-session') appendFileSync(socket + '.log', JSON.stringify({ socket, args: rest, home: e.HOME, configDir: e.CLAUDE_CONFIG_DIR, root: e.NVOY_INSTANCE_ROOT, keyed: e.CLAUDE_CODE_OAUTH_TOKEN === 'sk-ant-oat-fake-login' }) + '\\n')
-if (rest[0] === 'display-message') console.log('0 ')
+const pid = (() => { try { return Number(readFileSync(socket + '.pid', 'utf8')) } catch { return 0 } })()
+const alive = () => { try { process.kill(pid, 0); return true } catch { return false } }
+if (rest[0] === 'new-session') {
+  appendFileSync(socket + '.log', JSON.stringify({ socket, args: rest, home: e.HOME, configDir: e.CLAUDE_CONFIG_DIR, root: e.NVOY_INSTANCE_ROOT, keyed: e.CLAUDE_CODE_OAUTH_TOKEN === 'sk-ant-oat-fake-login' }) + '\\n')
+  const session = require('node:child_process').spawn(process.execPath, [${JSON.stringify(fakeClaudeSession)}, ...rest.slice(rest.indexOf('claude') + 1)], { detached: true, stdio: 'ignore', env: e })
+  writeFileSync(socket + '.pid', String(session.pid)); session.unref()
+}
+if (rest[0] === 'kill-server' && pid) try { process.kill(-pid, 'SIGKILL') } catch {}
+if (rest[0] === 'display-message') { if (!pid) process.exit(1); console.log(rest.at(-1).includes('pane_pid') ? String(pid) : alive() ? '0 ' : '1 0') }
 if (rest[0] === 'capture-pane') console.log('  ? for shortcuts')
 `)
 chmodSync(join(fakeBin, 'tmux'), 0o755)
-const remoteEnv = { ...process.env, HOME: ownHome, CLAUDE_CONFIG_DIR: join(ownHome, '.claude'), PATH: `${fakeBin}:${process.env.PATH}`, HARNESS_POLL_MS: '25', HARNESS_WATCH_MS: '50' }
+const remoteEnv = { ...process.env, HOME: ownHome, CLAUDE_CONFIG_DIR: join(ownHome, '.claude'), PATH: `${fakeBin}:${process.env.PATH}`, HARNESS_POLL_MS: '25', HARNESS_WATCH_MS: '50',
+  HARNESS_CHANNEL_SETTLE_MS: '300', HARNESS_RETRY_MS: '100' }
 const refused = (value, pattern, mode) => {
   const r = spawnSync(process.execPath, ['mcp/tools/instance-harness.mjs', '--instance', 'mac-test', '--remote', clientConfig(value, mode)], { cwd: resolve('.'), encoding: 'utf8', env: remoteEnv, timeout: 10000 })
   return r.status === 1 && pattern.test(r.stderr) && !/PRIVATE-KEY|sk-ant-oat/.test(r.stdout + r.stderr)
@@ -348,6 +383,24 @@ ok('the portable harness seeds its own home and never touches the owner\'s ~/.cl
   JSON.parse(readText(join(harnessHome, '.claude', 'settings.json'))).permissions.allow.includes('mcp__nvoy-mac-test') &&
   !/Nostr key/.test(readText(join(harnessHome, 'workspace', 'CLAUDE.md'))))
 ok('the portable harness leaves every local channel lock alone: the lock is the fleet\'s', readText(localLock) === '99999\n')
+ok('ready is declared only once the channel to the fleet has stayed up', /mac-test session ready; its channel to the fleet is up/.test(portableOut) &&
+  portableOut.indexOf('session ready') > portableOut.indexOf('starting the mac-test session'))
+const readies = () => (portableOut.match(/mac-test session ready/g) || []).length
+const fakeCtl = join(harnessHome, '.fake')
+mkdirSync(fakeCtl, { recursive: true })
+writeFileSync(join(fakeCtl, 'nochannel'), ''); writeFileSync(join(fakeCtl, 'drop'), '')
+ok('a channel that closes under a ready session (an adapter recreate) restarts the session', await waitFor(() => /the channel to the fleet closed; restarting the session to reconnect it/.test(portableOut)))
+ok('a session whose channel never starts is not declared ready, however ready its prompt looks',
+  await waitFor(() => /the session is ready but its channel to the fleet never started/.test(portableOut)) && readies() === 1)
+const refusals = () => (portableOut.match(/channel to the fleet (?:closed during startup|never started)/g) || []).length, refusedBefore = refusals()
+rmSync(join(fakeCtl, 'nochannel')); writeFileSync(join(fakeCtl, 'refuse'), '')
+ok('while the fleet refuses the channel (its lock still held), no session is declared ready and each retry backs off',
+  await waitFor(() => refusals() > refusedBefore) && readies() === 1 && /next start in/.test(portableOut.slice(portableOut.indexOf('restarting the session to reconnect'))))
+rmSync(join(fakeCtl, 'refuse'))
+const restarted = await waitFor(() => readies() === 2, 15000)
+const allSessions = readText(join(harnessHome, '.nvoy-harness', 'tmux.sock.log')).split('\n').filter(Boolean).map(JSON.parse)
+ok('once the fleet takes the channel again, the same conversation resumes and is ready', restarted && allSessions.length >= 3 &&
+  !allSessions[0].args.includes('--continue') && allSessions.slice(1).every(session => session.args.at(-1) === '--continue'))
 portable.kill('SIGTERM'); await portableExited
 
 rmSync(root, { recursive: true, force: true })

@@ -19,7 +19,7 @@ import { resolve } from 'node:path'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { readClientConfig } from './channel_client.mjs'
 import { runCodexHarness } from './codex_harness.mjs'
-import { classifyPane, claudeArgs, defaultInstructions, hasPriorSession, mcpConfig, seedClaudeJson, seedSettings, serverName } from './harness_session.mjs'
+import { channelProcessUp, classifyPane, claudeArgs, defaultInstructions, hasPriorSession, mcpConfig, seedClaudeJson, seedSettings, serverName } from './harness_session.mjs'
 
 const die = message => { console.error(`instance-harness: ${message}`); process.exit(1) }
 const log = message => console.log(`instance-harness: ${message}`)
@@ -63,7 +63,9 @@ const tmuxConf = `${socket}.conf`
 const STARTUP_MS = Number(process.env.HARNESS_STARTUP_MS || 120000)
 const POLL_MS = Number(process.env.HARNESS_POLL_MS || 1000)
 const WATCH_MS = Number(process.env.HARNESS_WATCH_MS || 5000)
+const RETRY_MS = Number(process.env.HARNESS_RETRY_MS || 5000)
 const RETRY_MAX_MS = Number(process.env.HARNESS_RETRY_MAX_MS || 300000)
+const SETTLE_MS = Number(process.env.HARNESS_CHANNEL_SETTLE_MS || 10000)
 
 function readJson(path) { try { return JSON.parse(readFileSync(path, 'utf8')) } catch { return {} } }
 function writePrivate(path, value) { writeFileSync(path, value, { mode: 0o600 }); chmodSync(path, 0o600) }
@@ -74,7 +76,8 @@ mkdirSync(resolve(home, '.claude'), { recursive: true, mode: 0o700 })
 writePrivate(resolve(home, '.claude.json'), JSON.stringify(seedClaudeJson(readJson(resolve(home, '.claude.json')), workdir), null, 2))
 const settingsPath = resolve(home, '.claude', 'settings.json')
 writePrivate(settingsPath, JSON.stringify(seedSettings(readJson(settingsPath), server), null, 2))
-writePrivate(mcpConfigPath, JSON.stringify(mcpConfig({ manifest, root, remote }), null, 2))
+const sessionMcp = mcpConfig({ manifest, root, remote })
+writePrivate(mcpConfigPath, JSON.stringify(sessionMcp, null, 2))
 if (!existsSync(resolve(workdir, 'CLAUDE.md'))) writePrivate(resolve(workdir, 'CLAUDE.md'), defaultInstructions(manifest))
 // The channel lock lives on the runtime volume, so it outlives the container whose channel wrote it.
 // PIDs restart with the container, so its PID can name a live process here and the new channel
@@ -101,6 +104,18 @@ const paneDead = () => {
   return { dead: dead === '1', status: status || '' }
 }
 
+// Off the fleet the channel is an ssh child of the session, and it dies whenever the fleet recreates
+// the identity's adapter (each release, each manifest change). Claude Code never restarts it, so
+// the supervisor watches for it and restarts the session. The fleet form is left as it was.
+let watchChannel = !!remote
+function channelUp() {
+  const pid = tmux(['display-message', '-p', '-t', 'harness', '#{pane_pid}']).stdout?.trim()
+  if (!/^\d+$/.test(pid || '')) return false
+  const ps = spawnSync('ps', ['-A', '-ww', '-o', 'pid=,ppid=,command='], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+  if (ps.status !== 0) { watchChannel = false; log('cannot list processes; the channel is not watched'); return null }
+  return channelProcessUp(ps.stdout, pid, sessionMcp.mcpServers[server].args)
+}
+
 let stopping = false
 for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => { stopping = true; tmux(['kill-server']); process.exit(0) })
 
@@ -113,6 +128,7 @@ async function start() {
   log(`${resume ? 'resuming' : 'starting'} the ${manifest.id} session with channel ${server}`)
   const answered = new Map()
   const deadline = Date.now() + STARTUP_MS
+  let readyAt = 0, channelSince = 0
   while (!stopping && Date.now() < deadline) {
     await sleep(POLL_MS)
     const { dead, status } = paneDead()
@@ -120,9 +136,22 @@ async function start() {
       const tail = pane().split('\n').filter(line => line.trim()).slice(-12).join('\n')
       throw new Error(`session exited during startup (status ${status})${tail ? `:\n${tail}` : ''}`)
     }
+    // Ready means the channel is up too: a fleet that still holds the channel lock, or refuses the
+    // key, ends the ssh within a second while the prompt looks ready (mc-claude, 2026-09-25).
+    if (watchChannel) {
+      const up = channelUp()
+      if (up) channelSince ||= Date.now()
+      else if (up === false && channelSince) throw new Error('the channel to the fleet closed during startup; the fleet may still hold the channel lock from an earlier session')
+    }
+    if (readyAt) {
+      if (!watchChannel) { log(`${manifest.id} session ready`); return }
+      if (channelSince && Date.now() - channelSince >= SETTLE_MS) { log(`${manifest.id} session ready; its channel to the fleet is up`); return }
+      if (!channelSince && Date.now() - readyAt >= SETTLE_MS) throw new Error('the session is ready but its channel to the fleet never started')
+      continue
+    }
     const screen = classifyPane(pane())
     if (screen.state === 'login') throw new Error('Claude Code is not logged in: the harness credential was refused or has expired')
-    if (screen.state === 'ready') { log(`${manifest.id} session ready; the channel will inject admitted messages`); return }
+    if (screen.state === 'ready') { if (!watchChannel) { log(`${manifest.id} session ready; the channel will inject admitted messages`); return } readyAt = Date.now(); continue }
     if (screen.key) {
       const count = answered.get(screen.state) || 0
       if (count >= 3) throw new Error(`startup screen "${screen.state}" would not accept its answer`)
@@ -135,7 +164,7 @@ async function start() {
   if (!stopping) log(`session not confirmed ready after ${Math.round(STARTUP_MS / 1000)}s; leaving it running — attach to inspect`)
 }
 
-let delay = 5000
+let delay = RETRY_MS
 while (!stopping) {
   const startedAt = Date.now()
   try {
@@ -144,8 +173,9 @@ while (!stopping) {
       await sleep(WATCH_MS)
       const { dead, status } = paneDead()
       if (dead) { log(`session exited (status ${status}); restarting`); break }
+      if (watchChannel && channelUp() === false) { log('the channel to the fleet closed; restarting the session to reconnect it'); break }
     }
-    if (Date.now() - startedAt > RETRY_MAX_MS) delay = 5000
+    if (Date.now() - startedAt > RETRY_MAX_MS) delay = RETRY_MS
   } catch (error) {
     console.error(`instance-harness: ${error.message}`)
   }

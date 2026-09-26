@@ -9,6 +9,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { sshChannelEntry } from '../mcp/tools/channel_client.mjs'
 import { CODEX_CHANNEL_TOOLS, codexConfigToml, codexTurnText } from '../mcp/tools/harness_session.mjs'
 import { attachCommand, sshFeedArgs } from '../mcp/tools/codex_portable_harness.mjs'
+import { claimPidLock } from '../mcp/tools/pid_lock.mjs'
 
 let fails = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); if (!value) fails++ }
@@ -137,11 +138,40 @@ const g = feed()
 g.hello(null)
 ok('a lock that binds another instance fails closed', await Promise.race([g.exited, wait(5000)]) === 1 && /does not bind this instance/.test(g.err))
 clearInterval(g.ping); rmSync(lockPath)
-writeFileSync(lockPath, JSON.stringify({ version: 1, instance: 'cx-test', pid: process.pid, started_at: 1 }))
+// The holder must look like this feed for this instance: on Linux the feed reads /proc and would
+// rightly reclaim a lock whose live PID runs anything else.
+const holder = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', 'codex-channel-feed.mjs', '--instance', 'cx-test'], { stdio: 'ignore' })
+writeFileSync(lockPath, JSON.stringify({ version: 1, instance: 'cx-test', pid: holder.pid, started_at: 1 }))
 const h = feed()
 h.hello(null)
-ok('a lock naming a live process is not reclaimed', await Promise.race([h.exited, wait(5000)]) === 1 && new RegExp(`already runs as pid ${process.pid}`).test(h.err))
-clearInterval(h.ping); rmSync(lockPath)
+ok('a lock naming a live process is not reclaimed', await Promise.race([h.exited, wait(5000)]) === 1 && new RegExp(`already runs as pid ${holder.pid}`).test(h.err))
+clearInterval(h.ping); holder.kill(); rmSync(lockPath)
+// The feed lock outlives the adapter container, and in the next one its PID can name a live,
+// unrelated process. Where /proc shows the PID running anything but this feed for this instance,
+// the lock is stale; where /proc cannot say, a live PID still refuses.
+const stranger = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+const proc = join(root, 'proc'), strangerLock = join(root, 'stranger.lock')
+const cmdline = (...argv) => { mkdirSync(join(proc, String(stranger.pid)), { recursive: true }); writeFileSync(join(proc, String(stranger.pid), 'cmdline'), argv.join('\0') + '\0') }
+const claimOver = (options) => {
+  writeFileSync(strangerLock, JSON.stringify({ version: 1, instance: 'cx-test', pid: stranger.pid, started_at: 1 }))
+  try { claimPidLock(strangerLock, 'cx-test', 'Codex harness feed', options)(); return 'claimed' } catch (error) { return error.message }
+}
+const feedOptions = { program: 'codex-channel-feed.mjs', procRoot: proc }
+const noProc = claimOver(feedOptions)
+cmdline('/usr/bin/python3', '-m', 'http.server')
+const strangerProgram = claimOver(feedOptions)
+cmdline('node', '/srv/nvoy/mcp/tools/codex-channel-feed.mjs', '--instance', 'other-test')
+const otherInstance = claimOver(feedOptions)
+cmdline('node', '/srv/nvoy/mcp/tools/codex-channel-feed.mjs', '--instance', 'cx-test', '--heartbeat-ms', '150')
+const liveFeed = claimOver(feedOptions)
+cmdline('/usr/bin/python3', '-m', 'http.server')
+const noProgram = claimOver({ procRoot: proc })
+stranger.kill()
+ok('a feed lock whose live PID /proc shows running another program, or the feed for another instance, is reclaimed',
+  strangerProgram === 'claimed' && otherInstance === 'claimed')
+ok('a live PID running this instance\'s feed, or one /proc cannot describe, still holds the lock', /already runs as pid/.test(liveFeed) && /already runs as pid/.test(noProc) &&
+  /already runs as pid/.test(noProgram))
+rmSync(strangerLock, { force: true })
 const quiet = spawn(process.execPath, ['mcp/tools/codex-channel-feed.mjs', '--instance', 'cx-test', '--client-timeout-ms', '600'], { cwd: resolve('.'), env: { ...process.env, NVOY_INSTANCE_ROOT: fleet } })
 let quietErr = ''
 quiet.stdin.on('error', () => {})
@@ -178,6 +208,7 @@ const log = row => fs.appendFileSync(home + '/fake.jsonl', JSON.stringify(row) +
 if (process.argv[2] !== 'app-server' || process.argv[3] !== '--listen' || !String(process.argv[4]).startsWith('unix://')) process.exit(2)
 const path = process.argv[4].slice(7)
 log({ start: true, env: Object.keys(process.env).sort(), listen: path })
+fs.rmSync(home + '/mcp-dead', { force: true })
 const THREAD = fs.existsSync(home + '/unsaved') ? '0199a213-81c0-7800-8aa1-cccccccccccc' : '0199a213-81c0-7800-8aa1-bbab2a035a53'
 const conns = new Set()
 let turns = 0, queued = [], active = null, activeAt = 0
@@ -219,6 +250,12 @@ net.createServer(sock => {
         send({ id: m.id, result: { turn: { id: begin(m.params.clientUserMessageId) } } })
         send({ id: 'srv-' + turns, method: 'item/tool/requestUserInput', params: { threadId: THREAD } })
       }
+      // Shapes observed from codex-cli 0.149.1 (2026-09-25): a live server resolves with its result;
+      // a server that has exited, cleanly or by signal, rejects with -32603 "Transport closed".
+      if (m.method === 'mcpServer/tool/call') send(fs.existsSync(home + '/no-probe-spec') ? { id: m.id, error: { code: -32601, message: 'Method not found' } }
+        : fs.existsSync(home + '/no-probe') ? { id: m.id, error: { code: -32600, message: 'Invalid request: unknown variant \`' + m.method + '\`, expected one of \`initialize\`' } }
+        : fs.existsSync(home + '/mcp-dead') ? { id: m.id, error: { code: -32603, message: 'tool call failed for \`' + m.params.server + '/' + m.params.tool + '\`: Transport closed' } }
+        : { id: m.id, result: { content: [{ type: 'text', text: '[]' }] } })
       if (m.method === 'thread/queue/add') {
         if (!experimental) { send({ id: m.id, error: { code: -32600, message: 'thread/queue/add requires experimentalApi' } }); continue }
         queued.push(m.params.clientUserMessageId); send({ id: m.id, result: { queuedSubmission: { id: 'q-' + queued.length, input: m.params.input, clientUserMessageId: m.params.clientUserMessageId } } })
@@ -286,8 +323,11 @@ const socket = join(codexHome, 'ctl', 'as.sock')
 const s1 = startSupervisor(client, { HARNESS_EXTRA_VAR: 'kept-out' })
 ok('the supervisor starts its thread, baselines the fleet queue, and connects the feed', await waitFor(() => /session ready/.test(s1.out) && /wake feed connected/.test(s1.out)) &&
   /first start: baselined the cx-test queue/.test(s1.out) && clientCalls('thread/start').length === 1 && clientCalls('thread/start')[0].params.cwd === join(codexHome, 'workspace'))
-ok('it prints the command a person runs to attach to the same thread', s1.out.includes(`attach: CODEX_HOME=${codexHome} codex resume ${THREAD} --remote unix://${socket}`) &&
-  attachCommand({ codexHome: '/a b', socket: '/s', threadId: 't' }) === "CODEX_HOME='/a b' codex resume t --remote unix:///s")
+const attachLine = `attach: CODEX_HOME=${codexHome} codex resume ${THREAD} --remote unix://${socket}`
+ok('a new thread has no rollout to resume yet, so ready says when the attach command comes instead of printing it (#218)',
+  /attach: available after the thread's first turn/.test(s1.out) && !s1.out.includes(attachLine) && attachCommand({ codexHome: '/a b', socket: '/s', threadId: 't' }) === "CODEX_HOME='/a b' codex resume t --remote unix:///s")
+ok('the thread\'s channel is asked before ready, by the channel\'s own tool', clientCalls('mcpServer/tool/call')[0]?.params.server === 'nvoy-cx-test' &&
+  clientCalls('mcpServer/tool/call')[0]?.params.tool === 'nvoy_channel_list' && clientCalls('mcpServer/tool/call')[0]?.params.threadId === THREAD)
 ok('the app-server listens on the owner-only socket under CODEX_HOME, and the client frames are masked', fakeLog(codexHome)[0].listen === socket &&
   (statSync(socket).mode & 0o777) === 0o600 && clientCalls('initialize').length === 1)
 ok('it opts into the experimental API that thread/queue/add needs', clientCalls('initialize')[0].params.capabilities.experimentalApi === true)
@@ -298,6 +338,8 @@ appendFileSync(queue, record(3, 'verified-notification'))
 await waitFor(() => /queued 333333333333 behind the running turn/.test(s1.out))
 rmSync(join(codexHome, 'hold'))
 await waitFor(() => fakeLog(codexHome).filter(m => m.began).length >= 2)
+ok('the attach command is printed once the thread\'s first turn has ended', await waitFor(() => s1.out.includes(attachLine)) &&
+  s1.out.indexOf(attachLine) > s1.out.indexOf('turn for 222222222222 ended'))
 const starts1 = clientCalls('turn/start'), queues1 = clientCalls('thread/queue/add')
 ok('an envelope arriving while the thread is idle is injected once as turn/start', starts1.length === 1 && starts1[0].params.threadId === THREAD &&
   starts1[0].params.clientUserMessageId === `nvoy:${envelope(2)}` && starts1[0].params.input[0].text === codexTurnText({ envelope: envelope(2), type: 'admitted-task' }))
@@ -328,12 +370,42 @@ await s3.stop()
 await s1.stop()
 ok('stopping the supervisor ends its feed and frees the fleet lock', await waitFor(() => !existsSync(lockPath), 5000))
 appendFileSync(queue, record(4))
-const s2 = startSupervisor()
+const s2 = startSupervisor(client, { HARNESS_RETRY_MS: '100' })
 await waitFor(() => /injected 444444444444 as a turn/.test(s2.out))
 ok('a restart resumes the same thread and injects only what arrived while it was down, once', /resumed the cx-test thread/.test(s2.out) &&
   clientCalls('thread/resume').some(m => m.params.threadId === THREAD) && clientCalls('thread/start').length === 1 &&
   clientCalls('turn/start').length === 2 && clientCalls('turn/start')[1].params.clientUserMessageId === `nvoy:${envelope(4)}` && clientCalls('thread/queue/add').length === 1)
+ok('a resumed thread prints its attach command at ready', s2.out.indexOf(attachLine) >= 0 && s2.out.indexOf(attachLine) < s2.out.indexOf('injected 444444444444'))
+// The fleet recreates the adapter: the thread's channel MCP and the wake feed die together.
+await waitFor(() => /turn for 444444444444 ended/.test(s2.out))
+writeFileSync(join(codexHome, 'hold'), '')
+appendFileSync(queue, record(5))
+await waitFor(() => /injected 555555555555 as a turn/.test(s2.out))
+const appServers = () => fakeLog(codexHome).filter(m => m.start).length, serversBefore = appServers()
+writeFileSync(join(codexHome, 'mcp-dead'), '')
+process.kill(JSON.parse(readText(lockPath)).pid, 'SIGKILL')
+ok('a wake feed reconnect asks the channel, and a closed transport marks it down', await waitFor(() => /the channel to the fleet is down \(tool call failed for `nvoy-cx-test\/nvoy_channel_list`: Transport closed\)/.test(s2.out)))
+await wait(400)
+ok('a running turn is never cut short to reconnect the channel', !/restarting codex app-server/.test(s2.out) && appServers() === serversBefore)
+rmSync(join(codexHome, 'hold'))
+ok('once the turn ends, codex app-server restarts and resumes the same thread', await waitFor(() => appServers() === serversBefore + 1 && /session ready/.test(s2.out.slice(s2.out.lastIndexOf('restarting codex app-server')))) &&
+  /restarting codex app-server to reconnect the channel/.test(s2.out) && clientCalls('thread/resume').filter(m => m.params.threadId === THREAD).length === 2 && clientCalls('thread/start').length === 1)
+appendFileSync(queue, record(6))
+ok('after the restart, new envelopes reach the thread again', await waitFor(() => /injected 666666666666 as a turn/.test(s2.out)) &&
+  clientCalls('turn/start').at(-1).params.clientUserMessageId === `nvoy:${envelope(6)}`)
 await s2.stop()
+// A Codex without the tool-call method: the feed reconnect alone is the signal.
+for (const [file, answer] of [['no-probe', '-32600 unknown variant, as 0.149.1 answers'], ['no-probe-spec', '-32601, as JSON-RPC specifies']]) {
+  writeFileSync(join(codexHome, file), '')
+  const s5 = startSupervisor(client, { HARNESS_RETRY_MS: '100' })
+  await waitFor(() => /session ready/.test(s5.out) && /wake feed connected/.test(s5.out))
+  const s5Servers = appServers()
+  process.kill(JSON.parse(readText(lockPath)).pid, 'SIGKILL')
+  ok(`where Codex cannot be asked about its channel (${answer}), a wake feed reconnect restarts codex app-server`, /cannot be asked about its channel/.test(s5.out) &&
+    await waitFor(() => /channel to the fleet is down \(the wake feed reconnected\)/.test(s5.out) && appServers() === s5Servers + 1 && (s5.out.match(/session ready/g) || []).length === 2))
+  await s5.stop()
+  rmSync(join(codexHome, file))
+}
 writeFileSync(join(codexHome, 'unsaved'), '')
 const s4 = startSupervisor()
 ok('a stored thread Codex never saved is replaced by a new one (#218)', await waitFor(() => /never saved the stored cx-test thread; starting a new one/.test(s4.out) && /session ready/.test(s4.out)) &&

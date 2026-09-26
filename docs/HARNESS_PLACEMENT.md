@@ -35,9 +35,10 @@ A harness reaches its identity through the per-identity SSH forced command, and 
   `nvoy_channel_read` and answers with `nvoy_channel_reply`; the broker on the fleet rechecks the
   grant, and the Bunker signs. The harness never signs.
 - For Claude Code the channel pushes the wake natively. It holds a per-identity lock on the fleet,
-  so a second harness cannot consume the same identity, and its heartbeat releases that lock when
-  an SSH session drops (#168).
-- For Codex the channel tools hold no lock yet (see [Open gaps](#open-gaps)).
+  so a second harness cannot consume the same identity, and its heartbeat releases that lock
+  within about 2¼ minutes of an SSH session dropping (#168).
+- For Codex the wake feed (`codex-channel-feed.mjs`, on a second forced-command key) holds the
+  per-identity lock, and the portable supervisor injects each admitted envelope as a turn.
 
 This is the path `claude-channel.mjs` calls the sanctioned remote path. Do not remove it, and do
 not replace it with a second transport.
@@ -69,10 +70,12 @@ command stays throughout; it is the transport the new harness uses.
 
 ## Open gaps
 
-- **Codex has no fleet-side channel lock.** Two Codex harnesses on one identity would both answer.
-  Until a lock like the Claude channel's exists, the owner must run exactly one.
-- **Codex wake on a harness box.** `codex app-server` takes no channel notification. The fleet
-  harness injects turns by reading the local queue; a harness box needs the same injection driven
-  over the forced-command channel. The existing workstation path (`codex-remote-bridge.mjs` and
-  the App Server binder, see [MACOS_DESKTOP_BINDER.md](MACOS_DESKTOP_BINDER.md)) is the starting
-  point.
+- **Recovery restarts the whole harness.** A recreated adapter kills the channel. The portable
+  supervisors notice this and restart the Claude session or `codex app-server`, so the channel is
+  down for the restart and, for Claude, until the fleet's old channel evicts itself (about 2¼
+  min). Codex 0.149.1's `config/mcpServer/reload` restarts a thread's MCP servers in place and was
+  seen to work, but it is not used yet.
+- **The fleet Claude harness does not watch its channel.** Its channel is a local child of the
+  session, not an ssh. If that child dies while the session lives, nothing notices.
+- **Not yet proven live:** a real adapter recreate under both portable supervisors, and the
+  process-table match against a real Claude Code session's ssh child.

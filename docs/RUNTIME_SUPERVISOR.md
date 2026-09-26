@@ -617,6 +617,17 @@ session runs with that directory as `HOME`, so your own `~/.claude` is never rea
 `model`, `pubkey` and `channels` are optional. The MCP entry is exactly the one `claude-channel-doctor
 --mode client` renders; the channel lock and queue stay on the fleet, so nothing local is cleared.
 
+The channel is an ssh child of the session, and it dies whenever the fleet recreates the
+identity's adapter (each release, each manifest change). Claude Code never restarts it, so the
+supervisor watches for it in the process table, among the session's descendants. It says `ready`
+only once the prompt is idle and the channel has stayed up for `HARNESS_CHANNEL_SETTLE_MS` (10s).
+A channel that closes during startup, or never starts, fails the start. That is usually the fleet
+still holding the channel lock from a session that ended without EOF. A channel that closes under a
+ready session restarts it with `--continue`. Retries back off from `HARNESS_RETRY_MS` (5s) to 5 min.
+The fleet channel evicts a client that misses 4 pings 30s apart, so a restarted harness is let back
+in within about 2¼ min. A laptop asleep longer than that loses its channel, and the watch restarts
+the session on wake.
+
 #### Portable Codex harness (`codex-harness-portable.mjs`)
 
 The Codex form of the above: one persistent Codex thread on any box, a Mac included, billed to the
@@ -631,8 +642,17 @@ owner's ChatGPT subscription rather than an API key, which a person can attach t
   supervisor keeps an envelope cursor in `<codex_home>/nvoy/feed-cursor.json`, and reconnects from
   it with backoff. It sends a keepalive line every 20s; a feed that hears none for two minutes exits.
 - **One consumer per identity.** The feed holds `codex-mcp-state/feed.lock` on the fleet, with the
-  channel lock's rules: reclaimed only when its PID is gone. A second harness for the identity,
-  on any box, is refused. A second supervisor on the same `codex_home` is refused locally.
+  channel lock's rules: reclaimed only when its PID is gone. The lock outlives the adapter container,
+  so the feed also reclaims it when `/proc` shows the PID running anything but this feed for this
+  instance. A second harness for the identity, on any box, is refused. A second supervisor on the
+  same `codex_home` is refused locally.
+- **Channel recovery.** The channel MCP is an ssh into the adapter container, and Codex never
+  restarts a dead MCP server (every later tool call fails with `Transport closed`). The supervisor
+  calls `nvoy_channel_list` through `mcpServer/tool/call` before it says ready, before each new
+  injection, and after each wake-feed reconnect, since the feed's ssh dies with the same container.
+  A failed call restarts `codex app-server` and resumes the same thread, but only once no turn is
+  running. Restarts back off from `HARNESS_RETRY_MS` (5s). A Codex without that method restarts on
+  every feed reconnect instead.
 - **Injection.** When the thread is idle an envelope becomes `turn/start`. When a turn is running
   (yours, typed in the TUI, or an earlier envelope's) it is queued with `thread/queue/add`, which
   needs the experimental API. Each one carries `clientUserMessageId: nvoy:<envelope>` and is
@@ -687,7 +707,9 @@ Owner steps, with placeholder paths:
    node mcp/tools/codex-harness-portable.mjs --instance codex-jaf --config /absolute/path/codex-jaf-harness.json
    ```
 
-5. Attach to the thread with the command the supervisor prints once it is ready:
+5. Attach to the thread with the command the supervisor prints. For a resumed thread it is
+   printed at ready. A new thread has nothing for `codex resume` to find until its first turn ends,
+   so it is printed then:
 
    ```sh
    CODEX_HOME=/absolute/path/codex-jaf-home codex resume <thread-id> --remote unix:///absolute/path/codex-jaf-home/ctl/as.sock

@@ -307,5 +307,11 @@ try {
   ok('the refusal left the session alive — the throw was prevented, not merely caught', false)
 } finally { try { await trimClient.close() } catch { /* already gone */ } }
 
+// The shipped window bounds how long a restarted portable harness is refused: 30s × 4 is
+// ~2¼ min, where 60s × 10 was ten. The measured formula above is what makes the default a window.
+const channelSource = readFileSync('mcp/tools/claude-channel.mjs', 'utf8')
+ok('the shipped stale-lock window is 30s × 4 misses, about 2¼ minutes',
+  /flag\('--heartbeat-ms'\) \|\| 30000\)/.test(channelSource) && /flag\('--heartbeat-misses'\) \|\| 4\)/.test(channelSource))
+
 console.log(`\n${passed}/${passed + failed} passed`)
 process.exit(failed ? 1 : 0)
