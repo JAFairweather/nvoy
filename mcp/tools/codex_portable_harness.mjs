@@ -28,14 +28,16 @@ import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, readFileSy
 import { spawn } from 'node:child_process'
 import { homedir } from 'node:os'
 import { isAbsolute, resolve } from 'node:path'
-import { fixedPath, knownHostsFile, privateFile, sshChannelEntry, SSH, SSH_TARGET } from './channel_client.mjs'
+import { fixedPath, knownHostsFile, privateFile, SSH, SSH_TARGET } from './channel_client.mjs'
 import { instanceId } from './runtime_manifest.mjs'
 import { codexConfigToml, codexTurnText, defaultInstructions, serverName } from './harness_session.mjs'
 import { openThread } from './codex_harness.mjs'
 import { connectWsPeer } from './codex_ws_peer.mjs'
 import { claimPidLock } from './pid_lock.mjs'
+import { feedCursor, followWakeFeed } from './wake_feed_client.mjs'
 
-const HEX64 = /^[0-9a-f]{64}$/
+export { sshFeedArgs } from './wake_feed_client.mjs'
+
 const sleep = ms => new Promise(done => setTimeout(done, ms))
 
 // The client config names paths, never values. Beyond the portable Claude config's refusals, a
@@ -102,22 +104,12 @@ export function refuseApiKeyEnvironment(env) {
 const shellWord = value => /^[\w/.:@%+=-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`
 export const attachCommand = ({ codexHome, socket, threadId }) => `CODEX_HOME=${shellWord(codexHome)} codex resume ${threadId} --remote ${shellWord(`unix://${socket}`)}`
 
-// The feed's ssh: the hardened channel entry on the feed key, plus keepalives so a dead carrier
-// ends the process instead of leaving it waiting.
-export function sshFeedArgs(config, aliveSeconds = 15) {
-  const entry = sshChannelEntry({ identity: config.feedIdentity, knownHosts: config.knownHosts, target: config.target })
-  return [...entry.args.slice(0, -1), '-o', `ServerAliveInterval=${aliveSeconds}`, '-o', 'ServerAliveCountMax=3', entry.args.at(-1)]
-}
-
 export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH }) {
   const { codexHome, socket } = config
   const workdir = resolve(codexHome, 'workspace'), privateDir = resolve(codexHome, 'nvoy'), ctlDir = resolve(codexHome, 'ctl')
   const threadPath = resolve(privateDir, 'codex-thread.json'), deliveredPath = resolve(privateDir, 'delivered.jsonl'), cursorPath = resolve(privateDir, 'feed-cursor.json')
   const STARTUP_MS = Number(process.env.HARNESS_STARTUP_MS || 30000)
   const RETRY_MAX_MS = Number(process.env.HARNESS_RETRY_MAX_MS || 300000)
-  const KEEPALIVE_MS = Number(process.env.HARNESS_FEED_KEEPALIVE_MS || 20000)
-  const SILENCE_MS = Number(process.env.HARNESS_FEED_SILENCE_MS || 90000)
-  const FEED_RETRY_MAX_MS = Number(process.env.HARNESS_FEED_RETRY_MAX_MS || 60000)
   const RETRY_MS = Number(process.env.HARNESS_RETRY_MS || 5000)
   const PROBE_MS = Number(process.env.HARNESS_CHANNEL_PROBE_MS || 30000)
   const writePrivate = (path, value) => { writeFileSync(path, value, { mode: 0o600 }); chmodSync(path, 0o600) }
@@ -137,65 +129,14 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
     appendFileSync(deliveredPath, JSON.stringify({ envelope, ...row, at: Date.now() }) + '\n', { mode: 0o600 }); chmodSync(deliveredPath, 0o600)
     delivered.add(envelope)
   }
-  // undefined: never baselined. null: baselined on an empty queue, so everything it holds is new.
-  let cursor
-  try { const saved = JSON.parse(readFileSync(cursorPath, 'utf8')); if (saved.instance === config.id && (saved.cursor === null || HEX64.test(saved.cursor))) cursor = saved.cursor } catch {}
-  const saveCursor = value => { cursor = value; writePrivate(cursorPath, JSON.stringify({ version: 1, instance: config.id, cursor: value }) + '\n') }
+  const cursor = feedCursor(cursorPath, config.id)
 
   // Envelopes the feed has announced and the thread has not yet taken, oldest first.
   const pending = [], announced = new Set()
-  let wake = () => {}, feeds = 0, recheck = false
+  let wake = () => {}, recheck = false
   const offer = row => { if (announced.has(row.envelope)) return; announced.add(row.envelope); pending.push(row); wake() }
-
-  async function feedOnce() {
-    const since = cursor === undefined ? null : cursor === null ? 'start' : cursor
-    const child = spawn(ssh, sshFeedArgs(config), { stdio: ['pipe', 'pipe', 'pipe'], env: { PATH: process.env.PATH || '/usr/bin:/bin', HOME: codexHome } })
-    children.add(child)
-    let stderr = '', out = '', healthy = false, lastLine = Date.now(), reason = ''
-    const stop = why => { if (!reason) reason = why; try { child.kill('SIGTERM') } catch {} }
-    const exited = new Promise(done => child.on('close', code => done(code)))
-    child.on('error', error => stop(error.code || error.message))
-    child.stdin.on('error', () => {})
-    child.stderr.on('data', data => { stderr = (stderr + String(data)).slice(-600) })
-    child.stdin.write(JSON.stringify({ since }) + '\n')
-    const keepalive = setInterval(() => child.stdin.write('{"ping":1}\n'), KEEPALIVE_MS)
-    const watchdog = setInterval(() => { if (Date.now() - lastLine > SILENCE_MS) stop(`silent for ${SILENCE_MS}ms`) }, Math.min(SILENCE_MS, 1000))
-    child.stdout.on('data', data => {
-      out += data
-      if (out.length > 4096 && out.indexOf('\n') < 0) return stop('feed line exceeds its bound')
-      let at
-      while ((at = out.indexOf('\n')) >= 0) {
-        const line = out.slice(0, at); out = out.slice(at + 1); lastLine = Date.now()
-        let event
-        try { event = JSON.parse(line) } catch { return stop('feed sent malformed JSON') }
-        if (event.event === 'hello') {
-          if (event.instance !== config.id) return stop('feed answered for another instance')
-          healthy = true
-          if (++feeds > 1) { recheck = true; wake() }
-          const placed = event.cursor === null || HEX64.test(String(event.cursor)) ? event.cursor : null
-          if (cursor === undefined) { saveCursor(placed); log(`first start: baselined the ${config.id} queue; later arrivals are live`) }
-          else if (event.since_found === false) { saveCursor(placed); log(`the fleet queue no longer holds the saved cursor; resuming from now`) }
-          log('wake feed connected')
-        } else if (event.event === 'admitted' && healthy && HEX64.test(String(event.envelope))) {
-          offer({ envelope: event.envelope, type: event.type === 'verified-notification' ? 'verified-notification' : 'admitted-task' })
-        }
-      }
-    })
-    const code = await exited
-    clearInterval(keepalive); clearInterval(watchdog); children.delete(child)
-    return { healthy, reason: reason || `exited (${code})${stderr.trim() ? `: ${stderr.trim().split('\n').at(-1).slice(0, 300)}` : ''}` }
-  }
-  ;(async () => {
-    let delay = 1000
-    while (!stopping()) {
-      const { healthy, reason } = await feedOnce()
-      if (stopping()) break
-      if (healthy) delay = 1000
-      log(`wake feed ${reason}; reconnecting in ${Math.round(delay / 1000)}s`)
-      await sleep(delay)
-      delay = Math.min(delay * 2, FEED_RETRY_MAX_MS)
-    }
-  })()
+  followWakeFeed({ config, cursor, ssh, env: { PATH: process.env.PATH || '/usr/bin:/bin', HOME: codexHome }, children, log, stopping,
+    onAdmitted: offer, onConnected: n => { if (n > 1) { recheck = true; wake() } } })
 
   const env = { PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin', HOME: codexHome, CODEX_HOME: codexHome }
   let delay = RETRY_MS
@@ -286,7 +227,7 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
           }
         }
         pending.shift(); announced.delete(next.envelope)
-        saveCursor(next.envelope)
+        cursor.save(next.envelope)
       }
     } catch (error) {
       log(`codex harness: ${error.message}`)
