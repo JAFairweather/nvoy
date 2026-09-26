@@ -718,6 +718,109 @@ Owner steps, with placeholder paths:
 `--remote` and `thread/queue/add` were checked against codex-cli 0.149.1. Pin that version, or
 recheck both after an upgrade.
 
+#### Portable Pi harness (`pi-harness.mjs`)
+
+The same arrangement for the [pi coding agent](https://github.com/earendil-works/pi): one long-lived
+pi session on any box, a Mac included, on the owner's ChatGPT login rather than an API key. A person
+can attach to it, watch it and type into it. Admitted messages are injected into that session as a
+readable prompt, and pi answers them itself with the channel tools.
+
+- **Transport.** The supervisor runs interactive `pi` in tmux on an owner-only socket
+  (`<state_dir>/tmux.sock`, which must fit in 104 bytes), and restarts it with backoff from
+  `HARNESS_RETRY_MS` (5s) whenever the pane dies. The restart runs `--continue` on
+  `<state_dir>/sessions`, so it reopens the same session. When pi dies while starting, the log shows
+  the last lines of its screen, which is usually a missing or expired login.
+- **Wake source.** It is the same feed as the Codex harness, with the same key, lock and one-consumer
+  rule. The pi extension `pi_harness_extension.mjs` holds the feed, not the supervisor. It starts on
+  pi's `session_start`, keeps its cursor in `<state_dir>/nvoy/feed-cursor.json`, and reconnects from it
+  with backoff.
+- **Injection.** Each new envelope is sent with
+  `pi.sendUserMessage(text, { deliverAs: "followUp" })`. The text is the Codex harness's turn text,
+  with `NVOY_ENVELOPE_ID` in it. When the session is idle, this starts a turn. When a turn is running,
+  it is queued behind that turn. Each envelope is recorded once in `<state_dir>/nvoy/delivered.jsonl`,
+  so a replayed feed never injects it twice.
+- **Channel.** The extension registers `nvoy_channel_list`, `nvoy_channel_read` and
+  `nvoy_channel_reply`, with the fleet MCP's own schemas. It proxies them over the channel key to
+  `codex-channel-mcp.mjs` as newline JSON-RPC. It keeps one ssh child and respawns it at the next call
+  after it exits, after a call goes unanswered for `HARNESS_CHANNEL_CALL_MS` (30s), and after every
+  wake-feed reconnect. The feed's ssh dies with the same container. A failed call is a tool error in
+  the turn, never a hang.
+- **Tools.** The supervisor starts pi with `--no-extensions -e <extension>` and
+  `--tools nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply`, which is a hard allowlist. The
+  model gets no `bash`, `read`, `edit` or `write`, and discovered extensions do not load. It also passes
+  `--no-approve`, so pi ignores project-local files in its workspace.
+- **Login.** `pi_home` is the harness's own `PI_CODING_AGENT_DIR`, never `~/.pi/agent`, and it must be
+  an owner-only directory. The supervisor refuses to start if its `auth.json` is not owner-only, holds
+  any API-key credential, or has no `openai-codex` OAuth login. It reads only the credential types and
+  prints nothing. pi gets a built environment:
+  - `PATH`, `TERM` and `LANG`;
+  - `HOME=<state_dir>/home`;
+  - `PI_CODING_AGENT_DIR`;
+  - `PI_SKIP_VERSION_CHECK=1`;
+  - the two `NVOY_PI_HARNESS_*` variables that point the extension at its config.
+
+  No owner API key or setting reaches it.
+
+Owner steps for `pi-dog`, with placeholder paths:
+
+1. Make two SSH keys, one for the channel and one for the feed:
+
+   ```sh
+   mkdir -m 700 -p ~/.nvoy-harness/credentials
+   ssh-keygen -t ed25519 -N '' -C pi-dog-channel -f ~/.nvoy-harness/credentials/pi-dog.channel
+   ssh-keygen -t ed25519 -N '' -C pi-dog-feed -f ~/.nvoy-harness/credentials/pi-dog.feed
+   ```
+
+2. Copy the two `.pub` files to the fleet. Then install one forced-command line for each, for the
+   identity's dedicated account. The tool is the Codex one: its lines serve any local-broker,
+   notify-only instance.
+
+   ```sh
+   NVOY_INSTANCE_ROOT=/etc/nvoy/instances node mcp/tools/instance-codex-channel-authorized-key.mjs \
+     --instance pi-dog --public-key-file /etc/nvoy/keys/pi-dog.channel.pub --container nvoy-pi-dog-adapter-1
+   NVOY_INSTANCE_ROOT=/etc/nvoy/instances node mcp/tools/instance-codex-channel-authorized-key.mjs \
+     --instance pi-dog --public-key-file /etc/nvoy/keys/pi-dog.feed.pub --container nvoy-pi-dog-adapter-1 --mode feed
+   ```
+
+3. Write the client config, owner-only. It names paths only. It is refused if any field or value
+   could carry a Nostr key, a Bunker credential or an API key. `state_dir` and `pi_home` must be
+   absolute, must be the harness's own, and must not be your home.
+
+   ```json
+   { "instance": "pi-dog", "ssh_target": "nvoy-pi@broker.example",
+     "identity_file": "/Users/you/.nvoy-harness/credentials/pi-dog.channel",
+     "feed_identity_file": "/Users/you/.nvoy-harness/credentials/pi-dog.feed",
+     "known_hosts_file": "/Users/you/.nvoy-harness/nvoy-known-hosts",
+     "state_dir": "/Users/you/.nvoy-harness/pi-dog", "pi_home": "/Users/you/.nvoy-harness/pi-dog-agent" }
+   ```
+
+   `model` (default `gpt-5.5`), `pubkey` and `channels` are optional.
+
+4. Log pi in inside its own agent directory. In pi, run `/login`, choose ChatGPT, then quit. Never
+   copy `~/.pi/agent/auth.json`.
+
+   ```sh
+   mkdir -m 700 /Users/you/.nvoy-harness/pi-dog-agent
+   PI_CODING_AGENT_DIR=/Users/you/.nvoy-harness/pi-dog-agent pi
+   ```
+
+5. Retire any other consumer of the identity's feed, then start the supervisor. The first start
+   baselines the fleet queue, and later arrivals are live.
+
+   ```sh
+   node mcp/tools/pi-harness.mjs --instance pi-dog --config /Users/you/.nvoy-harness/pi-dog.json
+   ```
+
+6. Attach with the command the supervisor prints, and detach with `C-b d`. The pane's status line
+   shows the feed as `connecting`, `listening` or `reconnecting`.
+
+   ```sh
+   tmux -S /Users/you/.nvoy-harness/pi-dog/tmux.sock attach -t harness
+   ```
+
+The extension API, `--tools`, `--no-approve` and `--continue` were checked against pi 0.87.1. Pin
+that version, or recheck them after an upgrade.
+
 ### Docker reference deployment
 
 [`deploy/participant-runtime.compose.yml`](../deploy/participant-runtime.compose.yml) is the
