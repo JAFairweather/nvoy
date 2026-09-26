@@ -66,7 +66,11 @@ export function readManifest(root, requestedId) {
     let relay
     try { relay = normalizeBuzzRelay(raw.buzz?.relay) } catch (e) { die(`buzz.relay: ${e.message}`) }
     if (!channels.length || !channels.every(validChannel) || new Set(channels).size !== channels.length) die('buzz requires distinct channel UUIDs')
-    buzz = Object.freeze({ relay, channels: Object.freeze(channels) })
+    // Native status reactions (👀 seen, 💬 working) are on wherever the identity is a member; an
+    // owner may switch them off, but only with an explicit boolean.
+    const statusReactions = raw.buzz?.status_reactions ?? true
+    if (typeof statusReactions !== 'boolean') die('buzz.status_reactions must be true or false')
+    buzz = Object.freeze({ relay, channels: Object.freeze(channels), statusReactions })
   }
   if (!valid(pubkey) || !grantors.length || !grantors.every(valid) || !relays.length) die('manifest requires pubkey, grantors, and wss relays')
   if (new Set(carriers.map(entry => entry.pubkey)).size !== carriers.length) die('task_carrier pubkeys must be distinct')

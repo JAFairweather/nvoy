@@ -9,6 +9,7 @@ import { randomBytes } from 'node:crypto'
 import { resolve } from 'node:path'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { validateDesktopDelivery } from './admitted_task.mjs'
+import { requestWorkingStatus } from './buzz_status.mjs'
 
 const die = message => { console.error(`nvoy-codex-channel-mcp: ${message}`); process.exit(1) }
 const flag = name => { const i = process.argv.indexOf(name); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -89,6 +90,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async request => {
     if (!read.has(envelope)) {
       try { appendFileSync(statePath, JSON.stringify({ version: 1, instance: manifest.id, envelope, read_at: Date.now() }) + '\n', { mode: 0o600 }); chmodSync(statePath, 0o600) }
       catch (error) { return result({ code: 'NVOY_READ_LOG_FAILED', message: error.message }, true) }
+      // First read is the start of work: ask the broker for the native 💬. Names the envelope only.
+      requestWorkingStatus(manifest, record)
     }
     return record.type === 'verified-notification'
       ? result({ envelope, type: record.type, authority: null, notification: record.notification })

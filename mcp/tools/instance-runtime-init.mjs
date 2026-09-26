@@ -42,6 +42,8 @@ if (m.workerEnabled || m.deliveryMode === 'notify_only') provisionFile(`${m.runt
 // The restricted Desktop SSH principal is the credential-free adapter UID, never the model
 // worker UID. Its separate queue is writable by that UID and readable by the broker group.
 provisionFile(`${m.runtimeDir}/desktop-reply-requests.jsonl`, m.adapterUid, m.brokerAdapterGid, 0o640, 'Desktop reply queue')
+// The channel reader's "started on envelope X" requests for the native 💬; broker-group readable.
+if (m.deliveryMode === 'notify_only' && m.buzz?.statusReactions) provisionFile(`${m.runtimeDir}/status-requests.jsonl`, m.workerUid, m.brokerAdapterGid, 0o640, 'status request queue')
 if (m.workerEnabled) provisionFile(`${m.runtimeDir}/worker-consumed.jsonl`, m.workerUid, m.workerUid, 0o600, 'worker consumed queue')
 // Only the adapter can create these immutable per-envelope inputs; the worker gets group
 // traversal/read access but cannot replace an input belonging to a different envelope.

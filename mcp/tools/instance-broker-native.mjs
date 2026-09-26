@@ -19,6 +19,7 @@ import { claimChannelSource, completeChannelSource } from './channel_source_dedu
 import { claimBrokerLock } from './broker_lock.mjs'
 import { brokerSigner } from './broker_signer.mjs'
 import { nativeMention, openBuzzSession } from './buzz_native.mjs'
+import { recordStatusAdmission } from './buzz_status.mjs'
 
 const HEX64 = /^[0-9a-f]{64}$/
 let signer
@@ -130,6 +131,9 @@ client.on('data', chunk => {
   if (ack.type !== 'ack' || ack.instance !== manifest.id) die('adapter acknowledgement does not bind this instance')
   try { completeChannelSource(sourceIndex, eventId, eventId) } catch (e) { die(`adapter acknowledged but channel source completion failed: ${e.message}`) }
   try { renameSync(markerPath, `${markerPath}.done`) } catch (e) { die(`acknowledged but could not finalize marker: ${e.message}`) }
+  // Queued durably: the status keeper may now show 👀 on the message. Decoration, never a gate.
+  try { recordStatusAdmission(manifest, { envelope: eventId, target: eventId, channel: mention.channel }) }
+  catch (e) { console.error(`instance-broker-native: status[👀] ${eventId.slice(0, 12)} failed: fact-unrecorded (${e.code || 'error'})`) }
   console.log(`instance-broker-native: ${eventId.slice(0, 12)}… admitted from ${mention.author.slice(0, 8)} (${grant.cap})`)
   client.end()
   exit(0)

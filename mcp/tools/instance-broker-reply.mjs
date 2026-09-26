@@ -18,6 +18,7 @@ import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest
 import { makeBunkerSigner } from './nip46-signer.mjs'
 import { verifyOutboundApproval } from './outbound_approval.mjs'
 import { channelReply, openBuzzSession } from './buzz_native.mjs'
+import { recordStatusReplied } from './buzz_status.mjs'
 
 const die = m => { console.error(`instance-broker-reply: ${m}`); process.exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -166,6 +167,8 @@ if (existsSync(recordPath)) {
   if (record.version !== (buzzNative ? 3 : 2)) die('outbound record does not match this receipt\'s reply path, or is a legacy record with no discrete approval')
   if (record.published === true) {
     try { renameSync(receiptInflight, receiptUsed) } catch (e) { die(`could not finalize one-use receipt: ${e.message}`) }
+    // A crash after publishing may have lost the status fact; the keeper ignores a repeat.
+    if (channelCarry || buzzNative) try { recordStatusReplied(manifest, { envelope: receipt.envelope }) } catch { /* the stale sweep clears it */ }
     console.log(JSON.stringify({ request: requestId, receipt: request.receipt, accepted: record.accepted || 0, replay: true }))
     process.exit(0)
   }
@@ -278,4 +281,9 @@ if (buzzNative) {
 record.published = true; record.published_at = Date.now(); record.accepted = accepted
 try { writeFileSync(recordPath, JSON.stringify(record), { mode: 0o600 }) } catch (e) { die(`published but could not finalize record: ${e.message}`) }
 try { renameSync(receiptInflight, receiptUsed) } catch (e) { die(`published but could not finalize one-use receipt: ${e.message}`) }
+// The answer is out: the status keeper removes 👀/💬 from the message it answers, if it put any there.
+if (channelReplyPath) {
+  try { recordStatusReplied(manifest, { envelope: receipt.envelope }) }
+  catch (e) { console.error(`instance-broker-reply: status[clear] ${receipt.envelope.slice(0, 12)} failed: fact-unrecorded (${e.code || 'error'})`) }
+}
 console.log(JSON.stringify({ request: requestId, receipt: request.receipt, accepted }))
