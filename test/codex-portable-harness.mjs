@@ -324,6 +324,8 @@ const s1 = startSupervisor(client, { HARNESS_EXTRA_VAR: 'kept-out' })
 ok('the supervisor starts its thread, baselines the fleet queue, and connects the feed', await waitFor(() => /session ready/.test(s1.out) && /wake feed connected/.test(s1.out)) &&
   /first start: baselined the cx-test queue/.test(s1.out) && clientCalls('thread/start').length === 1 && clientCalls('thread/start')[0].params.cwd === join(codexHome, 'workspace'))
 const attachLine = `attach: CODEX_HOME=${codexHome} codex resume ${THREAD} --remote unix://${socket}`
+// "session ready" and the attach line are two writes, and they can reach this process as two chunks.
+await waitFor(() => /attach: /.test(s1.out))
 ok('a new thread has no rollout to resume yet, so ready says when the attach command comes instead of printing it (#218)',
   /attach: available after the thread's first turn/.test(s1.out) && !s1.out.includes(attachLine) && attachCommand({ codexHome: '/a b', socket: '/s', threadId: 't' }) === "CODEX_HOME='/a b' codex resume t --remote unix:///s")
 ok('the thread\'s channel is asked before ready, by the channel\'s own tool', clientCalls('mcpServer/tool/call')[0]?.params.server === 'nvoy-cx-test' &&
