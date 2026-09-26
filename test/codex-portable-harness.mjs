@@ -138,11 +138,14 @@ const g = feed()
 g.hello(null)
 ok('a lock that binds another instance fails closed', await Promise.race([g.exited, wait(5000)]) === 1 && /does not bind this instance/.test(g.err))
 clearInterval(g.ping); rmSync(lockPath)
-writeFileSync(lockPath, JSON.stringify({ version: 1, instance: 'cx-test', pid: process.pid, started_at: 1 }))
+// The holder must look like this feed for this instance: on Linux the feed reads /proc and would
+// rightly reclaim a lock whose live PID runs anything else.
+const holder = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', 'codex-channel-feed.mjs', '--instance', 'cx-test'], { stdio: 'ignore' })
+writeFileSync(lockPath, JSON.stringify({ version: 1, instance: 'cx-test', pid: holder.pid, started_at: 1 }))
 const h = feed()
 h.hello(null)
-ok('a lock naming a live process is not reclaimed', await Promise.race([h.exited, wait(5000)]) === 1 && new RegExp(`already runs as pid ${process.pid}`).test(h.err))
-clearInterval(h.ping); rmSync(lockPath)
+ok('a lock naming a live process is not reclaimed', await Promise.race([h.exited, wait(5000)]) === 1 && new RegExp(`already runs as pid ${holder.pid}`).test(h.err))
+clearInterval(h.ping); holder.kill(); rmSync(lockPath)
 // The feed lock outlives the adapter container, and in the next one its PID can name a live,
 // unrelated process. Where /proc shows the PID running anything but this feed for this instance,
 // the lock is stale; where /proc cannot say, a live PID still refuses.
