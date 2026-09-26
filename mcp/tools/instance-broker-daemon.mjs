@@ -137,20 +137,22 @@ function drain() {
     } catch (e) { if (e.code !== 'ENOENT') console.error(`instance-broker-daemon: ${source} reply queue unavailable: ${e.message}`) }
   }
 }
-// The keyless Buzz watcher can log in only through this oracle. It is supervised here, beside the
-// drain, so it runs as the broker and holds the same credential; a crash is restarted with backoff.
-function superviseAuthOracle(delay = 1000) {
-  const child = spawn(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-auth.mjs'), '--instance', manifest.id],
+// The keyless Buzz watcher can log in only through this oracle, and the status keeper puts the
+// native 👀/💬 on admitted Buzz messages. Both are supervised here, beside the drain, so they run as
+// the broker and hold the same credential; a crash is restarted with backoff.
+function supervise(script, label, delay = 1000) {
+  const child = spawn(process.execPath, [resolve(new URL('.', import.meta.url).pathname, script), '--instance', manifest.id],
     { env: childEnv, stdio: ['ignore', 'inherit', 'inherit'] })
   const started = Date.now()
   child.on('exit', code => {
     const next = Date.now() - started > 60000 ? 1000 : Math.min(delay * 2, 60000)
-    console.error(`instance-broker-daemon: AUTH oracle exited (${code ?? 'signal'}); restarting in ${next / 1000}s`)
-    setTimeout(() => superviseAuthOracle(next), next).unref?.()
+    console.error(`instance-broker-daemon: ${label} exited (${code ?? 'signal'}); restarting in ${next / 1000}s`)
+    setTimeout(() => supervise(script, label, next), next).unref?.()
   })
 }
 recover()
-if (manifest.buzz) superviseAuthOracle()
+if (manifest.buzz) supervise('instance-broker-auth.mjs', 'AUTH oracle')
+if (manifest.buzz?.statusReactions) supervise('instance-broker-status.mjs', 'status keeper')
 drain()
 setInterval(drain, 1000)
 console.log(`instance-broker-daemon: draining ${manifest.id}`)

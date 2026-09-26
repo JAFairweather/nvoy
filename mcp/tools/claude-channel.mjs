@@ -13,6 +13,7 @@ import { randomBytes } from 'node:crypto'
 import { resolve } from 'node:path'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { validateDesktopDelivery } from './admitted_task.mjs'
+import { requestWorkingStatus } from './buzz_status.mjs'
 
 const die = message => { console.error(`nvoy-claude-channel: ${message}`); process.exit(1) }
 const flag = name => { const i = process.argv.indexOf(name); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -239,6 +240,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async request => {
           envelope, read_at: Date.now() }) + '\n', { mode: 0o600 })
         chmodSync(readPath, 0o600)
       } catch (error) { return toolResult({ code: 'NVOY_READ_LOG_FAILED', message: error.message }, true) }
+      // First read is the start of work: ask the broker for the native 💬. Names the envelope only.
+      requestWorkingStatus(manifest, task)
     }
     return task.type === 'verified-notification'
       ? toolResult({ envelope, authority: null, notification: task.notification })

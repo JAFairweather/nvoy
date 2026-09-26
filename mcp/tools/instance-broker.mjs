@@ -13,6 +13,7 @@ import net from 'node:net'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { claimChannelSource, completeChannelSource } from './channel_source_dedup.mjs'
 import { claimBrokerLock } from './broker_lock.mjs'
+import { recordStatusAdmission } from './buzz_status.mjs'
 
 const die = message => { console.error(`instance-broker: ${message}`); process.exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -199,5 +200,11 @@ client.on('data', chunk => {
   // A completed marker stays as durable audit evidence but cannot be delivered a second time.
   // Rename is atomic on the single spool filesystem; a second broker sees no source marker.
   try { renameSync(markerPath, `${markerPath}.done`) } catch (e) { die(`acknowledged but could not finalize marker: ${e.message}`) }
+  // A carried mention names the original Buzz event. Where this identity is itself a member of that
+  // channel, the status keeper may show 👀 on it, exactly as for a mention heard natively.
+  if (channelCarry) {
+    try { recordStatusAdmission(manifest, { envelope, target: receipt.source_event, channel: receipt.reply_channel }) }
+    catch (e) { console.error(`instance-broker: status[👀] ${envelope.slice(0, 12)} failed: fact-unrecorded (${e.code || 'error'})`) }
+  }
   client.end()
 })

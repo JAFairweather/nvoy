@@ -91,6 +91,7 @@ For each `<id>`, the installer creates a dedicated OS account `nvoy-<id>` and:
 | adapter socket | adapter:broker-adapter 0660 | broker only |
 | task input + admitted queue | adapter:worker-handoff 0640 | adapter → worker, read-only for worker |
 | reply queue | worker:broker-adapter 0640 | worker → broker, read-only for broker |
+| status request queue (`status-requests.jsonl`) | worker:broker-adapter 0640 | channel reader → broker status keeper, read-only for broker |
 | watcher spool | watcher:broker-adapter 0770, markers 0660 | watcher→broker marker intake |
 
 Credentials are source files staged as `root:root` mode `0600`: that is safe even before an
@@ -190,6 +191,51 @@ Buzz relay ──kind:9 #h #p──> keyless buzz watcher ──<event>.buzz.pen
 - **Replying** uses the same `reply-request` queue. For a v3 receipt the actuator rechecks the
   author's grant live, freezes the kind-9 reply, signs it, and publishes it to the community relay
   (see OUTBOUND_ACTION_APPROVAL, "Channel replies enacted on the live grant chain").
+
+## Native status reactions
+
+With a `buzz` block the identity also shows its progress on the message it was asked in, exactly
+as Buzz's own agents do. `"status_reactions": false` inside the block turns this off; it is on by
+default, and any value other than a boolean refuses the manifest.
+
+| Moment | Event (signed by the identity) | Who decides | Path |
+|---|---|---|---|
+| admitted and durably queued | kind 7 `👀`, tags `[["e", <source event>]]` | admission broker (`instance-broker-native.mjs`, or `instance-broker.mjs` for a carried mention) appends an `admitted` fact after the adapter ACK | status keeper signs and publishes |
+| first `nvoy_channel_read` of the envelope | kind 7 `💬`, same single `e` tag | keyless reader (`claude-channel.mjs`, `codex-channel-mcp.mjs`) appends one `status-request` naming the envelope | status keeper validates, signs, publishes |
+| reply accepted by the relay | kind 5, `[["e", <reaction id>]]`, one per reaction | `instance-broker-reply.mjs` appends a `replied` fact after the one-use receipt is consumed | status keeper deletes |
+| no reply within 20 minutes | kind 5 as above | status keeper's sweep | status keeper deletes |
+
+No `h`, `p` or `k` tag: the relay derives the channel from the target and requires the signer to
+be a member of it. A carried mention (authority v2) is covered when its channel is also one of the
+manifest's `buzz.channels`; the reaction goes on the original Buzz event the carrier embedded, which
+the broker verified at admission. Both channel readers request `💬`, so every portable harness
+that reads through them (Claude, Codex, or any other MCP client) shows it; the headless worker and the Codex app-server
+and macOS adapters do not, so their mentions show `👀` and are cleared, without `💬`.
+
+**Authority.** `instance-broker-status.mjs` is supervised by the broker daemon beside the AUTH
+oracle, runs as the broker, and holds the broker's signer. It follows two logs: its own
+`<state>/buzz-status/facts.jsonl`, written only by broker processes, and
+`<runtime>/status-requests.jsonl`, the only thing the keyless side can say. A request is exactly
+`{version, type: "status-request", instance, envelope, state: "working"}`; any other field, state or
+instance is ignored, and an envelope the broker did not itself record as admitted gets nothing. The
+emoji, the target event and the relay are never chosen by the requester. A deletion names only a
+reaction id the keeper signed and recorded.
+
+**At most once.** `<state>/buzz-status/state.json` records, per envelope, each transition before
+the signer is asked and each signed event before it is published, so a restart neither signs a
+second reaction nor loses an id it must later delete. A replayed fact, a repeated read, or a request
+after the clear does nothing; facts older than 20 minutes are history and never react. A deletion is
+signed once and its publish retried at most three times; cleared entries are pruned after a day.
+
+**Failure is decoration.** Nothing here gates admission, delivery or the reply. Every failure is
+one line, `status[👀] <envelope 12> failed: <class>` (`bunker-refused`, `signer-timeout`,
+`relay-refused`, `relay-unavailable`, …), never message content, relay payloads or credentials.
+
+**Bunker requirement.** The pairing's permissions must allow the identity to sign kinds **7 and 5**
+in addition to what it already does (for example 22242 AUTH, kind 9 channel replies, kind 13 seals). A refusal is announced once per
+kind — `Bunker refused kind 7 — widen the pairing's permissions to sign kinds 7 and 5` — and
+delivery and replies carry on. A Bunker that silently drops the request instead of refusing shows as
+`signer-timeout` after the NIP-46 timeout, which also delays later statuses for that identity.
 
 ## Required negative tests
 
