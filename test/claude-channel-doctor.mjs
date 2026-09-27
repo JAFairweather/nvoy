@@ -182,7 +182,10 @@ ok('broker doctor emits the exact worker UID/GID baseline before key installatio
 
 const relativePublic = spawnSync(process.execPath, [tool, '--mode', 'broker', '--instance', 'claude-test', '--public-key-file', 'channel.pub', '--container', 'nvoy-claude-1'], { encoding: 'utf8', cwd: root, env: { ...process.env, NVOY_INSTANCE_ROOT: manifests } })
 ok('broker doctor refuses a relative public-key path', relativePublic.status !== 0 && /path must be absolute/.test(relativePublic.stderr))
-const wrongManifest = { ...manifest, id: 'claude-wrong', pubkey: '3'.repeat(64), state_dir: join(root, 'wrong-state'), runtime_dir: join(root, 'wrong-runtime'), spool_dir: join(root, 'wrong-spool'), delivery_mode: 'headless', worker_enabled: false }
+const wrongManifest = { ...manifest, id: 'claude-wrong', pubkey: '3'.repeat(64), state_dir: join(root, 'wrong-state'), runtime_dir: join(root, 'wrong-runtime'), spool_dir: join(root, 'wrong-spool'),
+  key_ref: '/run/secrets/claude-wrong', broker_adapter_gid: 42111, worker_handoff_gid: 42112,
+  watcher_uid: 41111, broker_uid: 41112, adapter_uid: 41113, worker_uid: 41114,
+  delivery_mode: 'headless', worker_enabled: false }
 writeFileSync(join(manifests, 'claude-wrong.json'), JSON.stringify(wrongManifest))
 const wrong = spawnSync(process.execPath, [tool, '--mode', 'broker', '--instance', 'claude-wrong', '--public-key-file', publicKey, '--container', 'nvoy-claude-1'], { encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifests } })
 ok('broker doctor refuses a non-notify-only identity', wrong.status !== 0 && /notify_only/.test(wrong.stderr))
