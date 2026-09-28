@@ -1,4 +1,7 @@
-node_modules/
+# No trailing slash: that form matches directories only, and review checkouts here link
+# node_modules from a sibling worktree rather than installing per worktree. A symlink is not a
+# directory, so `node_modules/` let one through into #167. See #180.
+node_modules
 CLAUDE.md
 .claude/
 drafts/
