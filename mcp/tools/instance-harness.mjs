@@ -23,7 +23,7 @@ import { resolve } from 'node:path'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { readClientConfig } from './channel_client.mjs'
 import { runCodexHarness } from './codex_harness.mjs'
-import { herdrAgentName, herdrClient, launcherScript } from './harness_herdr.mjs'
+import { herdrAgentName, herdrClient, herdrSession } from './harness_herdr.mjs'
 import { channelProcessUp, classifyPane, claudeArgs, defaultInstructions, hasPriorSession, mcpConfig, seedClaudeJson, seedSettings, serverName } from './harness_session.mjs'
 
 const die = message => { console.error(`instance-harness: ${message}`); process.exit(1) }
@@ -127,41 +127,9 @@ function tmuxTerminal() {
 }
 
 function herdrTerminal(herdr) {
-  const name = herdrAgentName(manifest.id)
-  const launcher = resolve(privateDir, 'session.sh'), pidFile = resolve(privateDir, 'session.pid'), statusFile = resolve(privateDir, 'session.status')
-  const alive = pid => { try { process.kill(Number(pid), 0); return true } catch { return false } }
-  const readPid = () => { try { return readFileSync(pidFile, 'utf8').trim() } catch { return '' } }
-  let pane = ''
-  const stop = async () => {
-    const pid = readPid()
-    if (!/^\d+$/.test(pid) || !alive(pid)) return
-    // The launcher leads its job's process group, so the session goes with it.
-    try { process.kill(-Number(pid), 'SIGTERM') } catch { try { process.kill(Number(pid), 'SIGTERM') } catch {} }
-    for (let i = 0; i < 50 && alive(pid); i++) await sleep(100)
-    if (alive(pid)) try { process.kill(-Number(pid), 'SIGKILL') } catch {}
-  }
-  return {
-    async start(resume) {
-      pane = herdr.pane({ label: name, cwd: workdir })
-      await stop()
-      rmSync(pidFile, { force: true }); rmSync(statusFile, { force: true })
-      const { CLAUDE_CODE_OAUTH_TOKEN, ...env } = sessionEnv
-      writeFileSync(launcher, launcherScript({ env, cwd: workdir, command: args(resume), pidFile, statusFile, credential: { env: 'CLAUDE_CODE_OAUTH_TOKEN', file: credentialFile } }), { mode: 0o700 })
-      chmodSync(launcher, 0o700)
-      herdr.run(pane, `'${launcher.replace(/'/g, `'\\''`)}'`)
-    },
-    screen: () => herdr.read(pane),
-    keys: key => herdr.keys(pane, key),
-    dead() {
-      if (existsSync(statusFile)) return { dead: true, status: readFileSync(statusFile, 'utf8').trim() }
-      const pid = readPid()
-      return pid && !alive(pid) ? { dead: true, status: 'gone' } : { dead: false, status: '' }
-    },
-    pid: readPid,
-    // herdr names an agent only once it has recognised one, and forgets the name when it goes.
-    named() { try { const agent = herdr.agent(pane); if (agent && agent.name !== name) { herdr.name(pane, name); log(`named the herdr agent ${name}`) } } catch {} },
-    stop,
-  }
+  const session = herdrSession({ herdr, name: herdrAgentName(manifest.id), dir: privateDir, cwd: workdir, log })
+  const { CLAUDE_CODE_OAUTH_TOKEN, ...env } = sessionEnv
+  return { ...session, start: resume => session.start({ command: args(resume), env, credential: { env: 'CLAUDE_CODE_OAUTH_TOKEN', file: credentialFile } }) }
 }
 
 const mode = process.env.HARNESS_TERMINAL || 'auto'

@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { sshChannelEntry } from '../mcp/tools/channel_client.mjs'
+import { fakeHerdr } from './fake-herdr.mjs'
 import { CODEX_CHANNEL_TOOLS, channelProcessUp, classifyPane, claudeArgs, codexConfigToml, codexTurnText, defaultInstructions, hasPriorSession, mcpConfig, pendingEnvelopes, seedClaudeJson, seedSettings, serverName } from '../mcp/tools/harness_session.mjs'
 
 let fails = 0
@@ -404,34 +405,8 @@ ok('once the fleet takes the channel again, the same conversation resumes and is
   !allSessions[0].args.includes('--continue') && allSessions.slice(1).every(session => session.args.at(-1) === '--continue'))
 portable.kill('SIGTERM'); await portableExited
 
-// The herdr form, against a fake herdr: workspaces and panes in a state file, and a pane that runs
-// whatever is typed into it, in its own process group as a shell's job would.
-const herdrState = join(remoteDir, 'herdr.json'), herdrLog = join(remoteDir, 'herdr.log')
-writeFileSync(join(fakeBin, 'herdr'), `#!/usr/bin/env node
-const { appendFileSync, readFileSync, writeFileSync } = require('node:fs')
-const file = ${JSON.stringify(herdrState)}
-const state = (() => { try { return JSON.parse(readFileSync(file, 'utf8')) } catch { return { workspaces: [], panes: {} } } })()
-const save = () => writeFileSync(file, JSON.stringify(state))
-const [noun, verb, ...rest] = process.argv.slice(2)
-appendFileSync(${JSON.stringify(herdrLog)}, JSON.stringify([noun, verb, ...rest]) + '\\n')
-const answer = result => console.log(JSON.stringify({ result }))
-if (noun === 'workspace' && verb === 'list') answer({ workspaces: state.workspaces })
-else if (noun === 'workspace' && verb === 'create') {
-  const n = state.workspaces.length + 1, ws = { workspace_id: 'w' + n, label: rest[rest.indexOf('--label') + 1] }, pane = 'w' + n + ':p1'
-  state.workspaces.push(ws); state.panes[pane] = { workspace: ws.workspace_id, name: null }; save()
-  answer({ workspace: ws, tab: { root_pane: { pane_id: pane } } })
-} else if (noun === 'pane' && verb === 'list') answer({ panes: Object.entries(state.panes).filter(([, p]) => p.workspace === rest[1]).map(([pane_id]) => ({ pane_id })) })
-else if (noun === 'pane' && verb === 'run') {
-  state.panes[rest[0]].name = null; save()
-  require('node:child_process').spawn('/bin/sh', ['-c', 'exec ' + rest[1]], { detached: true, stdio: 'ignore', env: { ...process.env, HERDR_PANE_ID: rest[0] } }).unref()
-  answer({})
-} else if (noun === 'pane' && verb === 'read') console.log('  ? for shortcuts')
-else if (noun === 'pane' && verb === 'send-keys') answer({})
-else if (noun === 'agent' && verb === 'list') answer({ agents: Object.entries(state.panes).map(([pane_id, p]) => ({ pane_id, agent: 'claude', name: p.name })) })
-else if (noun === 'agent' && verb === 'rename') { state.panes[rest[0]].name = rest[1]; save(); answer({}) }
-else { console.log(JSON.stringify({ error: { code: 'unknown', message: noun + ' ' + verb } })); process.exit(1) }
-`)
-chmodSync(join(fakeBin, 'herdr'), 0o755)
+// The herdr form, against a fake herdr (see fake-herdr.mjs).
+const herdrFake = fakeHerdr(remoteDir)
 // The session's claude logs what reached it, then is the same fake session as tmux runs.
 writeFileSync(join(fakeBin, 'claude'), `#!/usr/bin/env node
 const e = process.env
@@ -441,16 +416,16 @@ require(${JSON.stringify(fakeClaudeSession)})
 `)
 chmodSync(join(fakeBin, 'claude'), 0o755)
 const herdrHome = join(ownHome, '.nvoy-harness', 'herdr-test')
-const herdrCalls = () => readText(herdrLog).split('\n').filter(Boolean).map(JSON.parse)
+const herdrCalls = herdrFake.calls
 const claudeRuns = () => readText(join(herdrHome, 'claude.log')).split('\n').filter(Boolean).map(JSON.parse)
 const alive = pid => { try { process.kill(pid, 0); return true } catch { return false } }
 const herdrSupervisor = spawn(process.execPath, ['mcp/tools/instance-harness.mjs', '--instance', 'mac-test', '--remote', clientConfig({ ...client, home: herdrHome })],
-  { cwd: resolve('.'), env: { ...remoteEnv, HARNESS_TERMINAL: 'auto', HARNESS_HERDR_BIN: join(fakeBin, 'herdr') } })
+  { cwd: resolve('.'), env: { ...remoteEnv, HARNESS_TERMINAL: 'auto', HARNESS_HERDR_BIN: herdrFake.bin } })
 let herdrOut = ''
 herdrSupervisor.stdout.on('data', d => { herdrOut += d }); herdrSupervisor.stderr.on('data', d => { herdrOut += d })
 const herdrExited = new Promise(done => herdrSupervisor.on('exit', done))
 ok('where herdr answers, the portable session runs in herdr and is seen ready', await waitFor(() => /the session runs in herdr/.test(herdrOut) && /mac-test session ready; its channel to the fleet is up/.test(herdrOut)))
-const herdrState1 = JSON.parse(readText(herdrState) || '{}')
+const herdrState1 = herdrFake.state()
 ok('the identity gets its own workspace, labelled with its name, and nothing in tmux', herdrState1.workspaces?.length === 1 && herdrState1.workspaces[0].label === 'mac-test' &&
   !existsSync(join(herdrHome, '.nvoy-harness', 'tmux.sock.log')))
 const launcher = join(herdrHome, '.nvoy-harness', 'session.sh')
@@ -459,15 +434,23 @@ ok('the pane is sent only the owner-only launcher\'s path, and the launcher hold
 const run1 = claudeRuns()[0] || {}
 ok('claude runs in the pane with the harness home, the login, the channel, and none of the owner\'s environment', run1.home === herdrHome && run1.keyed && run1.configDir === undefined &&
   run1.pane === 'w1:p1' && run1.args.includes('server:nvoy-mac-test') && !run1.args.includes('--continue'))
-ok('herdr is asked to name the agent after the identity', await waitFor(() => JSON.parse(readText(herdrState)).panes['w1:p1'].name === 'mac-test'))
+ok('herdr is asked to name the agent after the identity', await waitFor(() => herdrFake.state().panes['w1:p1'].name === 'mac-test'))
 process.kill(run1.pid, 'SIGKILL')
-ok('a session that exits restarts in the same pane, resuming, and is named again', await waitFor(() => claudeRuns().length === 2 && JSON.parse(readText(herdrState)).panes['w1:p1'].name === 'mac-test', 15000) &&
-  /session exited \(status 137\); restarting/.test(herdrOut) && claudeRuns()[1].pane === 'w1:p1' && claudeRuns()[1].args.at(-1) === '--continue' && JSON.parse(readText(herdrState)).workspaces.length === 1)
+ok('a session that exits restarts in the same pane, resuming, and is named again', await waitFor(() => claudeRuns().length === 2 && herdrFake.state().panes['w1:p1'].name === 'mac-test', 15000) &&
+  /session exited \(status 137\); restarting/.test(herdrOut) && claudeRuns()[1].pane === 'w1:p1' && claudeRuns()[1].args.at(-1) === '--continue' && herdrFake.state().workspaces.length === 1)
 const sessionPid = Number(readText(join(herdrHome, '.nvoy-harness', 'session.pid')))
 const run2 = claudeRuns()[1]
 herdrSupervisor.kill('SIGTERM'); await herdrExited
 ok('stopping the supervisor stops the session it started in herdr', await waitFor(() => !alive(sessionPid) && !alive(run2.pid)))
 ok('nothing secret reaches the supervisor\'s output in herdr either', !/PRIVATE-KEY|sk-ant-oat/.test(herdrOut))
+const agentPlist = spawnSync(process.execPath, ['mcp/tools/install-harness-launchagent.mjs', '--runner', 'claude', '--instance', 'mac-test', '--config', clientConfig(client), '--print'],
+  { cwd: resolve('.'), encoding: 'utf8', env: { ...remoteEnv } })
+ok('the LaunchAgent runs the portable supervisor headless, in herdr, logging under the harness home, and carries no secret', agentPlist.status === 0 &&
+  agentPlist.stdout.includes('<string>pub.nave.nvoy.mac-test.harness</string>') && /instance-harness\.mjs<\/string><string>--instance<\/string><string>mac-test<\/string><string>--remote<\/string>/.test(agentPlist.stdout) &&
+  agentPlist.stdout.includes('<key>HARNESS_TERMINAL</key><string>herdr</string>') && agentPlist.stdout.includes('<key>KeepAlive</key><true/>') &&
+  agentPlist.stdout.includes(join(harnessHome, '.nvoy-harness', 'launchagent', 'stderr.log')) && !/PRIVATE-KEY|sk-ant-oat|nsec|bunker/i.test(agentPlist.stdout))
+ok('the LaunchAgent installer refuses a config the supervisor would refuse', spawnSync(process.execPath, ['mcp/tools/install-harness-launchagent.mjs', '--runner', 'claude', '--instance', 'mac-test',
+  '--config', clientConfig({ ...client, nsec_file: '/x' }), '--print'], { cwd: resolve('.'), encoding: 'utf8', env: remoteEnv }).status === 1)
 
 rmSync(root, { recursive: true, force: true })
 console.log(fails ? `\n${fails} FAILED` : '\nall passed')

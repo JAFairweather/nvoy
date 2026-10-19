@@ -109,7 +109,16 @@ export function sshFeedArgs(config, aliveSeconds = 15) {
   return [...entry.args.slice(0, -1), '-o', `ServerAliveInterval=${aliveSeconds}`, '-o', 'ServerAliveCountMax=3', entry.args.at(-1)]
 }
 
-export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH }) {
+// The command a viewer runs to attach to the thread, for a terminal that shows it (herdr).
+export const viewerCommand = ({ codexHome, socket, threadId }) => ({
+  command: ['codex', 'resume', threadId, '--remote', `unix://${socket}`],
+  env: { PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin', HOME: codexHome, CODEX_HOME: codexHome, TERM: 'xterm-256color', LANG: 'C.UTF-8' },
+  started: `showing the thread in herdr`,
+})
+
+// `viewer`, when given, is shown the thread whenever it can be attached and hidden when the
+// app-server it attaches to goes (see herdrKeeper).
+export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH, viewer = null }) {
   const { codexHome, socket } = config
   const workdir = resolve(codexHome, 'workspace'), privateDir = resolve(codexHome, 'nvoy'), ctlDir = resolve(codexHome, 'ctl')
   const threadPath = resolve(privateDir, 'codex-thread.json'), deliveredPath = resolve(privateDir, 'delivered.jsonl'), cursorPath = resolve(privateDir, 'feed-cursor.json')
@@ -124,7 +133,7 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
   for (const dir of [workdir, privateDir, ctlDir]) { mkdirSync(dir, { recursive: true, mode: 0o700 }); chmodSync(dir, 0o700) }
   const release = claimPidLock(resolve(privateDir, 'supervisor.lock'), config.id, 'portable Codex harness')
   const children = new Set()
-  process.on('exit', () => { for (const child of children) try { child.kill('SIGTERM') } catch {} release() })
+  process.on('exit', () => { for (const child of children) try { child.kill('SIGTERM') } catch {} viewer?.hide(); release() })
 
   const manifest = { id: config.id, pubkey: config.pubkey, buzz: { channels: config.channels }, harness: { runner: 'codex', model: config.model } }
   writePrivate(resolve(codexHome, 'config.toml'), codexConfigToml({ manifest, root: '', model: config.model, auth: 'chatgpt',
@@ -248,12 +257,13 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
           const envelope = turnEnvelope.get(p.turn?.id)
           log(`turn ${envelope ? `for ${envelope.slice(0, 12)} ` : ''}ended: ${p.turn?.status || 'unknown'}`)
           // Codex writes a thread's rollout at its first turn; until then `codex resume` finds nothing (#218).
-          if (!attachable) { attachable = true; log(`attach: ${attachCommand({ codexHome, socket, threadId })}`) }
+          if (!attachable) { attachable = true; log(`attach: ${attachCommand({ codexHome, socket, threadId })}`); viewer?.show(viewerCommand({ codexHome, socket, threadId })) }
         }
         if (!busy) wake()
       })
       log(`${config.id} session ready; admitted messages will be injected into the thread`)
       log(attachable ? `attach: ${attachCommand({ codexHome, socket, threadId })}` : 'attach: available after the thread\'s first turn, when Codex saves it; the command is printed then')
+      if (attachable) viewer?.show(viewerCommand({ codexHome, socket, threadId }))
       while (!stopping() && !server.closed) {
         if (down && !busy) { log(`restarting codex app-server to reconnect the channel (${down})`); break }
         const next = pending[0]
@@ -294,6 +304,7 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
       log(`codex harness: ${error.message}`)
     } finally {
       server?.stop()
+      viewer?.hide()
       if (child) { try { child.kill('SIGTERM') } catch {} children.delete(child) }
     }
     if (stopping()) break
