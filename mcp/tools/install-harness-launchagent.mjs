@@ -6,7 +6,7 @@
 //
 //   node mcp/tools/install-harness-launchagent.mjs --runner claude|codex --instance <id> --config <client-config.json> [--print]
 
-import { chmodSync, mkdirSync, renameSync, writeFileSync } from 'node:fs'
+import { accessSync, chmodSync, constants, mkdirSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -28,14 +28,16 @@ const entry = resolve(repoRoot, 'mcp/tools', runner === 'claude' ? 'instance-har
 const args = runner === 'claude' ? ['--instance', id, '--remote', config] : ['--instance', id, '--config', config]
 // The installer's own PATH, so the supervisor finds the same claude, codex and herdr the owner does.
 const path = [...new Set((process.env.PATH || '').split(':').filter(isAbsolute))].join(':') || '/usr/bin:/bin'
+// node by its PATH name (Homebrew's stable link), not this process's versioned path, which an upgrade removes.
+const node = path.split(':').map(dir => resolve(dir, 'node')).find(file => { try { accessSync(file, constants.X_OK); return true } catch { return false } }) || process.execPath
 const label = `pub.nave.nvoy.${id}.harness`
 const esc = value => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
-if ([process.execPath, entry, config, logs, path, homedir(), ...args].some(value => /[\n\r\0]/.test(value))) die('a path contains an unsafe control character')
+if ([node, entry, config, logs, path, homedir(), ...args].some(value => /[\n\r\0]/.test(value))) die('a path contains an unsafe control character')
 const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>${esc(label)}</string>
-<key>ProgramArguments</key><array>${[process.execPath, entry, ...args].map(a => `<string>${esc(a)}</string>`).join('')}</array>
+<key>ProgramArguments</key><array>${[node, entry, ...args].map(a => `<string>${esc(a)}</string>`).join('')}</array>
 <key>WorkingDirectory</key><string>${esc(repoRoot)}</string>
 <key>EnvironmentVariables</key><dict><key>HOME</key><string>${esc(homedir())}</string><key>PATH</key><string>${esc(path)}</string><key>HARNESS_TERMINAL</key><string>herdr</string></dict>
 <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
