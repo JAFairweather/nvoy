@@ -920,6 +920,61 @@ Operator steps, on the fleet host:
 Rotating either file does not by itself restart anything. The init container copies credentials
 only when the stack is recreated, so recreate the identity after a rotation.
 
+### HTTPS door for the channel
+
+This is for a harness host that cannot reach SSH; see
+[Harness placement](HARNESS_PLACEMENT.md#https-door-for-a-harness-that-cannot-reach-ssh).
+
+```json
+"channel_door": { "token_hash_ref": "/etc/nvoy/credentials/<id>.door-token.sha256",
+                  "network": "<the reverse proxy's Docker network>" }
+```
+
+- **When it is valid.** Only on a local-broker, worker-disabled, `notify_only` manifest, the same
+  rule as the SSH principal. `token_hash_ref` must be an absolute path under
+  `/etc/nvoy/credentials` that names no other credential. `network` must already exist; the stack
+  joins it as external.
+- **What it is.** The `door` service uses the runtime image, runs as the worker UID with the
+  handoff group, is read-only, and has no capabilities. Its mounts are the manifest root, the
+  adapter runtime, and its own read-only `channel_door_credentials` volume. Init copies the hash
+  there, worker-owned and `0400`. It publishes no port. The proxy reaches it as
+  `nvoy-<id>-door:8790`, and it serves only `/door/<id>/mcp`.
+- **Requests.** A session opens only with `initialize`. There are at most 2 sessions, the oldest is
+  evicted, an idle session closes after 30 min, and a body may be at most 1 MiB. DELETE ends a
+  session and its channel process.
+- **Logs.** Only session open and close lines and failure notices. A token, header or message body
+  is never logged.
+
+Operator steps, on the fleet host:
+
+1. Mint the token and install its hash. The token file is the only copy of the token:
+   ```sh
+   umask 077
+   openssl rand -hex 32 > /root/<id>.door-token
+   tr -d '\n' < /root/<id>.door-token | sha256sum | cut -d' ' -f1 > /etc/nvoy/credentials/<id>.door-token.sha256
+   ```
+   (`channel-https-door.mjs mint` does the same where node is installed.)
+2. Back up the manifest to `/root`, then add the `channel_door` block. The path watch reconciles the
+   identity, and the deploy fails unless `nvoy-<id>-door` is running.
+3. Route the proxy to it. For Caddy:
+   ```caddyfile
+   door.example.org {
+   	handle /door/<id>/* {
+   		reverse_proxy nvoy-<id>-door:8790 {
+   			flush_interval -1
+   		}
+   	}
+   	handle {
+   		respond 404
+   	}
+   }
+   ```
+4. Give the token to the harness as a remote MCP server at `https://<host>/door/<id>/mcp`, with
+   header `Authorization: Bearer <token>`. Then delete `/root/<id>.door-token`.
+
+To rotate, repeat step 1 and recreate the identity. To retire, remove the block and delete the
+hash file.
+
 ### Automatic verified releases
 
 Routine releases are pull-based; an operator must not copy source or hand-edit image tags. The

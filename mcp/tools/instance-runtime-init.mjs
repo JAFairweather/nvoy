@@ -77,6 +77,7 @@ const sources = {
   harnessCredential: process.env.NVOY_HARNESS_CREDENTIAL_SOURCE || '',
   wakeWebhookUrl: process.env.NVOY_WAKE_WEBHOOK_URL_SOURCE || '',
   wakeWebhookHeaders: process.env.NVOY_WAKE_WEBHOOK_HEADERS_SOURCE || '',
+  channelDoorTokenHash: process.env.NVOY_CHANNEL_DOOR_TOKEN_HASH_SOURCE || '',
 }
 const brokerSources = [sources.bunkerUri, sources.bunkerClient]
 if (brokerSources.some(Boolean)) {
@@ -117,5 +118,15 @@ if (m.wakeWebhook) {
   provisionSecret(sources.wakeWebhookHeaders, `${webhookCredDir}/headers`, m.workerUid, m.workerUid, 'wake webhook headers')
 } else if (sources.wakeWebhookUrl || sources.wakeWebhookHeaders) {
   die('a runtime without a wake webhook refuses webhook credential sources')
+}
+// The channel door's bearer-token hash, copied worker-owned into a volume only the door mounts. It
+// is a digest, not the token, but it is still the one thing that decides who may dial the channel.
+if (m.channelDoor) {
+  if (!sources.channelDoorTokenHash) die('a channel door runtime requires its token hash source')
+  const doorCredDir = '/run/nvoy-channel-door-credentials'
+  provision(doorCredDir, 0, 0, 0o711, 'channel door credential directory')
+  provisionSecret(sources.channelDoorTokenHash, `${doorCredDir}/token.sha256`, m.workerUid, m.workerUid, 'channel door token hash')
+} else if (sources.channelDoorTokenHash) {
+  die('a runtime without a channel door refuses a token hash source')
 }
 console.log(`instance-runtime-init: provisioned ${m.id}`)

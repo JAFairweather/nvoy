@@ -41,7 +41,9 @@ A harness reaches its identity through the per-identity SSH forced command, and 
   per-identity lock, and the portable supervisor injects each admitted envelope as a turn.
 
 This is the path `claude-channel.mjs` calls the sanctioned remote path. Do not remove it, and do
-not replace it with a second transport.
+not replace it with a second transport. The [HTTPS door](#https-door-for-a-harness-that-cannot-reach-ssh)
+is the same channel process on a different wire, for a harness host that cannot reach SSH at all;
+it is not a second channel and spawns nothing else.
 
 ## Interim: harness containers on the fleet
 
@@ -74,6 +76,29 @@ to the identity's stack for that case.
 
 Setup is in
 [Webhook wake for an off-fleet harness](RUNTIME_SUPERVISOR.md#webhook-wake-for-an-off-fleet-harness).
+
+## HTTPS door for a harness that cannot reach SSH
+
+Some harness hosts pass only HTTPS. Grok Bot cloud computers have done so since an egress change in
+October 2026: every hostname resolves to a proxy address and port 22 times out, so the webhook wake
+arrives but the harness cannot open its channel. A manifest `channel_door` block adds a `door`
+service (`channel-https-door.mjs`) that carries the channel MCP over Streamable HTTP instead.
+
+- **What it spawns.** Each authenticated session becomes exactly `channelArgv(manifest)`, the
+  process the SSH principal `docker exec`s into the adapter. The two transports share that one
+  definition in `participant_unit.mjs`. The caller chooses no instance, argument or command.
+- **What it runs as.** The worker UID with the handoff group, the same image and the same mounts as
+  that exec'd process, and it refuses to start as anyone else. So a compromise of the door yields
+  what a valid token already grants: one identity's channel, and no more.
+- **Who can dial it.** One 256-bit bearer token. Only its SHA-256 reaches the stack. The harness
+  sends `Authorization: Bearer <token>`; anything else is 401, or 429 after 20 failures in a minute.
+  The right token is never throttled, so failures cannot lock the harness out.
+- **Where it listens.** On the reverse proxy's Docker network only, never on a host port. The proxy
+  terminates TLS.
+
+SSH stays the default. Use the door only for a host that cannot reach port 22, and retire it when
+that host can. Setup is in
+[HTTPS door for the channel](RUNTIME_SUPERVISOR.md#https-door-for-the-channel).
 
 ## Migration
 
