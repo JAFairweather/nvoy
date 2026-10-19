@@ -674,6 +674,19 @@ The fleet channel evicts a client that misses 4 pings 30s apart, so a restarted 
 in within about 2¼ min. A laptop asleep longer than that loses its channel, and the watch restarts
 the session on wake.
 
+**In herdr.** Where the owner runs [herdr](https://herdr.dev), the session runs in a herdr pane
+instead of tmux, so it is shown like any other agent on the box: one workspace per identity,
+labelled with its name, holding the one pane Claude Code runs in. herdr recognises it there and
+tracks its state; the supervisor names the agent after the identity and restarts the session in
+the same pane. `HARNESS_TERMINAL` picks the terminal: `auto` (the default) uses herdr when it
+answers and tmux otherwise, and `herdr` or `tmux` forces one. The pane is typed only the path of an
+owner-only launcher, `<home>/.nvoy-harness/session.sh`, which rebuilds the session's environment
+from nothing and reads the login from its file, so the token is never in a command line, the
+pane's scrollback or herdr's own records. herdr is never told how to resume the session: a herdr
+restart leaves the pane empty until the supervisor starts it again, rather than reopening it under
+the owner's own login. Watch it by switching to its workspace; a keystroke there reaches the
+session, as attaching to tmux would.
+
 #### Portable Codex harness (`codex-harness-portable.mjs`)
 
 The Codex form of the above: one persistent Codex thread on any box, a Mac included, billed to the
