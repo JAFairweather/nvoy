@@ -52,11 +52,22 @@ export function volumeLifecycle(manifest) {
     .map(v => Object.freeze({ ...v, volume: `nvoy-${manifest.id}_${v.suffix}` }))
 }
 
-// The exact remote process an inbound channel connection is allowed to become. It runs as
+// The exact process an inbound channel connection is allowed to become. It runs as
 // workerUid:workerHandoffGid — admitted tasks read-only, only the bounded channel cursor and reply
-// queue writable — and it takes no argument from the caller.
+// queue writable — and it takes no argument from the caller. Both transports are built on it, so
+// neither can widen it: the SSH principal `docker exec`s it into the adapter (forcedArgv), and the
+// HTTPS door spawns it directly from a container with the same image, uid:gid and mounts.
+export function channelArgv(manifest) {
+  return [NODE, TOOL, '--instance', manifest.id]
+}
+
+export function forcedArgv(manifest) {
+  return [DOCKER, 'exec', '-i', '--user', `${manifest.workerUid}:${manifest.workerHandoffGid}`,
+    manifest.adapterContainer, ...channelArgv(manifest)]
+}
+
 export function forcedCommand(manifest) {
-  return `${DOCKER} exec -i --user ${manifest.workerUid}:${manifest.workerHandoffGid} ${manifest.adapterContainer} ${NODE} ${TOOL} --instance ${manifest.id}`
+  return forcedArgv(manifest).join(' ')
 }
 
 export function principalComment(manifest) {

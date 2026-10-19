@@ -35,6 +35,9 @@ services:
       NVOY_WAKE_WEBHOOK_URL_SOURCE: /run/secrets/wake-webhook-url
       NVOY_WAKE_WEBHOOK_HEADERS_SOURCE: /run/secrets/wake-webhook-headers
       # @webhook-end
+      # @door-begin
+      NVOY_CHANNEL_DOOR_TOKEN_HASH_SOURCE: /run/secrets/channel-door-token-hash
+      # @door-end
     command: ["node", "mcp/tools/instance-runtime-init.mjs", "--instance", "${INSTANCE_ID:?}"]
     volumes:
       - type: bind
@@ -74,6 +77,11 @@ services:
         source: wake_webhook_state
         target: ${WAKE_WEBHOOK_STATE_DIR:?}
       # @webhook-end
+      # @door-begin
+      - type: volume
+        source: channel_door_credentials
+        target: /run/nvoy-channel-door-credentials
+      # @door-end
     secrets:
       - source: nvoy_bunker_uri
         target: bunker-uri
@@ -93,6 +101,10 @@ services:
       - source: nvoy_wake_webhook_headers
         target: wake-webhook-headers
       # @webhook-end
+      # @door-begin
+      - source: nvoy_channel_door_token_hash
+        target: channel-door-token-hash
+      # @door-end
     restart: "no"
 
   watcher:
@@ -292,6 +304,46 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
   # @webhook-end
+  # @door-begin
+  # The channel door: the channel MCP over HTTPS, for a harness host that cannot reach SSH. Each
+  # authenticated session becomes exactly the process the SSH principal is forced into, minus the
+  # `docker exec`: the same image, uid:gid and mounts as that exec'd process, with no argument from
+  # the caller. So a compromise of the door yields what a valid token already grants, and no more.
+  # It holds no Nostr credential and no model login, publishes no host port, and joins only the
+  # reverse proxy's network, which terminates TLS and reaches it as <container_name>:8790.
+  door:
+    image: ${NVOY_IMAGE:?set NVOY_IMAGE}
+    container_name: nvoy-${INSTANCE_ID:?}-door
+    user: "${WORKER_UID:?}:${WORKER_HANDOFF_GID:?}"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp:mode=1777]
+    environment:
+      NVOY_INSTANCE_ROOT: /etc/nvoy/instances
+    command: ["node", "mcp/tools/channel-https-door.mjs", "serve", "--instance", "${INSTANCE_ID:?}",
+      "--listen", "0.0.0.0:8790", "--token-hash-file", "/run/nvoy-channel-door-credentials/token.sha256"]
+    volumes:
+      - type: bind
+        source: ${MANIFEST_DIR:?}
+        target: /etc/nvoy/instances
+        read_only: true
+      - type: volume
+        source: adapter_runtime
+        target: ${RUNTIME_DIR:?}
+      - type: volume
+        source: channel_door_credentials
+        target: /run/nvoy-channel-door-credentials
+        read_only: true
+    networks: [door_edge]
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      adapter:
+        condition: service_started
+    restart: unless-stopped
+  # @door-end
 
 secrets:
   nvoy_bunker_uri:
@@ -319,6 +371,12 @@ secrets:
   nvoy_wake_webhook_headers:
     file: ${WAKE_WEBHOOK_HEADERS_FILE:?}
   # @webhook-end
+  # @door-begin
+  # The SHA-256 of the channel door's bearer token. The token itself never reaches this host's
+  # disk after minting; the operator hands it to the harness and deletes it.
+  nvoy_channel_door_token_hash:
+    file: ${CHANNEL_DOOR_TOKEN_HASH_FILE:?}
+  # @door-end
 
 volumes:
   watcher_spool: {}
@@ -339,3 +397,12 @@ volumes:
   # The notifier's envelope cursor, mounted over <runtime>/wake-webhook-state.
   wake_webhook_state: {}
   # @webhook-end
+  # @door-begin
+  channel_door_credentials: {}
+
+networks:
+  # The reverse proxy's network, created outside this stack; the door is its only member from here.
+  door_edge:
+    external: true
+    name: ${CHANNEL_DOOR_NETWORK:?}
+  # @door-end
