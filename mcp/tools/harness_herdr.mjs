@@ -64,7 +64,9 @@ export function herdrClient({ bin = process.env.HARNESS_HERDR_BIN || 'herdr', en
 // screen (it hid the development-channels prompt the supervisor answers; mc-claude, 2026-10-19).
 export function launcherScript({ env, cwd, command, pidFile, statusFile, credential = null }) {
   const q = value => `'${String(value).replace(/'/g, `'\\''`)}'`
-  const kept = ['HERDR_ENV', 'HERDR_PANE_ID', 'HERDR_BIN_PATH', 'HERDR_SOCKET_PATH']
+  // herdr's terminal variables too: without COLORTERM an agent falls back to 256 colours, and Codex's
+  // composer shading then all but hides its text (dj-codex, 2026-10-19).
+  const kept = ['HERDR_ENV', 'HERDR_PANE_ID', 'HERDR_BIN_PATH', 'HERDR_SOCKET_PATH', 'COLORTERM', 'TERM_PROGRAM', 'TERM_PROGRAM_VERSION']
   return [
     '#!/bin/sh',
     '# Written by the Nvoy harness supervisor; rewritten at each start.',
