@@ -135,7 +135,7 @@ ok('stopping the launcher ends the session and frees its lock', await waitFor(()
 const herdr = fakeHerdr(root)
 writeFileSync(join(fakeBin, 'pi'), `#!/usr/bin/env node
 const e = process.env
-require('node:fs').appendFileSync(e.HOME + '/pi.log', JSON.stringify({ pid: process.pid, args: process.argv.slice(2), pane: e.HERDR_PANE_ID, env: Object.keys(e).filter(k => !k.startsWith('HERDR_')).sort() }) + '\\n')
+require('node:fs').appendFileSync(e.HOME + '/pi.log', JSON.stringify({ pid: process.pid, args: process.argv.slice(2), pane: e.HERDR_PANE_ID, env: Object.keys(e).filter(k => !/^(HERDR_|COLORTERM$|TERM_PROGRAM)/.test(k)).sort() }) + '\\n')
 setInterval(() => {}, 1000)
 `)
 chmodSync(join(fakeBin, 'pi'), 0o755)
