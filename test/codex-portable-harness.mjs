@@ -434,15 +434,15 @@ const herdr = fakeHerdr(root)
 const viewers = () => readText(join(codexHome, 'viewer.jsonl')).split('\n').filter(Boolean).map(JSON.parse)
 const s6 = startSupervisor(client, { HARNESS_TERMINAL: 'auto', HARNESS_HERDR_BIN: herdr.bin, HARNESS_VIEWER_CHECK_MS: '100', HARNESS_RETRY_MS: '100' })
 ok('where herdr answers, the attachable thread is shown in a workspace labelled with the identity, and named after it',
-  await waitFor(() => viewers().length === 1 && herdr.state().panes['w1:p1']?.name === 'cx-test') && /the thread is shown in herdr, in workspace cx-test/.test(s6.out) &&
-  herdr.state().workspaces.length === 1 && herdr.state().workspaces[0].label === 'cx-test')
+  await waitFor(() => viewers().length === 1 && herdr.state().panes['w1:p1']?.name === 'cxtest') && /the thread is shown in herdr, in workspace cxtest/.test(s6.out) &&
+  herdr.state().workspaces.length === 1 && herdr.state().workspaces[0].label === 'cxtest')
 const v1 = viewers()[0]
 const threadNow = JSON.parse(readText(join(codexHome, 'nvoy', 'codex-thread.json'))).thread_id
 ok('the viewer attaches to the driven thread over the control socket, in the harness\'s CODEX_HOME and nothing of the owner\'s',
   JSON.stringify(v1.args) === JSON.stringify(['resume', threadNow, '--remote', `unix://${socket}`]) && v1.home === codexHome && v1.pane === 'w1:p1' &&
   !v1.env.includes('HARNESS_EXTRA_VAR') && !v1.env.includes('NVOY_HARNESS_SSH') && v1.env.includes('CODEX_HOME'))
 process.kill(v1.pid, 'SIGKILL')
-ok('a viewer that exits is shown again in the same pane', await waitFor(() => viewers().length === 2 && herdr.state().panes['w1:p1'].name === 'cx-test') &&
+ok('a viewer that exits is shown again in the same pane', await waitFor(() => viewers().length === 2 && herdr.state().panes['w1:p1'].name === 'cxtest') &&
   viewers()[1].pane === 'w1:p1' && herdr.state().workspaces.length === 1)
 const v2 = viewers()[1], s6Servers = appServers()
 process.kill(fakeLog(codexHome).filter(m => m.start).at(-1).pid, 'SIGKILL')

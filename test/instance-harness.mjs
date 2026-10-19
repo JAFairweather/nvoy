@@ -426,7 +426,7 @@ herdrSupervisor.stdout.on('data', d => { herdrOut += d }); herdrSupervisor.stder
 const herdrExited = new Promise(done => herdrSupervisor.on('exit', done))
 ok('where herdr answers, the portable session runs in herdr and is seen ready', await waitFor(() => /the session runs in herdr/.test(herdrOut) && /mac-test session ready; its channel to the fleet is up/.test(herdrOut)))
 const herdrState1 = herdrFake.state()
-ok('the identity gets its own workspace, labelled with its name, and nothing in tmux', herdrState1.workspaces?.length === 1 && herdrState1.workspaces[0].label === 'mac-test' &&
+ok('the identity gets its own workspace, labelled with its name, and nothing in tmux', herdrState1.workspaces?.length === 1 && herdrState1.workspaces[0].label === 'mactest' &&
   !existsSync(join(herdrHome, '.nvoy-harness', 'tmux.sock.log')))
 const launcher = join(herdrHome, '.nvoy-harness', 'session.sh')
 ok('the pane is sent only the owner-only launcher\'s path, and the launcher holds no login', herdrCalls().filter(c => c[1] === 'run').every(c => c[3] === `'${launcher}'`) &&
@@ -434,9 +434,9 @@ ok('the pane is sent only the owner-only launcher\'s path, and the launcher hold
 const run1 = claudeRuns()[0] || {}
 ok('claude runs in the pane with the harness home, the login, the channel, and none of the owner\'s environment', run1.home === herdrHome && run1.keyed && run1.configDir === undefined &&
   run1.pane === 'w1:p1' && run1.args.includes('server:nvoy-mac-test') && !run1.args.includes('--continue'))
-ok('herdr is asked to name the agent after the identity', await waitFor(() => herdrFake.state().panes['w1:p1'].name === 'mac-test'))
+ok('herdr is asked to name the agent after the identity', await waitFor(() => herdrFake.state().panes['w1:p1'].name === 'mactest'))
 process.kill(run1.pid, 'SIGKILL')
-ok('a session that exits restarts in the same pane, resuming, and is named again', await waitFor(() => claudeRuns().length === 2 && herdrFake.state().panes['w1:p1'].name === 'mac-test', 15000) &&
+ok('a session that exits restarts in the same pane, resuming, and is named again', await waitFor(() => claudeRuns().length === 2 && herdrFake.state().panes['w1:p1'].name === 'mactest', 15000) &&
   /session exited \(status 137\); restarting/.test(herdrOut) && claudeRuns()[1].pane === 'w1:p1' && claudeRuns()[1].args.at(-1) === '--continue' && herdrFake.state().workspaces.length === 1)
 const sessionPid = Number(readText(join(herdrHome, '.nvoy-harness', 'session.pid')))
 const run2 = claudeRuns()[1]
