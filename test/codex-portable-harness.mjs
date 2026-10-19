@@ -10,6 +10,7 @@ import { sshChannelEntry } from '../mcp/tools/channel_client.mjs'
 import { CODEX_CHANNEL_TOOLS, codexConfigToml, codexTurnText } from '../mcp/tools/harness_session.mjs'
 import { attachCommand, sshFeedArgs } from '../mcp/tools/codex_portable_harness.mjs'
 import { claimPidLock } from '../mcp/tools/pid_lock.mjs'
+import { fakeHerdr } from './fake-herdr.mjs'
 
 let fails = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); if (!value) fails++ }
@@ -205,6 +206,12 @@ writeFileSync(join(fakeBin, 'codex'), `#!/usr/bin/env node
 const net = require('node:net'), crypto = require('node:crypto'), fs = require('node:fs')
 const home = process.env.CODEX_HOME
 const log = row => fs.appendFileSync(home + '/fake.jsonl', JSON.stringify(row) + '\\n')
+if (process.argv[2] === 'resume') {
+  const e = process.env
+  fs.appendFileSync(home + '/viewer.jsonl', JSON.stringify({ pid: process.pid, args: process.argv.slice(2), home: e.HOME, pane: e.HERDR_PANE_ID, env: Object.keys(e).sort() }) + '\\n')
+  setInterval(() => {}, 1000)
+  return
+}
 if (process.argv[2] !== 'app-server' || process.argv[3] !== '--listen' || !String(process.argv[4]).startsWith('unix://')) process.exit(2)
 const path = process.argv[4].slice(7)
 log({ start: true, pid: process.pid, env: Object.keys(process.env).sort(), listen: path })
@@ -284,7 +291,8 @@ const knownHosts = secretFile(join(root, 'known_hosts'), 'broker.example ssh-ed2
 const client = { instance: 'cx-test', ssh_target: 'nvoy-codex@broker.example', identity_file: chanKey, feed_identity_file: feedKey, known_hosts_file: knownHosts, codex_home: codexHome }
 const clientConfig = (value, mode = 0o600) => secretFile(join(mkdtempSync(join(root, 'c-')), 'client.json'), JSON.stringify(value), mode)
 const baseEnv = (() => { const env = { ...process.env }; delete env.OPENAI_API_KEY; delete env.CODEX_API_KEY; return env })()
-const supervisorEnv = { ...baseEnv, HOME: ownHome, PATH: `${fakeBin}:${process.env.PATH}`, NVOY_HARNESS_SSH: fakeSsh, HARNESS_FEED_KEEPALIVE_MS: '100', HARNESS_FEED_SILENCE_MS: '3000' }
+const supervisorEnv = { ...baseEnv, HOME: ownHome, PATH: `${fakeBin}:${process.env.PATH}`, NVOY_HARNESS_SSH: fakeSsh, HARNESS_FEED_KEEPALIVE_MS: '100', HARNESS_FEED_SILENCE_MS: '3000',
+  HARNESS_TERMINAL: 'none', HARNESS_HERDR_BIN: '/nonexistent/herdr' }
 const refused = (value, pattern, env = {}, mode) => {
   const r = spawnSync(process.execPath, ['mcp/tools/codex-harness-portable.mjs', '--instance', 'cx-test', '--config', clientConfig(value, mode)], { cwd: resolve('.'), encoding: 'utf8', env: { ...supervisorEnv, ...env }, timeout: 10000 })
   return r.status === 1 && pattern.test(r.stderr) && !/PRIVATE-KEY|CHATGPT-TOKEN|sk-proj-live/.test(r.stdout + r.stderr)
@@ -419,6 +427,35 @@ ok('a stored thread Codex never saved is replaced by a new one (#218)', await wa
 const s4Server = fakeLog(codexHome).filter(m => m.start).at(-1).pid
 s4.child.kill('SIGHUP'); await s4.exited
 ok('a hangup, as when its pane closes, stops the detached app-server too', await waitFor(() => !alive(s4Server), 5000))
+
+// Where the owner runs herdr, the thread is shown there, in a workspace of the identity's own.
+rmSync(join(codexHome, 'unsaved'))
+const herdr = fakeHerdr(root)
+const viewers = () => readText(join(codexHome, 'viewer.jsonl')).split('\n').filter(Boolean).map(JSON.parse)
+const s6 = startSupervisor(client, { HARNESS_TERMINAL: 'auto', HARNESS_HERDR_BIN: herdr.bin, HARNESS_VIEWER_CHECK_MS: '100', HARNESS_RETRY_MS: '100' })
+ok('where herdr answers, the attachable thread is shown in a workspace labelled with the identity, and named after it',
+  await waitFor(() => viewers().length === 1 && herdr.state().panes['w1:p1']?.name === 'cx-test') && /the thread is shown in herdr, in workspace cx-test/.test(s6.out) &&
+  herdr.state().workspaces.length === 1 && herdr.state().workspaces[0].label === 'cx-test')
+const v1 = viewers()[0]
+const threadNow = JSON.parse(readText(join(codexHome, 'nvoy', 'codex-thread.json'))).thread_id
+ok('the viewer attaches to the driven thread over the control socket, in the harness\'s CODEX_HOME and nothing of the owner\'s',
+  JSON.stringify(v1.args) === JSON.stringify(['resume', threadNow, '--remote', `unix://${socket}`]) && v1.home === codexHome && v1.pane === 'w1:p1' &&
+  !v1.env.includes('HARNESS_EXTRA_VAR') && !v1.env.includes('NVOY_HARNESS_SSH') && v1.env.includes('CODEX_HOME'))
+process.kill(v1.pid, 'SIGKILL')
+ok('a viewer that exits is shown again in the same pane', await waitFor(() => viewers().length === 2 && herdr.state().panes['w1:p1'].name === 'cx-test') &&
+  viewers()[1].pane === 'w1:p1' && herdr.state().workspaces.length === 1)
+const v2 = viewers()[1], s6Servers = appServers()
+process.kill(fakeLog(codexHome).filter(m => m.start).at(-1).pid, 'SIGKILL')
+ok('when codex app-server restarts, its viewer is replaced by one on the new server', await waitFor(() => appServers() === s6Servers + 1 && viewers().length === 3 && !alive(v2.pid)))
+const v3 = viewers()[2]
+await s6.stop()
+ok('stopping the supervisor takes its viewer down with it', await waitFor(() => !alive(v3.pid)))
+const agentPlist = spawnSync(process.execPath, ['mcp/tools/install-harness-launchagent.mjs', '--runner', 'codex', '--instance', 'cx-test', '--config', clientConfig(client), '--print'],
+  { cwd: resolve('.'), encoding: 'utf8', env: supervisorEnv })
+ok('the Codex LaunchAgent runs the portable supervisor headless, in herdr, logging under CODEX_HOME, and carries no secret', agentPlist.status === 0 &&
+  agentPlist.stdout.includes('<string>pub.nave.nvoy.cx-test.harness</string>') && /codex-harness-portable\.mjs<\/string><string>--instance<\/string><string>cx-test<\/string><string>--config<\/string>/.test(agentPlist.stdout) &&
+  agentPlist.stdout.includes('<key>HARNESS_TERMINAL</key><string>herdr</string>') && agentPlist.stdout.includes(join(codexHome, 'nvoy', 'launchagent', 'stderr.log')) &&
+  !/PRIVATE-KEY|CHATGPT-TOKEN|OPENAI_API_KEY|nsec|bunker/i.test(agentPlist.stdout))
 
 rmSync(root, { recursive: true, force: true })
 console.log(fails ? `\n${fails} FAILED` : '\nall passed')

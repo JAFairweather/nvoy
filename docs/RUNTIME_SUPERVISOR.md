@@ -774,6 +774,11 @@ Owner steps, with placeholder paths:
    CODEX_HOME=/absolute/path/codex-jaf-home codex resume <thread-id> --remote unix:///absolute/path/codex-jaf-home/ctl/as.sock
    ```
 
+   Where the owner runs herdr, the supervisor does this itself: it shows the thread in a workspace
+   of its own, labelled with the identity's name, runs the viewer again if it exits, and replaces
+   it whenever `codex app-server` restarts. `HARNESS_TERMINAL` is `auto` (the default: herdr when it
+   answers), `herdr`, or `none` to print the command only.
+
 `--remote` and `thread/queue/add` were checked against codex-cli 0.149.1. Pin that version, or
 recheck both after an upgrade.
 
@@ -879,6 +884,26 @@ Owner steps for `pi-dog`, with placeholder paths:
 
 The extension API, `--tools`, `--no-approve` and `--continue` were checked against pi 0.87.1. Pin
 that version, or recheck them after an upgrade.
+
+#### Running a portable harness headless (macOS)
+
+In a launcher pane, a supervisor shows up in herdr beside the agent it supervises. As a
+LaunchAgent it runs headless, starts at login, and is restarted by launchd, and only the agent is on
+screen:
+
+```sh
+node mcp/tools/install-harness-launchagent.mjs --runner claude --instance claude-jaf --config /absolute/path/claude-jaf-harness.json
+node mcp/tools/install-harness-launchagent.mjs --runner codex --instance codex-jaf --config /absolute/path/codex-jaf-harness.json
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/pub.nave.nvoy.<id>.harness.plist
+```
+
+`--print` renders the plist without installing it. The installer reads the config the way the
+supervisor would, and refuses it on the same grounds. The plist names paths only and sets
+`HARNESS_TERMINAL=herdr`: at login herdr may not be up yet, and the session waits for it rather
+than starting in tmux, where no one would see it. It carries the installer's `PATH`, so the
+supervisor finds the same `claude`, `codex` and `herdr` you do. Logs go to `launchagent/` in the
+harness home (Claude) or under `CODEX_HOME/nvoy` (Codex). Stop it with
+`launchctl bootout gui/$(id -u)/pub.nave.nvoy.<id>.harness`, which also ends its session.
 
 ### Docker reference deployment
 

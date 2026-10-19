@@ -5,6 +5,10 @@
 // to resume a harness session: a herdr restart must not reopen one under the owner's own login.
 
 import { spawnSync } from 'node:child_process'
+import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+
+const sleep = ms => new Promise(done => setTimeout(done, ms))
 
 // herdr agent names: lowercase letters, digits, '-' and '_', starting with a letter, at most 32.
 export function herdrAgentName(id) {
@@ -71,4 +75,72 @@ export function launcherScript({ env, cwd, command, pidFile, statusFile, credent
     `echo $? > ${q(statusFile)}`,
     '',
   ].join('\n')
+}
+
+// One process in an identity's pane, run through an owner-only launcher in `dir`: started, watched
+// through its pid and exit-status files, named, and stopped with its process group (an interactive
+// shell runs the launcher as a job, so it leads its own group). A recorded pid is signalled only
+// while it is still that launcher, never a process that has since reused the number.
+export function herdrSession({ herdr, name, dir, cwd, file = 'session', log = () => {} }) {
+  const launcher = resolve(dir, `${file}.sh`), pidFile = resolve(dir, `${file}.pid`), statusFile = resolve(dir, `${file}.status`)
+  const readPid = () => { try { const pid = readFileSync(pidFile, 'utf8').trim(); return /^\d+$/.test(pid) ? pid : '' } catch { return '' } }
+  const ours = pid => !!pid && (spawnSync('ps', ['-o', 'args=', '-p', pid], { encoding: 'utf8' }).stdout || '').includes(launcher)
+  const signal = (pid, sig) => { try { process.kill(-Number(pid), sig) } catch { try { process.kill(Number(pid), sig) } catch {} } }
+  let pane = ''
+  const session = {
+    started: () => !!pane,
+    async start({ command, env, credential = null }) {
+      pane = herdr.pane({ label: name, cwd })
+      await session.stop()
+      rmSync(pidFile, { force: true }); rmSync(statusFile, { force: true })
+      writeFileSync(launcher, launcherScript({ env, cwd, command, pidFile, statusFile, credential }), { mode: 0o700 })
+      chmodSync(launcher, 0o700)
+      herdr.run(pane, `'${launcher.replace(/'/g, `'\\''`)}'`)
+    },
+    screen: () => herdr.read(pane),
+    keys: key => herdr.keys(pane, key),
+    dead() {
+      if (existsSync(statusFile)) return { dead: true, status: readFileSync(statusFile, 'utf8').trim() }
+      const pid = readPid()
+      return pid && !ours(pid) ? { dead: true, status: 'gone' } : { dead: false, status: '' }
+    },
+    pid: readPid,
+    // herdr names an agent only once it has recognised one, and forgets the name when it goes.
+    named() {
+      try { const agent = herdr.agent(pane); if (agent && agent.name !== name) { herdr.name(pane, name); log(`named the herdr agent ${name}`) } } catch {}
+    },
+    async stop() {
+      const pid = readPid()
+      if (!ours(pid)) return
+      signal(pid, 'SIGTERM')
+      for (let i = 0; i < 50 && ours(pid); i++) await sleep(100)
+      if (ours(pid)) signal(pid, 'SIGKILL')
+    },
+    // For an exit handler, which cannot wait.
+    kill() { const pid = readPid(); if (ours(pid)) signal(pid, 'SIGTERM') },
+  }
+  return session
+}
+
+// Keep one command shown in a herdr session, run again whenever it exits (a person quitting it, or
+// its server restarting under it), until hidden. herdr being down only delays it.
+export function herdrKeeper({ session, log = () => {}, everyMs = 5000 }) {
+  let want = null, timer = null, busy = false
+  const tick = async (fresh = false) => {
+    if (!want || busy) return
+    busy = true
+    try {
+      if (fresh || !session.started() || session.dead().dead) { await session.start(want); log(want.started) }
+      session.named()
+    } catch (error) { log(`herdr: ${error.message}`) } finally { busy = false }
+  }
+  return {
+    async show(spec) {
+      want = spec
+      if (!timer) { timer = setInterval(() => tick(), everyMs); timer.unref?.() }
+      while (busy) await sleep(50)
+      await tick(true)
+    },
+    hide() { want = null; session.kill() },
+  }
 }
