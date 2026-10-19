@@ -86,6 +86,27 @@ ok('the newer sessions still work', text(await d.client.callTool({ name: 'echo',
 ok('no token or body ever reaches the log', !logs.some(l => l.includes(token) || l.includes('héllo')))
 await c.transport.terminateSession(); await d.transport.terminateSession()
 
+// The real channel is single-instance per identity, so the default door keeps one session, and a
+// client that reconnects without a DELETE takes the channel over rather than waiting out the idle.
+const lockDoor = createDoor({ id: 'door-test', tokenHash: tokenDigest(token).toString('hex'),
+  argv: [...argv, '--lock', join(root, 'channel.lock')], env: { PATH: process.env.PATH }, log: m => logs.push(m) })
+await new Promise(r => lockDoor.listen({ host: '127.0.0.1', port: 0 }, r))
+const lockUrl = new URL(`http://127.0.0.1:${lockDoor.address().port}/door/door-test/mcp`)
+const lockConnect = async () => {
+  const client = new Client({ name: 'door-lock-client', version: '0' })
+  const transport = new StreamableHTTPClientTransport(lockUrl, { requestInit: { headers: { authorization: `Bearer ${token}` } } })
+  await client.connect(transport)
+  return { client, transport }
+}
+const e = await lockConnect()
+const ePid = JSON.parse(text(await e.client.callTool({ name: 'argv', arguments: {} }))).pid
+const f = await lockConnect() // e is abandoned, never DELETEd
+const fPid = JSON.parse(text(await f.client.callTool({ name: 'argv', arguments: {} }))).pid
+ok('by default a reconnect evicts the abandoned session and gets a working channel despite its lock',
+  !pidAlive(ePid) && pidAlive(fPid) && fPid !== ePid)
+await f.transport.terminateSession()
+lockDoor.close()
+
 // --- the failure bucket ---------------------------------------------------------------------
 for (let i = 0; i < 6; i++) await post('/door/door-test/mcp', 'Bearer nope')
 ok('after failLimit failures in a minute, a wrong token gets 429', (await post('/door/door-test/mcp', 'Bearer nope')).status === 429)
