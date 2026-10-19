@@ -676,7 +676,7 @@ the session on wake.
 
 **In herdr.** Where the owner runs [herdr](https://herdr.dev), the session runs in a herdr pane
 instead of tmux, so it is shown like any other agent on the box: one workspace per identity,
-labelled with its name, holding the one pane Claude Code runs in. herdr recognises it there and
+labelled with its name in lowercase letters and digits (`mc-claude` is `mcclaude`), holding the one pane Claude Code runs in. herdr recognises it there and
 tracks its state; the supervisor names the agent after the identity and restarts the session in
 the same pane. `HARNESS_TERMINAL` picks the terminal: `auto` (the default) uses herdr when it
 answers and tmux otherwise, and `herdr` or `tmux` forces one. The pane is typed only the path of an
@@ -876,7 +876,9 @@ Owner steps for `pi-dog`, with placeholder paths:
    ```
 
 6. Attach with the command the supervisor prints, and detach with `C-b d`. The pane's status line
-   shows the feed as `connecting`, `listening` or `reconnecting`.
+   shows the feed as `connecting`, `listening` or `reconnecting`. Where the owner runs herdr
+   (`HARNESS_TERMINAL` as for Claude), pi runs in a herdr workspace of its own instead, labelled
+   with the identity's name, and there is nothing to attach.
 
    ```sh
    tmux -S /Users/you/.nvoy-harness/pi-dog/tmux.sock attach -t harness
@@ -894,6 +896,7 @@ screen:
 ```sh
 node mcp/tools/install-harness-launchagent.mjs --runner claude --instance claude-jaf --config /absolute/path/claude-jaf-harness.json
 node mcp/tools/install-harness-launchagent.mjs --runner codex --instance codex-jaf --config /absolute/path/codex-jaf-harness.json
+node mcp/tools/install-harness-launchagent.mjs --runner pi --instance pi-dog --config /absolute/path/pi-dog.json
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/pub.nave.nvoy.<id>.harness.plist
 ```
 
@@ -901,8 +904,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/pub.nave.nvoy.<id>.harne
 supervisor would, and refuses it on the same grounds. The plist names paths only and sets
 `HARNESS_TERMINAL=herdr`: at login herdr may not be up yet, and the session waits for it rather
 than starting in tmux, where no one would see it. It carries the installer's `PATH`, so the
-supervisor finds the same `claude`, `codex` and `herdr` you do. Logs go to `launchagent/` in the
-harness home (Claude) or under `CODEX_HOME/nvoy` (Codex). Stop it with
+supervisor finds the same `claude`, `codex`, `pi` and `herdr` you do. Logs go to `launchagent/` in the
+harness home (Claude), under `CODEX_HOME/nvoy` (Codex), or under `state_dir/nvoy` (pi). Stop it with
 `launchctl bootout gui/$(id -u)/pub.nave.nvoy.<id>.harness`, which also ends its session.
 
 ### Docker reference deployment

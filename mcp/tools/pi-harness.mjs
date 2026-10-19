@@ -9,12 +9,16 @@
 // pi runs with its own PI_CODING_AGENT_DIR (pi_home), never ~/.pi/agent, with discovered
 // extensions off and the three channel tools as its only tools. Its environment is built, not
 // inherited, so no API key or owner setting reaches it.
+//
+// Where the owner runs herdr (HARNESS_TERMINAL=herdr, or auto when herdr answers), pi runs in a herdr
+// pane instead: one workspace per identity, labelled with its name. See harness_herdr.mjs.
 
 import { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { defaultInstructions } from './harness_session.mjs'
+import { herdrAgentName, herdrClient, herdrSession } from './harness_herdr.mjs'
 import { claimPidLock } from './pid_lock.mjs'
 import { PI_CHANNEL_TOOLS, readPiClientConfig } from './pi_harness_extension.mjs'
 
@@ -45,44 +49,76 @@ let release
 try { release = claimPidLock(resolve(privateDir, 'supervisor.lock'), config.id, 'portable Pi harness') } catch (error) { die(error.message) }
 const manifest = { id: config.id, pubkey: config.pubkey, buzz: { channels: config.channels } }
 if (!existsSync(resolve(workdir, 'AGENTS.md'))) writePrivate(resolve(workdir, 'AGENTS.md'), defaultInstructions(manifest))
-// A dead pane stays readable, so a session that fails to start can say why.
-writePrivate(tmuxConf, 'set -g remain-on-exit on\nset -g history-limit 5000\n')
 
 // HOME is the harness's own, so pi never reads the owner's dotfiles; the login is in pi_home.
 const sessionEnv = {
   PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin', HOME: home, TERM: 'xterm-256color', LANG: 'C.UTF-8',
   PI_CODING_AGENT_DIR: config.piHome, PI_SKIP_VERSION_CHECK: '1', NVOY_PI_HARNESS_CONFIG: resolve(configPath), NVOY_PI_HARNESS_INSTANCE: config.id,
 }
-const tmux = (args, env = process.env) => spawnSync('tmux', ['-S', socket, ...args], { encoding: 'utf8', env })
 const sleep = ms => new Promise(done => setTimeout(done, ms))
-const paneDead = () => {
-  const r = tmux(['display-message', '-p', '-t', 'harness', '#{pane_dead} #{pane_dead_status}'])
-  if (r.status !== 0) return { dead: true, status: 'gone' }
-  const [dead, status] = r.stdout.trim().split(' ')
-  return { dead: dead === '1', status: status || '' }
+const command = ['pi', ...piArgs(config)]
+
+// The terminal pi runs in: start it, tell whether it has exited, show its screen, and stop it.
+function tmuxTerminal() {
+  const tmux = (args, env = process.env) => spawnSync('tmux', ['-S', socket, ...args], { encoding: 'utf8', env })
+  // A dead pane stays readable, so a session that fails to start can say why.
+  writePrivate(tmuxConf, 'set -g remain-on-exit on\nset -g history-limit 5000\n')
+  return {
+    start() {
+      tmux(['kill-server'])
+      const r = tmux(['-f', tmuxConf, 'new-session', '-d', '-s', 'harness', '-x', '200', '-y', '50', '-c', workdir, ...command], sessionEnv)
+      if (r.status !== 0) throw new Error(`tmux would not start: ${(r.stderr || '').trim().slice(0, 200)}`)
+    },
+    attach: `attach: tmux -S ${socket} attach -t harness`,
+    dead() {
+      const r = tmux(['display-message', '-p', '-t', 'harness', '#{pane_dead} #{pane_dead_status}'])
+      if (r.status !== 0) return { dead: true, status: 'gone' }
+      const [dead, status] = r.stdout.trim().split(' ')
+      return { dead: dead === '1', status: status || '' }
+    },
+    screen: () => tmux(['capture-pane', '-p', '-t', 'harness']).stdout || '',
+    named() {},
+    stop: () => tmux(['kill-server']),
+  }
 }
+
+function herdrTerminal(herdr) {
+  const name = herdrAgentName(config.id)
+  const session = herdrSession({ herdr, name, dir: privateDir, cwd: workdir, log })
+  return { ...session, start: () => session.start({ command, env: sessionEnv }), attach: `shown in herdr, in workspace ${name}` }
+}
+
+const mode = process.env.HARNESS_TERMINAL || 'auto'
+if (!['auto', 'herdr', 'tmux'].includes(mode)) die('HARNESS_TERMINAL must be auto, herdr or tmux')
+const herdr = herdrClient()
+const useHerdr = mode === 'herdr' || (mode === 'auto' && herdr.available())
+let term
+try { term = useHerdr ? herdrTerminal(herdr) : tmuxTerminal() } catch (error) { die(error.message) }
 
 let stopping = false
 process.on('exit', () => release())
-for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => { stopping = true; tmux(['kill-server']); process.exit(0) })
+for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, async () => { stopping = true; await term.stop(); process.exit(0) })
 
 let delay = RETRY_MS
 while (!stopping) {
   const startedAt = Date.now()
-  tmux(['kill-server'])
-  const r = tmux(['-f', tmuxConf, 'new-session', '-d', '-s', 'harness', '-x', '200', '-y', '50', '-c', workdir, 'pi', ...piArgs(config)], sessionEnv)
-  if (r.status !== 0) log(`tmux would not start: ${(r.stderr || '').trim().slice(0, 200)}`)
-  else {
+  let started = false
+  try {
+    if (useHerdr && !herdr.available()) throw new Error('herdr is not answering; pi starts once it is')
+    await term.start(); started = true
+  } catch (error) { log(error.message) }
+  if (started) {
     log(`started the ${config.id} pi session; the extension injects admitted messages into it`)
-    log(`attach: tmux -S ${socket} attach -t harness`)
+    log(term.attach)
     for (;;) {
-      await sleep(WATCH_MS)
+      await sleep(useHerdr ? Math.min(WATCH_MS, 1000) : WATCH_MS)
       if (stopping) break
-      const { dead, status } = paneDead()
+      term.named()
+      const { dead, status } = term.dead()
       if (!dead) continue
       // Only a session that dies while starting shows its screen: usually a missing or expired login.
       const early = Date.now() - startedAt < STARTUP_MS
-      const tail = early ? (tmux(['capture-pane', '-p', '-t', 'harness']).stdout || '').split('\n').filter(line => line.trim()).slice(-12).join('\n') : ''
+      const tail = early ? (term.screen() || '').split('\n').filter(line => line.trim()).slice(-12).join('\n') : ''
       log(`pi exited (status ${status})${early ? ' during startup' : ''}; restarting${tail ? `:\n${tail}` : ''}`)
       break
     }

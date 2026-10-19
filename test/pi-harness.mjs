@@ -10,6 +10,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { codexTurnText } from '../mcp/tools/harness_session.mjs'
 import nvoyPiHarness, { PI_CHANNEL_TOOLS } from '../mcp/tools/pi_harness_extension.mjs'
+import { fakeHerdr } from './fake-herdr.mjs'
 
 let fails = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); if (!value) fails++ }
@@ -56,7 +57,8 @@ const clientConfig = (value, mode = 0o600) => secretFile(join(mkdtempSync(join(r
 // Launcher: refusals
 const fakeBin = join(root, 'bin')
 mkdirSync(fakeBin, { mode: 0o700 })
-const launcherEnv = { ...process.env, HOME: own, PATH: `${fakeBin}:${process.env.PATH}`, HARNESS_WATCH_MS: '50', HARNESS_RETRY_MS: '100', OPENAI_API_KEY: 'sk-proj-live-value' }
+const launcherEnv = { ...process.env, HOME: own, PATH: `${fakeBin}:${process.env.PATH}`, HARNESS_WATCH_MS: '50', HARNESS_RETRY_MS: '100', OPENAI_API_KEY: 'sk-proj-live-value',
+  HARNESS_TERMINAL: 'tmux', HARNESS_HERDR_BIN: '/nonexistent/herdr' }
 const refused = (value, pattern, mode) => {
   const r = spawnSync(process.execPath, ['mcp/tools/pi-harness.mjs', '--instance', 'pd-test', '--config', clientConfig(value, mode)], { cwd: resolve('.'), encoding: 'utf8', env: launcherEnv, timeout: 10000 })
   return r.status === 1 && pattern.test(r.stderr) && !/PRIVATE-KEY|CHATGPT-TOKEN|sk-proj-live/.test(r.stdout + r.stderr)
@@ -128,6 +130,41 @@ ok('no key, login token or message body reaches the launcher\'s output', !/PRIVA
 launcher.kill('SIGTERM'); await launcherExited
 ok('stopping the launcher ends the session and frees its lock', await waitFor(() => { try { process.kill(Number(readText(`${socket}.pid`)), 0); return false } catch { return true } }) &&
   !existsSync(join(stateDir, 'nvoy', 'supervisor.lock')))
+
+// The herdr form: pi in a workspace of the identity's own, against a fake herdr and a fake pi.
+const herdr = fakeHerdr(root)
+writeFileSync(join(fakeBin, 'pi'), `#!/usr/bin/env node
+const e = process.env
+require('node:fs').appendFileSync(e.HOME + '/pi.log', JSON.stringify({ pid: process.pid, args: process.argv.slice(2), pane: e.HERDR_PANE_ID, env: Object.keys(e).filter(k => !k.startsWith('HERDR_')).sort() }) + '\\n')
+setInterval(() => {}, 1000)
+`)
+chmodSync(join(fakeBin, 'pi'), 0o755)
+const piRuns = () => readText(join(stateDir, 'home', 'pi.log')).split('\n').filter(Boolean).map(JSON.parse)
+const inHerdr = spawn(process.execPath, ['mcp/tools/pi-harness.mjs', '--instance', 'pd-test', '--config', configPath], { cwd: resolve('.'), env: { ...launcherEnv, HARNESS_TERMINAL: 'auto', HARNESS_HERDR_BIN: herdr.bin } })
+let herdrOut = ''
+inHerdr.stdout.on('data', d => { herdrOut += d }); inHerdr.stderr.on('data', d => { herdrOut += d })
+const inHerdrExited = new Promise(done => inHerdr.on('exit', done))
+ok('where herdr answers, pi runs in a workspace labelled with the identity, named after it',
+  await waitFor(() => piRuns().length === 1 && herdr.state().panes['w1:p1']?.name === 'pdtest') && /shown in herdr, in workspace pdtest/.test(herdrOut) &&
+  herdr.state().workspaces.length === 1 && herdr.state().workspaces[0].label === 'pdtest')
+const pr1 = piRuns()[0]
+// What the launcher's /bin/sh and macOS set in every process, not anything carried over.
+const shellSet = ['OLDPWD', 'PWD', 'SHLVL', '_', '__CF_USER_TEXT_ENCODING']
+ok('pi in herdr gets the same arguments and the same built environment, and no API key', JSON.stringify(pr1.args) === JSON.stringify(args.slice(args.indexOf('pi') + 1)) &&
+  pr1.env.filter(k => !shellSet.includes(k)).join() === 'HOME,LANG,NVOY_PI_HARNESS_CONFIG,NVOY_PI_HARNESS_INSTANCE,PATH,PI_CODING_AGENT_DIR,PI_SKIP_VERSION_CHECK,TERM' && pr1.pane === 'w1:p1')
+process.kill(pr1.pid, 'SIGKILL')
+ok('pi exiting in herdr restarts it in the same pane, named again', await waitFor(() => piRuns().length === 2 && herdr.state().panes['w1:p1'].name === 'pdtest') &&
+  piRuns()[1].pane === 'w1:p1' && herdr.state().workspaces.length === 1)
+const pr2 = piRuns()[1]
+inHerdr.kill('SIGTERM'); await inHerdrExited
+ok('stopping the launcher ends pi in herdr and frees its lock', await waitFor(() => { try { process.kill(pr2.pid, 0); return false } catch { return true } }) &&
+  !existsSync(join(stateDir, 'nvoy', 'supervisor.lock')) && !/sk-proj-live|PRIVATE-KEY|CHATGPT-TOKEN/.test(herdrOut))
+const agentPlist = spawnSync(process.execPath, ['mcp/tools/install-harness-launchagent.mjs', '--runner', 'pi', '--instance', 'pd-test', '--config', configPath, '--print'],
+  { cwd: resolve('.'), encoding: 'utf8', env: launcherEnv })
+ok('the pi LaunchAgent runs the supervisor headless, in herdr, logging under the state dir, and carries no secret', agentPlist.status === 0 &&
+  agentPlist.stdout.includes('<string>pub.nave.nvoy.pd-test.harness</string>') && /pi-harness\.mjs<\/string><string>--instance<\/string><string>pd-test<\/string><string>--config<\/string>/.test(agentPlist.stdout) &&
+  agentPlist.stdout.includes('<key>HARNESS_TERMINAL</key><string>herdr</string>') && agentPlist.stdout.includes(join(stateDir, 'nvoy', 'launchagent', 'stderr.log')) &&
+  !/PRIVATE-KEY|CHATGPT-TOKEN|sk-proj-live|OPENAI_API_KEY|nsec|bunker/i.test(agentPlist.stdout))
 
 // Extension, in-process, against a fake pi. The fake ssh runs the fleet's own feed on the feed key
 // and its own channel MCP on the channel key, each for this fleet root.
