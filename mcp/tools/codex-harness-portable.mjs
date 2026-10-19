@@ -25,6 +25,7 @@ try {
 } catch (error) { die(error.message) }
 
 let stopping = false
-for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => { stopping = true; process.exit(0) })
+// SIGHUP too: a closed terminal no longer reaches the detached app-server, so exiting here stops it.
+for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => { stopping = true; process.exit(0) })
 try { await runCodexPortableHarness({ config, log, stopping: () => stopping, ssh }) } catch (error) { die(error.message) }
 process.exit(0)
