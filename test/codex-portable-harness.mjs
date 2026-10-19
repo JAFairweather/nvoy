@@ -207,7 +207,7 @@ const home = process.env.CODEX_HOME
 const log = row => fs.appendFileSync(home + '/fake.jsonl', JSON.stringify(row) + '\\n')
 if (process.argv[2] !== 'app-server' || process.argv[3] !== '--listen' || !String(process.argv[4]).startsWith('unix://')) process.exit(2)
 const path = process.argv[4].slice(7)
-log({ start: true, env: Object.keys(process.env).sort(), listen: path })
+log({ start: true, pid: process.pid, env: Object.keys(process.env).sort(), listen: path })
 fs.rmSync(home + '/mcp-dead', { force: true })
 const THREAD = fs.existsSync(home + '/unsaved') ? '0199a213-81c0-7800-8aa1-cccccccccccc' : '0199a213-81c0-7800-8aa1-bbab2a035a53'
 const conns = new Set()
@@ -333,6 +333,10 @@ ok('the thread\'s channel is asked before ready, by the channel\'s own tool', cl
 ok('the app-server listens on the owner-only socket under CODEX_HOME, and the client frames are masked', fakeLog(codexHome)[0].listen === socket &&
   (statSync(socket).mode & 0o777) === 0o600 && clientCalls('initialize').length === 1)
 ok('it opts into the experimental API that thread/queue/add needs', clientCalls('initialize')[0].params.capabilities.experimentalApi === true)
+const pgid = pid => spawnSync('ps', ['-o', 'pgid=', '-p', String(pid)], { encoding: 'utf8' }).stdout.trim()
+const alive = pid => { try { process.kill(pid, 0); return true } catch { return false } }
+const s1Server = fakeLog(codexHome)[0].pid
+ok('the app-server runs in its own session, off the supervisor\'s terminal', pgid(s1Server) === String(s1Server) && pgid(s1.child.pid) !== String(s1Server))
 writeFileSync(join(codexHome, 'hold'), '')
 appendFileSync(queue, record(2))
 await waitFor(() => /injected 222222222222 as a turn/.test(s1.out))
@@ -412,7 +416,9 @@ writeFileSync(join(codexHome, 'unsaved'), '')
 const s4 = startSupervisor()
 ok('a stored thread Codex never saved is replaced by a new one (#218)', await waitFor(() => /never saved the stored cx-test thread; starting a new one/.test(s4.out) && /session ready/.test(s4.out)) &&
   JSON.parse(readText(join(codexHome, 'nvoy', 'codex-thread.json'))).thread_id === '0199a213-81c0-7800-8aa1-cccccccccccc')
-await s4.stop()
+const s4Server = fakeLog(codexHome).filter(m => m.start).at(-1).pid
+s4.child.kill('SIGHUP'); await s4.exited
+ok('a hangup, as when its pane closes, stops the detached app-server too', await waitFor(() => !alive(s4Server), 5000))
 
 rmSync(root, { recursive: true, force: true })
 console.log(fails ? `\n${fails} FAILED` : '\nall passed')

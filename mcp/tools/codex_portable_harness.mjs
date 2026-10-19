@@ -204,7 +204,9 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
     let server = null, child = null
     try {
       if (existsSync(socket)) { if (!lstatSync(socket).isSocket()) throw new Error('the control socket path holds something that is not a socket'); rmSync(socket) }
-      child = spawn('codex', ['app-server', '--listen', `unix://${socket}`], { stdio: ['ignore', 'ignore', 'pipe'], env })
+      // Its own session, off the supervisor's terminal, so a terminal manager (herdr) sees Codex only in
+      // the pane that attaches to it; the exit handler above still stops it.
+      child = spawn('codex', ['app-server', '--listen', `unix://${socket}`], { stdio: ['ignore', 'ignore', 'pipe'], env, detached: true })
       children.add(child)
       let stderr = ''
       child.stderr.on('data', data => { stderr = (stderr + String(data)).slice(-4000) })
