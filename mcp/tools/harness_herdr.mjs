@@ -10,9 +10,11 @@ import { resolve } from 'node:path'
 
 const sleep = ms => new Promise(done => setTimeout(done, ms))
 
-// herdr agent names: lowercase letters, digits, '-' and '_', starting with a letter, at most 32.
+// The identity's name in herdr, for its workspace and its agent alike: lowercase letters and digits
+// only (mc-claude is mcclaude), the way the owner names agents and calls them by voice. herdr
+// allows '-' and '_' too, starting with a letter, at most 32.
 export function herdrAgentName(id) {
-  const name = String(id || '').toLowerCase().replace(/[^a-z0-9_-]/g, '')
+  const name = String(id || '').toLowerCase().replace(/[^a-z0-9]/g, '')
   if (!/^[a-z][a-z0-9_-]{0,31}$/.test(name)) throw new Error(`${id} cannot be a herdr agent name`)
   return name
 }
