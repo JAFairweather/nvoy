@@ -45,7 +45,9 @@ export function herdrClient({ bin = process.env.HARNESS_HERDR_BIN || 'herdr', en
       return pane
     },
     run(pane, command) { call(['pane', 'run', pane, command]) },
-    read(pane, lines = 60) { return call(['pane', 'read', pane, '--lines', String(lines)], { json: false }) },
+    // The screen as it stands, like tmux capture-pane: scrollback from an earlier run can hold a ready
+    // prompt or a startup screen that is no longer there.
+    read(pane) { return call(['pane', 'read', pane, '--source', 'visible'], { json: false }) },
     keys(pane, ...keys) { call(['pane', 'send-keys', pane, ...keys]) },
     agent(pane) { return (call(['agent', 'list']).agents || []).find(a => a.pane_id === pane) || null },
     name(pane, name) { call(['agent', 'rename', pane, name]) },
@@ -57,7 +59,9 @@ export function herdrClient({ bin = process.env.HARNESS_HERDR_BIN || 'herdr', en
 // it re-executes itself under a built environment (an owner's CLAUDE_CONFIG_DIR or API key never
 // reaches the session; herdr's pane variables do), records its pid, reads the credential from its
 // file only after that, so the secret is never in a command line or on the screen, and records
-// the session's exit status for the supervisor.
+// the session's exit status for the supervisor. Echo is off while the session starts: herdr's
+// terminal answers the queries an agent sends at startup, and an echoed answer is drawn over its
+// screen (it hid the development-channels prompt the supervisor answers; mc-claude, 2026-10-19).
 export function launcherScript({ env, cwd, command, pidFile, statusFile, credential = null }) {
   const q = value => `'${String(value).replace(/'/g, `'\\''`)}'`
   const kept = ['HERDR_ENV', 'HERDR_PANE_ID', 'HERDR_BIN_PATH', 'HERDR_SOCKET_PATH']
@@ -73,8 +77,11 @@ export function launcherScript({ env, cwd, command, pidFile, statusFile, credent
     `rm -f ${q(statusFile)}`,
     ...(credential ? [`${credential.env}=$(cat ${q(credential.file)}) || exit 1`, `export ${credential.env}`] : []),
     `cd ${q(cwd)} || exit 1`,
+    'stty -echo 2>/dev/null',
     command.map(q).join(' '),
-    `echo $? > ${q(statusFile)}`,
+    'status=$?',
+    'stty echo 2>/dev/null',
+    `echo $status > ${q(statusFile)}`,
     '',
   ].join('\n')
 }
