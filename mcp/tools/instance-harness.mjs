@@ -12,6 +12,10 @@
 // config stands in for the manifest; the channel, its lock and its queue stay on the fleet, reached
 // through the identity's SSH forced-command key; and the session's home is the harness's own
 // directory, never the owner's, so their own Claude Code login and settings are not touched.
+//
+// Where the owner runs herdr (HARNESS_TERMINAL=herdr, or auto when herdr answers), the session runs
+// in a herdr pane instead of tmux: one workspace per identity, labelled with its name, where herdr
+// shows the agent and its state like any other. See harness_herdr.mjs.
 
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
@@ -19,6 +23,7 @@ import { resolve } from 'node:path'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { readClientConfig } from './channel_client.mjs'
 import { runCodexHarness } from './codex_harness.mjs'
+import { herdrAgentName, herdrClient, launcherScript } from './harness_herdr.mjs'
 import { channelProcessUp, classifyPane, claudeArgs, defaultInstructions, hasPriorSession, mcpConfig, seedClaudeJson, seedSettings, serverName } from './harness_session.mjs'
 
 const die = message => { console.error(`instance-harness: ${message}`); process.exit(1) }
@@ -85,31 +90,94 @@ if (!existsSync(resolve(workdir, 'CLAUDE.md'))) writePrivate(resolve(workdir, 'C
 // Nothing can hold the lock before this harness starts its first session. Off the fleet the lock
 // is the fleet's, behind the forced command, and there is none here to clear.
 if (!remote) rmSync(resolve(manifest.runtimeDir, 'claude-channel-state', 'channel.lock'), { force: true })
-// A dead pane stays readable, so a session that fails to start can say why.
-writeFileSync(tmuxConf, 'set -g remain-on-exit on\nset -g history-limit 5000\n')
-
-// The login token travels only in the tmux server's environment, never in an argv. The environment
-// is built, not inherited, so an owner's own CLAUDE_CONFIG_DIR cannot pull the session back home.
+// The login token travels only in the tmux server's environment, or in herdr from its file through
+// the launcher, never in an argv. The environment is built, not inherited, so an owner's own
+// CLAUDE_CONFIG_DIR cannot pull the session back home.
 const sessionEnv = {
   PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin', HOME: home, TERM: 'xterm-256color', LANG: 'C.UTF-8',
   ...(remote ? {} : { NVOY_INSTANCE_ROOT: root }), CLAUDE_CODE_OAUTH_TOKEN: token, DISABLE_AUTOUPDATER: '1',
 }
-const tmux = (args, env = process.env) => spawnSync('tmux', ['-S', socket, ...args], { encoding: 'utf8', env })
 const sleep = ms => new Promise(done => setTimeout(done, ms))
-const pane = () => tmux(['capture-pane', '-p', '-t', 'harness']).stdout || ''
-const paneDead = () => {
-  const r = tmux(['display-message', '-p', '-t', 'harness', '#{pane_dead} #{pane_dead_status}'])
-  if (r.status !== 0) return { dead: true, status: 'gone' }
-  const [dead, status] = r.stdout.trim().split(' ')
-  return { dead: dead === '1', status: status || '' }
+const args = resume => ['claude', ...claudeArgs({ server, mcpConfigPath, resume, model: manifest.harness.model })]
+
+// The terminal the session runs in: start it, read its screen, send it keys, tell whether it has
+// exited, name the process at its root, and stop it.
+function tmuxTerminal() {
+  const tmux = (a, env = process.env) => spawnSync('tmux', ['-S', socket, ...a], { encoding: 'utf8', env })
+  // A dead pane stays readable, so a session that fails to start can say why.
+  writeFileSync(tmuxConf, 'set -g remain-on-exit on\nset -g history-limit 5000\n')
+  return {
+    start(resume) {
+      tmux(['kill-server'])
+      const r = tmux(['-f', tmuxConf, 'new-session', '-d', '-s', 'harness', '-x', '200', '-y', '50', '-c', workdir, ...args(resume)], sessionEnv)
+      if (r.status !== 0) throw new Error(`tmux would not start: ${(r.stderr || '').trim().slice(0, 200)}`)
+    },
+    screen: () => tmux(['capture-pane', '-p', '-t', 'harness']).stdout || '',
+    keys: key => tmux(['send-keys', '-t', 'harness', key]),
+    dead() {
+      const r = tmux(['display-message', '-p', '-t', 'harness', '#{pane_dead} #{pane_dead_status}'])
+      if (r.status !== 0) return { dead: true, status: 'gone' }
+      const [dead, status] = r.stdout.trim().split(' ')
+      return { dead: dead === '1', status: status || '' }
+    },
+    pid: () => tmux(['display-message', '-p', '-t', 'harness', '#{pane_pid}']).stdout?.trim(),
+    named() {},
+    stop: () => tmux(['kill-server']),
+  }
 }
+
+function herdrTerminal(herdr) {
+  const name = herdrAgentName(manifest.id)
+  const launcher = resolve(privateDir, 'session.sh'), pidFile = resolve(privateDir, 'session.pid'), statusFile = resolve(privateDir, 'session.status')
+  const alive = pid => { try { process.kill(Number(pid), 0); return true } catch { return false } }
+  const readPid = () => { try { return readFileSync(pidFile, 'utf8').trim() } catch { return '' } }
+  let pane = ''
+  const stop = async () => {
+    const pid = readPid()
+    if (!/^\d+$/.test(pid) || !alive(pid)) return
+    // The launcher leads its job's process group, so the session goes with it.
+    try { process.kill(-Number(pid), 'SIGTERM') } catch { try { process.kill(Number(pid), 'SIGTERM') } catch {} }
+    for (let i = 0; i < 50 && alive(pid); i++) await sleep(100)
+    if (alive(pid)) try { process.kill(-Number(pid), 'SIGKILL') } catch {}
+  }
+  return {
+    async start(resume) {
+      pane = herdr.pane({ label: name, cwd: workdir })
+      await stop()
+      rmSync(pidFile, { force: true }); rmSync(statusFile, { force: true })
+      const { CLAUDE_CODE_OAUTH_TOKEN, ...env } = sessionEnv
+      writeFileSync(launcher, launcherScript({ env, cwd: workdir, command: args(resume), pidFile, statusFile, credential: { env: 'CLAUDE_CODE_OAUTH_TOKEN', file: credentialFile } }), { mode: 0o700 })
+      chmodSync(launcher, 0o700)
+      herdr.run(pane, `'${launcher.replace(/'/g, `'\\''`)}'`)
+    },
+    screen: () => herdr.read(pane),
+    keys: key => herdr.keys(pane, key),
+    dead() {
+      if (existsSync(statusFile)) return { dead: true, status: readFileSync(statusFile, 'utf8').trim() }
+      const pid = readPid()
+      return pid && !alive(pid) ? { dead: true, status: 'gone' } : { dead: false, status: '' }
+    },
+    pid: readPid,
+    // herdr names an agent only once it has recognised one, and forgets the name when it goes.
+    named() { try { const agent = herdr.agent(pane); if (agent && agent.name !== name) { herdr.name(pane, name); log(`named the herdr agent ${name}`) } } catch {} },
+    stop,
+  }
+}
+
+const mode = process.env.HARNESS_TERMINAL || 'auto'
+if (!['auto', 'herdr', 'tmux'].includes(mode)) die('HARNESS_TERMINAL must be auto, herdr or tmux')
+const herdr = herdrClient()
+const useHerdr = !!remote && (mode === 'herdr' || (mode === 'auto' && herdr.available()))
+if (mode === 'herdr' && !remote) die('a herdr terminal is for the portable harness (--remote)')
+const term = useHerdr ? herdrTerminal(herdr) : tmuxTerminal()
+log(`the session runs in ${useHerdr ? 'herdr' : 'tmux'}`)
 
 // Off the fleet the channel is an ssh child of the session, and it dies whenever the fleet recreates
 // the identity's adapter (each release, each manifest change). Claude Code never restarts it, so
 // the supervisor watches for it and restarts the session. The fleet form is left as it was.
 let watchChannel = !!remote
 function channelUp() {
-  const pid = tmux(['display-message', '-p', '-t', 'harness', '#{pane_pid}']).stdout?.trim()
+  const pid = term.pid()
   if (!/^\d+$/.test(pid || '')) return false
   const ps = spawnSync('ps', ['-A', '-ww', '-o', 'pid=,ppid=,command='], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
   if (ps.status !== 0) { watchChannel = false; log('cannot list processes; the channel is not watched'); return null }
@@ -117,23 +185,21 @@ function channelUp() {
 }
 
 let stopping = false
-for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => { stopping = true; tmux(['kill-server']); process.exit(0) })
+for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, async () => { stopping = true; await term.stop(); process.exit(0) })
 
 async function start() {
   const resume = hasPriorSession(home, workdir)
-  tmux(['kill-server'])
-  const r = tmux(['-f', tmuxConf, 'new-session', '-d', '-s', 'harness', '-x', '200', '-y', '50', '-c', workdir,
-    'claude', ...claudeArgs({ server, mcpConfigPath, resume, model: manifest.harness.model })], sessionEnv)
-  if (r.status !== 0) throw new Error(`tmux would not start: ${(r.stderr || '').trim().slice(0, 200)}`)
+  if (useHerdr && !herdr.available()) throw new Error('herdr is not answering; the session starts once it is')
+  await term.start(resume)
   log(`${resume ? 'resuming' : 'starting'} the ${manifest.id} session with channel ${server}`)
   const answered = new Map()
   const deadline = Date.now() + STARTUP_MS
   let readyAt = 0, channelSince = 0
   while (!stopping && Date.now() < deadline) {
     await sleep(POLL_MS)
-    const { dead, status } = paneDead()
+    const { dead, status } = term.dead()
     if (dead) {
-      const tail = pane().split('\n').filter(line => line.trim()).slice(-12).join('\n')
+      const tail = term.screen().split('\n').filter(line => line.trim()).slice(-12).join('\n')
       throw new Error(`session exited during startup (status ${status})${tail ? `:\n${tail}` : ''}`)
     }
     // Ready means the channel is up too: a fleet that still holds the channel lock, or refuses the
@@ -149,15 +215,16 @@ async function start() {
       if (!channelSince && Date.now() - readyAt >= SETTLE_MS) throw new Error('the session is ready but its channel to the fleet never started')
       continue
     }
-    const screen = classifyPane(pane())
+    term.named()
+    const screen = classifyPane(term.screen())
     if (screen.state === 'login') throw new Error('Claude Code is not logged in: the harness credential was refused or has expired')
     if (screen.state === 'ready') { if (!watchChannel) { log(`${manifest.id} session ready; the channel will inject admitted messages`); return } readyAt = Date.now(); continue }
     if (screen.key) {
       const count = answered.get(screen.state) || 0
       if (count >= 3) throw new Error(`startup screen "${screen.state}" would not accept its answer`)
       answered.set(screen.state, count + 1)
-      tmux(['send-keys', '-t', 'harness', screen.key])
-      if (screen.key !== 'Enter') { await sleep(300); if (classifyPane(pane()).state === screen.state) tmux(['send-keys', '-t', 'harness', 'Enter']) }
+      term.keys(screen.key)
+      if (screen.key !== 'Enter') { await sleep(300); if (classifyPane(term.screen()).state === screen.state) term.keys('Enter') }
       log(`answered the ${screen.state} screen`)
     }
   }
@@ -171,7 +238,8 @@ while (!stopping) {
     await start()
     while (!stopping) {
       await sleep(WATCH_MS)
-      const { dead, status } = paneDead()
+      term.named()
+      const { dead, status } = term.dead()
       if (dead) { log(`session exited (status ${status}); restarting`); break }
       if (watchChannel && channelUp() === false) { log('the channel to the fleet closed; restarting the session to reconnect it'); break }
     }
