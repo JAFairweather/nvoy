@@ -64,9 +64,10 @@ export function herdrClient({ bin = process.env.HARNESS_HERDR_BIN || 'herdr', en
 // screen (it hid the development-channels prompt the supervisor answers; mc-claude, 2026-10-19).
 export function launcherScript({ env, cwd, command, pidFile, statusFile, credential = null }) {
   const q = value => `'${String(value).replace(/'/g, `'\\''`)}'`
-  // herdr's terminal variables too: without COLORTERM an agent falls back to 256 colours, and Codex's
-  // composer shading then all but hides its text (dj-codex, 2026-10-19).
-  const kept = ['HERDR_ENV', 'HERDR_PANE_ID', 'HERDR_BIN_PATH', 'HERDR_SOCKET_PATH', 'COLORTERM', 'TERM_PROGRAM', 'TERM_PROGRAM_VERSION']
+  // COLORTERM too: without it an agent falls back to 256 colours, and Codex's composer shading then all
+  // but hides its text. Not TERM_PROGRAM: with it, Claude Code stopped taking the keys the supervisor
+  // sends its startup screens (dj-codex, mc-claude, 2026-10-19).
+  const kept = ['HERDR_ENV', 'HERDR_PANE_ID', 'HERDR_BIN_PATH', 'HERDR_SOCKET_PATH', 'COLORTERM']
   return [
     '#!/bin/sh',
     '# Written by the Nvoy harness supervisor; rewritten at each start.',
@@ -106,6 +107,12 @@ export function herdrSession({ herdr, name, dir, cwd, file = 'session', log = ()
       rmSync(pidFile, { force: true }); rmSync(statusFile, { force: true })
       writeFileSync(launcher, launcherScript({ env, cwd, command, pidFile, statusFile, credential }), { mode: 0o700 })
       chmodSync(launcher, 0o700)
+      // The terminal's answers to a stopped session's last queries arrive at the shell's prompt; left
+      // there, they join the launcher's command line (one became `>|libghostty…;22c1`, a redirect that
+      // sent the session's screen to a file; mc-claude, 2026-10-19). Let them land, then clear the line.
+      await sleep(500)
+      herdr.keys(pane, 'ctrl+c')
+      await sleep(200)
       herdr.run(pane, `'${launcher.replace(/'/g, `'\\''`)}'`)
     },
     screen: () => herdr.read(pane),
