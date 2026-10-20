@@ -19,7 +19,8 @@ import { makeBunkerSigner } from './nip46-signer.mjs'
 import { verifyOutboundApproval } from './outbound_approval.mjs'
 import { channelReply, openBuzzSession } from './buzz_native.mjs'
 import { recordStatusReplied } from './buzz_status.mjs'
-import { nextHop } from './agent_limits.mjs'
+import { countInWindow, nextHop } from './agent_limits.mjs'
+import { validateReplyMention } from './agent_post.mjs'
 
 const die = m => { console.error(`instance-broker-reply: ${m}`); process.exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -54,7 +55,7 @@ try {
   }
 } catch (e) { die(`cannot read reply request queue: ${e.message}`) }
 if (!request || typeof request !== 'object') die('reply request is not present in this instance queue')
-const allowedKeys = ['version', 'type', 'id', 'instance', 'receipt', 'content']
+const allowedKeys = ['version', 'type', 'id', 'instance', 'receipt', 'content', 'mention']
 if (Object.keys(request).some(k => !allowedKeys.includes(k)) || request.type !== 'reply-request' || request.instance !== manifest.id ||
   request.version !== 1 || !/^[0-9a-f]{64}$/.test(String(request.receipt || '')) ||
   typeof request.content !== 'string' || !request.content.trim() || Buffer.byteLength(request.content, 'utf8') > 4000) die('reply request has an invalid or overbroad shape')
@@ -98,6 +99,11 @@ if (receipt.version === 3 && (!buzzNative || !manifest.buzz || !/^[0-9a-f]{64}$/
   !manifest.buzz.channels.includes(receipt.reply_channel))) {
   die('native Buzz receipt is not bound to a configured channel')
 }
+// A mention reaches beyond the sender, so it is the post's allowlist, not the receipt, that permits it.
+if (request.mention !== undefined) {
+  if (!buzzNative) die('reply refused: mentions are only for a native Buzz channel reply')
+  try { validateReplyMention(request.mention, manifest, receipt.reply_channel) } catch (e) { die(e.message) }
+}
 const credential = process.env.NVOY_BROKER_CREDENTIAL
 if (!credential || !existsSync(credential)) die('broker credential file is unavailable')
 let raw; try { raw = readFileSync(credential, 'utf8').trim() } catch { die('cannot read broker credential') }
@@ -138,6 +144,14 @@ if (!buzzNative && (!policy.policyUsable || !liveAdmission || liveAdmission.from
   (channelCarry && (liveAdmission.mode !== 'channel-carry' || liveAdmission.carrier !== receipt.carrier ||
     liveAdmission.carrier_grant_id !== receipt.carrier_grant_id || liveAdmission.reply_channel !== receipt.reply_channel ||
     liveAdmission.source_event !== receipt.source_event)))) die('admission receipt no longer has a live matching grant chain')
+// A mention spends the post budget. Counted before the claim, so a refusal leaves the receipt
+// answerable without one; the count is per request, so a retry of a frozen reply is a repeat.
+if (request.mention !== undefined && !existsSync(resolve(manifest.stateDir, 'outbound', `${requestId}.json`))) {
+  let verdict
+  try { verdict = countInWindow(resolve(manifest.stateDir, 'agent-limits', 'posts.json'), { key: 'post', id: requestId, limit: manifest.mayPost.perHour }) }
+  catch (e) { die(`cannot read the post counter: ${e.message}`) }
+  if (!verdict.allowed) die(`reply refused: over the may_post hourly cap (${verdict.count}/${manifest.mayPost.perHour} in the last hour)`)
+}
 // Claim before stamping. The stamp below writes to `receiptPath`, which is still `receiptBase`
 // until this rename — so stamping first RE-CREATES a receipt another invocation has already
 // claimed, its rename then succeeds, and two different replies get signed from one single-use
@@ -179,7 +193,7 @@ if (existsSync(recordPath)) {
   const parent = { id: receipt.source_event, pubkey: receipt.sender,
     tags: receipt.reply_root !== receipt.source_event ? [['e', receipt.reply_root, '', 'root']] : [] }
   // One hop further than the message it answers; a receipt from before hops were recorded counts as 0.
-  const unsignedEvent = { pubkey: manifest.pubkey, ...channelReply({ channel: receipt.reply_channel, parent, content: request.content, hop: nextHop(receipt.hop) }) }
+  const unsignedEvent = { pubkey: manifest.pubkey, ...channelReply({ channel: receipt.reply_channel, parent, content: request.content, hop: nextHop(receipt.hop), mentions: request.mention || [] }) }
   record = { version: 3, request_digest: digest, request_id: requestId,
     fingerprint: getEventHash(unsignedEvent), unsigned_event: unsignedEvent, event: null, published: false }
   const tmp = `${recordPath}.${process.pid}.tmp`

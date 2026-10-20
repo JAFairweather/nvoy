@@ -263,6 +263,15 @@ admitted message. `may_post` lets it start a conversation too.
   (`h`, one `p` per mention, no `e`), and then signs, publishes and logs
   `posted <event 12>… in <channel>`, never the text. A retry republishes the frozen event. A refusal
   is terminal (`<state>/terminal-posts.jsonl`).
+- **`nvoy_channel_reply {envelope, text, mention?}`** may bring someone else into the thread it
+  answers, on the same allowlist. The tool resolves the names and refuses at once without
+  `may_post` (`NVOY_REPLY_MENTION_NOT_PERMITTED`) or off it (`NVOY_REPLY_MENTION_REFUSED`). The row
+  carries `mention` only when it is non-empty, so a reply without one is byte-identical to before.
+  `instance-broker-reply.mjs` accepts a mention only on a native Buzz receipt, re-checks it against
+  `may_post.mention` and the reply's channel against `may_post.channels`, and spends one
+  `per_hour` slot from the post counter before claiming the receipt. The frozen kind:9 adds one `p`
+  per mention after the parent's. Each refusal starts `reply refused:` and is terminal. A reply
+  without a mention is not metered.
 - **Hops.** Every kind:9 the broker signs carries `["nvoy-hop", n]`. A post is 1, and a reply is
   its parent's hop + 1 (0 + 1 for an untagged, human message). Both admission paths refuse an event
   whose hop is `>= max_hops` (1–10, default 3) and log `hop limit`. A malformed or repeated tag
