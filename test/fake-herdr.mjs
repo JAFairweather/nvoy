@@ -1,16 +1,18 @@
 // A fake herdr for the harness tests: workspaces, panes and agent names in a state file, every call
 // logged, and a pane that runs whatever is typed into it in its own process group, as a shell's job.
+// The state file is replaced whole, never rewritten in place: a call reading it half-written took it
+// for empty and saved that, losing the identity's workspace mid-test.
 // A test can wedge a pane (what is typed never runs) or leave an agent in its foreground.
-import { chmodSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 export function fakeHerdr(dir) {
   const bin = join(dir, 'herdr'), stateFile = join(dir, 'herdr.json'), logFile = join(dir, 'herdr.log')
   writeFileSync(bin, `#!/usr/bin/env node
-const { appendFileSync, readFileSync, writeFileSync } = require('node:fs')
+const { appendFileSync, readFileSync, renameSync, writeFileSync } = require('node:fs')
 const file = ${JSON.stringify(stateFile)}
 const state = (() => { try { return JSON.parse(readFileSync(file, 'utf8')) } catch { return { workspaces: [], panes: {} } } })()
-const save = () => writeFileSync(file, JSON.stringify(state))
+const save = () => { writeFileSync(file + '.' + process.pid, JSON.stringify(state)); renameSync(file + '.' + process.pid, file) }
 const [noun, verb, ...rest] = process.argv.slice(2)
 appendFileSync(${JSON.stringify(logFile)}, JSON.stringify([noun, verb, ...rest]) + '\\n')
 const answer = result => console.log(JSON.stringify({ result }))
@@ -43,6 +45,6 @@ else { console.log(JSON.stringify({ error: { code: 'unknown', message: noun + ' 
     bin,
     state: () => { try { return JSON.parse(read(stateFile)) } catch { return { workspaces: [], panes: {} } } },
     calls: () => read(logFile).split('\n').filter(Boolean).map(JSON.parse),
-    set: (pane, fields) => { const s = JSON.parse(read(stateFile)); Object.assign(s.panes[pane], fields); writeFileSync(stateFile, JSON.stringify(s)) },
+    set: (pane, fields) => { const s = JSON.parse(read(stateFile)); Object.assign(s.panes[pane], fields); writeFileSync(stateFile + '.set', JSON.stringify(s)); renameSync(stateFile + '.set', stateFile) },
   }
 }
