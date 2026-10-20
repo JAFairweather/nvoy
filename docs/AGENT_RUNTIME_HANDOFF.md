@@ -60,7 +60,7 @@ The adapter is the plug-in boundary:
 |---|---|---|
 | Session ingress | local Codex App Server (`thread/read`, `thread/resume`, `turn/steer` or `turn/start`) | native Claude Code custom Channel notification |
 | Session selection | immutable `codex_thread_id` and project root | one open Claude session configured with exactly one identity-scoped Channel server |
-| Exact read/reply | fixed-instance Codex channel MCP | `nvoy_channel_read` / `nvoy_channel_reply` |
+| Exact read/reply | fixed-instance Codex channel MCP | `nvoy_channel_read` / `nvoy_channel_reply` (and `nvoy_channel_post` under `may_post`) |
 | UI automation | forbidden | forbidden |
 | Current proof | partial live wake/reply; clean same-task MCP proof remains | implementation exists; distinct live runtime and end-to-end proof remain |
 
@@ -170,7 +170,8 @@ After resolving the identity decision in section 3:
    open. The channel emits only an opaque envelope notification; Claude must call
    `nvoy_channel_read` to obtain broker-admitted content.
 8. Use `nvoy_channel_reply` for the exact envelope. The broker rechecks grants, chooses the fixed
-   destination, signs through Bunker, and records completion.
+   destination, signs through Bunker, and records completion. To start a conversation instead,
+   `nvoy_channel_post` works only under the manifest's `may_post` block (RUNTIME_SUPERVISOR).
 9. Run the acceptance matrix in section 9 before claiming parity.
 
 The Claude adapter is allowed to differ only where the model runtime requires it. It must preserve

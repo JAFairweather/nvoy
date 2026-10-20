@@ -33,7 +33,8 @@ A harness reaches its identity through the per-identity SSH forced command, and 
   --instance <id>`. It grants no shell, PTY, forwarding, container choice or caller-chosen command.
 - The harness registers that SSH command as its MCP server. It reads an admitted envelope with
   `nvoy_channel_read` and answers with `nvoy_channel_reply`; the broker on the fleet rechecks the
-  grant, and the Bunker signs. The harness never signs.
+  grant, and the Bunker signs. The harness never signs. An identity whose manifest has `may_post` can
+  also start a message with `nvoy_channel_post`, which the broker checks against that block.
 - For Claude Code the channel pushes the wake natively. It holds a per-identity lock on the fleet,
   so a second harness cannot consume the same identity, and its heartbeat releases that lock
   within about 2¼ minutes of an SSH session dropping (#168).

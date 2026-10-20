@@ -68,7 +68,8 @@ is model-specific:
   turn or start an idle turn in one immutable task. Screen scraping, Accessibility paste and
   browser inspection are failed experiments, not fallback architecture.
 - **Claude Code:** `claude-channel.mjs` implements the native Channel MCP notification plus exact
-  `nvoy_channel_read` and receipt-bound `nvoy_channel_reply`. The code and tests exist; the
+  `nvoy_channel_read` and receipt-bound `nvoy_channel_reply`, plus `nvoy_channel_post` for an identity
+  whose manifest grants `may_post`. The code and tests exist; the
   distinct Claude participant (`ad05b00e…`) has been minted and published, but its isolated
   runtime and end-to-end live wake/reply proof are still pending. Claude OG is a separate
   historical identity and must not be reused for this proof.

@@ -172,9 +172,9 @@ ok('the Codex config reads the API key from the environment and never asks for a
   /^env_key = "OPENAI_API_KEY"$/m.test(toml) && /^requires_openai_auth = false$/m.test(toml) && /^approval_policy = "never"$/m.test(toml) &&
   /^sandbox_mode = "read-only"$/m.test(toml) && !/danger|full-access|sk-/i.test(toml))
 ok('each keyless channel tool, and only those, is pre-approved so Codex never elicits one',
-  CODEX_CHANNEL_TOOLS.join() === 'nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply' &&
+  CODEX_CHANNEL_TOOLS.join() === 'nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply,nvoy_channel_post' &&
   CODEX_CHANNEL_TOOLS.every(tool => toml.includes(`[mcp_servers.nvoy-dj-test.tools.${tool}]\napproval_mode = "approve"\n`)) &&
-  (toml.match(/^approval_mode = /gm) || []).length === 3 && (toml.match(/^\[mcp_servers\.nvoy-dj-test\.tools\./gm) || []).length === 3)
+  (toml.match(/^approval_mode = /gm) || []).length === 4 && (toml.match(/^\[mcp_servers\.nvoy-dj-test\.tools\./gm) || []).length === 4)
 ok('a Codex model is set only when chosen', !/^model = /m.test(toml) && /^model = "gpt-5\.5"$/m.test(codexConfigToml({ manifest: codexManifest, root: '/r', model: 'gpt-5.5' })))
 const turn = codexTurnText({ envelope: 'd'.repeat(64), type: 'admitted-task' })
 ok('an injected turn carries only the envelope marker and how to read and answer it', turn.includes('d'.repeat(64)) && /nvoy_channel_read/.test(turn) &&

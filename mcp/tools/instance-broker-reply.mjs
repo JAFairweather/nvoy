@@ -19,6 +19,7 @@ import { makeBunkerSigner } from './nip46-signer.mjs'
 import { verifyOutboundApproval } from './outbound_approval.mjs'
 import { channelReply, openBuzzSession } from './buzz_native.mjs'
 import { recordStatusReplied } from './buzz_status.mjs'
+import { nextHop } from './agent_limits.mjs'
 
 const die = m => { console.error(`instance-broker-reply: ${m}`); process.exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -177,7 +178,8 @@ if (existsSync(recordPath)) {
   // fingerprint is its id, and a retry republishes this event rather than authoring a second one.
   const parent = { id: receipt.source_event, pubkey: receipt.sender,
     tags: receipt.reply_root !== receipt.source_event ? [['e', receipt.reply_root, '', 'root']] : [] }
-  const unsignedEvent = { pubkey: manifest.pubkey, ...channelReply({ channel: receipt.reply_channel, parent, content: request.content }) }
+  // One hop further than the message it answers; a receipt from before hops were recorded counts as 0.
+  const unsignedEvent = { pubkey: manifest.pubkey, ...channelReply({ channel: receipt.reply_channel, parent, content: request.content, hop: nextHop(receipt.hop) }) }
   record = { version: 3, request_digest: digest, request_id: requestId,
     fingerprint: getEventHash(unsignedEvent), unsigned_event: unsignedEvent, event: null, published: false }
   const tmp = `${recordPath}.${process.pid}.tmp`

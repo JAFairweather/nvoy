@@ -21,6 +21,7 @@ import { brokerSigner } from './broker_signer.mjs'
 import { nativeMention, openBuzzSession } from './buzz_native.mjs'
 import { recordStatusAdmission } from './buzz_status.mjs'
 import { grantLookup, noGrantVerdict } from './grant_evidence.mjs'
+import { admissionLimit, hopOf } from './agent_limits.mjs'
 
 const HEX64 = /^[0-9a-f]{64}$/
 let signer
@@ -92,20 +93,28 @@ const grants = (Array.isArray(policy.grants) ? policy.grants : []).filter(g => g
 const grant = grants.find(g => g.cap === 'task+act') || grants.find(g => g.cap === 'task')
 if (!grant || !HEX64.test(String(grant.grant_id || ''))) finish(`author ${mention.author.slice(0, 8)} holds no live task grant; heard as data only [${noGrantVerdict(lookup)}]`)
 
+// 2b. The brakes on agents directing agents: a broker-signed chain past max_hops, or a non-grantor
+// sender past its hourly budget, is terminal. The words stay unread.
+const hop = hopOf(source)
+let limited
+try { limited = admissionLimit({ limits: manifest.agentLimits, grantors: manifest.grantors, sender: mention.author, eventId, hop,
+  path: resolve(manifest.stateDir, 'agent-limits', 'admissions.json') }) } catch (e) { die(`cannot read the admission counter: ${e.message}`) }
+if (limited) finish(limited)
+
 // 3. One signed message, one admission — across native and carried paths alike.
 const sourceIndex = resolve(manifest.stateDir, 'channel-source-admissions.jsonl')
 let claim
 try { claim = claimChannelSource(sourceIndex, eventId, eventId) } catch (e) { die(`cannot claim channel source: ${e.message}`) }
 if (!claim.accepted) finish('was already admitted through another path')
 
-// 4. The receipt the reply actuator will require. It records where a reply threads, so the reply
-// needs no second read of the source.
+// 4. The receipt the reply actuator will require. It records where a reply threads, and the hop it
+// continues, so the reply needs no second read of the source.
 const marked = marker => (source.tags || []).find(t => t?.[0] === 'e' && t[3] === marker && HEX64.test(String(t[1])))?.[1]
 const admittedAt = Date.now()
 const receipt = { version: 3, mode: 'buzz-native', instance: manifest.id, broker: me, envelope: eventId,
   sender: mention.author, grant_id: grant.grant_id, grantor: grant.grantor, cap: grant.cap,
   source_event: eventId, reply_channel: mention.channel, reply_root: marked('root') || marked('reply') || eventId,
-  admitted_at: admittedAt, expires_at: admittedAt + 5 * 60 * 1000 }
+  hop: Number.isSafeInteger(hop) ? hop : null, admitted_at: admittedAt, expires_at: admittedAt + 5 * 60 * 1000 }
 const receiptDir = resolve(manifest.stateDir, 'receipts')
 try {
   mkdirSync(receiptDir, { recursive: true, mode: 0o700 })

@@ -4,7 +4,7 @@
 // crash-left `.inflight` markers are requeued at boot and are harmless because the adapter queue
 // deduplicates on envelope before ACKing.
 
-import { readdirSync, renameSync, readFileSync, lstatSync } from 'node:fs'
+import { appendFileSync, readdirSync, renameSync, readFileSync, lstatSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
@@ -33,6 +33,16 @@ const childEnv = { PATH: process.env.PATH || '', NVOY_INSTANCE_ROOT: root, NVOY_
 const retryAfter = new Map()
 const proposalRetryAfter = new Map()
 const announcedProposals = new Set()
+// Agent-initiated posts (nvoy_channel_post). A refusal by the manifest or the hourly cap is final:
+// recorded by id, with no content, so the queue is not re-proposed every tick or after a restart.
+const terminalPostsPath = resolve(manifest.stateDir, 'terminal-posts.jsonl')
+const postDone = new Set()
+try {
+  for (const line of readFileSync(terminalPostsPath, 'utf8').split('\n')) {
+    try { const x = JSON.parse(line); if (x?.type === 'terminal-post' && /^[0-9a-f]{32}$/.test(String(x.id))) postDone.add(x.id) } catch { /* partial line */ }
+  }
+} catch (e) { if (e.code !== 'ENOENT') die(`cannot load terminal post log: ${e.message}`) }
+const isTerminalPost = stderr => /post refused:|post request has an invalid|post record does not bind/.test(stderr)
 
 function recover() {
   let names = []
@@ -143,6 +153,32 @@ function drain() {
     } catch (e) { if (e.code !== 'ENOENT') console.error(`instance-broker-daemon: ${source} reply queue unavailable: ${e.message}`) }
   }
 }
+function drainPosts() {
+  const queue = resolve(manifest.runtimeDir, 'post-requests.jsonl')
+  let ids
+  try {
+    const st = lstatSync(queue)
+    if (!st.isFile() || st.isSymbolicLink()) throw new Error('post queue is not a regular file')
+    ids = new Set(readFileSync(queue, 'utf8').split('\n').flatMap(line => { try { const x = JSON.parse(line); return /^[0-9a-f]{32}$/.test(String(x?.id)) ? [x.id] : [] } catch { return [] } }))
+  } catch (e) { if (e.code !== 'ENOENT') console.error(`instance-broker-daemon: post queue unavailable: ${e.message}`); return }
+  for (const request of ids) {
+    const key = `post:${request}`
+    if (postDone.has(request) || (proposalRetryAfter.get(key) || 0) > Date.now()) continue
+    const r = spawnSync(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-post.mjs'),
+      '--instance', manifest.id, '--request', request], { env: childEnv, encoding: 'utf8', timeout: 90000 })
+    const stderr = String(r.stderr || '').trim()
+    if (r.status === 0) { postDone.add(request); proposalRetryAfter.delete(key); if (/^instance-broker-post: posted/.test(r.stdout)) console.log(r.stdout.trim()); continue }
+    if (isTerminalPost(stderr)) {
+      postDone.add(request)
+      try { appendFileSync(terminalPostsPath, JSON.stringify({ version: 1, type: 'terminal-post', id: request, at: Date.now() }) + '\n', { mode: 0o600 }) }
+      catch (e) { console.error(`instance-broker-daemon: cannot record terminal post ${request.slice(0, 12)}…: ${e.message}`) }
+      console.error(`instance-broker-daemon: post ${request.slice(0, 12)}… terminal: ${stderr.replace(/^instance-broker-post: /, '')}`)
+      continue
+    }
+    proposalRetryAfter.set(key, Date.now() + 5000)
+    console.error(`instance-broker-daemon: post ${request.slice(0, 12)}… held for retry: ${stderr}`)
+  }
+}
 // The keyless Buzz watcher can log in only through this oracle, and the status keeper puts the
 // native 👀/💬 on admitted Buzz messages. Both are supervised here, beside the drain, so they run as
 // the broker and hold the same credential; a crash is restarted with backoff.
@@ -161,4 +197,5 @@ if (manifest.buzz) supervise('instance-broker-auth.mjs', 'AUTH oracle')
 if (manifest.buzz?.statusReactions) supervise('instance-broker-status.mjs', 'status keeper')
 drain()
 setInterval(drain, 1000)
+if (manifest.mayPost) { drainPosts(); setInterval(drainPosts, 1000) }
 console.log(`instance-broker-daemon: draining ${manifest.id}`)

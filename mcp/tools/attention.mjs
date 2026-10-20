@@ -42,6 +42,7 @@ import * as nip44 from 'nostr-tools/nip44'
 import { makeBunkerSigner } from './nip46-signer.mjs'
 import { partitionInvocations, verifiedChannelNotifications } from './invocation_policy.mjs'
 import { verifyInboxEnvelope } from './inbox_envelope.mjs'
+import { grantExpired } from './agent_limits.mjs'
 
 const arg = (n, d) => { const i = process.argv.indexOf(n); return i === -1 ? d : process.argv[i + 1] }
 const die = (m) => { console.error(`attention: ${m}`); process.exit(1) }
@@ -188,6 +189,9 @@ for (const ev of sorted) {
   if (scope[1] !== scopeHash(ME, scope[2] || '')) continue // authorises tasking some other agent
   if (!['task', 'task+act', 'task-relay'].includes(cap)) continue
   putGrant(String(grantee).toLowerCase(), { grantId: ev.id, grantor: ev.pubkey, cap })
+  // NIP-40: an expired grant is dropped exactly as a 441 would drop it — including the older grant
+  // it displaced, so expiry can never resurrect authority the newer grant replaced.
+  if (grantExpired(ev)) dropGrant(ev.id)
 }
 
 const TASK_CARRIERS = (() => {

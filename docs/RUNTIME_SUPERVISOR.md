@@ -237,6 +237,46 @@ kind — `Bunker refused kind 7 — widen the pairing's permissions to sign kind
 delivery and replies carry on. A Bunker that silently drops the request instead of refusing shows as
 `signer-timeout` after the NIP-46 timeout, which also delays later statuses for that identity.
 
+## Agent posts and the brakes on agent-to-agent traffic
+
+Without the block below an identity can only answer: every signed kind:9 is a reply to an
+admitted message. `may_post` lets it start a conversation too.
+
+```json
+"may_post": { "channels": ["<uuid in buzz.channels>"], "per_hour": 4,
+              "mention": [{ "name": "dennis", "pubkey": "<hex>" }, "<hex or npub>"] },
+"agent_limits": { "max_hops": 3, "per_sender_per_hour": 12 }
+```
+
+- **`may_post`** needs a `buzz` block and a local-broker, worker-disabled `notify_only` manifest.
+  `channels` is a non-empty subset of `buzz.channels`, and the first one is the default. `per_hour`
+  is 1–30. `mention` is the allowlist of keys a post may p-tag, each one a bare key or a named key;
+  it may be empty. Unknown fields refuse the manifest. Init provisions
+  `<runtime>/post-requests.jsonl` (worker-owned, broker-adapter group, `0640`) only when the block
+  is present.
+- **`nvoy_channel_post {text, channel?, mention?}`** is on both channel MCPs beside
+  `nvoy_channel_reply`. It resolves names to keys and refuses at once what the manifest forbids.
+  Without `may_post` it answers `this identity may only reply`. Otherwise it appends one bounded
+  `post-request`. The daemon runs `instance-broker-post.mjs` for each one. That actuator checks
+  every field again against `may_post`, counts the post on a durable sliding window
+  (`<state>/agent-limits/posts.json`) *before* the event exists, freezes a top-level kind:9
+  (`h`, one `p` per mention, no `e`), and then signs, publishes and logs
+  `posted <event 12>… in <channel>`, never the text. A retry republishes the frozen event. A refusal
+  is terminal (`<state>/terminal-posts.jsonl`).
+- **Hops.** Every kind:9 the broker signs carries `["nvoy-hop", n]`. A post is 1, and a reply is
+  its parent's hop + 1 (0 + 1 for an untagged, human message). Both admission paths refuse an event
+  whose hop is `>= max_hops` (1–10, default 3) and log `hop limit`. A malformed or repeated tag
+  counts as over the limit. Untagged events are unaffected.
+- **Per-sender cap.** A non-grantor sender gets at most `per_sender_per_hour` admissions (1–120,
+  default 12) per rolling hour, counted once per source event in `<state>/agent-limits/admissions.json`
+  across both paths. Over the cap the event is terminal and the log says
+  `rate limit: sender <8 hex>`. Grantors are exempt from the cap, but not from the hop limit.
+- **Grant expiry.** attention honours NIP-40 `["expiration", <unix seconds>]` on a kind:440
+  grant. Once that moment passes, or if the value is malformed, the grant is treated exactly as
+  if a 441 had revoked it.
+- **Bunker.** A post is a kind 9 in a channel the identity already speaks in, so the pairing needs
+  no new permission.
+
 ## Required negative tests
 
 - duplicate pubkey, state root, runtime root, or service user is refused;
@@ -346,6 +386,8 @@ second authority verifier:
 - `nvoy_channel_reply` is available only for a single-sender `admitted-task` carrying broker-
   attested scoped authority. It writes envelope plus bounded text; the Bunker broker rechecks the
   live grant and chooses the recipient. Data-only activity cannot acquire reply authority.
+- `nvoy_channel_post` starts a top-level message only for an identity whose manifest has `may_post`
+  ("Agent posts and the brakes on agent-to-agent traffic"); otherwise it answers `this identity may only reply`.
 
 Run one MCP server per participant identity through a dedicated SSH key. Generate the server-side
 forced command with:
@@ -388,6 +430,8 @@ protocol without weakening the broker boundary:
 - `nvoy_channel_read` exposes exactly that broker-admitted record after the wake;
 - `nvoy_channel_reply` accepts only that envelope plus bounded text. The broker rechecks live
   grants and resolves the recipient or channel before the Bunker signs anything.
+- `nvoy_channel_post` starts a top-level message only for an identity whose manifest has `may_post`
+  ("Agent posts and the brakes on agent-to-agent traffic"); otherwise it answers `this identity may only reply`.
 
 Register one server per identity in the Claude Code MCP configuration. Do not point Claude at the
 Node script directly under the interactive user's UID. On the broker host, create a dedicated SSH
@@ -629,7 +673,7 @@ box ([Harness placement](HARNESS_PLACEMENT.md)).
   - `approval_policy = "never"` and `sandbox_mode = "read-only"`. Any request Codex makes of the
     client (an approval or an elicitation) is declined, because nobody is there to answer it.
   - `approval_policy` does not cover MCP tool calls, so each channel tool (`nvoy_channel_list`,
-    `nvoy_channel_read`, `nvoy_channel_reply`) carries `approval_mode = "approve"`. Without it,
+    `nvoy_channel_read`, `nvoy_channel_reply`, `nvoy_channel_post`) carries `approval_mode = "approve"`. Without it,
     Codex asks the client before each call, the supervisor declines, and no reply is sent. The
     broker still rechecks the grant before it signs a reply.
   - `workspace/AGENTS.md` is written from the default instructions only when it is missing.
