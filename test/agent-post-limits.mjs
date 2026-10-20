@@ -13,7 +13,7 @@ import { readManifest } from '../mcp/tools/runtime_manifest.mjs'
 import { channelPost, channelReply } from '../mcp/tools/buzz_native.mjs'
 import { verifyChannelTaskCarry } from '../mcp/tools/channel_task_carry.mjs'
 import { HOUR_MS, MALFORMED_HOP, admissionLimit, grantExpired, hopFromJson, hopOf, nextHop, slideWindow } from '../mcp/tools/agent_limits.mjs'
-import { queuePost, resolvePost, resolveReplyMention } from '../mcp/tools/agent_post.mjs'
+import { capabilityHash, capabilitySummary, queuePost, releaseSha, resolvePost, resolveReplyMention } from '../mcp/tools/agent_post.mjs'
 import { isTerminalReplyFailure } from '../mcp/tools/reply_retry.mjs'
 
 let fails = 0, passes = 0
@@ -89,6 +89,23 @@ ok('may_post is frozen', Object.isFrozen(poster.mayPost) && Object.isFrozen(post
 ok('mention may be omitted, leaving an empty allowlist', fixture('nomention', { may_post: { channels: [CH], per_hour: 1 } }).load().mayPost.mention.length === 0)
 const tuned = fixture('tuned', { agent_limits: { max_hops: 2 } }).load()
 ok('agent_limits tunes one field and defaults the other', tuned.agentLimits.maxHops === 2 && tuned.agentLimits.perSenderPerHour === 12)
+
+// --- 1b. what the agent is told it may do (the channel servers' instructions and notice) ---
+const told = capabilitySummary(poster)
+ok('a posting identity is told its channels, mention names, hourly cap and hop limit',
+  told.includes(`nvoy_channel_post in channel ${CH} (default ${CH}), at most 5 an hour`) &&
+  told.includes(`mention, in a post or a reply, ${dennis}, neil;`) && told.includes('stops at 3 hops') && told.includes('at most 12 messages an hour'))
+ok('a reply-only identity is told it may not post, and never offered a channel', /not post: nvoy_channel_post is refused, this identity may only reply/.test(capabilitySummary(plain)) && !capabilitySummary(plain).includes(CH))
+ok('the capability hash moves with what the identity may do', capabilityHash(told) !== capabilityHash(capabilitySummary(plain)) &&
+  capabilityHash(capabilitySummary(plain)) !== capabilityHash(capabilitySummary(tuned)) && capabilityHash(told) === capabilityHash(capabilitySummary(poster)))
+ok('the release is reported, never hashed: a release that changes nothing is not news', !/release/.test(told))
+writeFileSync(join(root, 'RELEASE'), 'ab'.repeat(20) + '\n')
+writeFileSync(join(root, 'RELEASE.bad'), 'main\n')
+ok('the release is the 40-hex sha the image build wrote, else unknown',
+  releaseSha(join(root, 'RELEASE')) === 'ab'.repeat(20) && releaseSha(join(root, 'RELEASE.bad')) === 'unknown' && releaseSha(join(root, 'absent')) === 'unknown')
+for (const file of ['deploy/nvoy-runtime.Dockerfile', 'deploy/nvoy-worker.Dockerfile']) {
+  ok(`${file} writes the release sha where releaseSha reads it`, /ARG NVOY_RELEASE_SHA=\nRUN printf '%s\\n' "\$NVOY_RELEASE_SHA" > RELEASE/.test(readFileSync(file, 'utf8')))
+}
 const refused = (why, extra, pattern, drop) => ok(`the manifest is refused with ${why}`, pattern.test(throws(fixture(`r${passes + fails}`, extra, drop).load)))
 refused('may_post but no buzz block', { may_post: mayPost }, /requires a buzz block/, ['buzz'])
 refused('a may_post channel outside buzz.channels', { may_post: { ...mayPost, channels: [OTHER] } }, /subset of buzz\.channels/)

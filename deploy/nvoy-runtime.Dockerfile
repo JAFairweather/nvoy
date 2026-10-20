@@ -21,6 +21,9 @@ COPY mcp/tools ./mcp/tools
 # image, mounts only the public instance manifest, and renders Compose from here. Keep
 # the template in the image or the digest-pinned deploy path cannot bootstrap itself.
 COPY deploy/participant-runtime.compose.yml ./deploy/participant-runtime.compose.yml
+# The release this image is built from, which the channel servers tell the agent (agent_post.mjs).
+ARG NVOY_RELEASE_SHA=
+RUN printf '%s\n' "$NVOY_RELEASE_SHA" > RELEASE
 
 # Compose always supplies numeric per-instance identities. The image must not claim an identity
 # at build time, and must remain usable by each non-root runtime role.

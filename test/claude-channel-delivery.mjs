@@ -11,7 +11,7 @@
 // sends `initialized` for you the moment you connect, and the whole point is to control that
 // moment. Both directions are asserted throughout: silence must be caused by the gate and by a
 // read envelope, never by the server simply not working.
-import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
@@ -43,6 +43,7 @@ writeFileSync(join(runtime, 'admitted-tasks.jsonl'), JSON.stringify({
 }) + '\n', { mode: 0o600 })
 writeFileSync(join(runtime, 'reply-requests.jsonl'), '', { mode: 0o640 })
 const readPath = join(runtime, 'claude-channel-state', 'read.jsonl')
+const capabilitiesPath = join(runtime, 'claude-channel-state', 'capabilities.json')
 
 const RENOTIFY = 3000
 const child = spawn(process.execPath,
@@ -50,7 +51,7 @@ const child = spawn(process.execPath,
   { env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stdio: ['pipe', 'pipe', 'pipe'] })
 
 let buf = ''
-const wakes = []
+const wakes = [], notices = []
 let initializeResult = null
 child.stdout.on('data', d => {
   buf += d
@@ -59,7 +60,7 @@ child.stdout.on('data', d => {
     if (!line.trim()) continue
     let m; try { m = JSON.parse(line) } catch { continue }
     if (m.id === 1) initializeResult = m.result
-    else if (m.method === 'notifications/claude/channel') wakes.push({ at: Date.now(), params: m.params })
+    else if (m.method === 'notifications/claude/channel') (m.params?.meta?.capabilities ? notices : wakes).push({ at: Date.now(), params: m.params })
   }
 })
 const send = frame => child.stdin.write(JSON.stringify(frame) + '\n')
@@ -73,7 +74,7 @@ try {
     !!initializeResult?.capabilities?.experimental?.['claude/channel'])
 
   // The gate. A notification sent here reaches a client that has not registered its handler.
-  ok('nothing is announced before the client reports the session initialized', wakes.length === 0)
+  ok('nothing is announced before the client reports the session initialized', wakes.length === 0 && notices.length === 0)
 
   send({ jsonrpc: '2.0', method: 'notifications/initialized' })
   await sleep(1200)
@@ -85,6 +86,10 @@ try {
     wakes[0]?.params?.meta?.envelope === envelope &&
     !JSON.stringify(wakes[0]).includes('inspect the queue'))
 
+  ok('a session never told this identity\'s capabilities is told them through the channel',
+    notices.length === 1 && /capabilities changed/.test(notices[0].params.content) &&
+    /not post: nvoy_channel_post is refused/.test(notices[0].params.content) && /stops at 3 hops/.test(notices[0].params.content))
+
   // Persistence. One announcement into a session that was not listening is a lost wake, and
   // nothing in this protocol reports that back.
   await sleep(RENOTIFY + 1200)
@@ -92,16 +97,47 @@ try {
 
   const gap = wakes.length >= 2 ? wakes[1].at - wakes[0].at : 0
   ok('it is repeated on the interval rather than on every poll', gap >= RENOTIFY)
+  ok('the capabilities notice is repeated too while no nvoy tool has been called', notices.length === 2)
 
   // ...and the repeat must stop. A wake that repeats forever after it has been handled is its
   // own failure: it would re-steer a session that already acted on the envelope.
   appendFileSync(readPath, JSON.stringify({ version: 1, instance: manifest.id, envelope, read_at: Date.now() }) + '\n')
-  const before = wakes.length
+  send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'nvoy_channel_list', arguments: {} } })
+  const before = wakes.length, noticesBefore = notices.length
   await sleep(RENOTIFY + 1200)
   ok('announcements stop once the envelope has been read', wakes.length === before)
+  ok('the capabilities notice stops once the agent calls an nvoy tool, and its hash is kept',
+    notices.length === noticesBefore && existsSync(capabilitiesPath) &&
+    JSON.parse(readFileSync(capabilitiesPath, 'utf8')).hash === notices[0].params.meta.capabilities)
 } finally {
   child.kill('SIGKILL')
 }
+
+// A later session, the case of a release or a restart: told nothing it was already told, and told
+// again once what the identity may do has changed. The second half is the control for the first —
+// a server that never re-reads its kept hash, or never tells anything twice, would pass alone.
+async function capabilityNotices() {
+  const later = spawn(process.execPath, [resolve('mcp/tools/claude-channel.mjs'), '--instance', manifest.id, '--poll-ms', '250'],
+    { env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stdio: ['pipe', 'pipe', 'pipe'] })
+  let rest = '', told = 0
+  later.stdout.on('data', d => {
+    rest += d
+    const lines = rest.split('\n'); rest = lines.pop()
+    for (const line of lines) { try { if (JSON.parse(line).params?.meta?.capabilities) told++ } catch {} }
+  })
+  const say = frame => later.stdin.write(JSON.stringify(frame) + '\n')
+  try {
+    say({ jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'delivery-test', version: '0' } } })
+    await sleep(500)
+    say({ jsonrpc: '2.0', method: 'notifications/initialized' })
+    await sleep(1200)
+    return told
+  } finally { later.kill('SIGKILL'); await sleep(200) }
+}
+ok('a later session is not told capabilities it was already told', await capabilityNotices() === 0)
+writeFileSync(join(manifests, `${manifest.id}.json`), JSON.stringify({ ...manifest, agent_limits: { max_hops: 2 } }))
+ok('a later session is told again once what the identity may do changes', await capabilityNotices() === 1)
 
 console.log(failed ? `\n${failed} FAILED` : `\nall ${passed} passed`)
 process.exit(failed ? 1 : 0)

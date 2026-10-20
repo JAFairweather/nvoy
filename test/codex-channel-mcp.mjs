@@ -34,6 +34,8 @@ const transport = new StdioClientTransport({ command: process.execPath, args: [r
 const client = new Client({ name: 'codex-channel-test', version: '0.1.0' })
 try {
   await client.connect(transport)
+  ok('the Codex instructions tell the agent what its manifest lets it do',
+    /What this identity may do, from its manifest:.*not post: nvoy_channel_post is refused.*stops at 3 hops.*This runtime is release/.test(client.getInstructions()))
   const tools = (await client.listTools()).tools.map(tool => tool.name)
   ok('fixed Codex MCP exposes only bounded list, exact read, receipt-bound reply, and manifest-gated post', tools.join(',') === 'nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply,nvoy_channel_post')
   const post = await client.callTool({ name: 'nvoy_channel_post', arguments: { text: 'hello room' } })
