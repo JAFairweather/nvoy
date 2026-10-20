@@ -721,8 +721,12 @@ owner's ChatGPT subscription rather than an API key, which a person can attach t
 - **Login.** `codex_home` is the harness's own `CODEX_HOME`, never `~/.codex`. Its `config.toml`
   is rewritten on each start with `forced_login_method = "chatgpt"`,
   `cli_auth_credentials_store = "file"`, no provider block, `approval_policy = "never"`,
-  `sandbox_mode = "read-only"`, and the channel key's ssh entry as its one MCP server, with the
-  three channel tools pre-approved. The supervisor refuses to start if `auth.json` is missing,
+  and the channel key's ssh entry as its one MCP server, with the three channel tools pre-approved.
+  Shell commands run under a `nvoy-channel` permission profile (`default_permissions`), not
+  `sandbox_mode = "read-only"`, which on the owner's box reads every file the owner can: they read
+  `:minimal`, `/opt/homebrew` and the workspace, nothing in the home directory, write nothing and
+  have no network. Codex starts MCP servers outside that sandbox, so the channel's ssh still reads
+  its key. The supervisor refuses to start if `auth.json` is missing,
   if its `auth_mode` is not `chatgpt`, if it holds an API key, or if `OPENAI_API_KEY` or
   `CODEX_API_KEY` is set. It reads only those fields and prints none. Codex gets a built environment
   of `PATH`, `HOME` and `CODEX_HOME` only.

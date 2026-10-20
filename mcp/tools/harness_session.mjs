@@ -123,7 +123,12 @@ export const CODEX_CHANNEL_TOOLS = ['nvoy_channel_list', 'nvoy_channel_read', 'n
 // `auth: 'chatgpt'` is the portable harness (codex_portable_harness.mjs): Codex on its owner's
 // ChatGPT login, stored as a file in a CODEX_HOME that is the harness's own. No provider block and
 // no key; `forced_login_method` stops Codex falling back to an API key it might find. The channel
-// is the SSH forced command, as for the portable Claude harness.
+// is the SSH forced command, as for the portable Claude harness. On the owner's own box,
+// `sandbox_mode = "read-only"` lets shell commands read every file the owner can: the GitHub
+// login, other harnesses' tokens, ssh keys (dj-codex, 2026-10-20). So its shell commands get a
+// permission profile instead: platform and Homebrew paths and the thread's workspace, read-only,
+// nothing in the home directory, no network. Codex starts MCP servers outside the sandbox, so the
+// channel's ssh still reads its key.
 export function codexConfigToml({ manifest, root, model = '', auth = 'api-key', remote = null }) {
   const q = value => JSON.stringify(String(value))
   if (auth === 'chatgpt') {
@@ -134,7 +139,12 @@ export function codexConfigToml({ manifest, root, model = '', auth = 'api-key', 
       'forced_login_method = "chatgpt"',
       'cli_auth_credentials_store = "file"',
       'approval_policy = "never"',
-      'sandbox_mode = "read-only"',
+      'default_permissions = "nvoy-channel"',
+      '',
+      '[permissions.nvoy-channel.filesystem]',
+      '":minimal" = "read"',
+      '"/opt/homebrew" = "read"',
+      '":workspace_roots" = "read"',
       '',
       `[mcp_servers.${serverName(manifest)}]`,
       `command = ${q(entry.command)}`,

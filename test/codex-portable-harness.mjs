@@ -45,11 +45,15 @@ const record = (n, type = 'admitted-task') => JSON.stringify({ version: 1, type,
 const remote = { identity: '/keys/cx-channel', knownHosts: '/keys/known_hosts', target: 'nvoy-codex@broker.example' }
 const toml = codexConfigToml({ manifest: { id: 'cx-test' }, root: '', auth: 'chatgpt', remote })
 const tomlLines = toml.split('\n').filter(Boolean)
-ok('the ChatGPT config is well-formed TOML of tables and single-line keys', tomlLines.every(line => /^\[[a-z0-9_.-]+\]$/i.test(line) || /^[a-z_]+ = (?:"[^"]*"|\[.*\])$/.test(line)))
+ok('the ChatGPT config is well-formed TOML of tables and single-line keys', tomlLines.every(line => /^\[[a-z0-9_.-]+\]$/i.test(line) || /^(?:[a-z_]+|"[^"]+") = (?:"[^"]*"|\[.*\])$/.test(line)))
 const args = JSON.parse(tomlLines.find(line => line.startsWith('args = ')).slice(7))
 ok('the ChatGPT config forces the ChatGPT login from a file store, with no provider and no key', /^forced_login_method = "chatgpt"$/m.test(toml) &&
   /^cli_auth_credentials_store = "file"$/m.test(toml) && !/model_provider|env_key|OPENAI_API_KEY|requires_openai_auth|sk-|base_url/.test(toml))
-ok('the ChatGPT config asks for no approval and keeps shell commands read-only', /^approval_policy = "never"$/m.test(toml) && /^sandbox_mode = "read-only"$/m.test(toml) && !/danger|full-access/.test(toml))
+ok('the ChatGPT config asks for no approval and keeps shell commands read-only', /^approval_policy = "never"$/m.test(toml) && !/danger|full-access/.test(toml))
+const profile = toml.split('[permissions.nvoy-channel.filesystem]\n')[1]?.split('\n\n')[0] || ''
+ok('its shell commands read only platform paths and the workspace, never the home directory or the root', /^default_permissions = "nvoy-channel"$/m.test(toml) &&
+  !/^sandbox_mode/m.test(toml) && profile.split('\n').sort().join('\n') === ['"/opt/homebrew" = "read"', '":minimal" = "read"', '":workspace_roots" = "read"'].sort().join('\n') &&
+  !/:root|~|\/Users|write|network/.test(toml.split('[mcp_servers')[0]))
 ok('its one MCP server is the hardened ssh entry to the channel forced command', (toml.match(/^\[mcp_servers\.[^.\]]+\]$/gm) || []).length === 1 &&
   toml.includes('[mcp_servers.nvoy-cx-test]\ncommand = "/usr/bin/ssh"\n') && JSON.stringify(args) === JSON.stringify(sshChannelEntry(remote).args) && !/NVOY_INSTANCE_ROOT/.test(toml))
 ok('each keyless channel tool, and only those, is pre-approved', CODEX_CHANNEL_TOOLS.every(tool => toml.includes(`[mcp_servers.nvoy-cx-test.tools.${tool}]\napproval_mode = "approve"\n`)) &&
