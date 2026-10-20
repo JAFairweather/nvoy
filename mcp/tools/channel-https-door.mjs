@@ -142,7 +142,18 @@ export function createDoor({ id, tokenHash, argv, env = { PATH: '/usr/bin:/bin' 
         if (existing) { touch(sid); return existing.transport.handleRequest(req, res, body) }
         return openSession(req, res, body)
       }
-      if (!existing) return refuse(res, 404, 'unknown mcp-session-id')
+      // Streamable HTTP: a server with no sessionless GET stream answers 405, and 404 only for a
+      // session it does not know — which a client reads as "re-initialize". A connector that probes
+      // with a bare GET and is told 404 gives up instead. Refusals are logged: they are the only
+      // trace a remote connector leaves.
+      if (typeof sid !== 'string') {
+        log(`channel-https-door: ${id} ${req.method} without a session refused 405`)
+        return refuse(res, 405, 'method not allowed without mcp-session-id', { allow: 'POST' })
+      }
+      if (!existing) {
+        log(`channel-https-door: ${id} ${req.method} for unknown session ${sid.slice(0, 8)} refused 404`)
+        return refuse(res, 404, 'unknown mcp-session-id')
+      }
       touch(sid)
       await existing.transport.handleRequest(req, res)
       if (req.method === 'DELETE') closeSession(sid, 'client deleted it')

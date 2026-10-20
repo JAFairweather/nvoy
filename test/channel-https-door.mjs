@@ -56,6 +56,13 @@ const declaredTooBig = await new Promise((done, fail) => {
 })
 ok('a declared oversized body is 413 before it is read', declaredTooBig === 413)
 ok('a body that is not JSON is 400', (await post('/door/door-test/mcp', `Bearer ${token}`, '{nope')).status === 400)
+const bareGet = await fetch(url, { headers: { authorization: `Bearer ${token}`, accept: 'text/event-stream' } })
+ok('an authorized GET without a session is 405 with Allow: POST, as Streamable HTTP requires',
+  bareGet.status === 405 && bareGet.headers.get('allow') === 'POST' && logs.some(l => /GET without a session refused 405/.test(l)))
+const staleGet = await fetch(url, { headers: { authorization: `Bearer ${token}`, accept: 'text/event-stream', 'mcp-session-id': 'gone-session-id' } })
+ok('…but a GET for an unknown session is 404, so the client re-initializes', staleGet.status === 404
+  && logs.some(l => /GET for unknown session gone-ses refused 404/.test(l)))
+ok('an unauthorized GET is still 401 before anything else', (await fetch(url)).status === 401)
 
 // --- the relay ------------------------------------------------------------------------------
 const a = await connect()
