@@ -102,11 +102,9 @@ export function refuseApiKeyEnvironment(env) {
 const shellWord = value => /^[\w/.:@%+=-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`
 export const attachCommand = ({ codexHome, socket, threadId }) => `CODEX_HOME=${shellWord(codexHome)} codex resume ${threadId} --remote ${shellWord(`unix://${socket}`)}`
 
-// The feed's ssh: the hardened channel entry on the feed key, plus keepalives so a dead carrier
-// ends the process instead of leaving it waiting.
-export function sshFeedArgs(config, aliveSeconds = 15) {
-  const entry = sshChannelEntry({ identity: config.feedIdentity, knownHosts: config.knownHosts, target: config.target })
-  return [...entry.args.slice(0, -1), '-o', `ServerAliveInterval=${aliveSeconds}`, '-o', 'ServerAliveCountMax=3', entry.args.at(-1)]
+// The feed's ssh: the hardened channel entry, keepalives included, on the feed key.
+export function sshFeedArgs(config) {
+  return sshChannelEntry({ identity: config.feedIdentity, knownHosts: config.knownHosts, target: config.target }).args
 }
 
 // The command a viewer runs to attach to the thread, for a terminal that shows it (herdr).

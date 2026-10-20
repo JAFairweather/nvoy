@@ -44,6 +44,11 @@ export function herdrClient({ bin = process.env.HARNESS_HERDR_BIN || 'herdr', en
       if (!pane) throw new Error(`herdr created workspace ${label} but named no pane`)
       return pane
     },
+    // The identity's workspace closed with everything in it, so the next pane() opens a fresh one.
+    close(label) {
+      const found = (call(['workspace', 'list']).workspaces || []).find(w => w.label === label)
+      if (found) call(['workspace', 'close', found.workspace_id])
+    },
     run(pane, command) { call(['pane', 'run', pane, command]) },
     // The screen as it stands, like tmux capture-pane: scrollback from an earlier run can hold a ready
     // prompt or a startup screen that is no longer there.
@@ -92,18 +97,32 @@ export function launcherScript({ env, cwd, command, pidFile, statusFile, credent
 // One process in an identity's pane, run through an owner-only launcher in `dir`: started, watched
 // through its pid and exit-status files, named, and stopped with its process group (an interactive
 // shell runs the launcher as a job, so it leads its own group). A recorded pid is signalled only
-// while it is still that launcher, never a process that has since reused the number.
-export function herdrSession({ herdr, name, dir, cwd, file = 'session', log = () => {} }) {
+// while it is still that launcher, or while the group it led for this supervisor still has members
+// (a number is not reused while its group lives), never a process that has since reused the number.
+export function herdrSession({ herdr, name, dir, cwd, file = 'session', launchMs = 10000, log = () => {} }) {
   const launcher = resolve(dir, `${file}.sh`), pidFile = resolve(dir, `${file}.pid`), statusFile = resolve(dir, `${file}.status`)
   const readPid = () => { try { const pid = readFileSync(pidFile, 'utf8').trim(); return /^\d+$/.test(pid) ? pid : '' } catch { return '' } }
   const ours = pid => !!pid && (spawnSync('ps', ['-o', 'args=', '-p', pid], { encoding: 'utf8' }).stdout || '').includes(launcher)
+  const grouped = pid => { if (!(Number(pid) > 1)) return false; try { process.kill(-Number(pid), 0); return true } catch { return false } }
   const signal = (pid, sig) => { try { process.kill(-Number(pid), sig) } catch { try { process.kill(Number(pid), sig) } catch {} } }
+  const agent = () => { try { return herdr.agent(pane)?.agent || '' } catch { return '' } }
+  // Every launcher this supervisor started, so a session that outlived its launcher, or whose pid file
+  // a later launch replaced, is still stopped (mc-claude kept its pane through three restarts, 2026-10-20).
+  const launched = new Set()
   let pane = ''
   const session = {
     started: () => !!pane,
     async start({ command, env, credential = null }) {
       pane = herdr.pane({ label: name, cwd })
       await session.stop()
+      // An agent still in the pane's foreground would take the launcher's path as its next prompt (it
+      // reached mc-claude's conversation every five minutes, 2026-10-20), so its workspace goes instead.
+      for (let i = 0; i < 20 && agent(); i++) await sleep(100)
+      if (agent()) {
+        log(`a session the supervisor could not stop still runs in the ${name} workspace; closing it`)
+        herdr.close(name)
+        pane = herdr.pane({ label: name, cwd })
+      }
       rmSync(pidFile, { force: true }); rmSync(statusFile, { force: true })
       writeFileSync(launcher, launcherScript({ env, cwd, command, pidFile, statusFile, credential }), { mode: 0o700 })
       chmodSync(launcher, 0o700)
@@ -114,6 +133,15 @@ export function herdrSession({ herdr, name, dir, cwd, file = 'session', log = ()
       herdr.keys(pane, 'ctrl+c')
       await sleep(200)
       herdr.run(pane, `'${launcher.replace(/'/g, `'\\''`)}'`)
+      // A killed session can leave the pane's terminal in its own modes, where Enter never ends a line
+      // and ctrl+c is inert: the path shows and never runs (mc-claude, 2026-10-20, 12:10 to 12:56).
+      for (const until = Date.now() + launchMs; !readPid() && Date.now() < until;) await sleep(100)
+      if (!readPid()) {
+        herdr.close(name)
+        pane = ''
+        throw new Error(`the ${name} pane did not run the launcher; its workspace is closed and the next start opens a fresh one`)
+      }
+      launched.add(readPid())
     },
     screen: () => herdr.read(pane),
     keys: key => herdr.keys(pane, key),
@@ -127,15 +155,25 @@ export function herdrSession({ herdr, name, dir, cwd, file = 'session', log = ()
     named() {
       try { const agent = herdr.agent(pane); if (agent && agent.name !== name) { herdr.name(pane, name); log(`named the herdr agent ${name}`) } } catch {}
     },
+    // The whole group, until it is gone: Claude Code can outlive its launcher's SIGTERM and keep the
+    // pane's foreground, so whatever stays is killed.
     async stop() {
       const pid = readPid()
-      if (!ours(pid)) return
-      signal(pid, 'SIGTERM')
-      for (let i = 0; i < 50 && ours(pid); i++) await sleep(100)
-      if (ours(pid)) signal(pid, 'SIGKILL')
+      const groups = new Set([...(ours(pid) ? [pid] : []), ...[...launched].filter(grouped)])
+      for (const group of groups) {
+        const up = () => grouped(group) || ours(group)
+        signal(group, 'SIGTERM')
+        for (let i = 0; i < 50 && up(); i++) await sleep(100)
+        if (up()) signal(group, 'SIGKILL')
+        for (let i = 0; i < 20 && up(); i++) await sleep(100)
+      }
+      for (const group of launched) if (!grouped(group)) launched.delete(group)
     },
     // For an exit handler, which cannot wait.
-    kill() { const pid = readPid(); if (ours(pid)) signal(pid, 'SIGTERM') },
+    kill() {
+      const pid = readPid()
+      for (const group of new Set([...(ours(pid) ? [pid] : []), ...[...launched].filter(grouped)])) signal(group, 'SIGTERM')
+    },
   }
   return session
 }

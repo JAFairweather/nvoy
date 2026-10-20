@@ -1,5 +1,6 @@
 // A fake herdr for the harness tests: workspaces, panes and agent names in a state file, every call
 // logged, and a pane that runs whatever is typed into it in its own process group, as a shell's job.
+// A test can wedge a pane (what is typed never runs) or leave an agent in its foreground.
 import { chmodSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
@@ -15,17 +16,24 @@ appendFileSync(${JSON.stringify(logFile)}, JSON.stringify([noun, verb, ...rest])
 const answer = result => console.log(JSON.stringify({ result }))
 if (noun === 'workspace' && verb === 'list') answer({ workspaces: state.workspaces })
 else if (noun === 'workspace' && verb === 'create') {
-  const n = state.workspaces.length + 1, ws = { workspace_id: 'w' + n, label: rest[rest.indexOf('--label') + 1] }, pane = 'w' + n + ':p1'
+  const n = state.next = (state.next || 0) + 1, ws = { workspace_id: 'w' + n, label: rest[rest.indexOf('--label') + 1] }, pane = 'w' + n + ':p1'
   state.workspaces.push(ws); state.panes[pane] = { workspace: ws.workspace_id, name: null }; save()
   answer({ workspace: ws, tab: { root_pane: { pane_id: pane } } })
+} else if (noun === 'workspace' && verb === 'close') {
+  for (const [pane, p] of Object.entries(state.panes)) if (p.workspace === rest[0]) { for (const job of p.jobs || []) try { process.kill(-job, 'SIGKILL') } catch {} delete state.panes[pane] }
+  state.workspaces = state.workspaces.filter(w => w.workspace_id !== rest[0]); save(); answer({})
 } else if (noun === 'pane' && verb === 'list') answer({ panes: Object.entries(state.panes).filter(([, p]) => p.workspace === rest[1]).map(([pane_id]) => ({ pane_id })) })
 else if (noun === 'pane' && verb === 'run') {
-  state.panes[rest[0]].name = null; save()
-  require('node:child_process').spawn('/bin/sh', ['-c', 'exec ' + rest[1]], { detached: true, stdio: 'ignore', env: { ...process.env, HERDR_PANE_ID: rest[0] } }).unref()
-  answer({})
+  const p = state.panes[rest[0]]
+  p.name = null
+  if (!p.wedged) {
+    const job = require('node:child_process').spawn('/bin/sh', ['-c', 'exec ' + rest[1]], { detached: true, stdio: 'ignore', env: { ...process.env, HERDR_PANE_ID: rest[0] } })
+    job.unref(); p.jobs = [...(p.jobs || []), job.pid]
+  }
+  save(); answer({})
 } else if (noun === 'pane' && verb === 'read') console.log('  ? for shortcuts')
 else if (noun === 'pane' && verb === 'send-keys') answer({})
-else if (noun === 'agent' && verb === 'list') answer({ agents: Object.entries(state.panes).map(([pane_id, p]) => ({ pane_id, name: p.name })) })
+else if (noun === 'agent' && verb === 'list') answer({ agents: Object.entries(state.panes).map(([pane_id, p]) => ({ pane_id, name: p.name, agent: p.foreground })) })
 else if (noun === 'agent' && verb === 'rename') { state.panes[rest[0]].name = rest[1]; save(); answer({}) }
 else { console.log(JSON.stringify({ error: { code: 'unknown', message: noun + ' ' + verb } })); process.exit(1) }
 `)
@@ -35,5 +43,6 @@ else { console.log(JSON.stringify({ error: { code: 'unknown', message: noun + ' 
     bin,
     state: () => { try { return JSON.parse(read(stateFile)) } catch { return { workspaces: [], panes: {} } } },
     calls: () => read(logFile).split('\n').filter(Boolean).map(JSON.parse),
+    set: (pane, fields) => { const s = JSON.parse(read(stateFile)); Object.assign(s.panes[pane], fields); writeFileSync(stateFile, JSON.stringify(s)) },
   }
 }
