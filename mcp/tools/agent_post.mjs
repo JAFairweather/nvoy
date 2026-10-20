@@ -7,7 +7,7 @@
 // advisory cap here counts the queue's own timestamps; it only spares the agent a silent refusal.
 
 import { appendFileSync, existsSync, lstatSync, readFileSync } from 'node:fs'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { resolve } from 'node:path'
 import { HOUR_MS } from './agent_limits.mjs'
 
@@ -17,6 +17,29 @@ const MAX_BYTES = 4000
 export const POST_ONLY_REPLY = 'this identity may only reply'
 export const postQueuePath = manifest => resolve(manifest.runtimeDir, 'post-requests.jsonl')
 export const MENTION_SCHEMA = { type: 'array', items: { type: 'string', minLength: 1, maxLength: 64 }, maxItems: 16 }
+
+// What this identity may do, from its manifest, told to the agent in the channel servers'
+// instructions and, when it changes, once as a channel notice (claude-channel.mjs). An agent in a
+// resumed session otherwise keeps what its history says it could do (dj-codex, pi-dog, 2026-10-20).
+// The release is reported but not part of the hash: a release that changes nothing it may do is
+// not news to the agent.
+export function capabilitySummary(manifest) {
+  const m = manifest.mayPost, limits = manifest.agentLimits
+  const names = m?.mention.map(e => e.name || e.pubkey).join(', ')
+  return [
+    'What this identity may do, from its manifest:',
+    'reply to a delivered envelope with nvoy_channel_reply;',
+    m ? `start a new message with nvoy_channel_post in channel ${m.channels.join(', ')} (default ${m.channels[0]}), at most ${m.perHour} an hour;` +
+      ` mention, in a post or a reply, ${names || 'nobody'};` : `not post: nvoy_channel_post is refused, ${POST_ONLY_REPLY};`,
+    `a chain of agent messages stops at ${limits.maxHops} hops, and at most ${limits.perSenderPerHour} messages an hour from one sender are admitted.`,
+  ].join(' ')
+}
+export const capabilityHash = summary => createHash('sha256').update(summary).digest('hex')
+// The image build writes the release it was built from beside mcp/ (deploy/*.Dockerfile).
+export function releaseSha(path = new URL('../../RELEASE', import.meta.url)) {
+  try { const sha = readFileSync(path, 'utf8').trim(); return /^[0-9a-f]{40}$/.test(sha) ? sha : 'unknown' } catch { return 'unknown' }
+}
+export const capabilityInstructions = manifest => `${capabilitySummary(manifest)} This runtime is release ${releaseSha()}.`
 
 export function postToolSpec(manifest) {
   const m = manifest.mayPost

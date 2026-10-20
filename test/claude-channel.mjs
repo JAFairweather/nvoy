@@ -46,8 +46,9 @@ const client = new Client({ name: 'claude-channel-test', version: '0.1.0' })
 const Channel = z.object({ method: z.literal('notifications/claude/channel'), params: z.object({
   content: z.string(), meta: z.record(z.string()),
 }) })
-const wakes = []
+const wakes = [], notices = []
 const arrived = new Promise(resolveWake => client.setNotificationHandler(Channel, notification => {
+  if (notification.params.meta.capabilities) return void notices.push(notification.params)
   wakes.push(notification.params); resolveWake()
 }))
 
@@ -58,6 +59,11 @@ try {
     wakes.length >= 1 && wakes.every(wake => wake?.meta?.instance === manifest.id &&
       [envelope, notificationEnvelope].includes(wake?.meta?.envelope) &&
       !JSON.stringify(wake).includes(task.messages[0].content) && !JSON.stringify(wake).includes(task.messages[0].from)))
+  ok('the instructions tell the agent what its manifest lets it do and which release it runs',
+    /What this identity may do, from its manifest: reply to a delivered envelope/.test(client.getInstructions()) &&
+    /not post: nvoy_channel_post is refused, this identity may only reply/.test(client.getInstructions()) &&
+    /stops at 3 hops/.test(client.getInstructions()) && /This runtime is release (unknown|[0-9a-f]{40})\./.test(client.getInstructions()))
+  ok('the capabilities notice carries no message content', notices.every(n => !JSON.stringify(n).includes(task.messages[0].content)))
   const tools = (await client.listTools()).tools.map(tool => tool.name)
   ok('Claude receives an explicit read tool, a receipt-bound reply tool, a body-free discovery tool, and the post tool',
     tools.length === 4 && tools.includes('nvoy_channel_read') && tools.includes('nvoy_channel_reply') &&

@@ -272,6 +272,14 @@ admitted message. `may_post` lets it start a conversation too.
   `per_hour` slot from the post counter before claiming the receipt. The frozen kind:9 adds one `p`
   per mention after the parent's. Each refusal starts `reply refused:` and is terminal. A reply
   without a mention is not metered.
+- **What the agent is told.** Both channel MCPs end their `instructions` with
+  `capabilitySummary` (`agent_post.mjs`): reply always; post only under `may_post`, with its
+  channels, mention names and `per_hour`; `max_hops` and `per_sender_per_hour`; and the release the
+  image was built from (`/srv/nvoy/RELEASE`, written from the build's `NVOY_RELEASE_SHA`, else
+  `unknown`). The Claude channel also tells a change once through its wake notification
+  (`meta.capabilities` is the summary's SHA-256, release excluded), repeated on the re-announce
+  interval at most three times until the agent calls any nvoy tool, and then keeps the hash in
+  `claude-channel-state/capabilities.json` so a later session is not told again.
 - **Hops.** Every kind:9 the broker signs carries `["nvoy-hop", n]`. A post is 1, and a reply is
   its parent's hop + 1 (0 + 1 for an untagged, human message). Both admission paths refuse an event
   whose hop is `>= max_hops` (1–10, default 3) and log `hop limit`. A malformed or repeated tag
