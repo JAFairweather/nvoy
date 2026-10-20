@@ -1,7 +1,8 @@
 // A stand-in channel MCP for test/channel-https-door.mjs: reports its own argv, echoes, and emits a
 // notification on request, so the test can see exactly what the door spawned and relayed. With
 // `--lock <path>` it refuses to start while another live process holds the lock, as the real
-// channel does.
+// channel does. With `--linger <ms>` it outlives its stdin by that long, as a real channel shutting
+// down does, which is the window a too-eager reconnect falls into.
 import { readFileSync, writeFileSync } from 'node:fs'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
@@ -31,4 +32,6 @@ server.setRequestHandler(CallToolRequestSchema, async ({ params }) => {
   }
   throw new Error(`unknown tool ${params.name}`)
 })
+const lingerAt = process.argv.indexOf('--linger')
+if (lingerAt > 0) process.stdin.on('end', () => setTimeout(() => process.exit(0), Number(process.argv[lingerAt + 1])))
 await server.connect(new StdioServerTransport())
