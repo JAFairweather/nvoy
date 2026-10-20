@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh the nvoy status page every minute (status S1)
+
+[Timer]
+OnBootSec=2min
+# Measured from the last run's end, so a slow relay never stacks two collectors.
+OnUnitInactiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

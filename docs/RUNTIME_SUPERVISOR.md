@@ -294,6 +294,41 @@ admitted message. `may_post` lets it start a conversation too.
 - **Bunker.** A post is a kind 9 in a channel the identity already speaks in, so the pairing needs
   no new permission.
 
+## The status page (waggle.nave.pub/status)
+
+A public, read-only page of whether each identity does its job, refreshed every minute on the fleet
+host. Green means a function was measured working (a login reached `listening`, a heard mention got
+a verdict, a live grant is on two relays its broker reads); a running container alone is never green.
+Grey means not measured. The page shows the snapshot's age first and turns red once it is over three
+minutes old, so a stopped collector never reads as a healthy fleet.
+
+- **Two stages.** `nvoy-status.service` (oneshot, every 60 s from `nvoy-status.timer`) first runs
+  `deploy/nvoy-status-facts.sh` on the host: container state, the watchers' and brokers' last 24 h of
+  logs, channel processes per instance, uptime, disk, memory and the deploy runner's record, into
+  `/var/lib/nvoy-status/facts` (root-only). It then runs `mcp/tools/nvoy-status.mjs` in the deployed
+  runtime image, read-only with every capability dropped and no Docker socket or credentials, which
+  reads those facts and `/etc/nvoy/instances/<id>.json`, asks each manifest relay for the grantors'
+  kind 440/441 events, probes the public endpoints, and writes `status.json` plus the page from
+  `mcp/tools/status-page/` into `/root/nave.pub/deploy/sites/status`, which Caddy serves as
+  `/srv/apps/status`.
+- **Per identity:** containers; ears (the watcher reached `listening` and has not dropped since);
+  login rate; signing, inferred from logins; grants (a live task grant to it, and on how many of its
+  broker's relays); the funnel (heard → admitted / data only / held, from the verdict logs, red on a
+  `no-grant-suspect` newer than the last admit or a mention five minutes without a verdict); the
+  harness's channel connection; status reactions. Then each relay (red if it does not answer, amber
+  if it no longer holds the newest live grant), the host, the deploy timer, and the public sites.
+- **Grants grid.** Rows are grantees, columns are targets; each cell is active (with cap, 8-hex grant
+  id and the target broker's relays that hold it), revoked, expired or none, decided by the broker's
+  own rules in `status_snapshot.mjs`. It has no actions.
+- **What may leave the box.** Only counts, times, names, 8-hex prefixes, relay host names and the
+  collector's own words; never a line of a log. Before writing, the collector runs its own sanitiser
+  over every key and value. A snapshot containing an IP address, an `nsec1`, a `bunker://` or
+  `nostrconnect://` URI, a credential path, a `secret=` parameter, a box host name or any full 64-hex
+  string is not written: a red notice saying only how many findings there were replaces it, and the
+  journal names where each was found, never its value.
+- **Not yet measured** (grey on the page): the waggle bridge and the synthetic canary (status S3,
+  which needs its own sender identity and grant), and whether a channel-door harness is connected.
+
 ## Required negative tests
 
 - duplicate pubkey, state root, runtime root, or service user is refused;
