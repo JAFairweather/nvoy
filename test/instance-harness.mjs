@@ -311,6 +311,7 @@ const args = process.argv.slice(2)
 const entry = Object.values(JSON.parse(readFileSync(args[args.indexOf('--mcp-config') + 1], 'utf8')).mcpServers)[0]
 const saved = process.env.HOME + '/.claude/projects/' + (process.env.HOME + '/workspace').replace(/[^a-zA-Z0-9]/g, '-')
 mkdirSync(saved, { recursive: true }); writeFileSync(saved + '/fake.jsonl', '{}\\n')
+if (existsSync(process.env.HOME + '/.fake/ignoreterm')) process.on('SIGTERM', () => {})
 if (!existsSync(process.env.HOME + '/.fake/nochannel')) require('node:child_process').spawn(process.execPath, [${JSON.stringify(fakeSsh)}, ...entry.args], { stdio: 'ignore' })
 setInterval(() => {}, 1000)
 `)
@@ -421,7 +422,7 @@ const herdrCalls = herdrFake.calls
 const claudeRuns = () => readText(join(herdrHome, 'claude.log')).split('\n').filter(Boolean).map(JSON.parse)
 const alive = pid => { try { process.kill(pid, 0); return true } catch { return false } }
 const herdrSupervisor = spawn(process.execPath, ['mcp/tools/instance-harness.mjs', '--instance', 'mac-test', '--remote', clientConfig({ ...client, home: herdrHome })],
-  { cwd: resolve('.'), env: { ...remoteEnv, HARNESS_TERMINAL: 'auto', HARNESS_HERDR_BIN: herdrFake.bin } })
+  { cwd: resolve('.'), env: { ...remoteEnv, HARNESS_TERMINAL: 'auto', HARNESS_HERDR_BIN: herdrFake.bin, HARNESS_LAUNCH_MS: '1500' } })
 let herdrOut = ''
 herdrSupervisor.stdout.on('data', d => { herdrOut += d }); herdrSupervisor.stderr.on('data', d => { herdrOut += d })
 const herdrExited = new Promise(done => herdrSupervisor.on('exit', done))
@@ -439,10 +440,33 @@ ok('herdr is asked to name the agent after the identity', await waitFor(() => he
 process.kill(run1.pid, 'SIGKILL')
 ok('a session that exits restarts in the same pane, resuming, and is named again', await waitFor(() => claudeRuns().length === 2 && herdrFake.state().panes['w1:p1'].name === 'mactest', 15000) &&
   /session exited \(status 137\); restarting/.test(herdrOut) && claudeRuns()[1].pane === 'w1:p1' && claudeRuns()[1].args.at(-1) === '--continue' && herdrFake.state().workspaces.length === 1)
+const herdrCtl = join(herdrHome, '.fake')
+mkdirSync(herdrCtl, { recursive: true }); writeFileSync(join(herdrCtl, 'ignoreterm'), '')
+const readyCount = () => herdrOut.split('mac-test session ready; its channel to the fleet is up').length - 1
+const readyBefore = readyCount()
+process.kill(claudeRuns()[1].pid, 'SIGKILL')
+await waitFor(() => claudeRuns().length === 3 && readyCount() > readyBefore, 15000)
+const survivor = claudeRuns()[2]
+rmSync(join(herdrCtl, 'ignoreterm'))
+writeFileSync(join(herdrCtl, 'drop'), '')
+ok('a session whose channel dies is restarted, and one that outlives its launcher\'s SIGTERM is killed with its group before the next launch',
+  await waitFor(() => claudeRuns().length === 4 && /the channel to the fleet closed; restarting/.test(herdrOut), 15000) && !alive(survivor.pid))
+await waitFor(() => herdrFake.state().panes['w1:p1']?.name === 'mactest')
+herdrFake.set('w1:p1', { foreground: 'claude' })
+process.kill(claudeRuns()[3].pid, 'SIGKILL')
+ok('an agent left in the pane\'s foreground is never typed into: its workspace is closed and the session starts in a fresh one',
+  await waitFor(() => claudeRuns().length === 5, 15000) && /could not stop still runs in the mactest workspace; closing it/.test(herdrOut) &&
+  claudeRuns()[4].pane === 'w2:p1' && herdrFake.state().workspaces.map(w => `${w.workspace_id} ${w.label}`).join() === 'w2 mactest')
+await waitFor(() => herdrFake.state().panes['w2:p1']?.name === 'mactest')
+herdrFake.set('w2:p1', { wedged: true })
+process.kill(claudeRuns()[4].pid, 'SIGKILL')
+ok('a pane that never runs the launcher is closed, and the next start runs in a fresh workspace',
+  await waitFor(() => claudeRuns().length === 6, 15000) && /the mactest pane did not run the launcher; its workspace is closed/.test(herdrOut) &&
+  claudeRuns()[5].pane === 'w3:p1' && herdrFake.state().workspaces.map(w => `${w.workspace_id} ${w.label}`).join() === 'w3 mactest')
 const sessionPid = Number(readText(join(herdrHome, '.nvoy-harness', 'session.pid')))
-const run2 = claudeRuns()[1]
+const lastRun = claudeRuns().at(-1)
 herdrSupervisor.kill('SIGTERM'); await herdrExited
-ok('stopping the supervisor stops the session it started in herdr', await waitFor(() => !alive(sessionPid) && !alive(run2.pid)))
+ok('stopping the supervisor stops the session it started in herdr', await waitFor(() => !alive(sessionPid) && !alive(lastRun.pid)))
 ok('nothing secret reaches the supervisor\'s output in herdr either', !/PRIVATE-KEY|sk-ant-oat/.test(herdrOut))
 const agentPlist = spawnSync(process.execPath, ['mcp/tools/install-harness-launchagent.mjs', '--runner', 'claude', '--instance', 'mac-test', '--config', clientConfig(client), '--print'],
   { cwd: resolve('.'), encoding: 'utf8', env: { ...remoteEnv } })
