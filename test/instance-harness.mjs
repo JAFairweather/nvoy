@@ -126,6 +126,7 @@ ok('an injected message that quotes a startup screen after ready cannot matter: 
   /if \(screen\.state === 'ready'\) \{ if \(!watchChannel\) \{ log\(.*\); return \} readyAt = Date\.now\(\); continue \}/.test(readFileSync('mcp/tools/instance-harness.mjs', 'utf8')) &&
   /if \(readyAt\) \{[^]*?continue\n    \}\n    const screen = classifyPane\(pane\(\)\)/.test(readFileSync('mcp/tools/instance-harness.mjs', 'utf8')))
 const sshArgs = sshChannelEntry({ identity: '/k/id', knownHosts: '/k/kh', target: 'nvoy-channel@broker.example' }).args
+ok('the channel ssh carries keepalives, so a half-open carrier ends the process the supervisor watches', sshArgs.join(' ').includes('-o ServerAliveInterval=15 -o ServerAliveCountMax=3 -i /k/id nvoy-channel@broker.example'))
 const ps = rows => rows.map(([pid, ppid, command]) => `  ${pid}   ${ppid} ${command}`).join('\n')
 ok('the channel is the session\'s descendant whose command line ends with the channel entry', channelProcessUp(ps([[1, 0, 'launchd'], [100, 1, 'tmux'], [101, 100, 'claude --mcp-config /m'],
   [102, 101, `/usr/bin/ssh ${sshArgs.join(' ')}`]]), 101, sshArgs) && channelProcessUp(ps([[101, 1, 'sh -c claude'], [102, 101, 'claude'], [103, 102, `/usr/bin/ssh ${sshArgs.join(' ')}`]]), 101, sshArgs) &&
