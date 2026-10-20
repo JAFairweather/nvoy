@@ -16,6 +16,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const MAX_BYTES = 4000
 export const POST_ONLY_REPLY = 'this identity may only reply'
 export const postQueuePath = manifest => resolve(manifest.runtimeDir, 'post-requests.jsonl')
+export const MENTION_SCHEMA = { type: 'array', items: { type: 'string', minLength: 1, maxLength: 64 }, maxItems: 16 }
 
 export function postToolSpec(manifest) {
   const m = manifest.mayPost
@@ -27,7 +28,7 @@ export function postToolSpec(manifest) {
     inputSchema: { type: 'object', properties: {
       text: { type: 'string', minLength: 1, maxLength: MAX_BYTES },
       channel: { type: 'string', pattern: UUID.source },
-      mention: { type: 'array', items: { type: 'string', minLength: 1, maxLength: 64 }, maxItems: 16 },
+      mention: MENTION_SCHEMA,
     }, required: ['text'], additionalProperties: false },
   }
 }
@@ -40,15 +41,40 @@ export function resolvePost(manifest, args = {}) {
   if (!content || Buffer.byteLength(content) > MAX_BYTES) return { code: 'NVOY_BAD_POST', message: `text must be 1..${MAX_BYTES} bytes` }
   const channel = args.channel == null ? m.channels[0] : String(args.channel).toLowerCase()
   if (!m.channels.includes(channel)) return { code: 'NVOY_POST_CHANNEL_REFUSED', message: `channel is not in may_post.channels (${m.channels.join(', ')})` }
-  if (args.mention != null && !Array.isArray(args.mention)) return { code: 'NVOY_BAD_POST', message: 'mention must be a list' }
+  const resolved = resolveMentions(m, args.mention, 'NVOY_BAD_POST', 'NVOY_POST_MENTION_REFUSED')
+  return resolved.code ? resolved : { channel, mention: resolved.mention, content }
+}
+
+// Names or hex keys to the distinct keys may_post.mention allows, or the refusal the agent is shown.
+function resolveMentions(m, list, badCode, refusedCode) {
+  if (list != null && !Array.isArray(list)) return { code: badCode, message: 'mention must be a list' }
   const mention = []
-  for (const raw of args.mention || []) {
+  for (const raw of list || []) {
     const value = String(raw).trim().toLowerCase()
     const entry = m.mention.find(e => e.pubkey === value || e.name?.toLowerCase() === value)
-    if (!entry) return { code: 'NVOY_POST_MENTION_REFUSED', message: `${HEX64.test(value) ? value.slice(0, 8) : value} is not on may_post.mention` }
+    if (!entry) return { code: refusedCode, message: `${HEX64.test(value) ? value.slice(0, 8) : value} is not on may_post.mention` }
     if (!mention.includes(entry.pubkey)) mention.push(entry.pubkey)
   }
-  return { channel, mention, content }
+  return { mention }
+}
+
+// nvoy_channel_reply's optional mention: a reply that brings someone new into the thread is held to
+// the same allowlist as a post. No list, or an empty one, leaves the reply exactly as it was.
+export function resolveReplyMention(manifest, list) {
+  if (list == null || (Array.isArray(list) && !list.length)) return { mention: [] }
+  if (!manifest.mayPost) return { code: 'NVOY_REPLY_MENTION_NOT_PERMITTED', message: 'mentioning anyone beyond the sender needs the manifest\'s may_post block' }
+  return resolveMentions(manifest.mayPost, list, 'NVOY_BAD_REPLY', 'NVOY_REPLY_MENTION_REFUSED')
+}
+
+// Broker side of a reply's mention, re-checked against the manifest as a post's is. Present only
+// when non-empty, so a reply without one keeps today's exact request shape and digest.
+export function validateReplyMention(mention, manifest, channel) {
+  if (!Array.isArray(mention) || !mention.length || !mention.every(p => HEX64.test(String(p))) ||
+      new Set(mention).size !== mention.length) throw new Error('reply request has an invalid or overbroad shape')
+  if (!manifest.mayPost) throw new Error('reply refused: mentions need the manifest\'s may_post block')
+  if (!manifest.mayPost.channels.includes(channel)) throw new Error('reply refused: channel is not in may_post.channels')
+  const off = mention.find(p => !manifest.mayPost.mention.some(e => e.pubkey === p))
+  if (off !== undefined) throw new Error(`reply refused: ${off.slice(0, 8)} is not on may_post.mention`)
 }
 
 // Broker side: the one shape a post request may have, re-checked against the manifest. The

@@ -14,6 +14,7 @@ const TERMINAL = [
   'admission receipt is missing',
   'admission receipt is not a live broker-bound sender capability',
   'admission receipt no longer has a live matching grant',
+  'reply refused: ',
 ]
 
 export function isTerminalReplyFailure(stderr) {
@@ -47,7 +48,7 @@ export function loadReplyRequestDigests(paths, instance) {
     for (const line of readFileSync(path, 'utf8').split('\n')) {
       try {
         const request = JSON.parse(line)
-        const allowed = ['version', 'type', 'id', 'instance', 'receipt', 'content']
+        const allowed = ['version', 'type', 'id', 'instance', 'receipt', 'content', 'mention']
         if (!request || typeof request !== 'object' || Array.isArray(request) ||
             Object.keys(request).some(key => !allowed.includes(key)) || request.version !== 1 ||
             request.type !== 'reply-request' || request.instance !== instance || !ID.test(String(request.id || '')) ||

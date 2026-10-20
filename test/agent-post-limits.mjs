@@ -13,7 +13,8 @@ import { readManifest } from '../mcp/tools/runtime_manifest.mjs'
 import { channelPost, channelReply } from '../mcp/tools/buzz_native.mjs'
 import { verifyChannelTaskCarry } from '../mcp/tools/channel_task_carry.mjs'
 import { HOUR_MS, MALFORMED_HOP, admissionLimit, grantExpired, hopFromJson, hopOf, nextHop, slideWindow } from '../mcp/tools/agent_limits.mjs'
-import { queuePost, resolvePost } from '../mcp/tools/agent_post.mjs'
+import { queuePost, resolvePost, resolveReplyMention } from '../mcp/tools/agent_post.mjs'
+import { isTerminalReplyFailure } from '../mcp/tools/reply_retry.mjs'
 
 let fails = 0, passes = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); value ? passes++ : fails++ }
@@ -118,6 +119,11 @@ const off = resolvePost(poster, { text: 'hi', mention: [stranger] })
 ok('an off-allowlist mention is refused, naming only a key prefix', off.code === 'NVOY_POST_MENTION_REFUSED' && off.message.includes(stranger.slice(0, 8)) && !off.message.includes(stranger))
 ok('an unknown name is refused', resolvePost(poster, { text: 'hi', mention: ['kerouac'] }).code === 'NVOY_POST_MENTION_REFUSED')
 ok('empty text is refused', resolvePost(poster, { text: '   ' }).code === 'NVOY_BAD_POST')
+ok('a reply without a mention needs no may_post', resolveReplyMention(plain, undefined).mention.length === 0 && resolveReplyMention(plain, []).mention.length === 0)
+ok('a reply mention without may_post is refused', resolveReplyMention(plain, ['neil']).code === 'NVOY_REPLY_MENTION_NOT_PERMITTED')
+ok('a reply mention resolves names and keys once each', resolveReplyMention(poster, ['Neil', dennis, 'neil']).mention.join() === [neil, dennis].join())
+ok('an off-allowlist or unknown reply mention is refused', resolveReplyMention(poster, [stranger]).code === 'NVOY_REPLY_MENTION_REFUSED' &&
+  resolveReplyMention(poster, ['kerouac']).code === 'NVOY_REPLY_MENTION_REFUSED' && resolveReplyMention(poster, 'neil').code === 'NVOY_BAD_REPLY')
 
 // --- 3. nvoy_channel_post end to end: queue → broker → signed kind:9 on the relay ---
 const credential = join(root, 'agent.key'); writeFileSync(credential, Buffer.from(agentSk).toString('hex'), { mode: 0o600 })
@@ -174,6 +180,11 @@ ok('a reply to an untagged (human) message is hop 1', hopOf(channelReply({ chann
 ok('a reply to a hop-2 message is hop 3', hopOf(channelReply({ channel: CH, parent, content: 'x', hop: nextHop(2) })) === 3)
 ok('a receipt from before hops were recorded continues at hop 1', nextHop(undefined) === 1)
 ok('a reply still threads and p-tags its parent', channelReply({ channel: CH, parent, content: 'x', hop: 2 }).tags.some(t => t[0] === 'p' && t[1] === dennis))
+ok('a reply\'s mentions follow its parent\'s p tag, without repeating the parent',
+  JSON.stringify(channelReply({ channel: CH, parent, content: 'x', mentions: [dennis, neil] }).tags) ===
+  JSON.stringify([['h', CH], ['e', parent.id, '', 'reply'], ['p', dennis], ['p', neil], ['nvoy-hop', '1']]))
+ok('channelReply refuses duplicate or non-hex mentions', !!throws(() => channelReply({ channel: CH, parent, content: 'x', mentions: [neil, neil] })) &&
+  !!throws(() => channelReply({ channel: CH, parent, content: 'x', mentions: ['neil'] })))
 ok('an absent hop tag is null', hopOf({ tags: [['h', CH]] }) === null)
 ok('a malformed or doubled hop tag is past every limit', hopOf({ tags: [['nvoy-hop', 'x']] }) === MALFORMED_HOP &&
   hopOf({ tags: [['nvoy-hop', '1'], ['nvoy-hop', '1']] }) === MALFORMED_HOP && hopOf({ tags: [['nvoy-hop', '01']] }) === MALFORMED_HOP)
@@ -244,6 +255,40 @@ ok('a grant with no expiration is live', holders.includes(dennis))
 ok('a grant whose NIP-40 expiration has passed is ignored', !holders.includes(neil))
 ok('a grant expiring later is live', holders.includes(author))
 ok('an expired grant drops like a revocation, never reviving the grant it displaced', !holders.includes(stranger))
+
+// --- 7. nvoy_channel_reply with a mention: same allowlist and hourly budget as a post ---
+const rf = fixture('replying', { may_post: mayPost })
+mkdirSync(join(rf.state, 'receipts'), { recursive: true, mode: 0o700 })
+const asked = (n, row, receipt = {}) => {
+  const source = String(n).repeat(64)
+  writeFileSync(join(rf.state, 'receipts', `${source}.json`), JSON.stringify({ version: 3, mode: 'buzz-native', instance: 'replying', broker: agent,
+    envelope: source, sender: dennis, grant_id: live.id, grantor, cap: 'task', source_event: source, reply_channel: CH, reply_root: source,
+    admitted_at: Date.now(), expires_at: Date.now() + 300000, ...receipt }), { mode: 0o600 })
+  const id = String(n).repeat(32)
+  writeFileSync(join(rf.run, 'reply-requests.jsonl'), JSON.stringify({ version: 1, type: 'reply-request', id, instance: 'replying', receipt: source, content: `reply ${n}`, ...row }) + '\n', { flag: 'a' })
+  return { id, source }
+}
+const reply = (id, mode) => run(['mcp/tools/instance-broker-reply.mjs', '--instance', 'replying', '--request', id, mode],
+  { NVOY_INSTANCE_ROOT: rf.root, NVOY_BROKER_CREDENTIAL: credential })
+let a = asked(1, { mention: [stranger] })
+r = await reply(a.id, '--prepare')
+ok('the broker refuses an off-allowlist reply mention before claiming the receipt', r.status === 1 && /reply refused: [0-9a-f]{8} is not on may_post\.mention/.test(r.stderr) &&
+  isTerminalReplyFailure(r.stderr) && existsSync(join(rf.state, 'receipts', `${a.source}.json`)))
+a = asked(2, { mention: [neil] }, { reply_channel: CH2 })
+r = await reply(a.id, '--prepare')
+ok('the broker refuses a reply mention in a channel outside may_post', r.status === 1 && /reply refused: channel is not in may_post\.channels/.test(r.stderr))
+a = asked(3, { mention: [neil] }, { version: 1, mode: undefined })
+r = await reply(a.id, '--prepare')
+ok('the broker refuses a mention on a wrapped reply', r.status === 1 && /mentions are only for a native Buzz channel reply/.test(r.stderr))
+a = asked(4, { mention: [] })
+r = await reply(a.id, '--prepare')
+ok('the broker refuses an empty or malformed mention field', r.status === 1 && /invalid or overbroad/.test(r.stderr))
+// Past these checks the broker needs a live grant chain on a wss relay, so the rest is pinned in its source.
+const replySource = readFileSync('mcp/tools/instance-broker-reply.mjs', 'utf8')
+const capAt = replySource.indexOf("countInWindow(resolve(manifest.stateDir, 'agent-limits', 'posts.json'), { key: 'post', id: requestId, limit: manifest.mayPost.perHour })")
+ok('a reply mention spends the same per-request post counter, after the live grant recheck and before the receipt is claimed',
+  capAt > replySource.indexOf("die('admission receipt no longer has a live matching grant chain')") && capAt < replySource.indexOf('renameSync(receiptBase, receiptInflight)'))
+ok('the frozen reply carries the validated mention', /channelReply\(\{[^}]*mentions: request\.mention \|\| \[\] \}\)/.test(replySource))
 
 buzz.close(); http.close(); grantRelay.close(); gHttp.close()
 console.log(`\n${passes}/${passes + fails} passed`)

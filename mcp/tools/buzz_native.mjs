@@ -70,16 +70,17 @@ export function checkAuthTemplate(ev, { relay, now = Math.floor(Date.now() / 100
 // A reply that threads the way Buzz clients do: root = the parent's root marker, else its reply
 // marker, else the parent itself. The mention travels as a p tag — Buzz never resolves @text, so
 // a reply without it reaches no one. `hop` is the parent's nvoy-hop + 1 (agent_limits.mjs).
-export function channelReply({ channel, parent, content, hop = 1, now = Math.floor(Date.now() / 1000) }) {
+export function channelReply({ channel, parent, content, hop = 1, mentions = [], now = Math.floor(Date.now() / 1000) }) {
   if (!validChannel(channel)) throw new Error('channel must be a UUID')
   if (!parent || !HEX64.test(String(parent.id)) || !HEX64.test(String(parent.pubkey))) throw new Error('reply needs the verified parent event')
   if (typeof content !== 'string' || !content.trim()) throw new Error('empty reply')
   if (!Number.isSafeInteger(hop) || hop < 1) throw new Error('hop must be a positive integer')
+  if (!Array.isArray(mentions) || !mentions.every(p => HEX64.test(String(p))) || new Set(mentions).size !== mentions.length) throw new Error('mentions must be distinct hex pubkeys')
   const marked = marker => (parent.tags || []).find(t => t?.[0] === 'e' && t[3] === marker && HEX64.test(String(t[1])))?.[1]
   const root = marked('root') || marked('reply') || parent.id
   const tags = [['h', channel]]
   if (root !== parent.id) tags.push(['e', root, '', 'root'])
-  tags.push(['e', parent.id, '', 'reply'], ['p', parent.pubkey], [HOP_TAG, String(hop)])
+  tags.push(['e', parent.id, '', 'reply'], ['p', parent.pubkey], ...mentions.filter(p => p !== parent.pubkey).map(p => ['p', p]), [HOP_TAG, String(hop)])
   return { kind: 9, created_at: now, content, tags }
 }
 

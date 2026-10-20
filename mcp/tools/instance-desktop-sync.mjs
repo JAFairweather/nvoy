@@ -52,7 +52,7 @@ for (const line of input.split('\n').filter(Boolean)) {
   if (Buffer.byteLength(line) > 8192) die('Desktop reply request exceeds sync bound')
   let request
   try { request = JSON.parse(line) } catch { die('Desktop reply stream contains malformed JSON') }
-  const keys = ['version', 'type', 'id', 'instance', 'receipt', 'content']
+  const keys = ['version', 'type', 'id', 'instance', 'receipt', 'content', 'mention']
   if (Object.keys(request).some(key => !keys.includes(key)) || request.version !== 1 || request.type !== 'reply-request' ||
       request.instance !== manifest.id || !/^[0-9a-f]{32}$/.test(String(request.id || '')) ||
       !/^[0-9a-f]{64}$/.test(String(request.receipt || '')) || !admitted.has(request.receipt) ||

@@ -14,7 +14,7 @@ import { resolve } from 'node:path'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { validateDesktopDelivery } from './admitted_task.mjs'
 import { requestWorkingStatus } from './buzz_status.mjs'
-import { postToolSpec, queuePost } from './agent_post.mjs'
+import { MENTION_SCHEMA, postToolSpec, queuePost, resolveReplyMention } from './agent_post.mjs'
 
 const die = message => { console.error(`nvoy-claude-channel: ${message}`); process.exit(1) }
 const flag = name => { const i = process.argv.indexOf(name); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -194,10 +194,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [
   },
   {
     name: 'nvoy_channel_reply',
-    description: 'Request one reply to an exact delivered envelope. The Bunker broker rechecks grants, selects the fixed recipient/channel, signs, and publishes.',
+    description: 'Request one reply to an exact delivered envelope. The Bunker broker rechecks grants, selects the fixed recipient/channel, signs, and publishes. In a Buzz channel the reply may also mention participants on may_post.mention, by name or hex key; that spends the hourly post budget.',
     inputSchema: { type: 'object', properties: {
       envelope: { type: 'string', pattern: '^[0-9a-f]{64}$' },
       text: { type: 'string', minLength: 1, maxLength: 4000 },
+      mention: MENTION_SCHEMA,
     }, required: ['envelope', 'text'], additionalProperties: false },
   },
   postToolSpec(manifest),
@@ -260,14 +261,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async request => {
   if (task.type !== 'admitted-task' || task.messages.length !== 1) {
     return toolResult({ code: 'NVOY_REPLY_REQUIRES_ONE_SENDER' }, true)
   }
+  const { mention, ...refused } = resolveReplyMention(manifest, args.mention)
+  if (refused.code) return toolResult(refused, true)
   try {
     const prior = lines(replyPath, 'Desktop reply queue').map(line => { try { return JSON.parse(line) } catch { throw new Error('Desktop reply queue contains malformed JSON') } })
     if (prior.some(item => item?.receipt === envelope)) return toolResult({ code: 'NVOY_ALREADY_REPLIED', envelope }, true)
     const record = { version: 1, type: 'reply-request', id: randomBytes(16).toString('hex'),
-      instance: manifest.id, receipt: envelope, content }
+      instance: manifest.id, receipt: envelope, content, ...(mention.length ? { mention } : {}) }
     appendFileSync(replyPath, JSON.stringify(record) + '\n', { mode: 0o640 })
     chmodSync(replyPath, 0o640)
-    return toolResult({ queued: true, envelope, request: record.id })
+    return toolResult({ queued: true, envelope, request: record.id, ...(mention.length ? { mention } : {}) })
   } catch (error) { return toolResult({ code: 'NVOY_REPLY_QUEUE_FAILED', message: error.message }, true) }
 })
 
