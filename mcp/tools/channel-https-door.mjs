@@ -58,6 +58,9 @@ export function createDoor({ id, tokenHash, argv, env = { PATH: '/usr/bin:/bin' 
   const refuse = (res, code, text, headers = {}) => { res.writeHead(code, { 'content-type': 'text/plain', ...headers }).end(text) }
 
   // Resolves once the channel process has exited, so a caller can wait for its lock to be free.
+  // Every close in flight is tracked, whatever started it: a client that DELETEs and at once
+  // re-initializes must not spawn a channel while its predecessor still holds the lock.
+  const closing = new Set()
   const closeSession = async (sid, why) => {
     const s = sessions.get(sid)
     if (!s) return
@@ -65,7 +68,10 @@ export function createDoor({ id, tokenHash, argv, env = { PATH: '/usr/bin:/bin' 
     clearTimeout(s.idle)
     log(`channel-https-door: ${id} session ${sid.slice(0, 8)} closed (${why})`)
     s.transport.close().catch(() => {})
-    await s.child.close().catch(() => {})
+    const exited = s.child.close().catch(() => {})
+    closing.add(exited)
+    await exited
+    closing.delete(exited)
   }
   const touch = (sid) => {
     const s = sessions.get(sid)
@@ -96,6 +102,7 @@ export function createDoor({ id, tokenHash, argv, env = { PATH: '/usr/bin:/bin' 
     // A client that reconnects without a DELETE must not be locked out until the idle timeout:
     // the newest session wins, and its channel starts only after the evicted one has exited.
     while (sessions.size >= maxSessions) await closeSession(sessions.keys().next().value, 'evicted by a newer session')
+    await Promise.all([...closing])
     const child = new StdioClientTransport({ command: argv[0], args: argv.slice(1), env, stderr: 'inherit' })
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
