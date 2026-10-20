@@ -35,7 +35,9 @@ const client = new Client({ name: 'codex-channel-test', version: '0.1.0' })
 try {
   await client.connect(transport)
   const tools = (await client.listTools()).tools.map(tool => tool.name)
-  ok('fixed Codex MCP exposes only bounded list, exact read, and receipt-bound reply', tools.join(',') === 'nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply')
+  ok('fixed Codex MCP exposes only bounded list, exact read, receipt-bound reply, and manifest-gated post', tools.join(',') === 'nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply,nvoy_channel_post')
+  const post = await client.callTool({ name: 'nvoy_channel_post', arguments: { text: 'hello room' } })
+  ok('without may_post the Codex post tool refuses: this identity may only reply', post.isError === true && /may only reply/.test(post.content[0].text))
   const listed = JSON.parse((await client.callTool({ name: 'nvoy_channel_list', arguments: {} })).content[0].text)
   ok('list returns bounded metadata without sender or message content', listed.instance === manifest.id && listed.total === 3 &&
     listed.truncated === false && listed.records.length === 3 &&

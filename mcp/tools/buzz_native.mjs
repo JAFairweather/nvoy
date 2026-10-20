@@ -19,6 +19,7 @@ import WebSocket from 'ws'
 import net from 'node:net'
 import { chmodSync, chownSync, unlinkSync } from 'node:fs'
 import { verifyEvent } from 'nostr-tools/pure'
+import { HOP_TAG } from './agent_limits.mjs'
 
 const HEX64 = /^[0-9a-f]{64}$/
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
@@ -68,17 +69,26 @@ export function checkAuthTemplate(ev, { relay, now = Math.floor(Date.now() / 100
 
 // A reply that threads the way Buzz clients do: root = the parent's root marker, else its reply
 // marker, else the parent itself. The mention travels as a p tag — Buzz never resolves @text, so
-// a reply without it reaches no one.
-export function channelReply({ channel, parent, content, now = Math.floor(Date.now() / 1000) }) {
+// a reply without it reaches no one. `hop` is the parent's nvoy-hop + 1 (agent_limits.mjs).
+export function channelReply({ channel, parent, content, hop = 1, now = Math.floor(Date.now() / 1000) }) {
   if (!validChannel(channel)) throw new Error('channel must be a UUID')
   if (!parent || !HEX64.test(String(parent.id)) || !HEX64.test(String(parent.pubkey))) throw new Error('reply needs the verified parent event')
   if (typeof content !== 'string' || !content.trim()) throw new Error('empty reply')
+  if (!Number.isSafeInteger(hop) || hop < 1) throw new Error('hop must be a positive integer')
   const marked = marker => (parent.tags || []).find(t => t?.[0] === 'e' && t[3] === marker && HEX64.test(String(t[1])))?.[1]
   const root = marked('root') || marked('reply') || parent.id
   const tags = [['h', channel]]
   if (root !== parent.id) tags.push(['e', root, '', 'root'])
-  tags.push(['e', parent.id, '', 'reply'], ['p', parent.pubkey])
+  tags.push(['e', parent.id, '', 'reply'], ['p', parent.pubkey], [HOP_TAG, String(hop)])
   return { kind: 9, created_at: now, content, tags }
+}
+
+// A conversation the identity starts: top level, so no e tags, and hop 1. Each mention is a p tag.
+export function channelPost({ channel, content, mentions = [], now = Math.floor(Date.now() / 1000) }) {
+  if (!validChannel(channel)) throw new Error('channel must be a UUID')
+  if (typeof content !== 'string' || !content.trim()) throw new Error('empty post')
+  if (!Array.isArray(mentions) || !mentions.every(p => HEX64.test(String(p))) || new Set(mentions).size !== mentions.length) throw new Error('mentions must be distinct hex pubkeys')
+  return { kind: 9, created_at: now, content, tags: [['h', channel], ...mentions.map(p => ['p', p]), [HOP_TAG, '1']] }
 }
 
 // Is this a message addressed to `me` in one of `channels`? Returns the facts admission needs,

@@ -59,9 +59,12 @@ try {
       [envelope, notificationEnvelope].includes(wake?.meta?.envelope) &&
       !JSON.stringify(wake).includes(task.messages[0].content) && !JSON.stringify(wake).includes(task.messages[0].from)))
   const tools = (await client.listTools()).tools.map(tool => tool.name)
-  ok('Claude receives an explicit read tool, a receipt-bound reply tool, and a body-free discovery tool',
-    tools.length === 3 && tools.includes('nvoy_channel_read') && tools.includes('nvoy_channel_reply') &&
-    tools.includes('nvoy_channel_list'))
+  ok('Claude receives an explicit read tool, a receipt-bound reply tool, a body-free discovery tool, and the post tool',
+    tools.length === 4 && tools.includes('nvoy_channel_read') && tools.includes('nvoy_channel_reply') &&
+    tools.includes('nvoy_channel_list') && tools.includes('nvoy_channel_post'))
+  const post = await client.callTool({ name: 'nvoy_channel_post', arguments: { text: 'hello room' } })
+  ok('without may_post the post tool refuses: this identity may only reply',
+    post.isError === true && /may only reply/.test(post.content[0].text) && !existsSync(join(runtime, 'post-requests.jsonl')))
   const duplicateProcess = spawnSync(process.execPath, [resolve('mcp/tools/claude-channel.mjs'), '--instance', manifest.id, '--baseline'],
     { encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifests } })
   ok('a second Claude session cannot bind the same participant identity',

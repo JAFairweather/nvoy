@@ -10,6 +10,7 @@ import { resolve, dirname, relative, sep } from 'node:path'
 import { decode } from 'nostr-tools/nip19'
 import { codexThreadId as validCodexThreadId, localControlSocket } from './codex_app_server.mjs'
 import { normalizeBuzzRelay } from './buzz_native.mjs'
+import { DEFAULT_LIMITS } from './agent_limits.mjs'
 
 const die = message => { throw new Error(message) }
 const hex = value => String(value || '').toLowerCase()
@@ -204,6 +205,44 @@ export function readManifest(root, requestedId) {
     if ([keyRef, bunkerUriRef, bunkerClientRef, harness?.credentialRef, wakeWebhook?.urlRef, wakeWebhook?.headersRef].includes(tokenHashRef)) die('channel_door token_hash_ref must not name another credential')
     channelDoor = Object.freeze({ tokenHashRef, network })
   }
+  // An identity may only reply unless its owner opts it in to starting conversations: which of its
+  // Buzz channels, how many posts an hour, and the closed list of keys it may p-tag. A mention entry
+  // is a key, or { name, pubkey } so the agent can name who it means.
+  let mayPost = null
+  if (raw.may_post != null) {
+    const block = raw.may_post
+    if (typeof block !== 'object' || Array.isArray(block) || Object.keys(block).some(k => !['channels', 'per_hour', 'mention'].includes(k))) die('may_post takes only channels, per_hour and mention')
+    if (!buzz) die('may_post requires a buzz block')
+    if (brokerMode !== 'local' || deliveryMode !== 'notify_only' || workerEnabled) die('may_post requires a local-broker, worker-disabled notify_only manifest')
+    const channels = (Array.isArray(block.channels) ? block.channels : []).map(value => String(value || '').toLowerCase())
+    if (!channels.length || !channels.every(validChannel) || new Set(channels).size !== channels.length) die('may_post.channels requires distinct channel UUIDs')
+    if (!channels.every(c => buzz.channels.includes(c))) die('may_post.channels must be a subset of buzz.channels')
+    if (!Number.isInteger(block.per_hour) || block.per_hour < 1 || block.per_hour > 30) die('may_post.per_hour must be an integer from 1 to 30')
+    if (block.mention != null && !Array.isArray(block.mention)) die('may_post.mention must be a list')
+    const mention = (block.mention || []).map(entry => {
+      const named = entry && typeof entry === 'object' && !Array.isArray(entry)
+      if (named && Object.keys(entry).some(k => !['name', 'pubkey'].includes(k))) die('a may_post.mention entry is a pubkey or { name, pubkey }')
+      let pk
+      try { pk = toHex(named ? entry.pubkey : entry) } catch { pk = '' }
+      const name = named ? String(entry.name || '') : ''
+      if (!valid(pk) || (named && !/^[a-z0-9][a-z0-9._-]{0,31}$/i.test(name))) die('a may_post.mention entry is a pubkey or { name, pubkey }')
+      return Object.freeze({ pubkey: pk, name: name || null })
+    })
+    if (new Set(mention.map(m => m.pubkey)).size !== mention.length) die('may_post.mention pubkeys must be distinct')
+    const names = mention.filter(m => m.name).map(m => m.name.toLowerCase())
+    if (new Set(names).size !== names.length) die('may_post.mention names must be distinct')
+    mayPost = Object.freeze({ channels: Object.freeze(channels), perHour: block.per_hour, mention: Object.freeze(mention) })
+  }
+  // The brakes on agent-to-agent traffic (agent_limits.mjs). Always in force; the block only tunes them.
+  let agentLimits = DEFAULT_LIMITS
+  if (raw.agent_limits != null) {
+    const block = raw.agent_limits
+    if (typeof block !== 'object' || Array.isArray(block) || Object.keys(block).some(k => !['max_hops', 'per_sender_per_hour'].includes(k))) die('agent_limits takes only max_hops and per_sender_per_hour')
+    const maxHops = block.max_hops ?? DEFAULT_LIMITS.maxHops, perSenderPerHour = block.per_sender_per_hour ?? DEFAULT_LIMITS.perSenderPerHour
+    if (!Number.isInteger(maxHops) || maxHops < 1 || maxHops > 10) die('agent_limits.max_hops must be an integer from 1 to 10')
+    if (!Number.isInteger(perSenderPerHour) || perSenderPerHour < 1 || perSenderPerHour > 120) die('agent_limits.per_sender_per_hour must be an integer from 1 to 120')
+    agentLimits = Object.freeze({ maxHops, perSenderPerHour })
+  }
   if (brokerMode === 'remote') {
     if (!['codex_app_server', 'macos_desktop'].includes(deliveryMode) || codexTransport !== 'local_control_socket') die('a remote broker is valid only for an exact local Codex Desktop binding')
     if (!/^[a-z_][a-z0-9_-]{0,31}@[a-z0-9.-]+$/i.test(sshTarget) || !sshIdentityFile.startsWith('/') ||
@@ -212,7 +251,7 @@ export function readManifest(root, requestedId) {
     }
   }
   return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, carriers: Object.freeze(carriers), buzz, relays, stateDir, runtimeDir, spoolDir,
-    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, adapterContainer, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath, codexAppBundleId, codexProjectLabel, codexChatLabel, codexUiDriver, harness, wakeWebhook, channelDoor,
+    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, adapterContainer, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath, codexAppBundleId, codexProjectLabel, codexChatLabel, codexUiDriver, harness, wakeWebhook, channelDoor, mayPost, agentLimits,
     sshTarget, sshIdentityFile, sshKnownHostsFile, sshKnownHostsSha256, approvalEndpoint: approvalEndpoint.replace(/\/$/, '') })
 }
 

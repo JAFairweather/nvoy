@@ -3,6 +3,7 @@
 // separate, live grants supplied by the caller's present-tense policy evaluation.
 
 import { verifyEvent } from 'nostr-tools/pure'
+import { hopOf } from './agent_limits.mjs'
 
 const HEX64 = /^[0-9a-f]{64}$/
 const HEX128 = /^[0-9a-f]{128}$/
@@ -93,6 +94,6 @@ export function verifyChannelTaskCarry(message, { channels = [], carrierGrant = 
     admission: { mode: 'channel-carry', from: source.pubkey, grant_id: authorGrant.grantId,
       grantor: authorGrant.grantor, cap: authorGrant.cap, carrier,
       carrier_grant_id: carrierGrant.grantId, carrier_grantor: carrierGrant.grantor,
-      source_event: source.id, reply_channel: channel },
+      source_event: source.id, reply_channel: channel, hop: hopOf(source) },
   }
 }
