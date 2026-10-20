@@ -939,9 +939,11 @@ This is for a harness host that cannot reach SSH; see
   adapter runtime, and its own read-only `channel_door_credentials` volume. Init copies the hash
   there, worker-owned and `0400`. It publishes no port. The proxy reaches it as
   `nvoy-<id>-door:8790`, and it serves only `/door/<id>/mcp`.
-- **Requests.** A session opens only with `initialize`. There are at most 2 sessions, the oldest is
-  evicted, an idle session closes after 30 min, and a body may be at most 1 MiB. DELETE ends a
-  session and its channel process.
+- **Requests.** A session opens only with `initialize`. There is one session at a time, because the
+  channel holds a per-identity lock: a new `initialize` closes the old session and waits for its
+  channel to exit, so a client that reconnects without a DELETE is never locked out. An idle
+  session closes after 30 min, and a body may be at most 1 MiB. DELETE ends a session and its
+  channel process.
 - **Logs.** Only session open and close lines and failure notices. A token, header or message body
   is never logged.
 

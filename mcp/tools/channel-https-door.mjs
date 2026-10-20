@@ -43,7 +43,7 @@ export const tokenDigest = token => createHash('sha256').update(String(token)).d
 // A door is an http.Server that is not yet listening. Everything it may spawn is fixed here, by
 // the caller, before the first request: `argv` is never derived from anything a request carries.
 export function createDoor({ id, tokenHash, argv, env = { PATH: '/usr/bin:/bin' }, allowedHosts = [],
-  maxSessions = 2, idleMs = 30 * 60 * 1000, failLimit = 20, log = console.log }) {
+  maxSessions = 1, idleMs = 30 * 60 * 1000, failLimit = 20, log = console.log }) {
   if (!HEX64.test(String(tokenHash))) throw new Error('door token hash must be 64 hex')
   if (!Array.isArray(argv) || !argv.length || argv.some(a => typeof a !== 'string')) throw new Error('door argv must be a string array')
   const expected = Buffer.from(tokenHash, 'hex')
@@ -57,14 +57,15 @@ export function createDoor({ id, tokenHash, argv, env = { PATH: '/usr/bin:/bin' 
   }
   const refuse = (res, code, text, headers = {}) => { res.writeHead(code, { 'content-type': 'text/plain', ...headers }).end(text) }
 
-  const closeSession = (sid, why) => {
+  // Resolves once the channel process has exited, so a caller can wait for its lock to be free.
+  const closeSession = async (sid, why) => {
     const s = sessions.get(sid)
     if (!s) return
     sessions.delete(sid)
     clearTimeout(s.idle)
-    s.transport.close().catch(() => {})
-    s.child.close().catch(() => {})
     log(`channel-https-door: ${id} session ${sid.slice(0, 8)} closed (${why})`)
+    s.transport.close().catch(() => {})
+    await s.child.close().catch(() => {})
   }
   const touch = (sid) => {
     const s = sessions.get(sid)
@@ -91,7 +92,10 @@ export function createDoor({ id, tokenHash, argv, env = { PATH: '/usr/bin:/bin' 
   async function openSession(req, res, body) {
     const isInit = (Array.isArray(body) ? body : [body]).some(m => m?.method === 'initialize')
     if (!isInit) return refuse(res, 400, 'missing or unknown mcp-session-id')
-    while (sessions.size >= maxSessions) closeSession(sessions.keys().next().value, 'evicted by a newer session')
+    // The channel holds a per-identity lock, so a second one exits at once while the first lives.
+    // A client that reconnects without a DELETE must not be locked out until the idle timeout:
+    // the newest session wins, and its channel starts only after the evicted one has exited.
+    while (sessions.size >= maxSessions) await closeSession(sessions.keys().next().value, 'evicted by a newer session')
     const child = new StdioClientTransport({ command: argv[0], args: argv.slice(1), env, stderr: 'inherit' })
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
@@ -138,7 +142,18 @@ export function createDoor({ id, tokenHash, argv, env = { PATH: '/usr/bin:/bin' 
         if (existing) { touch(sid); return existing.transport.handleRequest(req, res, body) }
         return openSession(req, res, body)
       }
-      if (!existing) return refuse(res, 404, 'unknown mcp-session-id')
+      // Streamable HTTP: a server with no sessionless GET stream answers 405, and 404 only for a
+      // session it does not know — which a client reads as "re-initialize". A connector that probes
+      // with a bare GET and is told 404 gives up instead. Refusals are logged: they are the only
+      // trace a remote connector leaves.
+      if (typeof sid !== 'string') {
+        log(`channel-https-door: ${id} ${req.method} without a session refused 405`)
+        return refuse(res, 405, 'method not allowed without mcp-session-id', { allow: 'POST' })
+      }
+      if (!existing) {
+        log(`channel-https-door: ${id} ${req.method} for unknown session ${sid.slice(0, 8)} refused 404`)
+        return refuse(res, 404, 'unknown mcp-session-id')
+      }
       touch(sid)
       await existing.transport.handleRequest(req, res)
       if (req.method === 'DELETE') closeSession(sid, 'client deleted it')
