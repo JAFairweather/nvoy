@@ -211,7 +211,7 @@ ok('session_start connects the wake feed once and baselines the fleet queue', aw
   pi1.statuses.at(-1) === 'nvoy=nvoy pd-test: listening')
 const feedArgs = readText(join(root, 'ssh-args.log')).trim()
 ok('the feed runs on its own key through the hardened entry, with ssh keepalives', feedArgs.includes(`-i ${feedKey} `) && !feedArgs.includes(chanKey) &&
-  /ServerAliveInterval=15 -o ServerAliveCountMax=3 nvoy-pi@broker\.example$/.test(feedArgs) && feedArgs.includes('BatchMode=yes') && feedArgs.includes(`UserKnownHostsFile=${knownHosts}`))
+  /ServerAliveInterval=15 -o ServerAliveCountMax=3 -i \S+ nvoy-pi@broker\.example$/.test(feedArgs) && feedArgs.includes('BatchMode=yes') && feedArgs.includes(`UserKnownHostsFile=${knownHosts}`))
 appendFileSync(queue, record(2))
 await waitFor(() => pi1.sent.length >= 1)
 ok('an admitted envelope is injected as a readable follow-up user message carrying its id', pi1.sent.length === 1 &&
