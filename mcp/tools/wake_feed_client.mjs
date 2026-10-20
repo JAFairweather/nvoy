@@ -10,11 +10,9 @@ import { sshChannelEntry, SSH } from './channel_client.mjs'
 const HEX64 = /^[0-9a-f]{64}$/
 const sleep = ms => new Promise(done => setTimeout(done, ms))
 
-// The feed's ssh: the hardened channel entry on the feed key, plus keepalives so a dead carrier
-// ends the process instead of leaving it waiting.
-export function sshFeedArgs(config, aliveSeconds = 15) {
-  const entry = sshChannelEntry({ identity: config.feedIdentity, knownHosts: config.knownHosts, target: config.target })
-  return [...entry.args.slice(0, -1), '-o', `ServerAliveInterval=${aliveSeconds}`, '-o', 'ServerAliveCountMax=3', entry.args.at(-1)]
+// The feed's ssh: the hardened channel entry, keepalives included, on the feed key.
+export function sshFeedArgs(config) {
+  return sshChannelEntry({ identity: config.feedIdentity, knownHosts: config.knownHosts, target: config.target }).args
 }
 
 // undefined: never baselined. null: baselined on an empty queue, so everything it holds is new.

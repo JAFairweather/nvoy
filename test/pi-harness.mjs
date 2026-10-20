@@ -135,12 +135,13 @@ ok('stopping the launcher ends the session and frees its lock', await waitFor(()
 const herdr = fakeHerdr(root)
 writeFileSync(join(fakeBin, 'pi'), `#!/usr/bin/env node
 const e = process.env
+if (require('node:fs').existsSync(${JSON.stringify(join(root, 'pi-ignoreterm'))})) process.on('SIGTERM', () => {})
 require('node:fs').appendFileSync(e.HOME + '/pi.log', JSON.stringify({ pid: process.pid, args: process.argv.slice(2), pane: e.HERDR_PANE_ID, env: Object.keys(e).filter(k => !/^(HERDR_|COLORTERM$|TERM_PROGRAM)/.test(k)).sort() }) + '\\n')
 setInterval(() => {}, 1000)
 `)
 chmodSync(join(fakeBin, 'pi'), 0o755)
 const piRuns = () => readText(join(stateDir, 'home', 'pi.log')).split('\n').filter(Boolean).map(JSON.parse)
-const inHerdr = spawn(process.execPath, ['mcp/tools/pi-harness.mjs', '--instance', 'pd-test', '--config', configPath], { cwd: resolve('.'), env: { ...launcherEnv, HARNESS_TERMINAL: 'auto', HARNESS_HERDR_BIN: herdr.bin } })
+const inHerdr = spawn(process.execPath, ['mcp/tools/pi-harness.mjs', '--instance', 'pd-test', '--config', configPath], { cwd: resolve('.'), env: { ...launcherEnv, HARNESS_TERMINAL: 'auto', HARNESS_HERDR_BIN: herdr.bin, HARNESS_LAUNCH_MS: '5000' } })
 let herdrOut = ''
 inHerdr.stdout.on('data', d => { herdrOut += d }); inHerdr.stderr.on('data', d => { herdrOut += d })
 const inHerdrExited = new Promise(done => inHerdr.on('exit', done))
@@ -155,7 +156,29 @@ ok('pi in herdr gets the same arguments and the same built environment, and no A
 process.kill(pr1.pid, 'SIGKILL')
 ok('pi exiting in herdr restarts it in the same pane, named again', await waitFor(() => piRuns().length === 2 && herdr.state().panes['w1:p1'].name === 'pdtest') &&
   piRuns()[1].pane === 'w1:p1' && herdr.state().workspaces.length === 1)
-const pr2 = piRuns()[1]
+const alive = pid => { try { process.kill(pid, 0); return true } catch { return false } }
+const launcherPid = () => Number(readText(join(stateDir, 'nvoy', 'session.pid')))
+writeFileSync(join(root, 'pi-ignoreterm'), '')
+process.kill(piRuns()[1].pid, 'SIGKILL')
+await waitFor(() => piRuns().length === 3 && herdr.state().panes['w1:p1']?.name === 'pdtest')
+const survivor = piRuns()[2]
+rmSync(join(root, 'pi-ignoreterm'))
+process.kill(launcherPid(), 'SIGKILL')
+ok('a pi that outlives its launcher is killed with its group before the next launch',
+  await waitFor(() => piRuns().length === 4 && !alive(survivor.pid), 30000) && piRuns()[3].pane === 'w1:p1')
+await waitFor(() => herdr.state().panes['w1:p1']?.name === 'pdtest')
+herdr.set('w1:p1', { foreground: 'pi' })
+process.kill(piRuns()[3].pid, 'SIGKILL')
+ok('an agent left in the pane\'s foreground is never typed into: its workspace is closed and pi starts in a fresh one',
+  await waitFor(() => piRuns().length === 5, 30000) && /could not stop still runs in the pdtest workspace; closing it/.test(herdrOut) &&
+  piRuns()[4].pane === 'w2:p1' && herdr.state().workspaces.map(w => `${w.workspace_id} ${w.label}`).join() === 'w2 pdtest')
+await waitFor(() => herdr.state().panes['w2:p1']?.name === 'pdtest')
+herdr.set('w2:p1', { wedged: true })
+process.kill(piRuns()[4].pid, 'SIGKILL')
+ok('a pane that never runs the launcher is a failed start: its workspace is closed and pi starts in a fresh one',
+  await waitFor(() => piRuns().length === 6, 30000) && /the pdtest pane did not run the launcher; its workspace is closed/.test(herdrOut) &&
+  piRuns()[5].pane === 'w3:p1' && herdr.state().workspaces.map(w => `${w.workspace_id} ${w.label}`).join() === 'w3 pdtest')
+const pr2 = piRuns()[5]
 inHerdr.kill('SIGTERM'); await inHerdrExited
 ok('stopping the launcher ends pi in herdr and frees its lock', await waitFor(() => { try { process.kill(pr2.pid, 0); return false } catch { return true } }) &&
   !existsSync(join(stateDir, 'nvoy', 'supervisor.lock')) && !/sk-proj-live|PRIVATE-KEY|CHATGPT-TOKEN/.test(herdrOut))
@@ -211,7 +234,7 @@ ok('session_start connects the wake feed once and baselines the fleet queue', aw
   pi1.statuses.at(-1) === 'nvoy=nvoy pd-test: listening')
 const feedArgs = readText(join(root, 'ssh-args.log')).trim()
 ok('the feed runs on its own key through the hardened entry, with ssh keepalives', feedArgs.includes(`-i ${feedKey} `) && !feedArgs.includes(chanKey) &&
-  /ServerAliveInterval=15 -o ServerAliveCountMax=3 nvoy-pi@broker\.example$/.test(feedArgs) && feedArgs.includes('BatchMode=yes') && feedArgs.includes(`UserKnownHostsFile=${knownHosts}`))
+  /ServerAliveInterval=15 -o ServerAliveCountMax=3 -i \S+ nvoy-pi@broker\.example$/.test(feedArgs) && feedArgs.includes('BatchMode=yes') && feedArgs.includes(`UserKnownHostsFile=${knownHosts}`))
 appendFileSync(queue, record(2))
 await waitFor(() => pi1.sent.length >= 1)
 ok('an admitted envelope is injected as a readable follow-up user message carrying its id', pi1.sent.length === 1 &&

@@ -370,7 +370,7 @@ ok('CODEX_HOME/config.toml is the ChatGPT config on the channel key, owner-only'
   /^forced_login_method = "chatgpt"$/m.test(written) && written.includes(`"-i", "${chanKey}"`) && !written.includes(feedKey) && written.includes('command = "/usr/bin/ssh"'))
 const sshArgs = readText(join(root, 'ssh-args.log')).trim().split('\n')[0]
 ok('the feed runs on its own key through the hardened entry, with ssh keepalives', sshArgs === sshFeedArgs({ feedIdentity: feedKey, knownHosts, target: client.ssh_target }).join(' ') &&
-  sshArgs.includes(`-i ${feedKey}`) && /ServerAliveInterval=15 -o ServerAliveCountMax=3 nvoy-codex@broker\.example$/.test(sshArgs) && sshArgs.includes('BatchMode=yes'))
+  sshArgs.includes(`-i ${feedKey}`) && /ServerAliveInterval=15 -o ServerAliveCountMax=3 -i \S+ nvoy-codex@broker\.example$/.test(sshArgs) && sshArgs.includes('BatchMode=yes'))
 ok('no key, login token or message body reaches a log', !/PRIVATE-KEY|CHATGPT-TOKEN|SECRET/.test(s1.out + readText(join(codexHome, 'nvoy', 'delivered.jsonl')) + readText(join(codexHome, 'nvoy', 'feed-cursor.json'))))
 ok('the delivered record and cursor are owner-only and name the last envelope', (statSync(join(codexHome, 'nvoy', 'delivered.jsonl')).mode & 0o777) === 0o600 &&
   JSON.parse(readText(join(codexHome, 'nvoy', 'feed-cursor.json'))).cursor === envelope(3))

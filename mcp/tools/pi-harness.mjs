@@ -42,6 +42,7 @@ const STARTUP_MS = Number(process.env.HARNESS_STARTUP_MS || 30000)
 const WATCH_MS = Number(process.env.HARNESS_WATCH_MS || 5000)
 const RETRY_MS = Number(process.env.HARNESS_RETRY_MS || 5000)
 const RETRY_MAX_MS = Number(process.env.HARNESS_RETRY_MAX_MS || 300000)
+const LAUNCH_MS = Number(process.env.HARNESS_LAUNCH_MS || 10000)
 const writePrivate = (path, value) => { writeFileSync(path, value, { mode: 0o600 }); chmodSync(path, 0o600) }
 
 for (const dir of [stateDir, workdir, privateDir, home, resolve(stateDir, 'sessions')]) { mkdirSync(dir, { recursive: true, mode: 0o700 }); chmodSync(dir, 0o700) }
@@ -84,7 +85,7 @@ function tmuxTerminal() {
 
 function herdrTerminal(herdr) {
   const name = herdrAgentName(config.id)
-  const session = herdrSession({ herdr, name, dir: privateDir, cwd: workdir, log })
+  const session = herdrSession({ herdr, name, dir: privateDir, cwd: workdir, launchMs: LAUNCH_MS, log })
   return { ...session, start: () => session.start({ command, env: sessionEnv }), attach: `shown in herdr, in workspace ${name}` }
 }
 

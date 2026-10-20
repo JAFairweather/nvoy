@@ -71,6 +71,7 @@ const WATCH_MS = Number(process.env.HARNESS_WATCH_MS || 5000)
 const RETRY_MS = Number(process.env.HARNESS_RETRY_MS || 5000)
 const RETRY_MAX_MS = Number(process.env.HARNESS_RETRY_MAX_MS || 300000)
 const SETTLE_MS = Number(process.env.HARNESS_CHANNEL_SETTLE_MS || 10000)
+const LAUNCH_MS = Number(process.env.HARNESS_LAUNCH_MS || 10000)
 
 function readJson(path) { try { return JSON.parse(readFileSync(path, 'utf8')) } catch { return {} } }
 function writePrivate(path, value) { writeFileSync(path, value, { mode: 0o600 }); chmodSync(path, 0o600) }
@@ -127,7 +128,7 @@ function tmuxTerminal() {
 }
 
 function herdrTerminal(herdr) {
-  const session = herdrSession({ herdr, name: herdrAgentName(manifest.id), dir: privateDir, cwd: workdir, log })
+  const session = herdrSession({ herdr, name: herdrAgentName(manifest.id), dir: privateDir, cwd: workdir, launchMs: LAUNCH_MS, log })
   const { CLAUDE_CODE_OAUTH_TOKEN, ...env } = sessionEnv
   return { ...session, start: resume => session.start({ command: args(resume), env, credential: { env: 'CLAUDE_CODE_OAUTH_TOKEN', file: credentialFile } }) }
 }
