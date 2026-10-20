@@ -145,9 +145,11 @@ function query(url, filter, ms = 10000) {
 // --- 1. Fetch policy: the grants, from the relays, verified here. -----------------------------
 const grantEvents = new Map()
 let relaysAnswered = 0
+const relayAnswers = []
 for (const url of RELAYS) {
   const { out, answered } = await query(url, { kinds: [KIND.grant, KIND.revocation], authors: GRANTORS, limit: 500 })
   if (answered) relaysAnswered++
+  relayAnswers.push({ relay: url, answered, events: out.length })
   for (const e of out) grantEvents.set(e.id, e)
 }
 
@@ -206,7 +208,7 @@ const TASK_CARRIERS = (() => {
 // relay was signed by its author and never wrapped, so the broker needs only this answer — who
 // holds which live grant for this identity — and must not pay for, or be confused by, a 1059 read.
 if (process.argv.includes('--policy-only')) {
-  console.log(JSON.stringify({ me: ME, policyUsable: relaysAnswered > 0, relaysAnswered,
+  console.log(JSON.stringify({ me: ME, policyUsable: relaysAnswered > 0, relaysAnswered, relays: relayAnswers,
     grants: [...permitted.entries()].flatMap(([pk, caps]) => [...caps.values()].map(g =>
       ({ pubkey: pk, cap: g.cap, grant_id: g.grantId, grantor: String(g.grantor).toLowerCase() }))) }))
   process.exit(0)
@@ -272,7 +274,7 @@ if (process.argv.includes('--mark')) {
 }
 
 if (process.argv.includes('--json')) {
-  console.log(JSON.stringify({ me: ME, grantors: GRANTORS, relaysAnswered, policyUsable,
+  console.log(JSON.stringify({ me: ME, grantors: GRANTORS, relaysAnswered, relays: relayAnswers, policyUsable,
     permitted: [...permitted.entries()].map(([pk, caps]) => ({ pubkey: pk, caps: [...caps.keys()] })), rejectedGrants: rejected,
     actionable, admissions, notifications, dataOnly: dataOnly.map(m => ({ from: m.from, at: m.at })) }, null, 2))
   // JSON is a transport format, not a weakening of the scheduler contract. The instance
