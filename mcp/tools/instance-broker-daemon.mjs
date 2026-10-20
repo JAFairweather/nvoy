@@ -9,6 +9,7 @@ import { resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { isTerminalReplyFailure, loadTerminalReplyIds, recordTerminalReply } from './reply_retry.mjs'
+import { childVerdict } from './broker_verdict.mjs'
 
 const die = m => { console.error(`instance-broker-daemon: ${m}`); process.exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -67,10 +68,15 @@ function drain() {
     const args = item.native ? [nativeBroker, 'deliver', '--instance', manifest.id, '--event', item.envelope]
       : [broker, 'deliver', '--instance', manifest.id, '--envelope', item.envelope]
     const r = spawnSync(process.execPath, args, { env: childEnv, encoding: 'utf8', timeout: 90000 })
+    const verdict = childVerdict(r)
     if (r.status !== 0) {
       retryAfter.set(key, Date.now() + 5000)
-      console.error(`instance-broker-daemon: ${item.envelope.slice(0, 12)}… held for retry: ${String(r.stderr || '').trim()}`)
-    } else retryAfter.delete(key)
+      console.error(`instance-broker-daemon: ${item.envelope.slice(0, 12)}… held for retry: ${verdict.join(' | ') || `exit ${r.status ?? 'signal'}: ${String(r.stderr || '').trim().slice(0, 240)}`}`)
+    } else {
+      retryAfter.delete(key)
+      // The funnel's only record of what became of a heard message: admitted, or why not.
+      for (const line of verdict) console.log(`instance-broker-daemon: ${line}`)
+    }
   }
   // AD-12: adapter/worker output is a proposal, never standing authority to sign. The daemon may
   // announce a queued proposal, but it must not invoke the keyed reply actuator. A separate,

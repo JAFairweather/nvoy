@@ -20,6 +20,7 @@ import { claimBrokerLock } from './broker_lock.mjs'
 import { brokerSigner } from './broker_signer.mjs'
 import { nativeMention, openBuzzSession } from './buzz_native.mjs'
 import { recordStatusAdmission } from './buzz_status.mjs'
+import { grantLookup, noGrantVerdict } from './grant_evidence.mjs'
 
 const HEX64 = /^[0-9a-f]{64}$/
 let signer
@@ -85,10 +86,11 @@ if (checked.status !== 0) requeue(`policy check failed (${checked.status ?? 'sig
 let policy
 try { policy = JSON.parse(checked.stdout) } catch { requeue('policy check returned invalid JSON') }
 if (policy.me !== me) die('policy was evaluated for a different identity')
-if (!policy.policyUsable) requeue('live grant policy unavailable')
+const lookup = grantLookup(resolve(manifest.stateDir, 'grant-relays.json'), policy.relays)
+if (!policy.policyUsable) requeue(`live grant policy unavailable (relays ${lookup.summary})`)
 const grants = (Array.isArray(policy.grants) ? policy.grants : []).filter(g => g?.pubkey === mention.author && manifest.grantors.includes(g.grantor))
 const grant = grants.find(g => g.cap === 'task+act') || grants.find(g => g.cap === 'task')
-if (!grant || !HEX64.test(String(grant.grant_id || ''))) finish('author holds no live task grant; heard as data only')
+if (!grant || !HEX64.test(String(grant.grant_id || ''))) finish(`author ${mention.author.slice(0, 8)} holds no live task grant; heard as data only [${noGrantVerdict(lookup)}]`)
 
 // 3. One signed message, one admission — across native and carried paths alike.
 const sourceIndex = resolve(manifest.stateDir, 'channel-source-admissions.jsonl')

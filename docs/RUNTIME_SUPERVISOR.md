@@ -829,7 +829,7 @@ What is *not* intuitive is which volumes are safe to drop. `docker compose down`
 | volume | holds | dropping it costs |
 |---|---|---|
 | `nvoy-<id>_watcher_spool` | `keyless-wake-seen.log`, the wake queue, retired envelope markers; with a `buzz` block also `buzz-wake-seen.log`, `buzz-wake-since` and `buzz-auth.sock` | the watcher re-scans its 48h relay window and re-records envelopes whose markers were already retired. Downstream dedup should absorb it — which makes dedup **load-bearing for a routine operation** |
-| `nvoy-<id>_broker_state` | `receipts/`, `outbound/`, `terminal-replies.jsonl`, channel-source admissions | the signing audit trail, and terminal classification — so retry loops that #145 killed **can resurrect** |
+| `nvoy-<id>_broker_state` | `receipts/`, `outbound/`, `terminal-replies.jsonl`, channel-source admissions, `grant-relays.json` (which relays have ever returned grants) | the signing audit trail, and terminal classification — so retry loops that #145 killed **can resurrect**; and an all-empty grant answer is believed again rather than logged `no-grant-suspect` |
 | `nvoy-<id>_adapter_runtime` | `admitted-tasks.jsonl`, the adapter socket, the channel read cursor | unread wakes. And because #149 re-announces until read, a lost read cursor **re-steers the agent on mail it has already handled** |
 | `nvoy-<id>_broker_credentials` | Bunker URI + NIP-46 client | a **Bunker re-pair**. The pairing secret is effectively single-use, and a spent one presents as `Unknown client`, which blames the client key rather than the secret |
 | `nvoy-<id>_worker_credentials` | the model-provider key | the provider key must be re-seated (worker-enabled identities only) |
