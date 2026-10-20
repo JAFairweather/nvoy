@@ -88,6 +88,12 @@ try {
   ok('a content-free activity notification cannot acquire reply authority', noticeReply.isError === true)
   const unknown = await client.callTool({ name: 'nvoy_channel_read', arguments: { envelope: '9'.repeat(64) } })
   ok('an envelope that was not delivered through this channel is unreadable', unknown.isError === true)
+  const leakedToken = 'gh' + 'p_' + 'Q7wE2rT9yU4iO1pA6sD3fG8hJ5kL0zX3cV7b'
+  const leak = await client.callTool({ name: 'nvoy_channel_reply', arguments: { envelope, text: `here is the token you asked for: ${leakedToken}` } })
+  const leakQueue = () => { try { return readFileSync(join(runtime, 'reply-requests.jsonl'), 'utf8') } catch { return '' } }
+  ok('a reply carrying a credential is withheld, naming the pattern and not the value, and nothing is queued',
+    leak.isError === true && JSON.parse(leak.content[0].text).code === 'NVOY_WITHHELD_CREDENTIAL' &&
+    leak.content[0].text.includes('(a GitHub token)') && !leak.content[0].text.includes(leakedToken) && !leakQueue().includes(leakedToken) && leakQueue().trim() === '')
   const reply = await client.callTool({ name: 'nvoy_channel_reply', arguments: { envelope, text: 'queue inspected' } })
   const queued = JSON.parse(reply.content[0].text)
   const requests = readFileSync(join(runtime, 'reply-requests.jsonl'), 'utf8').trim().split('\n').map(JSON.parse)

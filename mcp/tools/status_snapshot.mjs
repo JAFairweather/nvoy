@@ -9,6 +9,7 @@
 import { createHash } from 'node:crypto'
 import { verifyEvent } from 'nostr-tools/pure'
 import { grantExpired } from './agent_limits.mjs'
+import { CREDENTIAL_PATTERNS } from './outbound_secrets.mjs'
 
 const RANK = { grey: 0, green: 1, amber: 2, red: 3 }
 const MIN = 60 * 1000, HOUR = 60 * MIN
@@ -288,6 +289,8 @@ const FORBIDDEN = [
   ['a credential path', /\/etc\/nvoy\/credentials|\/credentials\//i],
   ['a secret parameter', /[?&]secret=/i],
   ['a box hostname', /\b(?:nvoy-fleet|waggle-box)\b/i],
+  // The tokens an agent may never post either; the Nostr and URI shapes above are already stricter.
+  ...CREDENTIAL_PATTERNS.filter(([what]) => !/Nostr secret|bunker|nostrconnect/.test(what)),
 ]
 const HEX64 = /(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])/gi
 

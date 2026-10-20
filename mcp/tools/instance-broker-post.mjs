@@ -20,6 +20,7 @@ import { channelPost, openBuzzSession } from './buzz_native.mjs'
 import { replyRequestDigest } from './outbound_record.mjs'
 import { countInWindow } from './agent_limits.mjs'
 import { POST_ONLY_REPLY, postQueuePath, validatePostRequest } from './agent_post.mjs'
+import { contentHash, credentialIn, withheldMessage } from './outbound_secrets.mjs'
 
 let signer
 const exit = code => { try { signer?.close?.() } catch { /* best effort */ } process.exit(code) }
@@ -44,6 +45,9 @@ try {
 } catch (e) { die(`cannot read post request queue: ${e.message}`) }
 if (!request) die('post request is not present in this instance queue')
 try { validatePostRequest(request, manifest) } catch (e) { die(e.message) }
+// Again here, where the signer is: a client that writes the queue without the tool skips the tool's check.
+const leaked = credentialIn(request.content)
+if (leaked) die(`post refused: ${withheldMessage(leaked)} [post sha256 ${contentHash(request.content)}] instance ${manifest.id}`)
 const digest = replyRequestDigest(request)
 
 const postsDir = resolve(manifest.stateDir, 'posts')

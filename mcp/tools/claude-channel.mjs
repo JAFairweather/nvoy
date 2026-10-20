@@ -15,6 +15,7 @@ import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest
 import { validateDesktopDelivery } from './admitted_task.mjs'
 import { requestWorkingStatus } from './buzz_status.mjs'
 import { MENTION_SCHEMA, capabilityHash, capabilityInstructions, capabilitySummary, postToolSpec, queuePost, resolveReplyMention } from './agent_post.mjs'
+import { credentialIn, withheld } from './outbound_secrets.mjs'
 
 const die = message => { console.error(`nvoy-claude-channel: ${message}`); process.exit(1) }
 const flag = name => { const i = process.argv.indexOf(name); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -276,6 +277,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async request => {
   if (request.params.name !== 'nvoy_channel_reply') return toolResult({ code: 'NVOY_UNKNOWN_TOOL' }, true)
   const content = String(args.text || '').trim()
   if (!content || Buffer.byteLength(content) > 4000) return toolResult({ code: 'NVOY_BAD_REPLY' }, true)
+  const credential = credentialIn(content)
+  if (credential) { const { error, log } = withheld({ instance: manifest.id, path: 'nvoy-claude-channel', name: credential, text: content }); console.error(log); return toolResult(error, true) }
   if (task.type !== 'admitted-task' || task.messages.length !== 1) {
     return toolResult({ code: 'NVOY_REPLY_REQUIRES_ONE_SENDER' }, true)
   }

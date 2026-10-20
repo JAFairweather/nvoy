@@ -54,6 +54,11 @@ try {
   ok('read acknowledgement is durable and identity-local', after.records.find(row => row.envelope === dataEnvelope).read === true && readFileSync(join(runtime, 'codex-mcp-state', 'read.jsonl'), 'utf8').includes(dataEnvelope))
   const denied = await client.callTool({ name: 'nvoy_channel_reply', arguments: { envelope: dataEnvelope, text: 'no' } })
   ok('data-only feedback cannot acquire reply authority', denied.isError === true && readFileSync(join(runtime, 'reply-requests.jsonl'), 'utf8') === '')
+  const leakedKey = 's' + 'k-ant-api03-' + 'x9Kd2Lm4Np6Qr8St0Uv2Wx4Yz6Ab8Cd0Ef2Gh4Ij6Kl8'
+  const leak = await client.callTool({ name: 'nvoy_channel_reply', arguments: { envelope: instructionEnvelope, text: `the key is ${leakedKey}` } })
+  ok('a reply carrying a credential is withheld, naming the pattern and not the value, and nothing is queued',
+    leak.isError === true && JSON.parse(leak.content[0].text).code === 'NVOY_WITHHELD_CREDENTIAL' && leak.content[0].text.includes('(an Anthropic key)') &&
+    !leak.content[0].text.includes(leakedKey) && readFileSync(join(runtime, 'reply-requests.jsonl'), 'utf8') === '')
   const reply = JSON.parse((await client.callTool({ name: 'nvoy_channel_reply', arguments: { envelope: instructionEnvelope, text: 'fixed' } })).content[0].text)
   const queued = JSON.parse(readFileSync(join(runtime, 'reply-requests.jsonl'), 'utf8'))
   ok('instruction reply contains no recipient, channel, signer, or instance selection', reply.queued === true && queued.receipt === instructionEnvelope && queued.content === 'fixed' &&

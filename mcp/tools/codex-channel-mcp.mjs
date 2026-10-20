@@ -11,6 +11,7 @@ import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest
 import { validateDesktopDelivery } from './admitted_task.mjs'
 import { requestWorkingStatus } from './buzz_status.mjs'
 import { MENTION_SCHEMA, capabilityInstructions, postToolSpec, queuePost, resolveReplyMention } from './agent_post.mjs'
+import { credentialIn, withheld } from './outbound_secrets.mjs'
 
 const die = message => { console.error(`nvoy-codex-channel-mcp: ${message}`); process.exit(1) }
 const flag = name => { const i = process.argv.indexOf(name); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -107,6 +108,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async request => {
   if (record.type !== 'admitted-task' || !record.authority || record.messages.length !== 1) return result({ code: 'NVOY_REPLY_NOT_AUTHORIZED', envelope }, true)
   const content = String(request.params.arguments?.text || '').trim()
   if (!content || Buffer.byteLength(content) > 4000) return result({ code: 'NVOY_BAD_REPLY' }, true)
+  const credential = credentialIn(content)
+  if (credential) { const { error, log } = withheld({ instance: manifest.id, path: 'nvoy-codex-channel-mcp', name: credential, text: content }); console.error(log); return result(error, true) }
   const { mention, ...refused } = resolveReplyMention(manifest, request.params.arguments?.mention)
   if (refused.code) return result(refused, true)
   try {

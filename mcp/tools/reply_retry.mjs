@@ -90,7 +90,8 @@ export function loadPublishedReplyIds(dir, requestDigests) {
 export function recordTerminalReply(path, ids, id, stderr, at = Date.now()) {
   if (!ID.test(String(id || ''))) throw new Error('terminal reply id is invalid')
   if (ids.has(id)) return false
-  const reason = String(stderr || '').includes('live matching grant') ? 'grant-no-longer-live' : 'receipt-not-live'
+  const text = String(stderr || '')
+  const reason = text.includes('withheld: ') ? 'withheld-credential' : text.includes('live matching grant') ? 'grant-no-longer-live' : 'receipt-not-live'
   appendFileSync(path, JSON.stringify({ version: 1, type: 'terminal-reply', id, reason, at }) + '\n', { mode: 0o600 })
   ids.add(id)
   return true

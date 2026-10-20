@@ -10,6 +10,7 @@ import { appendFileSync, existsSync, lstatSync, readFileSync } from 'node:fs'
 import { createHash, randomBytes } from 'node:crypto'
 import { resolve } from 'node:path'
 import { HOUR_MS } from './agent_limits.mjs'
+import { credentialIn, withheld } from './outbound_secrets.mjs'
 
 const HEX64 = /^[0-9a-f]{64}$/
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
@@ -128,6 +129,8 @@ function queueRows(path) {
 export function queuePost(manifest, args, now = Date.now()) {
   const resolved = resolvePost(manifest, args)
   if (resolved.code) return { error: resolved }
+  const credential = credentialIn(resolved.content)
+  if (credential) { const { error, log } = withheld({ instance: manifest.id, path: 'nvoy_channel_post', name: credential, text: resolved.content }); console.error(log); return { error } }
   const path = postQueuePath(manifest)
   // Provisioned by instance-runtime-init for a may_post manifest; the reader never creates it.
   if (!existsSync(path)) return { error: { code: 'NVOY_POST_QUEUE_FAILED', message: 'post request queue is not provisioned; re-run the runtime init' } }
