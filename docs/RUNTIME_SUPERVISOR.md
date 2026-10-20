@@ -665,7 +665,9 @@ session runs with that directory as `HOME`, so your own `~/.claude` is never rea
 
 The channel is an ssh child of the session, and it dies whenever the fleet recreates the
 identity's adapter (each release, each manifest change). Claude Code never restarts it, so the
-supervisor watches for it in the process table, among the session's descendants. It says `ready`
+supervisor watches for it in the process table, among the session's descendants. The ssh carries
+keepalives (15s × 3), so a carrier that dies without a close, from a recreated adapter, a sleep or a
+network change, ends the process within about 45s instead of leaving a half-open ssh that looks up. It says `ready`
 only once the prompt is idle and the channel has stayed up for `HARNESS_CHANNEL_SETTLE_MS` (10s).
 A channel that closes during startup, or never starts, fails the start. That is usually the fleet
 still holding the channel lock from a session that ended without EOF. A channel that closes under a

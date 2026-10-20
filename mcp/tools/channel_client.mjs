@@ -69,9 +69,13 @@ export function knownHostsFile(path) {
 
 // The only process the session may start for its channel: no config file, no agent or forwarding,
 // one identity, and a host key pinned in one file. The fleet's forced command decides the rest.
+// Keepalives end the process when the carrier dies without a close (a recreated adapter, a sleep, a
+// network change); otherwise a half-open ssh stays in the process table and the supervisor, which
+// watches for exactly that process, never restarts the session.
 export function sshChannelEntry({ identity, knownHosts, target }) {
   return { command: SSH, args: ['-F', '/dev/null', '-T', '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=yes',
-    '-o', `UserKnownHostsFile=${knownHosts}`, '-o', 'GlobalKnownHostsFile=/dev/null', '-o', 'ClearAllForwardings=yes', '-i', identity, target] }
+    '-o', `UserKnownHostsFile=${knownHosts}`, '-o', 'GlobalKnownHostsFile=/dev/null', '-o', 'ClearAllForwardings=yes',
+    '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3', '-i', identity, target] }
 }
 
 // A portable harness's whole configuration. It names paths, never values, and it can hold nothing
