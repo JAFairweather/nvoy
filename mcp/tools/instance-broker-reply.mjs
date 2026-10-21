@@ -17,7 +17,7 @@ import * as nip44 from 'nostr-tools/nip44'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { makeBunkerSigner } from './nip46-signer.mjs'
 import { verifyOutboundApproval } from './outbound_approval.mjs'
-import { channelReply, openBuzzSession } from './buzz_native.mjs'
+import { channelReply, openBuzzSession, validChannel } from './buzz_native.mjs'
 import { recordStatusReplied } from './buzz_status.mjs'
 import { countInWindow, nextHop } from './agent_limits.mjs'
 import { validateReplyMention } from './agent_post.mjs'
@@ -96,16 +96,22 @@ if (receipt.version === 2 && (!channelCarry || !/^[0-9a-f]{64}$/.test(String(rec
   die('channel-carry receipt is not bound to an allowed carrier and channel')
 }
 // v3: heard natively on the Buzz relay, so the answer is a kind:9 in the same channel, signed by
-// this identity and published on the community relay it is a member of.
+// this identity and published on the community relay it is a member of. A DM receipt answers in
+// that DM and nowhere else, and only ever the owner: the relay alone decides who reads a DM.
 const buzzNative = receipt.version === 3 && receipt.mode === 'buzz-native'
+const buzzDm = buzzNative && receipt.dm === true
 if (receipt.version === 3 && (!buzzNative || !manifest.buzz || !/^[0-9a-f]{64}$/.test(String(receipt.source_event || '')) ||
   receipt.source_event !== receipt.envelope || !/^[0-9a-f]{64}$/.test(String(receipt.reply_root || '')) ||
-  !manifest.buzz.channels.includes(receipt.reply_channel))) {
+  (receipt.dm !== undefined && !buzzDm) || (!buzzDm && !manifest.buzz.channels.includes(receipt.reply_channel)))) {
   die('native Buzz receipt is not bound to a configured channel')
+}
+if (buzzDm && (!validChannel(receipt.reply_channel) || manifest.buzz.channels.includes(receipt.reply_channel) || !manifest.grantors.includes(receipt.sender))) {
+  die('native Buzz DM receipt is not bound to a DM from this identity\'s owner')
 }
 // A mention reaches beyond the sender, so it is the post's allowlist, not the receipt, that permits it.
 if (request.mention !== undefined) {
   if (!buzzNative) die('reply refused: mentions are only for a native Buzz channel reply')
+  if (buzzDm) die('reply refused: a DM reply mentions no one')
   try { validateReplyMention(request.mention, manifest, receipt.reply_channel) } catch (e) { die(e.message) }
 }
 const credential = process.env.NVOY_BROKER_CREDENTIAL

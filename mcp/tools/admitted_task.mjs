@@ -25,8 +25,9 @@ export function validateAdmittedTask(record, { instance = '', scopeSubject = '',
   const v2Keys = [...v1Keys, 'carrier', 'carrier_grant_id', 'carrier_grantor', 'source_event', 'reply_channel']
   // v3: heard natively on the Buzz relay. The author signed the channel message itself, so there is
   // no carrier — the source event IS the envelope, and the reply channel must be one the manifest
-  // gave this identity.
-  const v3Keys = [...v1Keys, 'source_event', 'reply_channel']
+  // gave this identity — or, marked `dm`, a Buzz DM, which no manifest can list, and then only for
+  // a message the owner wrote.
+  const v3Keys = [...v1Keys, 'source_event', 'reply_channel', 'dm']
   const authorityKeys = a?.version === 3 ? v3Keys : a?.version === 2 ? v2Keys : v1Keys
   if (!a || typeof a !== 'object' || Array.isArray(a) || Object.keys(a).some(key => !authorityKeys.includes(key)) ||
       ![1, 2, 3].includes(a.version) || a.type !== 'scoped-instruction' || !HEX64.test(String(a.sender || '')) ||
@@ -48,8 +49,10 @@ export function validateAdmittedTask(record, { instance = '', scopeSubject = '',
     }
   }
   if (a.version === 3) {
-    if (!HEX64.test(String(a.source_event || '')) || record.envelope !== a.source_event ||
-        !buzz?.channels?.includes(a.reply_channel) || record.messages.length !== 1 ||
+    const dm = a.dm === true && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(String(a.reply_channel || '')) &&
+      grantors.includes(a.sender) && !buzz?.channels?.includes(a.reply_channel)
+    if (!HEX64.test(String(a.source_event || '')) || record.envelope !== a.source_event || (a.dm !== undefined && !dm) ||
+        !buzz?.channels || (!dm && !buzz.channels.includes(a.reply_channel)) || record.messages.length !== 1 ||
         record.messages.some(message => message.event_id !== a.source_event || message.kind !== 9)) {
       throw new Error('invalid native Buzz authority')
     }

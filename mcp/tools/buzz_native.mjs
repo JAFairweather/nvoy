@@ -25,6 +25,9 @@ const HEX64 = /^[0-9a-f]{64}$/
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '[::1]'])
 export const CHANNEL_KINDS = Object.freeze([9, 40002])
+// Relay-signed membership notices: 44100 added, 44101 removed (block/buzz NOSTR.md "Membership
+// Notifications"). They carry no channel scope, so they are the one stream read without #h.
+export const MEMBERSHIP_KINDS = Object.freeze([44100, 44101])
 // nostr-tools caches a passed verification on the event object under a symbol, and object spread
 // copies it — so a tampered copy of a verified event would verify. Check a clean copy of the fields.
 const verified = (ev, verify = verifyEvent) => {
@@ -104,6 +107,37 @@ export function nativeMention(ev, { me, channels, now = Math.floor(Date.now() / 
   return { channel: h[0], author: ev.pubkey, event_id: ev.id, created_at: ev.created_at }
 }
 
+// A Buzz DM is a channel like any other — kind:9 with an h tag, and clients p-tag every participant
+// — so what makes it a DM is its channel type, `dm`. The relay stamps that type as the first t tag
+// on the channel's 39000 and on every 44100/44101 notice about it, and a client cannot submit a
+// notice of its own (block/buzz NOSTR.md, NIP-CL). The relay also refuses a notice filter whose #p
+// is anyone but the reader, so this one asks only about `me`.
+export const dmNoticeFilter = me => ({ kinds: [...MEMBERSHIP_KINDS], '#p': [me], '#t': ['dm'] })
+
+// The DM channels `me` is in now: the newest signed notice for each channel decides, and a removal
+// stamped in the same second as an add wins, so a tie leaves the identity listening to less.
+export function dmChannels(notices, { me, verify = verifyEvent }) {
+  const latest = new Map()
+  const usable = (Array.isArray(notices) ? notices : []).filter(ev => MEMBERSHIP_KINDS.includes(ev?.kind) &&
+    Number.isSafeInteger(ev.created_at) && tagValues(ev, 'p').includes(me) && tagValues(ev, 't')[0] === 'dm' &&
+    tagValues(ev, 'h').length === 1 && validChannel(tagValues(ev, 'h')[0]) && verified(ev, verify))
+  usable.sort((a, b) => a.created_at - b.created_at || a.kind - b.kind)
+  for (const ev of usable) latest.set(tagValues(ev, 'h')[0], ev.kind === MEMBERSHIP_KINDS[0])
+  return [...latest].filter(([, member]) => member).map(([channel]) => channel).sort()
+}
+
+// Who may task this identity with a native message. In a channel: anyone holding a live task grant
+// from a manifest grantor, as before. In a DM: the owner alone — the manifest's grantors, the same
+// keys every grant descends from — and still on the owner's own live grant, so a revocation silences
+// a DM exactly as it silences a channel. A grant held by anyone else, another agent included, is no
+// way into a DM. James, 2026-10-21: "owner only I think - I don't want agents DM'ing each other".
+export function nativeGrant({ author, dm, grants, grantors }) {
+  if (dm && !grantors.includes(author)) return null
+  const held = (Array.isArray(grants) ? grants : []).filter(g => g?.pubkey === author && grantors.includes(g.grantor))
+  const grant = held.find(g => g.cap === 'task+act') || held.find(g => g.cap === 'task')
+  return grant && HEX64.test(String(grant.grant_id || '')) ? grant : null
+}
+
 // One authenticated connection. `signer` is { getPublicKey(), signEvent(template) }; the pubkey
 // is resolved BEFORE the socket opens, both to warm a Bunker inside the 5s window and so a
 // signer that answers for a different key is caught before anything is sent. `pingMs` makes a
@@ -149,7 +183,10 @@ export async function openBuzzSession({ relay, signer, timeoutMs = 10000, pingMs
   // a timer behind when send throws on a closed socket — one that later rejects with no one listening.
   const sendAndAwaitOk = (frame, id) => { send(frame); return bounded(new Promise((resolve, reject) => waiters.set(id, { resolve, reject })), 'relay OK') }
   const close = () => { closedWith ??= 'session closed'; try { ws.close() } catch { /* already gone */ } }
-  const needsChannels = filters => !filters.length || filters.some(f => !Array.isArray(f?.['#h']) || !f['#h'].length || !f['#h'].every(validChannel))
+  // A membership-notice filter is the one exception, and only for our own notices.
+  const notices = f => Array.isArray(f?.kinds) && f.kinds.length && f.kinds.every(k => MEMBERSHIP_KINDS.includes(k)) &&
+    Array.isArray(f['#p']) && f['#p'].length === 1 && f['#p'][0] === me && f['#h'] === undefined
+  const needsChannels = filters => !filters.length || filters.some(f => !notices(f) && (!Array.isArray(f?.['#h']) || !f['#h'].length || !f['#h'].every(validChannel)))
 
   try {
     const c = challenge ?? await bounded(new Promise((resolve, reject) => { onChallenge = { resolve, reject } }), 'AUTH challenge')
@@ -182,7 +219,8 @@ export async function openBuzzSession({ relay, signer, timeoutMs = 10000, pingMs
     publishSigned,
     // Sign and publish; resolves only on the relay's OK, and reports its refusal verbatim.
     async publish(template) { return publishSigned(await signer.signEvent(template)) },
-    // Stored events up to EOSE. Every filter must name its channels, or Buzz answers with nothing.
+    // Stored events up to EOSE. Every filter must name its channels (or ask for our own membership
+    // notices), or Buzz answers with nothing.
     async fetch(...filters) {
       if (needsChannels(filters)) throw new Error('every Buzz filter needs #h channel UUIDs — without it the relay returns nothing')
       const id = `q${++n}`
