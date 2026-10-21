@@ -24,13 +24,13 @@
 // Like the fleet form it never reads a message body or a reply: Codex does, through the keyless
 // channel tools, and the broker rechecks the grant before it signs.
 
-import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { homedir } from 'node:os'
-import { isAbsolute, resolve } from 'node:path'
+import { delimiter, dirname, isAbsolute, relative, resolve } from 'node:path'
 import { fixedPath, knownHostsFile, privateFile, sshChannelEntry, SSH, SSH_TARGET } from './channel_client.mjs'
 import { instanceId } from './runtime_manifest.mjs'
-import { codexConfigToml, codexTurnText, defaultInstructions, serverName } from './harness_session.mjs'
+import { CHANNEL_PERMISSIONS, codexConfigToml, codexTurnText, defaultInstructions, serverName } from './harness_session.mjs'
 import { openThread } from './codex_harness.mjs'
 import { connectWsPeer } from './codex_ws_peer.mjs'
 import { claimPidLock } from './pid_lock.mjs'
@@ -107,6 +107,22 @@ export function sshFeedArgs(config) {
   return sshChannelEntry({ identity: config.feedIdentity, knownHosts: config.knownHosts, target: config.target }).args
 }
 
+// The Codex the app-server runs, by its real path, and the release directory holding it: Codex's file
+// helper re-executes the binary it was started as under the thread's permission profile, so that
+// release must be readable and a symlink into the owner's home (~/.local/bin/codex points into
+// ~/.codex) must not be the path. A release holding the home directory or this CODEX_HOME is refused.
+export function codexInstall({ path = process.env.PATH || '', home = homedir(), codexHome }) {
+  for (const dir of path.split(delimiter).filter(isAbsolute)) {
+    let bin
+    try { bin = realpathSync(resolve(dir, 'codex')); if (!statSync(bin).isFile()) continue } catch { continue }
+    const release = dirname(dirname(bin))
+    const holds = inner => { const r = relative(release, realpathSync(inner)); return r === '' || (!r.startsWith('..') && !isAbsolute(r)) }
+    if (holds(home) || holds(codexHome)) throw new Error(`codex at ${bin} sits in a directory that holds the home directory or the harness's CODEX_HOME; its shell commands would read them`)
+    return { bin, release }
+  }
+  throw new Error('codex is not on PATH')
+}
+
 // The command a viewer runs to attach to the thread, for a terminal that shows it (herdr).
 export const viewerCommand = ({ codexHome, socket, threadId }) => ({
   command: ['codex', 'resume', threadId, '--remote', `unix://${socket}`],
@@ -134,7 +150,8 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
   process.on('exit', () => { for (const child of children) try { child.kill('SIGTERM') } catch {} viewer?.hide(); release() })
 
   const manifest = { id: config.id, pubkey: config.pubkey, buzz: { channels: config.channels }, harness: { runner: 'codex', model: config.model } }
-  writePrivate(resolve(codexHome, 'config.toml'), codexConfigToml({ manifest, root: '', model: config.model, auth: 'chatgpt',
+  const codex = codexInstall({ codexHome })
+  writePrivate(resolve(codexHome, 'config.toml'), codexConfigToml({ manifest, root: '', model: config.model, auth: 'chatgpt', codexRelease: codex.release,
     remote: { identity: config.identity, knownHosts: config.knownHosts, target: config.target } }))
   if (!existsSync(resolve(workdir, 'AGENTS.md'))) writePrivate(resolve(workdir, 'AGENTS.md'), defaultInstructions(manifest))
 
@@ -213,7 +230,7 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
       if (existsSync(socket)) { if (!lstatSync(socket).isSocket()) throw new Error('the control socket path holds something that is not a socket'); rmSync(socket) }
       // Its own session, off the supervisor's terminal, so a terminal manager (herdr) sees Codex only in
       // the pane that attaches to it; the exit handler above still stops it.
-      child = spawn('codex', ['app-server', '--listen', `unix://${socket}`], { stdio: ['ignore', 'ignore', 'pipe'], env, detached: true })
+      child = spawn(codex.bin, ['app-server', '--listen', `unix://${socket}`], { stdio: ['ignore', 'ignore', 'pipe'], env, detached: true })
       children.add(child)
       let stderr = ''
       child.stderr.on('data', data => { stderr = (stderr + String(data)).slice(-4000) })
@@ -230,7 +247,7 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
       chmodSync(socket, 0o600)
       await server.request('initialize', { clientInfo: { name: 'nvoy-harness', title: 'Nvoy harness', version: '1' }, capabilities: { experimentalApi: true } })
       server.notify('initialized')
-      const { threadId, thread, saved } = await openThread({ server, manifest, workdir, threadPath, log, writePrivate })
+      const { threadId, thread, saved } = await openThread({ server, manifest, workdir, threadPath, log, writePrivate, permissions: CHANNEL_PERMISSIONS })
       // '' when the channel answered, null when this Codex cannot be asked, else why it is down.
       // Any answer, a tool error included, is a live channel; only a failed call is a dead one. On
       // 0.149.1 a server that has exited rejects with -32603 "Transport closed", an unknown method
@@ -280,7 +297,7 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
           let turn = ''
           if (!busy) {
             try {
-              turn = String((await server.request('turn/start', { threadId, input, clientUserMessageId }))?.turn?.id || '')
+              turn = String((await server.request('turn/start', { threadId, input, clientUserMessageId, permissions: CHANNEL_PERMISSIONS }))?.turn?.id || '')
               if (!turn) throw new Error('Codex returned no turn id')
               busy = !ended.has(turn); turnEnvelope.set(turn, next.envelope)
             } catch (error) { if (server.closed) throw error; log(`turn/start refused (${error.message}); queueing behind the running turn`) }

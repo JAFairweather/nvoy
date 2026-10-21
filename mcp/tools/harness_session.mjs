@@ -126,10 +126,14 @@ export const CODEX_CHANNEL_TOOLS = ['nvoy_channel_list', 'nvoy_channel_read', 'n
 // is the SSH forced command, as for the portable Claude harness. On the owner's own box,
 // `sandbox_mode = "read-only"` lets shell commands read every file the owner can: the GitHub
 // login, other harnesses' tokens, ssh keys (dj-codex, 2026-10-20). So its shell commands get a
-// permission profile instead: platform and Homebrew paths and the thread's workspace, read-only,
-// nothing in the home directory, no network. Codex starts MCP servers outside the sandbox, so the
-// channel's ssh still reads its key.
-export function codexConfigToml({ manifest, root, model = '', auth = 'api-key', remote = null }) {
+// permission profile instead: platform and Homebrew paths, the Codex release that runs them and the
+// thread's workspace, read-only, nothing else in the home directory, no network. Codex's own file
+// helper runs that release under the profile, so without it a resume fails to load AGENTS.md. Codex
+// starts MCP servers outside the sandbox, so the channel's ssh still reads its key. A thread keeps the
+// profile it was started under, so the supervisor names this one on every resume and turn too.
+export const CHANNEL_PERMISSIONS = 'nvoy-channel'
+
+export function codexConfigToml({ manifest, root, model = '', auth = 'api-key', remote = null, codexRelease = '' }) {
   const q = value => JSON.stringify(String(value))
   if (auth === 'chatgpt') {
     if (!remote) throw new Error('a ChatGPT-login Codex config reaches its channel only through the SSH forced command')
@@ -139,12 +143,13 @@ export function codexConfigToml({ manifest, root, model = '', auth = 'api-key', 
       'forced_login_method = "chatgpt"',
       'cli_auth_credentials_store = "file"',
       'approval_policy = "never"',
-      'default_permissions = "nvoy-channel"',
+      `default_permissions = ${q(CHANNEL_PERMISSIONS)}`,
       '',
-      '[permissions.nvoy-channel.filesystem]',
+      `[permissions.${CHANNEL_PERMISSIONS}.filesystem]`,
       '":minimal" = "read"',
       '"/opt/homebrew" = "read"',
       '":workspace_roots" = "read"',
+      ...(codexRelease ? [`${q(codexRelease)} = "read"`] : []),
       '',
       `[mcp_servers.${serverName(manifest)}]`,
       `command = ${q(entry.command)}`,

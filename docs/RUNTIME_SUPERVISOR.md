@@ -724,9 +724,13 @@ owner's ChatGPT subscription rather than an API key, which a person can attach t
   and the channel key's ssh entry as its one MCP server, with the three channel tools pre-approved.
   Shell commands run under a `nvoy-channel` permission profile (`default_permissions`), not
   `sandbox_mode = "read-only"`, which on the owner's box reads every file the owner can: they read
-  `:minimal`, `/opt/homebrew` and the workspace, nothing in the home directory, write nothing and
-  have no network. Codex starts MCP servers outside that sandbox, so the channel's ssh still reads
-  its key. The supervisor refuses to start if `auth.json` is missing,
+  `:minimal`, `/opt/homebrew`, the workspace and the Codex release that runs them, nothing else in
+  the home directory, write nothing and have no network. The supervisor runs `codex` by its real
+  path (`~/.local/bin/codex` is a symlink into `~/.codex`), because Codex's file helper re-executes
+  that binary under the profile, and it refuses a release directory that holds the home directory
+  or `CODEX_HOME`. A resumed thread keeps the profile it started under whatever `config.toml` says,
+  so `thread/start`, `thread/resume` and every `turn/start` name the profile. Codex starts MCP
+  servers outside that sandbox, so the channel's ssh still reads its key. The supervisor refuses to start if `auth.json` is missing,
   if its `auth_mode` is not `chatgpt`, if it holds an API key, or if `OPENAI_API_KEY` or
   `CODEX_API_KEY` is set. It reads only those fields and prints none. Codex gets a built environment
   of `PATH`, `HOME` and `CODEX_HOME` only.
