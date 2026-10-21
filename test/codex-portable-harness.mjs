@@ -2,13 +2,13 @@
 // lock, the feed's forced-command line, and the watchable supervisor end to end. No real Codex, SSH
 // or ChatGPT login runs: a fake `codex app-server --listen unix://…` speaks WebSocket over a Unix
 // socket, and a fake ssh execs the local feed script. The first live session is the operator's check.
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { sshChannelEntry } from '../mcp/tools/channel_client.mjs'
 import { CODEX_CHANNEL_TOOLS, codexConfigToml, codexTurnText } from '../mcp/tools/harness_session.mjs'
-import { attachCommand, sshFeedArgs } from '../mcp/tools/codex_portable_harness.mjs'
+import { attachCommand, codexInstall, sshFeedArgs } from '../mcp/tools/codex_portable_harness.mjs'
 import { claimPidLock } from '../mcp/tools/pid_lock.mjs'
 import { fakeHerdr } from './fake-herdr.mjs'
 
@@ -45,11 +45,17 @@ const record = (n, type = 'admitted-task') => JSON.stringify({ version: 1, type,
 const remote = { identity: '/keys/cx-channel', knownHosts: '/keys/known_hosts', target: 'nvoy-codex@broker.example' }
 const toml = codexConfigToml({ manifest: { id: 'cx-test' }, root: '', auth: 'chatgpt', remote })
 const tomlLines = toml.split('\n').filter(Boolean)
-ok('the ChatGPT config is well-formed TOML of tables and single-line keys', tomlLines.every(line => /^\[[a-z0-9_.-]+\]$/i.test(line) || /^[a-z_]+ = (?:"[^"]*"|\[.*\])$/.test(line)))
+ok('the ChatGPT config is well-formed TOML of tables and single-line keys', tomlLines.every(line => /^\[[a-z0-9_.-]+\]$/i.test(line) || /^(?:[a-z_]+|"[^"]+") = (?:"[^"]*"|\[.*\])$/.test(line)))
 const args = JSON.parse(tomlLines.find(line => line.startsWith('args = ')).slice(7))
 ok('the ChatGPT config forces the ChatGPT login from a file store, with no provider and no key', /^forced_login_method = "chatgpt"$/m.test(toml) &&
   /^cli_auth_credentials_store = "file"$/m.test(toml) && !/model_provider|env_key|OPENAI_API_KEY|requires_openai_auth|sk-|base_url/.test(toml))
-ok('the ChatGPT config asks for no approval and keeps shell commands read-only', /^approval_policy = "never"$/m.test(toml) && /^sandbox_mode = "read-only"$/m.test(toml) && !/danger|full-access/.test(toml))
+ok('the ChatGPT config asks for no approval and keeps shell commands read-only', /^approval_policy = "never"$/m.test(toml) && !/danger|full-access/.test(toml))
+const profile = toml.split('[permissions.nvoy-channel.filesystem]\n')[1]?.split('\n\n')[0] || ''
+ok('its shell commands read only platform paths and the workspace, never the home directory or the root', /^default_permissions = "nvoy-channel"$/m.test(toml) &&
+  !/^sandbox_mode/m.test(toml) && profile.split('\n').sort().join('\n') === ['"/opt/homebrew" = "read"', '":minimal" = "read"', '":workspace_roots" = "read"'].sort().join('\n') &&
+  !/:root|~|\/Users|write|network/.test(toml.split('[mcp_servers')[0]))
+const withRelease = codexConfigToml({ manifest: { id: 'cx-test' }, root: '', auth: 'chatgpt', remote, codexRelease: '/opt/codex/releases/0.163.0' })
+ok('the Codex release that runs its shell commands is readable too, and nothing more', withRelease.replace('"/opt/codex/releases/0.163.0" = "read"\n', '') === toml)
 ok('its one MCP server is the hardened ssh entry to the channel forced command', (toml.match(/^\[mcp_servers\.[^.\]]+\]$/gm) || []).length === 1 &&
   toml.includes('[mcp_servers.nvoy-cx-test]\ncommand = "/usr/bin/ssh"\n') && JSON.stringify(args) === JSON.stringify(sshChannelEntry(remote).args) && !/NVOY_INSTANCE_ROOT/.test(toml))
 ok('each keyless channel tool, and only those, is pre-approved', CODEX_CHANNEL_TOOLS.every(tool => toml.includes(`[mcp_servers.nvoy-cx-test.tools.${tool}]\napproval_mode = "approve"\n`)) &&
@@ -199,10 +205,12 @@ writeFileSync(join(otherRoot, 'cx-test.json'), JSON.stringify({ ...manifest, wor
 const wrongUser = spawnSync(process.execPath, ['mcp/tools/codex-channel-feed.mjs', '--instance', 'cx-test'], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: otherRoot }, input: '' })
 ok('the feed runs only as the manifest-bound worker user', wrongUser.status === 1 && /worker user/.test(wrongUser.stderr))
 
-// Supervisor, against a fake WebSocket-over-unix app-server and a fake ssh that runs the feed locally
-const fakeBin = join(root, 'bin')
-mkdirSync(fakeBin, { mode: 0o700 })
-writeFileSync(join(fakeBin, 'codex'), `#!/usr/bin/env node
+// Supervisor, against a fake WebSocket-over-unix app-server and a fake ssh that runs the feed locally.
+// PATH reaches the fake through a symlink, as ~/.local/bin/codex reaches a release under ~/.codex.
+const fakeBin = join(root, 'bin'), fakeRelease = join(root, 'release', '0.0.0'), fakeCodex = join(fakeRelease, 'bin', 'codex')
+mkdirSync(fakeBin, { mode: 0o700 }); mkdirSync(dirname(fakeCodex), { recursive: true, mode: 0o700 })
+symlinkSync(fakeCodex, join(fakeBin, 'codex'))
+writeFileSync(fakeCodex, `#!/usr/bin/env node
 const net = require('node:net'), crypto = require('node:crypto'), fs = require('node:fs')
 const home = process.env.CODEX_HOME
 const log = row => fs.appendFileSync(home + '/fake.jsonl', JSON.stringify(row) + '\\n')
@@ -214,7 +222,7 @@ if (process.argv[2] === 'resume') {
 }
 if (process.argv[2] !== 'app-server' || process.argv[3] !== '--listen' || !String(process.argv[4]).startsWith('unix://')) process.exit(2)
 const path = process.argv[4].slice(7)
-log({ start: true, pid: process.pid, env: Object.keys(process.env).sort(), listen: path })
+log({ start: true, pid: process.pid, env: Object.keys(process.env).sort(), listen: path, exe: process.argv[1] })
 fs.rmSync(home + '/mcp-dead', { force: true })
 const THREAD = fs.existsSync(home + '/unsaved') ? '0199a213-81c0-7800-8aa1-cccccccccccc' : '0199a213-81c0-7800-8aa1-bbab2a035a53'
 const conns = new Set()
@@ -272,7 +280,7 @@ net.createServer(sock => {
 }).listen(path)
 process.on('SIGTERM', () => { try { fs.rmSync(path) } catch {} process.exit(0) })
 `)
-chmodSync(join(fakeBin, 'codex'), 0o755)
+chmodSync(fakeCodex, 0o755)
 const fakeSsh = secretFile(join(fakeBin, 'ssh'), `#!/bin/sh
 echo "$@" >> ${join(root, 'ssh-args.log')}
 NVOY_INSTANCE_ROOT=${fleet} exec ${process.execPath} ${resolve('mcp/tools/codex-channel-feed.mjs')} --instance cx-test --heartbeat-ms 150 --poll-ms 40
@@ -340,6 +348,9 @@ ok('the thread\'s channel is asked before ready, by the channel\'s own tool', cl
   clientCalls('mcpServer/tool/call')[0]?.params.tool === 'nvoy_channel_list' && clientCalls('mcpServer/tool/call')[0]?.params.threadId === THREAD)
 ok('the app-server listens on the owner-only socket under CODEX_HOME, and the client frames are masked', fakeLog(codexHome)[0].listen === socket &&
   (statSync(socket).mode & 0o777) === 0o600 && clientCalls('initialize').length === 1)
+ok('the app-server is run by its real path, and its release is the one extra directory its shell commands read', fakeLog(codexHome)[0].exe === fakeCodex &&
+  readText(join(codexHome, 'config.toml')).includes(`${JSON.stringify(fakeRelease)} = "read"\n`))
+ok('the new thread is started under the channel profile', clientCalls('thread/start')[0].params.permissions === 'nvoy-channel')
 ok('it opts into the experimental API that thread/queue/add needs', clientCalls('initialize')[0].params.capabilities.experimentalApi === true)
 const pgid = pid => spawnSync('ps', ['-o', 'pgid=', '-p', String(pid)], { encoding: 'utf8' }).stdout.trim()
 const alive = pid => { try { process.kill(pid, 0); return true } catch { return false } }
@@ -389,6 +400,10 @@ await waitFor(() => /injected 444444444444 as a turn/.test(s2.out))
 ok('a restart resumes the same thread and injects only what arrived while it was down, once', /resumed the cx-test thread/.test(s2.out) &&
   clientCalls('thread/resume').some(m => m.params.threadId === THREAD) && clientCalls('thread/start').length === 1 &&
   clientCalls('turn/start').length === 2 && clientCalls('turn/start')[1].params.clientUserMessageId === `nvoy:${envelope(4)}` && clientCalls('thread/queue/add').length === 1)
+ok('the resumed thread is put under the channel profile, and so is every turn: a resume otherwise keeps the profile the thread started under (dj-codex, 2026-10-21)',
+  clientCalls('thread/resume').every(m => m.params.permissions === 'nvoy-channel') && clientCalls('turn/start').every(m => m.params.permissions === 'nvoy-channel'))
+ok('a Codex whose release would hold the home directory or CODEX_HOME is refused', (() => { try { codexInstall({ path: fakeBin, home: ownHome, codexHome: join(fakeRelease, 'bin') }); return false } catch (e) { return /holds the home directory or the harness's CODEX_HOME/.test(e.message) } })() &&
+  (() => { try { codexInstall({ path: fakeBin, home: ownHome, codexHome }); return true } catch { return false } })())
 ok('a resumed thread prints its attach command at ready', s2.out.indexOf(attachLine) >= 0 && s2.out.indexOf(attachLine) < s2.out.indexOf('injected 444444444444'))
 // The fleet recreates the adapter: the thread's channel MCP and the wake feed die together.
 await waitFor(() => /turn for 444444444444 ended/.test(s2.out))

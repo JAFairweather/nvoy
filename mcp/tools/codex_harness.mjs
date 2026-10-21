@@ -59,12 +59,15 @@ function appServer({ env, log }) {
 }
 
 // Resume the stored thread, or start one and store it. Shared by the fleet and portable supervisors.
-export async function openThread({ server, manifest, workdir, threadPath, log, writePrivate }) {
+// `permissions`, a profile named in config.toml, is given on resume as well as start: a resumed thread
+// otherwise keeps the profile it was started under, whatever config.toml now says (dj-codex, 2026-10-21).
+export async function openThread({ server, manifest, workdir, threadPath, log, writePrivate, permissions = '' }) {
+  const profile = permissions ? { permissions } : {}
   let threadId = '', thread = null, saved = false
   try { threadId = codexThreadId(JSON.parse(readFileSync(threadPath, 'utf8')).thread_id) } catch {}
   if (threadId) {
     try {
-      const resumed = await server.request('thread/resume', { threadId })
+      const resumed = await server.request('thread/resume', { threadId, ...profile })
       if (resumed?.thread?.id !== threadId) throw new Error('Codex resumed an unexpected thread')
       thread = resumed.thread; saved = true
       log(`resumed the ${manifest.id} thread`)
@@ -77,7 +80,7 @@ export async function openThread({ server, manifest, workdir, threadPath, log, w
     }
   }
   if (!threadId) {
-    const started = await server.request('thread/start', { cwd: workdir, serviceName: 'nvoy_harness', ...(manifest.harness.model ? { model: manifest.harness.model } : {}) })
+    const started = await server.request('thread/start', { cwd: workdir, serviceName: 'nvoy_harness', ...profile, ...(manifest.harness.model ? { model: manifest.harness.model } : {}) })
     threadId = codexThreadId(started?.thread?.id)
     thread = started.thread
     writePrivate(threadPath, JSON.stringify({ version: 1, instance: manifest.id, thread_id: threadId }) + '\n')
