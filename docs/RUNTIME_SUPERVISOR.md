@@ -293,6 +293,20 @@ admitted message. `may_post` lets it start a conversation too.
   if a 441 had revoked it.
 - **Bunker.** A post is a kind 9 in a channel the identity already speaks in, so the pairing needs
   no new permission.
+- **No credentials out.** Whatever the agent was asked, and by whom, a reply or post whose text
+  looks like a credential is refused whole, never redacted and sent (`outbound_secrets.mjs`).
+  The patterns are Nostr secret keys (`nsec1`, `ncryptsec1`), `bunker://` URIs and
+  `nostrconnect://` URIs carrying a `secret`, private key blocks, GitHub, Anthropic,
+  OpenAI-style, AWS, Google and Slack tokens, JWTs, a `secret`/`token`/`key`-style URL
+  parameter, and a long mixed-case random run outside a URL. Hex event ids and pubkeys, npubs and
+  other bech32, and URLs do not match. Zero-width characters and full-width letters are folded away
+  first. The tools refuse at once (`NVOY_WITHHELD_CREDENTIAL`,
+  `withheld: looks like a credential (<pattern>); nothing was posted — rewrite it without the secret`),
+  and both signers refuse again (`reply refused: withheld: …`, `post refused: withheld: …`,
+  terminal; a reply records `withheld-credential`), so a row written past the tool is caught where
+  the key is. Every refusal logs the path, the instance, the pattern and a 12-hex SHA-256 of the
+  whole post, never the text. This is a brake on the accident and the obvious ask; an agent set on
+  encoding a secret can still do it, so it does not replace keeping secrets out of the agent's reach.
 
 ## The status page (waggle.nave.pub/status)
 

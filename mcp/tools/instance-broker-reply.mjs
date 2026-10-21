@@ -21,6 +21,7 @@ import { channelReply, openBuzzSession } from './buzz_native.mjs'
 import { recordStatusReplied } from './buzz_status.mjs'
 import { countInWindow, nextHop } from './agent_limits.mjs'
 import { validateReplyMention } from './agent_post.mjs'
+import { contentHash, credentialIn, withheldMessage } from './outbound_secrets.mjs'
 
 const die = m => { console.error(`instance-broker-reply: ${m}`); process.exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -60,6 +61,9 @@ if (Object.keys(request).some(k => !allowedKeys.includes(k)) || request.type !==
   request.version !== 1 || !/^[0-9a-f]{64}$/.test(String(request.receipt || '')) ||
   typeof request.content !== 'string' || !request.content.trim() || Buffer.byteLength(request.content, 'utf8') > 4000) die('reply request has an invalid or overbroad shape')
 request.receipt = request.receipt.toLowerCase()
+// Again here, where the signer is: a client that writes the queue without the tool skips the tool's check.
+const leaked = credentialIn(request.content)
+if (leaked) die(`reply refused: ${withheldMessage(leaked)} [post sha256 ${contentHash(request.content)}] instance ${manifest.id}`)
 
 const receiptBase = resolve(manifest.stateDir, 'receipts', `${request.receipt}.json`)
 const receiptInflight = resolve(manifest.stateDir, 'receipts', `${request.receipt}.${requestId}.inflight`)

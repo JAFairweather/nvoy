@@ -95,6 +95,8 @@ const leaks = {
   'an IPv4 address': 'wss://203.0.113.9/', 'an IPv6 address': 'wss://[2001:db8::1]/', 'an nsec': 'nsec1qqqq', 'a bunker URI': 'bunker://x?relay=y',
   'a nostrconnect URI': 'nostrconnect://x', 'a credential path': '/etc/nvoy/credentials/agent.nsec', 'a secret parameter': 'x?secret=abc',
   'a box hostname': 'ssh nvoy-fleet', 'a full 64-hex key or id': pub.alpha,
+  // The token shapes an agent may never post (outbound_secrets.mjs), built at run time.
+  'a GitHub token': 'token ' + 'gh' + 'p_' + 'Z8x6C4v2B0n8M6l4K2j0H8g6F4d2S0a8P6o4', 'an AWS access key': 'AK' + 'IA' + 'Q3ZT7RW2YX8V5N4M',
 }
 for (const [what, value] of Object.entries(leaks)) ok(`the sanitiser refuses ${what}`, sanitiserFindings({ a: [{ b: value }] }).some(x => x.what === what && x.path === '$.a[0].b'))
 ok('the sanitiser reads keys as well as values', sanitiserFindings({ [pub.beta]: 1 }).length === 1)

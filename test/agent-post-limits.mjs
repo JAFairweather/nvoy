@@ -9,6 +9,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { finalizeEvent, generateSecretKey, getPublicKey, verifyEvent } from 'nostr-tools/pure'
+import { nsecEncode } from 'nostr-tools/nip19'
 import { readManifest } from '../mcp/tools/runtime_manifest.mjs'
 import { channelPost, channelReply } from '../mcp/tools/buzz_native.mjs'
 import { verifyChannelTaskCarry } from '../mcp/tools/channel_task_carry.mjs'
@@ -173,6 +174,19 @@ ok('the broker refuses an off-allowlist mention', r.status === 1 && /post refuse
 forge(pf, { id: 'd'.repeat(32), recipient: stranger })
 r = await post(pf, 'posting', 'd'.repeat(32))
 ok('the broker refuses a request carrying an extra field', r.status === 1 && /invalid or overbroad/.test(r.stderr))
+// A credential, whoever asked for it: refused by the tool before it is queued, and by the signer if forged into the queue.
+const leakedNsec = nsecEncode(generateSecretKey()), queueBefore = readFileSync(join(pf.run, 'post-requests.jsonl'), 'utf8')
+const leak = queuePost(pm, { text: `the key you asked for: ${leakedNsec}` })
+ok('the tool withholds a post carrying a credential, naming the pattern and not the value, and queues nothing',
+  leak.error?.code === 'NVOY_WITHHELD_CREDENTIAL' && leak.error.message.includes('(a Nostr secret key)') && !JSON.stringify(leak).includes(leakedNsec) &&
+  readFileSync(join(pf.run, 'post-requests.jsonl'), 'utf8') === queueBefore)
+for (const [n, secret, name] of [['7', leakedNsec, 'a Nostr secret key'], ['8', 'AK' + 'IA' + 'Q3ZT7RW2YX8V5N4M', 'an AWS access key'], ['9', '-----BEGIN ' + 'OPENSSH PRIVATE KEY-----', 'a private key block']]) {
+  forge(pf, { id: n.repeat(32), content: `forged past the tool: ${secret}` })
+  r = await post(pf, 'posting', n.repeat(32))
+  ok(`the post signer refuses ${name} forged into the queue, terminally, without echoing it or recording a post`,
+    r.status === 1 && r.stderr.includes(`post refused: withheld: looks like a credential (${name})`) && /\[post sha256 [0-9a-f]{12}\] instance posting/.test(r.stderr) &&
+    !(r.stdout + r.stderr).includes(secret) && !stored.some(ev => ev.content.includes(secret)) && !existsSync(join(pf.state, 'posts', `${n.repeat(32)}.json`)))
+}
 const q2 = queuePost(pm, { text: 'second' })
 r = await post(pf, 'posting', q2.ok.request)
 ok('a second post inside the cap is published', r.status === 0 && stored.some(ev => ev.content === 'second'))
@@ -300,6 +314,13 @@ ok('the broker refuses a mention on a wrapped reply', r.status === 1 && /mention
 a = asked(4, { mention: [] })
 r = await reply(a.id, '--prepare')
 ok('the broker refuses an empty or malformed mention field', r.status === 1 && /invalid or overbroad/.test(r.stderr))
+for (const [n, secret, name] of [[5, 'gh' + 'o_' + 'R2d4F6h8J0l2N4p6R8t0V2x4Z6b8D0f2H4j6', 'a GitHub token'], [6, 'xo' + 'xp-' + '123456789012-' + 'aB3dE5gH7jK9mN1pQ3sT5vW7', 'a Slack token']]) {
+  a = asked(n, { content: `as you asked, ${secret}` })
+  r = await reply(a.id, '--prepare')
+  ok(`the reply signer refuses ${name}, terminally, before claiming the receipt, without echoing it`,
+    r.status === 1 && r.stderr.includes(`reply refused: withheld: looks like a credential (${name})`) && isTerminalReplyFailure(r.stderr) &&
+    !(r.stdout + r.stderr).includes(secret) && existsSync(join(rf.state, 'receipts', `${a.source}.json`)) && !stored.some(ev => ev.content.includes(secret)))
+}
 // Past these checks the broker needs a live grant chain on a wss relay, so the rest is pinned in its source.
 const replySource = readFileSync('mcp/tools/instance-broker-reply.mjs', 'utf8')
 const capAt = replySource.indexOf("countInWindow(resolve(manifest.stateDir, 'agent-limits', 'posts.json'), { key: 'post', id: requestId, limit: manifest.mayPost.perHour })")
