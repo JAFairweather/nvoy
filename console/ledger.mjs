@@ -7,7 +7,7 @@
 // and the honest TTL banner (§6.4.3 — hard expiry runs while this is open).
 // Revoke-now (§6.4.5) shares the rotation spine in ttl.mjs.
 
-import { saveGrantIndex } from '../lib/nipxx.mjs'
+import { saveGrantIndex, fetchScope } from '../lib/nipxx.mjs'
 import { sendRevocationNotice, grantWithTerms } from './nvoygrant.mjs'
 import { revokedEvent, rotatedEvent, grantedEvent, appendLedger, eventsFor, computeTotals, fmtCountdown, receivedActions } from './ledgerlog.mjs'
 import { rotateDropping, runRelinquishRotation, nextExpiry } from './ttl.mjs'
@@ -275,6 +275,7 @@ function delegationCard(d, i) {
       <div class="outbox" data-agent="${d.agent}"><span class="msg">loading output scope…</span></div>` : ''}
     ${events.length ? `<div class="history">${events.map(hRow).join('')}</div>` : ''}
     <div class="actions" style="margin-top:6px">
+      ${held ? '<button class="redeliver" title="send this grant again to the same identity — same key, same value — and rebroadcast the scope to your relays. For a grant a relay has dropped: the Index still lists the holder, but the holder can no longer find it.">↻ re-deliver</button>' : ''}
       <button class="addg" title="grant this exact scope — same key, same value — to another identity (credential sovereignty: the identity that consumes it becomes a grantee, no secret re-entered)">＋ grant to another identity</button>
       <span class="addg-ui"></span>
       <span class="msg lg-msg"></span>
@@ -581,6 +582,8 @@ export function renderLedger() {
     if (btn) btn.onclick = () => revoke(d, msg)
     const rel = card.querySelector('.rel-confirm')
     if (rel) rel.onclick = () => confirmRelinquish(d, msg)
+    const rd = card.querySelector('.redeliver')
+    if (rd) rd.onclick = () => redeliver(d, msg)
     const addg = card.querySelector('.addg')
     if (addg) addg.onclick = () => {
       const entry = (state.index.issued ?? []).find(e => e.scope === d.scope)
@@ -641,6 +644,37 @@ async function addGrantee(d, newPub, msg) {
       grantedEvent({ scope: d.scope, agent: newPub, v: entry.v, terms: { nvoy: 1, ...terms }, name: scopeName }))
     await saveGrantIndex(state.relay, state.signer, state.index)
     await load()
+  } catch (err) { msg.textContent = err.message }
+}
+
+/** Re-deliver a grant the holder has lost: public relays prune, and a gift wrap or a scope event
+ *  that a relay dropped leaves the Index saying "held" while the holder finds nothing. Nothing new
+ *  is decided here — same grantee, same key, same generation, same terms — so the Index and the
+ *  ledger are left as they are. The scope event is rebroadcast as signed (not re-signed), so it
+ *  lands on every configured relay again. If no relay still has the scope, its value is gone and
+ *  only a fresh issue (value re-entered) can replace it. */
+async function redeliver(d, msg) {
+  const entry = (state.index.issued ?? []).find(e => e.scope === d.scope)
+  if (!entry) { msg.textContent = 'scope not in the index — cannot re-deliver'; return }
+  const scopeKey = Uint8Array.from(atob(entry.key), c => c.charCodeAt(0))
+  const scopeName = entry.scope_name ?? d.scopeName
+  msg.textContent = `looking for “${scopeName}” on your relays…`
+  try {
+    const [event] = await state.relay.query({ kinds: [30440], authors: [state.me], '#d': [d.scope] })
+    const got = event ? await fetchScope(state.relay, { publisher: state.me, scopeId: d.scope, generation: entry.v, scopeKey }) : { status: 'missing' }
+    if (got.status !== 'ok') {
+      msg.textContent = got.status === 'missing'
+        ? `“${scopeName}” is gone from every relay, so its value is lost — issue it fresh from Delegate`
+        : `“${scopeName}” on the relays is v${got.generation}, not the v${entry.v} this grant names — not re-delivered`
+      return
+    }
+    msg.textContent = `rebroadcasting the scope and re-delivering to ${agentName(d.agent)}…`
+    await state.relay.publish(event)
+    const terms = d.terms ? { ...d.terms } : { purpose: d.purpose || scopeName }
+    await grantWithTerms(state.relay, state.signer, d.agent, {
+      scopeId: d.scope, generation: entry.v, scopeKey, scopeName, relayHint: RELAYS[0], terms,
+    })
+    msg.textContent = `re-delivered “${scopeName}” to ${agentName(d.agent)} (v${entry.v}, same value)`
   } catch (err) { msg.textContent = err.message }
 }
 
