@@ -668,9 +668,11 @@ async function redeliver(d, msg) {
         : `“${scopeName}” on the relays is v${got.generation}, not the v${entry.v} this grant names — not re-delivered`
       return
     }
+    // Same terms or nothing: inventing them here could quietly drop a no_persist or an expiry.
+    if (!d.terms) { msg.textContent = `no recorded terms for “${scopeName}” — not re-delivered; issue it fresh from Delegate`; return }
     msg.textContent = `rebroadcasting the scope and re-delivering to ${agentName(d.agent)}…`
     await state.relay.publish(event)
-    const terms = d.terms ? { ...d.terms } : { purpose: d.purpose || scopeName }
+    const terms = { ...d.terms }
     await grantWithTerms(state.relay, state.signer, d.agent, {
       scopeId: d.scope, generation: entry.v, scopeKey, scopeName, relayHint: RELAYS[0], terms,
     })
