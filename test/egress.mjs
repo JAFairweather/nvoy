@@ -59,6 +59,7 @@ const check = (name, ok, detail = '') => {
 // Blossom hosts ship in v1 (outbox payloads are JSON; artifact pointers are
 // deferred — CLAUDE.md decision 26).
 const NETWORK = new Set([
+  'wss://relay.nave.pub', 'wss://relay.ditto.pub',                  // relays that retain grants
   'wss://nos.lol', 'wss://relay.primal.net', // relays
   'https://esm.sh',                                                  // pinned modules (console)
 ])
