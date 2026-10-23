@@ -2,6 +2,7 @@
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { resolve } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import { getEventHash, verifyEvent } from 'nostr-tools/pure'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { validateProfileRequest, profileQueuePath, profileResultsPath } from './agent_profile.mjs'
@@ -49,7 +50,7 @@ function latestProfile(events) {
     verifyEvent(JSON.parse(JSON.stringify(event)))).sort((left, right) => right.created_at - left.created_at || right.id.localeCompare(left.id))[0]
   if (!latest) throw new ProfileRefusal('NVOY_PROFILE_INVALID_CURRENT',
     events.length ? 'relay returned an invalid kind-0 event' : 'relay returned no current kind-0 event')
-  try { return JSON.parse(latest.content) }
+  try { return { profile: JSON.parse(latest.content), event: latest } }
   catch { throw new ProfileRefusal('NVOY_PROFILE_INVALID_CURRENT', 'current kind-0 content is invalid JSON') }
 }
 
@@ -85,7 +86,7 @@ try {
     const signerPubkey = String(await signer.getPublicKey()).toLowerCase()
     if (signerPubkey !== manifest.pubkey) throw new ProfileRefusal('NVOY_PROFILE_SIGNER_MISMATCH', 'signer does not match manifest pubkey')
     session = await openBuzzSession({ relay: manifest.buzz.relay, signer })
-    const current = latestProfile(await session.fetch({ kinds: [0], authors: [manifest.pubkey], limit: 1 }))
+    const { profile: current, event: currentEvent } = latestProfile(await session.fetch({ kinds: [0], authors: [manifest.pubkey], limit: 1 }))
     const { profile, changed } = await mergedProfile(current, request.fields, { pubkey: manifest.pubkey, pictureHosts: grant.pictureHosts })
     changedForAudit = changed
     if (request.dry_run) {
@@ -97,7 +98,8 @@ try {
       const unsignedEvent = { pubkey: manifest.pubkey, kind: 0, created_at: Math.floor(Date.now() / 1000),
         tags: [], content: JSON.stringify(profile) }
       record = { version: 1, request_digest: digest, grant_id: grant.grantId, pubkey: manifest.pubkey,
-        fingerprint: getEventHash(unsignedEvent), unsigned_event: unsignedEvent, profile, changed, event: null }
+        fingerprint: getEventHash(unsignedEvent), unsigned_event: unsignedEvent, current_event: currentEvent,
+        profile, changed, event: null }
       persist()
     }
   }
@@ -119,6 +121,19 @@ try {
       if (signerPubkey !== manifest.pubkey) throw new ProfileRefusal('NVOY_PROFILE_SIGNER_MISMATCH', 'signer does not match manifest pubkey')
     }
     if (!record.event) {
+      const previous = record.current_event
+      let previousValid = false
+      try { previousValid = previous?.kind === 0 && previous.pubkey === manifest.pubkey &&
+        verifyEvent(JSON.parse(JSON.stringify(previous))) } catch {}
+      if (!previousValid)
+        throw new ProfileRefusal('NVOY_PROFILE_RECORD_INVALID', 'frozen profile has no signed prior profile')
+      let current
+      try { current = JSON.parse(previous.content) }
+      catch { throw new ProfileRefusal('NVOY_PROFILE_RECORD_INVALID', 'frozen prior profile is invalid JSON') }
+      const validated = await mergedProfile(current, request.fields,
+        { pubkey: manifest.pubkey, pictureHosts: grant.pictureHosts })
+      if (!isDeepStrictEqual(validated.profile, record.profile) || !isDeepStrictEqual(validated.changed, record.changed))
+        throw new ProfileRefusal('NVOY_PROFILE_RECORD_INVALID', 'frozen profile differs from the validated merge')
       const event = await signer.signEvent(record.unsigned_event)
       if (event?.id !== record.fingerprint || event.pubkey !== manifest.pubkey || event.kind !== 0 ||
           !verifyEvent(JSON.parse(JSON.stringify(event))))
@@ -137,7 +152,7 @@ try {
 } catch (error) {
   const code = error instanceof ProfileRefusal ? error.code :
     error.message?.startsWith('NVOY_PROFILE_') || error.message === 'NVOY_WITHHELD_CREDENTIAL' ? error.message : 'NVOY_PROFILE_RETRYABLE'
-  if (code === 'NVOY_PROFILE_RETRYABLE') {
+  if (code === 'NVOY_PROFILE_RETRYABLE' || code === 'NVOY_PROFILE_NIP05_UNAVAILABLE') {
     console.error(`instance-broker-profile: retryable ${requestId}: ${error.message}`)
     process.exitCode = 1
   } else {

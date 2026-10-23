@@ -272,8 +272,9 @@ and checks the exact signed event and all fields on readback. Each completed cal
 line with the seat, grant ID, changed old/new values, event ID, and outcome. `nvoy_profile_set`
 waits briefly for the result and otherwise returns a request ID; `nvoy_profile_status` reads that
 request's eventual result. Request IDs are reserved atomically in a worker-private runtime directory;
-the broker refuses conflicting queue rows and runs one bounded profile child at a time without
-blocking ordinary drains. Neither tool exposes the signing credential.
+the broker refuses conflicting queue rows, revalidates the frozen merge against the previously signed
+profile before signing, and runs one bounded profile child at a time without blocking ordinary drains.
+Neither tool exposes the signing credential.
 
 ```json
 "may_post": { "channels": ["<uuid in buzz.channels>"], "per_hour": 4,

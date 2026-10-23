@@ -193,14 +193,17 @@ const tamperRecordPath = join(fixture.directory, 'state', 'profiles', `${lastReq
 const originalRecord = JSON.parse(readFileSync(tamperRecordPath, 'utf8'))
 const sentBeforeTamper = sent.length
 for (const change of [
-  unsigned => { unsigned.kind = 9 },
-  unsigned => { unsigned.pubkey = other },
-  unsigned => { unsigned.tags = [['x', 'out-of-scope']] },
-  unsigned => { unsigned.content = JSON.stringify({ about: 'not validated' }) },
+  altered => { altered.unsigned_event.kind = 9 },
+  altered => { altered.unsigned_event.pubkey = other },
+  altered => { altered.unsigned_event.tags = [['x', 'out-of-scope']] },
+  altered => { altered.unsigned_event.content = JSON.stringify({ about: 'not validated' }) },
+  altered => { altered.profile.custom = 'forged'; altered.unsigned_event.content = JSON.stringify(altered.profile) },
+  altered => { altered.profile.custom = `sk-${'B'.repeat(24)}`; altered.unsigned_event.content = JSON.stringify(altered.profile) },
+  altered => { altered.current_event.content = JSON.stringify({ name: 'forged' }) },
 ]) {
   const altered = structuredClone(originalRecord)
   altered.event = null
-  change(altered.unsigned_event)
+  change(altered)
   altered.fingerprint = getEventHash(altered.unsigned_event)
   writeFileSync(tamperRecordPath, JSON.stringify(altered))
   assert.equal((await runBroker()).status, 0)
