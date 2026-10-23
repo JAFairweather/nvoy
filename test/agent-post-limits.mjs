@@ -14,7 +14,7 @@ import { readManifest } from '../mcp/tools/runtime_manifest.mjs'
 import { channelPost, channelReply } from '../mcp/tools/buzz_native.mjs'
 import { verifyChannelTaskCarry } from '../mcp/tools/channel_task_carry.mjs'
 import { HOUR_MS, MALFORMED_HOP, admissionLimit, grantExpired, hopFromJson, hopOf, nextHop, slideWindow } from '../mcp/tools/agent_limits.mjs'
-import { capabilityHash, capabilitySummary, queuePost, releaseSha, resolvePost, resolveReplyMention } from '../mcp/tools/agent_post.mjs'
+import { PARTICIPATION, capabilityHash, capabilitySummary, notMentioned, queuePost, releaseSha, resolvePost, resolveReplyMention } from '../mcp/tools/agent_post.mjs'
 import { isTerminalReplyFailure } from '../mcp/tools/reply_retry.mjs'
 
 let fails = 0, passes = 0
@@ -133,6 +133,19 @@ ok('an omitted channel is the first may_post channel, with trimmed text and no m
 const r2 = resolvePost(poster, { text: 'hi', mention: ['NEIL', dennis, 'neil'] })
 ok('a mention resolves by name or hex, once each', r2.mention.join() === [neil, dennis].join())
 ok('a channel outside may_post is refused', resolvePost(poster, { text: 'hi', channel: CH2 }).code === 'NVOY_POST_CHANNEL_REFUSED')
+// 10-23: agents wrote "@name" in text, which Buzz never resolves, and woke no one.
+const r3 = resolvePost(poster, { text: 'over to @Neil, then @nobody and @dennis; mail ops@neil.example' })
+ok('an @name in a post\'s text on the allowlist becomes a mention; other @text is handed back, and an address is not a mention',
+  r3.mention.join() === neil && r3.unresolved.join() === '@nobody,@dennis')
+ok('a mention field takes a name however it is typed', resolvePost(poster, { text: 'hi', mention: ['@Neil'] }).mention.join() === neil)
+const rr = resolveReplyMention(poster, undefined, 'thanks, @neil will review')
+ok('an @name in a reply\'s text becomes a mention, as in a post', rr.mention.join() === neil && !rr.code && rr.unresolved.length === 0)
+const plainReply = resolveReplyMention(plain, undefined, 'thanks, @neil')
+ok('without may_post, @text leaves a reply exactly as it was', plainReply.mention.length === 0 && !plainReply.code)
+ok('the tool result names the @text that reached no one, and who can be mentioned',
+  JSON.stringify(notMentioned(poster.mayPost, r3.unresolved)) === JSON.stringify({ not_mentioned: ['@nobody', '@dennis'], mentionable: [dennis, 'neil'] }) &&
+  JSON.stringify(notMentioned(poster.mayPost, [])) === '{}')
+ok('a posting identity is told how to take part; a reply-only one is not', told.includes(PARTICIPATION) && !capabilitySummary(plain).includes(PARTICIPATION))
 const off = resolvePost(poster, { text: 'hi', mention: [stranger] })
 ok('an off-allowlist mention is refused, naming only a key prefix', off.code === 'NVOY_POST_MENTION_REFUSED' && off.message.includes(stranger.slice(0, 8)) && !off.message.includes(stranger))
 ok('an unknown name is refused', resolvePost(poster, { text: 'hi', mention: ['kerouac'] }).code === 'NVOY_POST_MENTION_REFUSED')

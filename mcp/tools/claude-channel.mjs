@@ -14,7 +14,7 @@ import { resolve } from 'node:path'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { validateDesktopDelivery } from './admitted_task.mjs'
 import { requestWorkingStatus } from './buzz_status.mjs'
-import { MENTION_SCHEMA, capabilityHash, capabilityInstructions, capabilitySummary, postToolSpec, queuePost, resolveReplyMention } from './agent_post.mjs'
+import { MENTION_SCHEMA, capabilityHash, capabilityInstructions, capabilitySummary, notMentioned, postToolSpec, queuePost, resolveReplyMention } from './agent_post.mjs'
 import { profileToolSpec, profileStatusToolSpec, queueProfile, profileStatus, waitProfile } from './agent_profile.mjs'
 import { credentialIn, withheld } from './outbound_secrets.mjs'
 
@@ -297,7 +297,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async request => {
   if (task.type !== 'admitted-task' || task.messages.length !== 1) {
     return toolResult({ code: 'NVOY_REPLY_REQUIRES_ONE_SENDER' }, true)
   }
-  const { mention, ...refused } = resolveReplyMention(manifest, args.mention)
+  const { mention, unresolved, ...refused } = resolveReplyMention(manifest, args.mention, content)
   if (refused.code) return toolResult(refused, true)
   try {
     const prior = lines(replyPath, 'Desktop reply queue').map(line => { try { return JSON.parse(line) } catch { throw new Error('Desktop reply queue contains malformed JSON') } })
@@ -306,7 +306,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async request => {
       instance: manifest.id, receipt: envelope, content, ...(mention.length ? { mention } : {}) }
     appendFileSync(replyPath, JSON.stringify(record) + '\n', { mode: 0o640 })
     chmodSync(replyPath, 0o640)
-    return toolResult({ queued: true, envelope, request: record.id, ...(mention.length ? { mention } : {}) })
+    return toolResult({ queued: true, envelope, request: record.id, ...(mention.length ? { mention } : {}), ...notMentioned(manifest.mayPost, unresolved) })
   } catch (error) { return toolResult({ code: 'NVOY_REPLY_QUEUE_FAILED', message: error.message }, true) }
 })
 
