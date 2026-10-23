@@ -255,11 +255,17 @@ const terminalIds = loadTerminalReplyIds(terminalReplies)
 const expiredRequest = 'a'.repeat(32)
 ok('a missing or stale admission receipt is terminal, rather than a relay-query retry loop', isTerminalReplyFailure('instance-broker-reply: admission receipt is missing') && isTerminalReplyFailure('instance-broker-reply: admission receipt is not a live broker-bound sender capability') && recordTerminalReply(terminalReplies, terminalIds, expiredRequest, 'admission receipt is not a live broker-bound sender capability', 1) && terminalIds.has(expiredRequest) && !recordTerminalReply(terminalReplies, terminalIds, expiredRequest, 'admission receipt is not a live broker-bound sender capability', 2) && loadTerminalReplyIds(terminalReplies).has(expiredRequest) && !readFileSync(terminalReplies, 'utf8').includes('must not be signed'))
 // 10-23: two LukeDog replies to deleted mentions were refused this way every ~9s, with no end.
-const parentGone = 'instance-broker-reply: Buzz refused the reply: invalid: reply parent not found\ninstance-broker-reply: the Buzz relay did not accept the persisted channel reply; it remains retryable'
-ok('a reply whose Buzz parent is gone is terminal, while a merely unaccepted one stays retryable',
+const parentGone = 'instance-broker-reply: Buzz refused the reply: invalid: reply parent not found\ninstance-broker-reply: Buzz rejected the frozen channel reply as invalid; no retry can change it'
+const staleReply = 'instance-broker-reply: Buzz refused the reply: invalid: event timestamp too far from server time\ninstance-broker-reply: Buzz rejected the frozen channel reply as invalid; no retry can change it'
+ok('a frozen Buzz reply rejected as invalid is terminal, while a merely unaccepted one stays retryable',
   isTerminalReplyFailure(parentGone) && terminalReplyReason(parentGone) === 'parent-gone' &&
+  isTerminalReplyFailure(staleReply) && terminalReplyReason(staleReply) === 'invalid-frozen-reply' &&
   !isTerminalReplyFailure('instance-broker-reply: Buzz refused the reply: rate-limited: slow down\ninstance-broker-reply: the Buzz relay did not accept the persisted channel reply; it remains retryable') &&
   !isTerminalReplyFailure('instance-broker-reply: the Buzz relay did not accept the persisted channel reply; it remains retryable'))
+const replyActuator = readFileSync('mcp/tools/instance-broker-reply.mjs', 'utf8')
+ok('only an invalid verdict on a reply stamped no later than now is made terminal, so a future-stamped one can still land',
+  /\/\^invalid:\/\.test\(/.test(replyActuator) && /record\.event\.created_at <= Math\.floor\(Date\.now\(\) \/ 1000\)/.test(replyActuator) &&
+  /die\('Buzz rejected the frozen channel reply as invalid/.test(replyActuator))
 ok('the broker daemon invokes only the mechanically bounded prepare mode and has no approval input',
   /awaiting discrete approval/.test(daemonSource) && /instance-broker-reply\.mjs/.test(daemonSource) &&
   /'--prepare'/.test(daemonSource) && !/'--approval'/.test(daemonSource))

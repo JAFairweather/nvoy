@@ -296,8 +296,17 @@ if (buzzNative) {
   // The community relay is the only place this reply means anything; its refusal is reported verbatim.
   try {
     const session = await openBuzzSession({ relay: manifest.buzz.relay, signer })
-    try { const ok = await session.publishSigned(record.event); if (ok.accepted) accepted = 1; else console.error(`instance-broker-reply: Buzz refused the reply: ${ok.message}`) }
-    finally { session.close() }
+    try {
+      const ok = await session.publishSigned(record.event)
+      if (ok.accepted) accepted = 1
+      else {
+        console.error(`instance-broker-reply: Buzz refused the reply: ${ok.message}`)
+        // The event is frozen, so a NIP-01 `invalid:` verdict on it is final — a gone parent, or a
+        // timestamp that only grows staler. Only one stamped in the future can become valid by waiting.
+        if (/^invalid:/.test(String(ok.message || '')) && record.event.created_at <= Math.floor(Date.now() / 1000))
+          die('Buzz rejected the frozen channel reply as invalid; no retry can change it')
+      }
+    } finally { session.close() }
   } catch (e) { console.error(`instance-broker-reply: Buzz relay unavailable: ${e.message}`) }
   if (!accepted) die('the Buzz relay did not accept the persisted channel reply; it remains retryable')
 } else {
