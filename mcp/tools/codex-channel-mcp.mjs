@@ -11,6 +11,7 @@ import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest
 import { validateDesktopDelivery } from './admitted_task.mjs'
 import { requestWorkingStatus } from './buzz_status.mjs'
 import { MENTION_SCHEMA, capabilityInstructions, postToolSpec, queuePost, resolveReplyMention } from './agent_post.mjs'
+import { profileToolSpec, profileStatusToolSpec, queueProfile, profileStatus, waitProfile } from './agent_profile.mjs'
 import { credentialIn, withheld } from './outbound_secrets.mjs'
 
 const die = message => { console.error(`nvoy-codex-channel-mcp: ${message}`); process.exit(1) }
@@ -74,8 +75,20 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [
   { name: 'nvoy_channel_reply', description: 'Request one receipt-bound reply to an instruction-authorized envelope. This process cannot sign or select a recipient. In a Buzz channel the reply may also mention participants on may_post.mention, by name or hex key; that spends the hourly post budget.',
     inputSchema: { type: 'object', properties: { envelope: { type: 'string', pattern: '^[0-9a-f]{64}$' }, text: { type: 'string', minLength: 1, maxLength: 4000 }, mention: MENTION_SCHEMA }, required: ['envelope', 'text'], additionalProperties: false } },
   postToolSpec(manifest),
+  profileToolSpec(manifest),
+  profileStatusToolSpec(),
 ] }))
 mcp.setRequestHandler(CallToolRequestSchema, async request => {
+  if (request.params.name === 'nvoy_profile_set') {
+    const { ok, error } = queueProfile(manifest, request.params.arguments || {})
+    if (error) return result(error, true)
+    const completed = await waitProfile(manifest, ok.request)
+    return completed.error ? result(completed.error, true) : result(completed.ok)
+  }
+  if (request.params.name === 'nvoy_profile_status') {
+    const status = profileStatus(manifest, request.params.arguments?.request)
+    return status.error ? result(status.error, true) : result(status.ok)
+  }
   if (request.params.name === 'nvoy_channel_post') {
     const { ok, error } = queuePost(manifest, request.params.arguments || {})
     return error ? result(error, true) : result(ok)

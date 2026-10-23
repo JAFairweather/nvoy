@@ -52,7 +52,7 @@ ok('the ChatGPT config asks for no approval and keeps shell commands read-only',
 ok('its one MCP server is the hardened ssh entry to the channel forced command', (toml.match(/^\[mcp_servers\.[^.\]]+\]$/gm) || []).length === 1 &&
   toml.includes('[mcp_servers.nvoy-cx-test]\ncommand = "/usr/bin/ssh"\n') && JSON.stringify(args) === JSON.stringify(sshChannelEntry(remote).args) && !/NVOY_INSTANCE_ROOT/.test(toml))
 ok('each keyless channel tool, and only those, is pre-approved', CODEX_CHANNEL_TOOLS.every(tool => toml.includes(`[mcp_servers.nvoy-cx-test.tools.${tool}]\napproval_mode = "approve"\n`)) &&
-  (toml.match(/^approval_mode = /gm) || []).length === 4)
+  (toml.match(/^approval_mode = /gm) || []).length === 6)
 ok('a model is set only when chosen', !/^model = /m.test(toml) && /^model = "gpt-5\.5"$/m.test(codexConfigToml({ manifest: { id: 'cx-test' }, root: '', model: 'gpt-5.5', auth: 'chatgpt', remote })))
 ok('a ChatGPT config without the SSH channel, or an unknown auth mode, is refused', (() => { try { codexConfigToml({ manifest: { id: 'x' }, root: '', auth: 'chatgpt' }); return false } catch { return true } })() &&
   (() => { try { codexConfigToml({ manifest: { id: 'x' }, root: '', auth: 'env' }); return false } catch { return true } })())
