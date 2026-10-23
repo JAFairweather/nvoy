@@ -10,7 +10,7 @@
 
 import { existsSync, readFileSync } from 'node:fs'
 import { getPublicKey, finalizeEvent } from 'nostr-tools/pure'
-import { decode } from 'nostr-tools/nip19'
+import { decode, nsecEncode } from 'nostr-tools/nip19'
 import { makeBunkerSigner } from './nip46-signer.mjs'
 
 export const HEAL_AFTER_TIMEOUTS = 3
@@ -49,7 +49,9 @@ export function brokerSigner(die, options = {}) {
     let uri
     try { uri = readFileSync(uriPath, 'utf8').trim() } catch { die('cannot read Bunker URI credential') }
     if (!/^bunker:\/\//i.test(uri)) die('Bunker URI credential is invalid')
-    return { signer: selfHealingSigner(() => makeBunkerSigner(uri, raw, options)), attentionEnv: { NVOY_BUNKER_URI: uri, NVOY_NIP46_CLIENT_NSEC: raw } }
+    // Every transport-key reader downstream decodes an nsec, so a hex key is encoded once here.
+    const client = raw.startsWith('nsec1') ? raw : nsecEncode(Uint8Array.from(Buffer.from(raw, 'hex')))
+    return { signer: selfHealingSigner(() => makeBunkerSigner(uri, client, options)), attentionEnv: { NVOY_BUNKER_URI: uri, NVOY_NIP46_CLIENT_NSEC: client } }
   }
   const sk = raw.startsWith('nsec1') ? decode(raw).data : Uint8Array.from(Buffer.from(raw, 'hex'))
   return { signer: { getPublicKey: async () => getPublicKey(sk), signEvent: async event => finalizeEvent(event, sk) },
