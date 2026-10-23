@@ -57,7 +57,14 @@ try {
   const queue = profileQueuePath(manifest), stat = lstatSync(queue)
   if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 64 * 1024 * 1024) throw new ProfileRefusal('NVOY_PROFILE_BAD_REQUEST', 'profile queue is invalid')
   for (const line of readFileSync(queue, 'utf8').split('\n')) {
-    try { const candidate = JSON.parse(line); if (candidate?.id === requestId) { request = candidate; break } } catch {}
+    let candidate
+    try { candidate = JSON.parse(line) } catch { continue }
+    if (candidate?.id !== requestId) continue
+    validateProfileRequest(candidate, manifest)
+    if (request && (request.instance !== candidate.instance || request.dry_run !== candidate.dry_run ||
+        JSON.stringify(request.fields) !== JSON.stringify(candidate.fields)))
+      throw new ProfileRefusal('NVOY_PROFILE_REQUEST_CONFLICT', 'request ID has conflicting queue rows')
+    request = candidate
   }
   if (!request) throw new ProfileRefusal('NVOY_PROFILE_BAD_REQUEST', 'profile request is missing')
   validateProfileRequest(request, manifest)
@@ -68,7 +75,7 @@ try {
     if (!saved.isFile() || saved.isSymbolicLink()) throw new ProfileRefusal('NVOY_PROFILE_RECORD_INVALID', 'profile record is invalid')
     record = JSON.parse(readFileSync(path, 'utf8'))
     if (record?.version !== 1 || record.request_digest !== digest || record.grant_id !== grant.grantId ||
-        record.pubkey !== manifest.pubkey || !record.unsigned_event || getEventHash(record.unsigned_event) !== record.fingerprint ||
+        record.pubkey !== manifest.pubkey || !record.unsigned_event ||
         (record.event && (record.event.id !== record.fingerprint || !verifyEvent(JSON.parse(JSON.stringify(record.event))))))
       throw new ProfileRefusal('NVOY_PROFILE_RECORD_INVALID', 'profile record does not bind this request and grant')
   }
@@ -96,6 +103,16 @@ try {
   }
 
   if (record) {
+    const unsigned = record.unsigned_event
+    let fingerprint
+    try { fingerprint = getEventHash(unsigned) }
+    catch { throw new ProfileRefusal('NVOY_PROFILE_RECORD_INVALID', 'frozen profile event is malformed') }
+    if (unsigned?.kind !== 0 || unsigned.pubkey !== manifest.pubkey || !Array.isArray(unsigned.tags) || unsigned.tags.length ||
+        !Number.isSafeInteger(unsigned.created_at) || unsigned.content !== JSON.stringify(record.profile) ||
+        !record.profile || typeof record.profile !== 'object' || Array.isArray(record.profile) || record.profile.bot !== true ||
+        Object.entries(request.fields).some(([field, value]) => record.profile[field] !== value) ||
+        fingerprint !== record.fingerprint)
+      throw new ProfileRefusal('NVOY_PROFILE_RECORD_INVALID', 'frozen profile event is outside the validated scope')
     if (!signer) {
       ;({ signer } = brokerSigner(message => { throw new Error(message) }, { idleMs: 30000 }))
       const signerPubkey = String(await signer.getPublicKey()).toLowerCase()

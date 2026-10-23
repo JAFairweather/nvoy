@@ -45,6 +45,7 @@ try {
 const isTerminalPost = stderr => /post refused:|post request has an invalid|post record does not bind/.test(stderr)
 const profileDone = new Set()
 const profileRetryAfter = new Map()
+let profileActive = null
 if (manifest.maySetProfile) {
   try {
     for (const line of readFileSync(resolve(manifest.runtimeDir, 'profile-results.jsonl'), 'utf8').split('\n')) {
@@ -189,6 +190,7 @@ function drainPosts() {
   }
 }
 function drainProfiles() {
+  if (profileActive) return
   let ids
   try {
     const path = resolve(manifest.runtimeDir, 'profile-requests.jsonl'), stat = lstatSync(path)
@@ -199,16 +201,29 @@ function drainProfiles() {
   } catch (error) { console.error(`instance-broker-daemon: profile queue unavailable: ${error.message}`); return }
   for (const request of ids) {
     if (profileDone.has(request) || (profileRetryAfter.get(request) || 0) > Date.now()) continue
-    const result = spawnSync(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-profile.mjs'),
-      '--instance', manifest.id, '--request', request], { env: childEnv, encoding: 'utf8', timeout: 90000 })
-    if (result.status === 0) {
-      profileDone.add(request)
-      profileRetryAfter.delete(request)
-      console.log(`instance-broker-daemon: profile ${request.slice(0, 12)}… complete`)
-    } else {
-      profileRetryAfter.set(request, Date.now() + 5000)
-      console.error(`instance-broker-daemon: profile ${request.slice(0, 12)}… held for retry: ${String(result.stderr || '').trim().slice(0, 240)}`)
+    const child = spawn(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-profile.mjs'),
+      '--instance', manifest.id, '--request', request], { env: childEnv, stdio: ['ignore', 'ignore', 'pipe'] })
+    profileActive = request
+    let stderr = '', settled = false
+    child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-240) })
+    const timeout = setTimeout(() => child.kill('SIGKILL'), 90000)
+    const complete = (code, error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      profileActive = null
+      if (code === 0) {
+        profileDone.add(request)
+        profileRetryAfter.delete(request)
+        console.log(`instance-broker-daemon: profile ${request.slice(0, 12)}… complete`)
+      } else {
+        profileRetryAfter.set(request, Date.now() + 5000)
+        console.error(`instance-broker-daemon: profile ${request.slice(0, 12)}… held for retry: ${String(error?.message || stderr || `exit ${code}`).trim().slice(0, 240)}`)
+      }
     }
+    child.on('error', error => complete(null, error))
+    child.on('exit', code => complete(code))
+    break
   }
 }
 // The keyless Buzz watcher can log in only through this oracle, and the status keeper puts the

@@ -5,7 +5,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { WebSocketServer } from 'ws'
-import { finalizeEvent, generateSecretKey, getPublicKey, verifyEvent } from 'nostr-tools/pure'
+import { finalizeEvent, generateSecretKey, getEventHash, getPublicKey, verifyEvent } from 'nostr-tools/pure'
 import { readManifest } from '../mcp/tools/runtime_manifest.mjs'
 import { queueProfile, profileStatus, profileToolSpec } from '../mcp/tools/agent_profile.mjs'
 import { capabilitySummary } from '../mcp/tools/agent_post.mjs'
@@ -102,11 +102,32 @@ assert.throws(() => readbackProfile([], signed, merged.profile), error => error 
 
 writeFileSync(join(fixture.directory, 'run', 'profile-requests.jsonl'), '')
 writeFileSync(join(fixture.directory, 'run', 'profile-results.jsonl'), '')
+mkdirSync(join(fixture.directory, 'run', 'profile-request-ids'), { mode: 0o700 })
 assert.equal(queueProfile(manifest, { fields: { about: `sk-${'A'.repeat(24)}` } }).error.code, 'NVOY_WITHHELD_CREDENTIAL')
 const repeated = queueProfile(manifest, { request: 'cd'.repeat(16), fields: { about: 'same' } })
 assert.equal(repeated.ok.request, 'cd'.repeat(16))
 assert.equal(queueProfile(manifest, { request: 'cd'.repeat(16), fields: { about: 'same' } }).ok.repeat, true)
 assert.equal(queueProfile(manifest, { request: 'cd'.repeat(16), fields: { about: 'different' } }).error.code, 'NVOY_PROFILE_REQUEST_CONFLICT')
+const concurrentId = 'ef'.repeat(16)
+const enqueueScript = `import { readManifest } from './mcp/tools/runtime_manifest.mjs';
+import { queueProfile } from './mcp/tools/agent_profile.mjs';
+console.log(JSON.stringify(queueProfile(readManifest(process.env.NVOY_TEST_ROOT, 'seat'),
+  { request: process.env.NVOY_TEST_REQUEST, fields: { about: process.env.NVOY_TEST_ABOUT } })))`
+const enqueue = about => new Promise(resolve => {
+  const child = spawn(process.execPath, ['--input-type=module', '-e', enqueueScript],
+    { cwd: new URL('..', import.meta.url).pathname, env: { ...process.env, NVOY_TEST_ROOT: fixture.root,
+      NVOY_TEST_REQUEST: concurrentId, NVOY_TEST_ABOUT: about }, stdio: ['ignore', 'pipe', 'pipe'] })
+  let output = '', error = ''
+  child.stdout.on('data', chunk => { output += chunk })
+  child.stderr.on('data', chunk => { error += chunk })
+  child.on('exit', status => resolve({ status, result: output ? JSON.parse(output) : null, error }))
+})
+const concurrent = await Promise.all([enqueue('first'), enqueue('second')])
+assert(concurrent.every(attempt => attempt.status === 0), JSON.stringify(concurrent))
+assert.equal(concurrent.filter(attempt => attempt.result.ok).length, 1)
+assert.equal(concurrent.filter(attempt => attempt.result.error?.code === 'NVOY_PROFILE_REQUEST_CONFLICT').length, 1)
+assert.equal(readFileSync(join(fixture.directory, 'run', 'profile-requests.jsonl'), 'utf8').split('\n')
+  .filter(line => line.includes(concurrentId)).length, 1)
 writeFileSync(join(fixture.directory, 'run', 'profile-requests.jsonl'), '')
 const credential = join(root, 'credential')
 writeFileSync(credential, Buffer.from(secret).toString('hex'))
@@ -164,6 +185,33 @@ assert.equal(sent.at(-1).id, firstAttempt)
 assert.equal(profileStatus(manifest, lastRequest).ok.event_id, firstAttempt)
 
 savedManifest.may_set_profile.per_day = 3
+writeFileSync(manifestPath, JSON.stringify(savedManifest))
+submit({ fields: { about: 'tamper check' } })
+dropNext = true
+assert.equal((await runBroker()).status, 1)
+const tamperRecordPath = join(fixture.directory, 'state', 'profiles', `${lastRequest}.json`)
+const originalRecord = JSON.parse(readFileSync(tamperRecordPath, 'utf8'))
+const sentBeforeTamper = sent.length
+for (const change of [
+  unsigned => { unsigned.kind = 9 },
+  unsigned => { unsigned.pubkey = other },
+  unsigned => { unsigned.tags = [['x', 'out-of-scope']] },
+  unsigned => { unsigned.content = JSON.stringify({ about: 'not validated' }) },
+]) {
+  const altered = structuredClone(originalRecord)
+  altered.event = null
+  change(altered.unsigned_event)
+  altered.fingerprint = getEventHash(altered.unsigned_event)
+  writeFileSync(tamperRecordPath, JSON.stringify(altered))
+  assert.equal((await runBroker()).status, 0)
+  assert.equal(profileStatus(manifest, lastRequest).error.code, 'NVOY_PROFILE_RECORD_INVALID')
+  assert.equal(sent.length, sentBeforeTamper)
+}
+writeFileSync(tamperRecordPath, JSON.stringify(originalRecord))
+assert.equal((await runBroker()).status, 0)
+assert.equal(profileStatus(manifest, lastRequest).ok.event_id, originalRecord.event.id)
+
+savedManifest.may_set_profile.per_day = 4
 writeFileSync(manifestPath, JSON.stringify(savedManifest))
 submit({ fields: { about: 'mismatch' } })
 mismatchNext = true

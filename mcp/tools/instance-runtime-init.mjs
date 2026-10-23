@@ -49,6 +49,7 @@ if (m.mayPost) provisionFile(`${m.runtimeDir}/post-requests.jsonl`, m.workerUid,
 if (m.maySetProfile) {
   provisionFile(`${m.runtimeDir}/profile-requests.jsonl`, m.workerUid, m.brokerAdapterGid, 0o640, 'profile request queue')
   provisionFile(`${m.runtimeDir}/profile-results.jsonl`, m.brokerUid, m.workerHandoffGid, 0o640, 'profile result log')
+  provision(`${m.runtimeDir}/profile-request-ids`, m.workerUid, m.workerUid, 0o700, 'profile request ID reservations')
 }
 if (m.workerEnabled) provisionFile(`${m.runtimeDir}/worker-consumed.jsonl`, m.workerUid, m.workerUid, 0o600, 'worker consumed queue')
 // Only the adapter can create these immutable per-envelope inputs; the worker gets group

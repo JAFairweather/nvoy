@@ -1,5 +1,5 @@
-import { appendFileSync, existsSync, lstatSync, readFileSync } from 'node:fs'
-import { randomBytes } from 'node:crypto'
+import { appendFileSync, existsSync, linkSync, lstatSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { createHash, randomBytes } from 'node:crypto'
 import { resolve } from 'node:path'
 import { credentialIn } from './outbound_secrets.mjs'
 
@@ -7,6 +7,7 @@ const HEX32 = /^[0-9a-f]{32}$/
 export const PROFILE_FIELDS = Object.freeze(['name', 'display_name', 'about', 'picture', 'website', 'nip05'])
 export const profileQueuePath = manifest => resolve(manifest.runtimeDir, 'profile-requests.jsonl')
 export const profileResultsPath = manifest => resolve(manifest.runtimeDir, 'profile-results.jsonl')
+export const profileRequestIdsPath = manifest => resolve(manifest.runtimeDir, 'profile-request-ids')
 
 export function profileToolSpec(manifest) {
   const grant = manifest.maySetProfile
@@ -56,6 +57,20 @@ export function queueProfile(manifest, args = {}, now = Date.now()) {
   try {
     const stat = lstatSync(path)
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 64 * 1024 * 1024) throw new Error('profile request queue is invalid')
+    const directory = profileRequestIdsPath(manifest), directoryStat = lstatSync(directory)
+    if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) throw new Error('profile request IDs are not provisioned')
+    const digest = createHash('sha256').update(JSON.stringify({ instance: row.instance, fields: row.fields, dry_run: row.dry_run })).digest('hex')
+    const reservation = resolve(directory, row.id), temporary = resolve(directory, `.${randomBytes(16).toString('hex')}.tmp`)
+    try {
+      writeFileSync(temporary, digest, { flag: 'wx', mode: 0o600 })
+      try { linkSync(temporary, reservation) }
+      catch (error) { if (error.code !== 'EEXIST') throw error }
+    } finally { try { unlinkSync(temporary) } catch {} }
+    const reservationStat = lstatSync(reservation)
+    if (!reservationStat.isFile() || reservationStat.isSymbolicLink() || reservationStat.size !== 64)
+      throw new Error('profile request ID reservation is invalid')
+    if (readFileSync(reservation, 'utf8') !== digest)
+      return { error: { code: 'NVOY_PROFILE_REQUEST_CONFLICT', message: 'request ID belongs to different profile fields' } }
     for (const line of readFileSync(path, 'utf8').split('\n')) {
       let existing
       try { existing = JSON.parse(line) } catch { continue }
