@@ -22,10 +22,11 @@ import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest
 import { claimChannelSource, completeChannelSource } from './channel_source_dedup.mjs'
 import { claimBrokerLock } from './broker_lock.mjs'
 import { brokerSigner } from './broker_signer.mjs'
-import { dmChannels, dmNoticeFilter, nativeGrant, nativeMention, openBuzzSession } from './buzz_native.mjs'
+import { channelContext, contextFilters, dmChannels, dmNoticeFilter, nativeGrant, nativeMention, openBuzzSession } from './buzz_native.mjs'
 import { recordStatusAdmission } from './buzz_status.mjs'
 import { grantLookup, noGrantVerdict } from './grant_evidence.mjs'
 import { admissionLimit, hopOf } from './agent_limits.mjs'
+import { validateContext } from './admitted_task.mjs'
 
 const HEX64 = /^[0-9a-f]{64}$/
 let signer
@@ -71,13 +72,28 @@ let me
 try { me = String(await signer.getPublicKey()).toLowerCase() } catch (e) { requeue(`signer unavailable: ${e.message}`) }
 if (me !== manifest.pubkey) die('signer does not match manifest pubkey')
 
-// 1. The event, read as ourselves. Only what the relay returns under this id counts.
-let source, dms
+// 1. The event, read as ourselves. Only what the relay returns under this id counts. On the same
+// login, the conversation around it (#245): best effort, so a failed read costs the context, never the task.
+let source, dms, context = null
 try {
   const session = await openBuzzSession({ relay: manifest.buzz.relay, signer })
   try {
     dms = dmChannels(await session.fetch(dmNoticeFilter(me)), { me }).filter(ch => !manifest.buzz.channels.includes(ch))
     source = (await session.fetch({ ids: [eventId], kinds: [9], '#h': [...manifest.buzz.channels, ...dms] })).find(ev => ev?.id === eventId)
+    const filters = source && contextFilters(source)
+    if (filters) {
+      const names = Object.fromEntries((manifest.mayPost?.mention || []).filter(m => m.name).map(m => [m.pubkey, m.name]))
+      // One REQ per filter, so a relay that refuses the thread query still yields the recent messages.
+      const events = []
+      for (const filter of filters) {
+        try { events.push(...await session.fetch(filter)) }
+        catch (e) { console.error(`instance-broker-native: ${eventId.slice(0, 12)}… context read failed: ${e.message}`) }
+      }
+      context = channelContext(events, { source, names })
+      // The adapter refuses a task whose context it cannot accept, and a refused task is retried
+      // forever; so a context that would not pass is dropped here rather than sent.
+      try { validateContext(context) } catch (e) { context = null; console.error(`instance-broker-native: ${eventId.slice(0, 12)}… context dropped: ${e.message}`) }
+    }
   } finally { session.close() }
 } catch (e) { requeue(`Buzz relay unavailable: ${e.message}`) }
 if (!source) finish('is not stored in any configured channel')
@@ -136,7 +152,8 @@ const authority = { version: 3, type: 'scoped-instruction', sender: receipt.send
   grantor: receipt.grantor, cap: receipt.cap, scope_subject: me, policy_checked_at: admittedAt,
   source_event: eventId, reply_channel: receipt.reply_channel, ...(dm ? { dm: true } : {}) }
 const payload = JSON.stringify({ type: 'admitted-task', instance: manifest.id, envelope: eventId, authority,
-  messages: [{ from: mention.author, at: source.created_at, content: String(source.content), event_id: eventId, kind: 9 }] }) + '\n'
+  messages: [{ from: mention.author, at: source.created_at, content: String(source.content), event_id: eventId, kind: 9 }],
+  ...(context?.messages.length ? { context } : {}) }) + '\n'
 const client = net.createConnection(resolve(manifest.runtimeDir, 'adapter.sock'))
 const timer = setTimeout(() => { client.destroy(); die('adapter acknowledgement timed out') }, 15000)
 client.on('error', e => { clearTimeout(timer); die(`adapter socket unavailable: ${e.message}`) })

@@ -107,6 +107,50 @@ export function nativeMention(ev, { me, channels, now = Math.floor(Date.now() / 
   return { channel: h[0], author: ev.pubkey, event_id: ev.id, created_at: ev.created_at }
 }
 
+// The conversation around an admitted message, so the agent can follow the room it was asked in
+// (#245). Background only: context carries no authority, whoever wrote it. One fetch asks for the
+// channel's last messages before the source, the thread's root, and the thread's replies.
+export const CONTEXT_LIMIT = 30
+const CONTEXT_MESSAGE_BYTES = 4000, CONTEXT_BYTES = 48 * 1024
+const threadRoot = ev => {
+  const marked = marker => (ev.tags || []).find(t => t?.[0] === 'e' && t[3] === marker && HEX64.test(String(t[1])))?.[1]
+  return marked('root') || marked('reply') || ev.id
+}
+export function contextFilters(source) {
+  const h = tagValues(source, 'h')
+  if (h.length !== 1 || !validChannel(h[0]) || !Number.isSafeInteger(source.created_at)) return null
+  const root = threadRoot(source)
+  return [{ kinds: [9], '#h': h, until: source.created_at, limit: CONTEXT_LIMIT + 1 },
+    ...(root !== source.id ? [{ kinds: [9], '#h': h, ids: [root] }] : []),
+    { kinds: [9], '#h': h, '#e': [root] }]
+}
+export function channelContext(events, { source, names = {}, limit = CONTEXT_LIMIT, verify = verifyEvent, now = Math.floor(Date.now() / 1000) }) {
+  const [channel] = tagValues(source, 'h'), root = threadRoot(source), byId = new Map()
+  for (const ev of Array.isArray(events) ? events : []) {
+    if (ev?.kind !== 9 || ev.id === source.id || byId.has(ev.id) || !HEX64.test(String(ev.id)) || !HEX64.test(String(ev.pubkey)) ||
+        !Number.isSafeInteger(ev.created_at) || ev.created_at > source.created_at || typeof ev.content !== 'string') continue
+    const h = tagValues(ev, 'h')
+    if (h.length !== 1 || h[0] !== channel || !verified(ev, verify)) continue
+    byId.set(ev.id, ev)
+  }
+  // The thread first, then the most recent channel messages, until the count or byte budget is spent.
+  const inThread = ev => ev.id === root || threadRoot(ev) === root
+  const ranked = [...byId.values()].sort((a, b) => (inThread(b) - inThread(a)) || (b.created_at - a.created_at))
+  const kept = []
+  let bytes = 0
+  for (const ev of ranked) {
+    if (kept.length >= limit) break
+    let content = ev.content
+    if (Buffer.byteLength(content) > CONTEXT_MESSAGE_BYTES) content = `${Buffer.from(content).subarray(0, CONTEXT_MESSAGE_BYTES).toString().replace(/�+$/, '')}…`
+    if (bytes + Buffer.byteLength(content) > CONTEXT_BYTES) break
+    bytes += Buffer.byteLength(content)
+    const replyTo = (ev.tags || []).find(t => t?.[0] === 'e' && t[3] === 'reply' && HEX64.test(String(t[1])))?.[1]
+    const name = names[ev.pubkey]
+    kept.push({ from: ev.pubkey, ...(name ? { name } : {}), at: ev.created_at, content, event_id: ev.id, ...(replyTo ? { reply_to: replyTo } : {}) })
+  }
+  return { channel, fetched_at: now, messages: kept.sort((a, b) => a.at - b.at) }
+}
+
 // A Buzz DM is a channel like any other — kind:9 with an h tag, and clients p-tag every participant
 // — so what makes it a DM is its channel type, `dm`. The relay stamps that type as the first t tag
 // on the channel's 39000 and on every 44100/44101 notice about it, and a client cannot submit a
