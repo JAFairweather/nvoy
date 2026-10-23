@@ -26,7 +26,9 @@ const envelope = '3'.repeat(64)
 const task = { type: 'admitted-task', instance: manifest.id, envelope,
   authority: { version: 1, type: 'scoped-instruction', sender: '4'.repeat(64), grant_id: '5'.repeat(64),
     grantor: manifest.grantors[0], cap: 'task', scope_subject: manifest.pubkey, policy_checked_at: Date.now() },
-  messages: [{ from: '4'.repeat(64), at: 1785880000, content: 'inspect the queue' }] }
+  messages: [{ from: '4'.repeat(64), at: 1785880000, content: 'inspect the queue' }],
+  context: { channel: 'a8186b53-537d-46ad-a7e7-b6486c58970e', fetched_at: 1785880001,
+    messages: [{ from: '6'.repeat(64), name: 'pi-dog', at: 1785879990, content: 'the queue stalled at noon', event_id: '8'.repeat(64) }] } }
 const notificationEnvelope = '7'.repeat(64)
 const notification = { type: 'verified-notification', instance: manifest.id, envelope: notificationEnvelope,
   notification: { version: 1, type: 'verified-channel-activity', source_author: '6'.repeat(64),
@@ -79,6 +81,8 @@ try {
   const body = JSON.parse(read.content[0].text)
   ok('the exact marker reads only its broker-validated task and authority',
     body.envelope === envelope && body.authority.sender === task.authority.sender && body.messages[0].content === task.messages[0].content)
+  ok('the read also returns the channel context the broker attached (#245)',
+    body.context?.messages?.[0]?.content === 'the queue stalled at noon' && body.context.messages[0].name === 'pi-dog')
   const noticeRead = await client.callTool({ name: 'nvoy_channel_read', arguments: { envelope: notificationEnvelope } })
   const noticeBody = JSON.parse(noticeRead.content[0].text)
   ok('a content-free verified notification remains readable without acquiring instruction authority',

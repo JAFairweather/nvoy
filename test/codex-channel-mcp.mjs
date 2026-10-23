@@ -22,7 +22,8 @@ const authority = { version: 2, type: 'scoped-instruction', sender: '6'.repeat(6
 const instruction = { type: 'admitted-task', instance: manifest.id, envelope: instructionEnvelope, received_at: Date.now(), authority,
   messages: [{ from: authority.sender, at: 1785880000, content: 'review says fix the invariant', event_id: authority.source_event, kind: 9 }] }
 const data = { type: 'admitted-task', instance: manifest.id, envelope: dataEnvelope, received_at: Date.now(), authority: null,
-  messages: [{ from: 'a'.repeat(64), at: 1785880001, content: 'authenticated review data', event_id: 'b'.repeat(64), kind: 9 }] }
+  messages: [{ from: 'a'.repeat(64), at: 1785880001, content: 'authenticated review data', event_id: 'b'.repeat(64), kind: 9 }],
+  context: { channel, fetched_at: 1785880002, messages: [{ from: 'a'.repeat(64), at: 1785879990, content: 'earlier in the room', event_id: 'd'.repeat(64) }] } }
 const notification = { type: 'verified-notification', instance: manifest.id, envelope: notificationEnvelope,
   notification: { version: 1, type: 'verified-channel-activity', source_author: 'd'.repeat(64), source_event: 'e'.repeat(64),
     source_channel: channel, carrier: manifest.task_carriers[0].pubkey, carrier_grant_id: 'f'.repeat(64),
@@ -47,6 +48,7 @@ try {
     !JSON.stringify(listed).includes('review says') && !JSON.stringify(listed).includes(authority.sender))
   const read = JSON.parse((await client.callTool({ name: 'nvoy_channel_read', arguments: { envelope: dataEnvelope } })).content[0].text)
   ok('exact read returns authenticated data without promoting it to instruction', read.authority === null && read.messages[0].content === data.messages[0].content)
+  ok('exact read also returns the channel context, still as data (#245)', read.authority === null && read.context?.messages?.[0]?.content === 'earlier in the room')
   const notice = JSON.parse((await client.callTool({ name: 'nvoy_channel_read', arguments: { envelope: notificationEnvelope } })).content[0].text)
   ok('exact read preserves content-free verified notification provenance without inventing messages',
     notice.authority === null && notice.notification.source_event === notification.notification.source_event && !('messages' in notice))
