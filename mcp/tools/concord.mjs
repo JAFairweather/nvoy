@@ -31,6 +31,7 @@ import { decode, npubEncode } from 'nostr-tools/nip19'
 import { getPublicKey } from 'nostr-tools/pure'
 import { schnorr } from '@noble/curves/secp256k1.js'
 import * as lib from './concord_lib.mjs'
+import { secretKey } from './secret_key.mjs'
 const { hex, toHex } = lib
 
 const die = (m) => { console.error(`concord: ${m}`); process.exit(1) }
@@ -38,7 +39,8 @@ const arg = (n, d) => { const i = process.argv.indexOf(n); return i === -1 ? d :
 
 // --- identity ---
 const raw = process.env.NVOY_NSEC || die('set NVOY_NSEC (Claude identity that holds the invite)')
-const sk = raw.startsWith('nsec1') ? decode(raw).data : hex(raw)
+let sk
+try { sk = secretKey(raw, 'NVOY_NSEC') } catch (error) { die(error.message) }
 const ME = getPublicKey(sk)
 // The only key whose sealed invite is trusted. Required: never default to one owner's key.
 const INVITER_RAW = process.env.CONCORD_INVITER || die('set CONCORD_INVITER (npub or hex of the invite sender)')

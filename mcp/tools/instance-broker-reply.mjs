@@ -12,10 +12,10 @@ import { replyRequestDigest, validateOutboundRecord } from './outbound_record.mj
 import { spawnSync } from 'node:child_process'
 import WebSocket from 'ws'
 import { getPublicKey, getEventHash, finalizeEvent, generateSecretKey, verifyEvent } from 'nostr-tools/pure'
-import { decode } from 'nostr-tools/nip19'
 import * as nip44 from 'nostr-tools/nip44'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { makeBunkerSigner } from './nip46-signer.mjs'
+import { secretKey } from './secret_key.mjs'
 import { verifyOutboundApproval } from './outbound_approval.mjs'
 import { channelReply, openBuzzSession, validChannel } from './buzz_native.mjs'
 import { recordStatusReplied } from './buzz_status.mjs'
@@ -122,9 +122,10 @@ let signer
 let bunkerUri = process.env.NVOY_BUNKER_URI || ''
 if (!bunkerUri && process.env.NVOY_BUNKER_URI_FILE) { try { bunkerUri = readFileSync(process.env.NVOY_BUNKER_URI_FILE, 'utf8').trim() } catch { die('cannot read Bunker URI credential') } }
 if (bunkerUri) {
-  signer = makeBunkerSigner(bunkerUri, raw)
+  signer = makeBunkerSigner(bunkerUri, raw, { clientSource: `broker credential ${credential}` })
 } else {
-  const sk = raw.startsWith('nsec1') ? decode(raw).data : Uint8Array.from(Buffer.from(raw, 'hex'))
+  let sk
+  try { sk = secretKey(raw, `broker credential ${credential}`) } catch (error) { die(error.message) }
   signer = { getPublicKey: async () => getPublicKey(sk), signEvent: async event => finalizeEvent(event, sk),
     nip44Encrypt: async (peer, text) => nip44.encrypt(text, nip44.getConversationKey(sk, peer)) }
 }

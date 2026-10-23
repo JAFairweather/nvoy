@@ -33,6 +33,7 @@ import { createHash } from 'node:crypto'
 import { decode, npubEncode } from 'nostr-tools/nip19'
 import { getPublicKey, verifyEvent, finalizeEvent, generateSecretKey } from 'nostr-tools/pure'
 import * as nip44 from 'nostr-tools/nip44'
+import { secretKey } from './secret_key.mjs'
 
 const arg = (n, d) => { const i = process.argv.indexOf(n); return i === -1 ? d : process.argv[i + 1] }
 const DRY = process.argv.includes('--dry-run')
@@ -49,7 +50,8 @@ const COOLDOWN = Number(arg('--cooldown', 90)) * 1000   // never wake more often
 const SETTLE = 4000                                      // coalesce a burst into one wake
 
 const raw = process.env.NVOY_NSEC || (() => { console.error('wake-watcher: set NVOY_NSEC'); process.exit(1) })()
-const sk = raw.startsWith('nsec1') ? decode(raw).data : Uint8Array.from(Buffer.from(raw, 'hex'))
+let sk
+try { sk = secretKey(raw, 'NVOY_NSEC') } catch (error) { console.error(`wake-watcher: ${error.message}`); process.exit(1) }
 const ME = getPublicKey(sk)
 
 // --notify <npub|hex> (or WAKE_NOTIFY): who to tell, out of band, that a wake happened.

@@ -40,6 +40,7 @@ import { decode, npubEncode } from 'nostr-tools/nip19'
 import { getPublicKey, verifyEvent } from 'nostr-tools/pure'
 import * as nip44 from 'nostr-tools/nip44'
 import { makeBunkerSigner } from './nip46-signer.mjs'
+import { secretKey } from './secret_key.mjs'
 import { partitionInvocations, verifiedChannelNotifications } from './invocation_policy.mjs'
 import { verifyInboxEnvelope } from './inbox_envelope.mjs'
 import { grantExpired } from './agent_limits.mjs'
@@ -69,13 +70,15 @@ let ME, decrypt
 if (bunkerUri) {
   const clientNsec = clientFile || process.env.NVOY_NIP46_CLIENT_NSEC ||
     die('set NVOY_NIP46_CLIENT_NSEC_FILE (preferred) or NVOY_NIP46_CLIENT_NSEC for the Bunker connection')
-  const signer = makeBunkerSigner(bunkerUri, clientNsec)
+  const clientPath = process.env.NVOY_NIP46_CLIENT_NSEC_FILE || process.env.NVOY_NIP46_CLIENT_FILE
+  const signer = makeBunkerSigner(bunkerUri, clientNsec, { clientSource: clientFile ? `Bunker client credential at ${clientPath}` : 'NVOY_NIP46_CLIENT_NSEC' })
   ME = await signer.getPublicKey()
   decrypt = (peer, ciphertext) => signer.nip44Decrypt(peer, ciphertext)
 } else {
   const raw = credential(process.env.NVOY_NSEC_FILE, 'local identity credential') || process.env.NVOY_NSEC ||
     die('set NVOY_NSEC_FILE (preferred), NVOY_NSEC, or the Bunker credential-file pair')
-  const sk = raw.startsWith('nsec1') ? decode(raw).data : Uint8Array.from(Buffer.from(raw, 'hex'))
+  let sk
+  try { sk = secretKey(raw, process.env.NVOY_NSEC_FILE ? `local identity credential at ${process.env.NVOY_NSEC_FILE}` : 'NVOY_NSEC') } catch (error) { die(error.message) }
   ME = getPublicKey(sk)
   decrypt = async (peer, ciphertext) => nip44.decrypt(ciphertext, nip44.getConversationKey(sk, peer))
 }

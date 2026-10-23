@@ -33,6 +33,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { finalizeEvent, getPublicKey } from 'nostr-tools/pure'
 import * as nip19 from 'nostr-tools/nip19'
 import { makeBunkerSigner } from './nip46-signer.mjs'
+import { secretKey } from './secret_key.mjs'
 import { CHANNEL_KINDS, normalizeBuzzRelay, openBuzzSession, validChannel } from './buzz_native.mjs'
 
 const die = (m) => { console.error(`buzz-probe: ${m}`); process.exit(1) }
@@ -80,11 +81,10 @@ let signer
 if (bunkerUri) {
   // Held open for the whole probe: the relay allows 5s from challenge to AUTH, and a Bunker that
   // reconnects per call can spend most of that before it signs.
-  signer = makeBunkerSigner(bunkerUri, bunkerClient, { idleMs: 30000 })
+  signer = makeBunkerSigner(bunkerUri, bunkerClient, { idleMs: 30000, clientSource: `Bunker client credential at ${process.env.NVOY_NIP46_CLIENT_NSEC_FILE || process.env.NVOY_NIP46_CLIENT_FILE}` })
 } else {
   let sk
-  try { sk = keyText.startsWith('nsec1') ? nip19.decode(keyText).data : Uint8Array.from(Buffer.from(keyText, 'hex')) } catch { sk = null }
-  if (!(sk instanceof Uint8Array) || sk.length !== 32) die('identity key file does not hold a valid nsec')
+  try { sk = secretKey(keyText, `identity key at ${process.env.NVOY_NSEC_FILE}`) } catch (error) { die(error.message) }
   signer = { getPublicKey: async () => getPublicKey(sk), signEvent: async t => finalizeEvent(t, sk) }
 }
 

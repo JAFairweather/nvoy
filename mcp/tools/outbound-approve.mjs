@@ -165,7 +165,8 @@ const credential = (path, label) => {
   if (!value) die(`${label} at ${path} is empty`)
   return value
 }
-const signer = makeBunkerSigner(credential(uriFile, 'approver Bunker URI'), credential(clientFile, 'approver Bunker client credential'))
+const signer = makeBunkerSigner(credential(uriFile, 'approver Bunker URI'), credential(clientFile, 'approver Bunker client credential'),
+  { clientSource: `approver Bunker client credential at ${clientFile}` })
 const approver = await signer.getPublicKey()
 if (!manifest.grantors.includes(approver)) die('the Bunker identity is not an authorized approver for this instance')
 if (approver === manifest.pubkey) die('the participant identity cannot approve its own outbound action')
