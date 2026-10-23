@@ -242,6 +242,37 @@ delivery and replies carry on. A Bunker that silently drops the request instead 
 Without the block below an identity can only answer: every signed kind:9 is a reply to an
 admitted message. `may_post` lets it start a conversation too.
 
+### Broker-managed kind-0 profiles
+
+An identity whose key stays in the broker may opt into `nvoy_profile_set` with a separate manifest
+block. Without it, profile changes are refused. This is not a NIP-DA grant event: `grant_id` is the
+operator's stable audit identifier for this opt-in.
+
+```json
+"may_set_profile": { "kind": 0, "pubkey": "<this manifest's pubkey>",
+                     "grant_id": "<64-hex audit identifier>", "per_day": 1,
+                     "picture_hosts": ["nave.pub"] }
+```
+
+`per_day` defaults to 1; values 2–24 are an explicit operator override. `picture_hosts` defaults
+to `nave.pub`. The block requires a local broker, a Buzz relay, worker-disabled `notify_only`
+delivery, and an exact kind/pubkey match. Manifest loading and the broker both check that scope.
+
+The channel tool accepts only `name`, `display_name`, `about`, `picture`, `website`, and `nip05`.
+The broker requires and reads the latest Buzz kind 0, merges those fields, preserves everything else,
+and forces `bot: true`; an empty relay answer fails closed rather than replacing an unseen profile.
+It bounds field lengths, requires an allowed HTTPS picture host, and verifies a
+`name@nave.pub` NIP-05 against `nave.pub/.well-known/nostr.json`. `dry_run` validates and returns
+the candidate without signing kind 0 or spending the profile budget; a NIP-42 AUTH signature may
+still be necessary to read the current profile.
+
+For a live change the broker counts a separate durable daily budget, freezes kind 0 before signing,
+persists the signed event, and resends the same ID after a relay timeout. It reports relay acceptance
+and checks the exact signed event and all fields on readback. Each completed call writes an audit
+line with the seat, grant ID, changed old/new values, event ID, and outcome. `nvoy_profile_set`
+waits briefly for the result and otherwise returns a request ID; `nvoy_profile_status` reads that
+request's eventual result. Neither tool exposes the signing credential.
+
 ```json
 "may_post": { "channels": ["<uuid in buzz.channels>"], "per_hour": 4,
               "mention": [{ "name": "dennis", "pubkey": "<hex>" }, "<hex or npub>"] },

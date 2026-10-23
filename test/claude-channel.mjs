@@ -68,8 +68,9 @@ try {
   ok('the capabilities notice carries no message content', notices.every(n => !JSON.stringify(n).includes(task.messages[0].content)))
   const tools = (await client.listTools()).tools.map(tool => tool.name)
   ok('Claude receives an explicit read tool, a receipt-bound reply tool, a body-free discovery tool, and the post tool',
-    tools.length === 4 && tools.includes('nvoy_channel_read') && tools.includes('nvoy_channel_reply') &&
-    tools.includes('nvoy_channel_list') && tools.includes('nvoy_channel_post'))
+    tools.length === 6 && tools.includes('nvoy_channel_read') && tools.includes('nvoy_channel_reply') &&
+    tools.includes('nvoy_channel_list') && tools.includes('nvoy_channel_post') &&
+    tools.includes('nvoy_profile_set') && tools.includes('nvoy_profile_status'))
   const post = await client.callTool({ name: 'nvoy_channel_post', arguments: { text: 'hello room' } })
   ok('without may_post the post tool refuses: this identity may only reply',
     post.isError === true && /may only reply/.test(post.content[0].text) && !existsSync(join(runtime, 'post-requests.jsonl')))

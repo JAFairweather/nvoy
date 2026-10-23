@@ -46,6 +46,10 @@ provisionFile(`${m.runtimeDir}/desktop-reply-requests.jsonl`, m.adapterUid, m.br
 if (m.deliveryMode === 'notify_only' && m.buzz?.statusReactions) provisionFile(`${m.runtimeDir}/status-requests.jsonl`, m.workerUid, m.brokerAdapterGid, 0o640, 'status request queue')
 // nvoy_channel_post's requests, for an identity whose owner opted it in; broker-group readable.
 if (m.mayPost) provisionFile(`${m.runtimeDir}/post-requests.jsonl`, m.workerUid, m.brokerAdapterGid, 0o640, 'post request queue')
+if (m.maySetProfile) {
+  provisionFile(`${m.runtimeDir}/profile-requests.jsonl`, m.workerUid, m.brokerAdapterGid, 0o640, 'profile request queue')
+  provisionFile(`${m.runtimeDir}/profile-results.jsonl`, m.brokerUid, m.workerHandoffGid, 0o640, 'profile result log')
+}
 if (m.workerEnabled) provisionFile(`${m.runtimeDir}/worker-consumed.jsonl`, m.workerUid, m.workerUid, 0o600, 'worker consumed queue')
 // Only the adapter can create these immutable per-envelope inputs; the worker gets group
 // traversal/read access but cannot replace an input belonging to a different envelope.
