@@ -8,7 +8,7 @@ import { appendFileSync, readdirSync, renameSync, readFileSync, lstatSync } from
 import { resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
-import { isTerminalReplyFailure, loadTerminalReplyIds, recordTerminalReply } from './reply_retry.mjs'
+import { isTerminalReplyFailure, loadTerminalReplyIds, recordTerminalReply, terminalReplyReason } from './reply_retry.mjs'
 import { childVerdict } from './broker_verdict.mjs'
 
 const die = m => { console.error(`instance-broker-daemon: ${m}`); process.exit(1) }
@@ -112,7 +112,7 @@ function drain() {
           if (isTerminalReplyFailure(stderr)) {
             try {
               if (recordTerminalReply(terminalRepliesPath, terminalReplyIds, request, stderr))
-                console.error(`instance-broker-daemon: ${source} reply proposal ${request.slice(0, 12)}… terminal — its receipt is no longer live`)
+                console.error(`instance-broker-daemon: ${source} reply proposal ${request.slice(0, 12)}… terminal (${terminalReplyReason(stderr)})`)
             } catch (e) { console.error(`instance-broker-daemon: cannot record terminal reply ${request.slice(0, 12)}…: ${e.message || e}`) }
             continue
           }
@@ -135,7 +135,7 @@ function drain() {
             if (isTerminalReplyFailure(stderr)) {
               try {
                 if (recordTerminalReply(terminalRepliesPath, terminalReplyIds, request, stderr))
-                  console.error(`instance-broker-daemon: ${source} reply ${request.slice(0, 12)}… terminal — its receipt is no longer live`)
+                  console.error(`instance-broker-daemon: ${source} reply ${request.slice(0, 12)}… terminal (${terminalReplyReason(stderr)})`)
               } catch (e) { console.error(`instance-broker-daemon: cannot record terminal reply ${request.slice(0, 12)}…: ${e.message || e}`) }
             } else {
               proposalRetryAfter.set(key, Date.now() + 5000)
