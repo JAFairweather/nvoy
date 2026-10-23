@@ -17,6 +17,20 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const MAX_BYTES = 4000
 export const POST_ONLY_REPLY = 'this identity may only reply'
 export const postQueuePath = manifest => resolve(manifest.runtimeDir, 'post-requests.jsonl')
+// A name as an agent writes it ("@mc-claude", "MC-Claude", "mydude") is matched without case, the @
+// or separators, so it resolves to the manifest's name however it was typed.
+const fold = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '')
+
+// How to take part, beside what the manifest allows. Agents left to their defaults answered and
+// stopped, and wrote "@name" in text, which Buzz never resolves; the others never woke (10-23).
+// It follows waggle's AGENT_BRIEF: mentions are the wake signal.
+export const PARTICIPATION = 'How to take part: the others are episodic and wake only when mentioned, so an assignment' +
+  ' without a mention is a note to yourself. Mention with the mention field, or write @name with a name from the' +
+  ' mentionable list; any other @text reaches no one, and the tool result says which names it mentioned. End each' +
+  ' message with the next step and who owns it, mentioning them; when you finish work, mention whoever acts on it' +
+  ' next; when blocked, mention whoever can unblock you. When you see work that needs doing, say so and propose' +
+  ' who takes it rather than waiting to be asked. Say when there is nothing further, so a thread ends rather than' +
+  ' going quiet. The hop and hourly limits are the brakes; spend them on moving work forward.'
 export const MENTION_SCHEMA = { type: 'array', items: { type: 'string', minLength: 1, maxLength: 64 }, maxItems: 16 }
 
 // What this identity may do, from its manifest, told to the agent in the channel servers'
@@ -36,6 +50,7 @@ export function capabilitySummary(manifest) {
       ? `set this seat's kind-0 profile with nvoy_profile_set under manifest grant ${manifest.maySetProfile.grantId}, at most ${manifest.maySetProfile.perDay} per rolling 24 hours; scope kind 0 and pubkey ${manifest.pubkey}; picture hosts ${manifest.maySetProfile.pictureHosts.join(', ')};`
       : 'not set profile: nvoy_profile_set is refused without may_set_profile;',
     `a chain of agent messages stops at ${limits.maxHops} hops, and at most ${limits.perSenderPerHour} messages an hour from one sender are admitted.`,
+    ...(m ? [PARTICIPATION] : []),
   ].join(' ')
 }
 export const capabilityHash = summary => createHash('sha256').update(summary).digest('hex')
@@ -68,9 +83,27 @@ export function resolvePost(manifest, args = {}) {
   if (!content || Buffer.byteLength(content) > MAX_BYTES) return { code: 'NVOY_BAD_POST', message: `text must be 1..${MAX_BYTES} bytes` }
   const channel = args.channel == null ? m.channels[0] : String(args.channel).toLowerCase()
   if (!m.channels.includes(channel)) return { code: 'NVOY_POST_CHANNEL_REFUSED', message: `channel is not in may_post.channels (${m.channels.join(', ')})` }
-  const resolved = resolveMentions(m, args.mention, 'NVOY_BAD_POST', 'NVOY_POST_MENTION_REFUSED')
-  return resolved.code ? resolved : { channel, mention: resolved.mention, content }
+  const text = textMentions(m, content)
+  const resolved = resolveMentions(m, withTextMentions(args.mention, text), 'NVOY_BAD_POST', 'NVOY_POST_MENTION_REFUSED')
+  return resolved.code ? resolved : { channel, mention: resolved.mention, content, unresolved: text.unresolved }
 }
+
+// Buzz wakes only a p-tagged key, never "@name" text, yet that is how agents write a mention: on
+// 10-23 mc-claude had named others in 10 replies and woken none of them. An @name on
+// may_post.mention becomes a mention; any other is handed back so the agent sees it reached no one.
+export function textMentions(m, content) {
+  const found = [], unresolved = []
+  for (const [, token] of String(content).matchAll(/(?:^|[^\w@])@([a-z0-9][\w-]{0,63})/gi)) {
+    const entry = m?.mention.find(e => e.name && fold(e.name) === fold(token))
+    if (entry) { if (!found.includes(entry.name)) found.push(entry.name) }
+    else if (!unresolved.includes(`@${token}`)) unresolved.push(`@${token}`)
+  }
+  return { found, unresolved }
+}
+const withTextMentions = (list, text) => list == null ? text.found : Array.isArray(list) ? [...list, ...text.found] : list
+// What the agent is shown when some @text named no one it may mention.
+export const notMentioned = (m, unresolved) => unresolved?.length
+  ? { not_mentioned: unresolved, mentionable: m.mention.map(e => e.name || e.pubkey) } : {}
 
 // Names or hex keys to the distinct keys may_post.mention allows, or the refusal the agent is shown.
 function resolveMentions(m, list, badCode, refusedCode) {
@@ -78,19 +111,23 @@ function resolveMentions(m, list, badCode, refusedCode) {
   const mention = []
   for (const raw of list || []) {
     const value = String(raw).trim().toLowerCase()
-    const entry = m.mention.find(e => e.pubkey === value || e.name?.toLowerCase() === value)
+    const entry = m.mention.find(e => e.pubkey === value || (e.name && fold(e.name) === fold(value)))
     if (!entry) return { code: refusedCode, message: `${HEX64.test(value) ? value.slice(0, 8) : value} is not on may_post.mention` }
     if (!mention.includes(entry.pubkey)) mention.push(entry.pubkey)
   }
   return { mention }
 }
 
-// nvoy_channel_reply's optional mention: a reply that brings someone new into the thread is held to
-// the same allowlist as a post. No list, or an empty one, leaves the reply exactly as it was.
-export function resolveReplyMention(manifest, list) {
-  if (list == null || (Array.isArray(list) && !list.length)) return { mention: [] }
+// nvoy_channel_reply's optional mention, plus any @name in its text: a reply that brings someone
+// new into the thread is held to the same allowlist as a post. With neither, or without a may_post
+// block for @text, the reply is exactly as it was.
+export function resolveReplyMention(manifest, list, content = '') {
+  const text = manifest.mayPost ? textMentions(manifest.mayPost, content) : { found: [], unresolved: [] }
+  const all = withTextMentions(list, text)
+  if (all == null || (Array.isArray(all) && !all.length)) return { mention: [], unresolved: text.unresolved }
   if (!manifest.mayPost) return { code: 'NVOY_REPLY_MENTION_NOT_PERMITTED', message: 'mentioning anyone beyond the sender needs the manifest\'s may_post block' }
-  return resolveMentions(manifest.mayPost, list, 'NVOY_BAD_REPLY', 'NVOY_REPLY_MENTION_REFUSED')
+  const resolved = resolveMentions(manifest.mayPost, all, 'NVOY_BAD_REPLY', 'NVOY_REPLY_MENTION_REFUSED')
+  return resolved.code ? resolved : { ...resolved, unresolved: text.unresolved }
 }
 
 // Broker side of a reply's mention, re-checked against the manifest as a post's is. Present only
@@ -143,6 +180,6 @@ export function queuePost(manifest, args, now = Date.now()) {
     const row = { version: 1, type: 'post-request', id: randomBytes(16).toString('hex'), instance: manifest.id,
       channel: resolved.channel, mention: resolved.mention, content: resolved.content, requested_at: now }
     appendFileSync(path, JSON.stringify(row) + '\n')
-    return { ok: { queued: true, request: row.id, channel: row.channel, mention: row.mention } }
+    return { ok: { queued: true, request: row.id, channel: row.channel, mention: row.mention, ...notMentioned(manifest.mayPost, resolved.unresolved) } }
   } catch (error) { return { error: { code: 'NVOY_POST_QUEUE_FAILED', message: error.message } } }
 }

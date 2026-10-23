@@ -10,7 +10,7 @@ import { resolve } from 'node:path'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { validateDesktopDelivery } from './admitted_task.mjs'
 import { requestWorkingStatus } from './buzz_status.mjs'
-import { MENTION_SCHEMA, capabilityInstructions, postToolSpec, queuePost, resolveReplyMention } from './agent_post.mjs'
+import { MENTION_SCHEMA, capabilityInstructions, notMentioned, postToolSpec, queuePost, resolveReplyMention } from './agent_post.mjs'
 import { profileToolSpec, profileStatusToolSpec, queueProfile, profileStatus, waitProfile } from './agent_profile.mjs'
 import { credentialIn, withheld } from './outbound_secrets.mjs'
 
@@ -123,14 +123,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async request => {
   if (!content || Buffer.byteLength(content) > 4000) return result({ code: 'NVOY_BAD_REPLY' }, true)
   const credential = credentialIn(content)
   if (credential) { const { error, log } = withheld({ instance: manifest.id, path: 'nvoy-codex-channel-mcp', name: credential, text: content }); console.error(log); return result(error, true) }
-  const { mention, ...refused } = resolveReplyMention(manifest, request.params.arguments?.mention)
+  const { mention, unresolved, ...refused } = resolveReplyMention(manifest, request.params.arguments?.mention, content)
   if (refused.code) return result(refused, true)
   try {
     const prior = lines(replyPath, 'reply request queue').map(line => { try { return JSON.parse(line) } catch { throw new Error('reply request queue contains malformed JSON') } })
     if (prior.some(row => row?.receipt === envelope)) return result({ code: 'NVOY_ALREADY_REPLIED', envelope }, true)
     const row = { version: 1, type: 'reply-request', id: randomBytes(16).toString('hex'), instance: manifest.id, receipt: envelope, content, ...(mention.length ? { mention } : {}) }
     appendFileSync(replyPath, JSON.stringify(row) + '\n', { mode: 0o640 }); chmodSync(replyPath, 0o640)
-    return result({ queued: true, envelope, request: row.id, ...(mention.length ? { mention } : {}) })
+    return result({ queued: true, envelope, request: row.id, ...(mention.length ? { mention } : {}), ...notMentioned(manifest.mayPost, unresolved) })
   } catch (error) { return result({ code: 'NVOY_REPLY_QUEUE_FAILED', message: error.message }, true) }
 })
 await mcp.connect(new StdioServerTransport())
