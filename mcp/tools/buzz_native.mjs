@@ -230,7 +230,11 @@ export async function openBuzzSession({ relay, signer, timeoutMs = 10000, pingMs
   // A membership-notice filter is the one exception, and only for our own notices.
   const notices = f => Array.isArray(f?.kinds) && f.kinds.length && f.kinds.every(k => MEMBERSHIP_KINDS.includes(k)) &&
     Array.isArray(f['#p']) && f['#p'].length === 1 && f['#p'][0] === me && f['#h'] === undefined
-  const needsChannels = filters => !filters.length || filters.some(f => !notices(f) && (!Array.isArray(f?.['#h']) || !f['#h'].length || !f['#h'].every(validChannel)))
+  const ownProfile = f => Array.isArray(f?.kinds) && f.kinds.length === 1 && f.kinds[0] === 0 &&
+    Array.isArray(f?.authors) && f.authors.length === 1 && f.authors[0] === me && f['#h'] === undefined &&
+    Number.isInteger(f.limit) && f.limit === 1
+  const needsChannels = filters => !filters.length || filters.some(f => !notices(f) && !ownProfile(f) &&
+    (!Array.isArray(f?.['#h']) || !f['#h'].length || !f['#h'].every(validChannel)))
 
   try {
     const c = challenge ?? await bounded(new Promise((resolve, reject) => { onChallenge = { resolve, reject } }), 'AUTH challenge')
@@ -263,8 +267,8 @@ export async function openBuzzSession({ relay, signer, timeoutMs = 10000, pingMs
     publishSigned,
     // Sign and publish; resolves only on the relay's OK, and reports its refusal verbatim.
     async publish(template) { return publishSigned(await signer.signEvent(template)) },
-    // Stored events up to EOSE. Every filter must name its channels (or ask for our own membership
-    // notices), or Buzz answers with nothing.
+    // Stored events up to EOSE. Channel filters need #h; the two narrow exceptions are our own
+    // membership notices and our own latest kind-0 profile.
     async fetch(...filters) {
       if (needsChannels(filters)) throw new Error('every Buzz filter needs #h channel UUIDs — without it the relay returns nothing')
       const id = `q${++n}`

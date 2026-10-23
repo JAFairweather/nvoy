@@ -43,6 +43,16 @@ try {
   }
 } catch (e) { if (e.code !== 'ENOENT') die(`cannot load terminal post log: ${e.message}`) }
 const isTerminalPost = stderr => /post refused:|post request has an invalid|post record does not bind/.test(stderr)
+const profileDone = new Set()
+const profileRetryAfter = new Map()
+let profileActive = null
+if (manifest.maySetProfile) {
+  try {
+    for (const line of readFileSync(resolve(manifest.runtimeDir, 'profile-results.jsonl'), 'utf8').split('\n')) {
+      try { const row = JSON.parse(line); if (row?.type === 'profile-result' && /^[0-9a-f]{32}$/.test(String(row.request))) profileDone.add(row.request) } catch {}
+    }
+  } catch (error) { if (error.code !== 'ENOENT') die(`cannot load profile results: ${error.message}`) }
+}
 
 function recover() {
   let names = []
@@ -179,6 +189,43 @@ function drainPosts() {
     console.error(`instance-broker-daemon: post ${request.slice(0, 12)}… held for retry: ${stderr}`)
   }
 }
+function drainProfiles() {
+  if (profileActive) return
+  let ids
+  try {
+    const path = resolve(manifest.runtimeDir, 'profile-requests.jsonl'), stat = lstatSync(path)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 64 * 1024 * 1024) throw new Error('profile queue is invalid')
+    ids = new Set(readFileSync(path, 'utf8').split('\n').flatMap(line => {
+      try { const row = JSON.parse(line); return /^[0-9a-f]{32}$/.test(String(row?.id)) ? [row.id] : [] } catch { return [] }
+    }))
+  } catch (error) { console.error(`instance-broker-daemon: profile queue unavailable: ${error.message}`); return }
+  for (const request of ids) {
+    if (profileDone.has(request) || (profileRetryAfter.get(request) || 0) > Date.now()) continue
+    const child = spawn(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-profile.mjs'),
+      '--instance', manifest.id, '--request', request], { env: childEnv, stdio: ['ignore', 'ignore', 'pipe'] })
+    profileActive = request
+    let stderr = '', settled = false
+    child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-240) })
+    const timeout = setTimeout(() => child.kill('SIGKILL'), 90000)
+    const complete = (code, error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      profileActive = null
+      if (code === 0) {
+        profileDone.add(request)
+        profileRetryAfter.delete(request)
+        console.log(`instance-broker-daemon: profile ${request.slice(0, 12)}… complete`)
+      } else {
+        profileRetryAfter.set(request, Date.now() + 5000)
+        console.error(`instance-broker-daemon: profile ${request.slice(0, 12)}… held for retry: ${String(error?.message || stderr || `exit ${code}`).trim().slice(0, 240)}`)
+      }
+    }
+    child.on('error', error => complete(null, error))
+    child.on('exit', code => complete(code))
+    break
+  }
+}
 // The keyless Buzz watcher can log in only through this oracle, and the status keeper puts the
 // native 👀/💬 on admitted Buzz messages. Both are supervised here, beside the drain, so they run as
 // the broker and hold the same credential; a crash is restarted with backoff.
@@ -198,4 +245,5 @@ if (manifest.buzz?.statusReactions) supervise('instance-broker-status.mjs', 'sta
 drain()
 setInterval(drain, 1000)
 if (manifest.mayPost) { drainPosts(); setInterval(drainPosts, 1000) }
+if (manifest.maySetProfile) { drainProfiles(); setInterval(drainProfiles, 1000) }
 console.log(`instance-broker-daemon: draining ${manifest.id}`)

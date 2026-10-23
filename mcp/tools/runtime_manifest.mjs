@@ -233,6 +233,25 @@ export function readManifest(root, requestedId) {
     if (new Set(names).size !== names.length) die('may_post.mention names must be distinct')
     mayPost = Object.freeze({ channels: Object.freeze(channels), perHour: block.per_hour, mention: Object.freeze(mention) })
   }
+  let maySetProfile = null
+  if (raw.may_set_profile != null) {
+    const block = raw.may_set_profile
+    if (!block || typeof block !== 'object' || Array.isArray(block) ||
+        Object.keys(block).some(key => !['kind', 'pubkey', 'grant_id', 'per_day', 'picture_hosts'].includes(key))) die('may_set_profile has unknown fields')
+    if (!buzz) die('may_set_profile requires a buzz block')
+    if (brokerMode !== 'local' || deliveryMode !== 'notify_only' || workerEnabled) die('may_set_profile requires a local-broker, worker-disabled notify_only manifest')
+    const scopedPubkey = toHex(block.pubkey)
+    if (block.kind !== 0 || scopedPubkey !== pubkey) die('may_set_profile must scope kind 0 to the manifest pubkey')
+    if (!valid(String(block.grant_id || '').toLowerCase())) die('may_set_profile.grant_id must be a 64-hex identifier')
+    const perDay = block.per_day ?? 1
+    if (!Number.isInteger(perDay) || perDay < 1 || perDay > 24) die('may_set_profile.per_day must be an integer from 1 to 24')
+    const pictureHosts = block.picture_hosts ?? ['nave.pub']
+    if (!Array.isArray(pictureHosts) || !pictureHosts.length || !pictureHosts.every(host =>
+      typeof host === 'string' && /^[a-z0-9][a-z0-9.-]*[a-z0-9]$/.test(host) && !host.includes('..')) ||
+      new Set(pictureHosts).size !== pictureHosts.length) die('may_set_profile.picture_hosts requires distinct DNS hosts')
+    maySetProfile = Object.freeze({ kind: 0, pubkey, grantId: block.grant_id.toLowerCase(), perDay,
+      pictureHosts: Object.freeze([...pictureHosts]) })
+  }
   // The brakes on agent-to-agent traffic (agent_limits.mjs). Always in force; the block only tunes them.
   let agentLimits = DEFAULT_LIMITS
   if (raw.agent_limits != null) {
@@ -251,7 +270,7 @@ export function readManifest(root, requestedId) {
     }
   }
   return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, carriers: Object.freeze(carriers), buzz, relays, stateDir, runtimeDir, spoolDir,
-    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, adapterContainer, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath, codexAppBundleId, codexProjectLabel, codexChatLabel, codexUiDriver, harness, wakeWebhook, channelDoor, mayPost, agentLimits,
+    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, adapterContainer, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath, codexAppBundleId, codexProjectLabel, codexChatLabel, codexUiDriver, harness, wakeWebhook, channelDoor, mayPost, maySetProfile, agentLimits,
     sshTarget, sshIdentityFile, sshKnownHostsFile, sshKnownHostsSha256, approvalEndpoint: approvalEndpoint.replace(/\/$/, '') })
 }
 
