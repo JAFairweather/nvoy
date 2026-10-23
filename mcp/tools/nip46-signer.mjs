@@ -3,16 +3,12 @@
 // it is a broker-only connection credential, not passed to watcher/adapter/worker.
 
 import { randomUUID } from 'node:crypto'
-import { finalizeEvent, getPublicKey, nip19, nip44 } from 'nostr-tools'
+import { finalizeEvent, getPublicKey, nip44 } from 'nostr-tools'
 import { SimplePool } from 'nostr-tools/pool'
+import { secretKey } from './secret_key.mjs'
 
 const BUNKER = /^bunker:\/\/([0-9a-f]{64})/i
-const nsec = raw => {
-  const { type, data } = nip19.decode(String(raw || '').trim())
-  if (type !== 'nsec') throw new Error('NIP-46 client credential must be nsec1…')
-  return data
-}
-
+// `options.clientSource` names where clientNsec came from, for an error that must not quote it.
 export function makeBunkerSigner(uriText, clientNsec, options = {}) {
   const match = BUNKER.exec(String(uriText || '').trim())
   if (!match) throw new Error('invalid bunker URI')
@@ -20,7 +16,7 @@ export function makeBunkerSigner(uriText, clientNsec, options = {}) {
   const relays = [...new Set(uri.searchParams.getAll('relay').filter(v => /^wss:\/\//.test(v)))]
   if (!relays.length) throw new Error('bunker URI needs at least one wss relay')
   const pubkey = match[1].toLowerCase(), secret = uri.searchParams.get('secret') || ''
-  const clientKey = nsec(clientNsec), clientPubkey = getPublicKey(clientKey)
+  const clientKey = secretKey(clientNsec, options.clientSource || 'NIP-46 client credential', { hex: false }), clientPubkey = getPublicKey(clientKey)
   const conversation = nip44.v2.utils.getConversationKey(clientKey, pubkey)
   const pool = options.pool || new SimplePool(), pending = new Map()
   const idleMs = Number.isSafeInteger(options.idleMs) && options.idleMs >= 0 ? options.idleMs : 250

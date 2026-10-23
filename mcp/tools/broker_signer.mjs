@@ -10,8 +10,9 @@
 
 import { existsSync, readFileSync } from 'node:fs'
 import { getPublicKey, finalizeEvent } from 'nostr-tools/pure'
-import { decode, nsecEncode } from 'nostr-tools/nip19'
+import { nsecEncode } from 'nostr-tools/nip19'
 import { makeBunkerSigner } from './nip46-signer.mjs'
+import { secretKey } from './secret_key.mjs'
 
 export const HEAL_AFTER_TIMEOUTS = 3
 
@@ -40,6 +41,7 @@ export function selfHealingSigner(open, { healAfter = HEAL_AFTER_TIMEOUTS, log =
 
 export function brokerSigner(die, options = {}) {
   const credential = process.env.NVOY_BROKER_CREDENTIAL
+  options = { clientSource: `broker credential ${credential}`, ...options }
   if (!credential || !existsSync(credential)) die('broker credential file is unavailable')
   let raw
   try { raw = readFileSync(credential, 'utf8').trim() } catch { die('cannot read broker credential') }
@@ -53,7 +55,8 @@ export function brokerSigner(die, options = {}) {
     const client = raw.startsWith('nsec1') ? raw : nsecEncode(Uint8Array.from(Buffer.from(raw, 'hex')))
     return { signer: selfHealingSigner(() => makeBunkerSigner(uri, client, options)), attentionEnv: { NVOY_BUNKER_URI: uri, NVOY_NIP46_CLIENT_NSEC: client } }
   }
-  const sk = raw.startsWith('nsec1') ? decode(raw).data : Uint8Array.from(Buffer.from(raw, 'hex'))
+  let sk
+  try { sk = secretKey(raw, `broker credential ${credential}`) } catch (error) { die(error.message) }
   return { signer: { getPublicKey: async () => getPublicKey(sk), signEvent: async event => finalizeEvent(event, sk) },
     attentionEnv: { NVOY_NSEC: raw } }
 }
