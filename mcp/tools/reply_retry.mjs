@@ -15,6 +15,9 @@ const TERMINAL = [
   'admission receipt is not a live broker-bound sender capability',
   'admission receipt no longer has a live matching grant',
   'reply refused: ',
+  // The frozen kind:9 names its parent by id, so once Buzz has dropped that message (deleted, or
+  // never kept) no retry can land it: the event cannot be re-addressed without re-signing.
+  'Buzz refused the reply: invalid: reply parent not found',
 ]
 
 export function isTerminalReplyFailure(stderr) {
@@ -87,11 +90,16 @@ export function loadPublishedReplyIds(dir, requestDigests) {
   return ids
 }
 
+export function terminalReplyReason(stderr) {
+  const text = String(stderr || '')
+  return text.includes('withheld: ') ? 'withheld-credential' : text.includes('live matching grant') ? 'grant-no-longer-live'
+    : text.includes('reply parent not found') ? 'parent-gone' : 'receipt-not-live'
+}
+
 export function recordTerminalReply(path, ids, id, stderr, at = Date.now()) {
   if (!ID.test(String(id || ''))) throw new Error('terminal reply id is invalid')
   if (ids.has(id)) return false
-  const text = String(stderr || '')
-  const reason = text.includes('withheld: ') ? 'withheld-credential' : text.includes('live matching grant') ? 'grant-no-longer-live' : 'receipt-not-live'
+  const reason = terminalReplyReason(stderr)
   appendFileSync(path, JSON.stringify({ version: 1, type: 'terminal-reply', id, reason, at }) + '\n', { mode: 0o600 })
   ids.add(id)
   return true
