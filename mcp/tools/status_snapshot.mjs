@@ -6,9 +6,8 @@
 // its process is up. Every check here measures a function (a login signed, a grant is readable, a
 // heard mention got a verdict); container state is shown but never decides a colour on its own.
 
-import { createHash } from 'node:crypto'
 import { verifyEvent } from 'nostr-tools/pure'
-import { grantExpired } from './agent_limits.mjs'
+import { foldGrants } from './grant_fold.mjs'
 import { CREDENTIAL_PATTERNS } from './outbound_secrets.mjs'
 
 const RANK = { grey: 0, green: 1, amber: 2, red: 3 }
@@ -152,39 +151,16 @@ export function agentChecks({ manifest, watcher = [], broker = [], containers = 
 
 // --- Grants: who may task whom --------------------------------------------------------------------
 
-const TASK_CAPS = ['task', 'task+act', 'task-relay']
-// The broker's own construction (attention.mjs), byte for byte, so the page reads a grant exactly
-// as the broker that enforces it does.
-const scopeHash = (agentHex, saltHex) => createHash('sha256').update(Buffer.concat([
-  Buffer.from('waggle/da-scope/v1'), Buffer.from([0]), Buffer.from(String(agentHex)), Buffer.from(saltHex || '', 'hex'),
-])).digest('hex')
-const tag = (ev, name) => (ev.tags || []).find(t => t[0] === name)
-
-// What one target's broker would conclude from these events: the same order, grantor filter,
-// revocation and expiry rules as attention.mjs. Returns grantee -> { state, cap, grantId }.
+// What one target's broker would conclude from these events: the broker's own fold (grant_fold.mjs),
+// so the page reads a grant exactly as the broker that enforces it does. grantee -> { state, cap, grantId }.
 function taskAuthority(events, target) {
-  const live = new Map(), ended = new Map()
-  const drop = (id, why) => {
-    for (const [pk, caps] of live) {
-      for (const [cap, g] of caps) if (g.grantId === id) { caps.delete(cap); ended.set(pk, why) }
-      if (!caps.size) live.delete(pk)
-    }
-  }
-  for (const ev of [...events].sort((a, b) => (a.created_at || 0) - (b.created_at || 0))) {
-    if (!target.grantors.includes(String(ev.pubkey || '').toLowerCase())) continue
-    if (ev.kind === 441) { const id = tag(ev, 'e')?.[1]; if (id) drop(id, 'revoked'); continue }
-    const grantee = String(tag(ev, 'p')?.[1] || '').toLowerCase(), scope = tag(ev, 'da-scope'), cap = tag(ev, 'da-cap')?.[1]
-    if (!grantee || !scope || !TASK_CAPS.includes(cap) || scope[1] !== scopeHash(target.pubkey, scope[2] || '')) continue
-    if (!live.has(grantee)) live.set(grantee, new Map())
-    live.get(grantee).set(cap, { grantId: ev.id, cap })
-    if (grantExpired(ev)) drop(ev.id, 'expired')
-  }
+  const { live, ended } = foldGrants(events, { me: target.pubkey, grantors: target.grantors })
   const out = new Map()
   for (const [pk, caps] of live) {
     const g = caps.get('task+act') || caps.get('task') || caps.get('task-relay')
-    out.set(pk, { state: 'active', cap: g.cap, grantId: g.grantId })
+    out.set(pk, { state: 'active', cap: g.cap, grantId: g.grantId, voiceOf: g.shadow ? g.grantor : null })
   }
-  for (const [pk, why] of ended) if (!out.has(pk)) out.set(pk, { state: why })
+  for (const [pk, why] of ended) out.set(pk, { state: why })
   return out
 }
 
@@ -207,7 +183,7 @@ export function grantGrid({ events = [], heldBy = new Map(), targets = [], names
       if (!a) return { state: 'none' }
       if (a.state !== 'active') return { state: a.state }
       const relays = [...(heldBy.get(a.grantId) || [])].filter(r => t.relays.includes(r)).sort()
-      return { state: 'active', cap: a.cap, grant: a.grantId.slice(0, 8), relays }
+      return { state: 'active', cap: a.cap, grant: a.grantId.slice(0, 8), relays, ...(a.voiceOf ? { voice_of: a.voiceOf.slice(0, 8) } : {}) }
     }),
   }))
   const grantors = [...new Set(targets.flatMap(t => t.grantors))].map(pk => ({ name: names.get(pk) || null, pubkey: pk.slice(0, 8) }))
@@ -261,7 +237,8 @@ export function swarmView({ manifests = [], grid = { targets: [], rows: [] }, ag
     r.cells.forEach((c, i) => {
       if (c.state !== 'active') return
       const from = nodes.get(r.pubkey) || nodes.set(r.pubkey, { id: r.pubkey, name: r.name, kind: r.name ? 'named' : 'unknown' }).get(r.pubkey)
-      edges.push({ type: 'instructs', from: from.id, to: grid.targets[i].pubkey, cap: c.cap, grant: c.grant })
+      edges.push({ type: 'instructs', from: from.id, to: grid.targets[i].pubkey, cap: c.cap, grant: c.grant, ...(c.voice_of ? { voice_of: c.voice_of } : {}) })
+      if (c.voice_of) from.voice_of = c.voice_of
     })
   }
   for (const m of manifests) for (const e of m.mayPost?.mention || []) {

@@ -35,15 +35,14 @@ import WebSocket from 'ws'
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { resolve, dirname } from 'node:path'
-import { createHash } from 'node:crypto'
 import { decode, npubEncode } from 'nostr-tools/nip19'
-import { getPublicKey, verifyEvent } from 'nostr-tools/pure'
+import { getPublicKey } from 'nostr-tools/pure'
 import * as nip44 from 'nostr-tools/nip44'
 import { makeBunkerSigner } from './nip46-signer.mjs'
 import { secretKey } from './secret_key.mjs'
 import { partitionInvocations, verifiedChannelNotifications } from './invocation_policy.mjs'
 import { verifyInboxEnvelope } from './inbox_envelope.mjs'
-import { grantExpired } from './agent_limits.mjs'
+import { foldGrants } from './grant_fold.mjs'
 
 const arg = (n, d) => { const i = process.argv.indexOf(n); return i === -1 ? d : process.argv[i + 1] }
 const die = (m) => { console.error(`attention: ${m}`); process.exit(1) }
@@ -89,15 +88,9 @@ const GRANTORS = String(process.env.GRANTORS || '')
   .split(',').map(s => toHex(s.trim())).filter(Boolean)
 if (!GRANTORS.length) die('set GRANTORS (comma-separated npub or hex) — no grantor means nothing can be authorised')
 
-// Kind numbers and tag names mirror the bridge's admission tier so one vocabulary covers both.
+// Kind numbers mirror the bridge's admission tier so one vocabulary covers both. The scope check,
+// revocation, expiry and voices are grant_fold.mjs, shared with the wake watcher and the status page.
 const KIND = { grant: 440, revocation: 441 }
-const TAG = { scope: 'da-scope', cap: 'da-cap' }
-// The scope is a salted hash of the AGENT this grant is about, so a grant authorising someone to
-// task a different agent cannot be replayed against this one, and the agent id does not ride
-// publicly in the clear.
-const scopeHash = (agentHex, saltHex) => createHash('sha256').update(Buffer.concat([
-  Buffer.from('waggle/da-scope/v1'), Buffer.from([0]), Buffer.from(String(agentHex)), Buffer.from(saltHex || '', 'hex'),
-])).digest('hex')
 
 const RELAYS = (process.env.NVOY_RELAYS?.split(',') || [
   'wss://nos.lol', 'wss://relay.primal.net',
@@ -157,45 +150,12 @@ for (const url of RELAYS) {
   for (const e of out) grantEvents.set(e.id, e)
 }
 
-// Grants first, then revocations — order matters, and a 441 must be able to kill a 440 seen
-// on a different relay in the same pass.
-// One identity may legitimately hold both `task` and the carrier-only `task-relay`. Keep grants
-// by capability rather than letting the newest one overwrite the other.
-const permitted = new Map() // sender hex -> Map(cap -> { grantId, grantor, cap })
-const putGrant = (pk, grant) => {
-  if (!permitted.has(pk)) permitted.set(pk, new Map())
-  permitted.get(pk).set(grant.cap, grant)
-}
-const dropGrant = grantId => {
-  for (const [pk, caps] of permitted) {
-    for (const [cap, grant] of caps) if (grant.grantId === grantId) caps.delete(cap)
-    if (!caps.size) permitted.delete(pk)
-  }
-}
+// One fold over the union, so a 441 on one relay kills a 440 seen on another in the same pass.
+// One identity may legitimately hold both `task` and the carrier-only `task-relay`, and a voice holds
+// its grantor's grants under its shadow grant (grant_fold.mjs).
+const { live: permitted, rejected } = foldGrants([...grantEvents.values()], { me: ME, grantors: GRANTORS })
 const taskGrant = pk => permitted.get(pk)?.get('task+act') || permitted.get(pk)?.get('task') || null
 const relayGrant = pk => permitted.get(pk)?.get('task-relay') || null
-const sorted = [...grantEvents.values()].sort((a, b) => (a.created_at || 0) - (b.created_at || 0))
-let rejected = 0
-for (const ev of sorted) {
-  if (!GRANTORS.includes(String(ev.pubkey || '').toLowerCase())) continue
-  let ok = false; try { ok = verifyEvent(ev) } catch { ok = false }
-  if (!ok) { rejected++; continue }
-  if (ev.kind === KIND.revocation) {
-    const target = (ev.tags || []).find(t => t[0] === 'e')?.[1]
-    dropGrant(target)
-    continue
-  }
-  const grantee = (ev.tags || []).find(t => t[0] === 'p')?.[1]
-  const scope = (ev.tags || []).find(t => t[0] === TAG.scope)
-  const cap = (ev.tags || []).find(t => t[0] === TAG.cap)?.[1]
-  if (!grantee || !scope || !cap) continue
-  if (scope[1] !== scopeHash(ME, scope[2] || '')) continue // authorises tasking some other agent
-  if (!['task', 'task+act', 'task-relay'].includes(cap)) continue
-  putGrant(String(grantee).toLowerCase(), { grantId: ev.id, grantor: ev.pubkey, cap })
-  // NIP-40: an expired grant is dropped exactly as a 441 would drop it — including the older grant
-  // it displaced, so expiry can never resurrect authority the newer grant replaced.
-  if (grantExpired(ev)) dropGrant(ev.id)
-}
 
 const TASK_CARRIERS = (() => {
   let raw
@@ -217,7 +177,7 @@ const TASK_CARRIERS = (() => {
 if (process.argv.includes('--policy-only')) {
   console.log(JSON.stringify({ me: ME, policyUsable: relaysAnswered > 0, relaysAnswered, relays: relayAnswers,
     grants: [...permitted.entries()].flatMap(([pk, caps]) => [...caps.values()].map(g =>
-      ({ pubkey: pk, cap: g.cap, grant_id: g.grantId, grantor: String(g.grantor).toLowerCase() }))) }))
+      ({ pubkey: pk, cap: g.cap, grant_id: g.grantId, grantor: String(g.grantor).toLowerCase(), ...(g.shadow ? { shadow: true } : {}) }))) }))
   process.exit(0)
 }
 
