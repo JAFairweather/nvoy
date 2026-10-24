@@ -47,7 +47,8 @@ for (const [shape, raw] of Object.entries(malformed)) {
 
 // --- the Bunker transport key ---
 const bunkerUri = `bunker://${getPublicKey(generateSecretKey())}?relay=wss://relay.invalid&secret=s`
-for (const [shape, raw] of Object.entries(malformed)) {
+// makeBunkerSigner takes hex too, so for it only the bech32 shapes are malformed.
+for (const [shape, raw] of Object.entries(malformed).filter(([shape]) => !shape.startsWith('a hex key'))) {
   const message = thrown(() => makeBunkerSigner(bunkerUri, raw, { clientSource: 'Bunker client credential at /run/test/client' }))
   ok(`makeBunkerSigner refuses ${shape} without quoting it`, /\/run\/test\/client/.test(message) && !leaks(message, raw))
 }

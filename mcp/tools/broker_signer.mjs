@@ -51,7 +51,7 @@ export function brokerSigner(die, options = {}) {
     let uri
     try { uri = readFileSync(uriPath, 'utf8').trim() } catch { die('cannot read Bunker URI credential') }
     if (!/^bunker:\/\//i.test(uri)) die('Bunker URI credential is invalid')
-    // Every transport-key reader downstream decodes an nsec, so a hex key is encoded once here.
+    // The attention env carries the transport key as an nsec, whichever form the file holds.
     const client = raw.startsWith('nsec1') ? raw : nsecEncode(Uint8Array.from(Buffer.from(raw, 'hex')))
     return { signer: selfHealingSigner(() => makeBunkerSigner(uri, client, options)), attentionEnv: { NVOY_BUNKER_URI: uri, NVOY_NIP46_CLIENT_NSEC: client } }
   }

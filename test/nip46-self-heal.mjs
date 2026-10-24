@@ -6,7 +6,9 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { decode } from 'nostr-tools/nip19'
-import { getPublicKey } from 'nostr-tools/pure'
+import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
+import * as nip44 from 'nostr-tools/nip44'
+import { makeBunkerSigner } from '../mcp/tools/nip46-signer.mjs'
 import { brokerSigner, HEAL_AFTER_TIMEOUTS, selfHealingSigner } from '../mcp/tools/broker_signer.mjs'
 
 let fails = 0
@@ -103,6 +105,33 @@ ok('the AUTH oracle gets its signer from brokerSigner', /brokerSigner\(die/.test
   ok('the transport key reaches the attention env as the same key, nsec-encoded',
     nsec.startsWith('nsec1') && Buffer.from(decode(nsec).data).toString('hex') === hex)
   built?.signer.close(); process.env = env; rmSync(dir, { recursive: true, force: true })
+}
+
+// --- every Bunker client takes a hex transport key, not only brokerSigner (10-24: the reply and
+// attention paths still decoded it as bech32) ---
+{
+  const bunkerSk = generateSecretKey(), clientSk = generateSecretKey()
+  const bunkerPub = getPublicKey(bunkerSk), clientPub = getPublicKey(clientSk)
+  const conversation = nip44.v2.utils.getConversationKey(bunkerSk, clientPub)
+  // A fake Bunker that can read only requests encrypted by the configured client key.
+  const pool = {
+    handler: null,
+    subscribeMany(_relays, _filter, callbacks) { this.handler = callbacks.onevent; return { close() {} } },
+    publish(_relays, event) {
+      const request = JSON.parse(nip44.v2.decrypt(event.content, conversation))
+      const response = finalizeEvent({ kind: 24133, created_at: 1, tags: [['p', clientPub]],
+        content: nip44.v2.encrypt(JSON.stringify({ id: request.id, result: bunkerPub }), conversation) }, bunkerSk)
+      queueMicrotask(() => this.handler(response))
+      return [Promise.resolve('ok')]
+    },
+    close() {},
+  }
+  let resolved, error
+  try {
+    const signer = makeBunkerSigner(`bunker://${bunkerPub}?relay=wss%3A%2F%2Frelay.invalid&secret=test`, Buffer.from(clientSk).toString('hex'), { pool, idleMs: 5 })
+    resolved = await signer.getPublicKey(); signer.close()
+  } catch (e) { error = e.message }
+  ok('makeBunkerSigner completes a Bunker round trip with a hex transport key' + (error ? ` (${error})` : ''), resolved === bunkerPub)
 }
 
 console.log(fails ? `\n${fails} FAILED` : '\nall passed')
