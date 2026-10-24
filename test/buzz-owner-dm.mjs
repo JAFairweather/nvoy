@@ -58,6 +58,10 @@ ok('in a channel, a grant holder is admitted as before', nativeGrant({ author: m
 ok('in a channel, a grant from a non-grantor still counts for nothing', nativeGrant({ author: grantee.pk, dm: false, grants: [grants[3]], grantors }) === null)
 ok('in a channel, a stranger with no grant is refused as before', nativeGrant({ author: stranger.pk, dm: false, grants, grantors }) === null)
 ok('task+act is preferred over task, as before', nativeGrant({ author: grantee.pk, dm: false, grants: [g(grantee.pk), g(grantee.pk, 'task+act')], grantors })?.cap === 'task+act')
+// A grantor's voice, which attention lists under the shadow grant's id marked shadow, speaks in channels only.
+const voiced = { ...g(myDude.pk, 'task+act'), shadow: true }
+ok('in a channel, the owner\'s voice is admitted on the shadow grant', nativeGrant({ author: myDude.pk, dm: false, grants: [voiced], grantors })?.grant_id === voiced.grant_id)
+ok('a DM from the owner\'s voice is refused: DMs stay the owner\'s alone', nativeGrant({ author: myDude.pk, dm: true, grants: [voiced], grantors }) === null)
 
 // --- a Buzz-shaped relay with DMs ---
 const members = new Set([agent.pk, owner.pk, myDude.pk, grantee.pk, stranger.pk]), stored = [], dmMembers = new Map()

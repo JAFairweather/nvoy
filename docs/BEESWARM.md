@@ -30,22 +30,28 @@ as the rest of the snapshot, so it carries names and 8-hex prefixes only.
 A voice is a key that speaks for a person without holding that person's authority key. Dead Rabbit is
 James's voice from the R1, so the Director's key never has to sit on the device.
 
-Today Dead Rabbit holds its own task grant on each agent, which has two faults: every new agent needs
-another grant (LukeDog has none), and taking the voice away means one revocation per agent. The fix
-is one **shadow grant**:
+Dead Rabbit used to need its own task grant on each agent, which has two faults: every new agent
+needs another grant (LukeDog had none), and taking the voice away means one revocation per agent.
+The fix is one **shadow grant**, which every broker now honours (`mcp/tools/grant_fold.mjs`):
 
 - A kind 440 from the Director with `["p", <voice>]`, a `da-scope` whose subject is the Director's own
   key, and `["da-cap", "shadow"]`, optionally with a NIP-40 expiration.
 - A broker treats a sender holding a live shadow grant, signed by one of its manifest grantors and
   scoped to that grantor, as holding whatever live task grants that grantor's key holds on this broker,
-  and no more. A new agent the Director can instruct is reachable by the voice at once.
+  under the shadow grant's id, and no more. A new agent the Director can instruct is reachable by the
+  voice at once.
 - One kind 441 against that grant silences the voice everywhere in one motion, and the Director's own
-  grants are untouched.
+  grants are untouched. Revoking the Director's own grant on one agent takes the voice's reach there too.
 - A shadow cannot sign grants: a grant the voice signs is still not from a manifest grantor, so a lost
   device can never mint authority that outlives the revocation. Shadows do not chain.
+- A voice is not a grantor. It stays under the hourly per-sender brake, a brake on a lost device, and
+  it speaks in channels only: a Buzz DM still admits the owner alone.
+- A voice's own direct grant, if it still holds one, wins for that capability, so the per-agent grants
+  must be revoked once the shadow is live for the shadow to be the one switch.
 
-beeswarm draws a shadow as a single link from the voice to its person, and shows the voice's reach as
-the person's reach. Until the broker honours `shadow`, the per-agent task grants stay.
+The broker, the wake watcher and the status page share one fold, so they cannot disagree about who
+may instruct whom. beeswarm draws a voice's edges with a dash-dot line and names whose voice it is
+and which one grant to revoke.
 
 ## How to run the swarm
 
@@ -67,9 +73,8 @@ Hierarchical authority, flat collaboration.
    what you own) is a kind 30440 body that James signs, granted to each agent with `admit+read`. The
    broker reads the briefs its agent holds and injects them into the harness's instructions, where
    `capabilitySummary()` already announces a change of capabilities. beeswarm gains an editor that
-   signs a brief with James's NIP-07 key; the page never holds a key. `may_post.externally` (posting
-   in public, outside the Buzz channels) becomes a defined right. The broker honours the `shadow` cap,
-   and Dead Rabbit's per-agent grants are replaced by one shadow grant.
+   signs a brief with James's NIP-07 key; the page never holds a key. `may_post.externally` becomes a
+   defined right: the agent may post publicly, as itself, on public relays (James, 2026-10-24).
 3. **Speaking rights as grants.** `may_post`, mention lists and profile rights move from private
    manifests into signed grants, so the page shows one source of truth and James can change a right
    without editing a manifest on the fleet host. A coordinator's delegated authority, if James wants

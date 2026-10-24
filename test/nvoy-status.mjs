@@ -132,6 +132,18 @@ const live = { ...grid, rows: [...grid.rows, { name: null, pubkey: 'f00dcafe', c
 const stranger = swarmView({ manifests: [], grid: live, names })
 ok('a live grant held by a key nobody named is an unknown node, drawn and warned about', stranger.nodes.find(n => n.id === 'f00dcafe')?.kind === 'unknown'
   && /Keys nobody named hold live task grants/.test(renderSwarm({ generated_at: new Date(now).toISOString(), swarm: stranger }, {}, now)))
+// A voice: the director holds a grant on alpha and shadows a key, which then reaches alpha as the director's voice.
+const voicePk = getPublicKey(generateSecretKey())
+const own = grant('director', pub.director, pub.alpha, 'task+act'), shadowed = grant('director', voicePk, pub.director, 'shadow')
+const voiced = grantGrid({ events: [own, shadowed], heldBy: new Map([[shadowed.id, new Set(['relay#1', 'relay#2'])]]), targets, names: new Map([...names, [voicePk, 'voice']]) })
+const vCell = voiced.rows.find(r => r.pubkey === voicePk.slice(0, 8))?.cells
+ok('a voice holds the grantor\'s grant under the shadow grant, on the relays that hold the shadow', vCell?.[0].state === 'active' && vCell[0].cap === 'task+act' && vCell[0].grant === shadowed.id.slice(0, 8) && vCell[0].voice_of === pub.director.slice(0, 8) && vCell[0].relays.length === 2)
+ok('and nothing where the grantor holds nothing', vCell?.[1].state === 'none')
+const vSwarm = swarmView({ manifests: [{ id: 'alpha', pubkey: pub.alpha, grantors: [pub.director], deliveryMode: 'notify_only', mayPost: null, agentLimits: { maxHops: 3, perSenderPerHour: 10 } }], grid: voiced, names: new Map([...names, [voicePk, 'voice']]) })
+const vEdge = vSwarm.edges.find(e => e.type === 'instructs' && e.from === voicePk.slice(0, 8))
+ok('the swarm draws the voice\'s edge as a voice of the grantor', vEdge?.voice_of === pub.director.slice(0, 8) && vSwarm.nodes.find(n => n.id === voicePk.slice(0, 8))?.voice_of === pub.director.slice(0, 8))
+const vPage = renderSwarm({ generated_at: new Date(now).toISOString(), swarm: vSwarm }, { selected: voicePk.slice(0, 8) }, now)
+ok('the panel says whose voice it is and which one grant to revoke', /Speaks as director/.test(vPage) && vPage.includes(shadowed.id.slice(0, 8)) && /class="edge instructs voice/.test(vPage))
 const spots = [...layout(swarm.nodes).values()]
 ok('the layout gives every node its own place inside the drawing', spots.length === swarm.nodes.length && new Set(spots.map(p => `${p.x},${p.y}`)).size === spots.length && spots.every(p => p.x > 40 && p.x < 720 && p.y > 40 && p.y < 640))
 const evilSwarm = renderSwarm({ generated_at: new Date(now).toISOString(), swarm: { nodes: [{ id: 'aaaa0000', name: '<script>x</script>', kind: 'agent" onclick="x', colour: 'red" onload="x', grantors: [], limits: {} }], edges: [{ type: 'instructs', from: 'aaaa0000', to: 'aaaa0000', cap: '<img src=x>' }] } }, { selected: 'aaaa0000' }, now)

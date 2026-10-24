@@ -48,7 +48,7 @@ function graph(sw, show, selected) {
   const edges = sw.edges.filter(e => EDGE_TYPES.includes(e.type) && show[e.type] && at.has(e.from) && at.has(e.to))
   const touches = e => !selected || e.from === selected || e.to === selected
   const near = new Set(selected ? [selected, ...edges.filter(touches).flatMap(e => [e.from, e.to])] : sw.nodes.map(n => n.id))
-  const paths = edges.map(e => `<path class="edge ${e.type}${touches(e) ? '' : ' cold'}" d="${curve(at.get(e.from), at.get(e.to))}" marker-end="url(#arrow-${e.type})"><title>${esc(label(sw.nodes.find(n => n.id === e.from)))} ${e.type === 'instructs' ? `may instruct (${esc(e.cap)})` : 'may wake'} ${esc(label(sw.nodes.find(n => n.id === e.to)))}</title></path>`).join('')
+  const paths = edges.map(e => `<path class="edge ${e.type}${e.voice_of ? ' voice' : ''}${touches(e) ? '' : ' cold'}" d="${curve(at.get(e.from), at.get(e.to))}" marker-end="url(#arrow-${e.type})"><title>${esc(label(sw.nodes.find(n => n.id === e.from)))} ${e.type === 'instructs' ? `may instruct (${esc(e.cap)})` : 'may wake'} ${esc(label(sw.nodes.find(n => n.id === e.to)))}</title></path>`).join('')
   const cells = sw.nodes.map(n => {
     const p = at.get(n.id)
     return `<g class="node ${kind(n.kind)} ${colour(n.colour)}${n.id === selected ? ' selected' : ''}${near.has(n.id) ? '' : ' cold'}" data-node="${esc(n.id)}" tabindex="0" role="button" aria-label="${esc(label(n))}">
@@ -77,8 +77,9 @@ ${unknown.length ? `<div class="warn"><b>Keys nobody named hold live task grants
   const agent = kind(n.kind) === 'agent', f = n.funnel || {}
   return `<h3><span class="dot ${colour(n.colour)}"></span>${esc(label(n))} <code>${esc(n.id)}</code> <small>${esc(kind(n.kind))}</small></h3>
 ${kind(n.kind) === 'unknown' ? '<div class="warn">No manifest or mention list names this key. If it holds grants, find out whose it is or revoke them.</div>' : ''}
-<h4>Takes instructions from</h4>${agent ? list(into('instructs').map(e => `${who(sw, e.from)} <small>${esc(e.cap)} · ${esc(e.grant)}</small>`)) : '<p class="dim">not a fleet agent: its own broker, if any, is not measured here</p>'}
-<h4>May instruct</h4>${list(out('instructs').map(e => `${who(sw, e.to)} <small>${esc(e.cap)}</small>`))}
+${n.voice_of ? `<p>Speaks as ${who(sw, n.voice_of)}'s voice: a shadow grant gives it that key's reach, and one revocation of grant <code>${esc(out('instructs')[0]?.grant || '')}</code> takes it all away.</p>` : ''}
+<h4>Takes instructions from</h4>${agent ? list(into('instructs').map(e => `${who(sw, e.from)} <small>${esc(e.cap)}${e.voice_of ? ' as a voice' : ''} · ${esc(e.grant)}</small>`)) : '<p class="dim">not a fleet agent: its own broker, if any, is not measured here</p>'}
+<h4>May instruct</h4>${list(out('instructs').map(e => `${who(sw, e.to)} <small>${esc(e.cap)}${e.voice_of ? ' as a voice' : ''}</small>`))}
 ${agent ? `<h4>May wake (mention)</h4>${list(out('wakes').map(e => who(sw, e.to)))}` : ''}
 <h4>Woken by</h4>${list(into('wakes').map(e => who(sw, e.from)))}
 ${agent ? `<h4>Speaks</h4><dl>
