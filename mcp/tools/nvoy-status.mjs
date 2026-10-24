@@ -2,7 +2,7 @@
 // The status page's collector (status S1). Every minute, on the fleet host, it turns the facts a host
 // script gathered (container state and logs, channel processes, uptime, the deploy runner's state)
 // plus what the relays and public endpoints answer right now into one sanitised status.json, and
-// copies the static page beside it. Caddy serves the pair at waggle.nave.pub/status.
+// copies the static pages beside it. Caddy serves them at waggle.nave.pub/status (and /beeswarm).
 //
 //   node mcp/tools/nvoy-status.mjs --facts <dir> --instances /etc/nvoy/instances --state <dir> --out <dir>
 //
@@ -18,7 +18,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { readManifest } from './runtime_manifest.mjs'
 import { relayLabel } from './grant_evidence.mjs'
-import { agentChecks, grantGrid, gridColumn, parseLog, platformChecks, relayChecks, sanitiserFindings, webCheck, worst } from './status_snapshot.mjs'
+import { agentChecks, grantGrid, gridColumn, parseLog, platformChecks, relayChecks, sanitiserFindings, swarmView, webCheck, worst } from './status_snapshot.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const arg = (name, fallback) => { const i = process.argv.indexOf(name); return i > 0 ? process.argv[i + 1] : fallback }
@@ -29,6 +29,8 @@ const FACTS = arg('--facts'), INSTANCES = arg('--instances', '/etc/nvoy/instance
 const PAGE = arg('--page', resolve(here, 'status-page'))
 const TIMEOUT_MS = Number(arg('--timeout-ms', 8000))
 // Public endpoints, each a page anyone can open. An empty --web skips them (tests).
+// A public NIP-05 list that names keys no manifest does (Dead Rabbit, the crew). An empty --names skips it.
+const NAMES = arg('--names', 'https://nave.pub/.well-known/nostr.json')
 const WEB = (arg('--web', 'waggle.nave.pub=https://waggle.nave.pub/,console=https://waggle.nave.pub/console/,nave.pub=https://nave.pub/,bunker=https://bunker.nave.pub/'))
   .split(',').filter(Boolean).map(pair => { const i = pair.indexOf('='); return [pair.slice(0, i), pair.slice(i + 1)] })
 if (!FACTS || !STATE || !OUT) die('usage: --facts <dir> --state <dir> --out <dir> [--instances <dir>] [--web name=url,…]')
@@ -48,6 +50,14 @@ const labelOf = new Map(allRelays.map((url, i) => [url, relayLabel(url, i)]))
 const names = new Map()
 for (const m of manifests) for (const e of m.mayPost?.mention || []) if (e.name) names.set(e.pubkey, e.name)
 for (const m of manifests) names.set(m.pubkey, m.id)
+// Published names only fill gaps: a manifest id or a mention name wins over them, and a list that
+// cannot be read leaves those keys shown as unknown rather than failing the snapshot.
+if (NAMES) try {
+  const r = await fetch(NAMES, { signal: AbortSignal.timeout(TIMEOUT_MS) })
+  for (const [name, pk] of Object.entries((await r.json()).names || {})) {
+    if (name !== '_' && /^[0-9a-f]{64}$/.test(pk) && !names.has(pk)) names.set(pk, name)
+  }
+} catch (e) { console.error(`nvoy-status: names from ${NAMES} skipped: ${e.message}`) }
 
 // --- Relays: one REQ each for every grant and revocation by any manifest grantor ------------------
 
@@ -141,7 +151,7 @@ const web = await Promise.all(WEB.map(async ([name, url]) => webCheck(name, awai
 const snapshot = {
   version: 1, generated_at: new Date(now).toISOString(), release: deploy.deployedSha.slice(0, 12) || null,
   overall: worst([...agents.map(a => a.colour), ...relays.map(r => r.colour), ...platform.checks.map(c => c.colour), ...web.map(c => c.colour)]),
-  agents, relays, grants: grid, platform: platform.checks, web,
+  agents, relays, grants: grid, platform: platform.checks, web, swarm: swarmView({ manifests, grid, agents, names }),
 }
 const findings = sanitiserFindings(snapshot)
 let published = snapshot
@@ -154,7 +164,7 @@ if (findings.length) {
 
 const atomic = (path, text) => { const tmp = `${path}.${process.pid}.tmp`; writeFileSync(tmp, text, { mode: 0o644 }); renameSync(tmp, path) }
 mkdirSync(OUT, { recursive: true }); mkdirSync(STATE, { recursive: true })
-for (const file of ['index.html', 'status-view.mjs']) copyFileSync(join(PAGE, file), join(OUT, file))
+for (const file of ['index.html', 'status-view.mjs', 'beeswarm.html', 'beeswarm-view.mjs']) copyFileSync(join(PAGE, file), join(OUT, file))
 atomic(join(OUT, 'status.json'), JSON.stringify(published, null, 1) + '\n')
 atomic(join(STATE, 'collector-state.json'), JSON.stringify(platform.state) + '\n')
 console.log(`nvoy-status: ${published.overall}${published.withheld ? ' (withheld)' : ''} — ${agents.map(a => `${a.id}=${a.colour}`).join(' ')}`)

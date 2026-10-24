@@ -229,6 +229,48 @@ export function grantCheck(column) {
 
 export const gridColumn = (grid, index) => grid.rows.map(r => ({ who: r.name || r.pubkey, cell: r.cells[index] }))
 
+// --- The swarm: who may instruct, wake and speak for whom (beeswarm) -----------------------------
+
+// One graph from what the brokers enforce: `instructs` edges are the grid's live task grants
+// (grantee → target), `wakes` edges each manifest's may_post.mention list. Nodes are 8-hex prefixes:
+// a fleet agent carries its own speaking rights and brakes, a grantor is marked, and a key nobody
+// named is `unknown`, so a grant to a stranger stands out instead of hiding in a prefix.
+export function swarmView({ manifests = [], grid = { targets: [], rows: [] }, agents = [], names = new Map() }) {
+  const nodes = new Map()
+  const node = (pk, extra = {}) => {
+    const id = String(pk).slice(0, 8)
+    const name = names.get(pk) || null
+    if (!nodes.has(id)) nodes.set(id, { id, name, kind: name ? 'named' : 'unknown' })
+    return Object.assign(nodes.get(id), extra)
+  }
+  const grantors = new Set(manifests.flatMap(m => m.grantors))
+  for (const m of manifests) {
+    const a = agents.find(x => x.id === m.id)
+    node(m.pubkey, {
+      name: m.id, kind: 'agent', colour: a?.colour || 'grey', funnel: a?.funnel || null,
+      delivery: m.deliveryMode, door: Boolean(m.channelDoor), webhook: Boolean(m.wakeWebhook),
+      grantors: m.grantors.map(g => g.slice(0, 8)),
+      post: m.mayPost ? { channels: m.mayPost.channels.map(c => c.slice(0, 8)), per_hour: m.mayPost.perHour } : null,
+      profile: m.maySetProfile ? { per_day: m.maySetProfile.perDay, picture_hosts: [...m.maySetProfile.pictureHosts] } : null,
+      limits: { max_hops: m.agentLimits.maxHops, per_sender_per_hour: m.agentLimits.perSenderPerHour },
+    })
+  }
+  for (const g of grantors) if (!manifests.some(m => m.pubkey === g)) node(g, { kind: 'grantor' })
+  const edges = []
+  for (const r of grid.rows) {
+    r.cells.forEach((c, i) => {
+      if (c.state !== 'active') return
+      const from = nodes.get(r.pubkey) || nodes.set(r.pubkey, { id: r.pubkey, name: r.name, kind: r.name ? 'named' : 'unknown' }).get(r.pubkey)
+      edges.push({ type: 'instructs', from: from.id, to: grid.targets[i].pubkey, cap: c.cap, grant: c.grant })
+    })
+  }
+  for (const m of manifests) for (const e of m.mayPost?.mention || []) {
+    edges.push({ type: 'wakes', from: m.pubkey.slice(0, 8), to: node(e.pubkey).id })
+  }
+  const order = { grantor: 0, agent: 1, named: 2, unknown: 3 }
+  return { nodes: [...nodes.values()].sort((a, b) => order[a.kind] - order[b.kind] || (a.name || a.id).localeCompare(b.name || b.id)), edges }
+}
+
 // --- Relays ---------------------------------------------------------------------------------------
 
 // `answers` are [{ label, answered, ms, ids:Set }]. The retention canary is the newest live grant:

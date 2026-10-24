@@ -368,6 +368,10 @@ minutes old, so a stopped collector never reads as a healthy fleet.
 - **Grants grid.** Rows are grantees, columns are targets; each cell is active (with cap, 8-hex grant
   id and the target broker's relays that hold it), revoked, expired or none, decided by the broker's
   own rules in `status_snapshot.mjs`. It has no actions.
+- **beeswarm.** `beeswarm.html` draws the same live grants, with each manifest's mention list and
+  speaking rights, as a graph of who may instruct, wake and speak for whom (`docs/BEESWARM.md`). Keys no
+  manifest names are named from the published NIP-05 list (`--names`); one that holds a live grant and
+  is still unnamed is drawn as a warning.
 - **What may leave the box.** Only counts, times, names, 8-hex prefixes, relay host names and the
   collector's own words; never a line of a log. Before writing, the collector runs its own sanitiser
   over every key and value. A snapshot containing an IP address, an `nsec1`, a `bunker://` or

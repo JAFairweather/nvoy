@@ -1,14 +1,16 @@
 // Status S1: the collector's judgements, the grant grid, the §5 sanitiser, the page's age verdict,
 // and one whole collector run against fixture facts, fixture manifests and two local relays.
 import { WebSocketServer } from 'ws'
+import { createServer } from 'node:http'
 import { spawn } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
-import { agentChecks, funnel, grantCheck, grantGrid, gridColumn, parseLog, platformChecks, relayChecks, sanitiserFindings, webCheck, worst } from '../mcp/tools/status_snapshot.mjs'
+import { agentChecks, funnel, grantCheck, grantGrid, gridColumn, parseLog, platformChecks, relayChecks, sanitiserFindings, swarmView, webCheck, worst } from '../mcp/tools/status_snapshot.mjs'
 import { ageVerdict, renderSnapshot } from '../mcp/tools/status-page/status-view.mjs'
+import { layout, renderSwarm } from '../mcp/tools/status-page/beeswarm-view.mjs'
 
 let fails = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); if (!value) fails++ }
@@ -113,7 +115,31 @@ const evil = renderSnapshot({ generated_at: new Date(now).toISOString(), overall
 ok('every value is escaped and colours are a closed set', !/<script>|<img/.test(evil) && /&lt;script&gt;/.test(evil) && /&lt;b&gt;/.test(evil) && !/onload/.test(evil))
 ok('a withheld snapshot shows only its reason', /failed its own sanitiser/.test(renderSnapshot({ generated_at: new Date(now).toISOString(), withheld: true, overall: 'red', reason: 'this snapshot failed its own sanitiser (1 finding(s))' }, now)))
 
-// --- 6. one collector run: fixture facts, fixture manifests, two local relays ---
+// --- 6. the swarm: instructs edges from live grants only, wakes edges from mention lists, strangers marked ---
+const swarm = swarmView({
+  manifests: [
+    { id: 'alpha', pubkey: pub.alpha, grantors: [pub.director], deliveryMode: 'notify_only', mayPost: { channels: ['3f1c2a4b-x'], perHour: 5, mention: [{ name: 'director', pubkey: pub.director }] }, agentLimits: { maxHops: 3, perSenderPerHour: 10 } },
+    { id: 'beta', pubkey: pub.beta, grantors: [pub.director], deliveryMode: 'notify_only', mayPost: null, agentLimits: { maxHops: 3, perSenderPerHour: 10 } }],
+  grid, agents: [{ id: 'alpha', colour: 'green', funnel: { heard: 1 } }], names })
+const kindOf = Object.fromEntries(swarm.nodes.map(n => [n.id, n.kind]))
+const instructs = swarm.edges.filter(e => e.type === 'instructs').map(e => `${e.from}>${e.to}:${e.cap}`)
+ok('the grantor, both agents and nobody else are nodes when every live grant holder is named', kindOf[pub.director.slice(0, 8)] === 'grantor' && kindOf[pub.alpha.slice(0, 8)] === 'agent' && kindOf[pub.beta.slice(0, 8)] === 'agent')
+ok('only live grants become instructs edges: a revoked, expired, forged or rogue one does not',
+  instructs.sort().join() === [`${pub.alpha.slice(0, 8)}>${pub.beta.slice(0, 8)}:task`, `${pub.beta.slice(0, 8)}>${pub.alpha.slice(0, 8)}:task`].sort().join() && !(pub.x.slice(0, 8) in kindOf))
+ok('a mention right is a wakes edge', swarm.edges.some(e => e.type === 'wakes' && e.from === pub.alpha.slice(0, 8) && e.to === pub.director.slice(0, 8)))
+ok('a fleet agent carries its speaking rights and brakes', swarm.nodes.find(n => n.name === 'alpha').post.per_hour === 5 && swarm.nodes.find(n => n.name === 'beta').post === null && swarm.nodes.find(n => n.name === 'alpha').limits.max_hops === 3)
+const live = { ...grid, rows: [...grid.rows, { name: null, pubkey: 'f00dcafe', cells: [{ state: 'active', cap: 'task', grant: 'abcd1234' }, { state: 'none' }] }] }
+const stranger = swarmView({ manifests: [], grid: live, names })
+ok('a live grant held by a key nobody named is an unknown node, drawn and warned about', stranger.nodes.find(n => n.id === 'f00dcafe')?.kind === 'unknown'
+  && /Keys nobody named hold live task grants/.test(renderSwarm({ generated_at: new Date(now).toISOString(), swarm: stranger }, {}, now)))
+const spots = [...layout(swarm.nodes).values()]
+ok('the layout gives every node its own place inside the drawing', spots.length === swarm.nodes.length && new Set(spots.map(p => `${p.x},${p.y}`)).size === spots.length && spots.every(p => p.x > 40 && p.x < 720 && p.y > 40 && p.y < 640))
+const evilSwarm = renderSwarm({ generated_at: new Date(now).toISOString(), swarm: { nodes: [{ id: 'aaaa0000', name: '<script>x</script>', kind: 'agent" onclick="x', colour: 'red" onload="x', grantors: [], limits: {} }], edges: [{ type: 'instructs', from: 'aaaa0000', to: 'aaaa0000', cap: '<img src=x>' }] } }, { selected: 'aaaa0000' }, now)
+ok('the swarm page escapes every value and keeps kinds and colours to closed sets', !/<script>|<img|onclick|onload/.test(evilSwarm) && /&lt;script&gt;/.test(evilSwarm))
+ok('a stale snapshot says so on the swarm page too', /class="age red"/.test(renderSwarm({ generated_at: new Date(now - 10 * MIN).toISOString(), swarm: swarm }, {}, now)))
+ok('a withheld snapshot draws no swarm', /failed its own sanitiser/.test(renderSwarm({ generated_at: new Date(now).toISOString(), withheld: true, reason: 'this snapshot failed its own sanitiser (1 finding(s))' }, {}, now)) && !/<svg/.test(renderSwarm({ withheld: true, reason: 'x' }, {}, now)))
+
+// --- 7. one collector run: fixture facts, fixture manifests, two local relays ---
 const relay = held => new Promise(done => {
   const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 }, () => done({ wss, url: `ws://127.0.0.1:${wss.address().port}` }))
   wss.on('connection', ws => ws.on('message', raw => {
@@ -123,7 +149,14 @@ const relay = held => new Promise(done => {
     ws.send(JSON.stringify(['EOSE', sub]))
   }))
 })
-const relayA = await relay([g1, g2, g3, r3]), relayB = await relay([g1, g3, r3])
+// Dead Rabbit's shape: a voice no manifest names, holding a live grant, named only by the published NIP-05 list.
+pub.rabbit = getPublicKey(generateSecretKey())
+const g4 = grant('director', pub.rabbit, pub.beta, 'task')
+const relayA = await relay([g1, g2, g3, r3, g4]), relayB = await relay([g1, g3, r3])
+const nip05 = await new Promise(done => {
+  const srv = createServer((_, res) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ names: { _: pub.alpha, rabbit: pub.rabbit, impostor: pub.alpha, junk: 'nope' } })) })
+  srv.listen(0, '127.0.0.1', () => done({ srv, url: `http://127.0.0.1:${srv.address().port}/.well-known/nostr.json` }))
+})
 const root = mkdtempSync(join(tmpdir(), 'nvoy-status-'))
 const dirs = { instances: join(root, 'instances'), facts: join(root, 'facts'), state: join(root, 'state'), out: join(root, 'out') }
 for (const d of [dirs.instances, join(dirs.facts, 'logs'), join(dirs.facts, 'deploy')]) mkdirSync(d, { recursive: true })
@@ -155,8 +188,8 @@ writeFileSync(join(dirs.facts, 'deploy', 'LAST_OUTCOME'), `current ${sha}\n`)
 writeFileSync(join(dirs.facts, 'deploy', 'REMOTE_HEAD.json'), JSON.stringify({ head: sha, settled: true }))
 writeFileSync(join(dirs.facts, 'deploy', 'timer'), 'active\n')
 
-const collect = (web = '') => new Promise(done => {
-  const p = spawn(process.execPath, ['mcp/tools/nvoy-status.mjs', '--facts', dirs.facts, '--state', dirs.state, '--out', dirs.out, '--instances', dirs.instances, '--web', web, '--timeout-ms', '3000'],
+const collect = (web = '', names = nip05.url) => new Promise(done => {
+  const p = spawn(process.execPath, ['mcp/tools/nvoy-status.mjs', '--facts', dirs.facts, '--state', dirs.state, '--out', dirs.out, '--instances', dirs.instances, '--web', web, '--names', names, '--timeout-ms', '3000'],
     { env: { ...process.env, NVOY_STATUS_RELAYS: `${relayA.url},${relayB.url}` }, stdio: ['ignore', 'pipe', 'pipe'] })
   let out = '', err = ''
   p.stdout.on('data', d => { out += d }); p.stderr.on('data', d => { err += d })
@@ -165,7 +198,7 @@ const collect = (web = '') => new Promise(done => {
 const run = await collect()
 const text = existsSync(join(dirs.out, 'status.json')) ? readFileSync(join(dirs.out, 'status.json'), 'utf8') : '{}'
 const snap = JSON.parse(text)
-ok('the collector exits 0 and writes status.json beside the page', run.code === 0 && existsSync(join(dirs.out, 'index.html')) && existsSync(join(dirs.out, 'status-view.mjs')))
+ok('the collector exits 0 and writes status.json beside both pages', run.code === 0 && ['index.html', 'status-view.mjs', 'beeswarm.html', 'beeswarm-view.mjs'].every(f => existsSync(join(dirs.out, f))))
 ok('the snapshot passes its own sanitiser and was not withheld', !snap.withheld && sanitiserFindings(snap).length === 0)
 ok('no address, full key, event id, nsec or message id from the logs or manifests leaves', !/198\.51|127\.0\.0\.1|nsec1|credentials/.test(text) && !text.includes(pub.alpha) && !text.includes(g1.id) && !text.includes(m1) && !/[0-9a-f]{64}/.test(text))
 ok('only exact <id>.json manifests are read', snap.agents?.map(a => a.id).join() === 'alpha,beta')
@@ -177,14 +210,18 @@ ok('beta, whose watcher is down and whose grant one relay dropped, is red with g
 ok('relays are labelled, never addressed, and the one missing the newest grant is amber', snap.relays?.map(r => `${r.label}:${r.colour}`).join() === 'relay#1:green,relay#2:amber')
 const rows = Object.fromEntries((snap.grants?.rows || []).map(r => [r.name || r.pubkey, r.cells.map(c => c.state).join('/')]))
 ok('the grid has the director as grantor and its rows by name', snap.grants?.grantors?.[0]?.name === 'director' && rows.beta === 'active/none' && rows.alpha === 'none/active' && rows[pub.x.slice(0, 8)] === 'revoked/none')
+const swarmed = Object.fromEntries((snap.swarm?.nodes || []).map(n => [n.id, n]))
+ok('the swarm names a voice from the published list, and a manifest id beats a published name',
+  swarmed[pub.rabbit.slice(0, 8)]?.name === 'rabbit' && swarmed[pub.rabbit.slice(0, 8)]?.kind === 'named' && swarmed[pub.alpha.slice(0, 8)]?.name === 'alpha')
+ok('the voice\'s live grant is an instructs edge to beta', snap.swarm?.edges?.some(e => e.type === 'instructs' && e.from === pub.rabbit.slice(0, 8) && e.to === pub.beta.slice(0, 8)))
 ok('the release and overall are carried, and reboot state is kept', snap.release === sha.slice(0, 12) && snap.overall === 'red' && existsSync(join(dirs.state, 'collector-state.json')))
 
 // A snapshot that would leak is never written: an endpoint named with an address withholds it all.
-const leak = await collect('192.0.2.1=https://127.0.0.1:9/')
+const leak = await collect('192.0.2.1=https://127.0.0.1:9/', '')
 const withheld = readFileSync(join(dirs.out, 'status.json'), 'utf8')
 ok('a leaking snapshot is replaced by a red withheld notice', JSON.parse(withheld).withheld === true && JSON.parse(withheld).overall === 'red' && !('agents' in JSON.parse(withheld)))
 ok('the withheld notice carries neither the value nor its path', !/192\.0\.2|127\.0\.0/.test(withheld) && !/\$\./.test(withheld))
 ok('the journal names where it was found, never what', leak.code === 0 && /withheld: an IPv4 address at \$\.web/.test(leak.err) && !/192\.0\.2/.test(leak.err))
 
-relayA.wss.close(); relayB.wss.close()
+relayA.wss.close(); relayB.wss.close(); nip05.srv.close()
 process.exit(fails ? 1 : 0)
