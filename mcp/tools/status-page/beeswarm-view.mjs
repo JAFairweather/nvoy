@@ -17,6 +17,18 @@ const capText = c => CAP_TEXT[c] || String(c ?? '')
 const R = 28
 
 // A stable key per edge, so the page can say what changed since the reader last looked.
+// Grants are signed in the waggle console, never here. These links open it at the grant to revoke or
+// the form to issue one; the console resolves the 8-hex prefixes only against keys and grants it has
+// verified for whoever signs in, and signs nothing until the owner confirms (waggle#610).
+export const CONSOLE = 'https://waggle.nave.pub/console/'
+const HEX = /^[0-9a-f]{8,64}$/
+export const revokeHref = grant => (HEX.test(String(grant)) ? `${CONSOLE}#revoke=${grant}` : null)
+export const grantHref = (to, on, cap = 'task') => (HEX.test(String(to)) && HEX.test(String(on)) ? `${CONSOLE}#grant=${to}&on=${on}&cap=${encodeURIComponent(cap)}` : null)
+const act = (href, text, title) => (href ? ` <a class="act" href="${esc(href)}" target="_blank" rel="noopener" title="${esc(title)}">${text}</a>` : '')
+const revokeLink = (sw, e) => act(revokeHref(e.grant), 'revoke', e.voice_of
+  ? `Revoke the shadow grant ${e.grant}: ${label(sw.nodes.find(n => n.id === e.from))} loses every right it holds as ${label(sw.nodes.find(n => n.id === e.voice_of))}'s voice`
+  : `Revoke grant ${e.grant} in the waggle console`)
+
 export const edgeKey = e => `${e.type}:${e.from}>${e.to}:${e.cap || ''}:${e.voice_of || ''}`
 
 // Authority reads top-down: grantors, then every other key that holds or is given rights (voices,
@@ -135,13 +147,13 @@ ${unknown.length ? `<div class="warn"><b>Keys nobody named hold live task grants
   const agent = kind(n.kind) === 'agent'
   return `<h3><span class="dot ${colour(n.colour)}"></span>${esc(label(n))} <code>${esc(n.id)}</code> <small>${esc(kind(n.kind))}</small></h3>
 ${kind(n.kind) === 'unknown' ? '<div class="warn">No manifest or mention list names this key. If it holds grants, find out whose it is or revoke them.</div>' : ''}
-${n.voice_of ? `<p>Speaks as ${who(sw, n.voice_of)}'s voice: a shadow grant gives it that key's reach, and one revocation of grant <code>${esc(out('instructs')[0]?.grant || '')}</code> takes it all away.</p>` : ''}
-<h4>Takes instructions from</h4>${agent ? list(into('instructs').map(e => `${who(sw, e.from)} <small>${esc(capText(e.cap))}${e.voice_of ? ' as a voice' : ''} · ${esc(e.grant)}</small>`)) : '<p class="dim">not a fleet agent: its own broker, if any, is not measured here</p>'}
-<h4>May instruct</h4>${list(out('instructs').map(e => `${who(sw, e.to)} <small>${esc(capText(e.cap))}${e.voice_of ? ' as a voice' : ''}</small>`))}
+${n.voice_of ? `<p>Speaks as ${who(sw, n.voice_of)}'s voice: a shadow grant gives it that key's reach, and one revocation of grant <code>${esc(out('instructs')[0]?.grant || '')}</code> takes it all away.${out('instructs')[0] ? revokeLink(sw, out('instructs')[0]) : ''}</p>` : ''}
+<h4>Takes instructions from</h4>${agent ? list(into('instructs').map(e => `${who(sw, e.from)} <small>${esc(capText(e.cap))}${e.voice_of ? ' as a voice' : ''} · ${esc(e.grant)}</small>${e.voice_of ? '' : revokeLink(sw, e)}`)) : '<p class="dim">not a fleet agent: its own broker, if any, is not measured here</p>'}
+<h4>May instruct</h4>${list(out('instructs').map(e => `${who(sw, e.to)} <small>${esc(capText(e.cap))}${e.voice_of ? ' as a voice' : ''}</small>${e.voice_of ? '' : revokeLink(sw, e)}`))}
 ${agent ? `<h4>May wake (mention)</h4>${list(out('wakes').map(e => who(sw, e.to)))}` : ''}
 <h4>Woken by</h4>${list(into('wakes').map(e => who(sw, e.from)))}
 ${agent ? rights(n) : ''}
-<p class="manage"><a href="https://waggle.nave.pub/console/" target="_blank" rel="noopener">Grant or revoke in the waggle console →</a></p>`
+<p class="manage"><a href="${CONSOLE}" target="_blank" rel="noopener">Open the waggle console →</a> <span class="dim">Revoke and grant links open it ready to sign; nothing is signed until you confirm there.</span></p>`
 }
 
 function rights(n) {
@@ -190,9 +202,16 @@ function matrix(sw, show, added) {
   const cell = (f, t) => edges.filter(e => e.from === f.id && e.to === t.id).map(e => e.type === 'instructs'
     ? `<span class="badge instructs${e.voice_of ? ' voice' : ''}${added.has(edgeKey(e)) ? ' new' : ''}" title="${esc(capText(e.cap))}${e.voice_of ? ' as a voice' : ''} · grant ${esc(e.grant)}">${esc(capText(e.cap))}${e.voice_of ? ' ◇' : ''}</span>`
     : `<span class="badge wakes${added.has(edgeKey(e)) ? ' new' : ''}" title="may mention">wakes</span>`).join('')
+  // A revoke link per held grant, and a grant link where a named key or an agent holds none. A
+  // voice's cells all share one shadow grant, so its revoke is in its panel, not on every cell.
+  const tools = (f, t) => {
+    const held = edges.filter(e => e.type === 'instructs' && e.from === f.id && e.to === t.id)
+    if (held.length) return held.filter(e => !e.voice_of).map(e => act(revokeHref(e.grant), '×', `Revoke grant ${e.grant} in the waggle console`)).join('')
+    return ['named', 'agent'].includes(kind(f.kind)) && !f.voice_of && show.instructs ? act(grantHref(f.id, t.id), '+', `Grant ${label(f)} task on ${label(t)} in the waggle console`) : ''
+  }
   return `<div class="scroll"><table class="grid"><thead><tr><th>from ↓ · to →</th>${agents.map(t => `<th scope="col">${esc(label(t))}</th>`).join('')}</tr></thead>
-<tbody>${rows.map(f => `<tr><th scope="row">${f.name ? `${esc(f.name)} ` : ''}<code>${esc(f.id)}</code></th>${agents.map(t => `<td>${f.id === t.id ? '<span class="dim">·</span>' : cell(f, t)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
-<p class="dim legend-note">◇ held as a voice, through a shadow grant. Hover a cell for its grant.</p>`
+<tbody>${rows.map(f => `<tr><th scope="row">${f.name ? `${esc(f.name)} ` : ''}<code>${esc(f.id)}</code></th>${agents.map(t => `<td>${f.id === t.id ? '<span class="dim">·</span>' : cell(f, t) + tools(f, t)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
+<p class="dim legend-note">◇ held as a voice, through a shadow grant. Hover a cell for its grant. × revokes it and + grants task, in the waggle console, where you confirm and sign.</p>`
 }
 
 // What changed against the edges the reader last marked as seen. Removed edges can no longer be drawn,
