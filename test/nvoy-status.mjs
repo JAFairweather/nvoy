@@ -10,7 +10,7 @@ import { join } from 'node:path'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
 import { agentChecks, funnel, grantCheck, grantGrid, gridColumn, parseLog, platformChecks, relayChecks, sanitiserFindings, swarmView, webCheck, worst } from '../mcp/tools/status_snapshot.mjs'
 import { ageVerdict, renderSnapshot } from '../mcp/tools/status-page/status-view.mjs'
-import { layout, renderSwarm } from '../mcp/tools/status-page/beeswarm-view.mjs'
+import { canvasSize, changes, edgeKey, layout, peerSummary, renderSwarm } from '../mcp/tools/status-page/beeswarm-view.mjs'
 
 let fails = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); if (!value) fails++ }
@@ -146,6 +146,26 @@ const vPage = renderSwarm({ generated_at: new Date(now).toISOString(), swarm: vS
 ok('the panel says whose voice it is and which one grant to revoke', /Speaks as director/.test(vPage) && vPage.includes(shadowed.id.slice(0, 8)) && /class="edge instructs voice/.test(vPage))
 const spots = [...layout(swarm.nodes).values()]
 ok('the layout gives every node its own place inside the drawing', spots.length === swarm.nodes.length && new Set(spots.map(p => `${p.x},${p.y}`)).size === spots.length && spots.every(p => p.x > 40 && p.x < 720 && p.y > 40 && p.y < 640))
+const narrowAt = layout(swarm.nodes, { narrow: true }), narrowBox = canvasSize(swarm.nodes, { narrow: true })
+ok('a phone draws the same nodes in two columns inside its narrower canvas', [...narrowAt.values()].every(p => p.x > 0 && p.x < narrowBox.w && p.y > 0 && p.y < narrowBox.h)
+  && narrowAt.get(pub.alpha.slice(0, 8)).x === narrowAt.get(pub.beta.slice(0, 8)).x && narrowAt.get(pub.director.slice(0, 8)).x < narrowAt.get(pub.alpha.slice(0, 8)).x)
+ok('authority reads top-down: grantors above the fleet', layout(swarm.nodes).get(pub.director.slice(0, 8)).y < layout(swarm.nodes).get(pub.alpha.slice(0, 8)).y)
+const swSnap = sw => ({ generated_at: new Date(now).toISOString(), swarm: sw })
+const peerPaths = page => (page.match(/<path class="edge instructs[ "]/g) || []).length
+ok('peer grants become one caption, not a hairball', peerSummary(swarm).text === 'every agent may task every other' && peerPaths(renderSwarm(swSnap(swarm), {}, now)) === 0
+  && /fleet · 2 agents · every agent may task every other/.test(renderSwarm(swSnap(swarm), {}, now)))
+ok('peer edges come back when asked for, or for the node you select', peerPaths(renderSwarm(swSnap(swarm), { show: { instructs: true, peers: true } }, now)) === 2
+  && peerPaths(renderSwarm(swSnap(swarm), { selected: pub.alpha.slice(0, 8) }, now)) === 2)
+const vQuiet = renderSwarm(swSnap(vSwarm), {}, now)
+ok('an unselected voice is drawn once, as speaking for its grantor', (vQuiet.match(/class="edge instructs voice speaks/g) || []).length === 1 && !/<path class="edge instructs voice(?! speaks)/.test(vQuiet))
+ok('the matrix names each cap and marks a voice', /<span class="badge instructs voice[^>]*>task \+ act ◇<\/span>/.test(renderSwarm(swSnap(vSwarm), { view: 'matrix' }, now)))
+ok('the agents view is one card per agent', (renderSwarm(swSnap(swarm), { view: 'agents' }, now).match(/<article class="card/g) || []).length === 2)
+ok('the selected panel links to where grants are signed', /class="manage"><a href="https:\/\/waggle\.nave\.pub\/console\/"/.test(renderSwarm(swSnap(swarm), { selected: pub.alpha.slice(0, 8) }, now)))
+const keys = swarm.edges.map(edgeKey)
+ok('a first visit is the baseline and shows no changes', changes(swarm, null).fresh && !/Since you last looked/.test(renderSwarm(swSnap(swarm), {}, now)))
+ok('nothing new since last look shows nothing', !/Since you last looked/.test(renderSwarm(swSnap(swarm), { seen: keys }, now)))
+const moved = renderSwarm(swSnap(swarm), { seen: [...keys.slice(1), 'instructs:f00dcafe>beta0000:task:'], show: { instructs: true, wakes: true, peers: true } }, now)
+ok('a change since last look is listed and highlighted, and a vanished grant is named', /Since you last looked/.test(moved) && /<li class="plus">/.test(moved) && /<li class="minus">− f00dcafe may instruct/.test(moved) && /class="edge [^"]* new"/.test(moved))
 const evilSwarm = renderSwarm({ generated_at: new Date(now).toISOString(), swarm: { nodes: [{ id: 'aaaa0000', name: '<script>x</script>', kind: 'agent" onclick="x', colour: 'red" onload="x', grantors: [], limits: {} }], edges: [{ type: 'instructs', from: 'aaaa0000', to: 'aaaa0000', cap: '<img src=x>' }] } }, { selected: 'aaaa0000' }, now)
 ok('the swarm page escapes every value and keeps kinds and colours to closed sets', !/<script>|<img|onclick|onload/.test(evilSwarm) && /&lt;script&gt;/.test(evilSwarm))
 ok('a stale snapshot says so on the swarm page too', /class="age red"/.test(renderSwarm({ generated_at: new Date(now - 10 * MIN).toISOString(), swarm: swarm }, {}, now)))
