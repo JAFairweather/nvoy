@@ -110,19 +110,35 @@
   .warn ul { margin: 6px 0; }
   .dot { display: inline-block; flex: none; width: 10px; height: 10px; border-radius: 50%; background: var(--grey); }
   .dot.green { background: var(--green); } .dot.amber { background: var(--amber); } .dot.red { background: var(--red); }
-  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
-  .toggle { font: 13px/1 var(--sans); padding: 8px 12px; border-radius: var(--r-pill); border: 1px solid var(--line-strong); background: var(--panel); color: var(--dim); cursor: pointer; }
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 10px 0 12px; }
+  .toggle, .tab { font: 13px/1 var(--sans); padding: 8px 12px; border-radius: var(--r-pill); border: 1px solid var(--line-strong); background: var(--panel); color: var(--dim); cursor: pointer; }
+  .toggle[aria-pressed="true"] { border-color: var(--text); color: var(--text); }
   .toggle[aria-pressed="true"].instructs { border-color: var(--accent); color: var(--accent); }
   .toggle[aria-pressed="true"].wakes { border-color: var(--gold); color: var(--gold); }
+  .tabs { display: flex; gap: 4px; margin: 18px 0 0; border-bottom: 1px solid var(--line); }
+  .tab { border-radius: var(--r-sm) var(--r-sm) 0 0; border-bottom: none; background: transparent; font-size: 14px; padding: 10px 16px; }
+  .tab[aria-pressed="true"] { background: var(--panel); color: var(--text); border-color: var(--line-strong); }
+  .legend { display: inline-flex; gap: 6px 10px; align-items: center; flex-wrap: wrap; color: var(--dim); font-size: 12px; margin-left: auto; }
+  .legend svg { vertical-align: middle; }
+  .summary .facts { margin: 14px 0 0; padding-left: 18px; color: var(--text); }
+  .summary .facts li { margin: 3px 0; }
+  .changes { margin: 10px 0; padding: 10px 14px; border-radius: var(--r-md); border: 1px solid var(--accent); background: color-mix(in srgb, var(--accent) 10%, var(--panel)); font-size: 14px; }
+  .changes ul { margin: 6px 0 0; padding-left: 18px; list-style: none; } .changes .plus { color: var(--good); } .changes .minus { color: var(--critical); }
+  .changes .toggle { margin-left: 8px; padding: 4px 10px; font-size: 12px; }
+  .changes.quiet { border-color: var(--line); background: var(--panel); color: var(--dim); }
   .split { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; align-items: start; }
   .canvas { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-md); }
   .panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-md); padding: 14px; font-size: 14px; }
   .panel ul { margin: 0; padding-left: 18px; } .panel li { margin: 2px 0; }
-  .panel dl { display: grid; grid-template-columns: 92px 1fr; gap: 4px 10px; margin: 0; }
-  .panel dt { font: 12px/1.5 var(--mono); color: var(--dim); } .panel dd { margin: 0; overflow-wrap: anywhere; }
+  dl.rights { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 4px 10px; margin: 8px 0 0; }
+  dl.rights dt { font: 12px/1.5 var(--mono); color: var(--dim); } dl.rights dd { margin: 0; overflow-wrap: anywhere; }
+  .manage { margin: 14px 0 0; font-size: 13px; } .manage a { color: var(--accent); }
   svg.swarm { display: block; width: 100%; height: auto; }
-  .edge { fill: none; stroke-width: 1.6; }
-  .edge.instructs { stroke: var(--accent); } .edge.instructs.voice { stroke-dasharray: 10 3 2 3; } .edge.wakes { stroke: var(--gold); stroke-dasharray: 5 4; stroke-width: 1.2; }
+  .fleet rect { fill: color-mix(in srgb, var(--accent) 5%, transparent); stroke: var(--line-strong); stroke-dasharray: 2 4; }
+  .fleet text { fill: var(--dim); font: 12px var(--mono); }
+  .edge { fill: none; stroke-width: 1.8; }
+  .edge.instructs { stroke: var(--accent); } .edge.instructs.voice { stroke-dasharray: 10 3 2 3; } .edge.wakes { stroke: var(--gold); stroke-dasharray: 5 4; stroke-width: 1.3; }
+  .edge.new { stroke-width: 3.5; } .edge.speaks { stroke-width: 2.4; }
   .tip.instructs { fill: var(--accent); } .tip.wakes { fill: var(--gold); }
   .edge.cold, .node.cold { opacity: .12; }
   .node { cursor: pointer; }
@@ -132,15 +148,22 @@
   .node.unknown polygon { stroke: var(--red); stroke-dasharray: 4 3; }
   .node.selected polygon { stroke-width: 4; }
   .node:focus { outline: none; } .node:focus-visible polygon { stroke: var(--text); }
-  .node text { fill: var(--text); font: 13px var(--sans); paint-order: stroke; stroke: var(--panel); stroke-width: 4px; stroke-linejoin: round; } .node text.pk { fill: var(--dim); font: 11px var(--mono); }
+  .node text { fill: var(--text); font: 14px var(--sans); paint-order: stroke; stroke: var(--panel); stroke-width: 4px; stroke-linejoin: round; } .node text.pk { fill: var(--dim); font: 11px var(--mono); }
+  .roster { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--grey); border-radius: var(--r-md); padding: 14px; font-size: 14px; cursor: pointer; }
+  .card.green { border-left-color: var(--green); } .card.amber { border-left-color: var(--amber); } .card.red { border-left-color: var(--red); }
+  .card.selected, .card:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .card dl.rights + dl.rights { border-top: 1px solid var(--line); padding-top: 8px; }
   .scroll { overflow-x: auto; }
   table.grid { border-collapse: collapse; width: 100%; font-size: 13px; background: var(--panel); }
   table.grid th, table.grid td { border: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; }
   table.grid thead th { font: 12px/1.3 var(--mono); color: var(--dim); }
-  .badge { display: inline-block; margin: 1px 4px 1px 0; padding: 1px 6px; border-radius: var(--r-pill); font: 11px/1.5 var(--mono); border: 1px solid; }
-  .badge.instructs { color: var(--accent); } .badge.wakes { color: var(--gold); }
-  footer { margin-top: 36px; color: var(--faint); font-size: 12px; }
-  @media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
+  table.grid tbody th { position: sticky; left: 0; background: var(--panel); white-space: nowrap; }
+  .badge { display: inline-block; margin: 1px 4px 1px 0; padding: 1px 6px; border-radius: var(--r-pill); font: 11px/1.5 var(--mono); border: 1px solid; white-space: nowrap; }
+  .badge.instructs { color: var(--accent); } .badge.wakes { color: var(--gold); } .badge.new { background: color-mix(in srgb, var(--good) 22%, transparent); }
+  .legend-note { font-size: 12px; margin: 6px 0 0; }
+  footer { margin-top: 36px; color: var(--faint); font-size: 12px; } footer a { color: var(--accent); }
+  @media (max-width: 900px) { .split { grid-template-columns: 1fr; } .legend { margin-left: 0; } }
 </style>
 </head>
 <body>
@@ -152,29 +175,51 @@
   <div id="fetch"></div>
   <div id="view"><div class="age red">loading…</div></div>
   <footer>Instructs is a live task grant: its arrow points from who may instruct to the agent that will listen.
-    Wakes is a may_post.mention right. Identities are shown by name and 8-hex prefix only.</footer>
+    Wakes is a may_post.mention right. Identities are shown by name and 8-hex prefix only.
+    Grants are signed and revoked in the <a href="https://waggle.nave.pub/console/">waggle console</a>; this page shows the result within a minute.</footer>
 </main>
 <script type="module">
-  import { renderSwarm } from './beeswarm-view.mjs'
+  import { renderSwarm, edgeKey, VIEWS } from './beeswarm-view.mjs'
   const view = document.getElementById('view'), note = document.getElementById('fetch')
-  const ui = { show: { instructs: true, wakes: false }, selected: null }
+  const ui = { show: { instructs: true, wakes: false, peers: false }, selected: null, view: 'overview', narrow: false, seen: null }
+  const SEEN = 'beeswarm.seen.v1'
+  const store = { get() { try { return JSON.parse(localStorage.getItem(SEEN)) } catch { return null } }, set(v) { try { localStorage.setItem(SEEN, JSON.stringify(v)) } catch { /* private window: no memory */ } } }
+  ui.seen = store.get()
   let last = null
+  const narrowQuery = matchMedia('(max-width: 620px)')
+  // The hash is a view name or a node's name, so a link can open straight onto one agent.
+  const nodeBy = name => (last?.swarm?.nodes || []).find(n => n.name === name || String(n.id) === name)
+  const fromHash = () => {
+    const h = decodeURIComponent(location.hash.slice(1))
+    if (VIEWS.includes(h)) { ui.view = h; return }
+    const n = nodeBy(h); if (n) ui.selected = String(n.id)
+  }
+  const toHash = () => {
+    const n = (last?.swarm?.nodes || []).find(x => String(x.id) === ui.selected)
+    history.replaceState(null, '', n ? `#${encodeURIComponent(n.name || n.id)}` : ui.view === 'overview' ? location.pathname : `#${ui.view}`)
+  }
   const draw = () => {
     const focused = document.activeElement?.dataset?.node
+    ui.narrow = narrowQuery.matches
     view.innerHTML = renderSwarm(last, ui)
     if (focused) view.querySelector(`[data-node="${CSS.escape(focused)}"]`)?.focus()
   }
   const pick = el => {
-    const t = el.closest('[data-toggle],[data-node],[data-clear]')
+    const t = el.closest('[data-toggle],[data-node],[data-clear],[data-view],[data-seen]')
     if (!t) return
     if (t.dataset.toggle) ui.show[t.dataset.toggle] = !ui.show[t.dataset.toggle]
-    else if (t.dataset.node) ui.selected = ui.selected === t.dataset.node ? null : t.dataset.node
+    else if (t.dataset.view) { ui.view = t.dataset.view; if (ui.view !== 'overview') ui.selected = null }
+    else if ('seen' in t.dataset) { ui.seen = (last?.swarm?.edges || []).map(edgeKey); store.set(ui.seen) }
+    else if (t.dataset.node) { const same = ui.selected === t.dataset.node; ui.selected = same ? null : t.dataset.node; if (!same) ui.view = 'overview' }
     else ui.selected = null
-    draw()
+    toHash(); draw()
   }
   view.addEventListener('click', e => pick(e.target))
   view.addEventListener('keydown', e => { if ((e.key === 'Enter' || e.key === ' ') && e.target.dataset?.node) { e.preventDefault(); pick(e.target) } })
+  narrowQuery.addEventListener('change', draw)
+  addEventListener('hashchange', () => { ui.selected = null; ui.view = 'overview'; fromHash(); draw() })
   async function load() {
+    const first = !last
     try {
       const r = await fetch('status.json', { cache: 'no-store' })
       if (!r.ok) throw new Error(`HTTP ${r.status}`)
@@ -183,6 +228,9 @@
     } catch (e) {
       note.innerHTML = `<div class="banner red">could not fetch status.json (${String(e.message).replace(/[<>&]/g, '')}); showing the last snapshot this page read</div>`
     }
+    // The first visit has nothing to compare with, so it becomes the baseline.
+    if (!ui.seen && last?.swarm) { ui.seen = last.swarm.edges.map(edgeKey); store.set(ui.seen) }
+    if (first) fromHash()
     draw()
   }
   load()
