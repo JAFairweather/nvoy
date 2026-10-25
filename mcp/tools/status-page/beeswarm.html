@@ -133,6 +133,7 @@
   dl.rights { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 4px 10px; margin: 8px 0 0; }
   dl.rights dt { font: 12px/1.5 var(--mono); color: var(--dim); } dl.rights dd { margin: 0; overflow-wrap: anywhere; }
   .manage { margin: 14px 0 0; font-size: 13px; } .manage a { color: var(--accent); }
+  a.act { color: var(--accent); font: 11px/1.5 var(--mono); text-decoration: none; padding: 0 4px; border-radius: 4px; } a.act:hover, a.act:focus-visible { background: color-mix(in srgb, var(--accent) 18%, transparent); text-decoration: underline; }
   svg.swarm { display: block; width: 100%; height: auto; }
   .fleet rect { fill: color-mix(in srgb, var(--accent) 5%, transparent); stroke: var(--line-strong); stroke-dasharray: 2 4; }
   .fleet text { fill: var(--dim); font: 12px var(--mono); }
@@ -157,6 +158,7 @@
   .scroll { overflow-x: auto; }
   table.grid { border-collapse: collapse; width: 100%; font-size: 13px; background: var(--panel); }
   table.grid th, table.grid td { border: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; }
+  table.grid td { white-space: nowrap; }
   table.grid thead th { font: 12px/1.3 var(--mono); color: var(--dim); }
   table.grid tbody th { position: sticky; left: 0; background: var(--panel); white-space: nowrap; }
   .badge { display: inline-block; margin: 1px 4px 1px 0; padding: 1px 6px; border-radius: var(--r-pill); font: 11px/1.5 var(--mono); border: 1px solid; white-space: nowrap; }
@@ -205,6 +207,7 @@
     if (focused) view.querySelector(`[data-node="${CSS.escape(focused)}"]`)?.focus()
   }
   const pick = el => {
+    if (el.closest('a')) return
     const t = el.closest('[data-toggle],[data-node],[data-clear],[data-view],[data-seen]')
     if (!t) return
     if (t.dataset.toggle) ui.show[t.dataset.toggle] = !ui.show[t.dataset.toggle]
