@@ -39,6 +39,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Refuse a committed node_modules entry
+        # Reads the index, not the working tree, so it must run before `npm ci` — that command
+        # deletes and recreates node_modules, which is why every suite stayed green while #167
+        # carried a committed symlink to a path on one developer's machine. `.gitignore` alone
+        # cannot be the guard: it is advisory and `git add -f` walks past it. #180.
+        run: |
+          offenders=$(git ls-files | grep -E '(^|/)node_modules(/|$)' || true)
+          if [ -n "$offenders" ]; then
+            echo "::error::node_modules is committed — remove it with: git rm --cached <path>"
+            echo "$offenders"
+            exit 1
+          fi
+          echo "index is clean: no node_modules entry among $(git ls-files | wc -l) tracked files"
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
