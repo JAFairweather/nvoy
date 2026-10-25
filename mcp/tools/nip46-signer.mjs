@@ -8,6 +8,8 @@ import { SimplePool } from 'nostr-tools/pool'
 import { secretKey } from './secret_key.mjs'
 
 const BUNKER = /^bunker:\/\/([0-9a-f]{64})/i
+// clientNsec is an nsec or 64-char hex, as identity.ts reads the same key, so no caller has to
+// convert (10-24: two broker paths still failed on a hex key after #248 encoded it in one).
 // `options.clientSource` names where clientNsec came from, for an error that must not quote it.
 export function makeBunkerSigner(uriText, clientNsec, options = {}) {
   const match = BUNKER.exec(String(uriText || '').trim())
@@ -16,7 +18,7 @@ export function makeBunkerSigner(uriText, clientNsec, options = {}) {
   const relays = [...new Set(uri.searchParams.getAll('relay').filter(v => /^wss:\/\//.test(v)))]
   if (!relays.length) throw new Error('bunker URI needs at least one wss relay')
   const pubkey = match[1].toLowerCase(), secret = uri.searchParams.get('secret') || ''
-  const clientKey = secretKey(clientNsec, options.clientSource || 'NIP-46 client credential', { hex: false }), clientPubkey = getPublicKey(clientKey)
+  const clientKey = secretKey(clientNsec, options.clientSource || 'NIP-46 client credential'), clientPubkey = getPublicKey(clientKey)
   const conversation = nip44.v2.utils.getConversationKey(clientKey, pubkey)
   const pool = options.pool || new SimplePool(), pending = new Map()
   const idleMs = Number.isSafeInteger(options.idleMs) && options.idleMs >= 0 ? options.idleMs : 250
