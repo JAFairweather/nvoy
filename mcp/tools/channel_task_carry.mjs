@@ -3,7 +3,7 @@
 // separate, live grants supplied by the caller's present-tense policy evaluation.
 
 import { verifyEvent } from 'nostr-tools/pure'
-import { hopOf } from './agent_limits.mjs'
+import { hopOf } from './admission.mjs'
 
 const HEX64 = /^[0-9a-f]{64}$/
 const HEX128 = /^[0-9a-f]{128}$/
