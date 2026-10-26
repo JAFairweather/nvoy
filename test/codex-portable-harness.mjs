@@ -2,7 +2,7 @@
 // lock, the feed's forced-command line, and the watchable supervisor end to end. No real Codex, SSH
 // or ChatGPT login runs: a fake `codex app-server --listen unix://…` speaks WebSocket over a Unix
 // socket, and a fake ssh execs the local feed script. The first live session is the operator's check.
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
@@ -320,12 +320,18 @@ function startSupervisor(config = client, env = {}) {
 const clientCalls = (method, home = codexHome) => fakeLog(home).filter(m => m.method === method && m.masked)
 const THREAD = '0199a213-81c0-7800-8aa1-bbab2a035a53'
 const socket = join(codexHome, 'ctl', 'as.sock')
+// Codex 0.163 leaves the control socket as a symlink into its own daemon directory; a restart must clear it.
+const staleTarget = join(root, 'codex-daemon-stale')
+writeFileSync(staleTarget, '')
+mkdirSync(join(codexHome, 'ctl'), { recursive: true, mode: 0o700 })
+symlinkSync(staleTarget, socket)
 const s1 = startSupervisor(client, { HARNESS_EXTRA_VAR: 'kept-out' })
 ok('the supervisor starts its thread, baselines the fleet queue, and connects the feed', await waitFor(() => /session ready/.test(s1.out) && /wake feed connected/.test(s1.out)) &&
   /first start: baselined the cx-test queue/.test(s1.out) && clientCalls('thread/start').length === 1 && clientCalls('thread/start')[0].params.cwd === join(codexHome, 'workspace'))
 const attachLine = `attach: CODEX_HOME=${codexHome} codex resume ${THREAD} --remote unix://${socket}`
 // "session ready" and the attach line are two writes, and they can reach this process as two chunks.
 await waitFor(() => /attach: /.test(s1.out))
+ok('a control socket left as a symlink is cleared without touching its target', statSync(socket).isSocket() && existsSync(staleTarget))
 ok('a new thread has no rollout to resume yet, so ready says when the attach command comes instead of printing it (#218)',
   /attach: available after the thread's first turn/.test(s1.out) && !s1.out.includes(attachLine) && attachCommand({ codexHome: '/a b', socket: '/s', threadId: 't' }) === "CODEX_HOME='/a b' codex resume t --remote unix:///s")
 ok('the thread\'s channel is asked before ready, by the channel\'s own tool', clientCalls('mcpServer/tool/call')[0]?.params.server === 'nvoy-cx-test' &&
