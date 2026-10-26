@@ -41,7 +41,31 @@ const sleep = ms => new Promise(done => setTimeout(done, ms))
 // The client config names paths, never values. Beyond the portable Claude config's refusals, a
 // field or value that could carry an OpenAI API key refuses the file: this harness bills the
 // owner's subscription, and a key anywhere near it is how it would quietly bill an account instead.
-const CODEX_FIELDS = new Set(['instance', 'ssh_target', 'identity_file', 'feed_identity_file', 'known_hosts_file', 'codex_home', 'model', 'pubkey', 'channels'])
+const CODEX_FIELDS = new Set(['instance', 'ssh_target', 'identity_file', 'feed_identity_file', 'known_hosts_file', 'codex_home', 'model', 'pubkey', 'channels', 'grants'])
+
+// `grants`: what this one harness's shell commands may reach beyond the channel profile, for an owner
+// who gives it real work (dj-codex, the reMarkable notebooks, 2026-10-26): { "filesystem": { "/abs/path":
+// "read" | "write" }, "network": true }. Never a path holding the home directory, the CODEX_HOME (its
+// login) or the channel keys; never inside ~/.ssh but for a socket or known_hosts named exactly.
+export function codexGrants(raw, { own, codexHome, keys }) {
+  if (raw === undefined) return { filesystem: {}, network: false }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).some(k => !['filesystem', 'network'].includes(k))) {
+    throw new Error('client config grants must be { filesystem, network }')
+  }
+  const fs = raw.filesystem === undefined ? {} : raw.filesystem
+  if (!fs || typeof fs !== 'object' || Array.isArray(fs)) throw new Error('client config grants.filesystem must map paths to read or write')
+  const inside = (outer, inner) => { const r = relative(outer, inner); return r === '' || (!r.startsWith('..') && !isAbsolute(r)) }
+  const filesystem = {}
+  for (const [path, mode] of Object.entries(fs)) {
+    if (!isAbsolute(path) || resolve(path) !== path) throw new Error(`grant ${path} must be an absolute, normal path`)
+    if (mode !== 'read' && mode !== 'write') throw new Error(`grant ${path} must be read or write`)
+    if ([own, codexHome, ...keys].some(held => inside(path, held))) throw new Error(`grant ${path} would reach the home directory, the harness's login or its keys`)
+    if (inside(resolve(own, '.ssh'), path) && !/(\.sock|\/known_hosts)$/.test(path)) throw new Error(`grant ${path}: only a socket or known_hosts inside ~/.ssh`)
+    filesystem[path] = mode
+  }
+  if (raw.network !== undefined && typeof raw.network !== 'boolean') throw new Error('client config grants.network must be true or false')
+  return { filesystem, network: raw.network === true }
+}
 export function readCodexClientConfig(path, id, own = homedir()) {
   const file = fixedPath(path, 'client config', 64 * 1024)
   if ((file.stat.mode & 0o022) !== 0) throw new Error('client config must not be group/world writable')
@@ -72,7 +96,8 @@ export function readCodexClientConfig(path, id, own = homedir()) {
   if (identity === feedIdentity) throw new Error('the channel and feed keys must be two keys: each forced command admits exactly one')
   const socket = resolve(codexHome, 'ctl', 'as.sock')
   if (Buffer.byteLength(socket) >= 104) throw new Error('codex_home is too deep for its control socket; choose a shorter path')
-  return Object.freeze({ id: instanceId(id), target, model, pubkey, channels, codexHome, socket, identity, feedIdentity,
+  const grants = codexGrants(raw.grants, { own, codexHome, keys: [identity, feedIdentity] })
+  return Object.freeze({ id: instanceId(id), target, model, pubkey, channels, codexHome, socket, identity, feedIdentity, grants,
     knownHosts: knownHostsFile(String(raw.known_hosts_file || '')) })
 }
 
@@ -151,7 +176,7 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
 
   const manifest = { id: config.id, pubkey: config.pubkey, buzz: { channels: config.channels }, harness: { runner: 'codex', model: config.model } }
   const codex = codexInstall({ codexHome })
-  writePrivate(resolve(codexHome, 'config.toml'), codexConfigToml({ manifest, root: '', model: config.model, auth: 'chatgpt', codexRelease: codex.release,
+  writePrivate(resolve(codexHome, 'config.toml'), codexConfigToml({ manifest, root: '', model: config.model, auth: 'chatgpt', codexRelease: codex.release, grants: config.grants,
     remote: { identity: config.identity, knownHosts: config.knownHosts, target: config.target } }))
   if (!existsSync(resolve(workdir, 'AGENTS.md'))) writePrivate(resolve(workdir, 'AGENTS.md'), defaultInstructions(manifest))
 

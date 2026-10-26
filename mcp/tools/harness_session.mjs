@@ -133,7 +133,7 @@ export const CODEX_CHANNEL_TOOLS = ['nvoy_channel_list', 'nvoy_channel_read', 'n
 // profile it was started under, so the supervisor names this one on every resume and turn too.
 export const CHANNEL_PERMISSIONS = 'nvoy-channel'
 
-export function codexConfigToml({ manifest, root, model = '', auth = 'api-key', remote = null, codexRelease = '' }) {
+export function codexConfigToml({ manifest, root, model = '', auth = 'api-key', remote = null, codexRelease = '', grants = null }) {
   const q = value => JSON.stringify(String(value))
   if (auth === 'chatgpt') {
     if (!remote) throw new Error('a ChatGPT-login Codex config reaches its channel only through the SSH forced command')
@@ -150,7 +150,9 @@ export function codexConfigToml({ manifest, root, model = '', auth = 'api-key', 
       '"/opt/homebrew" = "read"',
       '":workspace_roots" = "read"',
       ...(codexRelease ? [`${q(codexRelease)} = "read"`] : []),
+      ...Object.entries(grants?.filesystem || {}).map(([path, mode]) => `${q(path)} = ${q(mode)}`),
       '',
+      ...(grants?.network ? [`[permissions.${CHANNEL_PERMISSIONS}.network]`, 'enabled = true', ''] : []),
       `[mcp_servers.${serverName(manifest)}]`,
       `command = ${q(entry.command)}`,
       `args = [${entry.args.map(q).join(', ')}]`,

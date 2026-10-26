@@ -8,7 +8,7 @@ import { dirname, join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { sshChannelEntry } from '../mcp/tools/channel_client.mjs'
 import { CODEX_CHANNEL_TOOLS, codexConfigToml, codexTurnText } from '../mcp/tools/harness_session.mjs'
-import { attachCommand, codexInstall, sshFeedArgs } from '../mcp/tools/codex_portable_harness.mjs'
+import { attachCommand, codexGrants, codexInstall, sshFeedArgs } from '../mcp/tools/codex_portable_harness.mjs'
 import { claimPidLock } from '../mcp/tools/pid_lock.mjs'
 import { fakeHerdr } from './fake-herdr.mjs'
 
@@ -60,6 +60,18 @@ ok('its one MCP server is the hardened ssh entry to the channel forced command',
   toml.includes('[mcp_servers.nvoy-cx-test]\ncommand = "/usr/bin/ssh"\n') && JSON.stringify(args) === JSON.stringify(sshChannelEntry(remote).args) && !/NVOY_INSTANCE_ROOT/.test(toml))
 ok('each keyless channel tool, and only those, is pre-approved', CODEX_CHANNEL_TOOLS.every(tool => toml.includes(`[mcp_servers.nvoy-cx-test.tools.${tool}]\napproval_mode = "approve"\n`)) &&
   (toml.match(/^approval_mode = /gm) || []).length === 3)
+// grants: one harness's extra reach, never its own login, keys or the home directory itself
+const gOwn = '/Users/o', gHome = '/Users/o/.nvoy-harness/x/codex', gKeys = ['/Users/o/.nvoy-harness/x/id_channel', '/Users/o/.nvoy-harness/x/id_feed']
+const grant = raw => { try { return codexGrants(raw, { own: gOwn, codexHome: gHome, keys: gKeys }) } catch (e) { return e.message } }
+const granted = grant({ filesystem: { '/Users/o/R1-work': 'write', '/Users/o/.ssh/known_hosts': 'read', '/Users/o/.ssh/s/r1-agent.sock': 'write' }, network: true })
+ok('grants name work paths and the network', granted.filesystem?.['/Users/o/R1-work'] === 'write' && granted.network === true)
+ok('no grants: nothing beyond the channel profile', JSON.stringify(grant(undefined)) === '{"filesystem":{},"network":false}')
+ok('a grant may not hold the home directory', typeof grant({ filesystem: { '/Users/o': 'read' } }) === 'string' && typeof grant({ filesystem: { '/Users': 'read' } }) === 'string')
+ok('a grant may not reach the login or the channel keys', typeof grant({ filesystem: { '/Users/o/.nvoy-harness': 'read' } }) === 'string')
+ok('inside ~/.ssh only a socket or known_hosts', typeof grant({ filesystem: { '/Users/o/.ssh/id_ed25519': 'read' } }) === 'string' && typeof grant({ filesystem: { '/Users/o/.ssh': 'read' } }) === 'string')
+ok('a grant is read or write, on an absolute path', typeof grant({ filesystem: { 'R1-work': 'read' } }) === 'string' && typeof grant({ filesystem: { '/Users/o/R1-work': 'all' } }) === 'string')
+const grantedToml = codexConfigToml({ manifest: { id: 'cx-test' }, root: '', auth: 'chatgpt', remote, grants: granted })
+ok('the profile lists each grant, and the network only when granted', /^"\/Users\/o\/R1-work" = "write"$/m.test(grantedToml) && /\.network\]\nenabled = true/.test(grantedToml) && !/\.network\]/.test(toml))
 ok('a model is set only when chosen', !/^model = /m.test(toml) && /^model = "gpt-5\.5"$/m.test(codexConfigToml({ manifest: { id: 'cx-test' }, root: '', model: 'gpt-5.5', auth: 'chatgpt', remote })))
 ok('a ChatGPT config without the SSH channel, or an unknown auth mode, is refused', (() => { try { codexConfigToml({ manifest: { id: 'x' }, root: '', auth: 'chatgpt' }); return false } catch { return true } })() &&
   (() => { try { codexConfigToml({ manifest: { id: 'x' }, root: '', auth: 'env' }); return false } catch { return true } })())
