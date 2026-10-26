@@ -254,6 +254,9 @@ const terminalReplies = join(manifest.state_dir, 'terminal-replies.jsonl')
 const terminalIds = loadTerminalReplyIds(terminalReplies)
 const expiredRequest = 'a'.repeat(32)
 ok('a missing or stale admission receipt is terminal, rather than a relay-query retry loop', isTerminalReplyFailure('instance-broker-reply: admission receipt is missing') && isTerminalReplyFailure('instance-broker-reply: admission receipt is not a live broker-bound sender capability') && recordTerminalReply(terminalReplies, terminalIds, expiredRequest, 'admission receipt is not a live broker-bound sender capability', 1) && terminalIds.has(expiredRequest) && !recordTerminalReply(terminalReplies, terminalIds, expiredRequest, 'admission receipt is not a live broker-bound sender capability', 2) && loadTerminalReplyIds(terminalReplies).has(expiredRequest) && !readFileSync(terminalReplies, 'utf8').includes('must not be signed'))
+// 10-26: a DJ Codex reply that mentioned Pi Dog hit the 4-an-hour cap and was logged as receipt-not-live.
+const capped = 'instance-broker-reply: reply refused: over the may_post hourly cap (4/4 in the last hour)'
+ok('a reply refused by the may_post hourly cap is named as such', isTerminalReplyFailure(capped) && terminalReplyReason(capped) === 'post-cap')
 // 10-23: two LukeDog replies to deleted mentions were refused this way every ~9s, with no end.
 const parentGone = 'instance-broker-reply: Buzz refused the reply: invalid: reply parent not found\ninstance-broker-reply: Buzz rejected the frozen channel reply as invalid; no retry can change it'
 const staleReply = 'instance-broker-reply: Buzz refused the reply: invalid: event timestamp too far from server time\ninstance-broker-reply: Buzz rejected the frozen channel reply as invalid; no retry can change it'

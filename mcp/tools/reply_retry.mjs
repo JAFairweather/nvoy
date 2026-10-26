@@ -93,6 +93,7 @@ export function loadPublishedReplyIds(dir, requestDigests) {
 export function terminalReplyReason(stderr) {
   const text = String(stderr || '')
   return text.includes('withheld: ') ? 'withheld-credential' : text.includes('live matching grant') ? 'grant-no-longer-live'
+    : text.includes('over the may_post hourly cap') ? 'post-cap'
     : text.includes('reply parent not found') ? 'parent-gone'
     : text.includes('frozen channel reply as invalid') ? 'invalid-frozen-reply' : 'receipt-not-live'
 }
