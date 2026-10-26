@@ -201,7 +201,7 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
     const startedAt = Date.now()
     let server = null, child = null
     try {
-      if (existsSync(socket)) { if (!lstatSync(socket).isSocket()) throw new Error('the control socket path holds something that is not a socket'); rmSync(socket) }
+      if (existsSync(socket)) { const st = lstatSync(socket); if (!st.isSocket() && !st.isSymbolicLink()) throw new Error('the control socket path holds something that is not a socket'); rmSync(socket) }
       child = spawn('codex', ['app-server', '--listen', `unix://${socket}`], { stdio: ['ignore', 'ignore', 'pipe'], env })
       children.add(child)
       let stderr = ''
