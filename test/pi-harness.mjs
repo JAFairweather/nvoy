@@ -115,7 +115,7 @@ ok('pi runs on the ChatGPT login, gpt-5.5 by default, resuming its one session f
   argAfter('--model') === 'gpt-5.5' && argAfter('--session-dir') === join(stateDir, 'sessions') && args.at(-1) === '--continue' && argAfter('-c') === join(stateDir, 'workspace'))
 ok('discovered extensions are off and only this extension loads, by absolute path', args.includes('--no-extensions') && argAfter('-e') === resolve('mcp/tools/pi_harness_extension.mjs') &&
   args.filter(arg => arg === '-e').length === 1 && args.includes('--no-approve'))
-ok('the channel tools are pi\'s only tools', argAfter('--tools') === 'nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply')
+ok('the channel tools are pi\'s only tools', argAfter('--tools') === 'nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply,nvoy_channel_post')
 ok('pi gets a built environment: its own agent dir and home, the config, and no API key', sessions()[0].env.join() ===
   'HOME,LANG,NVOY_PI_HARNESS_CONFIG,NVOY_PI_HARNESS_INSTANCE,PATH,PI_CODING_AGENT_DIR,PI_SKIP_VERSION_CHECK,TERM' && sessions()[0].agentDir === piHome &&
   sessions()[0].home === join(stateDir, 'home') && sessions()[0].config === configPath && sessions()[0].instance === 'pd-test' && sessions()[0].skip === '1')
@@ -216,7 +216,7 @@ ok('outside the launcher, the extension refuses to load rather than run unconfig
 Object.assign(process.env, { NVOY_PI_HARNESS_CONFIG: configPath, NVOY_PI_HARNESS_INSTANCE: 'pd-test', NVOY_HARNESS_SSH: fakeSsh })
 const pi1 = fakePi()
 const harness1 = nvoyPiHarness(pi1)
-ok('loading registers the three channel tools and starts nothing', [...pi1.tools.keys()].join() === 'nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply' &&
+ok('loading registers the four channel tools and starts nothing', [...pi1.tools.keys()].join() === 'nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply,nvoy_channel_post' &&
   !existsSync(join(root, 'ssh-args.log')) && !existsSync(lockPath))
 const mcp = new Client({ name: 'pi-harness-test', version: '1' })
 await mcp.connect(new StdioClientTransport({ command: process.execPath, args: [resolve('mcp/tools/codex-channel-mcp.mjs'), '--instance', 'pd-test'], env: { ...process.env, NVOY_INSTANCE_ROOT: fleet } }))
