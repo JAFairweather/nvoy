@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { sha256 } from '@noble/hashes/sha2.js'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
 import { foldGrantsWith, nativeGrant } from '../mcp/tools/admission.mjs'
+import { verifyChannelTaskCarry } from '../mcp/tools/channel_task_carry.mjs'
 import { foldGrants, scopeHash } from '../mcp/tools/grant_fold.mjs'
 
 let fails = 0, passes = 0
@@ -25,6 +26,12 @@ const walk = file => {
 }
 for (const f of ['admission.mjs', 'invocation_policy.mjs', 'channel_task_carry.mjs']) walk(join(tools, f))
 ok(`the admission graph (${seen.size} modules) imports nothing a browser lacks${outside.size ? `: ${[...outside].join(', ')}` : ''}`, outside.size === 0)
+// An import scan misses a bare global, which is how Buffer.byteLength survived the move (#264 review).
+const NODE_GLOBALS = /\b(Buffer|process|require|__dirname|__filename|setImmediate|global)\b/
+const globals = [...seen].flatMap(file => readFileSync(file, 'utf8').split('\n')
+  .map((line, i) => [line.replace(/\/\/.*$/, ''), `${file.split('/').pop()}:${i + 1}`])
+  .filter(([code]) => NODE_GLOBALS.test(code)).map(([, at]) => at))
+ok(`the admission graph names no Node-only global${globals.length ? `: ${globals.join(', ')}` : ''}`, globals.length === 0)
 
 const hex = bytes => Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('')
 const browserScopeHash = (subject, salt) => {
@@ -61,6 +68,22 @@ const grants = [...node.live].flatMap(([pubkey, caps]) => [...caps.values()].map
 ok('a DM admits the owner only', nativeGrant({ author: owner.pk, dm: true, grants, grantors: [owner.pk] })?.cap === 'task+act'
   && nativeGrant({ author: colleague.pk, dm: true, grants, grantors: [owner.pk] }) === null)
 ok('in a channel a colleague\'s task grant admits', nativeGrant({ author: colleague.pk, dm: false, grants, grantors: [owner.pk] })?.cap === 'task')
+
+const channel = 'a8186b53-537d-46ad-a7e7-b6486c58970e', carrier = key().pk
+const carryOf = content => {
+  const source = JSON.parse(JSON.stringify(finalizeEvent({ kind: 9, created_at: now - 10, tags: [['h', channel]], content }, colleague.sk)))
+  return verifyChannelTaskCarry({ from: carrier, at: now, content: JSON.stringify({ v: 1, type: 'waggle-channel-task-carry', channel, reason: 'mention', source }) },
+    { channels: [channel], carrierGrant: { grantId: 'c'.repeat(64), grantor: owner.pk, cap: 'task-relay' },
+      taskGrantFor: pk => pk === colleague.pk ? { grantId: 'a'.repeat(64), grantor: owner.pk, cap: 'task' } : null })
+}
+const nodeBuffer = globalThis.Buffer
+delete globalThis.Buffer
+try {
+  ok('without Buffer, a channel carry still verifies', carryOf('please inspect the queue')?.message.from === colleague.pk)
+  ok('without Buffer, the 256 KiB limit still counts UTF-8 bytes, not characters',
+    carryOf('é'.repeat(128 * 1024)) !== null && carryOf('é'.repeat(128 * 1024 + 1)) === null)
+} catch (e) { ok(`without Buffer, a channel carry runs (${e.message})`, false) }
+finally { globalThis.Buffer = nodeBuffer }
 
 console.log(`\n${passes} passed, ${fails} failed`)
 process.exit(fails ? 1 : 0)

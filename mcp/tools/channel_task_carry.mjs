@@ -8,6 +8,7 @@ import { hopOf } from './admission.mjs'
 const HEX64 = /^[0-9a-f]{64}$/
 const HEX128 = /^[0-9a-f]{128}$/
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+const UTF8 = new TextEncoder()
 
 function parseChannelCarry(message, { channels = [], carriers = null, verify = verifyEvent } = {}) {
   if (!message || !HEX64.test(String(message.from || ''))) return null
@@ -27,7 +28,7 @@ function parseChannelCarry(message, { channels = [], carriers = null, verify = v
   const source = carry.source
   if (!source || typeof source !== 'object' || Array.isArray(source) ||
       Object.keys(source).sort().join(',') !== 'content,created_at,id,kind,pubkey,sig,tags' || source.kind !== 9 ||
-      typeof source.content !== 'string' || Buffer.byteLength(source.content) > 256 * 1024 ||
+      typeof source.content !== 'string' || UTF8.encode(source.content).length > 256 * 1024 ||
       !HEX64.test(String(source.pubkey || '')) || !HEX64.test(String(source.id || '')) ||
       !HEX128.test(String(source.sig || '')) || !Array.isArray(source.tags) ||
       !source.tags.every(tag => Array.isArray(tag) && tag.every(value => typeof value === 'string'))) return null
