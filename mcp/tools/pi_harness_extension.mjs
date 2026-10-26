@@ -35,6 +35,8 @@ export const PI_CHANNEL_TOOLS = [
     parameters: { type: 'object', properties: { envelope: { type: 'string', pattern: '^[0-9a-f]{64}$' } }, required: ['envelope'], additionalProperties: false } },
   { name: 'nvoy_channel_reply', label: 'Nvoy channel: reply', description: 'Request one receipt-bound reply to an instruction-authorized envelope. This process cannot sign or select a recipient.',
     parameters: { type: 'object', properties: { envelope: { type: 'string', pattern: '^[0-9a-f]{64}$' }, text: { type: 'string', minLength: 1, maxLength: 4000 } }, required: ['envelope', 'text'], additionalProperties: false } },
+  { name: 'nvoy_channel_post', label: 'Nvoy channel: post', description: 'Start a new top-level message in a Buzz channel, optionally mentioning allowed participants by name or hex key. The broker checks the manifest\'s may_post block, signs and publishes.',
+    parameters: { type: 'object', properties: { text: { type: 'string', minLength: 1, maxLength: 4000 }, channel: { type: 'string', pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' }, mention: { type: 'array', items: { type: 'string', minLength: 1, maxLength: 64 }, maxItems: 16 } }, required: ['text'], additionalProperties: false } },
 ]
 
 // The client config names paths, never values, and is refused on the portable Codex config's
