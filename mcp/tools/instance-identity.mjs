@@ -2,8 +2,19 @@
 // instance-identity.mjs — audit the identity blocks in use, and allocate one for a new participant.
 //
 //   instance-identity.mjs audit [--instance-root <dir>]
-//   instance-identity.mjs allocate --id <name> --pubkey <npub|hex> --grantor <npub|hex> \
-//                                  [--relay wss://…]… [--out <dir>] [--instance-root <dir>]
+//   instance-identity.mjs allocate --id <name> --pubkey <npub|hex> [--like <id>] \
+//                                  [--grantor <npub|hex>]… [--relay wss://…]… [--credential-dir <dir>]
+//                                  [--out <dir>] [--instance-root <dir>]
+//   instance-identity.mjs check --id <name> [--out <dir>] [--instance-root <dir>]
+//
+// `--like <id>` copies the policy blocks of a live agent the new one should work like (where it
+// listens and posts, its limits, its card, its task carriers) and, unless given, its grantors and
+// relays. Without it, grantors and relays must be given: the tool does not borrow them from
+// whichever manifest happens to sort first.
+//
+// `check` is the gate before the install: the staged manifest validates, collides with nothing in
+// the estate, and its two Bunker credential files are seated root:root 0600. It reads file metadata
+// only. It does not prove the pairing, which needs the signer and stays an operator step.
 //
 // All policy lives in `identity_allocation.mjs`, which is pure and carries its own suite. This file
 // reads manifests and prints; it decides nothing.
@@ -17,8 +28,8 @@
 // return it first calls `verify_running` for EVERY manifest it globbed, and a manifest with no
 // compose file beside it makes `docker compose -f <missing> ps` exit nonzero. That throws, the
 // health check reports the release unhealthy, and the runner reconciles — which is what renders and
-// starts the new identity. Installing a manifest is therefore a deploy trigger INDIRECTLY, on the
-// next tick (<=3.5 min), by failing a health check rather than by being discovered.
+// starts the new identity. Installing a manifest is therefore a deploy trigger, and an immediate one:
+// nvoy-runtime-deploy.path fires on any change to the instance root, and the 30 s timer backs it up.
 //
 // The conclusion is unchanged and the reconcile is estate-wide, so it matters more, not less: the
 // reconcile renders and verifies compose for every identity, then brings each up in turn, recording
@@ -33,11 +44,11 @@
 //
 // Exit: 0 clean · 1 a real fault (collision, refusal) · 3 INCONCLUSIVE — a manifest it could not read.
 
-import { readdirSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
+import { readdirSync, readFileSync, writeFileSync, mkdirSync, existsSync, lstatSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { readManifest } from './runtime_manifest.mjs'
 import { auditIdentityBlocks, allocateIdentityBlock, buildParticipantManifest, seatingPlan,
-  NUMERIC_FIELDS } from './identity_allocation.mjs'
+  policyFromTemplate, auditUniqueFields, credentialVerdict, NUMERIC_FIELDS, TEMPLATE_FIELDS } from './identity_allocation.mjs'
 
 const argv = process.argv.slice(2)
 const verb = argv[0]
@@ -46,9 +57,10 @@ const all = n => argv.reduce((acc, a, i) => (a === n && argv[i + 1] ? [...acc, a
 const die = m => { console.error(`instance-identity: ${m}`); process.exit(1) }
 const root = resolve(flag('--instance-root') || process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances')
 
-if (!['audit', 'allocate'].includes(verb)) {
-  die('usage: audit | allocate --id <name> --pubkey <npub|hex> --grantor <npub|hex> [--relay wss://…]')
+if (!['audit', 'allocate', 'check'].includes(verb)) {
+  die('usage: audit | allocate --id <name> --pubkey <npub|hex> [--like <id>] [--grantor <npub|hex>] [--relay wss://…] | check --id <name>')
 }
+const outDir = resolve(flag('--out') || join(process.env.HOME || '/tmp', '.nvoy', 'staged'))
 
 // ---- read the estate ----------------------------------------------------------------------------
 // A manifest we cannot read is INCONCLUSIVE, never "not there". Treating an unreadable sibling as
@@ -96,25 +108,62 @@ if (unreadable.length) {
 }
 
 const id = flag('--id')
-const relays = all('--relay')
-const grantors = all('--grantor')
+
+// ---- check ---------------------------------------------------------------------------------------
+if (verb === 'check') {
+  if (unreadable.length) {
+    console.error('\ninstance-identity: INCONCLUSIVE — cannot check against an estate it cannot fully read')
+    process.exit(3)
+  }
+  if (outDir === root) die('--out is the staging directory, not the live instance root')
+  if (manifests.some(m => m.id === id)) die(`${id} is already in the instance root; check is for a staged identity`)
+  let m
+  try { m = readManifest(outDir, id) } catch (e) { die(`staged manifest ${join(outDir, `${id}.json`)}: ${e.message}`) }
+  const results = []
+  const blocks = auditIdentityBlocks([...manifests, m])
+  results.push([blocks.ok, blocks.ok ? 'uid/gid block is clear of every identity' : blocks.collisions.map(c => `${c.kind} ${c.value} is held by ${c.held_by}`).join('; ')])
+  const unique = auditUniqueFields([...manifests, m])
+  results.push([unique.ok, unique.ok ? 'key, directories and adapter container are its own' : unique.collisions.map(c => `${c.field} is held by ${c.held_by}`).join('; ')])
+  for (const ref of [m.bunkerUriRef, m.bunkerClientRef]) {
+    let st = null
+    try { st = lstatSync(ref) } catch (e) { if (e.code !== 'ENOENT') die(`cannot stat ${ref}: ${e.code}`) }
+    const why = credentialVerdict(ref, st)
+    results.push([!why, why || `${ref} is seated root 0600`])
+  }
+  console.log(`\ncheck ${id} (staged at ${outDir}):`)
+  for (const [ok, text] of results) console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${text}`)
+  console.log('\n  NOT CHECKED  that the Bunker client signs as this manifest\'s key. Prove it read-only before installing.')
+  process.exit(results.every(([ok]) => ok) ? 0 : 1)
+}
+
+const like = flag('--like')
+let template = null
+if (like) {
+  if (!manifests.some(m => m.id === like)) die(`--like ${like}: no readable identity by that name in ${root}`)
+  template = JSON.parse(readFileSync(join(root, `${like}.json`), 'utf8'))
+}
+const relays = all('--relay').length ? all('--relay') : template?.relays || []
+const grantors = all('--grantor').length ? all('--grantor') : template?.grantors || []
+if (!grantors.length || !relays.length) die('give --grantor and --relay, or --like <id> to take them from an agent this one should work like')
 let allocation, manifest
 try {
   allocation = allocateIdentityBlock(manifests, { id })
   manifest = buildParticipantManifest(allocation, {
-    pubkey: flag('--pubkey'),
-    grantors: grantors.length ? grantors : manifests[0]?.grantors || [],
-    relays: relays.length ? relays : manifests[0]?.relays || [],
+    pubkey: flag('--pubkey'), grantors, relays, credentialDir: flag('--credential-dir') || undefined,
+    policy: template ? policyFromTemplate(template, { pubkey: flag('--pubkey') }) : {},
   })
 } catch (e) { die(e.message) }
 
-const outDir = resolve(flag('--out') || join(process.env.HOME || '/tmp', '.nvoy', 'staged'))
-if (resolve(outDir) === root) die('--out must not be the live instance root; installing the manifest is the deploy trigger')
+if (outDir === root) die('--out must not be the live instance root; installing the manifest is the deploy trigger')
 mkdirSync(outDir, { recursive: true })
 const staged = join(outDir, `${manifest.id}.json`)
 writeFileSync(staged, JSON.stringify(manifest, null, 2) + '\n', { mode: 0o644 })
+// Validate what was written with the reader every service uses, so a template block the new agent
+// cannot carry is refused here and not by the deploy.
+try { readManifest(outDir, manifest.id) } catch (e) { die(`the staged manifest does not validate: ${e.message}`) }
 
 console.log(`\nallocated ${manifest.id}: uid ${allocation.uid_range.join('-')}  gid ${allocation.gid_range.join('-')}`)
+if (like) console.log(`  policy copied from ${like}: ${TEMPLATE_FIELDS.filter(k => template[k] !== undefined).join(', ')}. Review may_post.mention before installing.`)
 console.log(`  allocated around: ${allocation.neighbours.join(', ') || '(first identity on this host)'}`)
 console.log(`\nSTAGED (not installed): ${staged}`)
 console.log('  It is NOT in the instance root. Placing it there starts a deploy within one tick.\n')

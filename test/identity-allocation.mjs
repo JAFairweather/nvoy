@@ -14,8 +14,14 @@
 //
 //   node test/identity-allocation.mjs
 
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, dirname } from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { auditIdentityBlocks, allocateIdentityBlock, buildParticipantManifest, seatingPlan,
-  occupiedNumbers, UID_ROLES, GID_ROLES, UID_BASE, GID_BASE } from '../mcp/tools/identity_allocation.mjs'
+  occupiedNumbers, policyFromTemplate, auditUniqueFields, credentialVerdict, TEMPLATE_FIELDS,
+  UID_ROLES, GID_ROLES, UID_BASE, GID_BASE } from '../mcp/tools/identity_allocation.mjs'
 
 let pass = true
 const check = (cond, label) => { console.log(`${cond ? 'ok  ' : 'FAIL'} — ${label}`); if (!cond) pass = false }
@@ -147,6 +153,104 @@ check(plan.some(s => /MORE than five minutes/i.test(s.what)), 'the plan ends wit
 check(plan.some(s => /read back by id from a fresh connection/i.test(s.what)), 'and requires a cold read-back')
 check(plan.filter(s => s.automatable === false).length >= 4,
   'the plan is honest about how much still needs a human')
+
+// ---- a template: a new agent works like a named live one (waggle#613 M5, nvoy#273) ---------------
+const CH = 'a8186b53-537d-46ad-a7e7-b6486c58970e'
+const NEW = 'd'.repeat(64), OTHER = 'e'.repeat(64), CARRIER = 'f'.repeat(64)
+const liveRaw = {
+  version: 1, id: 'pi-dog', pubkey: 'b'.repeat(64), grantors: [HEX], relays: ['wss://relay.example'],
+  buzz: { relay: 'wss://buzz.example', channels: [CH] },
+  may_post: { channels: [CH], per_hour: 30, mention: [{ name: 'newbie', pubkey: NEW }, { name: 'other', pubkey: OTHER }] },
+  agent_limits: { max_hops: 10, per_sender_per_hour: 30 }, agent_card: true,
+  task_carriers: [{ pubkey: CARRIER, channels: [CH] }],
+  wake_webhook: { url: 'https://hook.example/x', credential_ref: '/etc/nvoy/credentials/pi-dog.webhook' },
+  may_set_profile: { kind: 0, pubkey: 'b'.repeat(64), grant_id: '1'.repeat(64) },
+  bunker_uri_ref: '/etc/nvoy/credentials/pi-dog.bunker-uri',
+}
+const policy = policyFromTemplate(liveRaw, { pubkey: NEW })
+check(JSON.stringify(Object.keys(policy).sort()) === JSON.stringify([...TEMPLATE_FIELDS].sort()),
+  'a template copies exactly the policy blocks: buzz, may_post, agent_limits, agent_card, task_carriers')
+check(!('wake_webhook' in policy) && !('may_set_profile' in policy) && !('bunker_uri_ref' in policy) && !('pubkey' in policy),
+  'and nothing bound to the template agent: not its webhook, profile scope, credentials or key')
+check(policy.may_post.mention.length === 1 && policy.may_post.mention[0].pubkey === OTHER,
+  "the new agent's own key is dropped from the mention list it inherits")
+policy.may_post.per_hour = 1
+check(liveRaw.may_post.per_hour === 30, 'the copy is deep: editing it cannot change the live manifest it came from')
+refuses(() => buildParticipantManifest(second, { pubkey: NEW, grantors: [HEX], relays: ['wss://r'], policy: { harness: {} } }),
+  'a policy block outside the template fields is refused', 'harness')
+{
+  const m = buildParticipantManifest(second, { pubkey: NEW, grantors: [HEX], relays: ['wss://r'], policy: policyFromTemplate(liveRaw, { pubkey: NEW }) })
+  check(m.watcher_uid === second.block.watcherUid && m.pubkey === NEW && m.state_dir.endsWith(second.id),
+    'identity fields come from the allocation, never from the template')
+}
+
+// ---- the unique-field audit -------------------------------------------------------------------------
+const named = (id, extra = {}) => ({ id, pubkey: id.padEnd(64, '0').slice(0, 64), stateDir: `/s/${id}`, runtimeDir: `/r/${id}`, spoolDir: `/p/${id}`, adapterContainer: `nvoy-${id}-adapter-1`, ...extra })
+check(auditUniqueFields([named('a'), named('b')]).ok, 'two identities with their own key, directories and container audit clean')
+{
+  const r = auditUniqueFields([named('a'), named('b', { adapterContainer: 'nvoy-a-adapter-1' })])
+  check(!r.ok && r.collisions[0].field === 'adapterContainer' && r.collisions[0].held_by === 'a',
+    'a shared adapter container is caught: two principals would exec into one container')
+}
+check(!auditUniqueFields([named('a'), named('b', { pubkey: named('a').pubkey })]).ok, 'a shared key is caught')
+
+// ---- the credential verdict (lstat only) ------------------------------------------------------------
+const st = (o = {}) => ({ isSymbolicLink: () => !!o.link, isFile: () => o.file !== false, uid: o.uid ?? 0, mode: o.mode ?? 0o100600 })
+check(credentialVerdict('/c', st()) === null, 'root:root 0600 regular file passes')
+check(/does not exist/.test(credentialVerdict('/c', null)), 'a missing file fails')
+check(/symlink/.test(credentialVerdict('/c', st({ link: true }))), 'a symlink fails')
+check(/uid 501/.test(credentialVerdict('/c', st({ uid: 501 }))), 'a file not owned by root fails')
+check(/0640/.test(credentialVerdict('/c', st({ mode: 0o100640 }))), 'a group-readable file fails, naming its mode')
+check(credentialVerdict('/c', st({ mode: 0o100400 })) === null, 'a tighter 0400 still passes')
+
+// ---- the CLI, against a temporary instance root -----------------------------------------------------
+{
+  const CLI = join(dirname(fileURLToPath(import.meta.url)), '../mcp/tools/instance-identity.mjs')
+  const tmp = mkdtempSync(join(tmpdir(), 'nvoy-identity-'))
+  const root = join(tmp, 'instances'), out = join(tmp, 'staged'), creds = join(tmp, 'credentials')
+  mkdirSync(root); mkdirSync(creds)
+  const live = { ...liveRaw, broker_mode: 'local', delivery_mode: 'notify_only', worker_enabled: false,
+    state_dir: join(tmp, 'state/pi-dog'), runtime_dir: join(tmp, 'run/pi-dog'), spool_dir: join(tmp, 'spool/pi-dog'),
+    bunker_uri_ref: join(creds, 'pi-dog.bunker-uri'), bunker_client_ref: join(creds, 'pi-dog.nip46-client'),
+    watcher_uid: 41011, broker_uid: 41012, adapter_uid: 41013, worker_uid: 41014, broker_adapter_gid: 42011, worker_handoff_gid: 42012 }
+  delete live.wake_webhook; delete live.may_set_profile
+  writeFileSync(join(root, 'pi-dog.json'), JSON.stringify(live))
+  const run = (...args) => spawnSync(process.execPath, [CLI, ...args, '--instance-root', root, '--out', out], { encoding: 'utf8' })
+
+  const bare = run('allocate', '--id', 'hr', '--pubkey', NEW)
+  check(bare.status === 1 && /give --grantor and --relay, or --like/.test(bare.stderr),
+    'without --like or --grantor/--relay, allocate refuses rather than borrowing the first manifest it read')
+
+  const made = run('allocate', '--id', 'hr', '--pubkey', NEW, '--like', 'pi-dog', '--credential-dir', creds)
+  const staged = made.status === 0 ? JSON.parse(readFileSync(join(out, 'hr.json'), 'utf8')) : {}
+  check(made.status === 0 && staged.watcher_uid === 41021 && staged.may_post?.per_hour === 30 && staged.agent_card === true,
+    `allocate --like stages a manifest with the next block and the template's policy (exit ${made.status}${made.stderr ? `: ${made.stderr.trim()}` : ''})`)
+  check(/policy copied from pi-dog: buzz, may_post, agent_limits, agent_card, task_carriers/.test(made.stdout),
+    'and says which blocks it copied')
+  check(staged.grantors?.[0] === HEX && staged.relays?.[0] === 'wss://relay.example', 'grantors and relays come from the named template')
+
+  const unseated = run('check', '--id', 'hr')
+  check(unseated.status === 1 && /PASS {2}uid\/gid block is clear/.test(unseated.stdout) && /PASS {2}key, directories and adapter container/.test(unseated.stdout)
+    && /FAIL {2}.*hr\.bunker-uri does not exist/.test(unseated.stdout), 'check passes the estate audits and fails on unseated credentials')
+  check(/NOT CHECKED/.test(unseated.stdout), 'and says plainly that the Bunker pairing is not something it proved')
+
+  const SENTINEL = 'bunker://sentinel-never-printed'
+  writeFileSync(join(creds, 'hr.bunker-uri'), SENTINEL, { mode: 0o600 }); writeFileSync(join(creds, 'hr.nip46-client'), SENTINEL, { mode: 0o600 })
+  const owned = run('check', '--id', 'hr')
+  const asRoot = process.getuid?.() === 0
+  check(asRoot ? owned.status === 0 : owned.status === 1 && /not root/.test(owned.stdout),
+    asRoot ? 'seated 0600 by root: check passes' : 'seated 0600 by a non-root user: check fails on ownership, as the init container would')
+
+  // A staged manifest that collides with the estate.
+  writeFileSync(join(out, 'clash.json'), JSON.stringify({ ...live, id: 'clash', pubkey: OTHER,
+    state_dir: join(tmp, 'state/clash'), runtime_dir: join(tmp, 'run/clash'), spool_dir: join(tmp, 'spool/clash') }))
+  const clash = run('check', '--id', 'clash')
+  check(clash.status === 1 && /FAIL {2}uid 41011 is held by pi-dog/.test(clash.stdout), 'check fails a staged manifest whose block another identity holds')
+  const already = run('check', '--id', 'pi-dog')
+  check(already.status === 1 && /already in the instance root/.test(already.stderr), 'check refuses an identity that is already installed')
+  check(![made, unseated, owned, clash].some(r => (r.stdout + r.stderr).includes(SENTINEL)), 'no output ever carries a credential file\'s contents')
+  rmSync(tmp, { recursive: true, force: true })
+}
 
 console.log(`\n${pass ? 'ALL PASS' : 'FAILURES ABOVE'}`)
 process.exit(pass ? 0 : 1)

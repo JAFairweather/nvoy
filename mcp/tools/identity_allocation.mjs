@@ -136,12 +136,12 @@ export function allocateIdentityBlock(manifests, { id, uidBase = UID_BASE, gidBa
  * Returns the object only — writing it is the caller's business, and deliberately NOT into the live
  * instance root. `runtime-deploy-runner.py` gates on the release SHA and returns early when it is
  * already current, but it health-checks every globbed manifest before doing so; one with no compose
- * file beside it fails that check and forces an estate-wide reconcile on the next tick. So a
+ * file beside it fails that check and forces an estate-wide reconcile as soon as the file lands. So a
  * manifest that lands before its credentials exist fails to start, and that failure rolls back every
  * identity touched in the reconcile — including healthy ones. The ordering is the safety property,
  * so the tool stages. See the header of instance-identity.mjs for the mechanism in full.
  */
-export function buildParticipantManifest(allocation, { pubkey, grantors, relays, taskCarriers = [], credentialDir = '/etc/nvoy/credentials' } = {}) {
+export function buildParticipantManifest(allocation, { pubkey, grantors, relays, taskCarriers = [], policy = {}, credentialDir = '/etc/nvoy/credentials' } = {}) {
   if (!allocation || allocation.version !== ALLOCATION_VERSION) fail('a valid allocation is required')
   const id = allocation.id
   const hex = (v, label) => {
@@ -152,6 +152,8 @@ export function buildParticipantManifest(allocation, { pubkey, grantors, relays,
   if (!Array.isArray(grantors) || !grantors.length) fail('at least one grantor is required')
   if (!Array.isArray(relays) || !relays.length) fail('at least one relay is required')
   for (const r of relays) if (!String(r).startsWith('wss://')) fail(`relay ${r} must be wss://`)
+  const stray = Object.keys(policy).filter(k => !TEMPLATE_FIELDS.includes(k))
+  if (stray.length) fail(`a template may carry only ${TEMPLATE_FIELDS.join(', ')}, not ${stray.join(', ')}`)
 
   return Object.freeze({
     version: 1,
@@ -172,8 +174,66 @@ export function buildParticipantManifest(allocation, { pubkey, grantors, relays,
     grantors: grantors.map((g, i) => hex(g, `grantors[${i}]`)),
     relays: [...new Set(relays.map(String))],
     task_carriers: taskCarriers,
+    ...policy,
     ...allocation.block_snake ?? snakeBlock(allocation.block),
   })
+}
+
+// What a new agent copies from a named live one (`--like`). These are the policy blocks every hive
+// agent carries: where it listens, where and how often it may post, its limits, its card, and who
+// carries tasks to it. Nothing identity-bound is copied: not the key, the uids, the directories, the
+// credentials, a webhook or door (each names its own secret), nor may_set_profile (scoped to one key).
+export const TEMPLATE_FIELDS = Object.freeze(['buzz', 'may_post', 'agent_limits', 'agent_card', 'task_carriers'])
+
+/**
+ * The policy blocks of one raw (snake_case) manifest, for a new agent with `pubkey`. Copying is a
+ * choice the operator names, not a default: the template is whichever agent they say the new one
+ * should work like. The new agent's own key is dropped from the mention list, since mentioning
+ * yourself is not a use the manifest allows for.
+ */
+export function policyFromTemplate(raw, { pubkey } = {}) {
+  if (!raw || typeof raw !== 'object') fail('a template manifest is required')
+  const self = String(pubkey || '').toLowerCase()
+  const policy = {}
+  for (const k of TEMPLATE_FIELDS) if (raw[k] !== undefined) policy[k] = JSON.parse(JSON.stringify(raw[k]))
+  if (Array.isArray(policy.may_post?.mention)) {
+    policy.may_post.mention = policy.may_post.mention.filter(m => String(typeof m === 'object' ? m?.pubkey : m).toLowerCase() !== self)
+  }
+  if (Array.isArray(policy.task_carriers)) policy.task_carriers = policy.task_carriers.filter(c => String(c?.pubkey).toLowerCase() !== self)
+  return policy
+}
+
+/**
+ * The values no two identities may share, beyond the uid/gid block: the key, the three directories
+ * and the adapter container the channel principal names. `assertNoCollisions` covers the first four
+ * for manifests already in the instance root; this covers a staged one against that root before it
+ * lands, and adds the container. Takes manifests as `readManifest` returns them.
+ */
+export const UNIQUE_FIELDS = Object.freeze(['pubkey', 'stateDir', 'runtimeDir', 'spoolDir', 'adapterContainer'])
+export function auditUniqueFields(manifests) {
+  const seen = new Map(), collisions = []
+  for (const m of manifests || []) for (const field of UNIQUE_FIELDS) {
+    const value = m?.[field]
+    if (!value) continue
+    const key = `${field}:${value}`
+    if (seen.has(key) && seen.get(key) !== m.id) collisions.push(Object.freeze({ field, held_by: seen.get(key), wanted_by: m.id }))
+    else seen.set(key, m.id)
+  }
+  return Object.freeze({ collisions: Object.freeze(collisions), ok: collisions.length === 0 })
+}
+
+/**
+ * Whether a credential file is seated as the init container expects: present, a regular file and
+ * not a symlink, owned by root, and unreadable by group or world. `st` is an lstat result, or null
+ * when the file does not exist. The file's contents are never needed and never read.
+ */
+export function credentialVerdict(path, st) {
+  if (!st) return `${path} does not exist`
+  if (st.isSymbolicLink()) return `${path} is a symlink; seat the file itself`
+  if (!st.isFile()) return `${path} is not a regular file`
+  if (st.uid !== 0) return `${path} is owned by uid ${st.uid}, not root`
+  if (st.mode & 0o077) return `${path} is mode ${(st.mode & 0o777).toString(8).padStart(4, '0')}; it must be 0600 (no group or world access)`
+  return null
 }
 
 // The manifest on disk is snake_case; `readManifest` hands back camelCase. Converting in one named
@@ -208,7 +268,7 @@ export function seatingPlan(manifest) {
       why: 'Possessing a URI is not proof of control. This signs nothing and publishes nothing. Note that Bunker permissions are per-method — a sign_event denial is byte-identical to an empty inbox (nvoy#142).' }),
     Object.freeze({ step: 4, actor: 'operator', automatable: true,
       what: `Install the staged manifest at /etc/nvoy/instances/${id}.json (root:root 0644)`,
-      why: 'THIS STARTS THE DEPLOY, on the next tick (<=3.5 min) and indirectly: the runner health-checks every manifest it globs, and one with no compose file beside it fails that check and forces an estate-wide reconcile. If this identity then fails to start, every identity touched in that reconcile is rolled back — including healthy ones. Do not place it until steps 2 and 3 are done.' }),
+      why: 'THIS STARTS THE DEPLOY, at once: nvoy-runtime-deploy.path fires on any change to the instance root (and the 30 s timer would within a tick). The runner health-checks every manifest it globs, and one with no compose file beside it fails that check and forces an estate-wide reconcile. If this identity then fails to start, every identity touched in that reconcile is rolled back — including healthy ones. Do not place it until steps 2 and 3 are done.' }),
     Object.freeze({ step: 5, actor: 'operator', automatable: true,
       what: `Render and install the SSH principal, then verify it landed`,
       why: 'The renderer writes a .authorized_key file; nothing installs it. Verify reports an absent principal as FAIL rather than pass, and matches on the comment so a drifted one is reported wrong rather than missing.' }),
