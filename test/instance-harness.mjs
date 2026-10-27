@@ -180,6 +180,7 @@ ok('a Codex model is set only when chosen', !/^model = /m.test(toml) && /^model 
 const turn = codexTurnText({ envelope: 'd'.repeat(64), type: 'admitted-task' })
 ok('an injected turn carries only the envelope marker and how to read and answer it', turn.includes('d'.repeat(64)) && /nvoy_channel_read/.test(turn) &&
   /nvoy_channel_reply/.test(turn) && turn.endsWith(`NVOY_ENVELOPE_ID=${'d'.repeat(64)}`))
+ok('an injected task asks for the work itself, not only an answer', /do the\nwork end to end/.test(turn) && /what you did/.test(turn))
 const queue = [JSON.stringify({ envelope: '1'.repeat(64), type: 'admitted-task', body: 'ignored' }), 'not json', JSON.stringify({ envelope: 'XYZ' }),
   JSON.stringify({ envelope: '2'.repeat(64), type: 'verified-notification' }), JSON.stringify({ envelope: '1'.repeat(64), type: 'admitted-task' }),
   JSON.stringify({ envelope: '3'.repeat(64), type: 'something-else' })].join('\n')
