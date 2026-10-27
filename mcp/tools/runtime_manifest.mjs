@@ -252,6 +252,11 @@ export function readManifest(root, requestedId) {
     maySetProfile = Object.freeze({ kind: 0, pubkey, grantId: block.grant_id.toLowerCase(), perDay,
       pictureHosts: Object.freeze([...pictureHosts]) })
   }
+  // The agent card (agent_card.mjs): the broker publishes what this manifest allows, signed by the
+  // agent's own key. Off until the owner turns it on, since the agent's Bunker must allow kind 30078.
+  const agentCard = raw.agent_card ?? false
+  if (typeof agentCard !== 'boolean') die('agent_card must be true or false')
+  if (agentCard && (!buzz || brokerMode !== 'local')) die('agent_card requires a buzz block and a local broker')
   // The brakes on agent-to-agent traffic (agent_limits.mjs). Always in force; the block only tunes them.
   let agentLimits = DEFAULT_LIMITS
   if (raw.agent_limits != null) {
@@ -270,7 +275,7 @@ export function readManifest(root, requestedId) {
     }
   }
   return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, carriers: Object.freeze(carriers), buzz, relays, stateDir, runtimeDir, spoolDir,
-    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, adapterContainer, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath, codexAppBundleId, codexProjectLabel, codexChatLabel, codexUiDriver, harness, wakeWebhook, channelDoor, mayPost, maySetProfile, agentLimits,
+    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, adapterContainer, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath, codexAppBundleId, codexProjectLabel, codexChatLabel, codexUiDriver, harness, wakeWebhook, channelDoor, mayPost, maySetProfile, agentLimits, agentCard,
     sshTarget, sshIdentityFile, sshKnownHostsFile, sshKnownHostsSha256, approvalEndpoint: approvalEndpoint.replace(/\/$/, '') })
 }
 

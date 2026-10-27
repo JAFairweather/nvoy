@@ -239,7 +239,17 @@ function supervise(script, label, delay = 1000) {
     setTimeout(() => supervise(script, label, next), next).unref?.()
   })
 }
+// The agent card is checked at start and hourly; the child re-signs only when the card is due.
+function publishCard() {
+  const child = spawn(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-card.mjs'), '--instance', manifest.id],
+    { env: childEnv, stdio: ['ignore', 'inherit', 'inherit'] })
+  const timeout = setTimeout(() => child.kill('SIGKILL'), 90000)
+  const complete = code => { clearTimeout(timeout); if (code !== 0) console.error(`instance-broker-daemon: agent card unconfirmed (${code ?? 'signal'}); next check in an hour`) }
+  child.on('error', () => complete(null))
+  child.on('exit', complete)
+}
 recover()
+if (manifest.agentCard) { publishCard(); setInterval(publishCard, 60 * 60 * 1000) }
 if (manifest.buzz) supervise('instance-broker-auth.mjs', 'AUTH oracle')
 if (manifest.buzz?.statusReactions) supervise('instance-broker-status.mjs', 'status keeper')
 drain()
