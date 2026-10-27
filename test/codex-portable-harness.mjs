@@ -306,7 +306,8 @@ net.createServer(sock => {
     }
   })
 }).listen(path)
-process.on('SIGTERM', () => { try { fs.rmSync(path) } catch {} process.exit(0) })
+// codex-cli 0.163 drains on SIGTERM while a client stays attached: 'stubborn' stands in for that.
+process.on('SIGTERM', () => { if (fs.existsSync(home + '/stubborn')) return; try { fs.rmSync(path) } catch {} process.exit(0) })
 `)
 chmodSync(fakeCodex, 0o755)
 const fakeSsh = secretFile(join(fakeBin, 'ssh'), `#!/bin/sh
@@ -471,9 +472,29 @@ ok('a stored thread Codex never saved is replaced by a new one (#218)', await wa
 const s4Server = fakeLog(codexHome).filter(m => m.start).at(-1).pid
 s4.child.kill('SIGHUP'); await s4.exited
 ok('a hangup, as when its pane closes, stops the detached app-server too', await waitFor(() => !alive(s4Server), 5000))
+rmSync(join(codexHome, 'unsaved'))
+
+// A server that will not stop when asked must not outlive its restart: its lock refuses every later start (dj-codex, 2026-10-27).
+const s7 = startSupervisor(client, { HARNESS_RETRY_MS: '100', HARNESS_STOP_MS: '300' })
+await waitFor(() => /session ready/.test(s7.out) && /wake feed connected/.test(s7.out))
+const s7Server = fakeLog(codexHome).filter(m => m.start).at(-1).pid
+writeFileSync(join(codexHome, 'stubborn'), ''); writeFileSync(join(codexHome, 'mcp-dead'), '')
+process.kill(JSON.parse(readText(lockPath)).pid, 'SIGKILL')
+ok('a codex app-server that ignores SIGTERM is killed before the restart starts another', await waitFor(() => (s7.out.match(/session ready/g) || []).length === 2) &&
+  s7.out.includes(`codex app-server ${s7Server} did not stop when asked; killing it`) && !alive(s7Server))
+rmSync(join(codexHome, 'stubborn'))
+await s7.stop()
+writeFileSync(join(codexHome, 'stubborn'), '')
+const orphan = spawn(fakeCodex, ['app-server', '--listen', `unix://${socket}`], { env: { ...baseEnv, CODEX_HOME: codexHome }, detached: true, stdio: 'ignore' })
+orphan.unref()
+await waitFor(() => existsSync(socket))
+const s8 = startSupervisor(client, { HARNESS_STOP_MS: '300' })
+ok('a codex app-server an earlier run left on the control socket is stopped before the next one starts', await waitFor(() => /session ready/.test(s8.out)) &&
+  s8.out.includes(`stopping codex app-server ${orphan.pid}, left on the control socket by an earlier run`) && !alive(orphan.pid))
+rmSync(join(codexHome, 'stubborn'))
+await s8.stop()
 
 // Where the owner runs herdr, the thread is shown there, in a workspace of the identity's own.
-rmSync(join(codexHome, 'unsaved'))
 const herdr = fakeHerdr(root)
 const viewers = () => readText(join(codexHome, 'viewer.jsonl')).split('\n').filter(Boolean).map(JSON.parse)
 const s6 = startSupervisor(client, { HARNESS_TERMINAL: 'auto', HARNESS_HERDR_BIN: herdr.bin, HARNESS_VIEWER_CHECK_MS: '100', HARNESS_RETRY_MS: '100' })
