@@ -9,7 +9,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { codexTurnText } from '../mcp/tools/harness_session.mjs'
-import nvoyPiHarness, { PI_CHANNEL_TOOLS } from '../mcp/tools/pi_harness_extension.mjs'
+import nvoyPiHarness, { PI_CHANNEL_TOOLS, piTools } from '../mcp/tools/pi_harness_extension.mjs'
 import { fakeHerdr } from './fake-herdr.mjs'
 
 let fails = 0
@@ -116,6 +116,9 @@ ok('pi runs on the ChatGPT login, gpt-5.5 by default, resuming its one session f
 ok('discovered extensions are off and only this extension loads, by absolute path', args.includes('--no-extensions') && argAfter('-e') === resolve('mcp/tools/pi_harness_extension.mjs') &&
   args.filter(arg => arg === '-e').length === 1 && args.includes('--no-approve'))
 ok('the channel tools are pi\'s only tools', argAfter('--tools') === 'nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply,nvoy_channel_post')
+ok('work_tools adds pi\'s own read, shell and edit tools before the channel\'s, and must be a boolean',
+  piTools({ workTools: true }) === 'read,bash,edit,write,grep,find,ls,nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply,nvoy_channel_post' &&
+  piTools({}) === argAfter('--tools') && refused({ ...client, work_tools: 'yes' }, /work_tools must be true or false/))
 ok('pi gets a built environment: its own agent dir and home, the config, and no API key', sessions()[0].env.join() ===
   'HOME,LANG,NVOY_PI_HARNESS_CONFIG,NVOY_PI_HARNESS_INSTANCE,PATH,PI_CODING_AGENT_DIR,PI_SKIP_VERSION_CHECK,TERM' && sessions()[0].agentDir === piHome &&
   sessions()[0].home === join(stateDir, 'home') && sessions()[0].config === configPath && sessions()[0].instance === 'pd-test' && sessions()[0].skip === '1')

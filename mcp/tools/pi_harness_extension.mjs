@@ -41,7 +41,11 @@ export const PI_CHANNEL_TOOLS = [
 
 // The client config names paths, never values, and is refused on the portable Codex config's
 // grounds: nothing here signs, and nothing may bill an API key instead of the owner's subscription.
-const PI_FIELDS = new Set(['instance', 'ssh_target', 'identity_file', 'feed_identity_file', 'known_hosts_file', 'state_dir', 'pi_home', 'model', 'pubkey', 'channels'])
+const PI_FIELDS = new Set(['instance', 'ssh_target', 'identity_file', 'feed_identity_file', 'known_hosts_file', 'state_dir', 'pi_home', 'model', 'pubkey', 'channels', 'work_tools'])
+// `work_tools: true` gives pi its own read, shell and edit tools beside the channel's, for an agent
+// trusted to work on its own (James, 2026-10-27). Without it the channel tools are pi's only tools.
+export const PI_WORK_TOOLS = ['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls']
+export const piTools = config => [...(config.workTools ? PI_WORK_TOOLS : []), ...PI_CHANNEL_TOOLS.map(tool => tool.name)].join(',')
 export function readPiClientConfig(path, id, own = homedir()) {
   const file = fixedPath(path, 'client config', 64 * 1024)
   if ((file.stat.mode & 0o022) !== 0) throw new Error('client config must not be group/world writable')
@@ -64,6 +68,7 @@ export function readPiClientConfig(path, id, own = homedir()) {
   if (model && !/^[a-z0-9][a-z0-9.\-\[\]]{0,63}$/i.test(model)) throw new Error('client config model must be a model name or alias')
   const pubkey = String(raw.pubkey || '')
   if (pubkey && !/^[0-9a-f]{64}$/.test(pubkey)) throw new Error('client config pubkey must be 64 lowercase hex characters')
+  if (raw.work_tools !== undefined && typeof raw.work_tools !== 'boolean') throw new Error('client config work_tools must be true or false')
   const channels = raw.channels === undefined ? [] : raw.channels
   if (!Array.isArray(channels) || !channels.every(c => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(c))) throw new Error('client config channels must be Buzz channel ids')
   const stateDir = String(raw.state_dir || '')
@@ -74,7 +79,7 @@ export function readPiClientConfig(path, id, own = homedir()) {
   if (identity === feedIdentity) throw new Error('the channel and feed keys must be two keys: each forced command admits exactly one')
   const socket = resolve(stateDir, 'tmux.sock')
   if (Buffer.byteLength(socket) >= 104) throw new Error('state_dir is too deep for its tmux socket; choose a shorter path')
-  return Object.freeze({ id: instanceId(id), target, model, pubkey, channels, stateDir: resolve(stateDir), socket, identity, feedIdentity,
+  return Object.freeze({ id: instanceId(id), target, model, pubkey, channels, workTools: raw.work_tools === true, stateDir: resolve(stateDir), socket, identity, feedIdentity,
     piHome: piHomeDir(String(raw.pi_home || ''), own), knownHosts: knownHostsFile(String(raw.known_hosts_file || '')) })
 }
 

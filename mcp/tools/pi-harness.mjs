@@ -20,7 +20,7 @@ import { fileURLToPath } from 'node:url'
 import { defaultInstructions } from './harness_session.mjs'
 import { herdrAgentName, herdrClient, herdrSession } from './harness_herdr.mjs'
 import { claimPidLock } from './pid_lock.mjs'
-import { PI_CHANNEL_TOOLS, readPiClientConfig } from './pi_harness_extension.mjs'
+import { piTools, readPiClientConfig } from './pi_harness_extension.mjs'
 
 const die = message => { console.error(`pi-harness: ${message}`); process.exit(1) }
 const log = message => console.log(`pi-harness: ${message}`)
@@ -31,8 +31,8 @@ let config
 try { config = readPiClientConfig(configPath, id) } catch (error) { die(error.message) }
 
 const extension = resolve(dirname(fileURLToPath(import.meta.url)), 'pi_harness_extension.mjs')
-const piArgs = ({ model, stateDir }) => ['--provider', 'openai-codex', '--model', model || 'gpt-5.5',
-  '--no-extensions', '-e', extension, '--tools', PI_CHANNEL_TOOLS.map(tool => tool.name).join(','),
+const piArgs = ({ model, stateDir, workTools }) => ['--provider', 'openai-codex', '--model', model || 'gpt-5.5',
+  '--no-extensions', '-e', extension, '--tools', piTools({ workTools }),
   '--no-approve', '--session-dir', resolve(stateDir, 'sessions'), '--continue']
 
 const { stateDir, socket } = config
