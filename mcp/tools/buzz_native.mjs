@@ -20,6 +20,7 @@ import net from 'node:net'
 import { chmodSync, chownSync, unlinkSync } from 'node:fs'
 import { verifyEvent } from 'nostr-tools/pure'
 import { HOP_TAG } from './agent_limits.mjs'
+export { nativeGrant } from './admission.mjs'
 
 const HEX64 = /^[0-9a-f]{64}$/
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
@@ -168,18 +169,6 @@ export function dmChannels(notices, { me, verify = verifyEvent }) {
   usable.sort((a, b) => a.created_at - b.created_at || a.kind - b.kind)
   for (const ev of usable) latest.set(tagValues(ev, 'h')[0], ev.kind === MEMBERSHIP_KINDS[0])
   return [...latest].filter(([, member]) => member).map(([channel]) => channel).sort()
-}
-
-// Who may task this identity with a native message. In a channel: anyone holding a live task grant
-// from a manifest grantor, as before. In a DM: the owner alone — the manifest's grantors, the same
-// keys every grant descends from — and still on the owner's own live grant, so a revocation silences
-// a DM exactly as it silences a channel. A grant held by anyone else, another agent included, is no
-// way into a DM. James, 2026-10-21: "owner only I think - I don't want agents DM'ing each other".
-export function nativeGrant({ author, dm, grants, grantors }) {
-  if (dm && !grantors.includes(author)) return null
-  const held = (Array.isArray(grants) ? grants : []).filter(g => g?.pubkey === author && grantors.includes(g.grantor))
-  const grant = held.find(g => g.cap === 'task+act') || held.find(g => g.cap === 'task')
-  return grant && HEX64.test(String(grant.grant_id || '')) ? grant : null
 }
 
 // One authenticated connection. `signer` is { getPublicKey(), signEvent(template) }; the pubkey

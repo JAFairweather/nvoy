@@ -14,34 +14,12 @@
 
 import { lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { MALFORMED_HOP, hopLimited } from './admission.mjs'
 
-export const HOP_TAG = 'nvoy-hop'
+export { HOP_TAG, MALFORMED_HOP, hopOf, hopFromJson, nextHop, hopLimited, grantExpired } from './admission.mjs'
+
 export const HOUR_MS = 60 * 60 * 1000
 export const DEFAULT_LIMITS = Object.freeze({ maxHops: 3, perSenderPerHour: 12 })
-
-// null: no tag, so not broker-signed. A tag that is not one canonical non-negative integer is not
-// something a broker wrote, and it counts as past every limit rather than as absent. The sentinel is
-// finite on purpose: a carried admission crosses attention's JSON, where Infinity would become null.
-export const MALFORMED_HOP = Number.MAX_SAFE_INTEGER
-export function hopOf(ev) {
-  const values = (Array.isArray(ev?.tags) ? ev.tags : []).filter(t => t?.[0] === HOP_TAG).map(t => t[1])
-  if (!values.length) return null
-  if (values.length !== 1 || !/^(0|[1-9][0-9]{0,5})$/.test(String(values[0]))) return MALFORMED_HOP
-  return Number(values[0])
-}
-// A hop read back from JSON: absent is null, anything not a non-negative integer is malformed.
-export const hopFromJson = value => value == null ? null : Number.isSafeInteger(value) && value >= 0 ? value : MALFORMED_HOP
-export const nextHop = parentHop => (Number.isSafeInteger(parentHop) && parentHop >= 0 ? parentHop : 0) + 1
-export const hopLimited = (hop, maxHops) => hop != null && hop >= maxHops
-
-// NIP-40. A grant whose expiration has passed is treated exactly as a revoked one.
-export function grantExpired(ev, nowSec = Math.floor(Date.now() / 1000)) {
-  const tag = (Array.isArray(ev?.tags) ? ev.tags : []).find(t => t?.[0] === 'expiration')
-  if (!tag) return false
-  const at = Number(tag[1])
-  // A malformed expiration cannot be honoured, and a grant that might have expired is not a grant.
-  return !/^[0-9]{1,12}$/.test(String(tag[1])) || at <= nowSec
-}
 
 // Pure sliding window. `id` makes a retry idempotent: the same event or request is counted once
 // and, once counted, is never refused by its own earlier entry.
