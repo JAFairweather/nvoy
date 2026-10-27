@@ -43,6 +43,7 @@ import { secretKey } from './secret_key.mjs'
 import { partitionInvocations, verifiedChannelNotifications } from './invocation_policy.mjs'
 import { verifyInboxEnvelope } from './inbox_envelope.mjs'
 import { foldGrants } from './grant_fold.mjs'
+import { grantReadRelays } from './grant_relays.mjs'
 
 const arg = (n, d) => { const i = process.argv.indexOf(n); return i === -1 ? d : process.argv[i + 1] }
 const die = (m) => { console.error(`attention: ${m}`); process.exit(1) }
@@ -140,10 +141,11 @@ function query(url, filter, ms = 10000) {
 }
 
 // --- 1. Fetch policy: the grants, from the relays, verified here. -----------------------------
+// Grants are read from the shared grant set as well as this identity's relays (grant_relays.mjs).
 const grantEvents = new Map()
 let relaysAnswered = 0
 const relayAnswers = []
-for (const url of RELAYS) {
+for (const url of grantReadRelays(RELAYS, process.env.NVOY_GRANT_RELAYS)) {
   const { out, answered } = await query(url, { kinds: [KIND.grant, KIND.revocation], authors: GRANTORS, limit: 500 })
   if (answered) relaysAnswered++
   relayAnswers.push({ relay: url, answered, events: out.length })
