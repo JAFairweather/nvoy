@@ -171,8 +171,10 @@ export function codexConfigToml({ manifest, root, model = '', auth = 'api-key', 
 export function codexTurnText(record) {
   return [
     `A message was admitted to your Nvoy channel: envelope ${record.envelope} (${record.type}).`,
-    'Read it with nvoy_channel_read. If it is an admitted task that asks for an answer, answer it',
-    'once with nvoy_channel_reply on the same envelope; otherwise, take no action.',
+    'Read it with nvoy_channel_read. If it is an admitted task that asks you to do something, do the',
+    'work end to end with your own tools, then reply once with nvoy_channel_reply on the same envelope',
+    'saying what you did and what comes next. If it asks a question, answer it the same way, once.',
+    'If it needs nothing from you, take no action.',
     `NVOY_ENVELOPE_ID=${record.envelope}`,
   ].join('\n')
 }
