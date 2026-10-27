@@ -25,7 +25,7 @@
 // channel tools, and the broker rechecks the grant before it signs.
 
 import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { homedir } from 'node:os'
 import { isAbsolute, resolve } from 'node:path'
 import { fixedPath, knownHostsFile, privateFile, sshChannelEntry, SSH, SSH_TARGET } from './channel_client.mjs'
@@ -37,6 +37,8 @@ import { claimPidLock } from './pid_lock.mjs'
 
 const HEX64 = /^[0-9a-f]{64}$/
 const sleep = ms => new Promise(done => setTimeout(done, ms))
+const PS = existsSync('/bin/ps') ? '/bin/ps' : '/usr/bin/ps'
+const gone = pid => { try { process.kill(pid, 0); return false } catch (error) { return error.code === 'ESRCH' } }
 
 // The client config names paths, never values. Beyond the portable Claude config's refusals, a
 // field or value that could carry an OpenAI API key refuses the file: this harness bills the
@@ -118,6 +120,7 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
   const FEED_RETRY_MAX_MS = Number(process.env.HARNESS_FEED_RETRY_MAX_MS || 60000)
   const RETRY_MS = Number(process.env.HARNESS_RETRY_MS || 5000)
   const PROBE_MS = Number(process.env.HARNESS_CHANNEL_PROBE_MS || 30000)
+  const STOP_MS = Number(process.env.HARNESS_STOP_MS || 5000)
   const writePrivate = (path, value) => { writeFileSync(path, value, { mode: 0o600 }); chmodSync(path, 0o600) }
   for (const dir of [workdir, privateDir, ctlDir]) { mkdirSync(dir, { recursive: true, mode: 0o700 }); chmodSync(dir, 0o700) }
   const release = claimPidLock(resolve(privateDir, 'supervisor.lock'), config.id, 'portable Codex harness')
@@ -196,11 +199,28 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
   })()
 
   const env = { PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin', HOME: codexHome, CODEX_HOME: codexHome }
+  // codex-cli 0.163 drains on SIGTERM while a client stays attached, and holds its daemon lock,
+  // outside CODEX_HOME, until it exits: a server only asked to stop outlived the restart, and
+  // every later start failed "control socket is already in use" (dj-codex, 2026-10-27). So ask, then make it.
+  const stopPid = async (pid, exited) => {
+    if (exited()) return
+    try { process.kill(pid, 'SIGTERM') } catch { return }
+    for (const until = Date.now() + STOP_MS; Date.now() < until && !exited(); ) await sleep(50)
+    if (exited()) return
+    log(`codex app-server ${pid} did not stop when asked; killing it`)
+    try { process.kill(pid, 'SIGKILL') } catch {}
+    for (const until = Date.now() + STOP_MS; Date.now() < until && !exited(); ) await sleep(50)
+  }
+  // One an earlier supervisor left (one killed outright cannot stop its child) holds the same lock.
+  const leftovers = () => (spawnSync(PS, ['-axww', '-o', 'pid=,command='], { encoding: 'utf8' }).stdout || '').split('\n')
+    .map(line => /^\s*(\d+)\s+(.*)$/.exec(line)).filter(m => m && m[2].endsWith(` app-server --listen unix://${socket}`)).map(m => Number(m[1]))
+    .filter(pid => pid !== process.pid && ![...children].some(child => child.pid === pid))
   let delay = RETRY_MS
   while (!stopping()) {
     const startedAt = Date.now()
     let server = null, child = null
     try {
+      for (const pid of leftovers()) { log(`stopping codex app-server ${pid}, left on the control socket by an earlier run`); await stopPid(pid, () => gone(pid)) }
       if (existsSync(socket)) { const st = lstatSync(socket); if (!st.isSocket() && !st.isSymbolicLink()) throw new Error('the control socket path holds something that is not a socket'); rmSync(socket) }
       child = spawn('codex', ['app-server', '--listen', `unix://${socket}`], { stdio: ['ignore', 'ignore', 'pipe'], env })
       children.add(child)
@@ -290,7 +310,7 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
       log(`codex harness: ${error.message}`)
     } finally {
       server?.stop()
-      if (child) { try { child.kill('SIGTERM') } catch {} children.delete(child) }
+      if (child) { await stopPid(child.pid, () => child.exitCode !== null || child.signalCode !== null); children.delete(child) }
     }
     if (stopping()) break
     if (Date.now() - startedAt > RETRY_MAX_MS) delay = RETRY_MS
