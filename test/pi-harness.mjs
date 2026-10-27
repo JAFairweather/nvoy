@@ -111,8 +111,8 @@ ok('the launcher starts pi in tmux on the harness\'s own socket and prints how t
   launched.includes(`attach: tmux -S ${socket} attach -t harness`) && sessions().length === 1 && sessions()[0].socket === socket)
 const args = sessions()[0]?.args || []
 const argAfter = name => args[args.indexOf(name) + 1]
-ok('pi runs on the ChatGPT login, gpt-5.5 by default, resuming its one session from the state dir', args.includes('pi') && argAfter('--provider') === 'openai-codex' &&
-  argAfter('--model') === 'gpt-5.5' && argAfter('--session-dir') === join(stateDir, 'sessions') && args.at(-1) === '--continue' && argAfter('-c') === join(stateDir, 'workspace'))
+ok('pi runs on the ChatGPT login, gpt-5.6-luna by default, resuming its one session from the state dir', args.includes('pi') && argAfter('--provider') === 'openai-codex' &&
+  argAfter('--model') === 'gpt-5.6-luna' && argAfter('--session-dir') === join(stateDir, 'sessions') && args.at(-1) === '--continue' && argAfter('-c') === join(stateDir, 'workspace'))
 ok('discovered extensions are off and only this extension loads, by absolute path', args.includes('--no-extensions') && argAfter('-e') === resolve('mcp/tools/pi_harness_extension.mjs') &&
   args.filter(arg => arg === '-e').length === 1 && args.includes('--no-approve'))
 ok('the channel tools are pi\'s only tools', argAfter('--tools') === 'nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply,nvoy_channel_post')

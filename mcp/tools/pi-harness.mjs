@@ -31,7 +31,7 @@ let config
 try { config = readPiClientConfig(configPath, id) } catch (error) { die(error.message) }
 
 const extension = resolve(dirname(fileURLToPath(import.meta.url)), 'pi_harness_extension.mjs')
-const piArgs = ({ model, stateDir, workTools }) => ['--provider', 'openai-codex', '--model', model || 'gpt-5.5',
+const piArgs = ({ model, stateDir, workTools }) => ['--provider', 'openai-codex', '--model', model || 'gpt-5.6-luna',
   '--no-extensions', '-e', extension, '--tools', piTools({ workTools }),
   '--no-approve', '--session-dir', resolve(stateDir, 'sessions'), '--continue']
 
