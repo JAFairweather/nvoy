@@ -1,16 +1,17 @@
 // instance-broker-card.mjs — publish this agent's card (agent_card.mjs) when it is due.
 //
-// The broker daemon runs it at start and then hourly. It signs through the broker's own signer,
-// refuses a signature that is not the manifest's key, publishes to the card relays, and reads the card
-// back from each. Only a card read back somewhere counts, and the record names every relay that
-// accepted it and every relay that read it back, so a reader can see the coverage, not just "ok".
+// The broker daemon runs it at start and then hourly. When the card is due it signs through the
+// broker's own signer, refuses a signature that is not the manifest's key, and records the signed
+// event before publishing. Each run then sends that same event to every card relay that has not yet
+// read it back, so a relay that was down catches up within the hour and nothing is re-signed to retry.
+// The record names each relay, whether it accepted the card, and whether it read it back.
 
 import { readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { verifyEvent } from 'nostr-tools/pure'
 import WebSocket from 'ws'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
-import { agentCard, cardDigest, cardDue, cardRelays, cardTemplate, CARD_D, CARD_KIND } from './agent_card.mjs'
+import { agentCard, cardDigest, cardDue, cardRelays, cardTemplate, relaysOwed, CARD_D, CARD_KIND } from './agent_card.mjs'
 import { brokerSigner } from './broker_signer.mjs'
 import { credentialIn } from './outbound_secrets.mjs'
 
@@ -55,11 +56,16 @@ function publishAndReadBack(url, event) {
   })
 }
 
+function record(value) {
+  const temporary = `${statePath}.${process.pid}.tmp`
+  writeFileSync(temporary, JSON.stringify(value), { mode: 0o600 })
+  renameSync(temporary, statePath)
+}
+
 const card = agentCard(manifest)
 const leak = credentialIn(JSON.stringify(card))
 if (leak) throw new Error(`card withheld: it looks like it holds a credential (${leak})`)
-if (!cardDue(card, last)) console.log(JSON.stringify({ card: 'current', event_id: last.event_id }))
-else {
+if (cardDue(card, last)) {
   let signer
   try {
     ;({ signer } = brokerSigner(message => { throw new Error(message) }, { idleMs: 30000 }))
@@ -67,18 +73,22 @@ else {
     const event = await signer.signEvent({ pubkey: manifest.pubkey, ...template })
     if (event?.pubkey !== manifest.pubkey || event.kind !== CARD_KIND || event.content !== template.content ||
         JSON.stringify(event.tags) !== JSON.stringify(template.tags) || !verifyEvent(event)) throw new Error('signer returned a different card')
-    const relays = await Promise.all(cardRelays(manifest).map(url => publishAndReadBack(url, event)))
-    const read = relays.filter(r => r.read_back).map(r => r.relay)
-    console.log(JSON.stringify({ card: read.length ? 'published' : 'unconfirmed', event_id: event.id, read_back: read,
-      missing: relays.filter(r => !r.read_back).map(r => `${r.relay}: ${r.message}`) }))
-    // An unconfirmed card is not recorded, so the next run signs and tries again.
-    if (!read.length) process.exitCode = 1
-    else {
-      const temporary = `${statePath}.${process.pid}.tmp`
-      writeFileSync(temporary, JSON.stringify({ version: 1, at: Date.now(), digest: cardDigest(card), event_id: event.id, relays }), { mode: 0o600 })
-      renameSync(temporary, statePath)
-    }
+    last = { version: 1, at: Date.now(), digest: cardDigest(card), event, relays: [] }
+    record(last)
   } finally {
     try { signer?.close?.() } catch {}
   }
+}
+const relays = cardRelays(), owed = relaysOwed(relays, last)
+if (!owed.length) console.log(JSON.stringify({ card: 'current', event_id: last.event.id }))
+else {
+  const results = await Promise.all(owed.map(url => publishAndReadBack(url, last.event)))
+  last.relays = [...last.relays.filter(r => !owed.includes(r.relay)), ...results]
+  record(last)
+  const read = last.relays.filter(r => r.read_back).map(r => r.relay)
+  const missing = relays.filter(url => !read.includes(url))
+  console.log(JSON.stringify({ card: missing.length ? 'incomplete' : 'published', event_id: last.event.id, read_back: read,
+    missing: results.filter(r => !r.read_back).map(r => `${r.relay}: ${r.message}`) }))
+  // Short of full coverage the run fails, so the daemon log says so; the next run retries the same event.
+  if (missing.length) process.exitCode = 1
 }

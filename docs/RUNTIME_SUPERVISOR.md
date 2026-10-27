@@ -348,18 +348,20 @@ Neither tool exposes the signing credential.
 so the waggle hive manager can show it without reading the fleet (waggle#613 C1). It is off by
 default: the agent's Bunker pairing must first be allowed to sign kind 30078.
 
-The card is one kind-30078 event with `d` = `nvoy-agent-card`. Its content is an allowlist
-(`agent_card.mjs`): grantors, task carriers, relays, Buzz channel ids, `may_post`, `may_set_profile`,
-`agent_limits`, the delivery mode, the harness runner and model, the holdings by name only, the
-release, and the same capability sentence the agent is told. No credential path, uid, directory,
-host or Buzz relay address is on it. It goes to the grant relays (`grant_relays.mjs`), where the
-page already reads grants; the Buzz relay returns nothing to a filter without channel ids.
+The card is one kind-30078 event with `d` = `nvoy-agent-card`, and it is public, so it is coarse
+(`agent_card.mjs`): grantors, relays, post and profile limits as counts, `agent_limits`, the delivery
+mode, the harness runner, the release, and a capability sentence with no identifier in it. Channel
+ids, mentionable keys, holdings, the model and the profile grant id are listed under `withheld`; the
+harness profile and last activity are listed under `not_reported`, so a reader never infers them
+from the card's freshness. It goes to `relay.nave.pub` only (`NVOY_CARD_RELAYS` overrides it for
+tests).
 
-The daemon checks it at start and hourly. `instance-broker-card.mjs` re-signs only when the card
-changed or the last one is a day old, publishes to every card relay, and reads it back from each.
-`state/agent-card.json` records which relays accepted it and which read it back; a card no relay
-read back is not recorded, so the next check tries again. A Bunker that refuses kind 30078 shows in
-the daemon log as `agent card unconfirmed`, and nothing else the broker does is affected.
+The daemon checks it at start and hourly. `instance-broker-card.mjs` signs a new card only when it
+changed or the last is a day old, and records the signed event in `state/agent-card.json` before
+publishing. Every run sends that same event to each card relay that has not read it back, and the
+record names each relay, whether it accepted the card and whether it read it back. Short of full
+coverage the run exits 1 and the daemon logs `agent card unconfirmed`; a Bunker that refuses kind
+30078 shows the same way, and nothing else the broker does is affected.
 
 ## The status page (waggle.nave.pub/status)
 
