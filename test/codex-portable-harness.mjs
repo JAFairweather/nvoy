@@ -207,7 +207,7 @@ const home = process.env.CODEX_HOME
 const log = row => fs.appendFileSync(home + '/fake.jsonl', JSON.stringify(row) + '\\n')
 if (process.argv[2] !== 'app-server' || process.argv[3] !== '--listen' || !String(process.argv[4]).startsWith('unix://')) process.exit(2)
 const path = process.argv[4].slice(7)
-log({ start: true, env: Object.keys(process.env).sort(), listen: path })
+log({ start: true, pid: process.pid, env: Object.keys(process.env).sort(), listen: path })
 fs.rmSync(home + '/mcp-dead', { force: true })
 const THREAD = fs.existsSync(home + '/unsaved') ? '0199a213-81c0-7800-8aa1-cccccccccccc' : '0199a213-81c0-7800-8aa1-bbab2a035a53'
 const conns = new Set()
@@ -263,7 +263,8 @@ net.createServer(sock => {
     }
   })
 }).listen(path)
-process.on('SIGTERM', () => { try { fs.rmSync(path) } catch {} process.exit(0) })
+// codex-cli 0.163 drains on SIGTERM while a client stays attached: 'stubborn' stands in for that.
+process.on('SIGTERM', () => { if (fs.existsSync(home + '/stubborn')) return; try { fs.rmSync(path) } catch {} process.exit(0) })
 `)
 chmodSync(join(fakeBin, 'codex'), 0o755)
 const fakeSsh = secretFile(join(fakeBin, 'ssh'), `#!/bin/sh
@@ -309,6 +310,7 @@ ok('a CODEX_HOME too deep for its control socket is refused', refused({ ...clien
 
 writeFileSync(queue, record(1))
 const fakeLog = home => readText(join(home, 'fake.jsonl')).split('\n').filter(Boolean).map(JSON.parse)
+const alive = pid => { try { process.kill(pid, 0); return true } catch { return false } }
 function startSupervisor(config = client, env = {}) {
   const child = spawn(process.execPath, ['mcp/tools/codex-harness-portable.mjs', '--instance', 'cx-test', '--config', clientConfig(config)], { cwd: resolve('.'), env: { ...supervisorEnv, ...env } })
   const run = { child, out: '' }
@@ -419,6 +421,29 @@ const s4 = startSupervisor()
 ok('a stored thread Codex never saved is replaced by a new one (#218)', await waitFor(() => /never saved the stored cx-test thread; starting a new one/.test(s4.out) && /session ready/.test(s4.out)) &&
   JSON.parse(readText(join(codexHome, 'nvoy', 'codex-thread.json'))).thread_id === '0199a213-81c0-7800-8aa1-cccccccccccc')
 await s4.stop()
+rmSync(join(codexHome, 'unsaved'))
+
+// A server that will not stop when asked must not outlive its restart: its lock refuses every later start (dj-codex, 2026-10-27).
+const s7 = startSupervisor(client, { HARNESS_RETRY_MS: '100', HARNESS_STOP_MS: '300' })
+await waitFor(() => /session ready/.test(s7.out) && /wake feed connected/.test(s7.out))
+const s7Server = fakeLog(codexHome).filter(m => m.start).at(-1).pid
+writeFileSync(join(codexHome, 'stubborn'), ''); writeFileSync(join(codexHome, 'mcp-dead'), '')
+process.kill(JSON.parse(readText(lockPath)).pid, 'SIGKILL')
+ok('a codex app-server that ignores SIGTERM is killed before the restart starts another', await waitFor(() => (s7.out.match(/session ready/g) || []).length === 2) &&
+  s7.out.includes(`codex app-server ${s7Server} did not stop when asked; killing it`) && !alive(s7Server))
+rmSync(join(codexHome, 'stubborn')); rmSync(join(codexHome, 'mcp-dead'), { force: true })
+try { process.kill(s7Server, 'SIGKILL') } catch {}   // a failure leaves no stubborn server behind
+await s7.stop()
+writeFileSync(join(codexHome, 'stubborn'), '')
+const orphan = spawn(join(fakeBin, 'codex'), ['app-server', '--listen', `unix://${socket}`], { env: { ...baseEnv, CODEX_HOME: codexHome }, detached: true, stdio: 'ignore' })
+orphan.unref()
+await waitFor(() => existsSync(socket))
+const s8 = startSupervisor(client, { HARNESS_STOP_MS: '300' })
+ok('a codex app-server an earlier run left on the control socket is stopped before the next one starts', await waitFor(() => /session ready/.test(s8.out)) &&
+  s8.out.includes(`stopping codex app-server ${orphan.pid}, left on the control socket by an earlier run`) && !alive(orphan.pid))
+rmSync(join(codexHome, 'stubborn'))
+try { process.kill(orphan.pid, 'SIGKILL') } catch {}
+await s8.stop()
 
 rmSync(root, { recursive: true, force: true })
 console.log(fails ? `\n${fails} FAILED` : '\nall passed')
