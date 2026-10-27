@@ -10,7 +10,7 @@ import { join } from 'node:path'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
 import { agentChecks, funnel, grantCheck, grantGrid, gridColumn, parseLog, platformChecks, relayChecks, sanitiserFindings, swarmView, webCheck, worst } from '../mcp/tools/status_snapshot.mjs'
 import { ageVerdict, renderSnapshot } from '../mcp/tools/status-page/status-view.mjs'
-import { canvasSize, changes, edgeKey, grantHref, layout, peerSummary, renderSwarm, revokeHref } from '../mcp/tools/status-page/beeswarm-view.mjs'
+import { canvasSize, changes, edgeKey, layout, peerSummary, renderSwarm, rowHref, VIEWS as VIEWS_ALL } from '../mcp/tools/status-page/beeswarm-view.mjs'
 
 let fails = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); if (!value) fails++ }
@@ -160,24 +160,23 @@ const vQuiet = renderSwarm(swSnap(vSwarm), {}, now)
 ok('an unselected voice is drawn once, as speaking for its grantor', (vQuiet.match(/class="edge instructs voice speaks/g) || []).length === 1 && !/<path class="edge instructs voice(?! speaks)/.test(vQuiet))
 ok('the matrix names each cap and marks a voice', /<span class="badge instructs voice[^>]*>task \+ act ◇<\/span>/.test(renderSwarm(swSnap(vSwarm), { view: 'matrix' }, now)))
 ok('the agents view is one card per agent', (renderSwarm(swSnap(swarm), { view: 'agents' }, now).match(/<article class="card/g) || []).length === 2)
-ok('the selected panel links to where grants are signed', /class="manage"><a href="https:\/\/waggle\.nave\.pub\/console\/"/.test(renderSwarm(swSnap(swarm), { selected: pub.alpha.slice(0, 8) }, now)))
+ok("the selected panel links to that key's row on the hive page", renderSwarm(swSnap(swarm), { selected: pub.alpha.slice(0, 8) }, now).includes(`class="manage"><a href="https://waggle.nave.pub/console/hive.html#agent=${pub.alpha.slice(0, 8)}"`))
 const keys = swarm.edges.map(edgeKey)
 ok('a first visit is the baseline and shows no changes', changes(swarm, null).fresh && !/Since you last looked/.test(renderSwarm(swSnap(swarm), {}, now)))
 ok('nothing new since last look shows nothing', !/Since you last looked/.test(renderSwarm(swSnap(swarm), { seen: keys }, now)))
 const moved = renderSwarm(swSnap(swarm), { seen: [...keys.slice(1), 'instructs:f00dcafe>beta0000:task:'], show: { instructs: true, wakes: true, peers: true } }, now)
 ok('a change since last look is listed and highlighted, and a vanished grant is named', /Since you last looked/.test(moved) && /<li class="plus">/.test(moved) && /<li class="minus">− f00dcafe may instruct/.test(moved) && /class="edge [^"]* new"/.test(moved))
-ok('a console link carries only hex prefixes, and refuses anything else', revokeHref('e970d972') === 'https://waggle.nave.pub/console/#revoke=e970d972'
-  && grantHref('aaaa1111', 'bbbb2222', 'task+act') === 'https://waggle.nave.pub/console/#grant=aaaa1111&on=bbbb2222&cap=task%2Bact'
-  && revokeHref('"><script>') === null && revokeHref(undefined) === null && grantHref('npub1x', 'bbbb2222') === null)
+ok('a row link carries only a hex prefix, and refuses anything else', rowHref('e970d972') === 'https://waggle.nave.pub/console/hive.html#agent=e970d972'
+  && rowHref('"><script>') === null && rowHref(undefined) === null && rowHref('npub1x') === null)
 const linked = { nodes: [{ id: 'aaaa0000', name: 'james', kind: 'grantor' }, { id: 'cccc0000', name: 'coord', kind: 'named' }, { id: 'a1a10000', name: 'a1', kind: 'agent', limits: {} }, { id: 'b2b20000', name: 'b2', kind: 'agent', limits: {} }],
   edges: [{ type: 'instructs', from: 'aaaa0000', to: 'a1a10000', cap: 'task' }, { type: 'instructs', from: 'cccc0000', to: 'a1a10000', cap: 'task', grant: 'deadbeef' }] }
-const linkedGrid = renderSwarm(swSnap(linked), { view: 'matrix' }, now)
-ok('the matrix offers revoke on a held grant and grant where a named key holds none, never for the grantor', linkedGrid.includes('#revoke=deadbeef')
-  && linkedGrid.includes('#grant=cccc0000&amp;on=b2b20000&amp;cap=task') && !linkedGrid.includes('#grant=aaaa0000') && /target="_blank" rel="noopener"/.test(linkedGrid))
-ok('a selected agent\'s panel links each grant it holds to its revoke', renderSwarm(swSnap(linked), { selected: 'a1a10000' }, now).includes('#revoke=deadbeef'))
+// Grants are changed on the hive page now (waggle#613 M4): no view of this page offers one.
+const everyView = [...VIEWS_ALL.map(view => renderSwarm(swSnap(linked), { view }, now)), renderSwarm(swSnap(linked), { selected: 'a1a10000' }, now),
+  renderSwarm(swSnap(vSwarm), { selected: voicePk.slice(0, 8) }, now), renderSwarm(swSnap(vSwarm), { view: 'matrix' }, now)].join('')
+ok('no view offers a grant or revoke link any more', !/#grant=|#revoke=|class="act"/.test(everyView))
+ok('NEGATIVE CONTROL — the scan does find a link when one is drawn', /#grant=/.test('<a href="x/#grant=aaaa0000">'))
 const voicePanel = renderSwarm(swSnap(vSwarm), { selected: voicePk.slice(0, 8) }, now)
-ok('a voice is revoked once, by its shadow grant, and the link says what that takes away', voicePanel.includes(`#revoke=${shadowed.id.slice(0, 8)}`) && /loses every right it holds as director/.test(voicePanel)
-  && (voicePanel.match(/#revoke=/g) || []).length === 1)
+ok('a voice panel still names the one shadow grant that takes its reach away', voicePanel.includes(shadowed.id.slice(0, 8)) && /takes it all away/.test(voicePanel))
 const evilSwarm = renderSwarm({ generated_at: new Date(now).toISOString(), swarm: { nodes: [{ id: 'aaaa0000', name: '<script>x</script>', kind: 'agent" onclick="x', colour: 'red" onload="x', grantors: [], limits: {} }], edges: [{ type: 'instructs', from: 'aaaa0000', to: 'aaaa0000', cap: '<img src=x>' }] } }, { selected: 'aaaa0000' }, now)
 ok('the swarm page escapes every value and keeps kinds and colours to closed sets', !/<script>|<img|onclick|onload/.test(evilSwarm) && /&lt;script&gt;/.test(evilSwarm))
 ok('a stale snapshot says so on the swarm page too', /class="age red"/.test(renderSwarm({ generated_at: new Date(now - 10 * MIN).toISOString(), swarm: swarm }, {}, now)))
