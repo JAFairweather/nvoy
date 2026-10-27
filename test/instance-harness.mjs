@@ -104,6 +104,7 @@ ok('the default instructions name the read and reply tools and treat message bod
 const fresh = claudeArgs({ server: 'nvoy-mc-test', mcpConfigPath: '/home/harness/.nvoy-harness/mcp.json', resume: false })
 ok('the session loads exactly its own channel server and no ambient MCP configuration', JSON.stringify(fresh) === JSON.stringify(['--dangerously-load-development-channels', 'server:nvoy-mc-test', '--mcp-config', '/home/harness/.nvoy-harness/mcp.json', '--strict-mcp-config']))
 ok('a chosen model is passed as --model, and none is passed by default', JSON.stringify(claudeArgs({ server: 's', mcpConfigPath: '/m', resume: false, model: 'opus' }).slice(-2)) === '["--model","opus"]' && !fresh.includes('--model'))
+ok('the settings\' mode is passed as --permission-mode, so a resume cannot restore an older one', JSON.stringify(claudeArgs({ server: 's', mcpConfigPath: '/m', resume: true, permissionMode: 'auto' }).slice(-3)) === '["--permission-mode","auto","--continue"]' && !fresh.includes('--permission-mode'))
 ok('a restart resumes the same conversation', claudeArgs({ server: 's', mcpConfigPath: '/m', resume: true }).at(-1) === '--continue')
 ok('the command line never carries a permission bypass', !/skip-permissions|bypass/.test(JSON.stringify(fresh)))
 const home = join(root, 'home'), workdir = join(home, 'workspace')

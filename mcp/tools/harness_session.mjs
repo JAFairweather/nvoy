@@ -68,11 +68,14 @@ export function defaultInstructions(manifest) {
   ].join('\n')
 }
 
-export function claudeArgs({ server, mcpConfigPath, resume, model = '' }) {
+// `--continue` restores the mode the conversation last ran in, whatever settings.json now says, so the
+// settings' mode is given on the command line as well (mc-claude kept dontAsk after auto, 2026-10-27).
+export function claudeArgs({ server, mcpConfigPath, resume, model = '', permissionMode = '' }) {
   return [
     '--dangerously-load-development-channels', `server:${server}`,
     '--mcp-config', mcpConfigPath, '--strict-mcp-config',
     ...(model ? ['--model', model] : []),
+    ...(permissionMode ? ['--permission-mode', permissionMode] : []),
     ...(resume ? ['--continue'] : []),
   ]
 }

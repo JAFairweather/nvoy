@@ -81,7 +81,8 @@ mkdirSync(privateDir, { recursive: true, mode: 0o700 })
 mkdirSync(resolve(home, '.claude'), { recursive: true, mode: 0o700 })
 writePrivate(resolve(home, '.claude.json'), JSON.stringify(seedClaudeJson(readJson(resolve(home, '.claude.json')), workdir), null, 2))
 const settingsPath = resolve(home, '.claude', 'settings.json')
-writePrivate(settingsPath, JSON.stringify(seedSettings(readJson(settingsPath), server), null, 2))
+const settings = seedSettings(readJson(settingsPath), server)
+writePrivate(settingsPath, JSON.stringify(settings, null, 2))
 const sessionMcp = mcpConfig({ manifest, root, remote })
 writePrivate(mcpConfigPath, JSON.stringify(sessionMcp, null, 2))
 if (!existsSync(resolve(workdir, 'CLAUDE.md'))) writePrivate(resolve(workdir, 'CLAUDE.md'), defaultInstructions(manifest))
@@ -99,7 +100,7 @@ const sessionEnv = {
   ...(remote ? {} : { NVOY_INSTANCE_ROOT: root }), CLAUDE_CODE_OAUTH_TOKEN: token, DISABLE_AUTOUPDATER: '1',
 }
 const sleep = ms => new Promise(done => setTimeout(done, ms))
-const args = resume => ['claude', ...claudeArgs({ server, mcpConfigPath, resume, model: manifest.harness.model })]
+const args = resume => ['claude', ...claudeArgs({ server, mcpConfigPath, resume, model: manifest.harness.model, permissionMode: settings.permissions.defaultMode })]
 
 // The terminal the session runs in: start it, read its screen, send it keys, tell whether it has
 // exited, name the process at its root, and stop it.
