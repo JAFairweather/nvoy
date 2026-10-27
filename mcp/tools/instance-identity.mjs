@@ -6,6 +6,8 @@
 //                                  [--grantor <npub|hex>]… [--relay wss://…]… [--credential-dir <dir>]
 //                                  [--out <dir>] [--instance-root <dir>]
 //   instance-identity.mjs check --id <name> [--out <dir>] [--instance-root <dir>]
+//   instance-identity.mjs apply --id <name> --public-key-file <path> --authorized-keys <path> \
+//                               [--state-dir <dir>] [--wait-s <n>] [--out <dir>] [--instance-root <dir>]
 //
 // `--like <id>` copies the policy blocks of a live agent the new one should work like (where it
 // listens and posts, its limits, its card, its task carriers) and, unless given, its grantors and
@@ -15,6 +17,10 @@
 // `check` is the gate before the install: the staged manifest validates, collides with nothing in
 // the estate, and its two Bunker credential files are seated root:root 0600. It reads file metadata
 // only. It does not prove the pairing, which needs the signer and stays an operator step.
+//
+// `apply` runs `check` again and refuses unless it passes, then installs the staged manifest, waits
+// for the runner to record it, seats the channel principal and baselines the channel. The sequence
+// and why each step waits for the last are in `instance_apply.mjs`. Prove the pairing first.
 //
 // All policy lives in `identity_allocation.mjs`, which is pure and carries its own suite. This file
 // reads manifests and prints; it decides nothing.
@@ -45,10 +51,13 @@
 // Exit: 0 clean · 1 a real fault (collision, refusal) · 3 INCONCLUSIVE — a manifest it could not read.
 
 import { readdirSync, readFileSync, writeFileSync, mkdirSync, existsSync, lstatSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
 import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { readManifest } from './runtime_manifest.mjs'
 import { auditIdentityBlocks, allocateIdentityBlock, buildParticipantManifest, seatingPlan,
   policyFromTemplate, auditUniqueFields, credentialVerdict, NUMERIC_FIELDS, TEMPLATE_FIELDS } from './identity_allocation.mjs'
+import { applyStaged, readPublicKey } from './instance_apply.mjs'
 
 const argv = process.argv.slice(2)
 const verb = argv[0]
@@ -57,8 +66,9 @@ const all = n => argv.reduce((acc, a, i) => (a === n && argv[i + 1] ? [...acc, a
 const die = m => { console.error(`instance-identity: ${m}`); process.exit(1) }
 const root = resolve(flag('--instance-root') || process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances')
 
-if (!['audit', 'allocate', 'check'].includes(verb)) {
-  die('usage: audit | allocate --id <name> --pubkey <npub|hex> [--like <id>] [--grantor <npub|hex>] [--relay wss://…] | check --id <name>')
+if (!['audit', 'allocate', 'check', 'apply'].includes(verb)) {
+  die('usage: audit | allocate --id <name> --pubkey <npub|hex> [--like <id>] [--grantor <npub|hex>] [--relay wss://…] | check --id <name>'
+    + ' | apply --id <name> --public-key-file <path> --authorized-keys <path>')
 }
 const outDir = resolve(flag('--out') || join(process.env.HOME || '/tmp', '.nvoy', 'staged'))
 
@@ -109,8 +119,8 @@ if (unreadable.length) {
 
 const id = flag('--id')
 
-// ---- check ---------------------------------------------------------------------------------------
-if (verb === 'check') {
+// ---- check (and the gate apply runs first) -------------------------------------------------------
+if (verb === 'check' || verb === 'apply') {
   if (unreadable.length) {
     console.error('\ninstance-identity: INCONCLUSIVE — cannot check against an estate it cannot fully read')
     process.exit(3)
@@ -133,7 +143,38 @@ if (verb === 'check') {
   console.log(`\ncheck ${id} (staged at ${outDir}):`)
   for (const [ok, text] of results) console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${text}`)
   console.log('\n  NOT CHECKED  that the Bunker client signs as this manifest\'s key. Prove it read-only before installing.')
-  process.exit(results.every(([ok]) => ok) ? 0 : 1)
+  const passed = results.every(([ok]) => ok)
+  if (verb === 'check') process.exit(passed ? 0 : 1)
+  if (!passed) die('apply refused: the check above did not pass, and nothing was installed')
+
+  const keyFile = flag('--public-key-file'), keysPath = flag('--authorized-keys')
+  if (!keyFile || !keysPath) die('apply needs --public-key-file <path> and --authorized-keys <path>')
+  let publicKey
+  try {
+    const st = lstatSync(keyFile)
+    if (!st.isFile() || st.isSymbolicLink() || st.size > 16 * 1024) throw new Error('must be a regular file under 16 KiB')
+    if (st.mode & 0o022) throw new Error('must not be group or world writable')
+    publicKey = readPublicKey(readFileSync(keyFile, 'utf8'))
+  } catch (e) { die(`public key file ${keyFile}: ${e.message}`) }
+  const unit = join(dirname(fileURLToPath(import.meta.url)), 'instance-unit.mjs')
+  // verify reads the manifest from the root, as an operator's run would; baseline runs inside the
+  // adapter, where node and the tool exist (claude-channel-doctor.mjs states why).
+  const run = ([what, ...args]) => {
+    const r = what === 'verify'
+      ? spawnSync(process.execPath, [unit, 'verify', ...args], { encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: root } })
+      : spawnSync('/usr/bin/docker', ['exec', '--user', `${m.workerUid}:${m.workerHandoffGid}`, m.adapterContainer,
+        '/usr/local/bin/node', '/srv/nvoy/mcp/tools/claude-channel.mjs', '--instance', m.id, '--baseline'], { encoding: 'utf8' })
+    return { status: r.status, stdout: r.stdout || '', stderr: r.stderr || (r.error ? r.error.message : '') }
+  }
+  const waitS = Number(flag('--wait-s') || 600)
+  if (!Number.isInteger(waitS) || waitS < 30 || waitS > 3600) die('--wait-s is 30..3600')
+  console.log(`\napply ${id}:`)
+  const result = await applyStaged({ manifest: m, stagedPath: join(outDir, `${id}.json`), root, keysPath, publicKey, run,
+    stateDir: resolve(flag('--state-dir') || '/var/lib/nvoy-deploy'), waitMs: waitS * 1000,
+    log: (state, ok, detail) => console.log(`  ${ok === null ? 'INCONCLUSIVE' : ok ? 'PASS' : 'FAIL'}  ${state}: ${detail}`) })
+  console.log(result.ok ? `\n${id} is installed, deployed, seated and baselined. The pairing and a live wake are still yours to prove.`
+    : `\n${id} stopped at "${result.states.at(-1).state}". Every state above is reported as it was observed.`)
+  process.exit(result.ok ? 0 : result.inconclusive ? 3 : 1)
 }
 
 const like = flag('--like')
