@@ -84,6 +84,9 @@ ok('each prompt command becomes a rule that asks, and none that allows', codexRu
 ok('approvals refuse an unknown policy or field, a rule under never, and an unknown app mode',
   [{ policy: 'untrusted' }, { policy: 'on-request', allow: [['git']] }, { prompt_commands: [['git']] }, { policy: 'on-request', apps: { x: 'always' } },
     { policy: 'on-request', prompt_commands: [['git;rm']] }, { policy: 'on-request', prompt_commands: [[]] }].every(raw => typeof approve(raw) === 'string'))
+ok('a reviewer is user unless auto_review is chosen, and goes into config.toml', /^approvals_reviewer = "user"$/m.test(askedToml) && /^approvals_reviewer = "user"$/m.test(toml) &&
+  /^approvals_reviewer = "auto_review"$/m.test(codexConfigToml({ manifest: { id: 'cx-test' }, root: '', auth: 'chatgpt', remote, approvals: approve({ policy: 'on-request', reviewer: 'auto_review' }) })) &&
+  typeof approve({ policy: 'on-request', reviewer: 'guardian' }) === 'string')
 ok('approvals stay out of grants', typeof grant({ approvals: { policy: 'on-request' } }) === 'string')
 ok('a model is set only when chosen', !/^model = /m.test(toml) && /^model = "gpt-5\.5"$/m.test(codexConfigToml({ manifest: { id: 'cx-test' }, root: '', model: 'gpt-5.5', auth: 'chatgpt', remote })))
 ok('a ChatGPT config without the SSH channel, or an unknown auth mode, is refused', (() => { try { codexConfigToml({ manifest: { id: 'x' }, root: '', auth: 'chatgpt' }); return false } catch { return true } })() &&
@@ -426,8 +429,8 @@ ok('a restart resumes the same thread and injects only what arrived while it was
   clientCalls('thread/resume').some(m => m.params.threadId === THREAD) && clientCalls('thread/start').length === 1 &&
   clientCalls('turn/start').length === 2 && clientCalls('turn/start')[1].params.clientUserMessageId === `nvoy:${envelope(4)}` && clientCalls('thread/queue/add').length === 1)
 ok('the resumed thread is put under the channel profile, and so is every turn: a resume otherwise keeps the profile the thread started under (dj-codex, 2026-10-21)',
-  clientCalls('thread/resume').every(m => m.params.permissions === 'nvoy-channel' && m.params.excludeTurns === true && m.params.approvalPolicy === 'never') &&
-  clientCalls('turn/start').every(m => m.params.permissions === 'nvoy-channel' && m.params.approvalPolicy === 'never'))
+  clientCalls('thread/resume').every(m => m.params.permissions === 'nvoy-channel' && m.params.excludeTurns === true && m.params.approvalPolicy === 'never' && m.params.approvalsReviewer === 'user') &&
+  clientCalls('turn/start').every(m => m.params.permissions === 'nvoy-channel' && m.params.approvalPolicy === 'never' && m.params.approvalsReviewer === 'user'))
 ok('a Codex whose release would hold the home directory or CODEX_HOME is refused', (() => { try { codexInstall({ path: fakeBin, home: ownHome, codexHome: join(fakeRelease, 'bin') }); return false } catch (e) { return /holds the home directory or the harness's CODEX_HOME/.test(e.message) } })() &&
   (() => { try { codexInstall({ path: fakeBin, home: ownHome, codexHome }); return true } catch { return false } })())
 ok('a resumed thread prints its attach command at ready', s2.out.indexOf(attachLine) >= 0 && s2.out.indexOf(attachLine) < s2.out.indexOf('injected 444444444444'))

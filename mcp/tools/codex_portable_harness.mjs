@@ -53,10 +53,12 @@ const CODEX_FIELDS = new Set(['instance', 'ssh_target', 'identity_file', 'feed_i
 // "prompt_commands": [["git", ["commit", "push"]], ["gh"]], "apps": { "<connector id>": "writes" } }. A prompt rule asks before each matching command and runs the approved one outside the
 // sandbox: that is how a git write reaches a protected .git and a push reaches the owner's gh login.
 // Nothing is allowed without asking, and a request nobody answers waits for the attached person.
+// `reviewer` "auto_review" sends each request to Codex's own risk-reviewing subagent instead, for an
+// agent trusted to work on its own (James, 2026-10-27); "user", the default, waits for the person.
 const APP_APPROVALS = ['auto', 'prompt', 'writes', 'approve']
 export function codexApprovals(raw) {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).some(k => !['policy', 'prompt_commands', 'apps'].includes(k))) {
-    throw new Error('client config approvals must be { policy, prompt_commands, apps }')
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).some(k => !['policy', 'prompt_commands', 'apps', 'reviewer'].includes(k))) {
+    throw new Error('client config approvals must be { policy, prompt_commands, apps, reviewer }')
   }
   const policy = raw.policy === undefined ? 'never' : raw.policy
   if (policy !== 'never' && policy !== 'on-request') throw new Error('client config approvals.policy must be never or on-request')
@@ -70,7 +72,9 @@ export function codexApprovals(raw) {
   if (!apps || typeof apps !== 'object' || Array.isArray(apps) || Object.entries(apps).some(([id, mode]) => !/^[A-Za-z0-9_-]+$/.test(id) || !APP_APPROVALS.includes(mode))) {
     throw new Error(`client config approvals.apps must map connector ids to ${APP_APPROVALS.join(', ')}`)
   }
-  return { policy, prompt_commands, apps }
+  const reviewer = raw.reviewer === undefined ? 'user' : raw.reviewer
+  if (reviewer !== 'user' && reviewer !== 'auto_review') throw new Error('client config approvals.reviewer must be user or auto_review')
+  return { policy, prompt_commands, apps, reviewer }
 }
 export function codexGrants(raw, { own, codexHome, keys }) {
   if (raw === undefined) return { filesystem: {}, network: false }
@@ -202,7 +206,7 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
 
   const manifest = { id: config.id, pubkey: config.pubkey, buzz: { channels: config.channels }, harness: { runner: 'codex', model: config.model } }
   const codex = codexInstall({ codexHome })
-  const approvalPolicy = config.approvals?.policy || 'never'
+  const approvalPolicy = config.approvals?.policy || 'never', approvalsReviewer = config.approvals?.reviewer || 'user'
   writePrivate(resolve(codexHome, 'config.toml'), codexConfigToml({ manifest, root: '', model: config.model, auth: 'chatgpt', codexRelease: codex.release, grants: config.grants, approvals: config.approvals,
     remote: { identity: config.identity, knownHosts: config.knownHosts, target: config.target } }))
   const rules = codexRules(config.approvals), rulesFile = resolve(codexHome, 'rules', 'nvoy.rules')
@@ -301,7 +305,7 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
       chmodSync(socket, 0o600)
       await server.request('initialize', { clientInfo: { name: 'nvoy-harness', title: 'Nvoy harness', version: '1' }, capabilities: { experimentalApi: true } })
       server.notify('initialized')
-      const { threadId, thread, saved } = await openThread({ server, manifest, workdir, threadPath, log, writePrivate, permissions: CHANNEL_PERMISSIONS, approvalPolicy })
+      const { threadId, thread, saved } = await openThread({ server, manifest, workdir, threadPath, log, writePrivate, permissions: CHANNEL_PERMISSIONS, approvalPolicy, approvalsReviewer })
       // '' when the channel answered, null when this Codex cannot be asked, else why it is down.
       // Any answer, a tool error included, is a live channel; only a failed call is a dead one. On
       // 0.149.1 a server that has exited rejects with -32603 "Transport closed", an unknown method
@@ -351,7 +355,7 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
           let turn = ''
           if (!busy) {
             try {
-              turn = String((await server.request('turn/start', { threadId, input, clientUserMessageId, permissions: CHANNEL_PERMISSIONS, approvalPolicy }))?.turn?.id || '')
+              turn = String((await server.request('turn/start', { threadId, input, clientUserMessageId, permissions: CHANNEL_PERMISSIONS, approvalPolicy, approvalsReviewer }))?.turn?.id || '')
               if (!turn) throw new Error('Codex returned no turn id')
               busy = !ended.has(turn); turnEnvelope.set(turn, next.envelope)
             } catch (error) { if (server.closed) throw error; log(`turn/start refused (${error.message}); queueing behind the running turn`) }

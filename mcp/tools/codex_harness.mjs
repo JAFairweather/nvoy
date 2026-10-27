@@ -63,9 +63,10 @@ function appServer({ env, log }) {
 // otherwise keeps the profile it was started under, whatever config.toml now says (dj-codex, 2026-10-21).
 // A resume asks for no turns: only the thread's status is read, and a long thread's history overflows
 // one frame (dj-codex's 363 MB rollout, 2026-10-27). `approvalPolicy` is given the same way, for the same
-// reason: a resumed thread kept "never" after config.toml said "on-request" (dj-codex, 2026-10-27).
-export async function openThread({ server, manifest, workdir, threadPath, log, writePrivate, permissions = '', approvalPolicy = '' }) {
-  const profile = { ...(permissions ? { permissions } : {}), ...(approvalPolicy ? { approvalPolicy } : {}) }
+// reason: a resumed thread kept "never" after config.toml said "on-request" (dj-codex, 2026-10-27), and so
+// is `approvalsReviewer`.
+export async function openThread({ server, manifest, workdir, threadPath, log, writePrivate, permissions = '', approvalPolicy = '', approvalsReviewer = '' }) {
+  const profile = { ...(permissions ? { permissions } : {}), ...(approvalPolicy ? { approvalPolicy } : {}), ...(approvalsReviewer ? { approvalsReviewer } : {}) }
   let threadId = '', thread = null, saved = false
   try { threadId = codexThreadId(JSON.parse(readFileSync(threadPath, 'utf8')).thread_id) } catch {}
   if (threadId) {
