@@ -30,7 +30,7 @@ import { homedir } from 'node:os'
 import { delimiter, dirname, isAbsolute, relative, resolve } from 'node:path'
 import { fixedPath, knownHostsFile, privateFile, sshChannelEntry, SSH, SSH_TARGET } from './channel_client.mjs'
 import { instanceId } from './runtime_manifest.mjs'
-import { CHANNEL_PERMISSIONS, codexConfigToml, codexTurnText, defaultInstructions, serverName } from './harness_session.mjs'
+import { CHANNEL_PERMISSIONS, codexConfigToml, codexRules, codexTurnText, defaultInstructions, serverName } from './harness_session.mjs'
 import { openThread } from './codex_harness.mjs'
 import { connectWsPeer } from './codex_ws_peer.mjs'
 import { claimPidLock } from './pid_lock.mjs'
@@ -41,12 +41,37 @@ const sleep = ms => new Promise(done => setTimeout(done, ms))
 // The client config names paths, never values. Beyond the portable Claude config's refusals, a
 // field or value that could carry an OpenAI API key refuses the file: this harness bills the
 // owner's subscription, and a key anywhere near it is how it would quietly bill an account instead.
-const CODEX_FIELDS = new Set(['instance', 'ssh_target', 'identity_file', 'feed_identity_file', 'known_hosts_file', 'codex_home', 'model', 'pubkey', 'channels', 'grants'])
+const CODEX_FIELDS = new Set(['instance', 'ssh_target', 'identity_file', 'feed_identity_file', 'known_hosts_file', 'codex_home', 'model', 'pubkey', 'channels', 'grants', 'approvals'])
 
 // `grants`: what this one harness's shell commands may reach beyond the channel profile, for an owner
 // who gives it real work (dj-codex, the reMarkable notebooks, 2026-10-26): { "filesystem": { "/abs/path":
 // "read" | "write" }, "network": true }. Never a path holding the home directory, the CODEX_HOME (its
 // login) or the channel keys; never inside ~/.ssh but for a socket or known_hosts named exactly.
+
+// `approvals`: when Codex asks, not what it reaches, so beside `grants` rather than in it. For an
+// owner who answers at the attached TUI (herdr) (dj-codex, 2026-10-27): { "policy": "on-request",
+// "prompt_commands": [["git", ["commit", "push"]], ["gh"]], "apps": { "<connector id>": "writes" } }. A prompt rule asks before each matching command and runs the approved one outside the
+// sandbox: that is how a git write reaches a protected .git and a push reaches the owner's gh login.
+// Nothing is allowed without asking, and a request nobody answers waits for the attached person.
+const APP_APPROVALS = ['auto', 'prompt', 'writes', 'approve']
+export function codexApprovals(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).some(k => !['policy', 'prompt_commands', 'apps'].includes(k))) {
+    throw new Error('client config approvals must be { policy, prompt_commands, apps }')
+  }
+  const policy = raw.policy === undefined ? 'never' : raw.policy
+  if (policy !== 'never' && policy !== 'on-request') throw new Error('client config approvals.policy must be never or on-request')
+  const word = t => typeof t === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:\/-]*$/.test(t)
+  const prompt_commands = raw.prompt_commands === undefined ? [] : raw.prompt_commands
+  if (!Array.isArray(prompt_commands) || !prompt_commands.every(p => Array.isArray(p) && p.length && p.every(t => word(t) || (Array.isArray(t) && t.length && t.every(word))))) {
+    throw new Error('client config approvals.prompt_commands must be command prefixes: words, or lists of alternative words')
+  }
+  if (prompt_commands.length && policy === 'never') throw new Error('client config approvals.prompt_commands need policy on-request: under never nobody is asked')
+  const apps = raw.apps === undefined ? {} : raw.apps
+  if (!apps || typeof apps !== 'object' || Array.isArray(apps) || Object.entries(apps).some(([id, mode]) => !/^[A-Za-z0-9_-]+$/.test(id) || !APP_APPROVALS.includes(mode))) {
+    throw new Error(`client config approvals.apps must map connector ids to ${APP_APPROVALS.join(', ')}`)
+  }
+  return { policy, prompt_commands, apps }
+}
 export function codexGrants(raw, { own, codexHome, keys }) {
   if (raw === undefined) return { filesystem: {}, network: false }
   if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).some(k => !['filesystem', 'network'].includes(k))) {
@@ -97,7 +122,8 @@ export function readCodexClientConfig(path, id, own = homedir()) {
   const socket = resolve(codexHome, 'ctl', 'as.sock')
   if (Buffer.byteLength(socket) >= 104) throw new Error('codex_home is too deep for its control socket; choose a shorter path')
   const grants = codexGrants(raw.grants, { own, codexHome, keys: [identity, feedIdentity] })
-  return Object.freeze({ id: instanceId(id), target, model, pubkey, channels, codexHome, socket, identity, feedIdentity, grants,
+  const approvals = raw.approvals === undefined ? null : codexApprovals(raw.approvals)
+  return Object.freeze({ id: instanceId(id), target, model, pubkey, channels, codexHome, socket, identity, feedIdentity, grants, approvals,
     knownHosts: knownHostsFile(String(raw.known_hosts_file || '')) })
 }
 
@@ -176,8 +202,11 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
 
   const manifest = { id: config.id, pubkey: config.pubkey, buzz: { channels: config.channels }, harness: { runner: 'codex', model: config.model } }
   const codex = codexInstall({ codexHome })
-  writePrivate(resolve(codexHome, 'config.toml'), codexConfigToml({ manifest, root: '', model: config.model, auth: 'chatgpt', codexRelease: codex.release, grants: config.grants,
+  const approvalPolicy = config.approvals?.policy || 'never'
+  writePrivate(resolve(codexHome, 'config.toml'), codexConfigToml({ manifest, root: '', model: config.model, auth: 'chatgpt', codexRelease: codex.release, grants: config.grants, approvals: config.approvals,
     remote: { identity: config.identity, knownHosts: config.knownHosts, target: config.target } }))
+  const rules = codexRules(config.approvals), rulesFile = resolve(codexHome, 'rules', 'nvoy.rules')
+  if (rules) { mkdirSync(dirname(rulesFile), { recursive: true, mode: 0o700 }); writePrivate(rulesFile, rules) } else rmSync(rulesFile, { force: true })
   if (!existsSync(resolve(workdir, 'AGENTS.md'))) writePrivate(resolve(workdir, 'AGENTS.md'), defaultInstructions(manifest))
 
   const delivered = new Set(existsSync(deliveredPath)
@@ -272,7 +301,7 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
       chmodSync(socket, 0o600)
       await server.request('initialize', { clientInfo: { name: 'nvoy-harness', title: 'Nvoy harness', version: '1' }, capabilities: { experimentalApi: true } })
       server.notify('initialized')
-      const { threadId, thread, saved } = await openThread({ server, manifest, workdir, threadPath, log, writePrivate, permissions: CHANNEL_PERMISSIONS })
+      const { threadId, thread, saved } = await openThread({ server, manifest, workdir, threadPath, log, writePrivate, permissions: CHANNEL_PERMISSIONS, approvalPolicy })
       // '' when the channel answered, null when this Codex cannot be asked, else why it is down.
       // Any answer, a tool error included, is a live channel; only a failed call is a dead one. On
       // 0.149.1 a server that has exited rejects with -32603 "Transport closed", an unknown method
@@ -322,7 +351,7 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
           let turn = ''
           if (!busy) {
             try {
-              turn = String((await server.request('turn/start', { threadId, input, clientUserMessageId, permissions: CHANNEL_PERMISSIONS }))?.turn?.id || '')
+              turn = String((await server.request('turn/start', { threadId, input, clientUserMessageId, permissions: CHANNEL_PERMISSIONS, approvalPolicy }))?.turn?.id || '')
               if (!turn) throw new Error('Codex returned no turn id')
               busy = !ended.has(turn); turnEnvelope.set(turn, next.envelope)
             } catch (error) { if (server.closed) throw error; log(`turn/start refused (${error.message}); queueing behind the running turn`) }

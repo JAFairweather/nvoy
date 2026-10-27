@@ -133,7 +133,7 @@ export const CODEX_CHANNEL_TOOLS = ['nvoy_channel_list', 'nvoy_channel_read', 'n
 // profile it was started under, so the supervisor names this one on every resume and turn too.
 export const CHANNEL_PERMISSIONS = 'nvoy-channel'
 
-export function codexConfigToml({ manifest, root, model = '', auth = 'api-key', remote = null, codexRelease = '', grants = null }) {
+export function codexConfigToml({ manifest, root, model = '', auth = 'api-key', remote = null, codexRelease = '', grants = null, approvals = null }) {
   const q = value => JSON.stringify(String(value))
   if (auth === 'chatgpt') {
     if (!remote) throw new Error('a ChatGPT-login Codex config reaches its channel only through the SSH forced command')
@@ -142,7 +142,7 @@ export function codexConfigToml({ manifest, root, model = '', auth = 'api-key', 
       ...(model ? [`model = ${q(model)}`] : []),
       'forced_login_method = "chatgpt"',
       'cli_auth_credentials_store = "file"',
-      'approval_policy = "never"',
+      `approval_policy = ${q(approvals?.policy || 'never')}`,
       `default_permissions = ${q(CHANNEL_PERMISSIONS)}`,
       '',
       `[permissions.${CHANNEL_PERMISSIONS}.filesystem]`,
@@ -153,6 +153,7 @@ export function codexConfigToml({ manifest, root, model = '', auth = 'api-key', 
       ...Object.entries(grants?.filesystem || {}).map(([path, mode]) => `${q(path)} = ${q(mode)}`),
       '',
       ...(grants?.network ? [`[permissions.${CHANNEL_PERMISSIONS}.network]`, 'enabled = true', ''] : []),
+      ...Object.entries(approvals?.apps || {}).flatMap(([id, mode]) => [`[apps.${id}]`, `default_tools_approval_mode = ${q(mode)}`, '']),
       `[mcp_servers.${serverName(manifest)}]`,
       `command = ${q(entry.command)}`,
       `args = [${entry.args.map(q).join(', ')}]`,
@@ -181,6 +182,15 @@ export function codexConfigToml({ manifest, root, model = '', auth = 'api-key', 
     '',
     ...CODEX_CHANNEL_TOOLS.flatMap(tool => [`[mcp_servers.${serverName(manifest)}.tools.${tool}]`, 'approval_mode = "approve"', '']),
   ].join('\n')
+}
+
+// The execpolicy rules for a client config's approvals.prompt_commands (codex_portable_harness.mjs), in the
+// CODEX_HOME's rules/: every one asks, so a rule can only add a question, never skip one.
+export function codexRules(approvals) {
+  const q = value => JSON.stringify(String(value))
+  const word = t => Array.isArray(t) ? `[${t.map(q).join(', ')}]` : q(t)
+  return (approvals?.prompt_commands || []).map(p =>
+    `prefix_rule(pattern = [${p.map(word).join(', ')}], decision = "prompt", justification = "the owner approves this at the attached terminal")\n`).join('')
 }
 
 // The turn carries only the opaque envelope and a dedupe marker. The message itself comes back

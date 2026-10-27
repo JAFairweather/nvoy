@@ -61,13 +61,16 @@ function appServer({ env, log }) {
 // Resume the stored thread, or start one and store it. Shared by the fleet and portable supervisors.
 // `permissions`, a profile named in config.toml, is given on resume as well as start: a resumed thread
 // otherwise keeps the profile it was started under, whatever config.toml now says (dj-codex, 2026-10-21).
-export async function openThread({ server, manifest, workdir, threadPath, log, writePrivate, permissions = '' }) {
-  const profile = permissions ? { permissions } : {}
+// A resume asks for no turns: only the thread's status is read, and a long thread's history overflows
+// one frame (dj-codex's 363 MB rollout, 2026-10-27). `approvalPolicy` is given the same way, for the same
+// reason: a resumed thread kept "never" after config.toml said "on-request" (dj-codex, 2026-10-27).
+export async function openThread({ server, manifest, workdir, threadPath, log, writePrivate, permissions = '', approvalPolicy = '' }) {
+  const profile = { ...(permissions ? { permissions } : {}), ...(approvalPolicy ? { approvalPolicy } : {}) }
   let threadId = '', thread = null, saved = false
   try { threadId = codexThreadId(JSON.parse(readFileSync(threadPath, 'utf8')).thread_id) } catch {}
   if (threadId) {
     try {
-      const resumed = await server.request('thread/resume', { threadId, ...profile })
+      const resumed = await server.request('thread/resume', { threadId, excludeTurns: true, ...profile })
       if (resumed?.thread?.id !== threadId) throw new Error('Codex resumed an unexpected thread')
       thread = resumed.thread; saved = true
       log(`resumed the ${manifest.id} thread`)

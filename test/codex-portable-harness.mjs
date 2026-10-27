@@ -7,8 +7,8 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { sshChannelEntry } from '../mcp/tools/channel_client.mjs'
-import { CODEX_CHANNEL_TOOLS, codexConfigToml, codexTurnText } from '../mcp/tools/harness_session.mjs'
-import { attachCommand, codexGrants, codexInstall, sshFeedArgs } from '../mcp/tools/codex_portable_harness.mjs'
+import { CODEX_CHANNEL_TOOLS, codexConfigToml, codexRules, codexTurnText } from '../mcp/tools/harness_session.mjs'
+import { attachCommand, codexApprovals, codexGrants, codexInstall, sshFeedArgs } from '../mcp/tools/codex_portable_harness.mjs'
 import { claimPidLock } from '../mcp/tools/pid_lock.mjs'
 import { fakeHerdr } from './fake-herdr.mjs'
 
@@ -72,6 +72,19 @@ ok('inside ~/.ssh only a socket or known_hosts', typeof grant({ filesystem: { '/
 ok('a grant is read or write, on an absolute path', typeof grant({ filesystem: { 'R1-work': 'read' } }) === 'string' && typeof grant({ filesystem: { '/Users/o/R1-work': 'all' } }) === 'string')
 const grantedToml = codexConfigToml({ manifest: { id: 'cx-test' }, root: '', auth: 'chatgpt', remote, grants: granted })
 ok('the profile lists each grant, and the network only when granted', /^"\/Users\/o\/R1-work" = "write"$/m.test(grantedToml) && /\.network\]\nenabled = true/.test(grantedToml) && !/\.network\]/.test(toml))
+// approvals: when Codex asks the attached person, beside grants; by default it never asks
+const approve = raw => { try { return codexApprovals(raw) } catch (e) { return e.message } }
+const asked = approve({ policy: 'on-request', prompt_commands: [['git', ['commit', 'push']], ['gh']], apps: { connector_abc: 'writes' } })
+const askedToml = codexConfigToml({ manifest: { id: 'cx-test' }, root: '', auth: 'chatgpt', remote, approvals: asked })
+ok('approvals set the policy and each app\'s tool approvals', /^approval_policy = "on-request"$/m.test(askedToml) && askedToml.includes('[apps.connector_abc]\ndefault_tools_approval_mode = "writes"\n') &&
+  /^approval_policy = "never"$/m.test(toml) && !/\[apps\./.test(toml))
+ok('each prompt command becomes a rule that asks, and none that allows', codexRules(asked) ===
+  'prefix_rule(pattern = ["git", ["commit", "push"]], decision = "prompt", justification = "the owner approves this at the attached terminal")\n' +
+  'prefix_rule(pattern = ["gh"], decision = "prompt", justification = "the owner approves this at the attached terminal")\n' && codexRules(null) === '')
+ok('approvals refuse an unknown policy or field, a rule under never, and an unknown app mode',
+  [{ policy: 'untrusted' }, { policy: 'on-request', allow: [['git']] }, { prompt_commands: [['git']] }, { policy: 'on-request', apps: { x: 'always' } },
+    { policy: 'on-request', prompt_commands: [['git;rm']] }, { policy: 'on-request', prompt_commands: [[]] }].every(raw => typeof approve(raw) === 'string'))
+ok('approvals stay out of grants', typeof grant({ approvals: { policy: 'on-request' } }) === 'string')
 ok('a model is set only when chosen', !/^model = /m.test(toml) && /^model = "gpt-5\.5"$/m.test(codexConfigToml({ manifest: { id: 'cx-test' }, root: '', model: 'gpt-5.5', auth: 'chatgpt', remote })))
 ok('a ChatGPT config without the SSH channel, or an unknown auth mode, is refused', (() => { try { codexConfigToml({ manifest: { id: 'x' }, root: '', auth: 'chatgpt' }); return false } catch { return true } })() &&
   (() => { try { codexConfigToml({ manifest: { id: 'x' }, root: '', auth: 'env' }); return false } catch { return true } })())
@@ -413,7 +426,8 @@ ok('a restart resumes the same thread and injects only what arrived while it was
   clientCalls('thread/resume').some(m => m.params.threadId === THREAD) && clientCalls('thread/start').length === 1 &&
   clientCalls('turn/start').length === 2 && clientCalls('turn/start')[1].params.clientUserMessageId === `nvoy:${envelope(4)}` && clientCalls('thread/queue/add').length === 1)
 ok('the resumed thread is put under the channel profile, and so is every turn: a resume otherwise keeps the profile the thread started under (dj-codex, 2026-10-21)',
-  clientCalls('thread/resume').every(m => m.params.permissions === 'nvoy-channel') && clientCalls('turn/start').every(m => m.params.permissions === 'nvoy-channel'))
+  clientCalls('thread/resume').every(m => m.params.permissions === 'nvoy-channel' && m.params.excludeTurns === true && m.params.approvalPolicy === 'never') &&
+  clientCalls('turn/start').every(m => m.params.permissions === 'nvoy-channel' && m.params.approvalPolicy === 'never'))
 ok('a Codex whose release would hold the home directory or CODEX_HOME is refused', (() => { try { codexInstall({ path: fakeBin, home: ownHome, codexHome: join(fakeRelease, 'bin') }); return false } catch (e) { return /holds the home directory or the harness's CODEX_HOME/.test(e.message) } })() &&
   (() => { try { codexInstall({ path: fakeBin, home: ownHome, codexHome }); return true } catch { return false } })())
 ok('a resumed thread prints its attach command at ready', s2.out.indexOf(attachLine) >= 0 && s2.out.indexOf(attachLine) < s2.out.indexOf('injected 444444444444'))
