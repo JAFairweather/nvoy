@@ -342,6 +342,25 @@ Neither tool exposes the signing credential.
   whole post, never the text. This is a brake on the accident and the obvious ask; an agent set on
   encoding a secret can still do it, so it does not replace keeping secrets out of the agent's reach.
 
+## The agent card
+
+`"agent_card": true` has the broker publish what its manifest allows, signed by the agent's own key,
+so the waggle hive manager can show it without reading the fleet (waggle#613 C1). It is off by
+default: the agent's Bunker pairing must first be allowed to sign kind 30078.
+
+The card is one kind-30078 event with `d` = `nvoy-agent-card`. Its content is an allowlist
+(`agent_card.mjs`): grantors, task carriers, relays, Buzz channel ids, `may_post`, `may_set_profile`,
+`agent_limits`, the delivery mode, the harness runner and model, the holdings by name only, the
+release, and the same capability sentence the agent is told. No credential path, uid, directory,
+host or Buzz relay address is on it. It goes to the grant relays (`grant_relays.mjs`), where the
+page already reads grants; the Buzz relay returns nothing to a filter without channel ids.
+
+The daemon checks it at start and hourly. `instance-broker-card.mjs` re-signs only when the card
+changed or the last one is a day old, publishes to every card relay, and reads it back from each.
+`state/agent-card.json` records which relays accepted it and which read it back; a card no relay
+read back is not recorded, so the next check tries again. A Bunker that refuses kind 30078 shows in
+the daemon log as `agent card unconfirmed`, and nothing else the broker does is affected.
+
 ## The status page (waggle.nave.pub/status)
 
 A public, read-only page of whether each identity does its job, refreshed every minute on the fleet
