@@ -10,6 +10,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { codexTurnText } from '../mcp/tools/harness_session.mjs'
 import nvoyPiHarness, { PI_CHANNEL_TOOLS, piTools } from '../mcp/tools/pi_harness_extension.mjs'
+import { readPiClientConfig } from '../mcp/tools/pi_harness_extension.mjs'
 import { fakeHerdr } from './fake-herdr.mjs'
 
 let fails = 0
@@ -215,10 +216,12 @@ function fakePi() {
   pi.stop = () => pi.handlers.get('session_shutdown')({ type: 'session_shutdown', reason: 'quit' }, pi.ctx)
   return pi
 }
-ok('outside the launcher, the extension refuses to load rather than run unconfigured', throws(() => nvoyPiHarness(fakePi()), /NVOY_PI_HARNESS_CONFIG and NVOY_PI_HARNESS_INSTANCE must be set/))
+let unconfigured = false
+try { await nvoyPiHarness(fakePi()) } catch (error) { unconfigured = /NVOY_PI_HARNESS_CONFIG and NVOY_PI_HARNESS_INSTANCE must be set/.test(error.message) }
+ok('outside the launcher, the extension refuses to load rather than run unconfigured', unconfigured)
 Object.assign(process.env, { NVOY_PI_HARNESS_CONFIG: configPath, NVOY_PI_HARNESS_INSTANCE: 'pd-test', NVOY_HARNESS_SSH: fakeSsh })
 const pi1 = fakePi()
-const harness1 = nvoyPiHarness(pi1)
+const harness1 = await nvoyPiHarness(pi1)
 ok('loading registers the four channel tools and starts nothing', [...pi1.tools.keys()].join() === 'nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply,nvoy_channel_post' &&
   !existsSync(join(root, 'ssh-args.log')) && !existsSync(lockPath))
 const mcp = new Client({ name: 'pi-harness-test', version: '1' })
@@ -288,7 +291,7 @@ ok('session_shutdown ends the feed and frees the fleet lock', await waitFor(() =
 writeFileSync(join(privateDir, 'feed-cursor.json'), JSON.stringify({ version: 1, instance: 'pd-test', cursor: envelope(1) }))
 appendFileSync(queue, record(4))
 const pi2 = fakePi()
-nvoyPiHarness(pi2)
+await nvoyPiHarness(pi2)
 pi2.start()
 await waitFor(() => pi2.sent.length >= 1)
 await wait(300)
@@ -299,6 +302,22 @@ ok('the cursor, delivered record and log are owner-only and name the last envelo
 ok('no key, login token or message body reaches the harness\'s files', !/PRIVATE-KEY|CHATGPT-TOKEN|SECRET/.test(readText(harnessLog) + readText(join(privateDir, 'delivered.jsonl')) + readText(join(privateDir, 'feed-cursor.json'))))
 pi2.stop()
 await waitFor(() => !existsSync(lockPath), 5000)
+
+// Owner opt-in loads only fixed local modules; no extra feed or model call.
+const notebookDir = join(root, 'notebook-adapter')
+mkdirSync(notebookDir, { mode: 0o700 })
+for (const name of ['notebook_pi_responder.mjs', 'notebook_pi_socket.mjs']) secretFile(join(notebookDir, name), 'export {};\n')
+secretFile(join(notebookDir, 'notebook_pi_lifecycle.mjs'), 'export function registerNotebookResponder(pi, options) { pi.notebookOptions = options; return { settled: async () => {}, close: async () => {} }; }\n')
+const promptFile = secretFile(join(root, 'notebook-system-prompt.txt'), 'FIXED NOTEBOOK TEACHING PROMPT')
+const notebookConfig = clientConfig({ ...client, notebook: { adapter_dir: notebookDir, prompt_file: promptFile } })
+const parsedNotebook = readPiClientConfig(notebookConfig, 'pd-test', own)
+ok('notebook socket is fixed under this harness state dir, with no caller model selection', parsedNotebook.notebook.socketPath === join(stateDir, 'notebook.sock'))
+process.env.NVOY_PI_HARNESS_CONFIG = notebookConfig
+const pi3 = fakePi(), harness3 = await nvoyPiHarness(pi3)
+ok('owner opt-in registers the notebook adapter before session startup without starting another feed',
+  pi3.notebookOptions?.systemPrompt === 'FIXED NOTEBOOK TEACHING PROMPT' && pi3.notebookOptions.socketPath === join(stateDir, 'notebook.sock') &&
+  harness3.notebook && !existsSync(lockPath) && pi3.sent.length === 0 && pi3.tools.size === PI_CHANNEL_TOOLS.length)
+process.env.NVOY_PI_HARNESS_CONFIG = configPath
 
 rmSync(root, { recursive: true, force: true })
 console.log(fails ? `\n${fails} FAILED` : '\nall passed')

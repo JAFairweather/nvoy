@@ -10,6 +10,7 @@
     "smoke:local": "node test/smoke.mjs",
     "smoke:live": "node test/smoke.mjs --live",
     "conformance": "node test/mcp-conformance.mjs",
+    "test:pi-notebook": "node --test test/pi-notebook-host.mjs && node test/pi-harness.mjs",
     "regrant": "npm run build && node test/regrant.mjs && node test/redelegation-enforcement.mjs",
     "nopersist": "node test/nopersist.mjs",
     "egress": "npm run build && node test/egress.mjs",

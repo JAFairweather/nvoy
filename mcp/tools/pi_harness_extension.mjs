@@ -25,6 +25,7 @@ import { fixedPath, knownHostsFile, privateFile, sshChannelEntry, SSH, SSH_TARGE
 import { instanceId } from './runtime_manifest.mjs'
 import { codexTurnText } from './harness_session.mjs'
 import { feedCursor, followWakeFeed } from './wake_feed_client.mjs'
+import { readNotebookConfig, installPiNotebook } from './pi_notebook_host.mjs'
 
 // Mirrors codex-channel-mcp.mjs's tools/list, which is what the fleet enforces. pi validates tool
 // arguments against plain JSON Schema as well as TypeBox, so no TypeBox import is needed here.
@@ -59,7 +60,7 @@ export function readPiClientConfig(path, id, own = homedir()) {
   if (Object.keys(raw).some(key => /api[_-]?key|openai|token|credential|password/i.test(key)) || /(^|[^a-z0-9])sk-[a-z0-9_-]{8,}/i.test(text)) {
     throw new Error('client config must not name an API key: the portable Pi harness runs on the ChatGPT login only')
   }
-  const unknown = Object.keys(raw).filter(key => !PI_FIELDS.has(key))
+  const unknown = Object.keys(raw).filter(key => !PI_FIELDS.has(key) && key !== 'notebook')
   if (unknown.length) throw new Error(`client config has unknown field ${unknown.join(', ')}`)
   if (raw.instance !== id) throw new Error('client config names a different instance')
   const target = String(raw.ssh_target || '')
@@ -80,6 +81,7 @@ export function readPiClientConfig(path, id, own = homedir()) {
   const socket = resolve(stateDir, 'tmux.sock')
   if (Buffer.byteLength(socket) >= 104) throw new Error('state_dir is too deep for its tmux socket; choose a shorter path')
   return Object.freeze({ id: instanceId(id), target, model, pubkey, channels, workTools: raw.work_tools === true, stateDir: resolve(stateDir), socket, identity, feedIdentity,
+    notebook: readNotebookConfig(raw.notebook, resolve(stateDir)),
     piHome: piHomeDir(String(raw.pi_home || ''), own), knownHosts: knownHostsFile(String(raw.known_hosts_file || '')) })
 }
 
@@ -221,12 +223,16 @@ export function createPiHarness({ pi, config, ssh = SSH, log: logLine }) {
 
 // pi's entry point. The launcher names the config and instance in pi's environment; a replacement
 // ssh (a test's) must still be a fixed, owner-held file, as for the Codex harness.
-export default function nvoyPiHarness(pi) {
+export default async function nvoyPiHarness(pi) {
   const configPath = process.env.NVOY_PI_HARNESS_CONFIG || '', id = process.env.NVOY_PI_HARNESS_INSTANCE || ''
   if (!configPath || !id) throw new Error('nvoy pi harness: NVOY_PI_HARNESS_CONFIG and NVOY_PI_HARNESS_INSTANCE must be set; start it with mcp/tools/pi-harness.mjs')
   const config = readPiClientConfig(configPath, id)
   const ssh = process.env.NVOY_HARNESS_SSH ? fixedPath(process.env.NVOY_HARNESS_SSH, 'ssh executable', null).path : SSH
+  // Pi awaits async extension factories. Registration finishes before its first
+  // session_start; the adapter itself starts nothing during import/register.
+  const notebook = await installPiNotebook(pi, config.notebook)
   const harness = createPiHarness({ pi, config, ssh })
+  harness.notebook = notebook
   pi.on('session_start', (_event, ctx) => harness.start(ctx))
   pi.on('session_shutdown', () => harness.stop())
   return harness
