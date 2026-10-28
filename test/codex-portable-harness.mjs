@@ -416,16 +416,22 @@ ok('after the restart, new envelopes reach the thread again', await waitFor(() =
 await s2.stop()
 // A turn that outlasts the hold ceiling gets what it held queued behind it, as one submission.
 const recordAs = c => record(9).replaceAll(envelope(9), c.repeat(64))
-const s6 = startSupervisor(client, { HARNESS_HOLD_MAX_MS: '1000' })
+const s6 = startSupervisor(client, { HARNESS_HOLD_MAX_MS: '1000', HARNESS_BATCH_MAX: '2' })
 await waitFor(() => /session ready/.test(s6.out) && /wake feed connected/.test(s6.out))
 writeFileSync(join(codexHome, 'hold'), '')
 appendFileSync(queue, record(9))
 await waitFor(() => /injected 999999999999 as a turn/.test(s6.out))
-appendFileSync(queue, recordAs('a') + recordAs('b'))
-const ceiling = ['a', 'b'].map(c => ({ envelope: c.repeat(64), type: 'admitted-task' }))
-ok('a turn that outlasts the hold ceiling gets its held envelopes queued behind it as one submission', await waitFor(() => /queued aaaaaaaaaaaa and 1 more behind a turn still running after 1s/.test(s6.out)) &&
-  clientCalls('thread/queue/add').length === 1 && clientCalls('thread/queue/add')[0].params.clientUserMessageId === `nvoy:${'a'.repeat(64)}` &&
-  clientCalls('thread/queue/add')[0].params.input[0].text === codexBatchText(ceiling))
+appendFileSync(queue, recordAs('a') + recordAs('b') + recordAs('c'))
+const ceiling = ['a', 'b', 'c'].map(c => ({ envelope: c.repeat(64), type: 'admitted-task' }))
+await waitFor(() => /holding 3 until the running turn ends/.test(s6.out))
+const heldAt = Date.now()
+const firstAt = await waitFor(() => /queued aaaaaaaaaaaa and 1 more behind a turn still running after 1s/.test(s6.out)) ? Date.now() : 0
+const secondAt = await waitFor(() => /queued cccccccccccc behind a turn still running after 1s/.test(s6.out)) ? Date.now() : 0
+const queuedAdds = clientCalls('thread/queue/add')
+ok('a turn that outlasts the hold ceiling gets its held envelopes queued behind it, in batches', firstAt && secondAt && queuedAdds.length === 2 &&
+  queuedAdds[0].params.clientUserMessageId === `nvoy:${'a'.repeat(64)}` && queuedAdds[0].params.input[0].text === codexBatchText(ceiling.slice(0, 2)) &&
+  queuedAdds[1].params.clientUserMessageId === `nvoy:${'c'.repeat(64)}` && queuedAdds[1].params.input[0].text === codexBatchText(ceiling.slice(2)))
+ok('what one batch could not take is queued at the same ceiling, not held again', firstAt - heldAt < 1500 && secondAt - firstAt < 500)
 rmSync(join(codexHome, 'hold'))
 ok('the queued batch runs as the next turn', await waitFor(() => fakeLog(codexHome).some(m => m.began && m.via === `nvoy:${'a'.repeat(64)}`)))
 await s6.stop()

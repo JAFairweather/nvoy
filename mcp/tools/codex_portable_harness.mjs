@@ -319,9 +319,11 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
             log(`queued ${what} behind a turn still running after ${Math.round(HOLD_MAX_MS / 1000)}s`)
           }
         }
-        heldSince = 0; heldNoted = 0
         for (const row of batch) { pending.shift(); announced.delete(row.envelope) }
         saveCursor(batch.at(-1).envelope)
+        // What a batch could not take keeps its first arrival's deadline, so it is not held twice.
+        heldNoted = 0
+        if (!fresh(pending).length) heldSince = 0
       }
     } catch (error) {
       log(`codex harness: ${error.message}`)
