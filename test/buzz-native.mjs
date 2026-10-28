@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { finalizeEvent, generateSecretKey, getPublicKey, verifyEvent } from 'nostr-tools/pure'
 import * as nip19 from 'nostr-tools/nip19'
-import { channelReply, checkAuthTemplate, nativeMention, normalizeBuzzRelay, openBuzzSession } from '../mcp/tools/buzz_native.mjs'
+import { channelReply, checkAuthTemplate, nativeMention, normalizeBuzzRelay, openBuzzSession, ownRoots } from '../mcp/tools/buzz_native.mjs'
 
 let fails = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); if (!value) fails++ }
@@ -132,6 +132,30 @@ try {
   ok('the agent\'s own message is not a mention', nativeMention(finalizeEvent({ kind: 9, created_at: now(), content: 'x', tags: [['h', CH], ['p', agent]] }, agentSk), opts) === null)
   ok('a forged signature is not a mention', nativeMention({ ...top, content: 'tampered' }, opts) === null)
   ok('a kind:1 note is not a mention', nativeMention(finalizeEvent({ kind: 1, created_at: now(), content: 'x', tags: [['h', CH], ['p', agent]] }, humanSk), opts) === null)
+  ok('a mention says it was addressed by mention', nativeMention(top, opts)?.addressed === 'mention')
+
+  // --- replies in a thread the agent started (#280) ---
+  const asked = finalizeEvent({ kind: 9, created_at: now(), content: 'please review', tags: [['h', CH], ['p', human]] }, agentSk)
+  const aside = finalizeEvent({ kind: 9, created_at: now(), content: 'a question first', tags: [['h', CH], ['e', asked.id, '', 'reply'], ['p', agent]] }, strangerSk)
+  const inThread = (sk, parent, root) => finalizeEvent({ kind: 9, created_at: now(), content: 'verdict: approve',
+    tags: [['h', CH], ['e', root.id, '', 'root'], ['e', parent.id, '', 'reply'], ['p', getPublicKey(strangerSk)]] }, sk)
+  const verdict = inThread(humanSk, aside, asked)
+  const threads = ownRoots([asked, aside, verdict], { me: agent, channels: [CH] })
+  ok('the threads the agent started are its own top-level messages only', JSON.stringify(threads) === JSON.stringify([{ id: asked.id, channel: CH }]))
+  ok('a reply to a third party inside the agent\'s thread, with no p tag for it, is addressed as own-thread',
+    nativeMention(verdict, { ...opts, threads })?.addressed === 'own-thread')
+  ok('the same reply is not addressed without the thread', nativeMention(verdict, opts) === null)
+  const theirs = finalizeEvent({ kind: 9, created_at: now(), content: 'their own question', tags: [['h', CH]] }, strangerSk)
+  ok('the same reply in a thread the agent did not start is not addressed', nativeMention(inThread(humanSk, theirs, theirs), { ...opts, threads }) === null)
+  ok('a forged reply in the agent\'s thread is not addressed', nativeMention({ ...verdict, content: 'tampered' }, { ...opts, threads }) === null)
+  ok('a reply in the agent\'s thread from another channel is not addressed',
+    nativeMention(finalizeEvent({ kind: 9, created_at: now(), content: 'x', tags: [['h', OTHER], ['e', asked.id, '', 'root']] }, humanSk), { me: agent, channels: [CH, OTHER], threads }) === null)
+  const top2 = finalizeEvent({ kind: 9, created_at: now(), content: 'x', tags: [['h', CH]] }, humanSk)
+  ok('a thread root is never its own reply', nativeMention(top2, { ...opts, threads: [{ id: top2.id, channel: CH }] }) === null)
+  ok('a top-level message signed by someone else, or forged, is not the agent\'s thread',
+    ownRoots([theirs, { ...asked, content: 'tampered' }, { ...asked, pubkey: human }], { me: agent, channels: [CH] }).length === 0)
+  ok('a top-level message in an unconfigured channel is not the agent\'s thread',
+    ownRoots([finalizeEvent({ kind: 9, created_at: now(), content: 'x', tags: [['h', OTHER]] }, agentSk)], { me: agent, channels: [CH] }).length === 0)
 
   // --- live against the stub ---
   const session = await openBuzzSession({ relay: RELAY, signer: local(agentSk) })

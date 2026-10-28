@@ -22,7 +22,7 @@ import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest
 import { claimChannelSource, completeChannelSource } from './channel_source_dedup.mjs'
 import { claimBrokerLock } from './broker_lock.mjs'
 import { brokerSigner } from './broker_signer.mjs'
-import { channelContext, contextFilters, dmChannels, dmNoticeFilter, nativeGrant, nativeMention, openBuzzSession } from './buzz_native.mjs'
+import { channelContext, contextFilters, dmChannels, dmNoticeFilter, nativeGrant, nativeMention, openBuzzSession, ownRoots, threadRoot } from './buzz_native.mjs'
 import { recordStatusAdmission } from './buzz_status.mjs'
 import { grantLookup, noGrantVerdict } from './grant_evidence.mjs'
 import { admissionLimit, hopOf } from './agent_limits.mjs'
@@ -74,12 +74,16 @@ if (me !== manifest.pubkey) die('signer does not match manifest pubkey')
 
 // 1. The event, read as ourselves. Only what the relay returns under this id counts. On the same
 // login, the conversation around it (#245): best effort, so a failed read costs the context, never the task.
-let source, dms, context = null
+let source, dms, threads = [], context = null
 try {
   const session = await openBuzzSession({ relay: manifest.buzz.relay, signer })
   try {
     dms = dmChannels(await session.fetch(dmNoticeFilter(me)), { me }).filter(ch => !manifest.buzz.channels.includes(ch))
     source = (await session.fetch({ ids: [eventId], kinds: [9], '#h': [...manifest.buzz.channels, ...dms] })).find(ev => ev?.id === eventId)
+    // A reply in a thread this identity started is addressed to it, mention or not (#280); the
+    // root's own signature says whose thread it is.
+    const root = source && threadRoot(source)
+    if (root && root !== eventId) threads = ownRoots(await session.fetch({ ids: [root], kinds: [9], '#h': manifest.buzz.channels }), { me, channels: manifest.buzz.channels })
     const filters = source && contextFilters(source)
     if (filters) {
       const names = Object.fromEntries((manifest.mayPost?.mention || []).filter(m => m.name).map(m => [m.pubkey, m.name]))
@@ -97,7 +101,7 @@ try {
   } finally { session.close() }
 } catch (e) { requeue(`Buzz relay unavailable: ${e.message}`) }
 if (!source) finish('is not stored in any configured channel')
-const mention = nativeMention(source, { me, channels: [...manifest.buzz.channels, ...dms] })
+const mention = nativeMention(source, { me, channels: [...manifest.buzz.channels, ...dms], threads })
 if (!mention) finish('is not a signed mention of this identity')
 const dm = dms.includes(mention.channel)
 // Decided before any grant is consulted: no grant could change the answer.
