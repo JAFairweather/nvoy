@@ -76,15 +76,32 @@ the instance root:
 ```bash
 node mcp/tools/instance-identity.mjs allocate --id <name> --pubkey <64 hex> --like <live agent>
 node mcp/tools/instance-identity.mjs check --id <name>
+node mcp/tools/instance-identity.mjs apply --id <name> --public-key-file <channel key .pub> \
+  --authorized-keys /home/<channel-account>/.ssh/authorized_keys
 ```
 
 `allocate` picks a UID/GID block clear of every identity (a check `assertNoCollisions` does not
 make), above every block ever used: the installed manifests plus `identity-blocks.jsonl` beside the
 instance root, so a retired identity's numbers are never reused. It copies the named agent's `buzz`, `may_post`, `agent_limits`, `agent_card` and
 `task_carriers`, validates the result with `readManifest`, and writes it to a staging directory.
-`check` fails unless the staged manifest is clear of every installed identity and both Bunker
+`check` fails unless the staged manifest is clear of every installed identity and every recorded
+block, and both Bunker
 credential files are seated root-owned `0600`. Installing the staged file starts the deploy at
 once, through `nvoy-runtime-deploy.path`, so it comes last.
+
+`apply` is that last step. It runs `check` again and refuses unless it passes. It then decides the
+channel principal, and refuses if `authorized_keys` already holds a different line under this
+identity's comment. Next, under an exclusive lock beside the record, it reads `identity-blocks.jsonl`
+again, refuses a block recorded for another identity, and appends and syncs this block, all before
+the install. A held lock refuses at once; two applies cannot both take one block. A record it cannot read
+or write stops the apply with nothing installed. It then installs the manifest without clobbering,
+and waits until the runner
+records this manifest's digest in `DEPLOYED_MANIFESTS.json`. Only then does it append the principal,
+run `instance-unit.mjs verify`, and baseline the channel. It reports each state on its own line.
+If a tick that saw the new manifest fails, the runner rolls back every identity, so `apply`
+withdraws the manifest rather than let that rollback repeat. If no record appears in time, the
+result is INCONCLUSIVE, and the manifest stays in place. Prove the Bunker pairing before `apply`,
+and a live wake after it.
 
 `worker_credential_ref` is intentionally a different credential class: a dedicated, revocable
 model-provider API key used by the headless Claude/Codex process. It is mounted only in the
