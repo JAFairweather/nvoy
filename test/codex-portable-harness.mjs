@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { sshChannelEntry } from '../mcp/tools/channel_client.mjs'
-import { CODEX_CHANNEL_TOOLS, codexConfigToml, codexTurnText } from '../mcp/tools/harness_session.mjs'
+import { CODEX_CHANNEL_TOOLS, codexBatchText, codexConfigToml, codexTurnText } from '../mcp/tools/harness_session.mjs'
 import { attachCommand, sshFeedArgs } from '../mcp/tools/codex_portable_harness.mjs'
 import { claimPidLock } from '../mcp/tools/pid_lock.mjs'
 
@@ -345,17 +345,27 @@ writeFileSync(join(codexHome, 'hold'), '')
 appendFileSync(queue, record(2))
 await waitFor(() => /injected 222222222222 as a turn/.test(s1.out))
 appendFileSync(queue, record(3, 'verified-notification'))
-await waitFor(() => /queued 333333333333 behind the running turn/.test(s1.out))
+await waitFor(() => /holding 1 until the running turn ends/.test(s1.out))
+appendFileSync(queue, record(7) + record(8))
+ok('envelopes arriving mid-turn are held, neither started nor queued', await waitFor(() => /holding 3 until the running turn ends/.test(s1.out)) &&
+  await wait(300).then(() => clientCalls('turn/start').length === 1 && !clientCalls('thread/queue/add').length))
 rmSync(join(codexHome, 'hold'))
 await waitFor(() => fakeLog(codexHome).filter(m => m.began).length >= 2)
 ok('the attach command is printed once the thread\'s first turn has ended', await waitFor(() => s1.out.includes(attachLine)) &&
   s1.out.indexOf(attachLine) > s1.out.indexOf('turn for 222222222222 ended'))
-const starts1 = clientCalls('turn/start'), queues1 = clientCalls('thread/queue/add')
-ok('an envelope arriving while the thread is idle is injected once as turn/start', starts1.length === 1 && starts1[0].params.threadId === THREAD &&
+const starts1 = clientCalls('turn/start'), held1 = [{ envelope: envelope(3), type: 'verified-notification' }, { envelope: envelope(7), type: 'admitted-task' }, { envelope: envelope(8), type: 'admitted-task' }]
+ok('an envelope arriving while the thread is idle is injected once as turn/start', starts1[0].params.threadId === THREAD &&
   starts1[0].params.clientUserMessageId === `nvoy:${envelope(2)}` && starts1[0].params.input[0].text === codexTurnText({ envelope: envelope(2), type: 'admitted-task' }))
-ok('an envelope arriving mid-turn is queued once behind it with thread/queue/add, on the same thread', queues1.length === 1 && queues1[0].params.threadId === THREAD &&
-  queues1[0].params.clientUserMessageId === `nvoy:${envelope(3)}` && queues1[0].params.input[0].text === codexTurnText({ envelope: envelope(3), type: 'verified-notification' }) &&
+ok('a lone envelope keeps the single-message text', codexBatchText(held1.slice(0, 1)) === codexTurnText(held1[0]))
+ok('once the turn ends, the held envelopes go in together as one turn/start, oldest first', /injected 333333333333 and 2 more as a turn/.test(s1.out) &&
+  starts1.length === 2 && starts1[1].params.threadId === THREAD && starts1[1].params.clientUserMessageId === `nvoy:${envelope(3)}` &&
+  starts1[1].params.input.length === 1 && starts1[1].params.input[0].text === codexBatchText(held1) && !clientCalls('thread/queue/add').length &&
   fakeLog(codexHome).filter(m => m.began).map(m => m.via).join() === `nvoy:${envelope(2)},nvoy:${envelope(3)}`)
+ok('the batch text names every envelope, and its marker lines are last', held1.every(row => codexBatchText(held1).includes(`- envelope ${row.envelope} (${row.type})`)) &&
+  codexBatchText(held1).split('\n').slice(-3).join() === held1.map(row => `NVOY_ENVELOPE_ID=${row.envelope}`).join())
+const delivered1 = readText(join(codexHome, 'nvoy', 'delivered.jsonl')).split('\n').filter(Boolean).map(JSON.parse)
+ok('each held envelope is recorded once, against the one turn', held1.every(row => delivered1.filter(d => d.envelope === row.envelope).length === 1) &&
+  new Set(delivered1.filter(d => held1.some(row => row.envelope === d.envelope)).map(d => d.turn)).size === 1)
 ok('the baselined envelope is never injected', !JSON.stringify(fakeLog(codexHome)).includes(envelope(1)))
 ok('a request Codex makes of the client is left for an attached person, not declined', /Codex asked the client for item\/tool\/requestUserInput; left for an attached person/.test(s1.out) &&
   !fakeLog(codexHome).some(m => m.id === 'srv-1'))
@@ -369,7 +379,7 @@ ok('the feed runs on its own key through the hardened entry, with ssh keepalives
   sshArgs.includes(`-i ${feedKey}`) && /ServerAliveInterval=15 -o ServerAliveCountMax=3 -i \S+ nvoy-codex@broker\.example$/.test(sshArgs) && sshArgs.includes('BatchMode=yes'))
 ok('no key, login token or message body reaches a log', !/PRIVATE-KEY|CHATGPT-TOKEN|SECRET/.test(s1.out + readText(join(codexHome, 'nvoy', 'delivered.jsonl')) + readText(join(codexHome, 'nvoy', 'feed-cursor.json'))))
 ok('the delivered record and cursor are owner-only and name the last envelope', (statSync(join(codexHome, 'nvoy', 'delivered.jsonl')).mode & 0o777) === 0o600 &&
-  JSON.parse(readText(join(codexHome, 'nvoy', 'feed-cursor.json'))).cursor === envelope(3))
+  JSON.parse(readText(join(codexHome, 'nvoy', 'feed-cursor.json'))).cursor === envelope(8))
 const s2dup = startSupervisor()
 ok('a second supervisor on the same CODEX_HOME is refused', await Promise.race([s2dup.exited, wait(5000).then(() => 'hung')]) === 1 && /portable Codex harness already runs as pid/.test(s2dup.out))
 const otherHome = makeCodexHome(join(root, 'ch2'))
@@ -384,7 +394,7 @@ const s2 = startSupervisor(client, { HARNESS_RETRY_MS: '100' })
 await waitFor(() => /injected 444444444444 as a turn/.test(s2.out))
 ok('a restart resumes the same thread and injects only what arrived while it was down, once', /resumed the cx-test thread/.test(s2.out) &&
   clientCalls('thread/resume').some(m => m.params.threadId === THREAD) && clientCalls('thread/start').length === 1 &&
-  clientCalls('turn/start').length === 2 && clientCalls('turn/start')[1].params.clientUserMessageId === `nvoy:${envelope(4)}` && clientCalls('thread/queue/add').length === 1)
+  clientCalls('turn/start').length === 3 && clientCalls('turn/start')[2].params.clientUserMessageId === `nvoy:${envelope(4)}` && !clientCalls('thread/queue/add').length)
 ok('a resumed thread prints its attach command at ready', s2.out.indexOf(attachLine) >= 0 && s2.out.indexOf(attachLine) < s2.out.indexOf('injected 444444444444'))
 // The fleet recreates the adapter: the thread's channel MCP and the wake feed die together.
 await waitFor(() => /turn for 444444444444 ended/.test(s2.out))
@@ -404,6 +414,27 @@ appendFileSync(queue, record(6))
 ok('after the restart, new envelopes reach the thread again', await waitFor(() => /injected 666666666666 as a turn/.test(s2.out)) &&
   clientCalls('turn/start').at(-1).params.clientUserMessageId === `nvoy:${envelope(6)}`)
 await s2.stop()
+// A turn that outlasts the hold ceiling gets what it held queued behind it, as one submission.
+const recordAs = c => record(9).replaceAll(envelope(9), c.repeat(64))
+const s6 = startSupervisor(client, { HARNESS_HOLD_MAX_MS: '1000', HARNESS_BATCH_MAX: '2' })
+await waitFor(() => /session ready/.test(s6.out) && /wake feed connected/.test(s6.out))
+writeFileSync(join(codexHome, 'hold'), '')
+appendFileSync(queue, record(9))
+await waitFor(() => /injected 999999999999 as a turn/.test(s6.out))
+appendFileSync(queue, recordAs('a') + recordAs('b') + recordAs('c'))
+const ceiling = ['a', 'b', 'c'].map(c => ({ envelope: c.repeat(64), type: 'admitted-task' }))
+await waitFor(() => /holding 3 until the running turn ends/.test(s6.out))
+const heldAt = Date.now()
+const firstAt = await waitFor(() => /queued aaaaaaaaaaaa and 1 more behind a turn still running after 1s/.test(s6.out)) ? Date.now() : 0
+const secondAt = await waitFor(() => /queued cccccccccccc behind a turn still running after 1s/.test(s6.out)) ? Date.now() : 0
+const queuedAdds = clientCalls('thread/queue/add')
+ok('a turn that outlasts the hold ceiling gets its held envelopes queued behind it, in batches', firstAt && secondAt && queuedAdds.length === 2 &&
+  queuedAdds[0].params.clientUserMessageId === `nvoy:${'a'.repeat(64)}` && queuedAdds[0].params.input[0].text === codexBatchText(ceiling.slice(0, 2)) &&
+  queuedAdds[1].params.clientUserMessageId === `nvoy:${'c'.repeat(64)}` && queuedAdds[1].params.input[0].text === codexBatchText(ceiling.slice(2)))
+ok('what one batch could not take is queued at the same ceiling, not held again', firstAt - heldAt < 1500 && secondAt - firstAt < 500)
+rmSync(join(codexHome, 'hold'))
+ok('the queued batch runs as the next turn', await waitFor(() => fakeLog(codexHome).some(m => m.began && m.via === `nvoy:${'a'.repeat(64)}`)))
+await s6.stop()
 // A Codex without the tool-call method: the feed reconnect alone is the signal.
 for (const [file, answer] of [['no-probe', '-32600 unknown variant, as 0.149.1 answers'], ['no-probe-spec', '-32601, as JSON-RPC specifies']]) {
   writeFileSync(join(codexHome, file), '')

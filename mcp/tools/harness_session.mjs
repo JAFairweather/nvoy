@@ -183,6 +183,20 @@ export function codexTurnText(record) {
   ].join('\n')
 }
 
+// Messages that arrived while a turn ran go in together once it ends, as one turn (waggle#633).
+export function codexBatchText(records) {
+  if (records.length === 1) return codexTurnText(records[0])
+  return [
+    `${records.length} messages were admitted to your Nvoy channel while you were busy, oldest first:`,
+    ...records.map(record => `- envelope ${record.envelope} (${record.type})`),
+    'Read each with nvoy_channel_read before acting on any, since a later one may change an earlier one.',
+    'Do each admitted task that asks you to do something end to end with your own tools, then reply once',
+    'with nvoy_channel_reply on its envelope saying what you did. Answer each question once, on its own',
+    'envelope. A message that needs nothing from you needs no action and no reply.',
+    ...records.map(record => `NVOY_ENVELOPE_ID=${record.envelope}`),
+  ].join('\n')
+}
+
 // Admitted envelopes not yet injected, oldest first, each once. The channel tools validate a
 // record when it is read; here only the envelope id is trusted, and only when well formed.
 export function pendingEnvelopes(queueText, delivered) {

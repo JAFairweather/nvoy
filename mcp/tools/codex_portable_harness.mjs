@@ -10,9 +10,11 @@
 //   metadata (codex-channel-feed.mjs) over a long-lived, non-blocking ssh; the supervisor keeps an
 //   envelope cursor and reconnects from it with backoff. The feed also holds the fleet-side lock
 //   that makes this the identity's only Codex consumer.
-// - Injection. A person may be mid-turn, so an envelope becomes `turn/start` only when the thread
-//   is idle, and otherwise `thread/queue/add` (experimental API), which runs it after the current
-//   turn. Either way it carries `clientUserMessageId: nvoy:<envelope>` and is recorded once.
+// - Injection. A person may be mid-turn, so envelopes become `turn/start` only when the thread is
+//   idle. Those that arrive mid-turn are held and go in together, as one turn, when it ends: one
+//   turn each was most of an agent's day (waggle#633). A turn that outlasts HARNESS_HOLD_MAX_MS
+//   gets them as one `thread/queue/add` (experimental API) instead, which runs after it. Either
+//   way the input carries `clientUserMessageId: nvoy:<first envelope>`, and each is recorded once.
 //
 // The channel MCP is an ssh into the fleet's adapter container, which each release or manifest
 // change recreates. Codex never restarts a dead MCP server: every later tool call fails with
@@ -30,7 +32,7 @@ import { homedir } from 'node:os'
 import { isAbsolute, resolve } from 'node:path'
 import { fixedPath, knownHostsFile, privateFile, sshChannelEntry, SSH, SSH_TARGET } from './channel_client.mjs'
 import { instanceId } from './runtime_manifest.mjs'
-import { codexConfigToml, codexTurnText, defaultInstructions, serverName } from './harness_session.mjs'
+import { codexBatchText, codexConfigToml, defaultInstructions, serverName } from './harness_session.mjs'
 import { openThread } from './codex_harness.mjs'
 import { connectWsPeer } from './codex_ws_peer.mjs'
 import { claimPidLock } from './pid_lock.mjs'
@@ -121,6 +123,8 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
   const RETRY_MS = Number(process.env.HARNESS_RETRY_MS || 5000)
   const PROBE_MS = Number(process.env.HARNESS_CHANNEL_PROBE_MS || 30000)
   const STOP_MS = Number(process.env.HARNESS_STOP_MS || 5000)
+  const HOLD_MAX_MS = Number(process.env.HARNESS_HOLD_MAX_MS || 900000)
+  const BATCH_MAX = Math.max(1, Number(process.env.HARNESS_BATCH_MAX || 20))
   const writePrivate = (path, value) => { writeFileSync(path, value, { mode: 0o600 }); chmodSync(path, 0o600) }
   for (const dir of [workdir, privateDir, ctlDir]) { mkdirSync(dir, { recursive: true, mode: 0o700 }); chmodSync(dir, 0o700) }
   const release = claimPidLock(resolve(privateDir, 'supervisor.lock'), config.id, 'portable Codex harness')
@@ -270,41 +274,56 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
       })
       log(`${config.id} session ready; admitted messages will be injected into the thread`)
       log(attachable ? `attach: ${attachCommand({ codexHome, socket, threadId })}` : 'attach: available after the thread\'s first turn, when Codex saves it; the command is printed then')
+      // Held: arrivals not yet delivered while a turn runs, until the ceiling since the first of them.
+      let heldSince = 0, heldNoted = 0
+      const fresh = rows => rows.filter(row => !delivered.has(row.envelope))
+      const holding = () => busy && fresh(pending).length > 0 && (heldSince ||= Date.now()) + HOLD_MAX_MS > Date.now()
       while (!stopping() && !server.closed) {
         if (down && !busy) { log(`restarting codex app-server to reconnect the channel (${down})`); break }
         const next = pending[0]
         if (down || (!next && !recheck)) { await Promise.race([new Promise(done => { wake = done }), server.exited]); continue }
         const reconnected = recheck
+        if (!reconnected && holding()) {
+          const held = fresh(pending).length
+          if (held > heldNoted) { heldNoted = held; log(`holding ${held} until the running turn ends`) }
+          await Promise.race([new Promise(done => { wake = done }), server.exited, sleep(heldSince + HOLD_MAX_MS - Date.now())])
+          continue
+        }
         recheck = false
-        const why = reconnected || !delivered.has(next.envelope) ? await channelDown() : ''
+        const batch = pending.slice(0, BATCH_MAX), rows = fresh(batch)
+        const why = reconnected || rows.length ? await channelDown() : ''
         if (why || (why === null && reconnected)) {
           down = why || 'the wake feed reconnected'
           log(`the channel to the fleet is down (${down}); codex app-server restarts once no turn is running`)
           continue
         }
-        if (!next) continue
-        if (!delivered.has(next.envelope)) {
-          const input = [{ type: 'text', text: codexTurnText(next) }], clientUserMessageId = `nvoy:${next.envelope}`
+        if (!next || holding()) continue
+        if (rows.length) {
+          const input = [{ type: 'text', text: codexBatchText(rows) }], clientUserMessageId = `nvoy:${rows[0].envelope}`
+          const what = `${rows[0].envelope.slice(0, 12)}${rows.length > 1 ? ` and ${rows.length - 1} more` : ''}`
           let turn = ''
           if (!busy) {
             try {
               turn = String((await server.request('turn/start', { threadId, input, clientUserMessageId }))?.turn?.id || '')
               if (!turn) throw new Error('Codex returned no turn id')
-              busy = !ended.has(turn); turnEnvelope.set(turn, next.envelope)
-            } catch (error) { if (server.closed) throw error; log(`turn/start refused (${error.message}); queueing behind the running turn`) }
+              busy = !ended.has(turn); turnEnvelope.set(turn, rows[0].envelope)
+            } catch (error) { if (server.closed) throw error; log(`turn/start refused (${error.message}); holding ${what} until the running turn ends`); busy = true; continue }
           }
           if (turn) {
-            markDelivered(next.envelope, { turn })
-            log(`injected ${next.envelope.slice(0, 12)} as a turn`)
+            for (const row of rows) markDelivered(row.envelope, { turn })
+            log(`injected ${what} as a turn`)
           } else {
             const queued = String((await server.request('thread/queue/add', { threadId, input, clientUserMessageId }))?.queuedSubmission?.id || '')
             if (!queued) throw new Error('Codex returned no queued submission id')
-            markDelivered(next.envelope, { queued })
-            log(`queued ${next.envelope.slice(0, 12)} behind the running turn`)
+            for (const row of rows) markDelivered(row.envelope, { queued })
+            log(`queued ${what} behind a turn still running after ${Math.round(HOLD_MAX_MS / 1000)}s`)
           }
         }
-        pending.shift(); announced.delete(next.envelope)
-        saveCursor(next.envelope)
+        for (const row of batch) { pending.shift(); announced.delete(row.envelope) }
+        saveCursor(batch.at(-1).envelope)
+        // What a batch could not take keeps its first arrival's deadline, so it is not held twice.
+        heldNoted = 0
+        if (!fresh(pending).length) heldSince = 0
       }
     } catch (error) {
       log(`codex harness: ${error.message}`)

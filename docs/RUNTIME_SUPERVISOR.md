@@ -904,10 +904,13 @@ owner's ChatGPT subscription rather than an API key, which a person can attach t
   A failed call restarts `codex app-server` and resumes the same thread, but only once no turn is
   running. Restarts back off from `HARNESS_RETRY_MS` (5s). A Codex without that method restarts on
   every feed reconnect instead.
-- **Injection.** When the thread is idle an envelope becomes `turn/start`. When a turn is running
-  (yours, typed in the TUI, or an earlier envelope's) it is queued with `thread/queue/add`, which
-  needs the experimental API. Each one carries `clientUserMessageId: nvoy:<envelope>` and is
-  recorded once in `<codex_home>/nvoy/delivered.jsonl`.
+- **Injection.** When the thread is idle an envelope becomes `turn/start`. Envelopes that arrive
+  while a turn is running (yours, typed in the TUI, or an earlier envelope's) are held. When the
+  turn ends they go in together, oldest first, as one `turn/start` naming each of them, up to
+  `HARNESS_BATCH_MAX` (20). A turn still running after `HARNESS_HOLD_MAX_MS` (15 min) gets them
+  as one `thread/queue/add` instead, which needs the experimental API. The input carries
+  `clientUserMessageId: nvoy:<first envelope>`, and each envelope is recorded once in
+  `<codex_home>/nvoy/delivered.jsonl`.
 - **Login.** `codex_home` is the harness's own `CODEX_HOME`, never `~/.codex`. Its `config.toml`
   is rewritten on each start with `forced_login_method = "chatgpt"`,
   `cli_auth_credentials_store = "file"`, no provider block, `approval_policy = "never"`,
