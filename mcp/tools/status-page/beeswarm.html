@@ -133,7 +133,6 @@
   dl.rights { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 4px 10px; margin: 8px 0 0; }
   dl.rights dt { font: 12px/1.5 var(--mono); color: var(--dim); } dl.rights dd { margin: 0; overflow-wrap: anywhere; }
   .manage { margin: 14px 0 0; font-size: 13px; } .manage a { color: var(--accent); }
-  a.act { color: var(--accent); font: 11px/1.5 var(--mono); text-decoration: none; padding: 0 4px; border-radius: 4px; } a.act:hover, a.act:focus-visible { background: color-mix(in srgb, var(--accent) 18%, transparent); text-decoration: underline; }
   svg.swarm { display: block; width: 100%; height: auto; }
   .fleet rect { fill: color-mix(in srgb, var(--accent) 5%, transparent); stroke: var(--line-strong); stroke-dasharray: 2 4; }
   .fleet text { fill: var(--dim); font: 12px var(--mono); }
@@ -178,7 +177,7 @@
   <div id="view"><div class="age red">loading…</div></div>
   <footer>Instructs is a live task grant: its arrow points from who may instruct to the agent that will listen.
     Wakes is a may_post.mention right. Identities are shown by name and 8-hex prefix only.
-    Grants are signed and revoked in the <a href="https://waggle.nave.pub/console/">waggle console</a>; this page shows the result within a minute.</footer>
+    Grants are changed on the <a href="https://waggle.nave.pub/console/hive.html">waggle hive page</a>; this page shows the result within a minute.</footer>
 </main>
 <script type="module">
   import { renderSwarm, edgeKey, VIEWS } from './beeswarm-view.mjs'

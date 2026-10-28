@@ -42,8 +42,9 @@ first visit sets the baseline.
 Phones get the same tiers in two columns. A view or a node can be linked with `#agents`, `#matrix` or
 `#<name>`.
 
-The page signs nothing. Grants are issued and revoked in the waggle console, and the page shows the
-result within a minute; the side panel links there.
+The page signs nothing and has no grant or revoke links. Grants are changed on the waggle hive page
+(`/console/hive.html`), and this page shows the result within a minute. A selected key's side panel
+links to its row there (`hive.html#agent=<prefix>`, waggle#613 M4).
 
 The data is the `swarm` section of `status.json`, built by `swarmView()`. It passes the same sanitiser
 as the rest of the snapshot, so it carries names and 8-hex prefixes only.
