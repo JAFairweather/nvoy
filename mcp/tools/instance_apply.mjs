@@ -5,8 +5,8 @@
 //   1. principal planned   the authorized_keys line is decided BEFORE anything changes, so a file
 //                          already holding a different line under this identity's comment refuses
 //                          the whole apply rather than half of it.
-//   2. block recorded      the record is read again here, immediately before the install; a block it
-//                          already holds for another identity refuses. The UID/GID block is then
+//   2. block recorded      under an exclusive lock, the record is read again immediately before the
+//                          install; a block it already holds for another identity refuses. The UID/GID block is then
 //                          appended and synced BEFORE the deploy trigger, so no container ever runs
 //                          as numbers the record lacks. A record that cannot be read or written stops
 //                          the apply with nothing installed. A block recorded for an install that then
@@ -81,6 +81,38 @@ export function deployVerdict({ id, digest, deployed, failed, composeExists, ins
 
 const readJson = path => { try { return JSON.parse(readFileSync(path, 'utf8')) } catch { return null } }
 
+// Read the record, refuse a clash, append and fsync: one step, under an exclusive lock beside the
+// record, so two applies cannot both read it clear and both take the same block. The lock is
+// created O_EXCL and never waited on: a held lock refuses, and the operator re-runs.
+export function reserveBlock(ledgerPath, manifest, now = () => Date.now()) {
+  if (!ledgerPath) return { ok: false, detail: 'no block record path was given' }
+  const lock = `${ledgerPath}.lock`
+  let lockFd
+  try { lockFd = openSync(lock, 'wx', 0o644); writeSync(lockFd, `${process.pid}\n`) } catch (e) {
+    if (lockFd !== undefined) { closeSync(lockFd); unlinkSync(lock) }
+    return { ok: false, detail: e.code === 'EEXIST'
+      ? `${lock} is held: another apply is reserving a block. Re-run when it finishes; if none is running, an apply died holding it, so check the record, then remove the lock`
+      : `${lock}: ${e.message}` }
+  }
+  try {
+    let record
+    try { record = existsSync(ledgerPath) ? parseBlockRecord(readFileSync(ledgerPath, 'utf8')) : [] }
+    catch (e) { return { ok: false, detail: `${ledgerPath}: ${e.message}` } }
+    const clashes = recordedClashes(record, manifest)
+    if (clashes.length) return { ok: false, detail: `the block overlaps ${[...new Set(clashes.map(e => e.id))].join(', ')} in ${ledgerPath}, numbers once installed` }
+    if (record.some(e => e.id === manifest.id && NUMERIC_FIELDS.every(f => e[f] === manifest[f]))) return { ok: true, detail: `already in ${ledgerPath} for ${manifest.id}` }
+    const block = Object.fromEntries(NUMERIC_FIELDS.map(f => [f, manifest[f]]))
+    let fd
+    try {
+      fd = openSync(ledgerPath, 'a', 0o644)
+      writeSync(fd, JSON.stringify({ id: manifest.id, ...block, recorded_at: Math.floor(now() / 1000) }) + '\n')
+      fsyncSync(fd)
+    } catch (e) { return { ok: false, detail: `${ledgerPath}: ${e.message}` } }
+    finally { if (fd !== undefined) closeSync(fd) }
+    return { ok: true, detail: `appended to ${ledgerPath}` }
+  } finally { closeSync(lockFd); unlinkSync(lock) }
+}
+
 // `run(argv)` returns { status, stdout, stderr }. `sleep` and `now` (ms) are injected for the suite.
 export async function applyStaged({ manifest, stagedPath, root, stateDir, keysPath, publicKey, run, ledgerPath, waitMs = 600000, pollMs = 5000,
   sleep = ms => new Promise(r => setTimeout(r, ms)), now = () => Date.now(), log = () => {} }) {
@@ -97,24 +129,9 @@ export async function applyStaged({ manifest, stagedPath, root, stateDir, keysPa
   done('principal planned', true, plan.action === 'present' ? 'already present, unchanged' : `will append ${principalComment(manifest)}`)
 
   // 2. Reserve the block in the record, as the record is now, before anything can run as it.
-  if (!ledgerPath) return done('block recorded', false, 'no block record path was given; nothing was installed')
-  let record
-  try { record = existsSync(ledgerPath) ? parseBlockRecord(readFileSync(ledgerPath, 'utf8')) : [] }
-  catch (e) { return done('block recorded', false, `${ledgerPath}: ${e.message}; nothing was installed`) }
-  const clashes = recordedClashes(record, manifest)
-  if (clashes.length) return done('block recorded', false, `the block overlaps ${[...new Set(clashes.map(e => e.id))].join(', ')} in ${ledgerPath}, numbers once installed; nothing was installed`)
-  const already = record.some(e => e.id === id && NUMERIC_FIELDS.every(f => e[f] === manifest[f]))
-  if (!already) {
-    const block = Object.fromEntries(NUMERIC_FIELDS.map(f => [f, manifest[f]]))
-    let fd
-    try {
-      fd = openSync(ledgerPath, 'a', 0o644)
-      writeSync(fd, JSON.stringify({ id, ...block, recorded_at: Math.floor(now() / 1000) }) + '\n')
-      fsyncSync(fd)
-    } catch (e) { return done('block recorded', false, `${ledgerPath}: ${e.message}; nothing was installed`) }
-    finally { if (fd !== undefined) closeSync(fd) }
-  }
-  done('block recorded', true, already ? `already in ${ledgerPath} for ${id}` : `appended to ${ledgerPath}`)
+  const reserved = reserveBlock(ledgerPath, manifest, now)
+  if (!reserved.ok) return done('block recorded', false, `${reserved.detail}; nothing was installed`)
+  done('block recorded', true, reserved.detail)
 
   // 3. Install: write beside the target (same filesystem), then a no-clobber link. A name not ending
   //    in .json is invisible to the runner's glob.

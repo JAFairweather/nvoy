@@ -6,6 +6,8 @@
 //   - nothing is installed while authorized_keys already holds a conflicting line for this identity;
 //   - the block is recorded before the install, read again first: a block recorded for another
 //     identity, an unreadable record or a failed write each stop the apply with nothing installed;
+//   - that read, clash check and append happen under one exclusive lock, so two applies cannot
+//     both take the same block;
 //   - the install never clobbers, and the runner's glob never sees the temporary file;
 //   - "deployed" means the runner recorded THIS manifest's digest, not that a tick happened;
 //   - a failed tick that saw this manifest withdraws it, a failure from an earlier estate does not,
@@ -15,13 +17,13 @@
 //
 //   node test/instance-apply.mjs
 
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync, readdirSync } from 'node:fs'
+import { chmodSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { allocateIdentityBlock, buildParticipantManifest, NUMERIC_FIELDS } from '../mcp/tools/identity_allocation.mjs'
 import { readManifest } from '../mcp/tools/runtime_manifest.mjs'
 import { principalLine } from '../mcp/tools/participant_unit.mjs'
-import { applyStaged, deployVerdict, digestOf, estateHash, principalPlan, readPublicKey } from '../mcp/tools/instance_apply.mjs'
+import { applyStaged, deployVerdict, digestOf, estateHash, principalPlan, readPublicKey, reserveBlock } from '../mcp/tools/instance_apply.mjs'
 
 let pass = true
 const check = (cond, label) => { console.log(`${cond ? 'ok  ' : 'FAIL'} — ${label}`); if (!cond) pass = false }
@@ -145,6 +147,43 @@ const blockOf = (id, m = manifest) => JSON.stringify({ id, ...Object.fromEntries
   const r = await go()
   check(r.ok && /already in/.test(r.states[1].detail) && readFileSync(ctx.ledger, 'utf8') === blockOf('hr'),
     'the same identity re-applied with the same block (after a withdrawal) is its own record, not a clash, and is not duplicated')
+}
+{
+  const { ctx, go } = scenario({ runner: deploys, record: '' })
+  chmodSync(ctx.ledger, 0o444)
+  const r = await go()
+  check(!r.ok && states(r) === 'principal planned:true block recorded:false' && !existsSync(join(ctx.root, 'hr.json')) && !existsSync(`${ctx.ledger}.lock`),
+    'a record that can be read but not appended to stops the apply, and the lock is released')
+}
+
+// ── two contenders for one block ────────────────────────────────────────────────────────────────
+{
+  const dir = join(tmp, 'contend'); mkdirSync(dir)
+  const ledger = join(dir, 'identity-blocks.jsonl'), lock = `${ledger}.lock`
+  const other = { ...manifest, id: 'hr2' }
+  writeFileSync(lock, '4242\n')
+  const held = reserveBlock(ledger, other)
+  check(!held.ok && /is held/.test(held.detail) && readFileSync(lock, 'utf8') === '4242\n' && !existsSync(ledger),
+    'while another apply holds the lock, a second refuses at once and leaves that lock alone')
+  rmSync(lock)
+  check(reserveBlock(ledger, manifest).ok && !existsSync(lock), 'the first contender reserves the block and releases the lock')
+  const late = reserveBlock(ledger, other)
+  check(!late.ok && /overlaps hr /.test(late.detail) && readFileSync(ledger, 'utf8').trim().split('\n').length === 1 && !existsSync(lock),
+    'the second, once the lock is free, finds the block taken: one line in the record, lock released')
+
+  // Two processes released at the same instant: exactly one may hold the block.
+  const { spawn } = await import('node:child_process')
+  const raceLedger = join(dir, 'race.jsonl'), at = Date.now() + 400
+  const code = `import { reserveBlock } from ${JSON.stringify(new URL('../mcp/tools/instance_apply.mjs', import.meta.url).href)}
+const [ledger, at, m] = process.argv.slice(1); while (Date.now() < Number(at));
+console.log(JSON.stringify(reserveBlock(ledger, JSON.parse(m))))`
+  const contender = m => new Promise(res => {
+    const c = spawn(process.execPath, ['--input-type=module', '-e', code, raceLedger, String(at), JSON.stringify(m)])
+    let out = ''; c.stdout.on('data', d => { out += d }); c.on('close', () => { try { res(JSON.parse(out)) } catch { res({ ok: false, detail: `no result: ${out}` }) } })
+  })
+  const results = await Promise.all([contender(manifest), contender(other)])
+  check(results.filter(x => x.ok).length === 1 && readFileSync(raceLedger, 'utf8').trim().split('\n').length === 1 && !existsSync(`${raceLedger}.lock`),
+    `two processes racing for one block: one reserves it, the other is refused (${results.map(x => x.ok ? 'reserved' : /is held/.test(x.detail) ? 'lock held' : /overlaps/.test(x.detail) ? 'block taken' : x.detail).join(' / ')})`)
 }
 {
   const { ctx, go } = scenario({ runner: ({ root, state }) => writeFileSync(join(state, 'FAILED_ATTEMPT.json'), JSON.stringify({ attempt: `abc ${estateHash(root)}`, at: Date.now() })) })

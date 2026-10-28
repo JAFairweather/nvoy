@@ -91,8 +91,9 @@ once, through `nvoy-runtime-deploy.path`, so it comes last.
 
 `apply` is that last step. It runs `check` again and refuses unless it passes. It then decides the
 channel principal, and refuses if `authorized_keys` already holds a different line under this
-identity's comment. Next it reads `identity-blocks.jsonl` again, refuses a block recorded for
-another identity, and appends and syncs this block, all before the install. A record it cannot read
+identity's comment. Next, under an exclusive lock beside the record, it reads `identity-blocks.jsonl`
+again, refuses a block recorded for another identity, and appends and syncs this block, all before
+the install. A held lock refuses at once; two applies cannot both take one block. A record it cannot read
 or write stops the apply with nothing installed. It then installs the manifest without clobbering,
 and waits until the runner
 records this manifest's digest in `DEPLOYED_MANIFESTS.json`. Only then does it append the principal,
