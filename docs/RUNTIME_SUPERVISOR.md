@@ -90,7 +90,8 @@ once, through `nvoy-runtime-deploy.path`, so it comes last.
 
 `apply` is that last step. It runs `check` again and refuses unless it passes. It then decides the
 channel principal, and refuses if `authorized_keys` already holds a different line under this
-identity's comment. Next it installs the manifest without clobbering, and waits until the runner
+identity's comment. Next it installs the manifest without clobbering, records the block in
+`identity-blocks.jsonl` so it is never allocated again, and waits until the runner
 records this manifest's digest in `DEPLOYED_MANIFESTS.json`. Only then does it append the principal,
 run `instance-unit.mjs verify`, and baseline the channel. It reports each state on its own line.
 If a tick that saw the new manifest fails, the runner rolls back every identity, so `apply`

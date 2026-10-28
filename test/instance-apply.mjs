@@ -76,7 +76,8 @@ const scenario = ({ keys = `${unrelated}\n`, runner, verifyStatus = 0, preinstal
   const calls = []
   let clock = 2_000_000
   const ctx = { root, state, keysPath, calls }
-  return { ctx, go: () => applyStaged({ manifest, stagedPath, root, stateDir: state, keysPath, publicKey: KEY, waitMs, pollMs: 5000,
+  ctx.ledger = join(dir, 'identity-blocks.jsonl')
+  return { ctx, go: () => applyStaged({ manifest, stagedPath, root, stateDir: state, keysPath, publicKey: KEY, waitMs, pollMs: 5000, ledgerPath: ctx.ledger,
     now: () => clock, sleep: async ms => { clock += ms; runner?.(ctx, clock / 1000) },
     run: argv => { calls.push(argv[0]); return argv[0] === 'verify' ? { status: verifyStatus, stdout: 'verified', stderr: verifyStatus ? 'FAIL — forced command' : '' } : { status: 0, stdout: 'baselined 3', stderr: '' } } }) }
 }
@@ -89,18 +90,20 @@ const states = r => r.states.map(s => `${s.state}:${s.ok}`).join(' ')
 {
   const { ctx, go } = scenario({ runner: deploys })
   const r = await go()
-  check(r.ok && states(r) === 'principal planned:true installed:true deployed:true principal seated:true principal verified:true baselined:true', `the whole sequence, each state reported: ${states(r)}`)
+  check(r.ok && states(r) === 'principal planned:true installed:true block recorded:true deployed:true principal seated:true principal verified:true baselined:true', `the whole sequence, each state reported: ${states(r)}`)
   check(readFileSync(join(ctx.root, 'hr.json')).equals(readFileSync(stagedPath)), 'the installed bytes are the staged bytes')
   check(readdirSync(ctx.root).sort().join(',') === 'hr.compose.yml,hr.json,pi-dog.json', 'no temporary file is left behind in the instance root')
   const lines = readFileSync(ctx.keysPath, 'utf8').split('\n').filter(Boolean)
   check(lines.length === 2 && lines[0] === unrelated && lines[1] === want, 'the principal is appended once, after the unrelated line it found')
   check(ctx.calls.join(',') === 'verify,baseline', 'instance-unit verify runs, then the baseline')
+  const rec = JSON.parse(readFileSync(ctx.ledger, 'utf8'))
+  check(rec.id === 'hr' && rec.watcherUid === manifest.watcherUid && rec.workerHandoffGid === manifest.workerHandoffGid, 'the block is recorded in identity-blocks.jsonl')
   check(principalPlan(readFileSync(ctx.keysPath, 'utf8'), manifest, KEY).action === 'present', 'a re-run would find the principal present and add nothing')
 }
 {
   const { ctx, go } = scenario({ keys: principalLine(manifest, OTHER_KEY.keyType, OTHER_KEY.keyBody) + '\n', runner: deploys })
   const r = await go()
-  check(!r.ok && states(r) === 'principal planned:false' && !existsSync(join(ctx.root, 'hr.json')), 'a conflicting principal refuses BEFORE anything is installed')
+  check(!r.ok && states(r) === 'principal planned:false' && !existsSync(join(ctx.root, 'hr.json')) && !existsSync(ctx.ledger), 'a conflicting principal refuses BEFORE anything is installed or recorded')
 }
 {
   const { ctx, go } = scenario({ preinstall: true, runner: deploys })
@@ -115,6 +118,7 @@ const states = r => r.states.map(s => `${s.state}:${s.ok}`).join(' ')
   check(!r.ok && states(r).endsWith('deployed:false') && !existsSync(join(ctx.root, 'hr.json')) && /withdrawn/.test(r.states.at(-1).detail),
     'a failed tick that saw this manifest: it is withdrawn, so the estate-wide rollback does not repeat')
   check(readFileSync(ctx.keysPath, 'utf8') === `${unrelated}\n`, 'and no principal was seated for an agent that never started')
+  check(existsSync(ctx.ledger) && JSON.parse(readFileSync(ctx.ledger, 'utf8')).id === 'hr', 'but its block stays recorded: a container may have written files as those numbers')
 }
 {
   const { ctx, go } = scenario({ waitMs: 15000, runner: ({ state }) => writeFileSync(join(state, 'FAILED_ATTEMPT.json'), JSON.stringify({ attempt: 'abc not-this-estate', at: Date.now() })) })

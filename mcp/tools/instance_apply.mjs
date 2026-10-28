@@ -7,6 +7,9 @@
 //                          the whole apply rather than half of it.
 //   2. installed           the staged bytes land in the instance root under a no-clobber link. That
 //                          IS the deploy trigger (see instance-identity.mjs).
+//      block recorded      the UID/GID block is appended to identity-blocks.jsonl at once, before any
+//                          container can write a file as those numbers, so it is never allocated again
+//                          even if this identity is withdrawn or later retired.
 //   3. deployed            the runner recorded this exact manifest digest and wrote its compose file.
 //                          A FAILED_ATTEMPT naming the estate as installed means a tick that saw
 //                          this manifest failed and the runner rolled every identity back; the manifest is then withdrawn, because
@@ -25,6 +28,7 @@ import { createHash } from 'node:crypto'
 import { appendFileSync, existsSync, linkSync, lstatSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { parsePrincipal, principalComment, principalLine } from './participant_unit.mjs'
+import { NUMERIC_FIELDS } from './identity_allocation.mjs'
 
 const KEY_LINE = /^(ssh-ed25519|ecdsa-sha2-nistp256)\s+([A-Za-z0-9+/]+={0,2})(?:\s+\S.*)?$/
 
@@ -74,7 +78,7 @@ export function deployVerdict({ id, digest, deployed, failed, composeExists, ins
 const readJson = path => { try { return JSON.parse(readFileSync(path, 'utf8')) } catch { return null } }
 
 // `run(argv)` returns { status, stdout, stderr }. `sleep` and `now` (ms) are injected for the suite.
-export async function applyStaged({ manifest, stagedPath, root, stateDir, keysPath, publicKey, run, waitMs = 600000, pollMs = 5000,
+export async function applyStaged({ manifest, stagedPath, root, stateDir, keysPath, publicKey, run, ledgerPath, waitMs = 600000, pollMs = 5000,
   sleep = ms => new Promise(r => setTimeout(r, ms)), now = () => Date.now(), log = () => {} }) {
   const states = []
   const done = (state, ok, detail) => { states.push({ state, ok, detail }); log(state, ok, detail); return { ok, states } }
@@ -102,6 +106,11 @@ export async function applyStaged({ manifest, stagedPath, root, stateDir, keysPa
   }
   unlinkSync(temp)
   done('installed', true, `${target} (sha256 ${digest.slice(0, 12)}…)`)
+  const block = Object.fromEntries(NUMERIC_FIELDS.map(f => [f, manifest[f]]))
+  try {
+    appendFileSync(ledgerPath, JSON.stringify({ id, ...block, installed_at: Math.floor(installedAt) }) + '\n', { mode: 0o644 })
+    done('block recorded', true, `${ledgerPath}`)
+  } catch (e) { done('block recorded', false, `${ledgerPath}: ${e.message}. Add the line by hand, or the block may be reused`) }
   const estate = estateHash(root)
 
   // 3. Wait for the runner to record exactly this manifest.
@@ -135,5 +144,6 @@ export async function applyStaged({ manifest, stagedPath, root, stateDir, keysPa
   if (verify.status !== 0) return done('principal verified', false, (verify.stderr || verify.stdout).trim().split('\n').slice(-3).join(' | '))
   done('principal verified', true, 'instance-unit verify passed')
   const baseline = run(['baseline'])
-  return done('baselined', baseline.status === 0, (baseline.status === 0 ? baseline.stdout : baseline.stderr || baseline.stdout).trim().split('\n').slice(-1)[0] || `exit ${baseline.status}`)
+  done('baselined', baseline.status === 0, (baseline.status === 0 ? baseline.stdout : baseline.stderr || baseline.stdout).trim().split('\n').slice(-1)[0] || `exit ${baseline.status}`)
+  return { ok: states.every(st => st.ok), states }
 }

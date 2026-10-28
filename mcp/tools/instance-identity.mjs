@@ -71,6 +71,9 @@ if (!['audit', 'allocate', 'check', 'apply'].includes(verb)) {
     + ' | apply --id <name> --public-key-file <path> --authorized-keys <path>')
 }
 const outDir = resolve(flag('--out') || join(process.env.HOME || '/tmp', '.nvoy', 'staged'))
+// The durable record of every block ever installed, beside the instance root. Without it a retired
+// top identity's numbers would look free. A record that exists but cannot be read is INCONCLUSIVE.
+const ledger = join(dirname(root), 'identity-blocks.jsonl')
 
 // ---- read the estate ----------------------------------------------------------------------------
 // A manifest we cannot read is INCONCLUSIVE, never "not there". Treating an unreadable sibling as
@@ -169,7 +172,7 @@ if (verb === 'check' || verb === 'apply') {
   const waitS = Number(flag('--wait-s') || 600)
   if (!Number.isInteger(waitS) || waitS < 30 || waitS > 3600) die('--wait-s is 30..3600')
   console.log(`\napply ${id}:`)
-  const result = await applyStaged({ manifest: m, stagedPath: join(outDir, `${id}.json`), root, keysPath, publicKey, run,
+  const result = await applyStaged({ manifest: m, stagedPath: join(outDir, `${id}.json`), root, keysPath, publicKey, run, ledgerPath: ledger,
     stateDir: resolve(flag('--state-dir') || '/var/lib/nvoy-deploy'), waitMs: waitS * 1000,
     log: (state, ok, detail) => console.log(`  ${ok === null ? 'INCONCLUSIVE' : ok ? 'PASS' : 'FAIL'}  ${state}: ${detail}`) })
   console.log(result.ok ? `\n${id} is installed, deployed, seated and baselined. The pairing and a live wake are still yours to prove.`
@@ -186,9 +189,6 @@ if (like) {
 const relays = all('--relay').length ? all('--relay') : template?.relays || []
 const grantors = all('--grantor').length ? all('--grantor') : template?.grantors || []
 if (!grantors.length || !relays.length) die('give --grantor and --relay, or --like <id> to take them from an agent this one should work like')
-// The durable record of every block ever installed, beside the instance root. Without it a retired
-// top identity's numbers would look free. A record that exists but cannot be read is INCONCLUSIVE.
-const ledger = join(dirname(root), 'identity-blocks.jsonl')
 let used = []
 if (existsSync(ledger)) {
   try { used = readFileSync(ledger, 'utf8').split('\n').filter(l => l.trim()).map(l => JSON.parse(l)) } catch (e) {
