@@ -78,8 +78,9 @@ node mcp/tools/instance-identity.mjs allocate --id <name> --pubkey <64 hex> --li
 node mcp/tools/instance-identity.mjs check --id <name>
 ```
 
-`allocate` picks the next free UID/GID block (the cross-identity check `assertNoCollisions` does
-not make), copies the named agent's `buzz`, `may_post`, `agent_limits`, `agent_card` and
+`allocate` picks a UID/GID block clear of every identity (a check `assertNoCollisions` does not
+make), above every block ever used: the installed manifests plus `identity-blocks.jsonl` beside the
+instance root, so a retired identity's numbers are never reused. It copies the named agent's `buzz`, `may_post`, `agent_limits`, `agent_card` and
 `task_carriers`, validates the result with `readManifest`, and writes it to a staging directory.
 `check` fails unless the staged manifest is clear of every installed identity and both Bunker
 credential files are seated root-owned `0600`. Installing the staged file starts the deploy at

@@ -107,11 +107,18 @@ check(allocateIdentityBlock([], { id: 'oliver' }).id === 'oliver', 'PAIR: a well
 // uids outlive the manifests that named them — files on a volume, entries in a log. Handing a
 // retired identity's numbers to a new one makes the old artefacts read as the new agent's.
 const afterRetirement = allocateIdentityBlock([{ id: 'oliver', ...third.block }], { id: 'fresh' })
-check(afterRetirement.block.watcherUid === UID_BASE,
-  'a gap left by a retired identity is filled only when it is the LOWEST free stride')
+check(afterRetirement.block.watcherUid === 41041,
+  'codex-jaf and claude-jaf retired, oliver still installed: the new block goes ABOVE oliver, not into the freed 41011')
 const gapped = allocateIdentityBlock([codex, { id: 'oliver', ...third.block }], { id: 'fresh' })
-check(gapped.block.watcherUid === 41021 && !occupiedNumbers([codex, { id: 'oliver', ...third.block }]).uids.has(41021),
-  'allocation lands on a stride boundary, never mid-decade')
+check(gapped.block.watcherUid === 41041 && gapped.block.brokerAdapterGid === 42041,
+  'the decade claude-jaf left between two live identities stays empty')
+const topRetired = allocateIdentityBlock([codex], { id: 'fresh', used: [{ id: 'oliver', ...third.block }] })
+check(topRetired.block.watcherUid === 41041,
+  'the TOP identity retired: the durable record of used blocks still keeps its decade out of reach')
+check(allocateIdentityBlock([codex], { id: 'fresh' }).block.watcherUid === 41021,
+  'PAIR: with no record of oliver, the manifests are all there is, and the next stride above codex-jaf is used')
+check(allocateIdentityBlock([identity('odd', 41013, 42012)], { id: 'fresh' }).block.watcherUid === 41021,
+  'a block that is not stride-aligned still rounds the next one up to a stride boundary')
 
 // ---- the manifest it builds ------------------------------------------------------------------------
 const manifest = buildParticipantManifest(second, { pubkey: HEX, grantors: [HEX], relays: ['wss://relay.example'] })
@@ -228,6 +235,19 @@ check(credentialVerdict('/c', st({ mode: 0o100400 })) === null, 'a tighter 0400 
   check(/policy copied from pi-dog: buzz, may_post, agent_limits, agent_card, task_carriers/.test(made.stdout),
     'and says which blocks it copied')
   check(staged.grantors?.[0] === HEX && staged.relays?.[0] === 'wss://relay.example', 'grantors and relays come from the named template')
+  check(/no block record at .*identity-blocks\.jsonl/.test(made.stdout), 'with no block record, allocate says only the manifests bounded it')
+
+  // The durable record keeps a retired top identity's decade out of reach.
+  const ledger = join(tmp, 'identity-blocks.jsonl')
+  writeFileSync(ledger, JSON.stringify({ id: 'retired', watcherUid: 41051, brokerUid: 41052, adapterUid: 41053, workerUid: 41054, brokerAdapterGid: 42051, workerHandoffGid: 42052 }) + '\n')
+  const above = run('allocate', '--id', 'hr2', '--pubkey', OTHER, '--like', 'pi-dog', '--credential-dir', creds)
+  check(above.status === 0 && JSON.parse(readFileSync(join(out, 'hr2.json'), 'utf8')).watcher_uid === 41061,
+    'a block in the record, though no manifest holds it, is never handed out again')
+  rmSync(join(out, 'hr2.json'))
+  writeFileSync(ledger, '{not json\n')
+  const bad = run('allocate', '--id', 'hr2', '--pubkey', OTHER, '--like', 'pi-dog', '--credential-dir', creds)
+  check(bad.status === 3 && /INCONCLUSIVE/.test(bad.stderr), 'an unreadable record is INCONCLUSIVE, never "nothing retired"')
+  rmSync(ledger)
 
   const unseated = run('check', '--id', 'hr')
   check(unseated.status === 1 && /PASS {2}uid\/gid block is clear/.test(unseated.stdout) && /PASS {2}key, directories and adapter container/.test(unseated.stdout)

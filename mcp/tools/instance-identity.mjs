@@ -45,7 +45,7 @@
 // Exit: 0 clean · 1 a real fault (collision, refusal) · 3 INCONCLUSIVE — a manifest it could not read.
 
 import { readdirSync, readFileSync, writeFileSync, mkdirSync, existsSync, lstatSync } from 'node:fs'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { readManifest } from './runtime_manifest.mjs'
 import { auditIdentityBlocks, allocateIdentityBlock, buildParticipantManifest, seatingPlan,
   policyFromTemplate, auditUniqueFields, credentialVerdict, NUMERIC_FIELDS, TEMPLATE_FIELDS } from './identity_allocation.mjs'
@@ -145,9 +145,19 @@ if (like) {
 const relays = all('--relay').length ? all('--relay') : template?.relays || []
 const grantors = all('--grantor').length ? all('--grantor') : template?.grantors || []
 if (!grantors.length || !relays.length) die('give --grantor and --relay, or --like <id> to take them from an agent this one should work like')
+// The durable record of every block ever installed, beside the instance root. Without it a retired
+// top identity's numbers would look free. A record that exists but cannot be read is INCONCLUSIVE.
+const ledger = join(dirname(root), 'identity-blocks.jsonl')
+let used = []
+if (existsSync(ledger)) {
+  try { used = readFileSync(ledger, 'utf8').split('\n').filter(l => l.trim()).map(l => JSON.parse(l)) } catch (e) {
+    console.error(`\ninstance-identity: INCONCLUSIVE — ${ledger} cannot be read (${e.message}); it is the record that keeps retired blocks from reuse`)
+    process.exit(3)
+  }
+} else console.log(`\nno block record at ${ledger}: only the installed manifests bound the next block. \`apply\` starts the record.`)
 let allocation, manifest
 try {
-  allocation = allocateIdentityBlock(manifests, { id })
+  allocation = allocateIdentityBlock(manifests, { id, used })
   manifest = buildParticipantManifest(allocation, {
     pubkey: flag('--pubkey'), grantors, relays, credentialDir: flag('--credential-dir') || undefined,
     policy: template ? policyFromTemplate(template, { pubkey: flag('--pubkey') }) : {},

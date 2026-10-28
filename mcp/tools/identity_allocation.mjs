@@ -85,14 +85,17 @@ export function occupiedNumbers(manifests) {
 }
 
 /**
- * Choose the next free block.
+ * Choose the next block: the first stride ABOVE the highest number ever used.
  *
- * Deliberately allocates on the STRIDE, not into the first gap. A freed decade is left alone: uids
- * outlive the manifests that named them — files on a volume, entries in a log — and handing a
- * retired identity's numbers to a new one makes the old artefacts read as the new agent's. Reuse is
- * an operator decision with evidence behind it, not something an allocator does to save integers.
+ * Never a gap. uids outlive the manifests that named them — files on a volume, entries in a log —
+ * and handing a retired identity's numbers to a new one makes the old artefacts read as the new
+ * agent's. Scanning for the first free decade does exactly that the moment an identity is removed,
+ * so the floor is the high-water mark, not the lowest hole. The installed manifests alone forget a
+ * retired top identity, so `used` carries the durable record: every block ever installed
+ * (identity-blocks.jsonl, appended by `apply`). Reuse is an operator decision with evidence behind
+ * it, made by hand, never something an allocator does to save integers.
  */
-export function allocateIdentityBlock(manifests, { id, uidBase = UID_BASE, gidBase = GID_BASE } = {}) {
+export function allocateIdentityBlock(manifests, { id, uidBase = UID_BASE, gidBase = GID_BASE, used = [] } = {}) {
   if (!ID.test(String(id || ''))) fail('a usable instance id is required')
   if ((manifests || []).some(m => String(m?.id) === String(id))) fail(`an identity named ${id} already exists`)
 
@@ -103,18 +106,15 @@ export function allocateIdentityBlock(manifests, { id, uidBase = UID_BASE, gidBa
     fail(`refusing to allocate while ${audit.collisions.length} existing collision(s) stand — run the audit and resolve them first`)
   }
 
-  const { uids, gids } = occupiedNumbers(manifests || [])
-  const free = (base, stride, span, taken) => {
-    for (let start = base; start + span - 1 <= UID_CEILING; start += stride) {
-      let clear = true
-      for (let n = start; n < start + span; n++) if (taken.has(n)) { clear = false; break }
-      if (clear) return start
-    }
-    return null
+  const { uids, gids } = occupiedNumbers([...(manifests || []), ...(used || [])])
+  const above = (base, stride, span, taken) => {
+    const high = Math.max(base - 1, ...taken)
+    const start = base + Math.ceil((high + 1 - base) / stride) * stride
+    return start + span - 1 <= UID_CEILING ? start : null
   }
-  const uidStart = free(uidBase, UID_STRIDE, UID_ROLES.length, uids)
-  const gidStart = free(gidBase, GID_STRIDE, GID_ROLES.length, gids)
-  if (uidStart === null || gidStart === null) fail('no free block below the ceiling — allocate by hand and record why')
+  const uidStart = above(uidBase, UID_STRIDE, UID_ROLES.length, uids)
+  const gidStart = above(gidBase, GID_STRIDE, GID_ROLES.length, gids)
+  if (uidStart === null || gidStart === null) fail('no block left below the ceiling — allocate by hand and record why')
 
   const block = {}
   UID_ROLES.forEach((f, i) => { block[f] = uidStart + i })
