@@ -146,6 +146,15 @@ ok('the tool result names the @text that reached no one, and who can be mentione
   JSON.stringify(notMentioned(poster.mayPost, r3.unresolved)) === JSON.stringify({ not_mentioned: ['@nobody', '@dennis'], mentionable: [dennis, 'neil'] }) &&
   JSON.stringify(notMentioned(poster.mayPost, [])) === '{}')
 ok('a posting identity is told how to take part; a reply-only one is not', told.includes(PARTICIPATION) && !capabilitySummary(plain).includes(PARTICIPATION))
+// What fixed the 10-23 silence stays; what made every reply a wake goes (#276).
+ok('the agent is still told a mention is the only wake, and how to make one that resolves',
+  /wake only when mentioned/.test(PARTICIPATION) && /mention field/.test(PARTICIPATION) && /any other @text reaches no\s+one/.test(PARTICIPATION)
+  && /without a mention is a note to yourself/.test(PARTICIPATION))
+ok('a mention is only for someone who must act, and never to acknowledge, report or close',
+  /only when they must act/.test(PARTICIPATION) && /Never mention to acknowledge, thank, report status or close a thread/.test(PARTICIPATION)
+  && /a thread may simply end/.test(PARTICIPATION))
+ok('nothing tells an agent to mention whoever acts next, or to spend the limits',
+  !/End each message|mention whoever acts|propose who takes it|spend them/i.test(PARTICIPATION))
 const off = resolvePost(poster, { text: 'hi', mention: [stranger] })
 ok('an off-allowlist mention is refused, naming only a key prefix', off.code === 'NVOY_POST_MENTION_REFUSED' && off.message.includes(stranger.slice(0, 8)) && !off.message.includes(stranger))
 ok('an unknown name is refused', resolvePost(poster, { text: 'hi', mention: ['kerouac'] }).code === 'NVOY_POST_MENTION_REFUSED')

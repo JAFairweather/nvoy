@@ -23,14 +23,16 @@ const fold = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '')
 
 // How to take part, beside what the manifest allows. Agents left to their defaults answered and
 // stopped, and wrote "@name" in text, which Buzz never resolves; the others never woke (10-23).
-// It follows waggle's AGENT_BRIEF: mentions are the wake signal.
-export const PARTICIPATION = 'How to take part: the others are episodic and wake only when mentioned, so an assignment' +
-  ' without a mention is a note to yourself. Mention with the mention field, or write @name with a name from the' +
-  ' mentionable list; any other @text reaches no one, and the tool result says which names it mentioned. End each' +
-  ' message with the next step and who owns it, mentioning them; when you finish work, mention whoever acts on it' +
-  ' next; when blocked, mention whoever can unblock you. When you see work that needs doing, say so and propose' +
-  ' who takes it rather than waiting to be asked. Say when there is nothing further, so a thread ends rather than' +
-  ' going quiet. The hop and hourly limits are the brakes; spend them on moving work forward.'
+// It follows waggle's AGENT_BRIEF: mentions are the wake signal. The 10-23 text then told every
+// message to mention whoever acted next, so a thread between two agents never ended: dj-codex was
+// woken 113 times in a day, every time by another agent, mostly mid-turn (#276, waggle#633). A
+// mention is for someone who must act; a thread may simply end.
+export const PARTICIPATION = 'How to take part: the others are episodic and wake only when mentioned, and every mention' +
+  ' interrupts whatever they are doing. Mention someone only when they must act: to request a review, to hand over' +
+  ' work they will own, to return a result they asked you for, or to unblock you. Never mention to acknowledge, thank,' +
+  ' report status or close a thread; a thread may simply end. An assignment without a mention is a note to yourself.' +
+  ' Mention with the mention field, or write @name with a name from the mentionable list; any other @text reaches no' +
+  ' one, and the tool result says which names it mentioned. The hop and hourly limits are brakes, not a budget.'
 export const MENTION_SCHEMA = { type: 'array', items: { type: 'string', minLength: 1, maxLength: 64 }, maxItems: 16 }
 
 // What this identity may do, from its manifest, told to the agent in the channel servers'
