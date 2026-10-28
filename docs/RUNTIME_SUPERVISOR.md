@@ -207,7 +207,12 @@ Buzz relay ──kind:9 #h #p──> keyless buzz watcher ──<event>.buzz.pen
   signs a second template on the same connection.
 - **Hearing.** `instance-runtime watch` also starts `buzz-wake-watcher.mjs`. It subscribes to
   `{kinds:[9], #h: channels, #p: [self]}` and writes an opaque `<event>.buzz.pending` marker for
-  each event that `nativeMention` accepts. The marker holds `{envelope, observed_at}` only. It
+  each event that `nativeMention` accepts. It also hears a reply anywhere in a thread it started,
+  mention or not (#280). It first reads its own signed top-level messages from the last 7 days
+  (the newest 200), adds `{kinds:[9], #h: channels, #e: [those roots]}`, and reopens the
+  subscription when it starts a new thread. The broker does not trust that hint. It re-fetches the
+  thread root and counts the reply only if the root is this identity's own, in the same channel.
+  Addressed is not authorised: the author still needs a grant. The marker holds `{envelope, observed_at}` only. It
   keeps `buzz-wake-seen.log` and a `buzz-wake-since` watermark: the last moment it was known to be
   caught up. A restart therefore replays the gap it was down for, with ten minutes of overlap for
   author clock skew. A first run starts at "now" and never turns channel history into tasks.
