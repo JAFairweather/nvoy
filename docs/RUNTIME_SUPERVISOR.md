@@ -84,14 +84,17 @@ node mcp/tools/instance-identity.mjs apply --id <name> --public-key-file <channe
 make), above every block ever used: the installed manifests plus `identity-blocks.jsonl` beside the
 instance root, so a retired identity's numbers are never reused. It copies the named agent's `buzz`, `may_post`, `agent_limits`, `agent_card` and
 `task_carriers`, validates the result with `readManifest`, and writes it to a staging directory.
-`check` fails unless the staged manifest is clear of every installed identity and both Bunker
+`check` fails unless the staged manifest is clear of every installed identity and every recorded
+block, and both Bunker
 credential files are seated root-owned `0600`. Installing the staged file starts the deploy at
 once, through `nvoy-runtime-deploy.path`, so it comes last.
 
 `apply` is that last step. It runs `check` again and refuses unless it passes. It then decides the
 channel principal, and refuses if `authorized_keys` already holds a different line under this
-identity's comment. Next it installs the manifest without clobbering, records the block in
-`identity-blocks.jsonl` so it is never allocated again, and waits until the runner
+identity's comment. Next it reads `identity-blocks.jsonl` again, refuses a block recorded for
+another identity, and appends and syncs this block, all before the install. A record it cannot read
+or write stops the apply with nothing installed. It then installs the manifest without clobbering,
+and waits until the runner
 records this manifest's digest in `DEPLOYED_MANIFESTS.json`. Only then does it append the principal,
 run `instance-unit.mjs verify`, and baseline the channel. It reports each state on its own line.
 If a tick that saw the new manifest fails, the runner rolls back every identity, so `apply`

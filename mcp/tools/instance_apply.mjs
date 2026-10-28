@@ -5,19 +5,23 @@
 //   1. principal planned   the authorized_keys line is decided BEFORE anything changes, so a file
 //                          already holding a different line under this identity's comment refuses
 //                          the whole apply rather than half of it.
-//   2. installed           the staged bytes land in the instance root under a no-clobber link. That
+//   2. block recorded      the record is read again here, immediately before the install; a block it
+//                          already holds for another identity refuses. The UID/GID block is then
+//                          appended and synced BEFORE the deploy trigger, so no container ever runs
+//                          as numbers the record lacks. A record that cannot be read or written stops
+//                          the apply with nothing installed. A block recorded for an install that then
+//                          fails stays recorded: a reservation costs ten numbers, a reuse costs a
+//                          security domain.
+//   3. installed           the staged bytes land in the instance root under a no-clobber link. That
 //                          IS the deploy trigger (see instance-identity.mjs).
-//      block recorded      the UID/GID block is appended to identity-blocks.jsonl at once, before any
-//                          container can write a file as those numbers, so it is never allocated again
-//                          even if this identity is withdrawn or later retired.
-//   3. deployed            the runner recorded this exact manifest digest and wrote its compose file.
+//   4. deployed            the runner recorded this exact manifest digest and wrote its compose file.
 //                          A FAILED_ATTEMPT naming the estate as installed means a tick that saw
 //                          this manifest failed and the runner rolled every identity back; the manifest is then withdrawn, because
 //                          leaving it would re-run that estate-wide rollback every RETRY_AFTER_S.
-//   4. principal seated    appended only after the deploy: the forced command execs into a container
+//   5. principal seated    appended only after the deploy: the forced command execs into a container
 //                          that does not exist before it.
-//   5. principal verified  by instance-unit.mjs verify, the same check an operator runs.
-//   6. baselined           claude-channel.mjs --baseline in the adapter, so the agent does not wake
+//   6. principal verified  by instance-unit.mjs verify, the same check an operator runs.
+//   7. baselined           claude-channel.mjs --baseline in the adapter, so the agent does not wake
 //                          to every envelope admitted before it existed.
 //
 // A timeout is INCONCLUSIVE, not a failure: the deploy may still be running, so nothing is withdrawn.
@@ -25,10 +29,10 @@
 // It never reads credential contents. The public key is a public key; it is printed by path only.
 
 import { createHash } from 'node:crypto'
-import { appendFileSync, existsSync, linkSync, lstatSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { appendFileSync, closeSync, existsSync, fsyncSync, linkSync, lstatSync, openSync, readdirSync, readFileSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
 import { join } from 'node:path'
 import { parsePrincipal, principalComment, principalLine } from './participant_unit.mjs'
-import { NUMERIC_FIELDS } from './identity_allocation.mjs'
+import { NUMERIC_FIELDS, parseBlockRecord, recordedClashes } from './identity_allocation.mjs'
 
 const KEY_LINE = /^(ssh-ed25519|ecdsa-sha2-nistp256)\s+([A-Za-z0-9+/]+={0,2})(?:\s+\S.*)?$/
 
@@ -92,7 +96,27 @@ export async function applyStaged({ manifest, stagedPath, root, stateDir, keysPa
   if (plan.action === 'refuse') return done('principal planned', false, plan.why)
   done('principal planned', true, plan.action === 'present' ? 'already present, unchanged' : `will append ${principalComment(manifest)}`)
 
-  // 2. Install: write beside the target (same filesystem), then a no-clobber link. A name not ending
+  // 2. Reserve the block in the record, as the record is now, before anything can run as it.
+  if (!ledgerPath) return done('block recorded', false, 'no block record path was given; nothing was installed')
+  let record
+  try { record = existsSync(ledgerPath) ? parseBlockRecord(readFileSync(ledgerPath, 'utf8')) : [] }
+  catch (e) { return done('block recorded', false, `${ledgerPath}: ${e.message}; nothing was installed`) }
+  const clashes = recordedClashes(record, manifest)
+  if (clashes.length) return done('block recorded', false, `the block overlaps ${[...new Set(clashes.map(e => e.id))].join(', ')} in ${ledgerPath}, numbers once installed; nothing was installed`)
+  const already = record.some(e => e.id === id && NUMERIC_FIELDS.every(f => e[f] === manifest[f]))
+  if (!already) {
+    const block = Object.fromEntries(NUMERIC_FIELDS.map(f => [f, manifest[f]]))
+    let fd
+    try {
+      fd = openSync(ledgerPath, 'a', 0o644)
+      writeSync(fd, JSON.stringify({ id, ...block, recorded_at: Math.floor(now() / 1000) }) + '\n')
+      fsyncSync(fd)
+    } catch (e) { return done('block recorded', false, `${ledgerPath}: ${e.message}; nothing was installed`) }
+    finally { if (fd !== undefined) closeSync(fd) }
+  }
+  done('block recorded', true, already ? `already in ${ledgerPath} for ${id}` : `appended to ${ledgerPath}`)
+
+  // 3. Install: write beside the target (same filesystem), then a no-clobber link. A name not ending
   //    in .json is invisible to the runner's glob.
   const bytes = readFileSync(stagedPath)
   const digest = digestOf(bytes)
@@ -102,18 +126,13 @@ export async function applyStaged({ manifest, stagedPath, root, stateDir, keysPa
   const installedAt = now() / 1000
   try { linkSync(temp, target) } catch (e) {
     unlinkSync(temp)
-    return done('installed', false, e.code === 'EEXIST' ? `${target} appeared since the check; nothing was changed` : e.message)
+    return done('installed', false, `${e.code === 'EEXIST' ? `${target} appeared since the check; nothing was installed` : e.message}. The block stays recorded as a reservation`)
   }
   unlinkSync(temp)
   done('installed', true, `${target} (sha256 ${digest.slice(0, 12)}…)`)
-  const block = Object.fromEntries(NUMERIC_FIELDS.map(f => [f, manifest[f]]))
-  try {
-    appendFileSync(ledgerPath, JSON.stringify({ id, ...block, installed_at: Math.floor(installedAt) }) + '\n', { mode: 0o644 })
-    done('block recorded', true, `${ledgerPath}`)
-  } catch (e) { done('block recorded', false, `${ledgerPath}: ${e.message}. Add the line by hand, or the block may be reused`) }
   const estate = estateHash(root)
 
-  // 3. Wait for the runner to record exactly this manifest.
+  // 4. Wait for the runner to record exactly this manifest.
   const compose = join(root, `${id}.compose.yml`)
   let verdict = 'waiting'
   for (const start = now(); now() - start < waitMs;) {
@@ -130,7 +149,7 @@ export async function applyStaged({ manifest, stagedPath, root, stateDir, keysPa
   }
   done('deployed', true, `the runner recorded this manifest and wrote ${compose}`)
 
-  // 4. Seat the principal, re-planned against the file as it is now.
+  // 5. Seat the principal, re-planned against the file as it is now.
   const again = principalPlan(readFileSync(keysPath, 'utf8'), manifest, publicKey)
   if (again.action === 'refuse') return done('principal seated', false, `${keysPath} changed during the deploy: ${again.why}`)
   if (again.action === 'append') {
@@ -139,7 +158,7 @@ export async function applyStaged({ manifest, stagedPath, root, stateDir, keysPa
   }
   done('principal seated', true, again.action === 'present' ? 'already present' : `appended to ${keysPath}`)
 
-  // 5 and 6. The operator's own checks, run as the operator would.
+  // 6 and 7. The operator's own checks, run as the operator would.
   const verify = run(['verify', '--instance', id, '--authorized-keys', keysPath])
   if (verify.status !== 0) return done('principal verified', false, (verify.stderr || verify.stdout).trim().split('\n').slice(-3).join(' | '))
   done('principal verified', true, 'instance-unit verify passed')

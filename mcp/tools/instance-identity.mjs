@@ -56,7 +56,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { readManifest } from './runtime_manifest.mjs'
 import { auditIdentityBlocks, allocateIdentityBlock, buildParticipantManifest, seatingPlan,
-  policyFromTemplate, auditUniqueFields, credentialVerdict, NUMERIC_FIELDS, TEMPLATE_FIELDS } from './identity_allocation.mjs'
+  policyFromTemplate, auditUniqueFields, credentialVerdict, parseBlockRecord, recordedClashes, NUMERIC_FIELDS, TEMPLATE_FIELDS } from './identity_allocation.mjs'
 import { applyStaged, readPublicKey } from './instance_apply.mjs'
 
 const argv = process.argv.slice(2)
@@ -74,6 +74,13 @@ const outDir = resolve(flag('--out') || join(process.env.HOME || '/tmp', '.nvoy'
 // The durable record of every block ever installed, beside the instance root. Without it a retired
 // top identity's numbers would look free. A record that exists but cannot be read is INCONCLUSIVE.
 const ledger = join(dirname(root), 'identity-blocks.jsonl')
+const readRecord = () => {
+  if (!existsSync(ledger)) return null
+  try { return parseBlockRecord(readFileSync(ledger, 'utf8')) } catch (e) {
+    console.error(`\ninstance-identity: INCONCLUSIVE — ${ledger} cannot be read (${e.message}); it is the record that keeps retired blocks from reuse`)
+    process.exit(3)
+  }
+}
 
 // ---- read the estate ----------------------------------------------------------------------------
 // A manifest we cannot read is INCONCLUSIVE, never "not there". Treating an unreadable sibling as
@@ -135,6 +142,10 @@ if (verb === 'check' || verb === 'apply') {
   const results = []
   const blocks = auditIdentityBlocks([...manifests, m])
   results.push([blocks.ok, blocks.ok ? 'uid/gid block is clear of every identity' : blocks.collisions.map(c => `${c.kind} ${c.value} is held by ${c.held_by}`).join('; ')])
+  const record = readRecord()
+  const recorded = recordedClashes(record || [], m)
+  results.push([!recorded.length, recorded.length ? `uid/gid block overlaps ${[...new Set(recorded.map(e => e.id))].join(', ')} in ${ledger}, numbers once installed`
+    : record ? 'uid/gid block is clear of every recorded block' : `uid/gid block: no record at ${ledger} yet; \`apply\` starts it`])
   const unique = auditUniqueFields([...manifests, m])
   results.push([unique.ok, unique.ok ? 'key, directories and adapter container are its own' : unique.collisions.map(c => `${c.field} is held by ${c.held_by}`).join('; ')])
   for (const ref of [m.bunkerUriRef, m.bunkerClientRef]) {
@@ -189,13 +200,8 @@ if (like) {
 const relays = all('--relay').length ? all('--relay') : template?.relays || []
 const grantors = all('--grantor').length ? all('--grantor') : template?.grantors || []
 if (!grantors.length || !relays.length) die('give --grantor and --relay, or --like <id> to take them from an agent this one should work like')
-let used = []
-if (existsSync(ledger)) {
-  try { used = readFileSync(ledger, 'utf8').split('\n').filter(l => l.trim()).map(l => JSON.parse(l)) } catch (e) {
-    console.error(`\ninstance-identity: INCONCLUSIVE — ${ledger} cannot be read (${e.message}); it is the record that keeps retired blocks from reuse`)
-    process.exit(3)
-  }
-} else console.log(`\nno block record at ${ledger}: only the installed manifests bound the next block. \`apply\` starts the record.`)
+const used = readRecord() || []
+if (!existsSync(ledger)) console.log(`\nno block record at ${ledger}: only the installed manifests bound the next block. \`apply\` starts the record.`)
 let allocation, manifest
 try {
   allocation = allocateIdentityBlock(manifests, { id, used })

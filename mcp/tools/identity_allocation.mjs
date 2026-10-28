@@ -85,6 +85,33 @@ export function occupiedNumbers(manifests) {
 }
 
 /**
+ * Read identity-blocks.jsonl: one `{ id, <every numeric field> }` per line, appended by `apply`
+ * before each install. Any malformed line throws: a record that cannot be read whole cannot vouch
+ * that a block is free.
+ */
+export function parseBlockRecord(text) {
+  return String(text || '').split('\n').map((line, i) => [line.trim(), i + 1]).filter(([line]) => line).map(([line, n]) => {
+    let e
+    try { e = JSON.parse(line) } catch { fail(`block record line ${n} is not JSON`) }
+    if (!e || typeof e.id !== 'string' || !ID.test(e.id)) fail(`block record line ${n} has no valid id`)
+    for (const f of NUMERIC_FIELDS) if (!Number.isInteger(e[f]) || e[f] < 1) fail(`block record line ${n} (${e.id}) has no integer ${f}`)
+    return e
+  })
+}
+
+/**
+ * Recorded blocks that share a uid or gid with this manifest. A record of the same id with exactly
+ * these numbers is this identity's own earlier install (re-applied after a withdrawal), not a clash.
+ */
+export function recordedClashes(record, manifest) {
+  const mine = occupiedNumbers([manifest])
+  return (record || []).filter(e => !(e.id === manifest.id && NUMERIC_FIELDS.every(f => e[f] === manifest[f]))).filter(e => {
+    const theirs = occupiedNumbers([e])
+    return [...theirs.uids].some(u => mine.uids.has(u)) || [...theirs.gids].some(g => mine.gids.has(g))
+  })
+}
+
+/**
  * Choose the next block: the first stride ABOVE the highest number ever used.
  *
  * Never a gap. uids outlive the manifests that named them — files on a volume, entries in a log —
