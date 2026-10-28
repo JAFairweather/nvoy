@@ -889,6 +889,57 @@ Owner steps for `pi-dog`, with placeholder paths:
 The extension API, `--tools`, `--no-approve` and `--continue` were checked against pi 0.87.1. Pin
 that version, or recheck them after an upgrade.
 
+##### Optional reMarkable notebook responder
+
+The existing Pi process can host the isolated, image-first notebook adapter from
+`rabidrabbit/tools/herd-board`. This is an explicit operator opt-in, not a new
+channel tool, feed consumer, process, or model-initiated setting. Without the
+optional `notebook` client-config field, the existing harness behavior is unchanged.
+
+After reviewing both the host change and adapter revision, install these three
+files together in a fixed owner-held directory: `notebook_pi_lifecycle.mjs`,
+`notebook_pi_responder.mjs`, and `notebook_pi_socket.mjs`. Use a separate fixed
+UTF-8 file containing the reviewed notebook system prompt (nonempty, no NUL,
+at most 64,000 bytes, mode 0600). Modules must not be group/world writable;
+module and prompt paths must pass the harness's existing `fixedPath` checks.
+The adapter directory must be canonical, not a symlink alias. For example, add
+this field to the **existing** owner's client configuration:
+
+```json
+"notebook": {
+  "adapter_dir": "/Users/you/.nvoy-harness/notebook-adapter",
+  "prompt_file": "/Users/you/.nvoy-harness/notebook-prompt.txt"
+}
+```
+
+No socket or model selector is accepted in this object. The socket is derived as
+`<state_dir>/notebook.sock` (at most 100 bytes), and the adapter uses the running
+Pi session's selected image-capable `openai-codex` OAuth model and model registry.
+It does not copy or expose login credentials or inherit the channel transcript
+or tools. The extension factory awaits adapter registration before Pi emits
+`session_start`; that event opens the private socket. Model changes and shutdown
+cancel/drain the previous responder through the adapter's lifecycle hooks.
+
+Activate by the normal controlled restart of the **existing** supervisor, never
+by launching a second PiDog consumer. Do not replace modules while it is running:
+ES modules are cached for the life of the process. A configuration or import error
+refuses startup; a model/socket failure leaves the notebook endpoint unavailable
+without a shared-chat fallback. Never remove an existing socket merely to force
+startup: establish which process owns it first.
+
+On the notebook server, the separate rollout config can then point
+`model_transport.socket` at that derived socket for the isolated test notebook.
+Socket existence is not acceptance: send a captured page through the supported
+notebook client, validate the untouched model result, and measure the actual
+Respond-to-visible-output on the tablet before wider rollout. Removing the
+server opt-in stops new direct calls; removing the host `notebook` field and
+normally restarting restores the old host behavior. Preserve any pending tablet
+job rather than replaying it through another route.
+
+`npm run test:pi-notebook` exercises synthetic owner configuration and the existing
+fake-Pi/fake-SSH harness regression suite. It does **not** prove a deployed host,
+a real OAuth model response, or notebook preservation on the tablet.
+
 #### Running a portable harness headless (macOS)
 
 In a launcher pane, a supervisor shows up in herdr beside the agent it supervises. As a
