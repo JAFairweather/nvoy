@@ -69,6 +69,23 @@ connection capability and the client reference holds the stable NIP-46 transport
 the participant identity nsec, which remains solely in `bunker.nave.pub`; neither is inherited by
 watcher, adapter, or worker.
 
+Do not write a new manifest by hand from this example: its numbers are illustrative, and its
+blocks are not the ones a hive agent carries. Stage one, then check it, before anything lands in
+the instance root:
+
+```bash
+node mcp/tools/instance-identity.mjs allocate --id <name> --pubkey <64 hex> --like <live agent>
+node mcp/tools/instance-identity.mjs check --id <name>
+```
+
+`allocate` picks a UID/GID block clear of every identity (a check `assertNoCollisions` does not
+make), above every block ever used: the installed manifests plus `identity-blocks.jsonl` beside the
+instance root, so a retired identity's numbers are never reused. It copies the named agent's `buzz`, `may_post`, `agent_limits`, `agent_card` and
+`task_carriers`, validates the result with `readManifest`, and writes it to a staging directory.
+`check` fails unless the staged manifest is clear of every installed identity and both Bunker
+credential files are seated root-owned `0600`. Installing the staged file starts the deploy at
+once, through `nvoy-runtime-deploy.path`, so it comes last.
+
 `worker_credential_ref` is intentionally a different credential class: a dedicated, revocable
 model-provider API key used by the headless Claude/Codex process. It is mounted only in the
 keyless worker, never in the broker. For `worker_runner: "codex"` its file holds an
