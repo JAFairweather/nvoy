@@ -25,7 +25,7 @@ import { fixedPath, knownHostsFile, privateFile, sshChannelEntry, SSH, SSH_TARGE
 import { instanceId } from './runtime_manifest.mjs'
 import { codexTurnText } from './harness_session.mjs'
 import { feedCursor, followWakeFeed } from './wake_feed_client.mjs'
-import { readNotebookConfig, installPiNotebook } from './pi_notebook_host.mjs'
+import { readNotebookConfig, installPiNotebooks } from './pi_notebook_host.mjs'
 
 // Mirrors codex-channel-mcp.mjs's tools/list, which is what the fleet enforces. pi validates tool
 // arguments against plain JSON Schema as well as TypeBox, so no TypeBox import is needed here.
@@ -53,6 +53,9 @@ export function readPiClientConfig(path, id, own = homedir()) {
   let raw
   try { raw = JSON.parse(readFileSync(file.path, 'utf8')) } catch { throw new Error('client config is not valid JSON') }
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('client config must be a JSON object')
+  if (raw.notebook?.eval_roster !== undefined && (file.stat.mode & 0o077)) {
+    throw new Error('evaluation roster config must be owner-only (mode 0600)')
+  }
   const text = JSON.stringify(raw)
   if (Object.keys(raw).some(key => /nsec|bunker|secret|signer|private/i.test(key)) || /nsec1[02-9ac-hj-np-z]{20,}|bunker:\/\//i.test(text)) {
     throw new Error('client config must not name a Nostr key or Bunker credential: nothing on this box signs')
@@ -230,10 +233,27 @@ export default async function nvoyPiHarness(pi) {
   const ssh = process.env.NVOY_HARNESS_SSH ? fixedPath(process.env.NVOY_HARNESS_SSH, 'ssh executable', null).path : SSH
   // Pi awaits async extension factories. Registration finishes before its first
   // session_start; the adapter itself starts nothing during import/register.
-  const notebook = await installPiNotebook(pi, config.notebook)
-  const harness = createPiHarness({ pi, config, ssh })
-  harness.notebook = notebook
-  pi.on('session_start', (_event, ctx) => harness.start(ctx))
-  pi.on('session_shutdown', () => harness.stop())
-  return harness
+  const notebooks = await installPiNotebooks(pi, config.notebook)
+  try {
+    const harness = createPiHarness({ pi, config, ssh })
+    harness.notebook = notebooks.notebook
+    harness.notebookEval = notebooks.notebookEval
+    harness.notebookEvaluations = notebooks.evaluations
+    let disposed = false
+    const detach = []
+    harness.dispose = () => {
+      disposed = true
+      for (const remove of detach) if (typeof remove === 'function') remove()
+      harness.stop()
+      return notebooks.close()
+    }
+    // Session shutdown is restartable. Each notebook adapter owns its socket
+    // drain/rebind hooks; do not permanently close those registrations here.
+    detach.push(pi.on('session_start', (_event, ctx) => { if (!disposed) harness.start(ctx) }))
+    detach.push(pi.on('session_shutdown', () => harness.stop()))
+    return harness
+  } catch (error) {
+    await notebooks.close()
+    throw error
+  }
 }

@@ -307,7 +307,12 @@ await waitFor(() => !existsSync(lockPath), 5000)
 const notebookDir = join(root, 'notebook-adapter')
 mkdirSync(notebookDir, { mode: 0o700 })
 for (const name of ['notebook_pi_responder.mjs', 'notebook_pi_socket.mjs']) secretFile(join(notebookDir, name), 'export {};\n')
-secretFile(join(notebookDir, 'notebook_pi_lifecycle.mjs'), 'export function registerNotebookResponder(pi, options) { pi.notebookOptions = options; return { settled: async () => {}, close: async () => {} }; }\n')
+secretFile(join(notebookDir, 'notebook_pi_lifecycle.mjs'), `export function registerNotebookResponder(pi, options) {
+  pi.notebookOptions = options;
+  (pi.notebookRegistrations ||= []).push(options);
+  return { settled: async () => { pi.notebookDrained = (pi.notebookDrained || 0) + 1 },
+    close: async () => { pi.notebookClosed = (pi.notebookClosed || 0) + 1 } };
+}\n`)
 const promptFile = secretFile(join(root, 'notebook-system-prompt.txt'), 'FIXED NOTEBOOK TEACHING PROMPT')
 const notebookConfig = clientConfig({ ...client, notebook: { adapter_dir: notebookDir, prompt_file: promptFile } })
 const parsedNotebook = readPiClientConfig(notebookConfig, 'pd-test', own)
@@ -317,6 +322,27 @@ const pi3 = fakePi(), harness3 = await nvoyPiHarness(pi3)
 ok('owner opt-in registers the notebook adapter before session startup without starting another feed',
   pi3.notebookOptions?.systemPrompt === 'FIXED NOTEBOOK TEACHING PROMPT' && pi3.notebookOptions.socketPath === join(stateDir, 'notebook.sock') &&
   harness3.notebook && !existsSync(lockPath) && pi3.sent.length === 0 && pi3.tools.size === PI_CHANNEL_TOOLS.length)
+await harness3.dispose()
+const evalRoster = ['planner','drawer','critic'].flatMap(role => [0,1].map(i => {
+  const parent=join(root,role[0]+i);mkdirSync(parent,{mode:0o700})
+  return {role,prompt_file:secretFile(join(parent,'prompt.txt'),'FIXED '+role),
+    model:{provider:'openai-codex',id:'candidate-'+i},reasoning:i?'high':'medium',
+    output_tokens:2048,socket_path:join(parent,'notebook-eval.sock')}
+}))
+const roleClient={...client,notebook:{adapter_dir:notebookDir,prompt_file:promptFile,eval_roster:evalRoster}}
+let looseRosterRefused=false
+try {readPiClientConfig(clientConfig(roleClient,0o644),'pd-test',own)} catch(error) {looseRosterRefused=/owner-only/.test(error.message)}
+ok('a six-role roster requires an owner-only client config',looseRosterRefused)
+process.env.NVOY_PI_HARNESS_CONFIG=clientConfig(roleClient)
+const pi4=fakePi(),harness4=await nvoyPiHarness(pi4)
+ok('extension retains six evaluators beside production and starts no extra feed',
+  harness4.notebookEvaluations.length===6 && pi4.notebookRegistrations.length===7 &&
+  pi4.notebookRegistrations[0].socketPath===join(stateDir,'notebook.sock') &&
+  !existsSync(lockPath) && pi4.sent.length===0 && pi4.tools.size===PI_CHANNEL_TOOLS.length)
+await pi4.stop();await harness4.stop()
+ok('session shutdown and harness stop preserve notebook registrations',!pi4.notebookClosed && !pi4.notebookDrained)
+await harness4.dispose();await harness4.dispose()
+ok('permanent extension disposal closes and settles all seven handles exactly once',pi4.notebookClosed===7 && pi4.notebookDrained===7)
 process.env.NVOY_PI_HARNESS_CONFIG = configPath
 
 rmSync(root, { recursive: true, force: true })
