@@ -9,6 +9,7 @@ import { validateProfileRequest, profileQueuePath, profileResultsPath } from './
 import { mergedProfile, ProfileRefusal, readbackProfile } from './profile_policy.mjs'
 import { brokerSigner } from './broker_signer.mjs'
 import { openBuzzSession } from './buzz_native.mjs'
+import { publishRelay, queryRelay } from './public_relays.mjs'
 import { countInWindow } from './agent_limits.mjs'
 
 const flag = name => { const index = process.argv.indexOf(name); return index < 0 ? '' : process.argv[index + 1] || '' }
@@ -45,14 +46,24 @@ function persist() {
   writeFileSync(temporary, JSON.stringify(record), { mode: 0o600 })
   renameSync(temporary, path)
 }
-function latestProfile(events) {
-  const latest = (Array.isArray(events) ? events : []).filter(event => event?.kind === 0 && event.pubkey === manifest.pubkey &&
+// The newest signed profile on Buzz or on any of the seat's public relays is the one to build on, so
+// a profile set elsewhere is never overwritten by an older copy. A seat with no profile anywhere may
+// make its first one, but only when a public relay answered as well: an empty Buzz read alone cannot
+// be told apart from a read that failed quietly.
+function currentProfile(buzzEvents, outside) {
+  const all = [...(Array.isArray(buzzEvents) ? buzzEvents : []), ...outside.flatMap(read => read.events)]
+  const latest = all.filter(event => event?.kind === 0 && event.pubkey === manifest.pubkey &&
     verifyEvent(JSON.parse(JSON.stringify(event)))).sort((left, right) => right.created_at - left.created_at || right.id.localeCompare(left.id))[0]
-  if (!latest) throw new ProfileRefusal('NVOY_PROFILE_INVALID_CURRENT',
-    events.length ? 'relay returned an invalid kind-0 event' : 'relay returned no current kind-0 event')
-  try { return { profile: JSON.parse(latest.content), event: latest } }
-  catch { throw new ProfileRefusal('NVOY_PROFILE_INVALID_CURRENT', 'current kind-0 content is invalid JSON') }
+  if (latest) {
+    try { return { profile: JSON.parse(latest.content), event: latest, first: false } }
+    catch { throw new ProfileRefusal('NVOY_PROFILE_INVALID_CURRENT', 'current kind-0 content is invalid JSON') }
+  }
+  if (all.length) throw new ProfileRefusal('NVOY_PROFILE_INVALID_CURRENT', 'relays returned only invalid kind-0 events')
+  if (!outside.some(read => read.answered)) throw new ProfileRefusal('NVOY_PROFILE_INVALID_CURRENT',
+    'no current kind-0 event on Buzz, and no public relay answered to confirm there is none')
+  return { profile: {}, event: null, first: true }
 }
+const ownProfile = { kinds: [0], authors: [manifest.pubkey], limit: 1 }
 
 try {
   const queue = profileQueuePath(manifest), stat = lstatSync(queue)
@@ -86,11 +97,15 @@ try {
     const signerPubkey = String(await signer.getPublicKey()).toLowerCase()
     if (signerPubkey !== manifest.pubkey) throw new ProfileRefusal('NVOY_PROFILE_SIGNER_MISMATCH', 'signer does not match manifest pubkey')
     session = await openBuzzSession({ relay: manifest.buzz.relay, signer })
-    const { profile: current, event: currentEvent } = latestProfile(await session.fetch({ kinds: [0], authors: [manifest.pubkey], limit: 1 }))
+    const buzzEvents = await session.fetch(ownProfile)
+    const outside = await Promise.all(manifest.relays.map(url => queryRelay(url, ownProfile, { signer })))
+    const { profile: current, event: currentEvent, first } = currentProfile(buzzEvents, outside)
+    if (first && !String(request.fields.name || '').trim())
+      throw new ProfileRefusal('NVOY_PROFILE_FIRST_NEEDS_NAME', 'a first profile must set a name')
     const { profile, changed } = await mergedProfile(current, request.fields, { pubkey: manifest.pubkey, pictureHosts: grant.pictureHosts })
     changedForAudit = changed
     if (request.dry_run) {
-      finish({ dry_run: true, candidate: profile, changed, event_id: null, relay: null })
+      finish({ dry_run: true, first, candidate: profile, changed, event_id: null, relay: null })
     } else {
       const verdict = countInWindow(resolve(manifest.stateDir, 'agent-limits', 'profiles.json'),
         { key: 'profile', id: requestId, limit: grant.perDay, windowMs: 24 * 60 * 60 * 1000 })
@@ -99,7 +114,7 @@ try {
         tags: [], content: JSON.stringify(profile) }
       record = { version: 1, request_digest: digest, grant_id: grant.grantId, pubkey: manifest.pubkey,
         fingerprint: getEventHash(unsignedEvent), unsigned_event: unsignedEvent, current_event: currentEvent,
-        profile, changed, event: null }
+        first, profile, changed, event: null }
       persist()
     }
   }
@@ -122,14 +137,20 @@ try {
     }
     if (!record.event) {
       const previous = record.current_event
-      let previousValid = false
-      try { previousValid = previous?.kind === 0 && previous.pubkey === manifest.pubkey &&
-        verifyEvent(JSON.parse(JSON.stringify(previous))) } catch {}
-      if (!previousValid)
-        throw new ProfileRefusal('NVOY_PROFILE_RECORD_INVALID', 'frozen profile has no signed prior profile')
       let current
-      try { current = JSON.parse(previous.content) }
-      catch { throw new ProfileRefusal('NVOY_PROFILE_RECORD_INVALID', 'frozen prior profile is invalid JSON') }
+      if (record.first === true && previous === null) {
+        if (!String(record.profile.name || '').trim())
+          throw new ProfileRefusal('NVOY_PROFILE_RECORD_INVALID', 'frozen first profile has no name')
+        current = {}
+      } else {
+        let previousValid = false
+        try { previousValid = previous?.kind === 0 && previous.pubkey === manifest.pubkey &&
+          verifyEvent(JSON.parse(JSON.stringify(previous))) } catch {}
+        if (!previousValid)
+          throw new ProfileRefusal('NVOY_PROFILE_RECORD_INVALID', 'frozen profile has no signed prior profile')
+        try { current = JSON.parse(previous.content) }
+        catch { throw new ProfileRefusal('NVOY_PROFILE_RECORD_INVALID', 'frozen prior profile is invalid JSON') }
+      }
       const validated = await mergedProfile(current, request.fields,
         { pubkey: manifest.pubkey, pictureHosts: grant.pictureHosts })
       if (!isDeepStrictEqual(validated.profile, record.profile) || !isDeepStrictEqual(validated.changed, record.changed))
@@ -146,7 +167,11 @@ try {
     if (!published.accepted) throw new ProfileRefusal('NVOY_PROFILE_RELAY_REFUSED', published.message || 'Buzz relay refused profile')
     const events = await session.fetch({ kinds: [0], authors: [manifest.pubkey], limit: 1 })
     const readback = readbackProfile(events, record.event, record.profile)
+    // The same signed event goes to the seat's public relays, so its profile reads the same outside
+    // Buzz. Buzz is the one that must accept; a public relay that refuses is reported, not retried.
+    const outside = await Promise.all(manifest.relays.map(url => publishRelay(url, record.event, { signer })))
     finish({ event_id: record.event.id, relay: { accepted: true, message: published.message },
+      public_relays: outside.map(({ relay, accepted, message }) => ({ relay, accepted, message: message.slice(0, 160) })),
       changed: record.changed, readback })
   }
 } catch (error) {

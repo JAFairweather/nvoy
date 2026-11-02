@@ -1,6 +1,7 @@
 import { strict as assert } from 'node:assert'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { createServer } from 'node:http'
+import { createServer as createTlsServer } from 'node:https'
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -20,6 +21,32 @@ const websocket = new WebSocketServer({ server })
 const sent = []
 let stored = [finalizeEvent({ kind: 0, created_at: 1, tags: [], content: JSON.stringify({ name: 'grok', about: 'old', custom: 'keep', bot: false }) }, secret)]
 let dropNext = false, mismatchNext = false
+// A public relay, over TLS with a throwaway certificate trusted only by the broker processes here.
+const certDir = join(root, 'tls'); mkdirSync(certDir)
+const tls = spawnSync('openssl', ['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes', '-days', '1',
+  '-keyout', join(certDir, 'key.pem'), '-out', join(certDir, 'cert.pem'), '-subj', '/CN=localhost', '-addext', 'subjectAltName=IP:127.0.0.1'], { encoding: 'utf8' })
+if (tls.status !== 0) throw new Error('openssl could not make the test certificate')
+const publicServer = createTlsServer({ key: readFileSync(join(certDir, 'key.pem')), cert: readFileSync(join(certDir, 'cert.pem')) },
+  (request, response) => { response.writeHead(404); response.end() })
+await new Promise(resolve => publicServer.listen(0, '127.0.0.1', resolve))
+const publicRelay = `wss://127.0.0.1:${publicServer.address().port}`
+const publicSocket = new WebSocketServer({ server: publicServer })
+let publicStored = [], publicDown = false
+const publicSent = []
+publicSocket.on('connection', socket => socket.on('message', raw => {
+  const frame = JSON.parse(raw.toString())
+  if (frame[0] === 'REQ') {
+    if (publicDown) return socket.send(JSON.stringify(['CLOSED', frame[1], 'error: down']))
+    const event = publicStored.at(-1)
+    if (event) socket.send(JSON.stringify(['EVENT', frame[1], event]))
+    socket.send(JSON.stringify(['EOSE', frame[1]]))
+  }
+  if (frame[0] === 'EVENT') {
+    if (publicDown) return socket.send(JSON.stringify(['OK', frame[1].id, false, 'error: down']))
+    publicSent.push(frame[1]); publicStored.push(frame[1])
+    socket.send(JSON.stringify(['OK', frame[1].id, true, '']))
+  }
+}))
 websocket.on('connection', socket => {
   const challenge = Buffer.from(generateSecretKey()).toString('hex')
   let authorized = false
@@ -52,7 +79,7 @@ websocket.on('connection', socket => {
 function manifestFixture(id, extra = {}) {
   const directory = join(root, id)
   for (const name of ['instances', 'state', 'run', 'spool']) mkdirSync(join(directory, name), { recursive: true })
-  const raw = { id, pubkey, grantors: [other], relays: ['wss://relay.example'], buzz: { relay, channels: ['00000000-0000-4000-8000-000000000000'] },
+  const raw = { id, pubkey, grantors: [other], relays: [publicRelay], buzz: { relay, channels: ['00000000-0000-4000-8000-000000000000'] },
     broker_mode: 'local', key_ref: '/fake/key', delivery_mode: 'notify_only', worker_enabled: false,
     state_dir: join(directory, 'state'), runtime_dir: join(directory, 'run'), spool_dir: join(directory, 'spool'),
     broker_adapter_gid: 1001, worker_handoff_gid: 1002, watcher_uid: 1001, broker_uid: 1002,
@@ -133,7 +160,8 @@ const credential = join(root, 'credential')
 writeFileSync(credential, Buffer.from(secret).toString('hex'))
 const runBroker = (extraEnv = {}) => new Promise(resolve => {
   const child = spawn(process.execPath, ['mcp/tools/instance-broker-profile.mjs', '--instance', 'seat', '--request', lastRequest],
-    { cwd: new URL('..', import.meta.url).pathname, env: { ...process.env, NVOY_INSTANCE_ROOT: fixture.root, NVOY_BROKER_CREDENTIAL: credential, ...extraEnv },
+    { cwd: new URL('..', import.meta.url).pathname, env: { ...process.env, NVOY_INSTANCE_ROOT: fixture.root, NVOY_BROKER_CREDENTIAL: credential,
+      NODE_EXTRA_CA_CERTS: join(certDir, 'cert.pem'), ...extraEnv },
       stdio: ['ignore', 'pipe', 'pipe'] })
   let stderr = ''
   child.stderr.on('data', chunk => { stderr += chunk })
@@ -162,6 +190,8 @@ assert.equal(published.event_id, sent.at(-1).id)
 assert.equal(published.relay.accepted, true)
 assert.equal(published.readback.custom.match, true)
 assert.equal(JSON.parse(sent.at(-1).content).custom, 'keep')
+assert.deepEqual(published.public_relays.map(r => [r.relay, r.accepted]), [[publicRelay, true]])
+assert.equal(publicSent.at(-1).id, published.event_id)
 submit({ fields: { about: 'too soon' } })
 assert.equal((await runBroker()).status, 0)
 assert.equal(profileStatus(manifest, lastRequest).error.code, 'NVOY_PROFILE_RATE_LIMITED')
@@ -225,9 +255,35 @@ const auditAfter = readFileSync(join(fixture.directory, 'state', 'profile-audit.
 assert.equal(auditAfter.at(-1).outcome, 'NVOY_PROFILE_READBACK_MISMATCH')
 const savedEvents = stored
 stored = []
-submit({ fields: { about: 'missing current' }, dry_run: true })
+publicStored = []
+publicDown = true
+submit({ fields: { name: 'newcomer' }, dry_run: true })
 assert.equal((await runBroker()).status, 0)
-assert.equal(profileStatus(manifest, lastRequest).error.code, 'NVOY_PROFILE_INVALID_CURRENT')
+assert.equal(profileStatus(manifest, lastRequest).error.code, 'NVOY_PROFILE_INVALID_CURRENT',
+  'an empty Buzz read with no public relay answering is not proof there is no profile')
+publicDown = false
+submit({ fields: { about: 'no name yet' }, dry_run: true })
+assert.equal((await runBroker()).status, 0)
+assert.equal(profileStatus(manifest, lastRequest).error.code, 'NVOY_PROFILE_FIRST_NEEDS_NAME')
+submit({ fields: { name: 'newcomer' }, dry_run: true })
+assert.equal((await runBroker()).status, 0)
+assert.equal(profileStatus(manifest, lastRequest).ok.first, true)
+assert.deepEqual(profileStatus(manifest, lastRequest).ok.candidate, { name: 'newcomer', bot: true })
+publicStored = [finalizeEvent({ kind: 0, created_at: 5, tags: [], content: JSON.stringify({ name: 'outside', custom: 'outside-keep', bot: true }) }, secret)]
+submit({ fields: { about: 'built on the public copy' }, dry_run: true })
+assert.equal((await runBroker()).status, 0)
+assert.equal(profileStatus(manifest, lastRequest).ok.first, false)
+assert.equal(profileStatus(manifest, lastRequest).ok.candidate.custom, 'outside-keep',
+  'a profile that exists only on a public relay is built on, not overwritten')
+publicStored = []
+savedManifest.may_set_profile.per_day = 5
+writeFileSync(manifestPath, JSON.stringify(savedManifest))
+submit({ fields: { name: 'newcomer', about: 'first profile' } })
+assert.equal((await runBroker()).status, 0)
+const firstProfile = profileStatus(manifest, lastRequest).ok
+assert.equal(firstProfile.event_id, sent.at(-1).id)
+assert.deepEqual(JSON.parse(sent.at(-1).content), { name: 'newcomer', about: 'first profile', bot: true })
+assert.equal(publicSent.at(-1).id, firstProfile.event_id)
 stored = savedEvents
 const fetchStub = join(root, 'nip05-mismatch.mjs')
 writeFileSync(fetchStub, `globalThis.fetch = async () => ({ ok: true, json: async () => ({ names: { grok: '${other}' } }) })\n`)
@@ -237,4 +293,6 @@ assert.equal(profileStatus(manifest, lastRequest).error.code, 'NVOY_PROFILE_NIP0
 
 await new Promise(resolve => websocket.close(resolve))
 await new Promise(resolve => server.close(resolve))
-console.log('profile-set: manifest, validation, NIP-05, dry run, publish/readback, rate limit, retry and audit pass')
+await new Promise(resolve => publicSocket.close(resolve))
+await new Promise(resolve => publicServer.close(resolve))
+console.log('profile-set: manifest, validation, NIP-05, dry run, publish/readback, public relays, first profile, rate limit, retry and audit pass')

@@ -293,8 +293,12 @@ to `nave.pub`. The block requires a local broker, a Buzz relay, worker-disabled 
 delivery, and an exact kind/pubkey match. Manifest loading and the broker both check that scope.
 
 The channel tool accepts only `name`, `display_name`, `about`, `picture`, `website`, and `nip05`.
-The broker requires and reads the latest Buzz kind 0, merges those fields, preserves everything else,
-and forces `bot: true`; an empty relay answer fails closed rather than replacing an unseen profile.
+The broker reads the latest kind 0 from Buzz and from each of the manifest's public `relays`, builds on
+the newest signed one, merges those fields, preserves everything else, and forces `bot: true`. A seat
+with no profile anywhere may make its first one, which must set `name`, but only when at least one
+public relay answered too: an empty Buzz answer alone fails closed rather than replacing an unseen
+profile. A published profile goes to Buzz, which must accept it and read it back, and then the same
+signed event goes to each public relay; each public relay's answer is reported in the result.
 It bounds field lengths, requires an allowed HTTPS picture host, and verifies a
 `name@nave.pub` NIP-05 against `nave.pub/.well-known/nostr.json`. `dry_run` validates and returns
 the candidate without signing kind 0 or spending the profile budget; a NIP-42 AUTH signature may

@@ -14,7 +14,7 @@ export function profileToolSpec(manifest) {
   return {
     name: 'nvoy_profile_set',
     description: grant
-      ? `Propose changes to this seat's kind-0 profile. The broker merges and validates the fields, then signs and publishes under manifest grant ${grant.grantId}. Dry run validates without signing kind 0. Rolling 24-hour limit: ${grant.perDay}. Allowed picture hosts: ${grant.pictureHosts.join(', ')}.`
+      ? `Propose changes to this seat's kind-0 profile. The broker merges and validates the fields, then signs and publishes to Buzz and this seat's public relays under manifest grant ${grant.grantId}. A first profile must set name. Dry run validates without signing kind 0. Rolling 24-hour limit: ${grant.perDay}. Allowed picture hosts: ${grant.pictureHosts.join(', ')}.`
       : 'Profile changes are refused because this seat has no may_set_profile grant.',
     inputSchema: { type: 'object', properties: {
       fields: { type: 'object', properties: Object.fromEntries(PROFILE_FIELDS.map(field => [field, { type: 'string' }])),
