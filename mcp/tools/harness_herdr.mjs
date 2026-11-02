@@ -32,16 +32,19 @@ export function herdrClient({ bin = process.env.HARNESS_HERDR_BIN || 'herdr', en
   const client = {
     available() { try { call(['workspace', 'list']); return true } catch { return false } },
     // The identity's workspace and its first pane, created when missing.
+    // Its tab carries the identity's name too: Moshi lists an agent without a session title by its tab.
     pane({ label, cwd }) {
+      const nameTab = tab => { if (tab) try { call(['tab', 'rename', tab, label]) } catch {} }
       const found = (call(['workspace', 'list']).workspaces || []).find(w => w.label === label)
       if (found) {
         const panes = call(['pane', 'list', '--workspace', found.workspace_id]).panes || []
-        if (panes[0]?.pane_id) return panes[0].pane_id
+        if (panes[0]?.pane_id) { nameTab(panes[0].tab_id); return panes[0].pane_id }
         throw new Error(`herdr workspace ${label} has no pane`)
       }
       const created = call(['workspace', 'create', '--label', label, '--cwd', cwd, '--no-focus'])
       const pane = JSON.stringify(created).match(/"pane_id":"([^"]+)"/)?.[1]
       if (!pane) throw new Error(`herdr created workspace ${label} but named no pane`)
+      nameTab(JSON.stringify(created).match(/"tab_id":"([^"]+)"/)?.[1])
       return pane
     },
     // The identity's workspace closed with everything in it, so the next pane() opens a fresh one.
@@ -67,7 +70,9 @@ export function herdrClient({ bin = process.env.HARNESS_HERDR_BIN || 'herdr', en
 // the session's exit status for the supervisor. Echo is off while the session starts: herdr's
 // terminal answers the queries an agent sends at startup, and an echoed answer is drawn over its
 // screen (it hid the development-channels prompt the supervisor answers; mc-claude, 2026-10-19).
-export function launcherScript({ env, cwd, command, pidFile, statusFile, credential = null }) {
+// exec: the launcher becomes the agent (same pid, no exit-status file), so the pane's foreground is the agent
+// alone; Moshi treats a pane whose foreground also holds a shell as a plain terminal (pi-dog, 2026-11-02).
+export function launcherScript({ env, cwd, command, pidFile, statusFile, credential = null, exec = false }) {
   const q = value => `'${String(value).replace(/'/g, `'\\''`)}'`
   // COLORTERM too: without it an agent falls back to 256 colours, and Codex's composer shading then all
   // but hides its text. Not TERM_PROGRAM: with it, Claude Code stopped taking the keys the supervisor
@@ -86,10 +91,12 @@ export function launcherScript({ env, cwd, command, pidFile, statusFile, credent
     ...(credential ? [`${credential.env}=$(cat ${q(credential.file)}) || exit 1`, `export ${credential.env}`] : []),
     `cd ${q(cwd)} || exit 1`,
     'stty -echo 2>/dev/null',
-    command.map(q).join(' '),
-    'status=$?',
-    'stty echo 2>/dev/null',
-    `echo $status > ${q(statusFile)}`,
+    ...(exec ? [`exec ${command.map(q).join(' ')}`] : [
+      command.map(q).join(' '),
+      'status=$?',
+      'stty echo 2>/dev/null',
+      `echo $status > ${q(statusFile)}`,
+    ]),
     '',
   ].join('\n')
 }
@@ -99,10 +106,12 @@ export function launcherScript({ env, cwd, command, pidFile, statusFile, credent
 // shell runs the launcher as a job, so it leads its own group). A recorded pid is signalled only
 // while it is still that launcher, or while the group it led for this supervisor still has members
 // (a number is not reused while its group lives), never a process that has since reused the number.
-export function herdrSession({ herdr, name, dir, cwd, file = 'session', launchMs = 10000, log = () => {} }) {
+// execMarker: an argument only this agent's command line carries; given, the launcher execs the agent, and a
+// recorded pid still counts as ours while its command line holds the marker.
+export function herdrSession({ herdr, name, dir, cwd, file = 'session', launchMs = 10000, log = () => {}, execMarker = '' }) {
   const launcher = resolve(dir, `${file}.sh`), pidFile = resolve(dir, `${file}.pid`), statusFile = resolve(dir, `${file}.status`)
   const readPid = () => { try { const pid = readFileSync(pidFile, 'utf8').trim(); return /^\d+$/.test(pid) ? pid : '' } catch { return '' } }
-  const ours = pid => !!pid && (spawnSync('ps', ['-o', 'args=', '-p', pid], { encoding: 'utf8' }).stdout || '').includes(launcher)
+  const ours = pid => { if (!pid) return false; const args = spawnSync('ps', ['-o', 'args=', '-p', pid], { encoding: 'utf8' }).stdout || ''; return args.includes(launcher) || (!!execMarker && args.includes(execMarker)) }
   const grouped = pid => { if (!(Number(pid) > 1)) return false; try { process.kill(-Number(pid), 0); return true } catch { return false } }
   const signal = (pid, sig) => { try { process.kill(-Number(pid), sig) } catch { try { process.kill(Number(pid), sig) } catch {} } }
   const agent = () => { try { return herdr.agent(pane)?.agent || '' } catch { return '' } }
@@ -124,7 +133,7 @@ export function herdrSession({ herdr, name, dir, cwd, file = 'session', launchMs
         pane = herdr.pane({ label: name, cwd })
       }
       rmSync(pidFile, { force: true }); rmSync(statusFile, { force: true })
-      writeFileSync(launcher, launcherScript({ env, cwd, command, pidFile, statusFile, credential }), { mode: 0o700 })
+      writeFileSync(launcher, launcherScript({ env, cwd, command, pidFile, statusFile, credential, exec: !!execMarker }), { mode: 0o700 })
       chmodSync(launcher, 0o700)
       // The terminal's answers to a stopped session's last queries arrive at the shell's prompt; left
       // there, they join the launcher's command line (one became `>|libghostty…;22c1`, a redirect that
