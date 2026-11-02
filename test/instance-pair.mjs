@@ -67,6 +67,7 @@ try {
     const link = new URL(seen[0].replace(/^nostrconnect:/, 'http:'))
     check('the link asks for exactly the broker permissions', link.searchParams.get('perms') === brokerPerms().join(','))
     check('…which cover every kind the runtime signs, and NIP-44', BROKER_SIGN_KINDS.every(k => brokerPerms().includes(`sign_event:${k}`)) && brokerPerms().includes('nip44_decrypt'))
+    check('…including joining an open room, but never adding or removing someone else', brokerPerms().includes('sign_event:9021') && !brokerPerms().some(p => /^sign_event:900[01]$/.test(p)))
     const client = readFileSync(m.bunkerClientRef, 'utf8').trim(), pointer = readFileSync(m.bunkerUriRef, 'utf8').trim()
     check('both credential files are seated 0600', [m.bunkerClientRef, m.bunkerUriRef].every(f => (statSync(f).mode & 0o777) === 0o600))
     check('the client file is the key the link was made for', getPublicKey(Uint8Array.from(Buffer.from(client, 'hex'))) === link.hostname)
