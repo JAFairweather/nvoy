@@ -45,8 +45,23 @@ relay list, and every runtime manifest.
 
 ## 2. Pair the identity with Bunker
 
-Import the staged nsec into the owner-controlled Bunker and create a dedicated
-NIP-46 URI and client credential for this instance. The broker may receive only
+The Bunker must hold the identity's key (generate it there, or import it). Then,
+on the fleet host, as root:
+
+```
+node mcp/tools/instance-pair.mjs --id <name>
+```
+
+It makes the instance's NIP-46 client key on the host, prints a one-time
+`nostrconnect://` link, and waits. Approve the link in the Bunker with the
+identity's key. The tool refuses unless the Bunker answers as the manifest's
+pubkey and signs a probe that verifies, then seats `<name>.nip46-client` and
+`<name>.bunker-uri` root 0600. No `bunker://` secret is ever copied, and the
+pointer it writes carries no spent secret (#166, #171).
+
+The manual route below remains for a Bunker that cannot accept a
+`nostrconnect://` link: import the staged nsec into the owner-controlled Bunker
+and create a dedicated NIP-46 URI and client credential for this instance. The broker may receive only
 the URI reference and client transport credential. It must never receive the
 identity nsec.
 
