@@ -16,7 +16,7 @@
 //
 // `check` is the gate before the install: the staged manifest validates, collides with nothing in
 // the estate, and its two Bunker credential files are seated root:root 0600. It reads file metadata
-// only. It does not prove the pairing, which needs the signer and stays an operator step.
+// only. It does not prove the pairing; `instance-pair.mjs` pairs, proves and seats them (#166).
 //
 // `apply` runs `check` again and refuses unless it passes, then installs the staged manifest, waits
 // for the runner to record it, seats the channel principal and baselines the channel. The sequence
