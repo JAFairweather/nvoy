@@ -85,6 +85,17 @@ export function queueProfile(manifest, args = {}, now = Date.now()) {
   } catch (error) { return { error: { code: 'NVOY_PROFILE_QUEUE_FAILED', message: error.message } } }
 }
 
+// A profile on Buzz whose public relays are still being retried exits with this code and writes a
+// partial result marked retry. A request is finished once its last result row is not marked retry.
+export const PROFILE_PUBLIC_RETRY_EXIT = 75
+export function finishedProfileRequests(text) {
+  const last = new Map()
+  for (const line of String(text).split('\n')) {
+    try { const row = JSON.parse(line); if (row?.type === 'profile-result' && HEX32.test(String(row.request))) last.set(row.request, row) } catch {}
+  }
+  return new Set([...last].filter(([, row]) => row.retry !== true).map(([request]) => request))
+}
+
 export function profileStatus(manifest, request) {
   if (!HEX32.test(String(request || ''))) return { error: { code: 'NVOY_PROFILE_BAD_REQUEST' } }
   if (!manifest.maySetProfile) return { error: { code: 'NVOY_PROFILE_NOT_PERMITTED' } }

@@ -27,14 +27,17 @@ export function queryRelay(url, filter, { signer = null, ms = 10000 } = {}) {
       else if (frame[0] === 'CLOSED' && frame[1] === 'q' && !String(frame[2] || '').startsWith('auth-required')) finish(false)
     })
     ws.on('error', () => finish(false))
+    ws.on('close', () => finish(false))
   })
 }
 
-// Resolves { relay, accepted, message }. A relay that wants a login before accepting gets one.
+// Resolves { relay, accepted, answered, message }. answered is true when the relay said OK either way,
+// so a refusal (final) can be told apart from a timeout or a dropped connection (worth retrying).
+// A relay that wants a login before accepting gets one.
 export function publishRelay(url, event, { signer = null, ms = 10000 } = {}) {
   return new Promise(resolve => {
     let done = false, authed = false, ws
-    const finish = (accepted, message) => { if (done) return; done = true; clearTimeout(timer); try { ws.close() } catch {} ; resolve({ relay: url, accepted, message }) }
+    const finish = (accepted, message, answered = false) => { if (done) return; done = true; clearTimeout(timer); try { ws.close() } catch {} ; resolve({ relay: url, accepted, answered, message }) }
     const timer = setTimeout(() => finish(false, 'timeout'), ms)
     try { ws = new WebSocket(url) } catch (error) { return finish(false, error.message) }
     const send = () => ws.send(JSON.stringify(['EVENT', event]))
@@ -50,9 +53,10 @@ export function publishRelay(url, event, { signer = null, ms = 10000 } = {}) {
       if (frame[1] === event.id) {
         // Wait for the login and the resend; a relay that refuses again runs into the timeout.
         if (!frame[2] && signer && String(frame[3] || '').startsWith('auth-required')) return
-        finish(Boolean(frame[2]), String(frame[3] || ''))
+        finish(Boolean(frame[2]), String(frame[3] || ''), true)
       } else if (authed && frame[2]) send()
     })
     ws.on('error', error => finish(false, error.message))
+    ws.on('close', () => finish(false, 'connection closed'))
   })
 }

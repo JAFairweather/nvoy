@@ -5,7 +5,7 @@ import { resolve } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import { getEventHash, verifyEvent } from 'nostr-tools/pure'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
-import { validateProfileRequest, profileQueuePath, profileResultsPath } from './agent_profile.mjs'
+import { validateProfileRequest, profileQueuePath, profileResultsPath, PROFILE_PUBLIC_RETRY_EXIT } from './agent_profile.mjs'
 import { mergedProfile, ProfileRefusal, readbackProfile } from './profile_policy.mjs'
 import { brokerSigner } from './broker_signer.mjs'
 import { openBuzzSession } from './buzz_native.mjs'
@@ -48,8 +48,8 @@ function persist() {
 }
 // The newest signed profile on Buzz or on any of the seat's public relays is the one to build on, so
 // a profile set elsewhere is never overwritten by an older copy. A seat with no profile anywhere may
-// make its first one, but only when a public relay answered as well: an empty Buzz read alone cannot
-// be told apart from a read that failed quietly.
+// make its first one, but only when every public relay answered that it has none: a relay that is
+// down might hold the profile, and an empty Buzz read cannot be told apart from one that failed.
 function currentProfile(buzzEvents, outside) {
   const all = [...(Array.isArray(buzzEvents) ? buzzEvents : []), ...outside.flatMap(read => read.events)]
   const latest = all.filter(event => event?.kind === 0 && event.pubkey === manifest.pubkey &&
@@ -59,11 +59,14 @@ function currentProfile(buzzEvents, outside) {
     catch { throw new ProfileRefusal('NVOY_PROFILE_INVALID_CURRENT', 'current kind-0 content is invalid JSON') }
   }
   if (all.length) throw new ProfileRefusal('NVOY_PROFILE_INVALID_CURRENT', 'relays returned only invalid kind-0 events')
-  if (!outside.some(read => read.answered)) throw new ProfileRefusal('NVOY_PROFILE_INVALID_CURRENT',
-    'no current kind-0 event on Buzz, and no public relay answered to confirm there is none')
+  if (!outside.length || !outside.every(read => read.answered)) throw new ProfileRefusal('NVOY_PROFILE_INVALID_CURRENT',
+    'no current kind-0 event on Buzz, and not every public relay answered to confirm there is none')
   return { profile: {}, event: null, first: true }
 }
 const ownProfile = { kinds: [0], authors: [manifest.pubkey], limit: 1 }
+// A public relay that timed out or dropped the connection is tried again for a day, on the daemon's
+// slow retry (exit 75); one that answered with a refusal is final and reported.
+const PUBLIC_RETRY_MS = 24 * 60 * 60 * 1000
 
 try {
   const queue = profileQueuePath(manifest), stat = lstatSync(queue)
@@ -162,17 +165,34 @@ try {
       record.event = event
       persist()
     }
-    if (!session) session = await openBuzzSession({ relay: manifest.buzz.relay, signer })
-    const published = await session.publishSigned(record.event)
-    if (!published.accepted) throw new ProfileRefusal('NVOY_PROFILE_RELAY_REFUSED', published.message || 'Buzz relay refused profile')
-    const events = await session.fetch({ kinds: [0], authors: [manifest.pubkey], limit: 1 })
-    const readback = readbackProfile(events, record.event, record.profile)
+    if (!record.buzz) {
+      if (!session) session = await openBuzzSession({ relay: manifest.buzz.relay, signer })
+      const published = await session.publishSigned(record.event)
+      if (!published.accepted) throw new ProfileRefusal('NVOY_PROFILE_RELAY_REFUSED', published.message || 'Buzz relay refused profile')
+      const events = await session.fetch({ kinds: [0], authors: [manifest.pubkey], limit: 1 })
+      record.buzz = { message: published.message, readback: readbackProfile(events, record.event, record.profile) }
+      record.public = Object.fromEntries(manifest.relays.map(url => [url, { state: 'pending', message: '', attempts: 0 }]))
+      record.public_since = Date.now()
+      persist()
+    }
     // The same signed event goes to the seat's public relays, so its profile reads the same outside
-    // Buzz. Buzz is the one that must accept; a public relay that refuses is reported, not retried.
-    const outside = await Promise.all(manifest.relays.map(url => publishRelay(url, record.event, { signer })))
-    finish({ event_id: record.event.id, relay: { accepted: true, message: published.message },
-      public_relays: outside.map(({ relay, accepted, message }) => ({ relay, accepted, message: message.slice(0, 160) })),
-      changed: record.changed, readback })
+    // Buzz. Buzz is the one that must accept; the public legs are reported one by one.
+    const pending = Object.keys(record.public || {}).filter(url => record.public[url].state === 'pending')
+    for (const result of await Promise.all(pending.map(url => publishRelay(url, record.event, { signer })))) {
+      const leg = record.public[result.relay]
+      leg.attempts += 1
+      leg.message = String(result.message || '').slice(0, 160)
+      leg.state = result.accepted ? 'accepted' : result.answered ? 'refused' : 'pending'
+    }
+    const stillPending = Object.values(record.public || {}).some(leg => leg.state === 'pending')
+    const retrying = stillPending && Date.now() - record.public_since < PUBLIC_RETRY_MS
+    if (stillPending && !retrying) for (const leg of Object.values(record.public)) if (leg.state === 'pending') leg.state = 'gave_up'
+    persist()
+    const result = { event_id: record.event.id, relay: { accepted: true, message: record.buzz.message },
+      public_relays: Object.entries(record.public || {}).map(([relay, leg]) => ({ relay, ...leg })),
+      ...(stillPending ? { partial: true, retry: retrying } : {}), changed: record.changed, readback: record.buzz.readback }
+    finish(result)
+    if (retrying) process.exitCode = PROFILE_PUBLIC_RETRY_EXIT
   }
 } catch (error) {
   const code = error instanceof ProfileRefusal ? error.code :
