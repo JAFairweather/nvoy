@@ -14,7 +14,7 @@ export function profileToolSpec(manifest) {
   return {
     name: 'nvoy_profile_set',
     description: grant
-      ? `Propose changes to this seat's kind-0 profile. The broker merges and validates the fields, then signs and publishes under manifest grant ${grant.grantId}. Dry run validates without signing kind 0. Rolling 24-hour limit: ${grant.perDay}. Allowed picture hosts: ${grant.pictureHosts.join(', ')}.`
+      ? `Propose changes to this seat's kind-0 profile. The broker merges and validates the fields, then signs and publishes to Buzz and this seat's public relays under manifest grant ${grant.grantId}. A first profile must set name. Dry run validates without signing kind 0. Rolling 24-hour limit: ${grant.perDay}. Allowed picture hosts: ${grant.pictureHosts.join(', ')}.`
       : 'Profile changes are refused because this seat has no may_set_profile grant.',
     inputSchema: { type: 'object', properties: {
       fields: { type: 'object', properties: Object.fromEntries(PROFILE_FIELDS.map(field => [field, { type: 'string' }])),
@@ -83,6 +83,17 @@ export function queueProfile(manifest, args = {}, now = Date.now()) {
     appendFileSync(path, JSON.stringify(row) + '\n')
     return { ok: { queued: true, request: row.id } }
   } catch (error) { return { error: { code: 'NVOY_PROFILE_QUEUE_FAILED', message: error.message } } }
+}
+
+// A profile on Buzz whose public relays are still being retried exits with this code and writes a
+// partial result marked retry. A request is finished once its last result row is not marked retry.
+export const PROFILE_PUBLIC_RETRY_EXIT = 75
+export function finishedProfileRequests(text) {
+  const last = new Map()
+  for (const line of String(text).split('\n')) {
+    try { const row = JSON.parse(line); if (row?.type === 'profile-result' && HEX32.test(String(row.request))) last.set(row.request, row) } catch {}
+  }
+  return new Set([...last].filter(([, row]) => row.retry !== true).map(([request]) => request))
 }
 
 export function profileStatus(manifest, request) {
