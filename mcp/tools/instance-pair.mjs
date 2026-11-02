@@ -34,8 +34,10 @@ import { readManifest } from './runtime_manifest.mjs'
 
 // What the runtime signs as the agent: notes and replies (1), deletions (5), reactions (7), channel
 // posts (9), sealed DMs (13), relay AUTH (22242), HTTP auth to Buzz (27235, also the probe) and its
-// card and state (30078); plus the NIP-44 it uses to open and seal DMs.
-export const BROKER_SIGN_KINDS = Object.freeze([1, 5, 7, 9, 13, 22242, 27235, 30078])
+// card and state (30078); plus the NIP-44 it uses to open and seal DMs. And joining a room (9021),
+// so onboarding can put a new agent in the rooms its owner picked: the relay accepts a self-join
+// only for an open room. Adding or removing someone else (9000/9001) stays the owner's.
+export const BROKER_SIGN_KINDS = Object.freeze([1, 5, 7, 9, 13, 9021, 22242, 27235, 30078])
 export const brokerPerms = () => ['get_public_key', 'nip44_encrypt', 'nip44_decrypt', ...BROKER_SIGN_KINDS.map(k => `sign_event:${k}`)]
 
 const HEX64 = /^[0-9a-f]{64}$/
