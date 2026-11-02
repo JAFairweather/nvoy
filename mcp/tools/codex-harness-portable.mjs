@@ -36,7 +36,9 @@ let viewer = null
 if (mode === 'herdr' || (mode === 'auto' && herdr.available())) {
   let name
   try { name = herdrAgentName(config.id) } catch (error) { die(error.message) }
-  const session = herdrSession({ herdr, name, dir: resolve(config.codexHome, 'nvoy'), cwd: resolve(config.codexHome, 'workspace'), file: 'viewer', log })
+  // The viewer execs codex (see launcherScript); its --remote socket marks it as this identity's.
+  const session = herdrSession({ herdr, name, dir: resolve(config.codexHome, 'nvoy'), cwd: resolve(config.codexHome, 'workspace'), file: 'viewer', log,
+    execMarker: `unix://${resolve(config.codexHome, 'ctl', 'as.sock')}` })
   viewer = herdrKeeper({ session, log, everyMs: Number(process.env.HARNESS_VIEWER_CHECK_MS || 5000) })
   log(`the thread is shown in herdr, in workspace ${name}`)
 }
