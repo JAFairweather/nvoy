@@ -103,6 +103,29 @@ withdraws the manifest rather than let that rollback repeat. If no record appear
 result is INCONCLUSIVE, and the manifest stays in place. Prove the Bunker pairing before `apply`,
 and a live wake after it.
 
+### From an owner-signed request
+
+`nvoy-onboard.mjs` runs the steps above from one request the owner signs on the hive page (#289),
+so the operator types a name, not a manifest:
+
+```bash
+node mcp/tools/nvoy-onboard.mjs show <name>
+node mcp/tools/nvoy-onboard.mjs run <name> --authorized-keys /home/<channel-account>/.ssh/authorized_keys
+```
+
+The request is a kind 30078 event with `d` = `nvoy-onboard/<name>/add_agent`: the agent's key, its
+harness, the live agent to copy (`like`), who may give it work, and its rooms. A second one,
+`nvoy-onboard/<name>/bind_runtime`, carries the public channel key made on the agent's box. Only a
+grantor of the `like` agent can sign either, only public fields are accepted, and an unknown tag
+refuses the request. `show` verifies and prints the plan and writes nothing. `run` stages the
+manifest with a `may_set_profile` grant (one change a day), pairs, checks, waits for `bind_runtime`,
+applies, and then adds the agent to each giving seat's `may_post.mention`. That last step redeploys
+those seats, so it waits for `--givers-redeploy`, and backs each manifest up under
+`/root/<seat>-backups-<date>` first. A step that is waiting writes a `pending` receipt in
+`/var/lib/nvoy-onboard/<request id>.jsonl` saying on what, and `run` exits 4. Run it again to carry
+on: each step checks the state it makes, so nothing runs twice. The relay writer entry and the hive
+invite stay pending until nave.pub #157 and the sealed invite land.
+
 `worker_credential_ref` is intentionally a different credential class: a dedicated, revocable
 model-provider API key used by the headless Claude/Codex process. It is mounted only in the
 keyless worker, never in the broker. For `worker_runner: "codex"` its file holds an
