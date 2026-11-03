@@ -13,7 +13,7 @@ const seal = (text, to = agent) => nip44.encrypt(text, nip44.getConversationKey(
 const relay = 'wss://buzz.example', http = 'https://buzz.example'
 const room1 = '00000000-0000-4000-8000-000000000001', room2 = '00000000-0000-4000-8000-000000000002'
 
-function world({ member = false, terms = { version: '3', age_attestation_required: true }, termsFail = false, claimError = '' } = {}) {
+function world({ member = false, terms = { version: '3', age_attestation_required: true }, termsFail = false, claimError = '', stall = '' } = {}) {
   const w = { member, posts: [], decrypts: 0, logins: 0 }
   w.signer = {
     async nip44Decrypt(peer, ct) { w.decrypts++; return nip44.decrypt(ct, nip44.getConversationKey(agentSk, peer)) },
@@ -21,6 +21,7 @@ function world({ member = false, terms = { version: '3', age_attestation_require
   }
   w.open = async () => { w.logins++; if (!w.member) throw new Error('AUTH refused: restricted: not a member'); return { close() {} } }
   w.fetchImpl = async (url, { method, headers, body }) => {
+    if (stall && url.endsWith(stall)) return new Promise(() => {})
     const reply = (status, json) => ({ status, json: async () => json })
     if (method === 'GET' && url === `${http}/api/join-policy`) {
       if (termsFail) throw new Error('connection reset')
@@ -39,7 +40,7 @@ function world({ member = false, terms = { version: '3', age_attestation_require
   return w
 }
 const request = (extra = {}) => ({ owner, pubkey: agent, invite: seal(CODE), policy: '3', ageConfirmed: true, rooms: [room1], ...extra })
-const go = (w, add) => joinHive({ add, relay, signer: w.signer, open: w.open, fetchImpl: w.fetchImpl })
+const go = (w, add, ms) => joinHive({ add, relay, signer: w.signer, open: w.open, fetchImpl: w.fetchImpl, ...(ms ? { ms } : {}) })
 const noCode = r => assert.ok(!JSON.stringify({ state: r.state, detail: r.detail }).includes(CODE), 'the code never reaches a receipt')
 
 // Already a member: done, and the invite is never opened.
@@ -92,6 +93,19 @@ assert.equal(r.state, 'done'); assert.deepEqual(w.posts.map(p => p.url), [`${htt
 w = world({ claimError: `invite ${CODE} already used` }); r = await go(w, request())
 assert.equal(r.state, 'refused'); assert.match(r.detail, /already used/); noCode(r)
 
+// A code straddling the 200-character cut: redacted first, so not even its prefix survives.
+const lead = 'x'.repeat(190)   // the relay's words are cut at 200: the code starts 10 before the cut
+w = world({ claimError: `${lead}${CODE} was already used` }); r = await go(w, request())
+assert.equal(r.state, 'refused'); noCode(r); assert.ok(!r.detail.includes(CODE.slice(0, 8)), 'no prefix of the code survives the cut')
+
+// A hive that stops answering: each of the three exchanges becomes a waiting step, never a hang.
+w = world({ stall: '/api/join-policy' }); r = await go(w, request(), 20)
+assert.equal(r.state, 'pending'); assert.match(r.detail, /can't read the hive's terms \(no answer in 0\.02s\)/); assert.equal(w.posts.length, 0)
+w = world({ stall: '/api/invites/accept-policy' }); r = await go(w, request(), 20)
+assert.equal(r.state, 'pending'); assert.match(r.detail, /did not answer the terms acceptance/); assert.equal(w.posts.length, 0)
+w = world({ stall: '/api/invites/claim' }); r = await go(w, request(), 20)
+assert.equal(r.state, 'pending'); assert.match(r.detail, /did not answer the claim .*checks whether it took/); noCode(r)
+
 // ── Rooms ──────────────────────────────────────────────────────────────────────────────────────
 function rooms({ members = {}, refuse = [] } = {}) {
   const s = { published: [], lists: members }
@@ -126,4 +140,4 @@ assert.deepEqual(r, { state: 'done', detail: '2 of 2 rooms joined' }); assert.de
 s = rooms({ refuse: [room2] }); r = await joinRooms({ add: request({ rooms: [room1, room2] }), session: s })
 assert.equal(r.state, 'pending'); assert.match(r.detail, /1 of 2 rooms joined; 00000000 refused the join \(restricted: closed group\); if it is private, the owner adds it/)
 
-console.log('onboard-join: member already, no invite, wrong seal, relay down, terms unread/changed/age, full claim, no terms, scrubbed refusal, partial resume, rooms joined/private pass')
+console.log('onboard-join: member already, no invite, wrong seal, relay down, terms unread/changed/age, full claim, no terms, scrubbed refusal (straddling the cut), stalled hive, partial resume, rooms joined/private pass')

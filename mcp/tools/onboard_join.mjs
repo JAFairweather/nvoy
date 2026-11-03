@@ -18,31 +18,48 @@ const refusedLogin = error => /AUTH refused/.test(error?.message || '')
 const result = (state, detail, extra = {}) => ({ state, detail, ...extra })
 
 // The relay's own words, without the code in them should it ever echo one back.
+// Redacted before it is cut, so a code that straddles the cut cannot leave its prefix behind.
 const scrub = (text, code) => {
-  const said = String(text || '(no reason)').slice(0, 200)
-  return code ? said.split(code).join('[invite]') : said
+  const said = String(text || '(no reason)')
+  return (code ? said.split(code).join('[invite]') : said).slice(0, 200)
 }
 
-async function post(relay, path, payload, { signer, fetchImpl, signed }) {
+// Every HTTP exchange with the hive, the body read included, is bounded: a stalled answer becomes a
+// step that waits, never a command that hangs. The signal aborts a real fetch; the race bounds any other.
+export const HTTP_TIMEOUT_MS = 15000
+async function exchange(fetchImpl, url, init, ms) {
+  let timer
+  const stalled = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`no answer in ${ms / 1000}s`)), ms) })
+  const run = (async () => {
+    const res = await fetchImpl(url, { ...init, signal: AbortSignal.timeout(ms) })
+    let json
+    try { json = await res.json() } catch { json = undefined }
+    return { status: res.status, json }
+  })()
+  try { return await Promise.race([run, stalled]) } finally { clearTimeout(timer) }
+}
+
+async function post(relay, path, payload, { signer, fetchImpl, signed, ms }) {
   const url = `${httpBase(relay)}${path}`, body = JSON.stringify(payload), headers = { 'content-type': 'application/json' }
   if (signed) {
     const auth = await signer.signEvent({ kind: 27235, created_at: Math.floor(Date.now() / 1000), content: '', tags: [
       ['u', url], ['method', 'POST'], ['payload', createHash('sha256').update(body).digest('hex')], ['nonce', randomUUID()]] })
     headers.authorization = `Nostr ${Buffer.from(JSON.stringify(auth)).toString('base64')}`
   }
-  const res = await fetchImpl(url, { method: 'POST', headers, body })
-  let json = {}
-  try { json = await res.json() } catch { /* judged by status */ }
-  return { status: res.status, json: json || {} }
+  try {
+    const { status, json } = await exchange(fetchImpl, url, { method: 'POST', headers, body }, ms)
+    return { status, json: json || {} }
+  } catch (error) { return { status: 0, json: {}, unanswered: error.message } }
 }
 
 // The hive's join terms. Unreadable is "can't tell", never "none".
-export async function readTerms(relay, { fetchImpl = globalThis.fetch } = {}) {
-  let res, json
-  try { res = await fetchImpl(`${httpBase(relay)}/api/join-policy`, { method: 'GET', headers: { accept: 'application/json' } }) }
+export async function readTerms(relay, { fetchImpl = globalThis.fetch, ms = HTTP_TIMEOUT_MS } = {}) {
+  let res
+  try { res = await exchange(fetchImpl, `${httpBase(relay)}/api/join-policy`, { method: 'GET', headers: { accept: 'application/json' } }, ms) }
   catch (error) { return { ok: false, reason: error.message } }
   if (res.status !== 200) return { ok: false, reason: `HTTP ${res.status}` }
-  try { json = await res.json() } catch { return { ok: false, reason: 'not JSON' } }
+  const json = res.json
+  if (json === undefined) return { ok: false, reason: 'not JSON' }
   if (!json || !('policy' in json)) return { ok: false, reason: 'no policy field' }
   if (json.policy == null) return { ok: true, version: 'none', age: false }
   return { ok: true, version: String(json.policy.version), age: json.policy.age_attestation_required === true }
@@ -50,7 +67,7 @@ export async function readTerms(relay, { fetchImpl = globalThis.fetch } = {}) {
 
 // Step "hive": the agent is a member when the relay accepts its login. Otherwise open the sealed
 // invite and claim it, then log in again as the proof.
-export async function joinHive({ add, relay, signer, open, fetchImpl = globalThis.fetch }) {
+export async function joinHive({ add, relay, signer, open, fetchImpl = globalThis.fetch, ms = HTTP_TIMEOUT_MS }) {
   try { return result('done', 'a member of the hive already', { session: await open() }) }
   catch (error) { if (!refusedLogin(error)) return result('pending', `the hive relay did not answer: ${error.message}`) }
   if (!add.invite) return result('pending', 'not a member, and the request carries no invite; the owner signs again from the page')
@@ -60,19 +77,22 @@ export async function joinHive({ add, relay, signer, open, fetchImpl = globalThi
   code = typeof code === 'string' ? code.trim() : ''
   if (!code) return result('refused', 'the invite was not sealed to this agent')
 
-  const terms = await readTerms(relay, { fetchImpl })
+  const terms = await readTerms(relay, { fetchImpl, ms })
   if (!terms.ok) return result('pending', `can't read the hive's terms (${terms.reason}); run again`)
   if (terms.version !== add.policy) return result('pending', `the terms changed since the owner signed (the hive serves ${terms.version}, the request agreed ${add.policy || 'nothing'}); the owner signs again`)
   if (terms.age && !add.ageConfirmed) return result('pending', 'the terms ask for the age confirmation and the request does not carry it; the owner signs again')
 
   let receipt = null
   if (terms.version !== 'none') {
-    const accepted = await post(relay, '/api/invites/accept-policy', { code, policy_version: terms.version, age_confirmed: add.ageConfirmed }, { signer, fetchImpl, signed: false })
+    const accepted = await post(relay, '/api/invites/accept-policy', { code, policy_version: terms.version, age_confirmed: add.ageConfirmed }, { signer, fetchImpl, signed: false, ms })
+    if (accepted.unanswered) return result('pending', `the hive did not answer the terms acceptance (${accepted.unanswered}); run again`)
     if (accepted.status !== 200 || typeof accepted.json.receipt !== 'string')
       return result('refused', `the hive refused the terms acceptance: ${scrub(accepted.json.error, code)}`)
     receipt = accepted.json.receipt
   }
-  const claimed = await post(relay, '/api/invites/claim', { code, ...(receipt ? { policy_receipt: receipt } : {}) }, { signer, fetchImpl, signed: true })
+  const claimed = await post(relay, '/api/invites/claim', { code, ...(receipt ? { policy_receipt: receipt } : {}) }, { signer, fetchImpl, signed: true, ms })
+  // A claim with no answer may still have landed, so the next run starts from the login check.
+  if (claimed.unanswered) return result('pending', `the hive did not answer the claim (${claimed.unanswered}); the next run checks whether it took`)
   if (claimed.status !== 200) return result('refused', `the hive refused the invite: ${scrub(claimed.json.error, code)}`)
   try { return result('done', 'claimed the invite, and the hive lets it log in', { session: await open() }) }
   catch (error) { return result('pending', `claimed, but the hive does not let it log in yet: ${error.message}`) }
