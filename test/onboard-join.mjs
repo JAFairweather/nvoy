@@ -68,6 +68,12 @@ assert.deepEqual(await termsOf({}), { ok: true, version: 'none', age: false })
 assert.deepEqual(await termsOf({ policy: null }), { ok: true, version: 'none', age: false })
 // Anything else that is not versioned terms stays unread.
 assert.deepEqual(await termsOf({}, 404), { ok: false, reason: 'HTTP 404' })
+// Only the exact no-terms shapes mean none: an error object, or a null policy beside other fields, is unread.
+assert.deepEqual(await termsOf({ error: 'policy unavailable' }), { ok: false, reason: 'no policy field' })
+assert.deepEqual(await termsOf({ policy: null, error: 'policy unavailable' }), { ok: false, reason: 'a null policy beside other fields' })
+w = world({ terms: undefined }); w.fetchImpl = (f => async (url, init) => url.endsWith('/api/join-policy') ? { status: 200, json: async () => ({ error: 'policy unavailable' }) } : f(url, init))(w.fetchImpl)
+r = await go(w, request({ policy: 'none', ageConfirmed: false }))
+assert.equal(r.state, 'pending'); assert.match(r.detail, /can't read the hive's terms \(no policy field\)/); assert.equal(w.posts.length, 0, 'an error answer never lets a claim through as no terms')
 assert.deepEqual(await termsOf(new SyntaxError('Unexpected token <')), { ok: false, reason: 'not JSON' })
 for (const body of [null, [], 'terms']) assert.equal((await termsOf(body)).ok, false, `${JSON.stringify(body)} is unread`)
 for (const policy of ['v1', [], {}]) assert.equal((await termsOf({ policy })).ok, false, `policy ${JSON.stringify(policy)} is unread`)

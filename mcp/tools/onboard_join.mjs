@@ -53,7 +53,7 @@ async function post(relay, path, payload, { signer, fetchImpl, signed, ms }) {
 }
 
 // The hive's join terms. Unreadable is "can't tell", never "none". The one no-terms answer is a 200
-// JSON object with no policy in it: the relay sends {} (policy null reads the same). The owner's page
+// of exactly {}, which is what the relay sends, or exactly {policy: null}. The owner's page
 // (waggle console/hive-invite.mjs termsFromRead) reads by the same rules, so the version it signs is
 // the version checked here.
 export async function readTerms(relay, { fetchImpl = globalThis.fetch, ms = HTTP_TIMEOUT_MS } = {}) {
@@ -64,8 +64,12 @@ export async function readTerms(relay, { fetchImpl = globalThis.fetch, ms = HTTP
   const json = res.json
   if (json === undefined) return { ok: false, reason: 'not JSON' }
   if (!json || typeof json !== 'object' || Array.isArray(json)) return { ok: false, reason: 'not a JSON object' }
+  const keys = Object.keys(json)
+  if (!keys.length || (keys.length === 1 && json.policy === null)) return { ok: true, version: 'none', age: false }
+  // Any other object without a policy ({error: ...}) is the relay saying something else.
   const policy = json.policy
-  if (policy == null) return { ok: true, version: 'none', age: false }
+  if (policy === undefined) return { ok: false, reason: 'no policy field' }
+  if (policy === null) return { ok: false, reason: 'a null policy beside other fields' }
   if (typeof policy !== 'object' || Array.isArray(policy)) return { ok: false, reason: 'the policy is not an object' }
   if (policy.version == null) return { ok: false, reason: 'the terms carry no version' }
   return { ok: true, version: String(policy.version), age: policy.age_attestation_required === true }
