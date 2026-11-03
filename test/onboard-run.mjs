@@ -51,8 +51,11 @@ const runTool = (tool, args) => {
   throw new Error(`unexpected tool ${tool}`)
 }
 let events = [add]
+// Not a hive member yet, and this request carries no invite: the hive step waits for one. (onboard-join.mjs covers the claim.)
+let joins = 0
+const joinWith = manifest => { joins++; assert.equal(manifest.buzz.relay, 'wss://buzz.example'); return { signer: {}, open: async () => { throw new Error('AUTH refused: not a member') }, close() {} } }
 const run = (extra = {}) => onboard({ command: 'run', name: 'hr', root, out, stateDir, backupRoot, keysPath: join(tmp, 'authorized_keys'),
-  fetchEvents: async () => events, runTool, log: () => {}, ...extra })
+  fetchEvents: async () => events, runTool, joinWith, log: () => {}, ...extra })
 const states = result => Object.fromEntries(result.receipts.map(row => [row.step, row.state]))
 
 // show writes nothing and runs nothing.
@@ -77,7 +80,9 @@ events = [add, bind]
 result = await run()
 assert.equal(states(result).started, 'done'); assert.equal(states(result).givers, 'pending')
 assert.match(result.receipts.find(row => row.step === 'givers').detail, /--givers-redeploy: it redeploys pi-dog/)
-assert.equal(states(result)['relay writer'], 'pending'); assert.equal(states(result)['hive and rooms'], 'pending')
+assert.equal(states(result)['relay writer'], 'pending'); assert.equal(states(result).hive, 'pending'); assert.equal(states(result).rooms, 'pending')
+assert.match(result.receipts.find(row => row.step === 'hive').detail, /carries no invite/)
+assert.equal(joins, 1, 'the agent connection opens only once it is installed')
 
 // Agreed: pi-dog may now mention hr, with a backup taken first, and the manifest still reads. The
 // giver outside the fleet stays pending, named, and nothing ran for it.
