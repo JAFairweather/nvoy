@@ -78,18 +78,21 @@ try {
     const checked = spawnSync(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'attention.mjs'), '--policy-only'], { encoding: 'utf8', timeout: 60000,
       env: { HOME: manifest.stateDir, PATH: process.env.PATH || '', NVOY_RELAYS: manifest.relays.join(','), GRANTORS: manifest.grantors.join(','), ...broker().attentionEnv } })
     let policy; try { policy = JSON.parse(checked.stdout) } catch { policy = null }
-    if (checked.status !== 0 || policy?.me !== manifest.pubkey || policy.policyUsable !== true) {
+    // A view names grant ids the page treats as taken, so it is published only once the keyless MCPs can read the same grants.
+    const usable = checked.status === 0 && policy?.me === manifest.pubkey && policy.policyUsable === true
+    const recorded = usable && recordMentionGrants(manifest, policy)
+    if (!recorded) {
       hold = !!last?.event
-      console.error(`instance-broker-card: live mention grants are unavailable; ${hold ? 'keeping the last card' : 'publishing without owner_view'}`)
+      const why = usable ? 'the mention-grants snapshot could not be written' : 'live mention grants are unavailable'
+      console.error(`instance-broker-card: ${why}; ${hold ? 'keeping the last card' : 'publishing without owner_view'}`)
     } else {
-      recordMentionGrants(manifest, policy)
       view = ownerView(manifest, policy.mentions)
       const leaked = credentialIn(JSON.stringify(view))
       if (leaked) throw new Error(`card withheld: its owner view looks like it holds a credential (${leaked})`)
     }
   }
   if (!hold && cardDue(card, last, Date.now(), view)) {
-    const template = cardTemplate(view ? { ...card, owner_view: sealOwnerView(view, manifest.grantors) } : card)
+    const template = cardTemplate(view ? { ...card, owner_view: sealOwnerView(view, manifest.grantors) } : card, Date.now(), last?.event?.created_at)
     const event = await broker().signer.signEvent({ pubkey: manifest.pubkey, ...template })
     if (event?.pubkey !== manifest.pubkey || event.kind !== CARD_KIND || event.content !== template.content ||
         JSON.stringify(event.tags) !== JSON.stringify(template.tags) || !verifyEvent(event)) throw new Error('signer returned a different card')

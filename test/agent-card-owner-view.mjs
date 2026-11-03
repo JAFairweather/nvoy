@@ -14,7 +14,7 @@ import { v2 as nip44 } from 'nostr-tools/nip44'
 import { scopeHash } from '../mcp/tools/grant_fold.mjs'
 import { readManifest } from '../mcp/tools/runtime_manifest.mjs'
 import { readMentionGrants } from '../mcp/tools/agent_post.mjs'
-import { agentCard, cardDigest, cardDue, ownerView, sealOwnerView } from '../mcp/tools/agent_card.mjs'
+import { agentCard, cardDigest, cardDue, ownerView, sealOwnerView, cardTemplate } from '../mcp/tools/agent_card.mjs'
 
 const key = () => { const sk = generateSecretKey(); return { sk, pk: getPublicKey(sk) } }
 const agentSk = generateSecretKey(), agent = getPublicKey(agentSk)
@@ -170,8 +170,20 @@ assert.equal(result.err, 'instance-broker-card: live mention grants are unavaila
 assert(!('owner_view' in content(cards.at(-1))), 'no view is "can\'t tell", never an empty one')
 const blind = cards.at(-1)
 grantRelay.down = false
+// A readable policy is not enough: with no snapshot for the keyless MCPs, no view claims a grant was taken.
+result = await run(fresh)
+assert.equal(result.code, 0, result.err)
+assert.equal(result.err, 'instance-broker-card: the mention-grants snapshot could not be written; keeping the last card')
+assert.equal(cards.at(-1).id, blind.id)
+writeFileSync(join(fresh.directory, 'run', 'mention-grants.json'), '')
 result = await run(fresh)
 assert.notEqual(cards.at(-1).id, blind.id)
+assert(cards.at(-1).created_at > blind.created_at, 'a replacement is always later than the card it replaces')
+{
+  const seen = JSON.parse(open(content(cards.at(-1)).owner_view[0], alice.sk))
+  assert.deepEqual(readMentionGrants(fresh.load()).map(g => g.grant_id).sort(), [...seen.mention.flatMap(e => e.grants), ...seen.refused.map(r => r.grant)].sort(),
+    'every grant id the view names is in the snapshot the keyless MCPs read')
+}
 assert.deepEqual(JSON.parse(open(content(cards.at(-1)).owner_view[0], alice.sk)), expected)
 
 // A reply-only agent's card carries no owner_view, and the policy is not read for it.
@@ -180,6 +192,14 @@ result = await run(plain)
 assert.equal(result.code, 0, result.err)
 assert(!('owner_view' in content(cards.at(-1))) && result.err === '')
 
+// NIP-01 keeps the lower id at an equal created_at, so a replacement is stamped past the card it replaces.
+{
+  const now = Date.UTC(2026, 10, 3, 12), s = Math.floor(now / 1000)
+  assert.equal(cardTemplate({ v: 1 }, now).created_at, s)
+  assert.equal(cardTemplate({ v: 2 }, now, s).created_at, s + 1)
+  assert.equal(cardTemplate({ v: 2 }, now, s + 5).created_at, s + 6)
+  assert.equal(cardTemplate({ v: 2 }, now, s - 9).created_at, s)
+}
 grantServer.close(); cardServer.close()
 console.log('ok agent card owner_view: merged list sealed to each grantor, digest of the plaintext, last card kept when the policy is unreadable')
 process.exit(0)

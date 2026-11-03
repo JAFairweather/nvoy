@@ -85,8 +85,10 @@ export function sealOwnerView(view, recipients) {
 // The public card plus the plaintext view, never the ciphertext, which is fresh on every seal.
 export const cardDigest = (card, view = null) => createHash('sha256').update(JSON.stringify(view ? { card, view } : card)).digest('hex')
 
-export function cardTemplate(card, now = Date.now()) {
-  return { kind: CARD_KIND, created_at: Math.floor(now / 1000), tags: [['d', CARD_D]], content: JSON.stringify(card) }
+// Always later than the card it replaces: at an equal created_at a relay keeps the lower id (NIP-01),
+// so a same-second replacement could lose and be resent unchanged until the daily refresh.
+export function cardTemplate(card, now = Date.now(), after = 0) {
+  return { kind: CARD_KIND, created_at: Math.max(Math.floor(now / 1000), (Number.isSafeInteger(after) ? after : 0) + 1), tags: [['d', CARD_D]], content: JSON.stringify(card) }
 }
 
 // A new signature is due when the card or its view says something new, or the last one is CARD_REFRESH_MS old.
