@@ -121,7 +121,9 @@ refuses the request. `show` verifies and prints the plan and writes nothing. `ru
 manifest with a `may_set_profile` grant (one change a day), pairs, checks, waits for `bind_runtime`,
 applies, and then adds the agent to each giving seat's `may_post.mention`. That last step redeploys
 those seats, so it waits for `--givers-redeploy`, and backs each manifest up under
-`/root/<seat>-backups-<date>` first. A step that is waiting writes a `pending` receipt in
+`/root/<seat>-backups-<date>` first, never over an earlier backup. The staged manifest belongs to the
+request that made it: a newer signed `add_agent` for the same name is staged afresh from its own
+`like`, and the earlier one is kept beside it as `.superseded-<id>`. A step that is waiting writes a `pending` receipt in
 `/var/lib/nvoy-onboard/<request id>.jsonl` saying on what, and `run` exits 4. Run it again to carry
 on: each step checks the state it makes, so nothing runs twice. The relay writer entry and the hive
 invite stay pending until nave.pub #157 and the sealed invite land.

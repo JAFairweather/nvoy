@@ -5,7 +5,7 @@
 // after the owner approves the pairing, after the box's bind_runtime arrives, or after the operator
 // agrees to redeploy the givers. Receipts record what each run found; they never hold a secret.
 
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync, chownSync } from 'node:fs'
+import { appendFileSync, constants, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync, chownSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { join } from 'node:path'
 import { readManifest } from './runtime_manifest.mjs'
@@ -29,14 +29,18 @@ const lines = path => existsSync(path) ? readFileSync(path, 'utf8').split('\n').
 
 const mentions = (raw, pubkey) => (raw?.may_post?.mention || []).some(entry => (entry?.pubkey || entry) === pubkey)
 
-// Writes a manifest in place the way an operator would: a dated backup first, then a same-owner,
-// same-mode temporary renamed over it, then read back through readManifest.
-function rewrite(root, id, change, { backupRoot, now }) {
+// Writes a manifest in place the way an operator would: a dated backup first, never over an earlier
+// one, then a same-owner, same-mode temporary renamed over it, then read back through readManifest.
+export function rewrite(root, id, change, { backupRoot, now }) {
   const path = join(root, `${id}.json`), raw = JSON.parse(readFileSync(path, 'utf8'))
-  const stamp = new Date(now()).toISOString().slice(0, 16).replace(/[-:T]/g, '')
+  const stamp = new Date(now()).toISOString().slice(0, 19).replace(/[-:T]/g, '')
   const dir = join(backupRoot, `${id}-backups-${stamp.slice(0, 8)}`)
   mkdirSync(dir, { recursive: true, mode: 0o700 })
-  copyFileSync(path, join(dir, `${id}.json.pre-onboard-${stamp.slice(8)}`))
+  for (let n = 0; ; n++) {
+    try { copyFileSync(path, join(dir, `${id}.json.pre-onboard-${stamp.slice(8)}${n ? `-${n}` : ''}`), constants.COPYFILE_EXCL); break } catch (error) {
+      if (error.code !== 'EEXIST') throw error
+    }
+  }
   const st = statSync(path), temporary = `${path}.onboard.tmp`
   writeFileSync(temporary, JSON.stringify(change(raw), null, 2) + '\n', { mode: st.mode & 0o777 })
   try { chownSync(temporary, st.uid, st.gid) } catch {}
@@ -47,7 +51,6 @@ function rewrite(root, id, change, { backupRoot, now }) {
 export async function onboard({ command, name, root, out, stateDir, keysPath = '', giversRedeploy = false,
   backupRoot = '/root', fetchEvents, runTool, now = () => Date.now(), log = console.log }) {
   if (!['show', 'run'].includes(command)) throw new OnboardRefusal('ONBOARD_USAGE', 'command is show or run')
-  mkdirSync(stateDir, { recursive: true, mode: 0o700 })
   const ledger = join(stateDir, 'requests.jsonl')
   const rows = lines(ledger), seen = new Set(rows.filter(row => row.finished).map(row => row.id))
   const inProgress = new Set(rows.map(row => row.id))
@@ -70,6 +73,7 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
   log(`  bind_runtime: ${bind ? `${bind.channelKey.keyType} key, ${bind.id.slice(0, 12)}` : 'not yet'}`)
   if (command === 'show') return { request: add, bind, receipts: [] }
 
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 })
   if (!inProgress.has(add.id)) appendFileSync(ledger, JSON.stringify({ id: add.id, name, op: 'add_agent', at: now() }) + '\n')
   const receiptPath = join(stateDir, `${add.id}.jsonl`), receipts = []
   const receipt = (step, state, detail) => {
@@ -78,14 +82,19 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
     return state === 'done'
   }
   const isInstalled = () => manifests.has(name)
-  const stagedPath = join(out, `${name}.json`)
+  const stagedPath = join(out, `${name}.json`), stagedFor = join(out, `${name}.request`)
 
   const steps = [
     ['staged', () => {
       if (isInstalled()) return receipt('staged', 'done', 'installed already')
+      // A staged manifest belongs to the request that made it. A newer signed request for this name is
+      // staged afresh, so its template, not the earlier one's, is what gets installed.
+      const owner = existsSync(stagedFor) ? readFileSync(stagedFor, 'utf8').trim() : ''
+      if (existsSync(stagedPath) && owner !== add.id) renameSync(stagedPath, `${stagedPath}.superseded-${(owner || 'unknown').slice(0, 12)}`)
       if (!existsSync(stagedPath)) {
         const code = runTool('instance-identity.mjs', ['allocate', '--id', name, '--pubkey', add.pubkey, '--like', add.like, '--out', out, '--instance-root', root])
         if (code !== 0) return receipt('staged', 'refused', `allocate exited ${code}`)
+        writeFileSync(stagedFor, `${add.id}\n`)
       }
       const raw = JSON.parse(readFileSync(stagedPath, 'utf8'))
       if (raw.pubkey !== add.pubkey) return receipt('staged', 'refused', 'a staged manifest for another key is in the way')
@@ -96,7 +105,7 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
         writeFileSync(stagedPath, JSON.stringify(raw, null, 2) + '\n')
       }
       try { readManifest(out, name) } catch (error) { return receipt('staged', 'refused', error.message) }
-      return receipt('staged', 'done', `staged with its profile grant`)
+      return receipt('staged', 'done', `staged like ${add.like} with its profile grant, for request ${add.id.slice(0, 12)}`)
     }],
     ['paired', () => {
       if (isInstalled()) return receipt('paired', 'done', 'installed already')

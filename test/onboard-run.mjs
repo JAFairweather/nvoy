@@ -4,12 +4,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
 import { SETUP_KIND } from '../mcp/tools/onboard_request.mjs'
-import { onboard } from '../mcp/tools/onboard_run.mjs'
+import { onboard, rewrite } from '../mcp/tools/onboard_run.mjs'
 
 const tmp = mkdtempSync(join(tmpdir(), 'nvoy-onboard-'))
 const root = join(tmp, 'instances'), out = join(tmp, 'staged'), stateDir = join(tmp, 'state'), creds = join(tmp, 'creds'), backupRoot = join(tmp, 'root')
 for (const dir of [root, out, creds, backupRoot]) mkdirSync(dir, { recursive: true })
-const owner = generateSecretKey(), ownerHex = getPublicKey(owner), agent = getPublicKey(generateSecretKey())
+const owner = generateSecretKey(), ownerHex = getPublicKey(owner), agent = getPublicKey(generateSecretKey()), agent2 = getPublicKey(generateSecretKey())
 const channel = '00000000-0000-4000-8000-000000000000', outsider = getPublicKey(generateSecretKey())
 let uid = 2000
 const raw = (id, pubkey, extra = {}) => {
@@ -28,21 +28,22 @@ for (const manifest of [pi, crystal]) writeFileSync(join(root, `${manifest.id}.j
 
 const KEY = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK0' + 'a'.repeat(40) + ' hr@box'
 const at = Math.floor(Date.now() / 1000)
-const sign = tags => finalizeEvent({ kind: SETUP_KIND, created_at: at, content: '', tags }, owner)
+const sign = (tags, created_at = at) => finalizeEvent({ kind: SETUP_KIND, created_at, content: '', tags }, owner)
 const add = sign([['d', 'nvoy-onboard/hr/add_agent'], ['op', 'add_agent'], ['p', agent], ['harness', 'claude-code'],
   ['like', 'crystalclaude'], ['giver', pi.pubkey], ['giver', ownerHex], ['giver', outsider], ['room', channel]])
 const bind = sign([['d', 'nvoy-onboard/hr/bind_runtime'], ['op', 'bind_runtime'], ['p', agent], ['harness', 'claude-code'],
   ['like', 'crystalclaude'], ['channel_key', KEY]])
 
 // Fake tools that make the state each real tool makes. The owner approves the pairing on the second try.
-const calls = []
+const calls = [], likes = []
 let approved = false
 const runTool = (tool, args) => {
   const op = tool === 'instance-pair.mjs' ? 'pair' : args[0]
   calls.push(op)
-  if (op === 'allocate') { writeFileSync(join(out, 'hr.json'), JSON.stringify({ ...raw('hr', agent), may_post: crystal.may_post })); return 0 }
+  const id = args[args.indexOf('--id') + 1]
+  if (op === 'allocate') { likes.push(args[args.indexOf('--like') + 1]); writeFileSync(join(out, `${id}.json`), JSON.stringify(raw(id, id === 'hr' ? agent : agent2))); return 0 }
   if (op === 'pair') {
-    if (!approved) return 1
+    if (id !== 'hr' || !approved) return 1
     writeFileSync(join(creds, 'hr.bunker-uri'), 'x'); writeFileSync(join(creds, 'hr.nip46-client'), 'x'); return 0
   }
   if (op === 'check') return 0
@@ -57,7 +58,7 @@ const states = result => Object.fromEntries(result.receipts.map(row => [row.step
 // show writes nothing and runs nothing.
 const shown = await onboard({ command: 'show', name: 'hr', root, out, stateDir, fetchEvents: async () => events, runTool, log: () => {} })
 assert.equal(shown.request.pubkey, agent); assert.deepEqual(calls, []); assert.equal(existsSync(join(out, 'hr.json')), false)
-assert.deepEqual(readdirSync(stateDir), [])
+assert.equal(existsSync(stateDir), false)
 
 // First run: staged with its profile grant, then waits on the Bunker.
 let result = await run()
@@ -101,5 +102,23 @@ events = [add, sign([...bind.tags.filter(tag => tag[0] !== 'p'), ['p', outsider]
 await assert.rejects(run(), error => error.code === 'ONBOARD_BIND_MISMATCH')
 assert.deepEqual(calls, ['allocate', 'pair', 'pair', 'check', 'check', 'apply'])
 
+// A newer signed request for the same name, before pairing, is staged afresh from its own template.
+const hr2 = like => [['d', 'nvoy-onboard/hr2/add_agent'], ['op', 'add_agent'], ['p', agent2], ['harness', 'claude-code'], ['like', like]]
+const first = sign(hr2('crystalclaude'), at - 60), second = sign(hr2('pi-dog'))
+const run2 = list => onboard({ command: 'run', name: 'hr2', root, out, stateDir, backupRoot, fetchEvents: async () => list, runTool, log: () => {} })
+likes.length = 0
+assert.equal(states(await run2([first])).paired, 'pending')
+result = await run2([first, second])
+assert.equal(states(result).paired, 'pending'); assert.deepEqual(likes, ['crystalclaude', 'pi-dog'])
+assert.equal(readFileSync(join(out, 'hr2.request'), 'utf8').trim(), second.id)
+assert.ok(existsSync(join(out, `hr2.json.superseded-${first.id.slice(0, 12)}`)))
+await run2([first, second]); assert.deepEqual(likes, ['crystalclaude', 'pi-dog'])
+
+// Two backups of one giver in the same second both survive.
+const fixed = () => Date.UTC(2026, 10, 2, 23, 50, 7)
+for (let n = 0; n < 2; n++) rewrite(root, 'pi-dog', m => m, { backupRoot, now: fixed })
+assert.deepEqual(readdirSync(join(backupRoot, 'pi-dog-backups-20261102')).filter(f => f.includes('235007')).sort(),
+  ['pi-dog.json.pre-onboard-235007', 'pi-dog.json.pre-onboard-235007-1'])
+
 rmSync(tmp, { recursive: true, force: true })
-console.log('onboard-run: show writes nothing, resume, pairing wait, bind, givers backup and redeploy consent pass')
+console.log('onboard-run: show writes nothing, resume, pairing wait, bind, givers backup and redeploy consent, a newer request restages, backups never overwrite pass')
