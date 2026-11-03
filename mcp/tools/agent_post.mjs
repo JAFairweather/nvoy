@@ -23,9 +23,10 @@ export const postQueuePath = manifest => resolve(manifest.runtimeDir, 'post-requ
 const fold = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '')
 
 // The effective may_post.mention (BEESWARM §3), rebuilt from scratch on every reading: the manifest's
-// entries in manifest order, then each live mention grant by (created_at, id). A grant for a key
-// already listed attaches its id to that entry and keeps its name; one whose name another key holds
-// is refused, logged and returned in `refused`, and its key gains nothing; any other adds an entry.
+// entries in manifest order, then each live mention grant by (created_at, id). A grant whose name
+// another key holds is refused, logged and returned in `refused`, checked first, so it is never
+// counted as taken; the refusal is that grant's alone. A grant for a key already listed attaches its
+// id to that entry and keeps its name; any other adds an entry.
 // Without may_post nothing changes, since a mention grant never grants posting.
 const toldClash = new Set()
 const logOnce = line => { if (!toldClash.has(line)) { toldClash.add(line); console.error(`nvoy-mention: ${line}`) } }
@@ -34,15 +35,15 @@ export function mergeMentions(entries, grants, log = logOnce) {
   const valid = (Array.isArray(grants) ? grants : []).filter(g => HEX64.test(String(g?.pubkey || '')) && MENTION_NAME.test(String(g?.name || '')) &&
     HEX64.test(String(g?.grant_id || '')) && Number.isSafeInteger(g?.created_at))
   for (const g of valid.sort((a, b) => a.created_at - b.created_at || (a.grant_id < b.grant_id ? -1 : 1))) {
-    const held = mention.find(e => e.pubkey === g.pubkey)
-    if (held) { held.grants.push(g.grant_id); continue }
-    const holder = mention.find(e => e.name && fold(e.name) === fold(g.name))
+    const holder = mention.find(e => e.pubkey !== g.pubkey && e.name && fold(e.name) === fold(g.name))
     if (holder) {
       const reason = `the name ${g.name} is held by ${holder.pubkey.slice(0, 8)}`
       refused.push({ grant_id: g.grant_id, reason })
       log(`mention grant ${g.grant_id.slice(0, 12)}… refused: ${reason}`)
       continue
     }
+    const held = mention.find(e => e.pubkey === g.pubkey)
+    if (held) { held.grants.push(g.grant_id); continue }
     mention.push({ pubkey: g.pubkey, name: g.name, grants: [g.grant_id] })
   }
   return { mention: Object.freeze(mention.map(e => Object.freeze({ ...e, grants: Object.freeze(e.grants) }))), refused: Object.freeze(refused) }

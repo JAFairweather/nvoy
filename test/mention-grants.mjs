@@ -125,6 +125,13 @@ ok('each refusal says why, and is logged with the grant id prefix', refused[0].r
   logged.length === 2 && logged[0].includes(hex(7).slice(0, 12)) && logged[1].includes(hex(6).slice(0, 12)))
 ok('a refused grant\'s key is not mentionable even by hex', resolvePost(withMentionGrants(poster, [grant(mallory, 'neil', 6)], () => {}), { text: 'hi', mention: [mallory] }).code === 'NVOY_POST_MENTION_REFUSED')
 ok('a malformed grant row adds nothing', !list.some(e => ['zz', other].includes(e.pubkey)))
+{
+  const r = mergeMentions(poster.mayPost.mention, [grant(kerouac, 'kerouac', 3), grant(kerouac, 'neil', 13, 1020)], () => {})
+  const k = r.mention.find(e => e.pubkey === kerouac)
+  ok('a listed key\'s later grant under another key\'s name is refused, never counted as taken, and the key keeps its own entry',
+    JSON.stringify(r.refused.map(x => x.grant_id)) === JSON.stringify([hex(13)]) && k?.name === 'kerouac' && k.grants.join() === hex(3) &&
+    r.mention.find(e => e.pubkey === neil)?.grants.length === 0)
+}
 ok('revoking the earlier holder of a name gives it to the next grant, recomputed from scratch',
   mergeMentions(poster.mayPost.mention, [grant(stranger.pk, 'kerouac', 7, 1005)], () => {}).mention.at(-1)?.pubkey === stranger.pk)
 ok('the manifest itself is unchanged', poster.mayPost.mention.length === 2 && !('grants' in poster.mayPost.mention[0]) && Object.isFrozen(merged.mayPost.mention))
