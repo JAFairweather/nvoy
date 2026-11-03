@@ -62,7 +62,16 @@ r = await go(w, request()); assert.equal(r.state, 'pending'); assert.equal(w.dec
 // Terms unreadable is "can't tell", never "none": nothing claimed.
 w = world({ termsFail: true }); r = await go(w, request())
 assert.equal(r.state, 'pending'); assert.match(r.detail, /can't read the hive's terms/); assert.equal(w.posts.length, 0)
-assert.deepEqual(await readTerms(relay, { fetchImpl: async () => ({ status: 200, json: async () => ({}) }) }), { ok: false, reason: 'no policy field' })
+const termsOf = (json, status = 200) => readTerms(relay, { fetchImpl: async () => ({ status, json: async () => { if (json instanceof Error) throw json; return json } }) })
+// The relay's no-terms answer is 200 {}: no terms, as the owner's page reads it. Policy null reads the same.
+assert.deepEqual(await termsOf({}), { ok: true, version: 'none', age: false })
+assert.deepEqual(await termsOf({ policy: null }), { ok: true, version: 'none', age: false })
+// Anything else that is not versioned terms stays unread.
+assert.deepEqual(await termsOf({}, 404), { ok: false, reason: 'HTTP 404' })
+assert.deepEqual(await termsOf(new SyntaxError('Unexpected token <')), { ok: false, reason: 'not JSON' })
+for (const body of [null, [], 'terms']) assert.equal((await termsOf(body)).ok, false, `${JSON.stringify(body)} is unread`)
+for (const policy of ['v1', [], {}]) assert.equal((await termsOf({ policy })).ok, false, `policy ${JSON.stringify(policy)} is unread`)
+assert.deepEqual(await termsOf({ policy: { version: 'v9', age_attestation_required: true } }), { ok: true, version: 'v9', age: true })
 
 // The terms changed since the owner signed: the owner signs again, nothing claimed.
 w = world({ terms: { version: '4', age_attestation_required: true } }); r = await go(w, request())
@@ -140,4 +149,4 @@ assert.deepEqual(r, { state: 'done', detail: '2 of 2 rooms joined' }); assert.de
 s = rooms({ refuse: [room2] }); r = await joinRooms({ add: request({ rooms: [room1, room2] }), session: s })
 assert.equal(r.state, 'pending'); assert.match(r.detail, /1 of 2 rooms joined; 00000000 refused the join \(restricted: closed group\); if it is private, the owner adds it/)
 
-console.log('onboard-join: member already, no invite, wrong seal, relay down, terms unread/changed/age, full claim, no terms, scrubbed refusal (straddling the cut), stalled hive, partial resume, rooms joined/private pass')
+console.log('onboard-join: member already, no invite, wrong seal, relay down, terms unread/changed/age, no-terms {} contract, full claim, no terms, scrubbed refusal (straddling the cut), stalled hive, partial resume, rooms joined/private pass')
