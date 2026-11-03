@@ -192,7 +192,8 @@ r = await post(pf, 'posting', 'b'.repeat(32))
 ok('the broker refuses a queued channel outside may_post, whatever the keyless side wrote', r.status === 1 && /post refused: channel is not in may_post\.channels/.test(r.stderr))
 forge(pf, { id: 'c'.repeat(32), mention: [stranger] })
 r = await post(pf, 'posting', 'c'.repeat(32))
-ok('the broker refuses an off-allowlist mention', r.status === 1 && /post refused: [0-9a-f]{8} is not on may_post\.mention/.test(r.stderr))
+ok('a mention off the manifest list waits on the live mention grants, held for retry rather than refused or posted',
+  r.status === 1 && /live mention grants are unavailable; held for retry/.test(r.stderr) && !/post refused/.test(r.stderr) && !stored.some(ev => ev.content === 'forged'))
 forge(pf, { id: 'd'.repeat(32), recipient: stranger })
 r = await post(pf, 'posting', 'd'.repeat(32))
 ok('the broker refuses a request carrying an extra field', r.status === 1 && /invalid or overbroad/.test(r.stderr))
@@ -325,8 +326,8 @@ const reply = (id, mode) => run(['mcp/tools/instance-broker-reply.mjs', '--insta
   { NVOY_INSTANCE_ROOT: rf.root, NVOY_BROKER_CREDENTIAL: credential })
 let a = asked(1, { mention: [stranger] })
 r = await reply(a.id, '--prepare')
-ok('the broker refuses an off-allowlist reply mention before claiming the receipt', r.status === 1 && /reply refused: [0-9a-f]{8} is not on may_post\.mention/.test(r.stderr) &&
-  isTerminalReplyFailure(r.stderr) && existsSync(join(rf.state, 'receipts', `${a.source}.json`)))
+ok('an off-allowlist reply mention is not refused before the live policy is asked, and the receipt stays unclaimed',
+  r.status === 1 && !/is not on may_post\.mention/.test(r.stderr) && /live matching grant chain/.test(r.stderr) && existsSync(join(rf.state, 'receipts', `${a.source}.json`)))
 a = asked(2, { mention: [neil] }, { reply_channel: CH2 })
 r = await reply(a.id, '--prepare')
 ok('the broker refuses a reply mention in a channel outside may_post', r.status === 1 && /reply refused: channel is not in may_post\.channels/.test(r.stderr))

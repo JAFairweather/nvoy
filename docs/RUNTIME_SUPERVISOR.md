@@ -151,6 +151,7 @@ For each `<id>`, the installer creates a dedicated OS account `nvoy-<id>` and:
 | task input + admitted queue | adapter:worker-handoff 0640 | adapter → worker, read-only for worker |
 | reply queue | worker:broker-adapter 0640 | worker → broker, read-only for broker |
 | status request queue (`status-requests.jsonl`) | worker:broker-adapter 0640 | channel reader → broker status keeper, read-only for broker |
+| mention grant snapshot (`mention-grants.json`, `may_post` only) | broker:worker-handoff 0640 | broker → channel MCPs, read-only for worker |
 | watcher spool | watcher:broker-adapter 0770, markers 0660 | watcher→broker marker intake |
 
 Credentials are source files staged as `root:root` mode `0600`: that is safe even before an
@@ -354,13 +355,23 @@ Neither tool exposes the signing credential.
   `channels` is a non-empty subset of `buzz.channels`, and the first one is the default. `per_hour`
   is 1–30. `mention` is the allowlist of keys a post may p-tag, each one a bare key or a named key;
   it may be empty. Unknown fields refuse the manifest. Init provisions
-  `<runtime>/post-requests.jsonl` (worker-owned, broker-adapter group, `0640`) only when the block
+  `<runtime>/post-requests.jsonl` (worker-owned, broker-adapter group, `0640`) and
+  `<runtime>/mention-grants.json` (broker-owned, worker-handoff group, `0640`) only when the block
   is present.
+- **Mention grants.** A kind 440 from a grantor with `da-cap` `mention`, `p` = the key, the agent's
+  `da-scope` as for `task`, and a `name` tag (the manifest's name rule) adds to that allowlist until
+  a 441 or its expiry. The effective list is the manifest's entries in order, then live grants by
+  `(created_at, id)`: a grant for a listed key only attaches its id, and one whose name another key
+  holds is refused and logged (`nvoy-mention:`). It never grants posting, and a shadow voice does
+  not inherit it. The brokers check against the live list (`attention.mjs --policy-only` reports it
+  as `mentions`) and record it in `<runtime>/mention-grants.json`, which the channel MCPs re-read.
 - **`nvoy_channel_post {text, channel?, mention?}`** is on both channel MCPs beside
-  `nvoy_channel_reply`. It resolves names to keys and refuses at once what the manifest forbids.
+  `nvoy_channel_reply`. It resolves names to keys and refuses at once what the manifest and the
+  recorded mention grants forbid.
   Without `may_post` it answers `this identity may only reply`. Otherwise it appends one bounded
   `post-request`. The daemon runs `instance-broker-post.mjs` for each one. That actuator checks
-  every field again against `may_post`, counts the post on a durable sliding window
+  every field again against `may_post` (asking the live policy only when a mention is off the
+  manifest's list, and holding the post for retry if it cannot), counts the post on a durable sliding window
   (`<state>/agent-limits/posts.json`) *before* the event exists, freezes a top-level kind:9
   (`h`, one `p` per mention, no `e`), and then signs, publishes and logs
   `posted <event 12>… in <channel>`, never the text. A retry republishes the frozen event. A refusal
@@ -370,7 +381,7 @@ Neither tool exposes the signing credential.
   `may_post` (`NVOY_REPLY_MENTION_NOT_PERMITTED`) or off it (`NVOY_REPLY_MENTION_REFUSED`). The row
   carries `mention` only when it is non-empty, so a reply without one is byte-identical to before.
   `instance-broker-reply.mjs` accepts a mention only on a native Buzz receipt, re-checks it against
-  `may_post.mention` and the reply's channel against `may_post.channels`, and spends one
+  the live effective `may_post.mention` and the reply's channel against `may_post.channels`, and spends one
   `per_hour` slot from the post counter before claiming the receipt. The frozen kind:9 adds one `p`
   per mention after the parent's. Each refusal starts `reply refused:` and is terminal. A reply
   without a mention is not metered.
@@ -381,7 +392,8 @@ Neither tool exposes the signing credential.
   `unknown`). The Claude channel also tells a change once through its wake notification
   (`meta.capabilities` is the summary's SHA-256, release excluded), repeated on the re-announce
   interval at most three times until the agent calls any nvoy tool, and then keeps the hash in
-  `claude-channel-state/capabilities.json` so a later session is not told again.
+  `claude-channel-state/capabilities.json` so a later session is not told again. A mention grant
+  recorded while it runs changes the summary, and is told the same way.
 - **Hops.** Every kind:9 the broker signs carries `["nvoy-hop", n]`. A post is 1, and a reply is
   its parent's hop + 1 (0 + 1 for an untagged, human message). Both admission paths refuse an event
   whose hop is `>= max_hops` (1–10, default 3) and log `hop limit`. A malformed or repeated tag
