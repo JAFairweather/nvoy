@@ -58,18 +58,19 @@ export function withMentionGrants(manifest, grants, log = logOnce) {
 // The keyless channel MCPs cannot run the policy, so each broker policy check leaves the live
 // mention grants here: broker-owned, worker-group readable, provisioned for a may_post manifest.
 export const mentionGrantsPath = manifest => resolve(manifest.runtimeDir, 'mention-grants.json')
+// True only when the file now holds exactly this policy's grants, so a caller can make that a precondition.
 export function recordMentionGrants(manifest, policy) {
-  if (!manifest.mayPost || policy?.me !== manifest.pubkey || policy.policyUsable !== true || !Array.isArray(policy.mentions)) return
+  if (!manifest.mayPost || policy?.me !== manifest.pubkey || policy.policyUsable !== true || !Array.isArray(policy.mentions)) return false
   const body = JSON.stringify({ version: 1, instance: manifest.id,
     mentions: policy.mentions.map(({ pubkey, name, grant_id, grantor, created_at }) => ({ pubkey, name, grant_id, grantor, created_at })) }) + '\n'
   let fd
   try {
     fd = openSync(mentionGrantsPath(manifest), constants.O_RDWR | constants.O_NOFOLLOW)
     if (!fstatSync(fd).isFile()) throw new Error('is not a regular file')
-    if (readFileSync(fd, 'utf8') === body) return
-    ftruncateSync(fd, 0); writeSync(fd, body, 0)
-  } catch (e) { if (e.code !== 'ENOENT') console.error(`nvoy-mention: cannot record live mention grants: ${e.message}`) }
+    if (readFileSync(fd, 'utf8') !== body) { ftruncateSync(fd, 0); writeSync(fd, body, 0) }
+  } catch (e) { if (e.code !== 'ENOENT') console.error(`nvoy-mention: cannot record live mention grants: ${e.message}`); return false }
   finally { if (fd !== undefined) closeSync(fd) }
+  try { return readFileSync(mentionGrantsPath(manifest), 'utf8') === body } catch { return false }
 }
 // null when the file cannot be read whole (absent, or mid-rewrite), so a reader keeps what it had.
 export function readMentionGrants(manifest) {

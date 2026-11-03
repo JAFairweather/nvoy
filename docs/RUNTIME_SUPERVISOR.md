@@ -433,11 +433,18 @@ The card is one kind-30078 event with `d` = `nvoy-agent-card`, and it is public,
 mode, the harness runner, the release, and a capability sentence with no identifier in it. Channel
 ids, mentionable keys, holdings, the model and the profile grant id are listed under `withheld`; the
 harness profile and last activity are listed under `not_reported`, so a reader never infers them
-from the card's freshness. It goes to `relay.nave.pub` only (`NVOY_CARD_RELAYS` overrides it for
-tests).
+from the card's freshness. With `may_post`, `owner_view` now carries what the owner needs of the
+withheld part, sealed to each grantor: one NIP-44 v2 copy per manifest grantor, from a fresh key
+made for that publication and never stored, holding the merged mention list (each entry's source,
+`manifest` or `grant`, and its grant ids), the refused grants and the post channels. It is read from
+the live policy (`attention.mjs --policy-only`), which also refreshes `mention-grants.json`. A run
+that cannot read the policy signs nothing and keeps the last card; with no last card it publishes
+one without `owner_view`, which the page reads as "can't tell". It goes to `relay.nave.pub` only
+(`NVOY_CARD_RELAYS` overrides it for tests).
 
 The daemon checks it at start and hourly. `instance-broker-card.mjs` signs a new card only when it
-changed or the last is a day old, and records the signed event in `state/agent-card.json` before
+or the plaintext of its `owner_view` changed (never the ciphertext, which is fresh on every seal) or
+the last is a day old, and records the signed event in `state/agent-card.json` before
 publishing. Every run sends that same event to each card relay that has not read it back, and the
 record names each relay, whether it accepted the card and whether it read it back. Short of full
 coverage the run exits 1 and the daemon logs `agent card unconfirmed`; a Bunker that refuses kind
