@@ -7,6 +7,8 @@ import { verifyEvent } from 'nostr-tools/pure'
 
 export const TASK_CAPS = ['task', 'task+act', 'task-relay']
 export const HOP_TAG = 'nvoy-hop'
+// The manifest's rule for a may_post.mention name (runtime_manifest.mjs), compared without case.
+export const MENTION_NAME = /^[a-z0-9][a-z0-9._-]{0,31}$/i
 const HEX64 = /^[0-9a-f]{64}$/
 
 // null: no tag, so not broker-signed. A tag that is not one canonical non-negative integer is not
@@ -51,7 +53,7 @@ const tag = (ev, name) => (ev.tags || []).find(t => t[0] === name)
 // fold with the same code the broker runs. grant_fold.mjs binds the node implementation.
 export function foldGrantsWith(events, { me, grantors, scopeHash }) {
   const by = grantors.map(g => String(g).toLowerCase())
-  const live = new Map(), voices = new Map(), ended = new Map()
+  const live = new Map(), voices = new Map(), ended = new Map(), named = new Map()
   let rejected = 0
   const drop = (id, why) => {
     for (const [pk, caps] of live) {
@@ -59,6 +61,7 @@ export function foldGrantsWith(events, { me, grantors, scopeHash }) {
       if (!caps.size) live.delete(pk)
     }
     for (const [pk, s] of voices) if (s.grantId === id) { voices.delete(pk); ended.set(pk, why) }
+    named.delete(id)
   }
   for (const ev of [...events].sort((a, b) => (a.created_at || 0) - (b.created_at || 0))) {
     const author = String(ev.pubkey || '').toLowerCase()
@@ -72,6 +75,10 @@ export function foldGrantsWith(events, { me, grantors, scopeHash }) {
     if (cap === 'shadow') {
       if (scope[1] !== scopeHash(author, scope[2] || '') || grantee === author) continue
       voices.set(grantee, { grantId: ev.id, grantor: author })
+    } else if (cap === 'mention') {
+      const name = tag(ev, 'name')?.[1]
+      if (!HEX64.test(grantee) || !MENTION_NAME.test(String(name ?? '')) || scope[1] !== scopeHash(me, scope[2] || '')) continue
+      named.set(ev.id, { pubkey: grantee, name, grantId: ev.id, grantor: author, created_at: ev.created_at || 0 })
     } else {
       if (!TASK_CAPS.includes(cap) || scope[1] !== scopeHash(me, scope[2] || '')) continue
       if (!live.has(grantee)) live.set(grantee, new Map())
@@ -89,5 +96,8 @@ export function foldGrantsWith(events, { me, grantors, scopeHash }) {
     }
   }
   for (const pk of live.keys()) ended.delete(pk)
-  return { live, ended, rejected }
+  // Who this agent may mention, never who may task it: kept apart from `live`, and a voice inherits
+  // none of it. Every live mention grant, in (created_at, id) order; agent_post.mjs merges them.
+  const mentions = [...named.values()].sort((a, b) => a.created_at - b.created_at || (a.grantId < b.grantId ? -1 : 1))
+  return { live, ended, rejected, mentions }
 }

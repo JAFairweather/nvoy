@@ -155,7 +155,7 @@ for (const url of grantReadRelays(RELAYS, process.env.NVOY_GRANT_RELAYS)) {
 // One fold over the union, so a 441 on one relay kills a 440 seen on another in the same pass.
 // One identity may legitimately hold both `task` and the carrier-only `task-relay`, and a voice holds
 // its grantor's grants under its shadow grant (grant_fold.mjs).
-const { live: permitted, rejected } = foldGrants([...grantEvents.values()], { me: ME, grantors: GRANTORS })
+const { live: permitted, rejected, mentions } = foldGrants([...grantEvents.values()], { me: ME, grantors: GRANTORS })
 const taskGrant = pk => permitted.get(pk)?.get('task+act') || permitted.get(pk)?.get('task') || null
 const relayGrant = pk => permitted.get(pk)?.get('task-relay') || null
 
@@ -176,10 +176,12 @@ const TASK_CARRIERS = (() => {
 // Policy only: the live grants, and nothing from the inbox. A message heard natively on a Buzz
 // relay was signed by its author and never wrapped, so the broker needs only this answer — who
 // holds which live grant for this identity — and must not pay for, or be confused by, a 1059 read.
+// `mentions` is apart from `grants`: the keys this identity may mention, which task nothing.
 if (process.argv.includes('--policy-only')) {
   console.log(JSON.stringify({ me: ME, policyUsable: relaysAnswered > 0, relaysAnswered, relays: relayAnswers,
     grants: [...permitted.entries()].flatMap(([pk, caps]) => [...caps.values()].map(g =>
-      ({ pubkey: pk, cap: g.cap, grant_id: g.grantId, grantor: String(g.grantor).toLowerCase(), ...(g.shadow ? { shadow: true } : {}) }))) }))
+      ({ pubkey: pk, cap: g.cap, grant_id: g.grantId, grantor: String(g.grantor).toLowerCase(), ...(g.shadow ? { shadow: true } : {}) }))),
+    mentions: mentions.map(g => ({ pubkey: g.pubkey, name: g.name, grant_id: g.grantId, grantor: g.grantor, created_at: g.created_at })) }))
   process.exit(0)
 }
 

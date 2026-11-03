@@ -56,11 +56,12 @@ const events = [
   ev(441, [['e', revoked.id]], now - 40),
   grant(key().pk, 'task', agent, now - 50, [['expiration', String(now - 1)]]),
   grant(voice.pk, 'shadow', owner.pk),
+  grant(colleague.pk, 'mention', agent, now - 50, [['name', 'colleague']]),
 ]
-const flat = r => JSON.stringify({ live: [...r.live].map(([pk, caps]) => [pk, [...caps]]).sort(), ended: [...r.ended].sort(), rejected: r.rejected })
+const flat = r => JSON.stringify({ live: [...r.live].map(([pk, caps]) => [pk, [...caps]]).sort(), ended: [...r.ended].sort(), rejected: r.rejected, mentions: r.mentions })
 const node = foldGrants(events, { me: agent, grantors: [owner.pk] })
 const browser = foldGrantsWith(events, { me: agent, grantors: [owner.pk], scopeHash: browserScopeHash })
-ok('the browser fold equals the broker fold', flat(node) === flat(browser))
+ok('the browser fold equals the broker fold, mention grants included', flat(node) === flat(browser) && node.mentions.length === 1)
 ok('the fold keeps the owner, the colleague and the voice, and drops the revoked and expired grants',
   node.live.size === 3 && node.live.has(colleague.pk) && node.live.get(voice.pk)?.get('task+act')?.shadow === true && node.ended.get(gone.pk) === 'revoked')
 
