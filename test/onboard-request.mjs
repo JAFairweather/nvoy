@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
 import * as nip44 from 'nostr-tools/nip44'
-import { newestRequest, OnboardRefusal, parseSetupRequest, sealedShape, SETUP_KIND } from '../mcp/tools/onboard_request.mjs'
+import { HARNESSES, newestRequest, OnboardRefusal, parseSetupRequest, sealedShape, SETUP_KIND } from '../mcp/tools/onboard_request.mjs'
 
 const owner = generateSecretKey(), stranger = generateSecretKey()
 const ownerHex = getPublicKey(owner)
@@ -46,6 +46,8 @@ refuses('ONBOARD_BAD_REQUEST', request({ content: 'please also' }))
 refuses('ONBOARD_BAD_REQUEST', request({ tags: swap('d', 'nvoy-onboard/other/add_agent') }))
 refuses('ONBOARD_BAD_OP', request({ tags: swap('op', 'shell') }))
 refuses('ONBOARD_BAD_HARNESS', request({ tags: swap('harness', 'bash') }))
+for (const harness of HARNESSES) assert.equal(parse(request({ tags: swap('harness', harness) })).harness, harness)
+assert.ok(HARNESSES.includes('hermes'), 'Hermes is a harness the owner can pick')
 refuses('ONBOARD_BAD_TEMPLATE', request({ tags: swap('like', 'nobody') }))
 refuses('ONBOARD_BAD_PUBKEY', request({ tags: swap('p', agent.toUpperCase()) }))
 refuses('ONBOARD_EXISTS', request({ tags: swap('p', pi.pubkey) }))
