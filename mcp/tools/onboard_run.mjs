@@ -58,7 +58,8 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
   const owners = [...new Set([...manifests.values()].flatMap(manifest => manifest.grantors))]
   const relays = [...new Set([...manifests.values()].flatMap(manifest => manifest.relays))]
   const events = await fetchEvents({ relays, owners, name })
-  const add = parseSetupRequest(newestRequest(events, name, 'add_agent'), { name, manifests, seen, inProgress, now: now() })
+  const earlier = rows.filter(row => row.op === 'add_agent' && row.name === name && row.pubkey)
+  const add = parseSetupRequest(newestRequest(events, name, 'add_agent'), { name, manifests, seen, inProgress, earlier, now: now() })
   let bind = null
   const bindEvent = newestRequest(events, name, 'bind_runtime')
   if (bindEvent) {
@@ -74,7 +75,8 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
   if (command === 'show') return { request: add, bind, receipts: [] }
 
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
-  if (!inProgress.has(add.id)) appendFileSync(ledger, JSON.stringify({ id: add.id, name, op: 'add_agent', at: now() }) + '\n')
+  if (!inProgress.has(add.id)) appendFileSync(ledger, JSON.stringify({ id: add.id, name, op: 'add_agent', at: now(),
+    pubkey: add.pubkey, owner: add.owner, harness: add.harness, like: add.like }) + '\n')
   const receiptPath = join(stateDir, `${add.id}.jsonl`), receipts = []
   const receipt = (step, state, detail) => {
     const row = { step, state, at: now(), detail }

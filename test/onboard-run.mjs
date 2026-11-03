@@ -107,6 +107,16 @@ events = [add, sign([...bind.tags.filter(tag => tag[0] !== 'p'), ['p', outsider]
 await assert.rejects(run(), error => error.code === 'ONBOARD_BIND_MISMATCH')
 assert.deepEqual(calls, ['allocate', 'pair', 'pair', 'check', 'check', 'apply'])
 
+// Signed again after it started (the terms changed, or the invite expired): the new request continues
+// to the hive with nothing reinstalled. A re-sign that changes its harness is refused.
+events = [sign(add.tags, at + 1), bind]
+result = await run({ giversRedeploy: true })
+assert.deepEqual(states(result), { staged: 'done', paired: 'done', checked: 'done', started: 'done', givers: 'pending', 'relay writer': 'pending', hive: 'pending', rooms: 'pending' })
+assert.match(result.receipts.find(row => row.step === 'started').detail, /^installed$/)
+assert.deepEqual(calls, ['allocate', 'pair', 'pair', 'check', 'check', 'apply'])
+events = [sign(add.tags.map(tag => tag[0] === 'harness' ? ['harness', 'codex'] : tag), at + 2), bind]
+await assert.rejects(run(), error => error.code === 'ONBOARD_EXISTS')
+
 // A newer signed request for the same name, before pairing, is staged afresh from its own template.
 const hr2 = like => [['d', 'nvoy-onboard/hr2/add_agent'], ['op', 'add_agent'], ['p', agent2], ['harness', 'claude-code'], ['like', like]]
 const first = sign(hr2('crystalclaude'), at - 60), second = sign(hr2('pi-dog'))
@@ -126,4 +136,4 @@ assert.deepEqual(readdirSync(join(backupRoot, 'pi-dog-backups-20261102')).filter
   ['pi-dog.json.pre-onboard-235007', 'pi-dog.json.pre-onboard-235007-1'])
 
 rmSync(tmp, { recursive: true, force: true })
-console.log('onboard-run: show writes nothing, resume, pairing wait, bind, givers backup and redeploy consent, a newer request restages, backups never overwrite pass')
+console.log('onboard-run: show writes nothing, resume, pairing wait, bind, givers backup and redeploy consent, re-signed after start, a newer request restages, backups never overwrite pass')

@@ -54,6 +54,13 @@ const hr = { id: 'hr', pubkey: agent, grantors: [ownerHex] }, withHr = new Map([
 refuses('ONBOARD_EXISTS', request(), { manifests: withHr })
 assert.equal(parse(request(), { manifests: withHr, inProgress: new Set([good.id]) }).pubkey, agent)
 refuses('ONBOARD_EXISTS', request({ tags: swap('p', pi.pubkey) }), { inProgress: new Set([request({ tags: swap('p', pi.pubkey) }).id]) })
+// Signed again after it started (changed terms, an expired invite): a continuation, identity fields fixed.
+const row = { op: 'add_agent', name: 'hr', pubkey: agent, owner: ownerHex, harness: 'claude-code', like: 'crystalclaude' }
+assert.equal(parse(request(), { manifests: withHr, earlier: [row] }).pubkey, agent)
+refuses('ONBOARD_EXISTS', request({ tags: swap('harness', 'codex') }), { manifests: withHr, earlier: [row] })
+refuses('ONBOARD_EXISTS', request({ tags: swap('like', 'pi-dog') }), { manifests: withHr, earlier: [row] })
+refuses('ONBOARD_EXISTS', request(), { manifests: withHr, earlier: [{ ...row, owner: getPublicKey(stranger) }] })
+refuses('ONBOARD_EXISTS', request(), { manifests: withHr, earlier: [{ ...row, name: 'other' }] })
 refuses('ONBOARD_BAD_GIVER', request({ tags: [...request().tags, ['giver', agent]] }))
 refuses('ONBOARD_BAD_ROOM', request({ tags: swap('room', 'waggle-test') }))
 refuses('ONBOARD_BAD_TAG', request({ tags: [...request().tags, ['channel_key', KEY]] }))

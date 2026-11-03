@@ -118,7 +118,12 @@ s = rooms(); r = await joinRooms({ add: request({ rooms: [room1, room2] }), sess
 assert.deepEqual(r, { state: 'done', detail: '2 of 2 rooms joined' })
 assert.deepEqual(s.published[0], { kind: JOIN_KIND, created_at: 5, tags: [['h', room1]], content: '' })
 
+// A partial earlier run (claimed, one room joined): the next run is a member, opens nothing, and joins only the missing room.
+w = world({ member: true }); r = await go(w, request()); assert.equal(r.state, 'done'); assert.equal(w.decrypts, 0); assert.equal(w.posts.length, 0)
+s = rooms({ members: { [room1]: [agent] } }); r = await joinRooms({ add: request({ rooms: [room1, room2] }), session: s })
+assert.deepEqual(r, { state: 'done', detail: '2 of 2 rooms joined' }); assert.deepEqual(s.published.map(t => t.tags[0][1]), [room2])
+
 s = rooms({ refuse: [room2] }); r = await joinRooms({ add: request({ rooms: [room1, room2] }), session: s })
 assert.equal(r.state, 'pending'); assert.match(r.detail, /1 of 2 rooms joined; 00000000 refused the join \(restricted: closed group\); if it is private, the owner adds it/)
 
-console.log('onboard-join: member already, no invite, wrong seal, relay down, terms unread/changed/age, full claim, no terms, scrubbed refusal, rooms joined/private pass')
+console.log('onboard-join: member already, no invite, wrong seal, relay down, terms unread/changed/age, full claim, no terms, scrubbed refusal, partial resume, rooms joined/private pass')

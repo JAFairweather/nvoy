@@ -50,7 +50,9 @@ export function newestRequest(events, name, op) {
 
 // manifests: Map(id -> manifest) of installed identities. seen: request ids already finished.
 // inProgress: request ids with receipts, so an add_agent whose own install has landed still reads.
-export function parseSetupRequest(event, { name, manifests, seen = new Set(), inProgress = new Set(), now = Date.now() }) {
+// earlier: the ledger's add_agent rows for this name. A newer add_agent the owner signs again (changed
+// terms, an expired invite or request) continues the install only when its identity fields match one.
+export function parseSetupRequest(event, { name, manifests, seen = new Set(), inProgress = new Set(), earlier = [], now = Date.now() }) {
   if (!NAME.test(String(name || ''))) refuse('ONBOARD_BAD_NAME', 'name must be a short stable identifier')
   if (!event) refuse('ONBOARD_NO_REQUEST', `no setup request for ${name}`)
   if (event.kind !== SETUP_KIND) refuse('ONBOARD_BAD_REQUEST', 'not a setup request')
@@ -85,7 +87,9 @@ export function parseSetupRequest(event, { name, manifests, seen = new Set(), in
 
   const installed = [...manifests.values()].find(manifest => manifest.pubkey === pubkey)
   if (one.op === 'add_agent') {
-    const resumed = inProgress.has(event.id) && (!installed || installed.id === name) &&
+    const continues = earlier.some(row => row.op === 'add_agent' && row.name === name && row.pubkey === pubkey &&
+      row.owner === event.pubkey && row.harness === one.harness && row.like === one.like)
+    const resumed = (inProgress.has(event.id) || continues) && (!installed || installed.id === name) &&
       (!manifests.has(name) || manifests.get(name).pubkey === pubkey)
     if (manifests.has(name) && !resumed) refuse('ONBOARD_EXISTS', `${name} is already installed`)
     if (installed && !resumed) refuse('ONBOARD_EXISTS', `that key is already ${installed.id}`)
