@@ -102,5 +102,6 @@ Hierarchical authority, flat collaboration.
 3. **Speaking rights as grants.** `may_post`, mention lists and profile rights move from private
    manifests into signed grants, so the page shows one source of truth and James can change a right
    without editing a manifest on the fleet host. A coordinator's delegated authority, if James wants
-   it, arrives here.
+   it, arrives here. Mention lists are first: a `mention` grant adds to `may_post.mention`
+   (RUNTIME_SUPERVISOR.md, "Mention grants").
 4. **Work state.** A ledger view of owners and next steps, and the coordinator sweep.

@@ -27,6 +27,7 @@ import { recordStatusAdmission } from './buzz_status.mjs'
 import { grantLookup, noGrantVerdict } from './grant_evidence.mjs'
 import { admissionLimit, hopOf } from './agent_limits.mjs'
 import { validateContext } from './admitted_task.mjs'
+import { recordMentionGrants } from './agent_post.mjs'
 
 const HEX64 = /^[0-9a-f]{64}$/
 let signer
@@ -114,6 +115,7 @@ try { policy = JSON.parse(checked.stdout) } catch { requeue('policy check return
 if (policy.me !== me) die('policy was evaluated for a different identity')
 const lookup = grantLookup(resolve(manifest.stateDir, 'grant-relays.json'), policy.relays)
 if (!policy.policyUsable) requeue(`live grant policy unavailable (relays ${lookup.summary})`)
+recordMentionGrants(manifest, policy)
 const grant = nativeGrant({ author: mention.author, dm, grants: policy.grants, grantors: manifest.grantors })
 if (!grant) finish(`author ${mention.author.slice(0, 8)} holds no live task grant; heard as data only [${noGrantVerdict(lookup)}]`)
 

@@ -20,7 +20,7 @@ import { verifyOutboundApproval } from './outbound_approval.mjs'
 import { channelReply, openBuzzSession, validChannel } from './buzz_native.mjs'
 import { recordStatusReplied } from './buzz_status.mjs'
 import { countInWindow, nextHop } from './agent_limits.mjs'
-import { validateReplyMention } from './agent_post.mjs'
+import { recordMentionGrants, replyMentionShape, validateReplyMention, withMentionGrants } from './agent_post.mjs'
 import { contentHash, credentialIn, withheldMessage } from './outbound_secrets.mjs'
 
 const die = m => { console.error(`instance-broker-reply: ${m}`); process.exit(1) }
@@ -109,10 +109,11 @@ if (buzzDm && (!validChannel(receipt.reply_channel) || manifest.buzz.channels.in
   die('native Buzz DM receipt is not bound to a DM from this identity\'s owner')
 }
 // A mention reaches beyond the sender, so it is the post's allowlist, not the receipt, that permits it.
+// Its keys are checked below, once the live policy has said which mention grants hold.
 if (request.mention !== undefined) {
   if (!buzzNative) die('reply refused: mentions are only for a native Buzz channel reply')
   if (buzzDm) die('reply refused: a DM reply mentions no one')
-  try { validateReplyMention(request.mention, manifest, receipt.reply_channel) } catch (e) { die(e.message) }
+  try { replyMentionShape(request.mention, manifest, receipt.reply_channel) } catch (e) { die(e.message) }
 }
 const credential = process.env.NVOY_BROKER_CREDENTIAL
 if (!credential || !existsSync(credential)) die('broker credential file is unavailable')
@@ -147,7 +148,11 @@ let policy; try { policy = JSON.parse(checked.stdout) } catch { die('live grant 
 if (buzzNative) {
   const live = (Array.isArray(policy.grants) ? policy.grants : []).find(g => g?.pubkey === receipt.sender &&
     g.grant_id === receipt.grant_id && ['task', 'task+act'].includes(g.cap) && manifest.grantors.includes(g.grantor))
+  recordMentionGrants(manifest, policy)
   if (policy.me !== manifest.pubkey || !policy.policyUsable || !live) die('admission receipt no longer has a live matching grant chain')
+  if (request.mention !== undefined) {
+    try { validateReplyMention(request.mention, withMentionGrants(manifest, policy.mentions), receipt.reply_channel) } catch (e) { die(e.message) }
+  }
 }
 const current = Array.isArray(policy.admissions) ? policy.admissions : []
 const liveAdmission = current.length === 1 ? current[0] : null

@@ -13,6 +13,10 @@
 // inherits only G's own grants, never another voice's, so shadows do not chain; and since only a
 // grantor's events are read, nothing a voice signs is ever a grant. A voice is not a grantor: it stays
 // under the hourly per-sender brake, and a Buzz DM still admits only the owner (nativeGrant).
+//
+// A `mention` grant names a key this agent may mention, scoped to the agent as `task` is, with a
+// `name` tag for how the agent writes it. It ends by a 441 or expiry like any grant, but it is
+// folded into `mentions`, never `live`: it lets the agent reach a key, never the key task the agent.
 
 import { createHash } from 'node:crypto'
 import { foldGrantsWith } from './admission.mjs'
@@ -26,5 +30,6 @@ export const scopeHash = (agentHex, saltHex) => createHash('sha256').update(Buff
 ])).digest('hex')
 
 // Returns live: grantee -> Map(cap -> { grantId, grantor, cap, shadow? }), ended: grantee -> 'revoked' |
-// 'expired' for a key whose every grant ended, and rejected: how many grantor events failed to verify.
+// 'expired' for a key whose every grant ended, rejected: how many grantor events failed to verify, and
+// mentions: every live mention grant as { pubkey, name, grantId, grantor, created_at }, oldest first.
 export const foldGrants = (events, { me, grantors }) => foldGrantsWith(events, { me, grantors, scopeHash })

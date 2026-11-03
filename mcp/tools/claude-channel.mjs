@@ -14,7 +14,7 @@ import { resolve } from 'node:path'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { validateDesktopDelivery } from './admitted_task.mjs'
 import { requestWorkingStatus } from './buzz_status.mjs'
-import { MENTION_SCHEMA, capabilityHash, capabilityInstructions, capabilitySummary, notMentioned, postToolSpec, queuePost, resolveReplyMention } from './agent_post.mjs'
+import { MENTION_SCHEMA, capabilityHash, capabilityInstructions, capabilitySummary, mentionView, notMentioned, postToolSpec, queuePost, resolveReplyMention } from './agent_post.mjs'
 import { profileToolSpec, profileStatusToolSpec, queueProfile, profileStatus, waitProfile } from './agent_profile.mjs'
 import { credentialIn, withheld } from './outbound_secrets.mjs'
 
@@ -63,10 +63,18 @@ const listedThisRun = new Set()
 // history over instructions it read long ago, so a change is also told through the wake path. Like
 // a wake, the notice can land before the client listens, so it is repeated on the same interval, at
 // most three times, until the agent calls any nvoy tool; then its hash is kept and it is not told again.
+// A mention grant the broker records while this runs changes the hash, and is told the same way.
 const capabilitiesPath = resolve(channelStateDir, 'capabilities.json')
-const capabilitiesHash = capabilityHash(capabilitySummary(manifest))
-let capabilitiesNews = (() => { try { return JSON.parse(readFileSync(capabilitiesPath, 'utf8')).hash !== capabilitiesHash } catch { return true } })()
+const view = mentionView(manifest)
+const keptHash = () => { try { return JSON.parse(readFileSync(capabilitiesPath, 'utf8')).hash } catch { return null } }
+let capabilitiesHash = capabilityHash(capabilitySummary(view()))
+let capabilitiesNews = keptHash() !== capabilitiesHash
 let capabilitiesTold = 0, capabilitiesAt = 0
+function capabilitiesNow() {
+  const current = view(), hash = capabilityHash(capabilitySummary(current))
+  if (hash !== capabilitiesHash) { capabilitiesHash = hash; capabilitiesNews = keptHash() !== hash; capabilitiesTold = 0; capabilitiesAt = 0 }
+  return current
+}
 function capabilitiesHeard() {
   if (!capabilitiesNews || !capabilitiesTold) return
   capabilitiesNews = false
@@ -197,7 +205,7 @@ const mcp = new Server(
       'To respond, call nvoy_channel_reply with the same envelope. The broker alone chooses the recipient and signs.',
       'To start a new conversation, call nvoy_channel_post; it is refused unless this identity\'s manifest allows posting.',
       'To update your public profile, call nvoy_profile_set; it is refused unless this identity\'s manifest allows profile changes.',
-      capabilityInstructions(manifest),
+      capabilityInstructions(view()),
     ].join(' '),
   },
 )
@@ -222,7 +230,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [
       mention: MENTION_SCHEMA,
     }, required: ['envelope', 'text'], additionalProperties: false },
   },
-  postToolSpec(manifest),
+  postToolSpec(view()),
   profileToolSpec(manifest),
   profileStatusToolSpec(),
 ] }))
@@ -261,7 +269,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async request => {
     return toolResult({ envelopes })
   }
   if (request.params.name === 'nvoy_channel_post') {
-    const { ok, error } = queuePost(manifest, args)
+    const { ok, error } = queuePost(view(), args)
     return error ? toolResult(error, true) : toolResult(ok)
   }
   const envelope = String(args.envelope || '').toLowerCase()
@@ -297,7 +305,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async request => {
   if (task.type !== 'admitted-task' || task.messages.length !== 1) {
     return toolResult({ code: 'NVOY_REPLY_REQUIRES_ONE_SENDER' }, true)
   }
-  const { mention, unresolved, ...refused } = resolveReplyMention(manifest, args.mention, content)
+  const allowed = view()
+  const { mention, unresolved, ...refused } = resolveReplyMention(allowed, args.mention, content)
   if (refused.code) return toolResult(refused, true)
   try {
     const prior = lines(replyPath, 'Desktop reply queue').map(line => { try { return JSON.parse(line) } catch { throw new Error('Desktop reply queue contains malformed JSON') } })
@@ -306,7 +315,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async request => {
       instance: manifest.id, receipt: envelope, content, ...(mention.length ? { mention } : {}) }
     appendFileSync(replyPath, JSON.stringify(record) + '\n', { mode: 0o640 })
     chmodSync(replyPath, 0o640)
-    return toolResult({ queued: true, envelope, request: record.id, ...(mention.length ? { mention } : {}), ...notMentioned(manifest.mayPost, unresolved) })
+    return toolResult({ queued: true, envelope, request: record.id, ...(mention.length ? { mention } : {}), ...notMentioned(allowed.mayPost, unresolved) })
   } catch (error) { return toolResult({ code: 'NVOY_REPLY_QUEUE_FAILED', message: error.message }, true) }
 })
 
@@ -326,11 +335,11 @@ async function poll() {
   polling = true
   try {
     const read = readIds()
-    const now = Date.now()
+    const now = Date.now(), current = capabilitiesNow()
     if (capabilitiesNews && capabilitiesTold < 3 && now - capabilitiesAt >= renotifyMs) {
       capabilitiesTold++; capabilitiesAt = now
       await mcp.notification({ method: 'notifications/claude/channel', params: {
-        content: `This identity's capabilities changed. ${capabilityInstructions(manifest)} Call nvoy_channel_list once to acknowledge.`,
+        content: `This identity's capabilities changed. ${capabilityInstructions(current)} Call nvoy_channel_list once to acknowledge.`,
         meta: { instance: manifest.id, capabilities: capabilitiesHash },
       } })
     }
