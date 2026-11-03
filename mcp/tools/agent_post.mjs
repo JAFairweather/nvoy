@@ -6,10 +6,11 @@
 // field against the manifest, enforces the hourly cap on its own durable counter, and signs. The
 // advisory cap here counts the queue's own timestamps; it only spares the agent a silent refusal.
 
-import { appendFileSync, existsSync, lstatSync, readFileSync } from 'node:fs'
+import { appendFileSync, closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, openSync, readFileSync, writeSync } from 'node:fs'
 import { createHash, randomBytes } from 'node:crypto'
 import { resolve } from 'node:path'
 import { HOUR_MS } from './agent_limits.mjs'
+import { MENTION_NAME } from './admission.mjs'
 import { credentialIn, withheld } from './outbound_secrets.mjs'
 
 const HEX64 = /^[0-9a-f]{64}$/
@@ -20,6 +21,70 @@ export const postQueuePath = manifest => resolve(manifest.runtimeDir, 'post-requ
 // A name as an agent writes it ("@mc-claude", "MC-Claude", "mydude") is matched without case, the @
 // or separators, so it resolves to the manifest's name however it was typed.
 const fold = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '')
+
+// The effective may_post.mention (BEESWARM §3), rebuilt from scratch on every reading: the manifest's
+// entries in manifest order, then each live mention grant by (created_at, id). A grant whose name
+// another key holds is refused, logged and returned in `refused`, checked first, so it is never
+// counted as taken; the refusal is that grant's alone. A grant for a key already listed attaches its
+// id to that entry and keeps its name; any other adds an entry.
+// Without may_post nothing changes, since a mention grant never grants posting.
+const toldClash = new Set()
+const logOnce = line => { if (!toldClash.has(line)) { toldClash.add(line); console.error(`nvoy-mention: ${line}`) } }
+export function mergeMentions(entries, grants, log = logOnce) {
+  const mention = entries.map(e => ({ ...e, grants: [] })), refused = []
+  const valid = (Array.isArray(grants) ? grants : []).filter(g => HEX64.test(String(g?.pubkey || '')) && MENTION_NAME.test(String(g?.name || '')) &&
+    HEX64.test(String(g?.grant_id || '')) && Number.isSafeInteger(g?.created_at))
+  for (const g of valid.sort((a, b) => a.created_at - b.created_at || (a.grant_id < b.grant_id ? -1 : 1))) {
+    const holder = mention.find(e => e.pubkey !== g.pubkey && e.name && fold(e.name) === fold(g.name))
+    if (holder) {
+      const reason = `the name ${g.name} is held by ${holder.pubkey.slice(0, 8)}`
+      refused.push({ grant_id: g.grant_id, reason })
+      log(`mention grant ${g.grant_id.slice(0, 12)}… refused: ${reason}`)
+      continue
+    }
+    const held = mention.find(e => e.pubkey === g.pubkey)
+    if (held) { held.grants.push(g.grant_id); continue }
+    mention.push({ pubkey: g.pubkey, name: g.name, grants: [g.grant_id] })
+  }
+  return { mention: Object.freeze(mention.map(e => Object.freeze({ ...e, grants: Object.freeze(e.grants) }))), refused: Object.freeze(refused) }
+}
+export function withMentionGrants(manifest, grants, log = logOnce) {
+  const m = manifest.mayPost
+  if (!m || !Array.isArray(grants) || !grants.length) return manifest
+  const { mention, refused } = mergeMentions(m.mention, grants, log)
+  return Object.freeze({ ...manifest, mayPost: Object.freeze({ ...m, mention, refused }) })
+}
+
+// The keyless channel MCPs cannot run the policy, so each broker policy check leaves the live
+// mention grants here: broker-owned, worker-group readable, provisioned for a may_post manifest.
+export const mentionGrantsPath = manifest => resolve(manifest.runtimeDir, 'mention-grants.json')
+export function recordMentionGrants(manifest, policy) {
+  if (!manifest.mayPost || policy?.me !== manifest.pubkey || policy.policyUsable !== true || !Array.isArray(policy.mentions)) return
+  const body = JSON.stringify({ version: 1, instance: manifest.id,
+    mentions: policy.mentions.map(({ pubkey, name, grant_id, grantor, created_at }) => ({ pubkey, name, grant_id, grantor, created_at })) }) + '\n'
+  let fd
+  try {
+    fd = openSync(mentionGrantsPath(manifest), constants.O_RDWR | constants.O_NOFOLLOW)
+    if (!fstatSync(fd).isFile()) throw new Error('is not a regular file')
+    if (readFileSync(fd, 'utf8') === body) return
+    ftruncateSync(fd, 0); writeSync(fd, body, 0)
+  } catch (e) { if (e.code !== 'ENOENT') console.error(`nvoy-mention: cannot record live mention grants: ${e.message}`) }
+  finally { if (fd !== undefined) closeSync(fd) }
+}
+// null when the file cannot be read whole (absent, or mid-rewrite), so a reader keeps what it had.
+export function readMentionGrants(manifest) {
+  try {
+    const path = mentionGrantsPath(manifest), st = lstatSync(path)
+    if (!st.isFile() || st.size > 1024 * 1024) return null
+    const x = JSON.parse(readFileSync(path, 'utf8'))
+    return x?.version === 1 && x.instance === manifest.id && Array.isArray(x.mentions) ? x.mentions : null
+  } catch { return null }
+}
+// What a channel MCP resolves and tells against: the manifest with the last recorded grants, re-read on use.
+export function mentionView(manifest) {
+  let last = []
+  return () => withMentionGrants(manifest, last = readMentionGrants(manifest) || last)
+}
 
 // How to take part, beside what the manifest allows. Agents left to their defaults answered and
 // stopped, and wrote "@name" in text, which Buzz never resolves; the others never woke (10-23).
@@ -35,7 +100,7 @@ export const PARTICIPATION = 'How to take part: the others are episodic and wake
   ' one, and the tool result says which names it mentioned. The hop and hourly limits are brakes, not a budget.'
 export const MENTION_SCHEMA = { type: 'array', items: { type: 'string', minLength: 1, maxLength: 64 }, maxItems: 16 }
 
-// What this identity may do, from its manifest, told to the agent in the channel servers'
+// What this identity may do, from its manifest and live mention grants, told to the agent in the channel servers'
 // instructions and, when it changes, once as a channel notice (claude-channel.mjs). An agent in a
 // resumed session otherwise keeps what its history says it could do (dj-codex, pi-dog, 2026-10-20).
 // The release is reported but not part of the hash: a release that changes nothing it may do is
@@ -133,12 +198,16 @@ export function resolveReplyMention(manifest, list, content = '') {
 }
 
 // Broker side of a reply's mention, re-checked against the manifest as a post's is. Present only
-// when non-empty, so a reply without one keeps today's exact request shape and digest.
-export function validateReplyMention(mention, manifest, channel) {
+// when non-empty, so a reply without one keeps today's exact request shape and digest. The shape,
+// may_post and channel need no policy, so the broker checks them before it asks for one.
+export function replyMentionShape(mention, manifest, channel) {
   if (!Array.isArray(mention) || !mention.length || !mention.every(p => HEX64.test(String(p))) ||
       new Set(mention).size !== mention.length) throw new Error('reply request has an invalid or overbroad shape')
   if (!manifest.mayPost) throw new Error('reply refused: mentions need the manifest\'s may_post block')
   if (!manifest.mayPost.channels.includes(channel)) throw new Error('reply refused: channel is not in may_post.channels')
+}
+export function validateReplyMention(mention, manifest, channel) {
+  replyMentionShape(mention, manifest, channel)
   const off = mention.find(p => !manifest.mayPost.mention.some(e => e.pubkey === p))
   if (off !== undefined) throw new Error(`reply refused: ${off.slice(0, 8)} is not on may_post.mention`)
 }

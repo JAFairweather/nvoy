@@ -4,7 +4,7 @@
 // A reply is authorised by the live grant chain of the message it answers. A post answers nothing,
 // so its authority is the owner's standing opt-in instead: the manifest's may_post block, which
 // names the channels, the people the post may p-tag, and how many posts an hour. Everything the
-// keyless queue says is re-checked here against that block.
+// keyless queue says is re-checked here against that block, whose mention list live mention grants extend.
 //
 // Same discipline as a native reply: the cap is counted before the event exists, the exact kind:9
 // is frozen before the signer opens, and a retry republishes that event instead of a second one.
@@ -13,16 +13,17 @@
 
 import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { spawnSync } from 'node:child_process'
 import { getEventHash, verifyEvent } from 'nostr-tools/pure'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { brokerSigner } from './broker_signer.mjs'
 import { channelPost, openBuzzSession } from './buzz_native.mjs'
 import { replyRequestDigest } from './outbound_record.mjs'
 import { countInWindow } from './agent_limits.mjs'
-import { POST_ONLY_REPLY, postQueuePath, validatePostRequest } from './agent_post.mjs'
+import { POST_ONLY_REPLY, postQueuePath, recordMentionGrants, validatePostRequest, withMentionGrants } from './agent_post.mjs'
 import { contentHash, credentialIn, withheldMessage } from './outbound_secrets.mjs'
 
-let signer
+let signer, attentionEnv
 const exit = code => { try { signer?.close?.() } catch { /* best effort */ } process.exit(code) }
 const die = m => { console.error(`instance-broker-post: ${m}`); exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -44,7 +45,19 @@ try {
   }
 } catch (e) { die(`cannot read post request queue: ${e.message}`) }
 if (!request) die('post request is not present in this instance queue')
-try { validatePostRequest(request, manifest) } catch (e) { die(e.message) }
+// A key off the manifest's list may hold a live mention grant, so only then is the policy asked, as
+// admission asks it. Unable to ask is not a refusal: the post is held for retry.
+let allowed = manifest
+if (Array.isArray(request.mention) && request.mention.some(p => !manifest.mayPost.mention.some(e => e.pubkey === p))) {
+  ;({ signer, attentionEnv } = brokerSigner(die, { idleMs: 30000 }))
+  const checked = spawnSync(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'attention.mjs'), '--policy-only'], { encoding: 'utf8', timeout: 60000,
+    env: { HOME: manifest.stateDir, PATH: process.env.PATH || '', NVOY_RELAYS: manifest.relays.join(','), GRANTORS: manifest.grantors.join(','), ...attentionEnv } })
+  let policy; try { policy = JSON.parse(checked.stdout) } catch { policy = null }
+  if (checked.status !== 0 || policy?.me !== manifest.pubkey || policy.policyUsable !== true) die('live mention grants are unavailable; held for retry')
+  recordMentionGrants(manifest, policy)
+  allowed = withMentionGrants(manifest, policy.mentions)
+}
+try { validatePostRequest(request, allowed) } catch (e) { die(e.message) }
 // Again here, where the signer is: a client that writes the queue without the tool skips the tool's check.
 const leaked = credentialIn(request.content)
 if (leaked) die(`post refused: ${withheldMessage(leaked)} [post sha256 ${contentHash(request.content)}] instance ${manifest.id}`)
@@ -78,7 +91,7 @@ if (existsSync(recordPath)) {
   persist()
 }
 
-;({ signer } = brokerSigner(die, { idleMs: 30000 }))
+if (!signer) ({ signer } = brokerSigner(die, { idleMs: 30000 }))
 let me
 try { me = String(await signer.getPublicKey()).toLowerCase() } catch (e) { die(`signer unavailable: ${e.message}`) }
 if (me !== manifest.pubkey) die('signer does not match manifest pubkey')
