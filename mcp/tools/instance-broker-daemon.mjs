@@ -10,6 +10,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { isTerminalReplyFailure, loadTerminalReplyIds, recordTerminalReply, terminalReplyReason } from './reply_retry.mjs'
 import { childVerdict } from './broker_verdict.mjs'
+import { finishedProfileRequests, PROFILE_PUBLIC_RETRY_EXIT } from './agent_profile.mjs'
 
 const die = m => { console.error(`instance-broker-daemon: ${m}`); process.exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -46,11 +47,11 @@ const isTerminalPost = stderr => /post refused:|post request has an invalid|post
 const profileDone = new Set()
 const profileRetryAfter = new Map()
 let profileActive = null
+// Public relays still pending are tried again on a slow clock, across restarts.
+const PROFILE_PUBLIC_RETRY_MS = 10 * 60 * 1000
 if (manifest.maySetProfile) {
   try {
-    for (const line of readFileSync(resolve(manifest.runtimeDir, 'profile-results.jsonl'), 'utf8').split('\n')) {
-      try { const row = JSON.parse(line); if (row?.type === 'profile-result' && /^[0-9a-f]{32}$/.test(String(row.request))) profileDone.add(row.request) } catch {}
-    }
+    for (const request of finishedProfileRequests(readFileSync(resolve(manifest.runtimeDir, 'profile-results.jsonl'), 'utf8'))) profileDone.add(request)
   } catch (error) { if (error.code !== 'ENOENT') die(`cannot load profile results: ${error.message}`) }
 }
 
@@ -216,6 +217,9 @@ function drainProfiles() {
         profileDone.add(request)
         profileRetryAfter.delete(request)
         console.log(`instance-broker-daemon: profile ${request.slice(0, 12)}… complete`)
+      } else if (code === PROFILE_PUBLIC_RETRY_EXIT) {
+        profileRetryAfter.set(request, Date.now() + PROFILE_PUBLIC_RETRY_MS)
+        console.log(`instance-broker-daemon: profile ${request.slice(0, 12)}… on Buzz; public relays pending, retrying in 10 min`)
       } else {
         profileRetryAfter.set(request, Date.now() + 5000)
         console.error(`instance-broker-daemon: profile ${request.slice(0, 12)}… held for retry: ${String(error?.message || stderr || `exit ${code}`).trim().slice(0, 240)}`)

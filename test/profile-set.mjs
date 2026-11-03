@@ -1,13 +1,14 @@
 import { strict as assert } from 'node:assert'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { createServer } from 'node:http'
+import { createServer as createTlsServer } from 'node:https'
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { WebSocketServer } from 'ws'
 import { finalizeEvent, generateSecretKey, getEventHash, getPublicKey, verifyEvent } from 'nostr-tools/pure'
 import { readManifest } from '../mcp/tools/runtime_manifest.mjs'
-import { queueProfile, profileStatus, profileToolSpec } from '../mcp/tools/agent_profile.mjs'
+import { queueProfile, profileStatus, profileToolSpec, finishedProfileRequests, PROFILE_PUBLIC_RETRY_EXIT } from '../mcp/tools/agent_profile.mjs'
 import { capabilitySummary } from '../mcp/tools/agent_post.mjs'
 import { mergedProfile, ProfileRefusal, readbackProfile } from '../mcp/tools/profile_policy.mjs'
 
@@ -20,6 +21,36 @@ const websocket = new WebSocketServer({ server })
 const sent = []
 let stored = [finalizeEvent({ kind: 0, created_at: 1, tags: [], content: JSON.stringify({ name: 'grok', about: 'old', custom: 'keep', bot: false }) }, secret)]
 let dropNext = false, mismatchNext = false
+// A public relay, over TLS with a throwaway certificate trusted only by the broker processes here.
+const certDir = join(root, 'tls'); mkdirSync(certDir)
+const tls = spawnSync('openssl', ['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes', '-days', '1',
+  '-keyout', join(certDir, 'key.pem'), '-out', join(certDir, 'cert.pem'), '-subj', '/CN=localhost', '-addext', 'subjectAltName=IP:127.0.0.1'], { encoding: 'utf8' })
+if (tls.status !== 0) throw new Error('openssl could not make the test certificate')
+const publicServer = createTlsServer({ key: readFileSync(join(certDir, 'key.pem')), cert: readFileSync(join(certDir, 'cert.pem')) },
+  (request, response) => { response.writeHead(404); response.end() })
+await new Promise(resolve => publicServer.listen(0, '127.0.0.1', resolve))
+const publicRelay = `wss://127.0.0.1:${publicServer.address().port}`
+const publicSocket = new WebSocketServer({ server: publicServer })
+// Two public relays on one server: the second, at /b, can be down (drops the connection) or refuse.
+let publicStored = [], publicDown = false, secondMode = 'up'
+const publicSent = [], secondSent = []
+publicSocket.on('connection', (socket, upgrade) => socket.on('message', raw => {
+  const frame = JSON.parse(raw.toString()), second = upgrade.url === '/b'
+  const down = second ? secondMode === 'down' : publicDown
+  if (frame[0] === 'REQ') {
+    if (down) return socket.terminate()
+    const event = second ? null : publicStored.at(-1)
+    if (event) socket.send(JSON.stringify(['EVENT', frame[1], event]))
+    socket.send(JSON.stringify(['EOSE', frame[1]]))
+  }
+  if (frame[0] === 'EVENT') {
+    if (down) return socket.terminate()
+    if (second && secondMode === 'refuse') return socket.send(JSON.stringify(['OK', frame[1].id, false, 'restricted: not a writer']))
+    if (second) secondSent.push(frame[1])
+    else { publicSent.push(frame[1]); publicStored.push(frame[1]) }
+    socket.send(JSON.stringify(['OK', frame[1].id, true, '']))
+  }
+}))
 websocket.on('connection', socket => {
   const challenge = Buffer.from(generateSecretKey()).toString('hex')
   let authorized = false
@@ -52,7 +83,7 @@ websocket.on('connection', socket => {
 function manifestFixture(id, extra = {}) {
   const directory = join(root, id)
   for (const name of ['instances', 'state', 'run', 'spool']) mkdirSync(join(directory, name), { recursive: true })
-  const raw = { id, pubkey, grantors: [other], relays: ['wss://relay.example'], buzz: { relay, channels: ['00000000-0000-4000-8000-000000000000'] },
+  const raw = { id, pubkey, grantors: [other], relays: [publicRelay, `${publicRelay}/b`], buzz: { relay, channels: ['00000000-0000-4000-8000-000000000000'] },
     broker_mode: 'local', key_ref: '/fake/key', delivery_mode: 'notify_only', worker_enabled: false,
     state_dir: join(directory, 'state'), runtime_dir: join(directory, 'run'), spool_dir: join(directory, 'spool'),
     broker_adapter_gid: 1001, worker_handoff_gid: 1002, watcher_uid: 1001, broker_uid: 1002,
@@ -133,7 +164,8 @@ const credential = join(root, 'credential')
 writeFileSync(credential, Buffer.from(secret).toString('hex'))
 const runBroker = (extraEnv = {}) => new Promise(resolve => {
   const child = spawn(process.execPath, ['mcp/tools/instance-broker-profile.mjs', '--instance', 'seat', '--request', lastRequest],
-    { cwd: new URL('..', import.meta.url).pathname, env: { ...process.env, NVOY_INSTANCE_ROOT: fixture.root, NVOY_BROKER_CREDENTIAL: credential, ...extraEnv },
+    { cwd: new URL('..', import.meta.url).pathname, env: { ...process.env, NVOY_INSTANCE_ROOT: fixture.root, NVOY_BROKER_CREDENTIAL: credential,
+      NODE_EXTRA_CA_CERTS: join(certDir, 'cert.pem'), ...extraEnv },
       stdio: ['ignore', 'pipe', 'pipe'] })
   let stderr = ''
   child.stderr.on('data', chunk => { stderr += chunk })
@@ -162,6 +194,10 @@ assert.equal(published.event_id, sent.at(-1).id)
 assert.equal(published.relay.accepted, true)
 assert.equal(published.readback.custom.match, true)
 assert.equal(JSON.parse(sent.at(-1).content).custom, 'keep')
+assert.deepEqual(published.public_relays.map(r => [r.relay, r.state]), [[publicRelay, 'accepted'], [`${publicRelay}/b`, 'accepted']])
+assert.equal(published.partial, undefined)
+assert.equal(publicSent.at(-1).id, published.event_id)
+assert.equal(secondSent.at(-1).id, published.event_id)
 submit({ fields: { about: 'too soon' } })
 assert.equal((await runBroker()).status, 0)
 assert.equal(profileStatus(manifest, lastRequest).error.code, 'NVOY_PROFILE_RATE_LIMITED')
@@ -225,10 +261,74 @@ const auditAfter = readFileSync(join(fixture.directory, 'state', 'profile-audit.
 assert.equal(auditAfter.at(-1).outcome, 'NVOY_PROFILE_READBACK_MISMATCH')
 const savedEvents = stored
 stored = []
-submit({ fields: { about: 'missing current' }, dry_run: true })
+publicStored = []
+publicDown = true
+submit({ fields: { name: 'newcomer' }, dry_run: true })
 assert.equal((await runBroker()).status, 0)
-assert.equal(profileStatus(manifest, lastRequest).error.code, 'NVOY_PROFILE_INVALID_CURRENT')
+assert.equal(profileStatus(manifest, lastRequest).error.code, 'NVOY_PROFILE_INVALID_CURRENT',
+  'an empty Buzz read with no public relay answering is not proof there is no profile')
+publicDown = false
+secondMode = 'down'
+submit({ fields: { name: 'newcomer' }, dry_run: true })
+assert.equal((await runBroker()).status, 0)
+assert.equal(profileStatus(manifest, lastRequest).error.code, 'NVOY_PROFILE_INVALID_CURRENT',
+  'one relay answering empty is not enough while another, which may hold the profile, is down')
+secondMode = 'up'
+submit({ fields: { about: 'no name yet' }, dry_run: true })
+assert.equal((await runBroker()).status, 0)
+assert.equal(profileStatus(manifest, lastRequest).error.code, 'NVOY_PROFILE_FIRST_NEEDS_NAME')
+submit({ fields: { name: 'newcomer' }, dry_run: true })
+assert.equal((await runBroker()).status, 0)
+assert.equal(profileStatus(manifest, lastRequest).ok.first, true)
+assert.deepEqual(profileStatus(manifest, lastRequest).ok.candidate, { name: 'newcomer', bot: true })
+publicStored = [finalizeEvent({ kind: 0, created_at: 5, tags: [], content: JSON.stringify({ name: 'outside', custom: 'outside-keep', bot: true }) }, secret)]
+submit({ fields: { about: 'built on the public copy' }, dry_run: true })
+assert.equal((await runBroker()).status, 0)
+assert.equal(profileStatus(manifest, lastRequest).ok.first, false)
+assert.equal(profileStatus(manifest, lastRequest).ok.candidate.custom, 'outside-keep',
+  'a profile that exists only on a public relay is built on, not overwritten')
+publicStored = []
+savedManifest.may_set_profile.per_day = 5
+writeFileSync(manifestPath, JSON.stringify(savedManifest))
+submit({ fields: { name: 'newcomer', about: 'first profile' } })
+assert.equal((await runBroker()).status, 0)
+const firstProfile = profileStatus(manifest, lastRequest).ok
+assert.equal(firstProfile.event_id, sent.at(-1).id)
+assert.deepEqual(JSON.parse(sent.at(-1).content), { name: 'newcomer', about: 'first profile', bot: true })
+assert.equal(publicSent.at(-1).id, firstProfile.event_id)
 stored = savedEvents
+
+// A public relay that drops the connection is retried on the slow clock, without signing or
+// publishing to Buzz again; one that refuses is final. Either way the result says which.
+savedManifest.may_set_profile.per_day = 7
+writeFileSync(manifestPath, JSON.stringify(savedManifest))
+secondMode = 'down'
+submit({ fields: { about: 'second relay down' } })
+assert.equal((await runBroker()).status, PROFILE_PUBLIC_RETRY_EXIT)
+const partial = profileStatus(manifest, lastRequest).ok
+const results = () => readFileSync(join(fixture.directory, 'run', 'profile-results.jsonl'), 'utf8')
+assert(!finishedProfileRequests(results()).has(lastRequest), 'a partial result marked retry is not finished, so the daemon tries again after a restart')
+assert.equal(partial.partial, true)
+assert.equal(partial.retry, true)
+assert.deepEqual(partial.public_relays.map(r => r.state), ['accepted', 'pending'])
+const buzzSends = sent.length, firstSends = publicSent.length
+secondMode = 'up'
+assert.equal((await runBroker()).status, 0)
+const recovered = profileStatus(manifest, lastRequest).ok
+assert.equal(recovered.event_id, partial.event_id)
+assert(finishedProfileRequests(results()).has(lastRequest))
+assert.deepEqual(recovered.public_relays.map(r => [r.state, r.attempts]), [['accepted', 1], ['accepted', 2]])
+assert.equal(recovered.partial, undefined)
+assert.equal(sent.length, buzzSends, 'Buzz is not published to again')
+assert.equal(publicSent.length, firstSends, 'a relay that accepted is not sent to again')
+assert.equal(secondSent.at(-1).id, partial.event_id)
+secondMode = 'refuse'
+submit({ fields: { about: 'second relay refuses' } })
+assert.equal((await runBroker()).status, 0)
+const refused = profileStatus(manifest, lastRequest).ok
+assert.deepEqual(refused.public_relays.map(r => r.state), ['accepted', 'refused'])
+assert.match(refused.public_relays[1].message, /not a writer/)
+secondMode = 'up'
 const fetchStub = join(root, 'nip05-mismatch.mjs')
 writeFileSync(fetchStub, `globalThis.fetch = async () => ({ ok: true, json: async () => ({ names: { grok: '${other}' } }) })\n`)
 submit({ fields: { nip05: 'grok@nave.pub' }, dry_run: true })
@@ -237,4 +337,6 @@ assert.equal(profileStatus(manifest, lastRequest).error.code, 'NVOY_PROFILE_NIP0
 
 await new Promise(resolve => websocket.close(resolve))
 await new Promise(resolve => server.close(resolve))
-console.log('profile-set: manifest, validation, NIP-05, dry run, publish/readback, rate limit, retry and audit pass')
+await new Promise(resolve => publicSocket.close(resolve))
+await new Promise(resolve => publicServer.close(resolve))
+console.log('profile-set: manifest, validation, NIP-05, dry run, publish/readback, public relays, first profile, rate limit, retry and audit pass')
