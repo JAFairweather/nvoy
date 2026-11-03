@@ -1,0 +1,76 @@
+import assert from 'node:assert/strict'
+import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
+import { newestRequest, OnboardRefusal, parseSetupRequest, SETUP_KIND } from '../mcp/tools/onboard_request.mjs'
+
+const owner = generateSecretKey(), stranger = generateSecretKey()
+const ownerHex = getPublicKey(owner)
+const agent = getPublicKey(generateSecretKey()), mydude = getPublicKey(generateSecretKey())
+const pi = { id: 'pi-dog', pubkey: getPublicKey(generateSecretKey()), grantors: [ownerHex] }
+const crystal = { id: 'crystalclaude', pubkey: getPublicKey(generateSecretKey()), grantors: [ownerHex] }
+const manifests = new Map([[pi.id, pi], [crystal.id, crystal]])
+const now = Date.now(), room = 'a8186b53-537d-46ad-a7e7-b6486c58970e'
+const KEY = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl hr@box'
+
+const request = ({ signer = owner, tags, at = Math.floor(now / 1000), content = '' } = {}) => finalizeEvent({
+  kind: SETUP_KIND, created_at: at, content,
+  tags: tags || [['d', 'nvoy-onboard/hr/add_agent'], ['op', 'add_agent'], ['p', agent], ['harness', 'claude-code'],
+    ['like', 'crystalclaude'], ['giver', ownerHex], ['giver', mydude], ['giver', pi.pubkey], ['room', room]],
+}, signer)
+const parse = (event, extra = {}) => parseSetupRequest(event, { name: 'hr', manifests, now, ...extra })
+const refuses = (code, event, extra) => assert.throws(() => parse(event, extra),
+  error => error instanceof OnboardRefusal && error.code === code, code)
+const swap = (key, value) => request().tags.map(tag => tag[0] === key ? [key, value] : tag)
+
+// A good request reads as its public fields, and nothing else.
+const good = parse(request())
+assert.equal(good.op, 'add_agent'); assert.equal(good.pubkey, agent); assert.equal(good.like, 'crystalclaude')
+assert.deepEqual(good.givers, [{ pubkey: ownerHex, owner: true }, { pubkey: mydude, outside: true }, { pubkey: pi.pubkey, seat: 'pi-dog' }])
+assert.deepEqual(good.rooms, [room]); assert.equal(good.channelKey, null)
+
+// Forged, replayed, stale and tampered requests refuse.
+refuses('ONBOARD_NOT_OWNER', request({ signer: stranger }))
+refuses('ONBOARD_REPLAY', request(), { seen: new Set([good.id]) })
+refuses('ONBOARD_STALE', request({ at: Math.floor(now / 1000) - 8 * 24 * 3600 }))
+refuses('ONBOARD_STALE', request({ at: Math.floor(now / 1000) + 3600 }))
+const tampered = { ...request(), tags: swap('p', crystal.pubkey) }
+refuses('ONBOARD_BAD_SIGNATURE', tampered)
+refuses('ONBOARD_NO_REQUEST', null)
+
+// Only the closed set of tags and values, one value where one is allowed.
+refuses('ONBOARD_UNKNOWN_TAG', request({ tags: [...request().tags, ['host', 'example']] }))
+refuses('ONBOARD_BAD_TAG', request({ tags: [...request().tags, ['op', 'add_agent']] }))
+refuses('ONBOARD_BAD_TAG', request({ tags: [...request().tags, ['room', room, 'extra']] }))
+refuses('ONBOARD_SECRET', request({ tags: [...request().tags, ['room', 'bunker://x']] }))
+refuses('ONBOARD_BAD_REQUEST', request({ content: 'please also' }))
+refuses('ONBOARD_BAD_REQUEST', request({ tags: swap('d', 'nvoy-onboard/other/add_agent') }))
+refuses('ONBOARD_BAD_OP', request({ tags: swap('op', 'shell') }))
+refuses('ONBOARD_BAD_HARNESS', request({ tags: swap('harness', 'bash') }))
+refuses('ONBOARD_BAD_TEMPLATE', request({ tags: swap('like', 'nobody') }))
+refuses('ONBOARD_BAD_PUBKEY', request({ tags: swap('p', agent.toUpperCase()) }))
+refuses('ONBOARD_EXISTS', request({ tags: swap('p', pi.pubkey) }))
+// Once its own install lands, the same add_agent still reads, so run can resume; nothing else does.
+const hr = { id: 'hr', pubkey: agent, grantors: [ownerHex] }, withHr = new Map([...manifests, ['hr', hr]])
+refuses('ONBOARD_EXISTS', request(), { manifests: withHr })
+assert.equal(parse(request(), { manifests: withHr, inProgress: new Set([good.id]) }).pubkey, agent)
+refuses('ONBOARD_EXISTS', request({ tags: swap('p', pi.pubkey) }), { inProgress: new Set([request({ tags: swap('p', pi.pubkey) }).id]) })
+refuses('ONBOARD_BAD_GIVER', request({ tags: [...request().tags, ['giver', agent]] }))
+refuses('ONBOARD_BAD_ROOM', request({ tags: swap('room', 'waggle-test') }))
+refuses('ONBOARD_BAD_TAG', request({ tags: [...request().tags, ['channel_key', KEY]] }))
+assert.throws(() => parseSetupRequest(request(), { name: 'crystalclaude', manifests, now }), /not add_agent for crystalclaude/)
+
+// bind_runtime carries the box's public channel key, never a private one.
+const bind = extra => request({ tags: [...swap('op', 'bind_runtime').map(tag => tag[0] === 'd' ? ['d', 'nvoy-onboard/hr/bind_runtime'] : tag), ...extra] })
+assert.deepEqual(parse(bind([['channel_key', KEY]])).channelKey.keyType, 'ssh-ed25519')
+refuses('ONBOARD_BAD_TAG', bind([]))
+refuses('ONBOARD_BAD_REQUEST', request({ tags: [...swap('op', 'bind_runtime'), ['channel_key', KEY]] }))
+refuses('ONBOARD_BAD_CHANNEL_KEY', bind([['channel_key', 'ssh-rsa AAAA x']]))
+refuses('ONBOARD_SECRET', bind([['channel_key', '-----BEGIN OPENSSH PRIVATE KEY-----']]))
+
+// The newest request for the name and op wins; a bind_runtime does not shadow the add_agent.
+const older = request({ at: Math.floor(now / 1000) - 60 }), newer = request(), bound = bind([['channel_key', KEY]])
+const pool = [newer, older, bound, request({ tags: swap('d', 'nvoy-onboard/other/add_agent') })]
+assert.equal(newestRequest(pool, 'hr', 'add_agent').id, newer.id)
+assert.equal(newestRequest(pool, 'hr', 'bind_runtime').id, bound.id)
+assert.equal(newestRequest([], 'hr', 'add_agent'), null)
+
+console.log('onboard-request: fields, owner, replay, age, closed tags, secrets, bind_runtime and newest pass')
