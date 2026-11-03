@@ -96,10 +96,14 @@ export function install({ id, target, hostKey, dir }) {
   if (!kept) {
     const made = spawnSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', `nvoy-channel-${id}`, '-f', key], { encoding: 'utf8' })
     if (made.status !== 0) throw new Error(`ssh-keygen failed: ${(made.stderr || '').trim().slice(0, 200)}`)
-  } else if (!existsSync(`${key}.pub`)) {
+  } else {
+    // The printed half always comes from the kept private key, so a stale or swapped .pub is rewritten.
     const derived = spawnSync('ssh-keygen', ['-y', '-f', key], { encoding: 'utf8' })
     if (derived.status !== 0) throw new Error('the existing channel key could not be read by ssh-keygen; move it aside to make a new one')
-    writeAtomic(`${key}.pub`, derived.stdout, 0o644)
+    const half = publicHalf(derived.stdout)
+    let onDisk = ''
+    try { onDisk = publicHalf(readFileSync(`${key}.pub`, 'utf8')) } catch { onDisk = '' }
+    if (onDisk !== half) writeAtomic(`${key}.pub`, `${half} nvoy-channel-${id}\n`, 0o644)
   }
   chmodSync(key, 0o600)
   writeAtomic(join(dir, 'known_hosts'), knownHostsLine(target, hostKey), 0o644)

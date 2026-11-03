@@ -67,6 +67,12 @@ r = run([], dir); assert.equal(r.status, 3); assert.equal(r.stdout.trim(), first
 rmSync(join(dir, 'channel.pub'))
 r = run([], dir); assert.equal(r.stdout.trim(), first)
 
+// A swapped .pub (another valid key) is never printed: the half comes from the kept private key.
+spawnSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', join(root, 'other')])
+writeFileSync(join(dir, 'channel.pub'), readFileSync(join(root, 'other.pub')))
+r = run([], dir); assert.equal(r.stdout.trim(), first, 'the printed half matches the kept key')
+assert.equal(publicHalf(readFileSync(join(dir, 'channel.pub'), 'utf8')), first, 'the stale .pub is rewritten')
+
 // With the owner's login saved: the config is one the portable harness accepts, and the start line is printed.
 writeFileSync(join(dir, 'claude-oauth-token'), 'not-a-real-token\n', { mode: 0o600 })
 r = run([], dir); noPrivate(r)
@@ -77,4 +83,4 @@ assert.equal(read.target, target); assert.equal(read.home, join(dir, 'home'))
 assert.ok(!(r.stdout + r.stderr).includes('not-a-real-token'), 'the login is never printed')
 
 rmSync(root, { recursive: true, force: true })
-console.log('box-install: host key one-and-typed, wrong line and old Claude change nothing, key made here and kept, pub rebuilt, one stdout line, login never printed, harness config accepted')
+console.log('box-install: host key one-and-typed, wrong line and old Claude change nothing, key made here and kept, pub rebuilt, swapped pub corrected, one stdout line, login never printed, harness config accepted')
