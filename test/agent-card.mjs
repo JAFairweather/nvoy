@@ -41,7 +41,7 @@ async function relay(options = { refuse: false }) {
 function fixture(id, extra = {}) {
   const directory = join(root, id)
   for (const name of ['instances', 'state', 'run', 'spool']) mkdirSync(join(directory, name), { recursive: true })
-  const raw = { id, pubkey, grantors: [grantor], relays: ['wss://relay.example'], buzz: { relay: 'wss://buzz.example', channels: [channel] },
+  const raw = { id, pubkey, grantors: [grantor], relays: ['wss://127.0.0.1:1'], buzz: { relay: 'wss://buzz.example', channels: [channel] },
     broker_mode: 'local', key_ref: '/etc/nvoy/credentials/seat.nsec', delivery_mode: 'notify_only', worker_enabled: false,
     state_dir: join(directory, 'state'), runtime_dir: join(directory, 'run'), spool_dir: join(directory, 'spool'),
     broker_adapter_gid: 1001, worker_handoff_gid: 1002, watcher_uid: 1001, broker_uid: 1002, adapter_uid: 1003, worker_uid: 1004,

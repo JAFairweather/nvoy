@@ -7,11 +7,14 @@
 //
 // The card is public, so it is the coarse projection only. Channel ids, mentionable keys, holdings,
 // the model and the profile grant id draw a private map of who works with whom; they are named in
-// `withheld` and stay off until a separately reviewed opt-in carries them. Every field is built here,
-// so a manifest field added upstream stays off the card until someone admits it.
+// `withheld` and stay off the public fields. The merged mention list and the post channels ride in
+// `owner_view` instead, sealed to each grantor (waggle docs/DESIGN_MENTION_RIGHTS.md). Every field is
+// built here, so a manifest field added upstream stays off the card until someone admits it.
 
 import { createHash } from 'node:crypto'
-import { releaseSha } from './agent_post.mjs'
+import { generateSecretKey, getPublicKey } from 'nostr-tools/pure'
+import { v2 as nip44 } from 'nostr-tools/nip44'
+import { mergeMentions, releaseSha } from './agent_post.mjs'
 
 export const CARD_KIND = 30078
 export const CARD_D = 'nvoy-agent-card'
@@ -57,15 +60,38 @@ export function agentCard(manifest, { release = releaseSha() } = {}) {
   }
 }
 
-export const cardDigest = card => createHash('sha256').update(JSON.stringify(card)).digest('hex')
+// What each grantor is shown: the merged mention list from the live policy, its refusals, and the
+// post channels. Null without may_post, so a reply-only card carries no owner_view.
+export function ownerView(manifest, mentions, log) {
+  const m = manifest.mayPost
+  if (!m) return null
+  const { mention, refused } = mergeMentions(m.mention, mentions, log)
+  const listed = new Set(m.mention.map(e => e.pubkey))
+  return {
+    mention: mention.map(e => ({ name: e.name ?? null, pubkey: e.pubkey, source: listed.has(e.pubkey) ? 'manifest' : 'grant', grants: [...e.grants] })),
+    refused: refused.map(r => ({ grant: r.grant_id, reason: r.reason })),
+    channels: m.channels.map(id => ({ id, name: null })),
+  }
+}
+
+// One NIP-44 v2 copy per grantor, from a key made for this publication and dropped after it. The
+// card's own signature is what makes the view the agent's.
+export function sealOwnerView(view, recipients) {
+  const secret = generateSecretKey(), by = getPublicKey(secret), json = JSON.stringify(view)
+  try { return recipients.map(to => ({ to, by, sealed: nip44.encrypt(json, nip44.utils.getConversationKey(secret, to)) })) }
+  finally { secret.fill(0) }
+}
+
+// The public card plus the plaintext view, never the ciphertext, which is fresh on every seal.
+export const cardDigest = (card, view = null) => createHash('sha256').update(JSON.stringify(view ? { card, view } : card)).digest('hex')
 
 export function cardTemplate(card, now = Date.now()) {
   return { kind: CARD_KIND, created_at: Math.floor(now / 1000), tags: [['d', CARD_D]], content: JSON.stringify(card) }
 }
 
-// A new signature is due when the card says something new, or the last one is CARD_REFRESH_MS old.
-export function cardDue(card, last, now = Date.now()) {
-  return !last?.event || last.digest !== cardDigest(card) || !(now - last.at < CARD_REFRESH_MS)
+// A new signature is due when the card or its view says something new, or the last one is CARD_REFRESH_MS old.
+export function cardDue(card, last, now = Date.now(), view = null) {
+  return !last?.event || last.digest !== cardDigest(card, view) || !(now - last.at < CARD_REFRESH_MS)
 }
 
 // The relays still owed the signed card: every card relay that has not read it back.

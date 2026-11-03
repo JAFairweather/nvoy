@@ -5,13 +5,19 @@
 // event before publishing. Each run then sends that same event to every card relay that has not yet
 // read it back, so a relay that was down catches up within the hour and nothing is re-signed to retry.
 // The record names each relay, whether it accepted the card, and whether it read it back.
+//
+// With may_post the card also carries owner_view, the merged mention list sealed to each grantor, so
+// each run reads the live policy as the post broker does. A run that cannot read it signs nothing
+// and keeps the last card; with no last card, it publishes one without owner_view ("can't tell").
 
 import { readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { spawnSync } from 'node:child_process'
 import { verifyEvent } from 'nostr-tools/pure'
 import WebSocket from 'ws'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
-import { agentCard, cardDigest, cardDue, cardRelays, cardTemplate, relaysOwed, CARD_D, CARD_KIND } from './agent_card.mjs'
+import { agentCard, cardDigest, cardDue, cardRelays, cardTemplate, ownerView, relaysOwed, sealOwnerView, CARD_D, CARD_KIND } from './agent_card.mjs'
+import { recordMentionGrants } from './agent_post.mjs'
 import { brokerSigner } from './broker_signer.mjs'
 import { credentialIn } from './outbound_secrets.mjs'
 
@@ -65,19 +71,33 @@ function record(value) {
 const card = agentCard(manifest)
 const leak = credentialIn(JSON.stringify(card))
 if (leak) throw new Error(`card withheld: it looks like it holds a credential (${leak})`)
-if (cardDue(card, last)) {
-  let signer
-  try {
-    ;({ signer } = brokerSigner(message => { throw new Error(message) }, { idleMs: 30000 }))
-    const template = cardTemplate(card)
-    const event = await signer.signEvent({ pubkey: manifest.pubkey, ...template })
+let keys, view = null, hold = false
+const broker = () => keys ||= brokerSigner(message => { throw new Error(message) }, { idleMs: 30000 })
+try {
+  if (manifest.mayPost) {
+    const checked = spawnSync(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'attention.mjs'), '--policy-only'], { encoding: 'utf8', timeout: 60000,
+      env: { HOME: manifest.stateDir, PATH: process.env.PATH || '', NVOY_RELAYS: manifest.relays.join(','), GRANTORS: manifest.grantors.join(','), ...broker().attentionEnv } })
+    let policy; try { policy = JSON.parse(checked.stdout) } catch { policy = null }
+    if (checked.status !== 0 || policy?.me !== manifest.pubkey || policy.policyUsable !== true) {
+      hold = !!last?.event
+      console.error(`instance-broker-card: live mention grants are unavailable; ${hold ? 'keeping the last card' : 'publishing without owner_view'}`)
+    } else {
+      recordMentionGrants(manifest, policy)
+      view = ownerView(manifest, policy.mentions)
+      const leaked = credentialIn(JSON.stringify(view))
+      if (leaked) throw new Error(`card withheld: its owner view looks like it holds a credential (${leaked})`)
+    }
+  }
+  if (!hold && cardDue(card, last, Date.now(), view)) {
+    const template = cardTemplate(view ? { ...card, owner_view: sealOwnerView(view, manifest.grantors) } : card)
+    const event = await broker().signer.signEvent({ pubkey: manifest.pubkey, ...template })
     if (event?.pubkey !== manifest.pubkey || event.kind !== CARD_KIND || event.content !== template.content ||
         JSON.stringify(event.tags) !== JSON.stringify(template.tags) || !verifyEvent(event)) throw new Error('signer returned a different card')
-    last = { version: 1, at: Date.now(), digest: cardDigest(card), event, relays: [] }
+    last = { version: 1, at: Date.now(), digest: cardDigest(card, view), event, relays: [] }
     record(last)
-  } finally {
-    try { signer?.close?.() } catch {}
   }
+} finally {
+  try { keys?.signer?.close?.() } catch {}
 }
 const relays = cardRelays(), owed = relaysOwed(relays, last)
 if (!owed.length) console.log(JSON.stringify({ card: 'current', event_id: last.event.id }))
