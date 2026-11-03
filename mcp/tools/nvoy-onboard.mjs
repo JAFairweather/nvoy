@@ -12,12 +12,15 @@
 // Exit: 0 every step done · 1 refused · 2 usage · 4 waiting on a step (a pending receipt says which).
 
 import { spawnSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { grantReadRelays } from './grant_relays.mjs'
 import { queryRelay } from './public_relays.mjs'
 import { requestD, SETUP_KIND, OnboardRefusal } from './onboard_request.mjs'
 import { onboard } from './onboard_run.mjs'
+import { makeBunkerSigner } from './nip46-signer.mjs'
+import { openBuzzSession } from './buzz_native.mjs'
 
 const argv = process.argv.slice(2)
 const flag = name => { const index = argv.indexOf(name); return index < 0 ? '' : argv[index + 1] || '' }
@@ -37,10 +40,16 @@ async function fetchEvents({ relays, owners, name }) {
   return [...new Map(reads.flatMap(read => read.events).map(event => [event.id, event])).values()]
 }
 
+// The agent's own connection, from its seated credential files, for the hive claim and room joins.
+function joinWith(manifest) {
+  const signer = makeBunkerSigner(readFileSync(manifest.bunkerUriRef, 'utf8').trim(), readFileSync(manifest.bunkerClientRef, 'utf8').trim(), { idleMs: 30000 })
+  return { signer, fetchImpl: globalThis.fetch, open: () => openBuzzSession({ relay: manifest.buzz.relay, signer }), close: () => signer.close?.() }
+}
+
 const runTool = (tool, args) => spawnSync(process.execPath, [join(here, tool), ...args], { stdio: 'inherit' }).status ?? 1
 
 try {
-  const { receipts } = await onboard({ command, name, fetchEvents, runTool,
+  const { receipts } = await onboard({ command, name, fetchEvents, runTool, joinWith,
     root: resolve(flag('--instance-root') || process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'),
     out: resolve(flag('--out') || join(process.env.HOME || '/root', '.nvoy', 'staged')),
     stateDir: resolve(flag('--state-dir') || '/var/lib/nvoy-onboard'),

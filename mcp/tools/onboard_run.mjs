@@ -10,9 +10,9 @@ import { randomBytes } from 'node:crypto'
 import { join } from 'node:path'
 import { readManifest } from './runtime_manifest.mjs'
 import { newestRequest, OnboardRefusal, parseSetupRequest } from './onboard_request.mjs'
+import { joinHive, joinRooms } from './onboard_join.mjs'
 
 const PENDING_RELAY = 'the relay writer list is nave.pub #157; until it lands, add the key to deploy/relay/allowlist.json by PR'
-const PENDING_HIVE = 'the sealed invite is not built; until it is, the owner sends the invite and the agent claims it'
 
 export function installed(root) {
   const manifests = new Map()
@@ -49,7 +49,7 @@ export function rewrite(root, id, change, { backupRoot, now }) {
 }
 
 export async function onboard({ command, name, root, out, stateDir, keysPath = '', giversRedeploy = false,
-  backupRoot = '/root', fetchEvents, runTool, now = () => Date.now(), log = console.log }) {
+  backupRoot = '/root', fetchEvents, runTool, joinWith, now = () => Date.now(), log = console.log }) {
   if (!['show', 'run'].includes(command)) throw new OnboardRefusal('ONBOARD_USAGE', 'command is show or run')
   const ledger = join(stateDir, 'requests.jsonl')
   const rows = lines(ledger), seen = new Set(rows.filter(row => row.finished).map(row => row.id))
@@ -58,7 +58,8 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
   const owners = [...new Set([...manifests.values()].flatMap(manifest => manifest.grantors))]
   const relays = [...new Set([...manifests.values()].flatMap(manifest => manifest.relays))]
   const events = await fetchEvents({ relays, owners, name })
-  const add = parseSetupRequest(newestRequest(events, name, 'add_agent'), { name, manifests, seen, inProgress, now: now() })
+  const earlier = rows.filter(row => row.op === 'add_agent' && row.name === name && row.pubkey)
+  const add = parseSetupRequest(newestRequest(events, name, 'add_agent'), { name, manifests, seen, inProgress, earlier, now: now() })
   let bind = null
   const bindEvent = newestRequest(events, name, 'bind_runtime')
   if (bindEvent) {
@@ -74,7 +75,8 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
   if (command === 'show') return { request: add, bind, receipts: [] }
 
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
-  if (!inProgress.has(add.id)) appendFileSync(ledger, JSON.stringify({ id: add.id, name, op: 'add_agent', at: now() }) + '\n')
+  if (!inProgress.has(add.id)) appendFileSync(ledger, JSON.stringify({ id: add.id, name, op: 'add_agent', at: now(),
+    pubkey: add.pubkey, owner: add.owner, harness: add.harness, like: add.like }) + '\n')
   const receiptPath = join(stateDir, `${add.id}.jsonl`), receipts = []
   const receipt = (step, state, detail) => {
     const row = { step, state, at: now(), detail }
@@ -148,13 +150,30 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
       return receipt('givers', outside.length ? 'pending' : 'done', `added ${name} to ${missing.map(giver => giver.seat).join(', ')}${tail}`)
     }],
     ['relay writer', () => receipt('relay writer', 'pending', PENDING_RELAY)],
-    ['hive and rooms', () => receipt('hive and rooms', 'pending', PENDING_HIVE)],
+    ['hive', async () => {
+      if (!isInstalled()) return receipt('hive', 'pending', 'waiting for the agent to start')
+      const manifest = manifests.get(name)
+      if (!manifest.buzz) return receipt('hive', 'refused', `${add.like} has no Buzz relay to copy, so there is no hive to join`)
+      agentLink = await joinWith(manifest)
+      const joined = await joinHive({ add, relay: manifest.buzz.relay, signer: agentLink.signer, open: agentLink.open, fetchImpl: agentLink.fetchImpl })
+      session = joined.session || null
+      return receipt('hive', joined.state, joined.detail)
+    }],
+    ['rooms', async () => {
+      if (!session) return receipt('rooms', 'pending', 'waiting for the hive')
+      const rooms = await joinRooms({ add, session, now })
+      return receipt('rooms', rooms.state, rooms.detail)
+    }],
   ]
-  // Stop at the first step that is not done, except the last three, which do not depend on each other.
-  for (const [index, [, step]] of steps.entries()) {
-    const done = step()
-    if (!done && index < 4) break
-  }
+  // Stop at the first step that is not done. After those four, givers, the relay writer and the hive
+  // do not depend on each other; rooms waits for the hive's login.
+  let agentLink = null, session = null
+  try {
+    for (const [index, [, step]] of steps.entries()) {
+      const done = await step()
+      if (!done && index < 4) break
+    }
+  } finally { session?.close?.(); agentLink?.close?.() }
   if (receipts.every(row => row.state === 'done')) appendFileSync(ledger, JSON.stringify({ id: add.id, name, op: 'add_agent', at: now(), finished: true }) + '\n')
   return { request: add, bind, receipts }
 }

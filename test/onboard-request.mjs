@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
-import { newestRequest, OnboardRefusal, parseSetupRequest, SETUP_KIND } from '../mcp/tools/onboard_request.mjs'
+import * as nip44 from 'nostr-tools/nip44'
+import { newestRequest, OnboardRefusal, parseSetupRequest, sealedShape, SETUP_KIND } from '../mcp/tools/onboard_request.mjs'
 
 const owner = generateSecretKey(), stranger = generateSecretKey()
 const ownerHex = getPublicKey(owner)
@@ -53,6 +54,13 @@ const hr = { id: 'hr', pubkey: agent, grantors: [ownerHex] }, withHr = new Map([
 refuses('ONBOARD_EXISTS', request(), { manifests: withHr })
 assert.equal(parse(request(), { manifests: withHr, inProgress: new Set([good.id]) }).pubkey, agent)
 refuses('ONBOARD_EXISTS', request({ tags: swap('p', pi.pubkey) }), { inProgress: new Set([request({ tags: swap('p', pi.pubkey) }).id]) })
+// Signed again after it started (changed terms, an expired invite): a continuation, identity fields fixed.
+const row = { op: 'add_agent', name: 'hr', pubkey: agent, owner: ownerHex, harness: 'claude-code', like: 'crystalclaude' }
+assert.equal(parse(request(), { manifests: withHr, earlier: [row] }).pubkey, agent)
+refuses('ONBOARD_EXISTS', request({ tags: swap('harness', 'codex') }), { manifests: withHr, earlier: [row] })
+refuses('ONBOARD_EXISTS', request({ tags: swap('like', 'pi-dog') }), { manifests: withHr, earlier: [row] })
+refuses('ONBOARD_EXISTS', request(), { manifests: withHr, earlier: [{ ...row, owner: getPublicKey(stranger) }] })
+refuses('ONBOARD_EXISTS', request(), { manifests: withHr, earlier: [{ ...row, name: 'other' }] })
 refuses('ONBOARD_BAD_GIVER', request({ tags: [...request().tags, ['giver', agent]] }))
 refuses('ONBOARD_BAD_ROOM', request({ tags: swap('room', 'waggle-test') }))
 refuses('ONBOARD_BAD_TAG', request({ tags: [...request().tags, ['channel_key', KEY]] }))
@@ -73,4 +81,19 @@ assert.equal(newestRequest(pool, 'hr', 'add_agent').id, newer.id)
 assert.equal(newestRequest(pool, 'hr', 'bind_runtime').id, bound.id)
 assert.equal(newestRequest([], 'hr', 'add_agent'), null)
 
-console.log('onboard-request: fields, owner, replay, age, closed tags, secrets, bind_runtime and newest pass')
+// The hive invite (#291): sealed to the agent, with the terms version and age exactly as the owner signed.
+const sealed = nip44.encrypt('v2.invite-code', nip44.getConversationKey(owner, agent))
+assert.ok(sealedShape(sealed)); assert.ok(!sealedShape('v2.invite-code')); assert.ok(!sealedShape(Buffer.alloc(120, 1).toString('base64')))
+const withJoin = parse(request({ tags: [...request().tags, ['invite', sealed], ['policy', '3'], ['age', 'confirmed']] }))
+assert.equal(withJoin.invite, sealed); assert.equal(withJoin.policy, '3'); assert.equal(withJoin.ageConfirmed, true)
+assert.deepEqual([good.invite, good.policy, good.ageConfirmed], ['', '', false])
+refuses('ONBOARD_BAD_INVITE', request({ tags: [...request().tags, ['invite', 'v2.plain-code-in-the-clear'], ['policy', '3']] }))
+refuses('ONBOARD_BAD_TAG', request({ tags: [...request().tags, ['invite', sealed]] }))
+refuses('ONBOARD_BAD_TAG', request({ tags: [...request().tags, ['invite', sealed], ['policy', 'three words here']] }))
+refuses('ONBOARD_BAD_TAG', request({ tags: [...request().tags, ['invite', sealed], ['policy', '3'], ['age', 'yes']] }))
+refuses('ONBOARD_BAD_TAG', request({ tags: [...request().tags, ['invite', sealed], ['invite', sealed], ['policy', '3']] }))
+refuses('ONBOARD_BAD_TAG', request({ tags: [['d', 'nvoy-onboard/hr/bind_runtime'], ['op', 'bind_runtime'], ['p', agent], ['harness', 'claude-code'],
+  ['like', 'crystalclaude'], ['channel_key', KEY], ['invite', sealed], ['policy', '3']] }))
+refuses('ONBOARD_SECRET', request({ tags: [...request().tags, ['policy', 'nsec1abc']] }))
+
+console.log('onboard-request: fields, owner, replay, age, closed tags, secrets, bind_runtime, newest and the sealed invite pass')

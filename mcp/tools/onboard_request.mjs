@@ -18,7 +18,18 @@ const NAME = /^[a-z0-9][a-z0-9._-]{1,63}$/i
 const HEX = /^[0-9a-f]{64}$/
 const ROOM = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const SECRETISH = /nsec1|bunker:|nostrconnect:|PRIVATE KEY|secret=/i
-const ONE = ['d', 'op', 'p', 'harness', 'like', 'channel_key']
+const ONE = ['d', 'op', 'p', 'harness', 'like', 'channel_key', 'invite', 'policy', 'age']
+const JOIN_TAGS = ['invite', 'policy', 'age']
+const POLICY = /^[A-Za-z0-9._:-]{1,64}$/
+const BASE64 = /^[A-Za-z0-9+/]+={0,2}$/
+
+// A NIP-44 v2 payload: version byte 2, a 32-byte nonce, at least 34 padded bytes, a 32-byte MAC.
+// Its shape is all the fleet can check here; whether it opens is the agent's connection's answer.
+export function sealedShape(value) {
+  if (!BASE64.test(value) || value.length < 132 || value.length > 87472) return false
+  const bytes = Buffer.from(value, 'base64')
+  return bytes.length >= 99 && bytes[0] === 2
+}
 const MANY = ['giver', 'room']
 
 export class OnboardRefusal extends Error {
@@ -39,7 +50,9 @@ export function newestRequest(events, name, op) {
 
 // manifests: Map(id -> manifest) of installed identities. seen: request ids already finished.
 // inProgress: request ids with receipts, so an add_agent whose own install has landed still reads.
-export function parseSetupRequest(event, { name, manifests, seen = new Set(), inProgress = new Set(), now = Date.now() }) {
+// earlier: the ledger's add_agent rows for this name. A newer add_agent the owner signs again (changed
+// terms, an expired invite or request) continues the install only when its identity fields match one.
+export function parseSetupRequest(event, { name, manifests, seen = new Set(), inProgress = new Set(), earlier = [], now = Date.now() }) {
   if (!NAME.test(String(name || ''))) refuse('ONBOARD_BAD_NAME', 'name must be a short stable identifier')
   if (!event) refuse('ONBOARD_NO_REQUEST', `no setup request for ${name}`)
   if (event.kind !== SETUP_KIND) refuse('ONBOARD_BAD_REQUEST', 'not a setup request')
@@ -56,7 +69,7 @@ export function parseSetupRequest(event, { name, manifests, seen = new Set(), in
   for (const tag of event.tags || []) {
     if (!Array.isArray(tag) || tag.length !== 2 || typeof tag[1] !== 'string') refuse('ONBOARD_BAD_TAG', 'every tag is a name and one value')
     const [key, value] = tag
-    if (SECRETISH.test(value)) refuse('ONBOARD_SECRET', `the ${key} tag holds something that looks like a secret`)
+    if (key !== 'invite' && SECRETISH.test(value)) refuse('ONBOARD_SECRET', `the ${key} tag holds something that looks like a secret`)
     if (ONE.includes(key)) {
       if (key in one) refuse('ONBOARD_BAD_TAG', `${key} appears twice`)
       one[key] = value
@@ -74,14 +87,21 @@ export function parseSetupRequest(event, { name, manifests, seen = new Set(), in
 
   const installed = [...manifests.values()].find(manifest => manifest.pubkey === pubkey)
   if (one.op === 'add_agent') {
-    const resumed = inProgress.has(event.id) && (!installed || installed.id === name) &&
+    const continues = earlier.some(row => row.op === 'add_agent' && row.name === name && row.pubkey === pubkey &&
+      row.owner === event.pubkey && row.harness === one.harness && row.like === one.like)
+    const resumed = (inProgress.has(event.id) || continues) && (!installed || installed.id === name) &&
       (!manifests.has(name) || manifests.get(name).pubkey === pubkey)
     if (manifests.has(name) && !resumed) refuse('ONBOARD_EXISTS', `${name} is already installed`)
     if (installed && !resumed) refuse('ONBOARD_EXISTS', `that key is already ${installed.id}`)
     if ('channel_key' in one) refuse('ONBOARD_BAD_TAG', 'channel_key belongs to bind_runtime')
+    if ('invite' in one && !sealedShape(one.invite)) refuse('ONBOARD_BAD_INVITE', 'the invite must be sealed to the agent (NIP-44), never plain')
+    if ('invite' in one && !('policy' in one)) refuse('ONBOARD_BAD_TAG', 'an invite needs the policy the owner agreed to, or none')
+    if ('policy' in one && !POLICY.test(one.policy)) refuse('ONBOARD_BAD_TAG', 'policy is a terms version, or none')
+    if ('age' in one && one.age !== 'confirmed') refuse('ONBOARD_BAD_TAG', 'age is confirmed, or absent')
   } else {
     if (installed && installed.id !== name) refuse('ONBOARD_EXISTS', `that key is already ${installed.id}`)
     if (!('channel_key' in one)) refuse('ONBOARD_BAD_TAG', 'bind_runtime needs channel_key')
+    if (JOIN_TAGS.some(key => key in one)) refuse('ONBOARD_BAD_TAG', 'the invite belongs to add_agent')
   }
   if (!HARNESSES.includes(one.harness)) refuse('ONBOARD_BAD_HARNESS', `harness must be one of ${HARNESSES.join(', ')}`)
 
@@ -103,5 +123,6 @@ export function parseSetupRequest(event, { name, manifests, seen = new Set(), in
   }
 
   return Object.freeze({ id: event.id, owner: event.pubkey, created_at: event.created_at, name, op: one.op,
-    pubkey, harness: one.harness, like: template.id, givers, rooms, channelKey })
+    pubkey, harness: one.harness, like: template.id, givers, rooms, channelKey,
+    invite: one.invite || '', policy: one.policy || '', ageConfirmed: one.age === 'confirmed' })
 }

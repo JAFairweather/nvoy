@@ -51,8 +51,11 @@ const runTool = (tool, args) => {
   throw new Error(`unexpected tool ${tool}`)
 }
 let events = [add]
+// Not a hive member yet, and this request carries no invite: the hive step waits for one. (onboard-join.mjs covers the claim.)
+let joins = 0
+const joinWith = manifest => { joins++; assert.equal(manifest.buzz.relay, 'wss://buzz.example'); return { signer: {}, open: async () => { throw new Error('AUTH refused: not a member') }, close() {} } }
 const run = (extra = {}) => onboard({ command: 'run', name: 'hr', root, out, stateDir, backupRoot, keysPath: join(tmp, 'authorized_keys'),
-  fetchEvents: async () => events, runTool, log: () => {}, ...extra })
+  fetchEvents: async () => events, runTool, joinWith, log: () => {}, ...extra })
 const states = result => Object.fromEntries(result.receipts.map(row => [row.step, row.state]))
 
 // show writes nothing and runs nothing.
@@ -77,7 +80,9 @@ events = [add, bind]
 result = await run()
 assert.equal(states(result).started, 'done'); assert.equal(states(result).givers, 'pending')
 assert.match(result.receipts.find(row => row.step === 'givers').detail, /--givers-redeploy: it redeploys pi-dog/)
-assert.equal(states(result)['relay writer'], 'pending'); assert.equal(states(result)['hive and rooms'], 'pending')
+assert.equal(states(result)['relay writer'], 'pending'); assert.equal(states(result).hive, 'pending'); assert.equal(states(result).rooms, 'pending')
+assert.match(result.receipts.find(row => row.step === 'hive').detail, /carries no invite/)
+assert.equal(joins, 1, 'the agent connection opens only once it is installed')
 
 // Agreed: pi-dog may now mention hr, with a backup taken first, and the manifest still reads. The
 // giver outside the fleet stays pending, named, and nothing ran for it.
@@ -102,6 +107,16 @@ events = [add, sign([...bind.tags.filter(tag => tag[0] !== 'p'), ['p', outsider]
 await assert.rejects(run(), error => error.code === 'ONBOARD_BIND_MISMATCH')
 assert.deepEqual(calls, ['allocate', 'pair', 'pair', 'check', 'check', 'apply'])
 
+// Signed again after it started (the terms changed, or the invite expired): the new request continues
+// to the hive with nothing reinstalled. A re-sign that changes its harness is refused.
+events = [sign(add.tags, at + 1), bind]
+result = await run({ giversRedeploy: true })
+assert.deepEqual(states(result), { staged: 'done', paired: 'done', checked: 'done', started: 'done', givers: 'pending', 'relay writer': 'pending', hive: 'pending', rooms: 'pending' })
+assert.match(result.receipts.find(row => row.step === 'started').detail, /^installed$/)
+assert.deepEqual(calls, ['allocate', 'pair', 'pair', 'check', 'check', 'apply'])
+events = [sign(add.tags.map(tag => tag[0] === 'harness' ? ['harness', 'codex'] : tag), at + 2), bind]
+await assert.rejects(run(), error => error.code === 'ONBOARD_EXISTS')
+
 // A newer signed request for the same name, before pairing, is staged afresh from its own template.
 const hr2 = like => [['d', 'nvoy-onboard/hr2/add_agent'], ['op', 'add_agent'], ['p', agent2], ['harness', 'claude-code'], ['like', like]]
 const first = sign(hr2('crystalclaude'), at - 60), second = sign(hr2('pi-dog'))
@@ -121,4 +136,4 @@ assert.deepEqual(readdirSync(join(backupRoot, 'pi-dog-backups-20261102')).filter
   ['pi-dog.json.pre-onboard-235007', 'pi-dog.json.pre-onboard-235007-1'])
 
 rmSync(tmp, { recursive: true, force: true })
-console.log('onboard-run: show writes nothing, resume, pairing wait, bind, givers backup and redeploy consent, a newer request restages, backups never overwrite pass')
+console.log('onboard-run: show writes nothing, resume, pairing wait, bind, givers backup and redeploy consent, re-signed after start, a newer request restages, backups never overwrite pass')
