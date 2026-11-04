@@ -438,9 +438,9 @@ ok('the pane is sent only the owner-only launcher\'s path, and the launcher hold
 const run1 = claudeRuns()[0] || {}
 ok('claude runs in the pane with the harness home, the login, the channel, and none of the owner\'s environment', run1.home === herdrHome && run1.keyed && run1.configDir === undefined &&
   run1.pane === 'w1:p1' && run1.args.includes('server:nvoy-mac-test') && !run1.args.includes('--continue'))
-ok('herdr is asked to name the agent after the identity', await waitFor(() => herdrFake.state().panes['w1:p1'].name === 'mactest'))
+ok('herdr is asked to name the agent after the identity', await waitFor(() => herdrFake.state().panes['w1:p1']?.name === 'mactest'))
 process.kill(run1.pid, 'SIGKILL')
-ok('a session that exits restarts in the same pane, resuming, and is named again', await waitFor(() => claudeRuns().length === 2 && herdrFake.state().panes['w1:p1'].name === 'mactest', 15000) &&
+ok('a session that exits restarts in the same pane, resuming, and is named again', await waitFor(() => claudeRuns().length === 2 && herdrFake.state().panes['w1:p1']?.name === 'mactest', 15000) &&
   /session exited \(status 137\); restarting/.test(herdrOut) && claudeRuns()[1].pane === 'w1:p1' && claudeRuns()[1].args.at(-1) === '--continue' && herdrFake.state().workspaces.length === 1)
 const herdrCtl = join(herdrHome, '.fake')
 mkdirSync(herdrCtl, { recursive: true }); writeFileSync(join(herdrCtl, 'ignoreterm'), '')
