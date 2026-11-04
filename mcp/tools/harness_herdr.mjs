@@ -5,7 +5,7 @@
 // to resume a harness session: a herdr restart must not reopen one under the owner's own login.
 
 import { spawnSync } from 'node:child_process'
-import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 const sleep = ms => new Promise(done => setTimeout(done, ms))
@@ -63,11 +63,12 @@ export function herdrClient({ bin = process.env.HARNESS_HERDR_BIN || 'herdr', en
 // The launcher a pane runs, as a file the supervisor writes owner-only. Typed into the pane's shell
 // it re-executes itself under a built environment (an owner's CLAUDE_CONFIG_DIR or API key never
 // reaches the session; herdr's pane variables do), records its pid, reads the credential from its
-// file only after that, so the secret is never in a command line or on the screen, and records
-// the session's exit status for the supervisor. Echo is off while the session starts: herdr's
+// file only after that, so the secret is never in a command line or on the screen, and then becomes
+// the session with exec: herdr and Moshi know an agent by the pane's foreground process, and a
+// launcher left waiting in front of it hid crystalclaude from Moshi (2026-11-04). Echo is off while the session starts: herdr's
 // terminal answers the queries an agent sends at startup, and an echoed answer is drawn over its
 // screen (it hid the development-channels prompt the supervisor answers; mc-claude, 2026-10-19).
-export function launcherScript({ env, cwd, command, pidFile, statusFile, credential = null }) {
+export function launcherScript({ env, cwd, command, pidFile, credential = null }) {
   const q = value => `'${String(value).replace(/'/g, `'\\''`)}'`
   // COLORTERM too: without it an agent falls back to 256 colours, and Codex's composer shading then all
   // but hides its text. Not TERM_PROGRAM: with it, Claude Code stopped taking the keys the supervisor
@@ -82,27 +83,29 @@ export function launcherScript({ env, cwd, command, pidFile, statusFile, credent
     'fi',
     'unset NVOY_HARNESS_CLEAN',
     `echo $$ > ${q(pidFile)}`,
-    `rm -f ${q(statusFile)}`,
     ...(credential ? [`${credential.env}=$(cat ${q(credential.file)}) || exit 1`, `export ${credential.env}`] : []),
     `cd ${q(cwd)} || exit 1`,
     'stty -echo 2>/dev/null',
-    command.map(q).join(' '),
-    'status=$?',
-    'stty echo 2>/dev/null',
-    `echo $status > ${q(statusFile)}`,
+    `exec ${command.map(q).join(' ')}`,
     '',
   ].join('\n')
 }
 
 // One process in an identity's pane, run through an owner-only launcher in `dir`: started, watched
-// through its pid and exit-status files, named, and stopped with its process group (an interactive
-// shell runs the launcher as a job, so it leads its own group). A recorded pid is signalled only
-// while it is still that launcher, or while the group it led for this supervisor still has members
-// (a number is not reused while its group lives), never a process that has since reused the number.
+// through its pid and the start time recorded with it, named, and stopped with its process group (an
+// interactive shell runs the launcher as a job, so it leads its own group). A recorded pid is
+// signalled only while it is still the process that started then, or while the group it led for this
+// supervisor still has members (a number is not reused while its group lives), never a process that
+// has since reused the number.
 export function herdrSession({ herdr, name, dir, cwd, file = 'session', launchMs = 10000, log = () => {} }) {
-  const launcher = resolve(dir, `${file}.sh`), pidFile = resolve(dir, `${file}.pid`), statusFile = resolve(dir, `${file}.status`)
+  const launcher = resolve(dir, `${file}.sh`), pidFile = resolve(dir, `${file}.pid`), startFile = resolve(dir, `${file}.start`)
   const readPid = () => { try { const pid = readFileSync(pidFile, 'utf8').trim(); return /^\d+$/.test(pid) ? pid : '' } catch { return '' } }
-  const ours = pid => !!pid && (spawnSync('ps', ['-o', 'args=', '-p', pid], { encoding: 'utf8' }).stdout || '').includes(launcher)
+  // When a live process started: exec keeps it, a reused number does not. A zombie has ended.
+  const startedAt = pid => {
+    const [stat = '', ...at] = (spawnSync('ps', ['-o', 'stat=', '-o', 'lstart=', '-p', pid], { encoding: 'utf8' }).stdout || '').trim().split(/\s+/)
+    return stat && !stat.startsWith('Z') ? at.join(' ') : ''
+  }
+  const ours = pid => { if (!pid) return false; const at = startedAt(pid); try { return !!at && at === readFileSync(startFile, 'utf8').trim() } catch { return false } }
   const grouped = pid => { if (!(Number(pid) > 1)) return false; try { process.kill(-Number(pid), 0); return true } catch { return false } }
   const signal = (pid, sig) => { try { process.kill(-Number(pid), sig) } catch { try { process.kill(Number(pid), sig) } catch {} } }
   const agent = () => { try { return herdr.agent(pane)?.agent || '' } catch { return '' } }
@@ -123,8 +126,8 @@ export function herdrSession({ herdr, name, dir, cwd, file = 'session', launchMs
         herdr.close(name)
         pane = herdr.pane({ label: name, cwd })
       }
-      rmSync(pidFile, { force: true }); rmSync(statusFile, { force: true })
-      writeFileSync(launcher, launcherScript({ env, cwd, command, pidFile, statusFile, credential }), { mode: 0o700 })
+      rmSync(pidFile, { force: true }); rmSync(startFile, { force: true }); rmSync(resolve(dir, `${file}.status`), { force: true })
+      writeFileSync(launcher, launcherScript({ env, cwd, command, pidFile, credential }), { mode: 0o700 })
       chmodSync(launcher, 0o700)
       // The terminal's answers to a stopped session's last queries arrive at the shell's prompt; left
       // there, they join the launcher's command line (one became `>|libghostty…;22c1`, a redirect that
@@ -132,7 +135,8 @@ export function herdrSession({ herdr, name, dir, cwd, file = 'session', launchMs
       await sleep(500)
       herdr.keys(pane, 'ctrl+c')
       await sleep(200)
-      herdr.run(pane, `'${launcher.replace(/'/g, `'\\''`)}'`)
+      // The launcher becomes the session, so the shell gives echo back once it ends.
+      herdr.run(pane, `'${launcher.replace(/'/g, `'\\''`)}'; stty echo 2>/dev/null`)
       // A killed session can leave the pane's terminal in its own modes, where Enter never ends a line
       // and ctrl+c is inert: the path shows and never runs (mc-claude, 2026-10-20, 12:10 to 12:56).
       for (const until = Date.now() + launchMs; !readPid() && Date.now() < until;) await sleep(100)
@@ -141,12 +145,13 @@ export function herdrSession({ herdr, name, dir, cwd, file = 'session', launchMs
         pane = ''
         throw new Error(`the ${name} pane did not run the launcher; its workspace is closed and the next start opens a fresh one`)
       }
+      writeFileSync(startFile, startedAt(readPid()), { mode: 0o600 })
       launched.add(readPid())
     },
     screen: () => herdr.read(pane),
     keys: key => herdr.keys(pane, key),
+    // The session is the launcher's process, so its exit status goes to the pane's shell, not here.
     dead() {
-      if (existsSync(statusFile)) return { dead: true, status: readFileSync(statusFile, 'utf8').trim() }
       const pid = readPid()
       return pid && !ours(pid) ? { dead: true, status: 'gone' } : { dead: false, status: '' }
     },
