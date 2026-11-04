@@ -932,6 +932,19 @@ The fleet channel evicts a client that misses 4 pings 30s apart, so a restarted 
 in within about 2¼ min. A laptop asleep longer than that loses its channel, and the watch restarts
 the session on wake.
 
+**In herdr.** Where the owner runs [herdr](https://herdr.dev), the session runs in a herdr pane
+instead of tmux, so it is shown like any other agent on the box: one workspace per identity,
+labelled with its name, holding the one pane Claude Code runs in. herdr recognises it there and
+tracks its state; the supervisor names the agent after the identity and restarts the session in
+the same pane. `HARNESS_TERMINAL` picks the terminal: `auto` (the default) uses herdr when it
+answers and tmux otherwise, and `herdr` or `tmux` forces one. The pane is typed only the path of an
+owner-only launcher, `<home>/.nvoy-harness/session.sh`, which rebuilds the session's environment
+from nothing and reads the login from its file, so the token is never in a command line, the
+pane's scrollback or herdr's own records. herdr is never told how to resume the session: a herdr
+restart leaves the pane empty until the supervisor starts it again, rather than reopening it under
+the owner's own login. Watch it by switching to its workspace; a keystroke there reaches the
+session, as attaching to tmux would.
+
 #### Portable Codex harness (`codex-harness-portable.mjs`)
 
 The Codex form of the above: one persistent Codex thread on any box, a Mac included, billed to the
@@ -964,8 +977,16 @@ owner's ChatGPT subscription rather than an API key, which a person can attach t
 - **Login.** `codex_home` is the harness's own `CODEX_HOME`, never `~/.codex`. Its `config.toml`
   is rewritten on each start with `forced_login_method = "chatgpt"`,
   `cli_auth_credentials_store = "file"`, no provider block, `approval_policy = "never"`,
-  `sandbox_mode = "read-only"`, and the channel key's ssh entry as its one MCP server, with the
-  three channel tools pre-approved. The supervisor refuses to start if `auth.json` is missing,
+  and the channel key's ssh entry as its one MCP server, with the three channel tools pre-approved.
+  Shell commands run under a `nvoy-channel` permission profile (`default_permissions`), not
+  `sandbox_mode = "read-only"`, which on the owner's box reads every file the owner can: they read
+  `:minimal`, `/opt/homebrew`, the workspace and the Codex release that runs them, nothing else in
+  the home directory, write nothing and have no network. The supervisor runs `codex` by its real
+  path (`~/.local/bin/codex` is a symlink into `~/.codex`), because Codex's file helper re-executes
+  that binary under the profile, and it refuses a release directory that holds the home directory
+  or `CODEX_HOME`. A resumed thread keeps the profile it started under whatever `config.toml` says,
+  so `thread/start`, `thread/resume` and every `turn/start` name the profile. Codex starts MCP
+  servers outside that sandbox, so the channel's ssh still reads its key. The supervisor refuses to start if `auth.json` is missing,
   if its `auth_mode` is not `chatgpt`, if it holds an API key, or if `OPENAI_API_KEY` or
   `CODEX_API_KEY` is set. It reads only those fields and prints none. Codex gets a built environment
   of `PATH`, `HOME` and `CODEX_HOME` only.
@@ -1019,8 +1040,33 @@ Owner steps, with placeholder paths:
    CODEX_HOME=/absolute/path/codex-jaf-home codex resume <thread-id> --remote unix:///absolute/path/codex-jaf-home/ctl/as.sock
    ```
 
+   Where the owner runs herdr, the supervisor does this itself: it shows the thread in a workspace
+   of its own, labelled with the identity's name, runs the viewer again if it exits, and replaces
+   it whenever `codex app-server` restarts. `HARNESS_TERMINAL` is `auto` (the default: herdr when it
+   answers), `herdr`, or `none` to print the command only.
+
 `--remote` and `thread/queue/add` were checked against codex-cli 0.149.1. Pin that version, or
 recheck both after an upgrade.
+
+#### Running a portable harness headless (macOS)
+
+In a launcher pane, a supervisor shows up in herdr beside the agent it supervises. As a
+LaunchAgent it runs headless, starts at login, and is restarted by launchd, and only the agent is on
+screen:
+
+```sh
+node mcp/tools/install-harness-launchagent.mjs --runner claude --instance claude-jaf --config /absolute/path/claude-jaf-harness.json
+node mcp/tools/install-harness-launchagent.mjs --runner codex --instance codex-jaf --config /absolute/path/codex-jaf-harness.json
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/pub.nave.nvoy.<id>.harness.plist
+```
+
+`--print` renders the plist without installing it. The installer reads the config the way the
+supervisor would, and refuses it on the same grounds. The plist names paths only and sets
+`HARNESS_TERMINAL=herdr`: at login herdr may not be up yet, and the session waits for it rather
+than starting in tmux, where no one would see it. It carries the installer's `PATH`, so the
+supervisor finds the same `claude`, `codex` and `herdr` you do. Logs go to `launchagent/` in the
+harness home (Claude) or under `CODEX_HOME/nvoy` (Codex). Stop it with
+`launchctl bootout gui/$(id -u)/pub.nave.nvoy.<id>.harness`, which also ends its session.
 
 ### Docker reference deployment
 

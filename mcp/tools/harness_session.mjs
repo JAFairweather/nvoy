@@ -72,11 +72,14 @@ export function defaultInstructions(manifest) {
   ].join('\n')
 }
 
-export function claudeArgs({ server, mcpConfigPath, resume, model = '' }) {
+// `--continue` restores the mode the conversation last ran in, whatever settings.json now says, so the
+// settings' mode is given on the command line as well (mc-claude kept dontAsk after auto, 2026-10-27).
+export function claudeArgs({ server, mcpConfigPath, resume, model = '', permissionMode = '' }) {
   return [
     '--dangerously-load-development-channels', `server:${server}`,
     '--mcp-config', mcpConfigPath, '--strict-mcp-config',
     ...(model ? ['--model', model] : []),
+    ...(permissionMode ? ['--permission-mode', permissionMode] : []),
     ...(resume ? ['--continue'] : []),
   ]
 }
@@ -127,8 +130,17 @@ export const CODEX_CHANNEL_TOOLS = ['nvoy_channel_list', 'nvoy_channel_read', 'n
 // `auth: 'chatgpt'` is the portable harness (codex_portable_harness.mjs): Codex on its owner's
 // ChatGPT login, stored as a file in a CODEX_HOME that is the harness's own. No provider block and
 // no key; `forced_login_method` stops Codex falling back to an API key it might find. The channel
-// is the SSH forced command, as for the portable Claude harness.
-export function codexConfigToml({ manifest, root, model = '', auth = 'api-key', remote = null }) {
+// is the SSH forced command, as for the portable Claude harness. On the owner's own box,
+// `sandbox_mode = "read-only"` lets shell commands read every file the owner can: the GitHub
+// login, other harnesses' tokens, ssh keys (dj-codex, 2026-10-20). So its shell commands get a
+// permission profile instead: platform and Homebrew paths, the Codex release that runs them and the
+// thread's workspace, read-only, nothing else in the home directory, no network. Codex's own file
+// helper runs that release under the profile, so without it a resume fails to load AGENTS.md. Codex
+// starts MCP servers outside the sandbox, so the channel's ssh still reads its key. A thread keeps the
+// profile it was started under, so the supervisor names this one on every resume and turn too.
+export const CHANNEL_PERMISSIONS = 'nvoy-channel'
+
+export function codexConfigToml({ manifest, root, model = '', auth = 'api-key', remote = null, codexRelease = '', grants = null, approvals = null }) {
   const q = value => JSON.stringify(String(value))
   if (auth === 'chatgpt') {
     if (!remote) throw new Error('a ChatGPT-login Codex config reaches its channel only through the SSH forced command')
@@ -137,9 +149,19 @@ export function codexConfigToml({ manifest, root, model = '', auth = 'api-key', 
       ...(model ? [`model = ${q(model)}`] : []),
       'forced_login_method = "chatgpt"',
       'cli_auth_credentials_store = "file"',
-      'approval_policy = "never"',
-      'sandbox_mode = "read-only"',
+      `approval_policy = ${q(approvals?.policy || 'never')}`,
+      `approvals_reviewer = ${q(approvals?.reviewer || 'user')}`,
+      `default_permissions = ${q(CHANNEL_PERMISSIONS)}`,
       '',
+      `[permissions.${CHANNEL_PERMISSIONS}.filesystem]`,
+      '":minimal" = "read"',
+      '"/opt/homebrew" = "read"',
+      '":workspace_roots" = "read"',
+      ...(codexRelease ? [`${q(codexRelease)} = "read"`] : []),
+      ...Object.entries(grants?.filesystem || {}).map(([path, mode]) => `${q(path)} = ${q(mode)}`),
+      '',
+      ...(grants?.network ? [`[permissions.${CHANNEL_PERMISSIONS}.network]`, 'enabled = true', ''] : []),
+      ...Object.entries(approvals?.apps || {}).flatMap(([id, mode]) => [`[apps.${id}]`, `default_tools_approval_mode = ${q(mode)}`, '']),
       `[mcp_servers.${serverName(manifest)}]`,
       `command = ${q(entry.command)}`,
       `args = [${entry.args.map(q).join(', ')}]`,
@@ -168,6 +190,15 @@ export function codexConfigToml({ manifest, root, model = '', auth = 'api-key', 
     '',
     ...CODEX_CHANNEL_TOOLS.flatMap(tool => [`[mcp_servers.${serverName(manifest)}.tools.${tool}]`, 'approval_mode = "approve"', '']),
   ].join('\n')
+}
+
+// The execpolicy rules for a client config's approvals.prompt_commands (codex_portable_harness.mjs), in the
+// CODEX_HOME's rules/: every one asks, so a rule can only add a question, never skip one.
+export function codexRules(approvals) {
+  const q = value => JSON.stringify(String(value))
+  const word = t => Array.isArray(t) ? `[${t.map(q).join(', ')}]` : q(t)
+  return (approvals?.prompt_commands || []).map(p =>
+    `prefix_rule(pattern = [${p.map(word).join(', ')}], decision = "prompt", justification = "the owner approves this at the attached terminal")\n`).join('')
 }
 
 // The turn carries only the opaque envelope and a dedupe marker. The message itself comes back

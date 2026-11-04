@@ -24,13 +24,13 @@
 // Like the fleet form it never reads a message body or a reply: Codex does, through the keyless
 // channel tools, and the broker rechecks the grant before it signs.
 
-import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { spawn, spawnSync } from 'node:child_process'
 import { homedir } from 'node:os'
-import { isAbsolute, resolve } from 'node:path'
+import { delimiter, dirname, isAbsolute, relative, resolve } from 'node:path'
 import { fixedPath, knownHostsFile, privateFile, sshChannelEntry, SSH, SSH_TARGET } from './channel_client.mjs'
 import { instanceId } from './runtime_manifest.mjs'
-import { codexConfigToml, codexTurnText, defaultInstructions, serverName } from './harness_session.mjs'
+import { CHANNEL_PERMISSIONS, codexConfigToml, codexRules, codexTurnText, defaultInstructions, serverName } from './harness_session.mjs'
 import { openThread } from './codex_harness.mjs'
 import { connectWsPeer } from './codex_ws_peer.mjs'
 import { claimPidLock } from './pid_lock.mjs'
@@ -43,7 +43,60 @@ const gone = pid => { try { process.kill(pid, 0); return false } catch (error) {
 // The client config names paths, never values. Beyond the portable Claude config's refusals, a
 // field or value that could carry an OpenAI API key refuses the file: this harness bills the
 // owner's subscription, and a key anywhere near it is how it would quietly bill an account instead.
-const CODEX_FIELDS = new Set(['instance', 'ssh_target', 'identity_file', 'feed_identity_file', 'known_hosts_file', 'codex_home', 'model', 'pubkey', 'channels'])
+const CODEX_FIELDS = new Set(['instance', 'ssh_target', 'identity_file', 'feed_identity_file', 'known_hosts_file', 'codex_home', 'model', 'pubkey', 'channels', 'grants', 'approvals'])
+
+// `grants`: what this one harness's shell commands may reach beyond the channel profile, for an owner
+// who gives it real work (dj-codex, the reMarkable notebooks, 2026-10-26): { "filesystem": { "/abs/path":
+// "read" | "write" }, "network": true }. Never a path holding the home directory, the CODEX_HOME (its
+// login) or the channel keys; never inside ~/.ssh but for a socket or known_hosts named exactly.
+
+// `approvals`: when Codex asks, not what it reaches, so beside `grants` rather than in it. For an
+// owner who answers at the attached TUI (herdr) (dj-codex, 2026-10-27): { "policy": "on-request",
+// "prompt_commands": [["git", ["commit", "push"]], ["gh"]], "apps": { "<connector id>": "writes" } }. A prompt rule asks before each matching command and runs the approved one outside the
+// sandbox: that is how a git write reaches a protected .git and a push reaches the owner's gh login.
+// Nothing is allowed without asking, and a request nobody answers waits for the attached person.
+// `reviewer` "auto_review" sends each request to Codex's own risk-reviewing subagent instead, for an
+// agent trusted to work on its own (James, 2026-10-27); "user", the default, waits for the person.
+const APP_APPROVALS = ['auto', 'prompt', 'writes', 'approve']
+export function codexApprovals(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).some(k => !['policy', 'prompt_commands', 'apps', 'reviewer'].includes(k))) {
+    throw new Error('client config approvals must be { policy, prompt_commands, apps, reviewer }')
+  }
+  const policy = raw.policy === undefined ? 'never' : raw.policy
+  if (policy !== 'never' && policy !== 'on-request') throw new Error('client config approvals.policy must be never or on-request')
+  const word = t => typeof t === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:\/-]*$/.test(t)
+  const prompt_commands = raw.prompt_commands === undefined ? [] : raw.prompt_commands
+  if (!Array.isArray(prompt_commands) || !prompt_commands.every(p => Array.isArray(p) && p.length && p.every(t => word(t) || (Array.isArray(t) && t.length && t.every(word))))) {
+    throw new Error('client config approvals.prompt_commands must be command prefixes: words, or lists of alternative words')
+  }
+  if (prompt_commands.length && policy === 'never') throw new Error('client config approvals.prompt_commands need policy on-request: under never nobody is asked')
+  const apps = raw.apps === undefined ? {} : raw.apps
+  if (!apps || typeof apps !== 'object' || Array.isArray(apps) || Object.entries(apps).some(([id, mode]) => !/^[A-Za-z0-9_-]+$/.test(id) || !APP_APPROVALS.includes(mode))) {
+    throw new Error(`client config approvals.apps must map connector ids to ${APP_APPROVALS.join(', ')}`)
+  }
+  const reviewer = raw.reviewer === undefined ? 'user' : raw.reviewer
+  if (reviewer !== 'user' && reviewer !== 'auto_review') throw new Error('client config approvals.reviewer must be user or auto_review')
+  return { policy, prompt_commands, apps, reviewer }
+}
+export function codexGrants(raw, { own, codexHome, keys }) {
+  if (raw === undefined) return { filesystem: {}, network: false }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).some(k => !['filesystem', 'network'].includes(k))) {
+    throw new Error('client config grants must be { filesystem, network }')
+  }
+  const fs = raw.filesystem === undefined ? {} : raw.filesystem
+  if (!fs || typeof fs !== 'object' || Array.isArray(fs)) throw new Error('client config grants.filesystem must map paths to read or write')
+  const inside = (outer, inner) => { const r = relative(outer, inner); return r === '' || (!r.startsWith('..') && !isAbsolute(r)) }
+  const filesystem = {}
+  for (const [path, mode] of Object.entries(fs)) {
+    if (!isAbsolute(path) || resolve(path) !== path) throw new Error(`grant ${path} must be an absolute, normal path`)
+    if (mode !== 'read' && mode !== 'write') throw new Error(`grant ${path} must be read or write`)
+    if ([own, codexHome, ...keys].some(held => inside(path, held))) throw new Error(`grant ${path} would reach the home directory, the harness's login or its keys`)
+    if (inside(resolve(own, '.ssh'), path) && !/(\.sock|\/known_hosts)$/.test(path)) throw new Error(`grant ${path}: only a socket or known_hosts inside ~/.ssh`)
+    filesystem[path] = mode
+  }
+  if (raw.network !== undefined && typeof raw.network !== 'boolean') throw new Error('client config grants.network must be true or false')
+  return { filesystem, network: raw.network === true }
+}
 export function readCodexClientConfig(path, id, own = homedir()) {
   const file = fixedPath(path, 'client config', 64 * 1024)
   if ((file.stat.mode & 0o022) !== 0) throw new Error('client config must not be group/world writable')
@@ -74,7 +127,9 @@ export function readCodexClientConfig(path, id, own = homedir()) {
   if (identity === feedIdentity) throw new Error('the channel and feed keys must be two keys: each forced command admits exactly one')
   const socket = resolve(codexHome, 'ctl', 'as.sock')
   if (Buffer.byteLength(socket) >= 104) throw new Error('codex_home is too deep for its control socket; choose a shorter path')
-  return Object.freeze({ id: instanceId(id), target, model, pubkey, channels, codexHome, socket, identity, feedIdentity,
+  const grants = codexGrants(raw.grants, { own, codexHome, keys: [identity, feedIdentity] })
+  const approvals = raw.approvals === undefined ? null : codexApprovals(raw.approvals)
+  return Object.freeze({ id: instanceId(id), target, model, pubkey, channels, codexHome, socket, identity, feedIdentity, grants, approvals,
     knownHosts: knownHostsFile(String(raw.known_hosts_file || '')) })
 }
 
@@ -109,7 +164,32 @@ export function sshFeedArgs(config) {
   return sshChannelEntry({ identity: config.feedIdentity, knownHosts: config.knownHosts, target: config.target }).args
 }
 
-export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH }) {
+// The Codex the app-server runs, by its real path, and the release directory holding it: Codex's file
+// helper re-executes the binary it was started as under the thread's permission profile, so that
+// release must be readable and a symlink into the owner's home (~/.local/bin/codex points into
+// ~/.codex) must not be the path. A release holding the home directory or this CODEX_HOME is refused.
+export function codexInstall({ path = process.env.PATH || '', home = homedir(), codexHome }) {
+  for (const dir of path.split(delimiter).filter(isAbsolute)) {
+    let bin
+    try { bin = realpathSync(resolve(dir, 'codex')); if (!statSync(bin).isFile()) continue } catch { continue }
+    const release = dirname(dirname(bin))
+    const holds = inner => { const r = relative(release, realpathSync(inner)); return r === '' || (!r.startsWith('..') && !isAbsolute(r)) }
+    if (holds(home) || holds(codexHome)) throw new Error(`codex at ${bin} sits in a directory that holds the home directory or the harness's CODEX_HOME; its shell commands would read them`)
+    return { bin, release }
+  }
+  throw new Error('codex is not on PATH')
+}
+
+// The command a viewer runs to attach to the thread, for a terminal that shows it (herdr).
+export const viewerCommand = ({ codexHome, socket, threadId }) => ({
+  command: ['codex', 'resume', threadId, '--remote', `unix://${socket}`],
+  env: { PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin', HOME: codexHome, CODEX_HOME: codexHome, TERM: 'xterm-256color', LANG: 'C.UTF-8' },
+  started: `showing the thread in herdr`,
+})
+
+// `viewer`, when given, is shown the thread whenever it can be attached and hidden when the
+// app-server it attaches to goes (see herdrKeeper).
+export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH, viewer = null }) {
   const { codexHome, socket } = config
   const workdir = resolve(codexHome, 'workspace'), privateDir = resolve(codexHome, 'nvoy'), ctlDir = resolve(codexHome, 'ctl')
   const threadPath = resolve(privateDir, 'codex-thread.json'), deliveredPath = resolve(privateDir, 'delivered.jsonl'), cursorPath = resolve(privateDir, 'feed-cursor.json')
@@ -125,11 +205,15 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
   for (const dir of [workdir, privateDir, ctlDir]) { mkdirSync(dir, { recursive: true, mode: 0o700 }); chmodSync(dir, 0o700) }
   const release = claimPidLock(resolve(privateDir, 'supervisor.lock'), config.id, 'portable Codex harness')
   const children = new Set()
-  process.on('exit', () => { for (const child of children) try { child.kill('SIGTERM') } catch {} release() })
+  process.on('exit', () => { for (const child of children) try { child.kill('SIGTERM') } catch {} viewer?.hide(); release() })
 
   const manifest = { id: config.id, pubkey: config.pubkey, buzz: { channels: config.channels }, harness: { runner: 'codex', model: config.model } }
-  writePrivate(resolve(codexHome, 'config.toml'), codexConfigToml({ manifest, root: '', model: config.model, auth: 'chatgpt',
+  const codex = codexInstall({ codexHome })
+  const approvalPolicy = config.approvals?.policy || 'never', approvalsReviewer = config.approvals?.reviewer || 'user'
+  writePrivate(resolve(codexHome, 'config.toml'), codexConfigToml({ manifest, root: '', model: config.model, auth: 'chatgpt', codexRelease: codex.release, grants: config.grants, approvals: config.approvals,
     remote: { identity: config.identity, knownHosts: config.knownHosts, target: config.target } }))
+  const rules = codexRules(config.approvals), rulesFile = resolve(codexHome, 'rules', 'nvoy.rules')
+  if (rules) { mkdirSync(dirname(rulesFile), { recursive: true, mode: 0o700 }); writePrivate(rulesFile, rules) } else rmSync(rulesFile, { force: true })
   if (!existsSync(resolve(workdir, 'AGENTS.md'))) writePrivate(resolve(workdir, 'AGENTS.md'), defaultInstructions(manifest))
 
   const delivered = new Set(existsSync(deliveredPath)
@@ -199,8 +283,8 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
   })()
 
   const env = { PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin', HOME: codexHome, CODEX_HOME: codexHome }
-  // codex-cli 0.163 drains on SIGTERM while a client stays attached, and holds its daemon lock,
-  // outside CODEX_HOME, until it exits: a server only asked to stop outlived the restart, and
+  // codex-cli 0.163 drains on SIGTERM while a client (the viewer) stays attached, and holds its daemon
+  // lock, outside CODEX_HOME, until it exits: a server only asked to stop outlived the restart, and
   // every later start failed "control socket is already in use" (dj-codex, 2026-10-27). So ask, then make it.
   const stopPid = async (pid, exited) => {
     if (exited()) return
@@ -211,7 +295,7 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
     try { process.kill(pid, 'SIGKILL') } catch {}
     for (const until = Date.now() + STOP_MS; Date.now() < until && !exited(); ) await sleep(50)
   }
-  // One an earlier supervisor left (one killed outright cannot stop its child) holds the same lock.
+  // One an earlier supervisor left (one killed outright cannot stop its detached child) holds the same lock.
   const leftovers = () => (spawnSync(PS, ['-axww', '-o', 'pid=,command='], { encoding: 'utf8' }).stdout || '').split('\n')
     .map(line => /^\s*(\d+)\s+(.*)$/.exec(line)).filter(m => m && m[2].endsWith(` app-server --listen unix://${socket}`)).map(m => Number(m[1]))
     .filter(pid => pid !== process.pid && ![...children].some(child => child.pid === pid))
@@ -222,7 +306,9 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
     try {
       for (const pid of leftovers()) { log(`stopping codex app-server ${pid}, left on the control socket by an earlier run`); await stopPid(pid, () => gone(pid)) }
       if (existsSync(socket)) { const st = lstatSync(socket); if (!st.isSocket() && !st.isSymbolicLink()) throw new Error('the control socket path holds something that is not a socket'); rmSync(socket) }
-      child = spawn('codex', ['app-server', '--listen', `unix://${socket}`], { stdio: ['ignore', 'ignore', 'pipe'], env })
+      // Its own session, off the supervisor's terminal, so a terminal manager (herdr) sees Codex only in
+      // the pane that attaches to it; the exit handler above still stops it.
+      child = spawn(codex.bin, ['app-server', '--listen', `unix://${socket}`], { stdio: ['ignore', 'ignore', 'pipe'], env, detached: true })
       children.add(child)
       let stderr = ''
       child.stderr.on('data', data => { stderr = (stderr + String(data)).slice(-4000) })
@@ -239,7 +325,7 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
       chmodSync(socket, 0o600)
       await server.request('initialize', { clientInfo: { name: 'nvoy-harness', title: 'Nvoy harness', version: '1' }, capabilities: { experimentalApi: true } })
       server.notify('initialized')
-      const { threadId, thread, saved } = await openThread({ server, manifest, workdir, threadPath, log, writePrivate })
+      const { threadId, thread, saved } = await openThread({ server, manifest, workdir, threadPath, log, writePrivate, permissions: CHANNEL_PERMISSIONS, approvalPolicy, approvalsReviewer })
       // '' when the channel answered, null when this Codex cannot be asked, else why it is down.
       // Any answer, a tool error included, is a live channel; only a failed call is a dead one. On
       // 0.149.1 a server that has exited rejects with -32603 "Transport closed", an unknown method
@@ -264,12 +350,13 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
           const envelope = turnEnvelope.get(p.turn?.id)
           log(`turn ${envelope ? `for ${envelope.slice(0, 12)} ` : ''}ended: ${p.turn?.status || 'unknown'}`)
           // Codex writes a thread's rollout at its first turn; until then `codex resume` finds nothing (#218).
-          if (!attachable) { attachable = true; log(`attach: ${attachCommand({ codexHome, socket, threadId })}`) }
+          if (!attachable) { attachable = true; log(`attach: ${attachCommand({ codexHome, socket, threadId })}`); viewer?.show(viewerCommand({ codexHome, socket, threadId })) }
         }
         if (!busy) wake()
       })
       log(`${config.id} session ready; admitted messages will be injected into the thread`)
       log(attachable ? `attach: ${attachCommand({ codexHome, socket, threadId })}` : 'attach: available after the thread\'s first turn, when Codex saves it; the command is printed then')
+      if (attachable) viewer?.show(viewerCommand({ codexHome, socket, threadId }))
       while (!stopping() && !server.closed) {
         if (down && !busy) { log(`restarting codex app-server to reconnect the channel (${down})`); break }
         const next = pending[0]
@@ -288,7 +375,7 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
           let turn = ''
           if (!busy) {
             try {
-              turn = String((await server.request('turn/start', { threadId, input, clientUserMessageId }))?.turn?.id || '')
+              turn = String((await server.request('turn/start', { threadId, input, clientUserMessageId, permissions: CHANNEL_PERMISSIONS, approvalPolicy, approvalsReviewer }))?.turn?.id || '')
               if (!turn) throw new Error('Codex returned no turn id')
               busy = !ended.has(turn); turnEnvelope.set(turn, next.envelope)
             } catch (error) { if (server.closed) throw error; log(`turn/start refused (${error.message}); queueing behind the running turn`) }
@@ -310,6 +397,7 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
       log(`codex harness: ${error.message}`)
     } finally {
       server?.stop()
+      viewer?.hide()
       if (child) { await stopPid(child.pid, () => child.exitCode !== null || child.signalCode !== null); children.delete(child) }
     }
     if (stopping()) break

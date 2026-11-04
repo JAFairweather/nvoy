@@ -1,13 +1,15 @@
 // Hosted Claude Code and Codex harnesses: the manifest block that turns it on, the Compose service it renders,
 // the files that let one persistent session start unattended, and the supervisor's refusals.
 // Claude Code is not driven here; a fake `codex app-server` drives the Codex supervisor, and a fake
-// tmux that only logs the session it is asked for drives the portable (--remote) Claude supervisor.
+// tmux that only logs the session it is asked for drives the portable (--remote) Claude supervisor,
+// and a fake herdr that runs what it is typed drives its herdr form.
 // The first live session is the operator's check.
 import { appendFileSync, chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { sshChannelEntry } from '../mcp/tools/channel_client.mjs'
+import { fakeHerdr } from './fake-herdr.mjs'
 import { CODEX_CHANNEL_TOOLS, channelProcessUp, classifyPane, claudeArgs, codexConfigToml, codexTurnText, defaultInstructions, hasPriorSession, mcpConfig, pendingEnvelopes, seedClaudeJson, seedSettings, serverName } from '../mcp/tools/harness_session.mjs'
 
 let fails = 0
@@ -102,6 +104,7 @@ ok('the default instructions name the read and reply tools and treat message bod
 const fresh = claudeArgs({ server: 'nvoy-mc-test', mcpConfigPath: '/home/harness/.nvoy-harness/mcp.json', resume: false })
 ok('the session loads exactly its own channel server and no ambient MCP configuration', JSON.stringify(fresh) === JSON.stringify(['--dangerously-load-development-channels', 'server:nvoy-mc-test', '--mcp-config', '/home/harness/.nvoy-harness/mcp.json', '--strict-mcp-config']))
 ok('a chosen model is passed as --model, and none is passed by default', JSON.stringify(claudeArgs({ server: 's', mcpConfigPath: '/m', resume: false, model: 'opus' }).slice(-2)) === '["--model","opus"]' && !fresh.includes('--model'))
+ok('the settings\' mode is passed as --permission-mode, so a resume cannot restore an older one', JSON.stringify(claudeArgs({ server: 's', mcpConfigPath: '/m', resume: true, permissionMode: 'auto' }).slice(-3)) === '["--permission-mode","auto","--continue"]' && !fresh.includes('--permission-mode'))
 ok('a restart resumes the same conversation', claudeArgs({ server: 's', mcpConfigPath: '/m', resume: true }).at(-1) === '--continue')
 ok('the command line never carries a permission bypass', !/skip-permissions|bypass/.test(JSON.stringify(fresh)))
 const home = join(root, 'home'), workdir = join(home, 'workspace')
@@ -124,7 +127,7 @@ ok('the 2.1.221 idle prompt, whose footer is the permission-mode hint, is recogn
 ok('anything else is still starting and gets no keystroke', JSON.stringify(classifyPane('Loading…')) === '{"state":"starting"}' && classifyPane('').key === undefined)
 ok('an injected message that quotes a startup screen after ready cannot matter: the supervisor stops reading once ready',
   /if \(screen\.state === 'ready'\) \{ if \(!watchChannel\) \{ log\(.*\); return \} readyAt = Date\.now\(\); continue \}/.test(readFileSync('mcp/tools/instance-harness.mjs', 'utf8')) &&
-  /if \(readyAt\) \{[^]*?continue\n    \}\n    const screen = classifyPane\(pane\(\)\)/.test(readFileSync('mcp/tools/instance-harness.mjs', 'utf8')))
+  /if \(readyAt\) \{[^]*?continue\n    \}\n    term\.named\(\)\n    const screen = classifyPane\(term\.screen\(\)\)/.test(readFileSync('mcp/tools/instance-harness.mjs', 'utf8')))
 const sshArgs = sshChannelEntry({ identity: '/k/id', knownHosts: '/k/kh', target: 'nvoy-channel@broker.example' }).args
 ok('the channel ssh carries keepalives, so a half-open carrier ends the process the supervisor watches', sshArgs.join(' ').includes('-o ServerAliveInterval=15 -o ServerAliveCountMax=3 -i /k/id nvoy-channel@broker.example'))
 const ps = rows => rows.map(([pid, ppid, command]) => `  ${pid}   ${ppid} ${command}`).join('\n')
@@ -310,6 +313,7 @@ const args = process.argv.slice(2)
 const entry = Object.values(JSON.parse(readFileSync(args[args.indexOf('--mcp-config') + 1], 'utf8')).mcpServers)[0]
 const saved = process.env.HOME + '/.claude/projects/' + (process.env.HOME + '/workspace').replace(/[^a-zA-Z0-9]/g, '-')
 mkdirSync(saved, { recursive: true }); writeFileSync(saved + '/fake.jsonl', '{}\\n')
+if (existsSync(process.env.HOME + '/.fake/ignoreterm')) process.on('SIGTERM', () => {})
 if (!existsSync(process.env.HOME + '/.fake/nochannel')) require('node:child_process').spawn(process.execPath, [${JSON.stringify(fakeSsh)}, ...entry.args], { stdio: 'ignore' })
 setInterval(() => {}, 1000)
 `)
@@ -332,7 +336,7 @@ if (rest[0] === 'capture-pane') console.log('  ? for shortcuts')
 `)
 chmodSync(join(fakeBin, 'tmux'), 0o755)
 const remoteEnv = { ...process.env, HOME: ownHome, CLAUDE_CONFIG_DIR: join(ownHome, '.claude'), PATH: `${fakeBin}:${process.env.PATH}`, HARNESS_POLL_MS: '25', HARNESS_WATCH_MS: '50',
-  HARNESS_CHANNEL_SETTLE_MS: '300', HARNESS_RETRY_MS: '100' }
+  HARNESS_CHANNEL_SETTLE_MS: '300', HARNESS_RETRY_MS: '100', HARNESS_TERMINAL: 'tmux', HARNESS_HERDR_BIN: '/nonexistent/herdr' }
 const refused = (value, pattern, mode) => {
   const r = spawnSync(process.execPath, ['mcp/tools/instance-harness.mjs', '--instance', 'mac-test', '--remote', clientConfig(value, mode)], { cwd: resolve('.'), encoding: 'utf8', env: remoteEnv, timeout: 10000 })
   return r.status === 1 && pattern.test(r.stderr) && !/PRIVATE-KEY|sk-ant-oat/.test(r.stdout + r.stderr)
@@ -404,6 +408,76 @@ const allSessions = readText(join(harnessHome, '.nvoy-harness', 'tmux.sock.log')
 ok('once the fleet takes the channel again, the same conversation resumes and is ready', restarted && allSessions.length >= 3 &&
   !allSessions[0].args.includes('--continue') && allSessions.slice(1).every(session => session.args.at(-1) === '--continue'))
 portable.kill('SIGTERM'); await portableExited
+
+// The herdr form, against a fake herdr (see fake-herdr.mjs).
+const herdrFake = fakeHerdr(remoteDir)
+// The session's claude logs what reached it, then is the same fake session as tmux runs.
+writeFileSync(join(fakeBin, 'claude'), `#!/usr/bin/env node
+const e = process.env
+require('node:fs').appendFileSync(e.HOME + '/claude.log', JSON.stringify({ pid: process.pid, args: process.argv.slice(2), home: e.HOME, configDir: e.CLAUDE_CONFIG_DIR, pane: e.HERDR_PANE_ID,
+  keyed: e.CLAUDE_CODE_OAUTH_TOKEN === 'sk-ant-oat-fake-login' }) + '\\n')
+require(${JSON.stringify(fakeClaudeSession)})
+`)
+chmodSync(join(fakeBin, 'claude'), 0o755)
+const herdrHome = join(ownHome, '.nvoy-harness', 'herdr-test')
+const herdrCalls = herdrFake.calls
+const claudeRuns = () => readText(join(herdrHome, 'claude.log')).split('\n').filter(Boolean).map(JSON.parse)
+const alive = pid => { try { process.kill(pid, 0); return true } catch { return false } }
+const herdrSupervisor = spawn(process.execPath, ['mcp/tools/instance-harness.mjs', '--instance', 'mac-test', '--remote', clientConfig({ ...client, home: herdrHome })],
+  { cwd: resolve('.'), env: { ...remoteEnv, HARNESS_TERMINAL: 'auto', HARNESS_HERDR_BIN: herdrFake.bin, HARNESS_LAUNCH_MS: '1500' } })
+let herdrOut = ''
+herdrSupervisor.stdout.on('data', d => { herdrOut += d }); herdrSupervisor.stderr.on('data', d => { herdrOut += d })
+const herdrExited = new Promise(done => herdrSupervisor.on('exit', done))
+ok('where herdr answers, the portable session runs in herdr and is seen ready', await waitFor(() => /the session runs in herdr/.test(herdrOut) && /mac-test session ready; its channel to the fleet is up/.test(herdrOut)))
+const herdrState1 = herdrFake.state()
+ok('the identity gets its own workspace, labelled with its name, and nothing in tmux', herdrState1.workspaces?.length === 1 && herdrState1.workspaces[0].label === 'mactest' &&
+  !existsSync(join(herdrHome, '.nvoy-harness', 'tmux.sock.log')))
+const launcher = join(herdrHome, '.nvoy-harness', 'session.sh')
+ok('the pane is sent only the owner-only launcher\'s path, and the launcher holds no login', herdrCalls().filter(c => c[1] === 'run').every(c => c[3] === `'${launcher}'`) &&
+  (statSync(launcher).mode & 0o777) === 0o700 && !readText(launcher).includes('sk-ant-oat') && !JSON.stringify(herdrCalls()).includes('sk-ant-oat'))
+const run1 = claudeRuns()[0] || {}
+ok('claude runs in the pane with the harness home, the login, the channel, and none of the owner\'s environment', run1.home === herdrHome && run1.keyed && run1.configDir === undefined &&
+  run1.pane === 'w1:p1' && run1.args.includes('server:nvoy-mac-test') && !run1.args.includes('--continue'))
+ok('herdr is asked to name the agent after the identity', await waitFor(() => herdrFake.state().panes['w1:p1'].name === 'mactest'))
+process.kill(run1.pid, 'SIGKILL')
+ok('a session that exits restarts in the same pane, resuming, and is named again', await waitFor(() => claudeRuns().length === 2 && herdrFake.state().panes['w1:p1'].name === 'mactest', 15000) &&
+  /session exited \(status 137\); restarting/.test(herdrOut) && claudeRuns()[1].pane === 'w1:p1' && claudeRuns()[1].args.at(-1) === '--continue' && herdrFake.state().workspaces.length === 1)
+const herdrCtl = join(herdrHome, '.fake')
+mkdirSync(herdrCtl, { recursive: true }); writeFileSync(join(herdrCtl, 'ignoreterm'), '')
+const readyCount = () => herdrOut.split('mac-test session ready; its channel to the fleet is up').length - 1
+const readyBefore = readyCount()
+process.kill(claudeRuns()[1].pid, 'SIGKILL')
+await waitFor(() => claudeRuns().length === 3 && readyCount() > readyBefore, 15000)
+const survivor = claudeRuns()[2]
+rmSync(join(herdrCtl, 'ignoreterm'))
+writeFileSync(join(herdrCtl, 'drop'), '')
+ok('a session whose channel dies is restarted, and one that outlives its launcher\'s SIGTERM is killed with its group before the next launch',
+  await waitFor(() => claudeRuns().length === 4 && /the channel to the fleet closed; restarting/.test(herdrOut), 15000) && !alive(survivor.pid))
+await waitFor(() => herdrFake.state().panes['w1:p1']?.name === 'mactest')
+herdrFake.set('w1:p1', { foreground: 'claude' })
+process.kill(claudeRuns()[3].pid, 'SIGKILL')
+ok('an agent left in the pane\'s foreground is never typed into: its workspace is closed and the session starts in a fresh one',
+  await waitFor(() => claudeRuns().length === 5, 15000) && /could not stop still runs in the mactest workspace; closing it/.test(herdrOut) &&
+  claudeRuns()[4].pane === 'w2:p1' && herdrFake.state().workspaces.map(w => `${w.workspace_id} ${w.label}`).join() === 'w2 mactest')
+await waitFor(() => herdrFake.state().panes['w2:p1']?.name === 'mactest')
+herdrFake.set('w2:p1', { wedged: true })
+process.kill(claudeRuns()[4].pid, 'SIGKILL')
+ok('a pane that never runs the launcher is closed, and the next start runs in a fresh workspace',
+  await waitFor(() => claudeRuns().length === 6, 15000) && /the mactest pane did not run the launcher; its workspace is closed/.test(herdrOut) &&
+  claudeRuns()[5].pane === 'w3:p1' && herdrFake.state().workspaces.map(w => `${w.workspace_id} ${w.label}`).join() === 'w3 mactest')
+const sessionPid = Number(readText(join(herdrHome, '.nvoy-harness', 'session.pid')))
+const lastRun = claudeRuns().at(-1)
+herdrSupervisor.kill('SIGTERM'); await herdrExited
+ok('stopping the supervisor stops the session it started in herdr', await waitFor(() => !alive(sessionPid) && !alive(lastRun.pid)))
+ok('nothing secret reaches the supervisor\'s output in herdr either', !/PRIVATE-KEY|sk-ant-oat/.test(herdrOut))
+const agentPlist = spawnSync(process.execPath, ['mcp/tools/install-harness-launchagent.mjs', '--runner', 'claude', '--instance', 'mac-test', '--config', clientConfig(client), '--print'],
+  { cwd: resolve('.'), encoding: 'utf8', env: { ...remoteEnv } })
+ok('the LaunchAgent runs the portable supervisor headless, in herdr, logging under the harness home, and carries no secret', agentPlist.status === 0 &&
+  agentPlist.stdout.includes('<string>pub.nave.nvoy.mac-test.harness</string>') && /instance-harness\.mjs<\/string><string>--instance<\/string><string>mac-test<\/string><string>--remote<\/string>/.test(agentPlist.stdout) &&
+  agentPlist.stdout.includes('<key>HARNESS_TERMINAL</key><string>herdr</string>') && agentPlist.stdout.includes('<key>KeepAlive</key><true/>') &&
+  agentPlist.stdout.includes(join(harnessHome, '.nvoy-harness', 'launchagent', 'stderr.log')) && !/PRIVATE-KEY|sk-ant-oat|nsec|bunker/i.test(agentPlist.stdout))
+ok('the LaunchAgent installer refuses a config the supervisor would refuse', spawnSync(process.execPath, ['mcp/tools/install-harness-launchagent.mjs', '--runner', 'claude', '--instance', 'mac-test',
+  '--config', clientConfig({ ...client, nsec_file: '/x' }), '--print'], { cwd: resolve('.'), encoding: 'utf8', env: remoteEnv }).status === 1)
 
 rmSync(root, { recursive: true, force: true })
 console.log(fails ? `\n${fails} FAILED` : '\nall passed')

@@ -4,12 +4,13 @@
 // socket, and a fake ssh execs the local feed script. The first live session is the operator's check.
 import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { sshChannelEntry } from '../mcp/tools/channel_client.mjs'
-import { CODEX_CHANNEL_TOOLS, codexConfigToml, codexTurnText } from '../mcp/tools/harness_session.mjs'
-import { attachCommand, sshFeedArgs } from '../mcp/tools/codex_portable_harness.mjs'
+import { CODEX_CHANNEL_TOOLS, codexConfigToml, codexRules, codexTurnText } from '../mcp/tools/harness_session.mjs'
+import { attachCommand, codexApprovals, codexGrants, codexInstall, sshFeedArgs } from '../mcp/tools/codex_portable_harness.mjs'
 import { claimPidLock } from '../mcp/tools/pid_lock.mjs'
+import { fakeHerdr } from './fake-herdr.mjs'
 
 let fails = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); if (!value) fails++ }
@@ -44,15 +45,49 @@ const record = (n, type = 'admitted-task') => JSON.stringify({ version: 1, type,
 const remote = { identity: '/keys/cx-channel', knownHosts: '/keys/known_hosts', target: 'nvoy-codex@broker.example' }
 const toml = codexConfigToml({ manifest: { id: 'cx-test' }, root: '', auth: 'chatgpt', remote })
 const tomlLines = toml.split('\n').filter(Boolean)
-ok('the ChatGPT config is well-formed TOML of tables and single-line keys', tomlLines.every(line => /^\[[a-z0-9_.-]+\]$/i.test(line) || /^[a-z_]+ = (?:"[^"]*"|\[.*\])$/.test(line)))
+ok('the ChatGPT config is well-formed TOML of tables and single-line keys', tomlLines.every(line => /^\[[a-z0-9_.-]+\]$/i.test(line) || /^(?:[a-z_]+|"[^"]+") = (?:"[^"]*"|\[.*\])$/.test(line)))
 const args = JSON.parse(tomlLines.find(line => line.startsWith('args = ')).slice(7))
 ok('the ChatGPT config forces the ChatGPT login from a file store, with no provider and no key', /^forced_login_method = "chatgpt"$/m.test(toml) &&
   /^cli_auth_credentials_store = "file"$/m.test(toml) && !/model_provider|env_key|OPENAI_API_KEY|requires_openai_auth|sk-|base_url/.test(toml))
-ok('the ChatGPT config asks for no approval and keeps shell commands read-only', /^approval_policy = "never"$/m.test(toml) && /^sandbox_mode = "read-only"$/m.test(toml) && !/danger|full-access/.test(toml))
+ok('the ChatGPT config asks for no approval and keeps shell commands read-only', /^approval_policy = "never"$/m.test(toml) && !/danger|full-access/.test(toml))
+const profile = toml.split('[permissions.nvoy-channel.filesystem]\n')[1]?.split('\n\n')[0] || ''
+ok('its shell commands read only platform paths and the workspace, never the home directory or the root', /^default_permissions = "nvoy-channel"$/m.test(toml) &&
+  !/^sandbox_mode/m.test(toml) && profile.split('\n').sort().join('\n') === ['"/opt/homebrew" = "read"', '":minimal" = "read"', '":workspace_roots" = "read"'].sort().join('\n') &&
+  !/:root|~|\/Users|write|network/.test(toml.split('[mcp_servers')[0]))
+const withRelease = codexConfigToml({ manifest: { id: 'cx-test' }, root: '', auth: 'chatgpt', remote, codexRelease: '/opt/codex/releases/0.163.0' })
+ok('the Codex release that runs its shell commands is readable too, and nothing more', withRelease.replace('"/opt/codex/releases/0.163.0" = "read"\n', '') === toml)
 ok('its one MCP server is the hardened ssh entry to the channel forced command', (toml.match(/^\[mcp_servers\.[^.\]]+\]$/gm) || []).length === 1 &&
   toml.includes('[mcp_servers.nvoy-cx-test]\ncommand = "/usr/bin/ssh"\n') && JSON.stringify(args) === JSON.stringify(sshChannelEntry(remote).args) && !/NVOY_INSTANCE_ROOT/.test(toml))
 ok('each keyless channel tool, and only those, is pre-approved', CODEX_CHANNEL_TOOLS.every(tool => toml.includes(`[mcp_servers.nvoy-cx-test.tools.${tool}]\napproval_mode = "approve"\n`)) &&
   (toml.match(/^approval_mode = /gm) || []).length === 6)
+// grants: one harness's extra reach, never its own login, keys or the home directory itself
+const gOwn = '/Users/o', gHome = '/Users/o/.nvoy-harness/x/codex', gKeys = ['/Users/o/.nvoy-harness/x/id_channel', '/Users/o/.nvoy-harness/x/id_feed']
+const grant = raw => { try { return codexGrants(raw, { own: gOwn, codexHome: gHome, keys: gKeys }) } catch (e) { return e.message } }
+const granted = grant({ filesystem: { '/Users/o/R1-work': 'write', '/Users/o/.ssh/known_hosts': 'read', '/Users/o/.ssh/s/r1-agent.sock': 'write' }, network: true })
+ok('grants name work paths and the network', granted.filesystem?.['/Users/o/R1-work'] === 'write' && granted.network === true)
+ok('no grants: nothing beyond the channel profile', JSON.stringify(grant(undefined)) === '{"filesystem":{},"network":false}')
+ok('a grant may not hold the home directory', typeof grant({ filesystem: { '/Users/o': 'read' } }) === 'string' && typeof grant({ filesystem: { '/Users': 'read' } }) === 'string')
+ok('a grant may not reach the login or the channel keys', typeof grant({ filesystem: { '/Users/o/.nvoy-harness': 'read' } }) === 'string')
+ok('inside ~/.ssh only a socket or known_hosts', typeof grant({ filesystem: { '/Users/o/.ssh/id_ed25519': 'read' } }) === 'string' && typeof grant({ filesystem: { '/Users/o/.ssh': 'read' } }) === 'string')
+ok('a grant is read or write, on an absolute path', typeof grant({ filesystem: { 'R1-work': 'read' } }) === 'string' && typeof grant({ filesystem: { '/Users/o/R1-work': 'all' } }) === 'string')
+const grantedToml = codexConfigToml({ manifest: { id: 'cx-test' }, root: '', auth: 'chatgpt', remote, grants: granted })
+ok('the profile lists each grant, and the network only when granted', /^"\/Users\/o\/R1-work" = "write"$/m.test(grantedToml) && /\.network\]\nenabled = true/.test(grantedToml) && !/\.network\]/.test(toml))
+// approvals: when Codex asks the attached person, beside grants; by default it never asks
+const approve = raw => { try { return codexApprovals(raw) } catch (e) { return e.message } }
+const asked = approve({ policy: 'on-request', prompt_commands: [['git', ['commit', 'push']], ['gh']], apps: { connector_abc: 'writes' } })
+const askedToml = codexConfigToml({ manifest: { id: 'cx-test' }, root: '', auth: 'chatgpt', remote, approvals: asked })
+ok('approvals set the policy and each app\'s tool approvals', /^approval_policy = "on-request"$/m.test(askedToml) && askedToml.includes('[apps.connector_abc]\ndefault_tools_approval_mode = "writes"\n') &&
+  /^approval_policy = "never"$/m.test(toml) && !/\[apps\./.test(toml))
+ok('each prompt command becomes a rule that asks, and none that allows', codexRules(asked) ===
+  'prefix_rule(pattern = ["git", ["commit", "push"]], decision = "prompt", justification = "the owner approves this at the attached terminal")\n' +
+  'prefix_rule(pattern = ["gh"], decision = "prompt", justification = "the owner approves this at the attached terminal")\n' && codexRules(null) === '')
+ok('approvals refuse an unknown policy or field, a rule under never, and an unknown app mode',
+  [{ policy: 'untrusted' }, { policy: 'on-request', allow: [['git']] }, { prompt_commands: [['git']] }, { policy: 'on-request', apps: { x: 'always' } },
+    { policy: 'on-request', prompt_commands: [['git;rm']] }, { policy: 'on-request', prompt_commands: [[]] }].every(raw => typeof approve(raw) === 'string'))
+ok('a reviewer is user unless auto_review is chosen, and goes into config.toml', /^approvals_reviewer = "user"$/m.test(askedToml) && /^approvals_reviewer = "user"$/m.test(toml) &&
+  /^approvals_reviewer = "auto_review"$/m.test(codexConfigToml({ manifest: { id: 'cx-test' }, root: '', auth: 'chatgpt', remote, approvals: approve({ policy: 'on-request', reviewer: 'auto_review' }) })) &&
+  typeof approve({ policy: 'on-request', reviewer: 'guardian' }) === 'string')
+ok('approvals stay out of grants', typeof grant({ approvals: { policy: 'on-request' } }) === 'string')
 ok('a model is set only when chosen', !/^model = /m.test(toml) && /^model = "gpt-5\.5"$/m.test(codexConfigToml({ manifest: { id: 'cx-test' }, root: '', model: 'gpt-5.5', auth: 'chatgpt', remote })))
 ok('a ChatGPT config without the SSH channel, or an unknown auth mode, is refused', (() => { try { codexConfigToml({ manifest: { id: 'x' }, root: '', auth: 'chatgpt' }); return false } catch { return true } })() &&
   (() => { try { codexConfigToml({ manifest: { id: 'x' }, root: '', auth: 'env' }); return false } catch { return true } })())
@@ -198,16 +233,24 @@ writeFileSync(join(otherRoot, 'cx-test.json'), JSON.stringify({ ...manifest, wor
 const wrongUser = spawnSync(process.execPath, ['mcp/tools/codex-channel-feed.mjs', '--instance', 'cx-test'], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: otherRoot }, input: '' })
 ok('the feed runs only as the manifest-bound worker user', wrongUser.status === 1 && /worker user/.test(wrongUser.stderr))
 
-// Supervisor, against a fake WebSocket-over-unix app-server and a fake ssh that runs the feed locally
-const fakeBin = join(root, 'bin')
-mkdirSync(fakeBin, { mode: 0o700 })
-writeFileSync(join(fakeBin, 'codex'), `#!/usr/bin/env node
+// Supervisor, against a fake WebSocket-over-unix app-server and a fake ssh that runs the feed locally.
+// PATH reaches the fake through a symlink, as ~/.local/bin/codex reaches a release under ~/.codex.
+const fakeBin = join(root, 'bin'), fakeRelease = join(root, 'release', '0.0.0'), fakeCodex = join(fakeRelease, 'bin', 'codex')
+mkdirSync(fakeBin, { mode: 0o700 }); mkdirSync(dirname(fakeCodex), { recursive: true, mode: 0o700 })
+symlinkSync(fakeCodex, join(fakeBin, 'codex'))
+writeFileSync(fakeCodex, `#!/usr/bin/env node
 const net = require('node:net'), crypto = require('node:crypto'), fs = require('node:fs')
 const home = process.env.CODEX_HOME
 const log = row => fs.appendFileSync(home + '/fake.jsonl', JSON.stringify(row) + '\\n')
+if (process.argv[2] === 'resume') {
+  const e = process.env
+  fs.appendFileSync(home + '/viewer.jsonl', JSON.stringify({ pid: process.pid, args: process.argv.slice(2), home: e.HOME, pane: e.HERDR_PANE_ID, env: Object.keys(e).sort() }) + '\\n')
+  setInterval(() => {}, 1000)
+  return
+}
 if (process.argv[2] !== 'app-server' || process.argv[3] !== '--listen' || !String(process.argv[4]).startsWith('unix://')) process.exit(2)
 const path = process.argv[4].slice(7)
-log({ start: true, pid: process.pid, env: Object.keys(process.env).sort(), listen: path })
+log({ start: true, pid: process.pid, env: Object.keys(process.env).sort(), listen: path, exe: process.argv[1] })
 fs.rmSync(home + '/mcp-dead', { force: true })
 const THREAD = fs.existsSync(home + '/unsaved') ? '0199a213-81c0-7800-8aa1-cccccccccccc' : '0199a213-81c0-7800-8aa1-bbab2a035a53'
 const conns = new Set()
@@ -266,7 +309,7 @@ net.createServer(sock => {
 // codex-cli 0.163 drains on SIGTERM while a client stays attached: 'stubborn' stands in for that.
 process.on('SIGTERM', () => { if (fs.existsSync(home + '/stubborn')) return; try { fs.rmSync(path) } catch {} process.exit(0) })
 `)
-chmodSync(join(fakeBin, 'codex'), 0o755)
+chmodSync(fakeCodex, 0o755)
 const fakeSsh = secretFile(join(fakeBin, 'ssh'), `#!/bin/sh
 echo "$@" >> ${join(root, 'ssh-args.log')}
 NVOY_INSTANCE_ROOT=${fleet} exec ${process.execPath} ${resolve('mcp/tools/codex-channel-feed.mjs')} --instance cx-test --heartbeat-ms 150 --poll-ms 40
@@ -285,7 +328,8 @@ const knownHosts = secretFile(join(root, 'known_hosts'), 'broker.example ssh-ed2
 const client = { instance: 'cx-test', ssh_target: 'nvoy-codex@broker.example', identity_file: chanKey, feed_identity_file: feedKey, known_hosts_file: knownHosts, codex_home: codexHome }
 const clientConfig = (value, mode = 0o600) => secretFile(join(mkdtempSync(join(root, 'c-')), 'client.json'), JSON.stringify(value), mode)
 const baseEnv = (() => { const env = { ...process.env }; delete env.OPENAI_API_KEY; delete env.CODEX_API_KEY; return env })()
-const supervisorEnv = { ...baseEnv, HOME: ownHome, PATH: `${fakeBin}:${process.env.PATH}`, NVOY_HARNESS_SSH: fakeSsh, HARNESS_FEED_KEEPALIVE_MS: '100', HARNESS_FEED_SILENCE_MS: '3000' }
+const supervisorEnv = { ...baseEnv, HOME: ownHome, PATH: `${fakeBin}:${process.env.PATH}`, NVOY_HARNESS_SSH: fakeSsh, HARNESS_FEED_KEEPALIVE_MS: '100', HARNESS_FEED_SILENCE_MS: '3000',
+  HARNESS_TERMINAL: 'none', HARNESS_HERDR_BIN: '/nonexistent/herdr' }
 const refused = (value, pattern, env = {}, mode) => {
   const r = spawnSync(process.execPath, ['mcp/tools/codex-harness-portable.mjs', '--instance', 'cx-test', '--config', clientConfig(value, mode)], { cwd: resolve('.'), encoding: 'utf8', env: { ...supervisorEnv, ...env }, timeout: 10000 })
   return r.status === 1 && pattern.test(r.stderr) && !/PRIVATE-KEY|CHATGPT-TOKEN|sk-proj-live/.test(r.stdout + r.stderr)
@@ -340,7 +384,13 @@ ok('the thread\'s channel is asked before ready, by the channel\'s own tool', cl
   clientCalls('mcpServer/tool/call')[0]?.params.tool === 'nvoy_channel_list' && clientCalls('mcpServer/tool/call')[0]?.params.threadId === THREAD)
 ok('the app-server listens on the owner-only socket under CODEX_HOME, and the client frames are masked', fakeLog(codexHome)[0].listen === socket &&
   (statSync(socket).mode & 0o777) === 0o600 && clientCalls('initialize').length === 1)
+ok('the app-server is run by its real path, and its release is the one extra directory its shell commands read', fakeLog(codexHome)[0].exe === fakeCodex &&
+  readText(join(codexHome, 'config.toml')).includes(`${JSON.stringify(fakeRelease)} = "read"\n`))
+ok('the new thread is started under the channel profile', clientCalls('thread/start')[0].params.permissions === 'nvoy-channel')
 ok('it opts into the experimental API that thread/queue/add needs', clientCalls('initialize')[0].params.capabilities.experimentalApi === true)
+const pgid = pid => spawnSync('ps', ['-o', 'pgid=', '-p', String(pid)], { encoding: 'utf8' }).stdout.trim()
+const s1Server = fakeLog(codexHome)[0].pid
+ok('the app-server runs in its own session, off the supervisor\'s terminal', pgid(s1Server) === String(s1Server) && pgid(s1.child.pid) !== String(s1Server))
 writeFileSync(join(codexHome, 'hold'), '')
 appendFileSync(queue, record(2))
 await waitFor(() => /injected 222222222222 as a turn/.test(s1.out))
@@ -385,6 +435,11 @@ await waitFor(() => /injected 444444444444 as a turn/.test(s2.out))
 ok('a restart resumes the same thread and injects only what arrived while it was down, once', /resumed the cx-test thread/.test(s2.out) &&
   clientCalls('thread/resume').some(m => m.params.threadId === THREAD) && clientCalls('thread/start').length === 1 &&
   clientCalls('turn/start').length === 2 && clientCalls('turn/start')[1].params.clientUserMessageId === `nvoy:${envelope(4)}` && clientCalls('thread/queue/add').length === 1)
+ok('the resumed thread is put under the channel profile, and so is every turn: a resume otherwise keeps the profile the thread started under (dj-codex, 2026-10-21)',
+  clientCalls('thread/resume').every(m => m.params.permissions === 'nvoy-channel' && m.params.excludeTurns === true && m.params.approvalPolicy === 'never' && m.params.approvalsReviewer === 'user') &&
+  clientCalls('turn/start').every(m => m.params.permissions === 'nvoy-channel' && m.params.approvalPolicy === 'never' && m.params.approvalsReviewer === 'user'))
+ok('a Codex whose release would hold the home directory or CODEX_HOME is refused', (() => { try { codexInstall({ path: fakeBin, home: ownHome, codexHome: join(fakeRelease, 'bin') }); return false } catch (e) { return /holds the home directory or the harness's CODEX_HOME/.test(e.message) } })() &&
+  (() => { try { codexInstall({ path: fakeBin, home: ownHome, codexHome }); return true } catch { return false } })())
 ok('a resumed thread prints its attach command at ready', s2.out.indexOf(attachLine) >= 0 && s2.out.indexOf(attachLine) < s2.out.indexOf('injected 444444444444'))
 // The fleet recreates the adapter: the thread's channel MCP and the wake feed die together.
 await waitFor(() => /turn for 444444444444 ended/.test(s2.out))
@@ -420,7 +475,9 @@ writeFileSync(join(codexHome, 'unsaved'), '')
 const s4 = startSupervisor()
 ok('a stored thread Codex never saved is replaced by a new one (#218)', await waitFor(() => /never saved the stored cx-test thread; starting a new one/.test(s4.out) && /session ready/.test(s4.out)) &&
   JSON.parse(readText(join(codexHome, 'nvoy', 'codex-thread.json'))).thread_id === '0199a213-81c0-7800-8aa1-cccccccccccc')
-await s4.stop()
+const s4Server = fakeLog(codexHome).filter(m => m.start).at(-1).pid
+s4.child.kill('SIGHUP'); await s4.exited
+ok('a hangup, as when its pane closes, stops the detached app-server too', await waitFor(() => !alive(s4Server), 5000))
 rmSync(join(codexHome, 'unsaved'))
 
 // A server that will not stop when asked must not outlive its restart: its lock refuses every later start (dj-codex, 2026-10-27).
@@ -435,7 +492,7 @@ rmSync(join(codexHome, 'stubborn')); rmSync(join(codexHome, 'mcp-dead'), { force
 try { process.kill(s7Server, 'SIGKILL') } catch {}   // a failure leaves no stubborn server behind
 await s7.stop()
 writeFileSync(join(codexHome, 'stubborn'), '')
-const orphan = spawn(join(fakeBin, 'codex'), ['app-server', '--listen', `unix://${socket}`], { env: { ...baseEnv, CODEX_HOME: codexHome }, detached: true, stdio: 'ignore' })
+const orphan = spawn(fakeCodex, ['app-server', '--listen', `unix://${socket}`], { env: { ...baseEnv, CODEX_HOME: codexHome }, detached: true, stdio: 'ignore' })
 orphan.unref()
 await waitFor(() => existsSync(socket))
 const s8 = startSupervisor(client, { HARNESS_STOP_MS: '300' })
@@ -444,6 +501,34 @@ ok('a codex app-server an earlier run left on the control socket is stopped befo
 rmSync(join(codexHome, 'stubborn'))
 try { process.kill(orphan.pid, 'SIGKILL') } catch {}
 await s8.stop()
+
+// Where the owner runs herdr, the thread is shown there, in a workspace of the identity's own.
+const herdr = fakeHerdr(root)
+const viewers = () => readText(join(codexHome, 'viewer.jsonl')).split('\n').filter(Boolean).map(JSON.parse)
+const s6 = startSupervisor(client, { HARNESS_TERMINAL: 'auto', HARNESS_HERDR_BIN: herdr.bin, HARNESS_VIEWER_CHECK_MS: '100', HARNESS_RETRY_MS: '100' })
+ok('where herdr answers, the attachable thread is shown in a workspace labelled with the identity, and named after it',
+  await waitFor(() => viewers().length === 1 && herdr.state().panes['w1:p1']?.name === 'cxtest') && /the thread is shown in herdr, in workspace cxtest/.test(s6.out) &&
+  herdr.state().workspaces.length === 1 && herdr.state().workspaces[0].label === 'cxtest')
+const v1 = viewers()[0]
+const threadNow = JSON.parse(readText(join(codexHome, 'nvoy', 'codex-thread.json'))).thread_id
+ok('the viewer attaches to the driven thread over the control socket, in the harness\'s CODEX_HOME and nothing of the owner\'s',
+  JSON.stringify(v1.args) === JSON.stringify(['resume', threadNow, '--remote', `unix://${socket}`]) && v1.home === codexHome && v1.pane === 'w1:p1' &&
+  !v1.env.includes('HARNESS_EXTRA_VAR') && !v1.env.includes('NVOY_HARNESS_SSH') && v1.env.includes('CODEX_HOME'))
+process.kill(v1.pid, 'SIGKILL')
+ok('a viewer that exits is shown again in the same pane', await waitFor(() => viewers().length === 2 && herdr.state().panes['w1:p1'].name === 'cxtest') &&
+  viewers()[1].pane === 'w1:p1' && herdr.state().workspaces.length === 1)
+const v2 = viewers()[1], s6Servers = appServers()
+process.kill(fakeLog(codexHome).filter(m => m.start).at(-1).pid, 'SIGKILL')
+ok('when codex app-server restarts, its viewer is replaced by one on the new server', await waitFor(() => appServers() === s6Servers + 1 && viewers().length === 3 && !alive(v2.pid)))
+const v3 = viewers()[2]
+await s6.stop()
+ok('stopping the supervisor takes its viewer down with it', await waitFor(() => !alive(v3.pid)))
+const agentPlist = spawnSync(process.execPath, ['mcp/tools/install-harness-launchagent.mjs', '--runner', 'codex', '--instance', 'cx-test', '--config', clientConfig(client), '--print'],
+  { cwd: resolve('.'), encoding: 'utf8', env: supervisorEnv })
+ok('the Codex LaunchAgent runs the portable supervisor headless, in herdr, logging under CODEX_HOME, and carries no secret', agentPlist.status === 0 &&
+  agentPlist.stdout.includes('<string>pub.nave.nvoy.cx-test.harness</string>') && /codex-harness-portable\.mjs<\/string><string>--instance<\/string><string>cx-test<\/string><string>--config<\/string>/.test(agentPlist.stdout) &&
+  agentPlist.stdout.includes('<key>HARNESS_TERMINAL</key><string>herdr</string>') && agentPlist.stdout.includes(join(codexHome, 'nvoy', 'launchagent', 'stderr.log')) &&
+  !/PRIVATE-KEY|CHATGPT-TOKEN|OPENAI_API_KEY|nsec|bunker/i.test(agentPlist.stdout))
 
 rmSync(root, { recursive: true, force: true })
 console.log(fails ? `\n${fails} FAILED` : '\nall passed')
