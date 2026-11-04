@@ -17,6 +17,9 @@ const root = realpathSync(mkdtempSync(join(tmpdir(), 'nvoy-wwh-')))
 const wait = ms => new Promise(done => setTimeout(done, ms))
 async function waitFor(test, ms = 8000) { const end = Date.now() + ms; while (Date.now() < end) { if (test()) return true; await wait(20) } return false }
 const readText = path => { try { return readFileSync(path, 'utf8') } catch { return '' } }
+// The notifier logs a POST's status before it persists the cursor, so a test that reads or relies on the
+// saved state waits for the cursor itself rather than the log line.
+const cursorOf = s => JSON.parse(readText(s.state) || '{}').cursor
 const envelope = n => n.toString(16).padStart(2, '0').repeat(32)
 const brokerAdapterGid = process.getgid()
 const workerHandoffGid = process.getgroups().find(g => g !== brokerAdapterGid)
@@ -117,7 +120,7 @@ try {
   ok('a burst is delivered in queue order, one request in flight at a time', await waitFor(() => posts('a').length === 5) &&
     JSON.stringify(bodies('a').slice(2).map(b => b.envelope)) === JSON.stringify([5, 6, 7].map(envelope)) && maxInFlight === 1)
   handlers.a = undefined
-  await waitFor(() => /POST 07070707 -> 204/.test(na.out))
+  await waitFor(() => /POST 07070707 -> 204/.test(na.out) && cursorOf(a) === envelope(7))
   await na.stop()
   ok('the cursor persists as an envelope id, owner-only', JSON.parse(readText(a.state)).cursor === envelope(7) && (statSync(a.state).mode & 0o777) === 0o600)
   appendFileSync(a.queue, record(8))
@@ -132,12 +135,12 @@ try {
   appendFileSync(a.queue, record(11))
   ok('a rewrite without the last envelope seen continues from its end rather than replaying', await waitFor(() => posts('a').length === 8) &&
     bodies('a')[7].envelope === envelope(11) && await wait(150).then(() => posts('a').length === 8))
-  await waitFor(() => /POST 0b0b0b0b -> 204/.test(na.out))
+  await waitFor(() => /POST 0b0b0b0b -> 204/.test(na.out) && cursorOf(a) === envelope(11))
   await na.stop()
   rewrite(a.queue, record(20) + record(21))
   na = notifier(a, ['--renotify-ms', '86400000'])
   ok('a cursor the queue no longer holds starts from its end on restart, posting nothing old', await waitFor(() => /cursor is not in the admitted queue/.test(na.out)) &&
-    await wait(250).then(() => posts('a').length === 8) && JSON.parse(readText(a.state)).cursor === envelope(21))
+    await wait(250).then(() => posts('a').length === 8) && await waitFor(() => cursorOf(a) === envelope(21)))
   markRead(a, 22)
   appendFileSync(a.queue, record(22))
   ok('an envelope the harness has already read is not posted', await waitFor(() => /16161616 already read; not posted/.test(na.out)) && posts('a').length === 8)
@@ -163,8 +166,8 @@ try {
   ok('each failed attempt logs its status and the next delay', /POST 01010101 -> 500; retry in 60ms/.test(nb.out) && /POST 01010101 -> 500; retry in 120ms/.test(nb.out))
   handlers.b = (row, seen) => ({ status: seen < 4 ? 503 : 202 })
   appendFileSync(b.queue, record(2))
-  ok('the queue moves on after a give-up, and a transient failure recovers on retry', await waitFor(() => /POST 02020202 -> 202/.test(nb.out)) && posts('b').length === 5 &&
-    JSON.parse(readText(b.state)).cursor === envelope(2))
+  ok('the queue moves on after a give-up, and a transient failure recovers on retry', await waitFor(() => /POST 02020202 -> 202/.test(nb.out) &&
+    cursorOf(b) === envelope(2)) && posts('b').length === 5)
   handlers.b = (row, seen) => seen === 5 ? { hang: true } : { status: 204 }
   appendFileSync(b.queue, record(3))
   ok('a POST that outlives its timeout is logged as a timeout and retried', await waitFor(() => /POST 03030303 -> timeout; retry/.test(nb.out) && /POST 03030303 -> 204/.test(nb.out), 6000))
@@ -198,7 +201,7 @@ try {
   markRead(r, 2)
   ok('an envelope that appears in the read log is not re-notified', await wait(900).then(() => posts('r').length === 4) && JSON.parse(readText(r.state)).watch.length === 0)
   appendFileSync(r.queue, record(3))
-  await waitFor(() => /POST 03030303 -> 204/.test(nr.out))
+  await waitFor(() => /POST 03030303 -> 204/.test(nr.out) && cursorOf(r) === envelope(3))
   await nr.stop()
   ok('the re-notify watch survives a restart', JSON.parse(readText(r.state)).watch.map(w => w.envelope).join() === envelope(3))
   const nr2 = notifier(r, ['--renotify-ms', '300', '--renotify-max', '2'])

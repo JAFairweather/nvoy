@@ -9,7 +9,7 @@ import net from 'node:net'
 import { createHash } from 'node:crypto'
 import { generateSecretKey, getPublicKey, finalizeEvent } from 'nostr-tools/pure'
 import * as nip19 from 'nostr-tools/nip19'
-import { isTerminalReplyFailure, loadPublishedReplyIds, loadReplyRequestDigests, loadTerminalReplyIds, recordTerminalReply } from '../mcp/tools/reply_retry.mjs'
+import { isTerminalReplyFailure, loadPublishedReplyIds, loadReplyRequestDigests, loadTerminalReplyIds, recordTerminalReply, terminalReplyReason } from '../mcp/tools/reply_retry.mjs'
 import { claimChannelSource, completeChannelSource, channelSourceClaims } from '../mcp/tools/channel_source_dedup.mjs'
 import { validateAdmittedTask } from '../mcp/tools/admitted_task.mjs'
 
@@ -254,6 +254,21 @@ const terminalReplies = join(manifest.state_dir, 'terminal-replies.jsonl')
 const terminalIds = loadTerminalReplyIds(terminalReplies)
 const expiredRequest = 'a'.repeat(32)
 ok('a missing or stale admission receipt is terminal, rather than a relay-query retry loop', isTerminalReplyFailure('instance-broker-reply: admission receipt is missing') && isTerminalReplyFailure('instance-broker-reply: admission receipt is not a live broker-bound sender capability') && recordTerminalReply(terminalReplies, terminalIds, expiredRequest, 'admission receipt is not a live broker-bound sender capability', 1) && terminalIds.has(expiredRequest) && !recordTerminalReply(terminalReplies, terminalIds, expiredRequest, 'admission receipt is not a live broker-bound sender capability', 2) && loadTerminalReplyIds(terminalReplies).has(expiredRequest) && !readFileSync(terminalReplies, 'utf8').includes('must not be signed'))
+// 10-26: a DJ Codex reply that mentioned Pi Dog hit the 4-an-hour cap and was logged as receipt-not-live.
+const capped = 'instance-broker-reply: reply refused: over the may_post hourly cap (4/4 in the last hour)'
+ok('a reply refused by the may_post hourly cap is named as such', isTerminalReplyFailure(capped) && terminalReplyReason(capped) === 'post-cap')
+// 10-23: two LukeDog replies to deleted mentions were refused this way every ~9s, with no end.
+const parentGone = 'instance-broker-reply: Buzz refused the reply: invalid: reply parent not found\ninstance-broker-reply: Buzz rejected the frozen channel reply as invalid; no retry can change it'
+const staleReply = 'instance-broker-reply: Buzz refused the reply: invalid: event timestamp too far from server time\ninstance-broker-reply: Buzz rejected the frozen channel reply as invalid; no retry can change it'
+ok('a frozen Buzz reply rejected as invalid is terminal, while a merely unaccepted one stays retryable',
+  isTerminalReplyFailure(parentGone) && terminalReplyReason(parentGone) === 'parent-gone' &&
+  isTerminalReplyFailure(staleReply) && terminalReplyReason(staleReply) === 'invalid-frozen-reply' &&
+  !isTerminalReplyFailure('instance-broker-reply: Buzz refused the reply: rate-limited: slow down\ninstance-broker-reply: the Buzz relay did not accept the persisted channel reply; it remains retryable') &&
+  !isTerminalReplyFailure('instance-broker-reply: the Buzz relay did not accept the persisted channel reply; it remains retryable'))
+const replyActuator = readFileSync('mcp/tools/instance-broker-reply.mjs', 'utf8')
+ok('only an invalid verdict on a reply stamped no later than now is made terminal, so a future-stamped one can still land',
+  /\/\^invalid:\/\.test\(/.test(replyActuator) && /record\.event\.created_at <= Math\.floor\(Date\.now\(\) \/ 1000\)/.test(replyActuator) &&
+  /die\('Buzz rejected the frozen channel reply as invalid/.test(replyActuator))
 ok('the broker daemon invokes only the mechanically bounded prepare mode and has no approval input',
   /awaiting discrete approval/.test(daemonSource) && /instance-broker-reply\.mjs/.test(daemonSource) &&
   /'--prepare'/.test(daemonSource) && !/'--approval'/.test(daemonSource))

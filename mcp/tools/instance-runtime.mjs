@@ -48,7 +48,7 @@ if (command === 'watch' || command === 'baseline') {
   // Either watcher exiting stops both, so the supervisor restarts a whole, not a half-deaf, watcher.
   if (command === 'watch' && manifest.buzz) {
     native = spawn(process.execPath, [tool('buzz-wake-watcher.mjs'), '--recipient', manifest.pubkey,
-      '--relay', manifest.buzz.relay, '--channels', manifest.buzz.channels.join(','),
+      '--relay', manifest.buzz.relay, '--channels', manifest.buzz.channels.join(','), '--owners', manifest.grantors.join(','),
       '--auth-socket', resolve(manifest.spoolDir, 'buzz-auth.sock'),
       '--marker-dir', manifest.spoolDir, '--marker-gid', String(manifest.brokerAdapterGid)],
     { env: { HOME: manifest.stateDir, PATH: process.env.PATH || '' }, stdio: 'inherit' })

@@ -14,6 +14,8 @@ import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest
 import { claimChannelSource, completeChannelSource } from './channel_source_dedup.mjs'
 import { claimBrokerLock } from './broker_lock.mjs'
 import { recordStatusAdmission } from './buzz_status.mjs'
+import { grantLookup, noGrantVerdict } from './grant_evidence.mjs'
+import { admissionLimit, hopFromJson } from './agent_limits.mjs'
 
 const die = message => { console.error(`instance-broker: ${message}`); process.exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -72,16 +74,22 @@ if (![0, 10].includes(result.status)) die(`attention failed (${result.status ?? 
 let report
 try { report = JSON.parse(result.stdout) } catch { die('attention returned invalid JSON') }
 if (report.me !== manifest.pubkey) die('credential does not match manifest pubkey')
+const lookup = grantLookup(resolve(manifest.stateDir, 'grant-relays.json'), report.relays)
 // No relay answer is not a denial. Policy is deliberately default-closed, but the opaque marker
 // must remain retryable so a transient relay outage cannot silently consume valid mail forever.
 if (!report.policyUsable) {
   try { renameSync(markerPath, pendingMarker) } catch (e) { die(`policy unavailable and marker could not be requeued: ${e.message}`) }
-  console.error('instance-broker: live grant policy unavailable; marker requeued')
+  console.error(`instance-broker: live grant policy unavailable (relays ${lookup.summary}); marker requeued`)
   process.exit(75)
 }
 const notifications = Array.isArray(report.notifications) ? report.notifications : []
 if ((!Array.isArray(report.actionable) || !report.actionable.length) && !notifications.length) {
   try { renameSync(markerPath, `${markerPath}.done`) } catch (e) { die(`cannot finalize terminal marker: ${e.message}`) }
+  const senders = [...new Set((Array.isArray(report.dataOnly) ? report.dataOnly : []).map(m => String(m?.from || '').slice(0, 8)))]
+    .filter(s => /^[0-9a-f]{8}$/.test(s))
+  console.error(`instance-broker: ${envelope.slice(0, 12)}… ${senders.length
+    ? `from ${senders.slice(0, 3).join(',')} holds no live task grant; heard as data only [${noGrantVerdict(lookup)}]`
+    : 'yielded no message for this identity'}`)
   process.exit(0)
 }
 
@@ -107,6 +115,7 @@ if (!report.actionable.length && notifications.length) {
     const marked = spawnSync(process.execPath, [attention, '--mark', '--json', '--envelope', envelope], { env, encoding: 'utf8', timeout: 60000 })
     if (marked.status !== 0) die(`attention watermark failed (${marked.status ?? 'signal'})`)
     try { renameSync(markerPath, `${markerPath}.done`) } catch (e) { die(`acknowledged but could not finalize marker: ${e.message}`) }
+    console.log(`instance-broker: ${envelope.slice(0, 12)}… delivered as channel activity from carrier ${String(n.carrier || '').slice(0, 8)}`)
     client.end()
   })
   // Do not fall through and manufacture an instruction receipt for a notification.
@@ -136,6 +145,18 @@ if (channelCarry && (!/^[0-9a-f]{64}$/.test(String(admission.carrier || '')) ||
   !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(String(admission.reply_channel || '')) ||
   !manifest.carriers.some(entry => entry.pubkey === admission.carrier && entry.channels.includes(admission.reply_channel)))) {
   die('channel carry lacks a verifiable carrier/source/channel binding')
+}
+// The brakes on agents directing agents (agent_limits.mjs), before the source is claimed: a carried
+// kind:9 brings its author's nvoy-hop, and every sender that is not a grantor has an hourly budget.
+// One signed source is one count, whichever path or envelope brings it.
+let limited
+try { limited = admissionLimit({ limits: manifest.agentLimits, grantors: manifest.grantors, sender: String(admission.from).toLowerCase(),
+  eventId: channelCarry ? String(admission.source_event).toLowerCase() : envelope, hop: channelCarry ? hopFromJson(admission.hop) : null,
+  path: resolve(manifest.stateDir, 'agent-limits', 'admissions.json') }) } catch (e) { die(`cannot read the admission counter: ${e.message}`) }
+if (limited) {
+  try { renameSync(markerPath, `${markerPath}.done`) } catch (e) { die(`cannot finalize limited marker: ${e.message}`) }
+  console.error(`instance-broker: ${envelope.slice(0, 12)}… ${limited}`)
+  process.exit(0)
 }
 const sourceIndex = resolve(manifest.stateDir, 'channel-source-admissions.jsonl')
 if (channelCarry) {
@@ -200,6 +221,7 @@ client.on('data', chunk => {
   // A completed marker stays as durable audit evidence but cannot be delivered a second time.
   // Rename is atomic on the single spool filesystem; a second broker sees no source marker.
   try { renameSync(markerPath, `${markerPath}.done`) } catch (e) { die(`acknowledged but could not finalize marker: ${e.message}`) }
+  console.log(`instance-broker: ${envelope.slice(0, 12)}… admitted from ${receipt.sender.slice(0, 8)} (${receipt.cap}, ${receipt.mode})`)
   // A carried mention names the original Buzz event. Where this identity is itself a member of that
   // channel, the status keeper may show 👀 on it, exactly as for a mention heard natively.
   if (channelCarry) {

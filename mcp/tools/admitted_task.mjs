@@ -9,7 +9,7 @@ const TASK_CAPS = new Set(['task', 'task+act'])
 
 export function validateAdmittedTask(record, { instance = '', scopeSubject = '', grantors = [], carriers = [], buzz = null } = {}) {
   if (!record || typeof record !== 'object' || Array.isArray(record)) throw new Error('admitted task must be an object')
-  const allowed = ['type', 'instance', 'envelope', 'messages', 'received_at', 'authority']
+  const allowed = ['type', 'instance', 'envelope', 'messages', 'received_at', 'authority', 'context']
   if (Object.keys(record).some(key => !allowed.includes(key)) || record.type !== 'admitted-task' ||
       (instance && record.instance !== instance) || !HEX64.test(String(record.envelope || '')) ||
       !Array.isArray(record.messages) || !record.messages.length || record.messages.length > 64) throw new Error('invalid admitted task')
@@ -19,14 +19,16 @@ export function validateAdmittedTask(record, { instance = '', scopeSubject = '',
         !HEX64.test(String(message.from || '')) || !Number.isFinite(Number(message.at)) ||
         typeof message.content !== 'string' || Buffer.byteLength(message.content) > 256 * 1024) throw new Error('invalid admitted message')
   }
+  if (record.context !== undefined) validateContext(record.context)
   if (record.authority == null) return { trustedInstruction: false }
   const a = record.authority
   const v1Keys = ['version', 'type', 'sender', 'grant_id', 'grantor', 'cap', 'scope_subject', 'policy_checked_at']
   const v2Keys = [...v1Keys, 'carrier', 'carrier_grant_id', 'carrier_grantor', 'source_event', 'reply_channel']
   // v3: heard natively on the Buzz relay. The author signed the channel message itself, so there is
   // no carrier — the source event IS the envelope, and the reply channel must be one the manifest
-  // gave this identity.
-  const v3Keys = [...v1Keys, 'source_event', 'reply_channel']
+  // gave this identity — or, marked `dm`, a Buzz DM, which no manifest can list, and then only for
+  // a message the owner wrote.
+  const v3Keys = [...v1Keys, 'source_event', 'reply_channel', 'dm']
   const authorityKeys = a?.version === 3 ? v3Keys : a?.version === 2 ? v2Keys : v1Keys
   if (!a || typeof a !== 'object' || Array.isArray(a) || Object.keys(a).some(key => !authorityKeys.includes(key)) ||
       ![1, 2, 3].includes(a.version) || a.type !== 'scoped-instruction' || !HEX64.test(String(a.sender || '')) ||
@@ -48,13 +50,35 @@ export function validateAdmittedTask(record, { instance = '', scopeSubject = '',
     }
   }
   if (a.version === 3) {
-    if (!HEX64.test(String(a.source_event || '')) || record.envelope !== a.source_event ||
-        !buzz?.channels?.includes(a.reply_channel) || record.messages.length !== 1 ||
+    const dm = a.dm === true && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(String(a.reply_channel || '')) &&
+      grantors.includes(a.sender) && !buzz?.channels?.includes(a.reply_channel)
+    if (!HEX64.test(String(a.source_event || '')) || record.envelope !== a.source_event || (a.dm !== undefined && !dm) ||
+        !buzz?.channels || (!dm && !buzz.channels.includes(a.reply_channel)) || record.messages.length !== 1 ||
         record.messages.some(message => message.event_id !== a.source_event || message.kind !== 9)) {
       throw new Error('invalid native Buzz authority')
     }
+    if (record.context && record.context.channel !== a.reply_channel) throw new Error('context is not from the channel the task came from')
   }
   return { trustedInstruction: true, authority: a }
+}
+
+// The conversation the broker read around a native Buzz task (#245). It is background for the
+// agent, never authority: nothing here is checked against a grant, so nothing here may instruct.
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+export function validateContext(context) {
+  if (!context || typeof context !== 'object' || Array.isArray(context) ||
+      Object.keys(context).some(key => !['channel', 'fetched_at', 'messages'].includes(key)) ||
+      !UUID.test(String(context.channel || '')) || !Number.isFinite(Number(context.fetched_at)) ||
+      !Array.isArray(context.messages) || context.messages.length > 40 ||
+      Buffer.byteLength(JSON.stringify(context)) > 96 * 1024) throw new Error('invalid task context')
+  for (const message of context.messages) {
+    if (!message || typeof message !== 'object' || Array.isArray(message) ||
+        Object.keys(message).some(key => !['from', 'name', 'at', 'content', 'event_id', 'reply_to'].includes(key)) ||
+        !HEX64.test(String(message.from || '')) || !HEX64.test(String(message.event_id || '')) ||
+        (message.reply_to !== undefined && !HEX64.test(String(message.reply_to))) ||
+        (message.name !== undefined && !/^[a-z0-9][a-z0-9._-]{0,31}$/i.test(String(message.name))) ||
+        !Number.isFinite(Number(message.at)) || typeof message.content !== 'string') throw new Error('invalid task context message')
+  }
 }
 
 export function validateDesktopDelivery(record, policy = {}) {

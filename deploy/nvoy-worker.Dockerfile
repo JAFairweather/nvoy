@@ -30,6 +30,9 @@ COPY mcp/package-lock.json mcp/package-lock.json
 RUN npm --prefix mcp ci --omit=dev --ignore-scripts
 
 COPY mcp/tools mcp/tools
+# The release this image is built from, which the channel servers tell the agent (agent_post.mjs).
+ARG NVOY_RELEASE_SHA=
+RUN printf '%s\n' "$NVOY_RELEASE_SHA" > RELEASE
 
 RUN useradd --uid 65532 --create-home --shell /usr/sbin/nologin nvoy \
  && mkdir -p /srv/nvoy/.codex \

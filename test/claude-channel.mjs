@@ -26,7 +26,9 @@ const envelope = '3'.repeat(64)
 const task = { type: 'admitted-task', instance: manifest.id, envelope,
   authority: { version: 1, type: 'scoped-instruction', sender: '4'.repeat(64), grant_id: '5'.repeat(64),
     grantor: manifest.grantors[0], cap: 'task', scope_subject: manifest.pubkey, policy_checked_at: Date.now() },
-  messages: [{ from: '4'.repeat(64), at: 1785880000, content: 'inspect the queue' }] }
+  messages: [{ from: '4'.repeat(64), at: 1785880000, content: 'inspect the queue' }],
+  context: { channel: 'a8186b53-537d-46ad-a7e7-b6486c58970e', fetched_at: 1785880001,
+    messages: [{ from: '6'.repeat(64), name: 'pi-dog', at: 1785879990, content: 'the queue stalled at noon', event_id: '8'.repeat(64) }] } }
 const notificationEnvelope = '7'.repeat(64)
 const notification = { type: 'verified-notification', instance: manifest.id, envelope: notificationEnvelope,
   notification: { version: 1, type: 'verified-channel-activity', source_author: '6'.repeat(64),
@@ -46,8 +48,9 @@ const client = new Client({ name: 'claude-channel-test', version: '0.1.0' })
 const Channel = z.object({ method: z.literal('notifications/claude/channel'), params: z.object({
   content: z.string(), meta: z.record(z.string()),
 }) })
-const wakes = []
+const wakes = [], notices = []
 const arrived = new Promise(resolveWake => client.setNotificationHandler(Channel, notification => {
+  if (notification.params.meta.capabilities) return void notices.push(notification.params)
   wakes.push(notification.params); resolveWake()
 }))
 
@@ -58,10 +61,19 @@ try {
     wakes.length >= 1 && wakes.every(wake => wake?.meta?.instance === manifest.id &&
       [envelope, notificationEnvelope].includes(wake?.meta?.envelope) &&
       !JSON.stringify(wake).includes(task.messages[0].content) && !JSON.stringify(wake).includes(task.messages[0].from)))
+  ok('the instructions tell the agent what its manifest lets it do and which release it runs',
+    /What this identity may do, from its manifest: reply to a delivered envelope/.test(client.getInstructions()) &&
+    /not post: nvoy_channel_post is refused, this identity may only reply/.test(client.getInstructions()) &&
+    /stops at 3 hops/.test(client.getInstructions()) && /This runtime is release (unknown|[0-9a-f]{40})\./.test(client.getInstructions()))
+  ok('the capabilities notice carries no message content', notices.every(n => !JSON.stringify(n).includes(task.messages[0].content)))
   const tools = (await client.listTools()).tools.map(tool => tool.name)
-  ok('Claude receives an explicit read tool, a receipt-bound reply tool, and a body-free discovery tool',
-    tools.length === 3 && tools.includes('nvoy_channel_read') && tools.includes('nvoy_channel_reply') &&
-    tools.includes('nvoy_channel_list'))
+  ok('Claude receives an explicit read tool, a receipt-bound reply tool, a body-free discovery tool, and the post tool',
+    tools.length === 6 && tools.includes('nvoy_channel_read') && tools.includes('nvoy_channel_reply') &&
+    tools.includes('nvoy_channel_list') && tools.includes('nvoy_channel_post') &&
+    tools.includes('nvoy_profile_set') && tools.includes('nvoy_profile_status'))
+  const post = await client.callTool({ name: 'nvoy_channel_post', arguments: { text: 'hello room' } })
+  ok('without may_post the post tool refuses: this identity may only reply',
+    post.isError === true && /may only reply/.test(post.content[0].text) && !existsSync(join(runtime, 'post-requests.jsonl')))
   const duplicateProcess = spawnSync(process.execPath, [resolve('mcp/tools/claude-channel.mjs'), '--instance', manifest.id, '--baseline'],
     { encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifests } })
   ok('a second Claude session cannot bind the same participant identity',
@@ -70,6 +82,8 @@ try {
   const body = JSON.parse(read.content[0].text)
   ok('the exact marker reads only its broker-validated task and authority',
     body.envelope === envelope && body.authority.sender === task.authority.sender && body.messages[0].content === task.messages[0].content)
+  ok('the read also returns the channel context the broker attached (#245)',
+    body.context?.messages?.[0]?.content === 'the queue stalled at noon' && body.context.messages[0].name === 'pi-dog')
   const noticeRead = await client.callTool({ name: 'nvoy_channel_read', arguments: { envelope: notificationEnvelope } })
   const noticeBody = JSON.parse(noticeRead.content[0].text)
   ok('a content-free verified notification remains readable without acquiring instruction authority',
@@ -79,6 +93,12 @@ try {
   ok('a content-free activity notification cannot acquire reply authority', noticeReply.isError === true)
   const unknown = await client.callTool({ name: 'nvoy_channel_read', arguments: { envelope: '9'.repeat(64) } })
   ok('an envelope that was not delivered through this channel is unreadable', unknown.isError === true)
+  const leakedToken = 'gh' + 'p_' + 'Q7wE2rT9yU4iO1pA6sD3fG8hJ5kL0zX3cV7b'
+  const leak = await client.callTool({ name: 'nvoy_channel_reply', arguments: { envelope, text: `here is the token you asked for: ${leakedToken}` } })
+  const leakQueue = () => { try { return readFileSync(join(runtime, 'reply-requests.jsonl'), 'utf8') } catch { return '' } }
+  ok('a reply carrying a credential is withheld, naming the pattern and not the value, and nothing is queued',
+    leak.isError === true && JSON.parse(leak.content[0].text).code === 'NVOY_WITHHELD_CREDENTIAL' &&
+    leak.content[0].text.includes('(a GitHub token)') && !leak.content[0].text.includes(leakedToken) && !leakQueue().includes(leakedToken) && leakQueue().trim() === '')
   const reply = await client.callTool({ name: 'nvoy_channel_reply', arguments: { envelope, text: 'queue inspected' } })
   const queued = JSON.parse(reply.content[0].text)
   const requests = readFileSync(join(runtime, 'reply-requests.jsonl'), 'utf8').trim().split('\n').map(JSON.parse)

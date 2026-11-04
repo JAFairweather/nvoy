@@ -10,6 +10,7 @@ import { resolve, dirname, relative, sep } from 'node:path'
 import { decode } from 'nostr-tools/nip19'
 import { codexThreadId as validCodexThreadId, localControlSocket } from './codex_app_server.mjs'
 import { normalizeBuzzRelay } from './buzz_native.mjs'
+import { DEFAULT_LIMITS } from './agent_limits.mjs'
 
 const die = message => { throw new Error(message) }
 const hex = value => String(value || '').toLowerCase()
@@ -191,6 +192,81 @@ export function readManifest(root, requestedId) {
     if (harness && refs.includes(harness.credentialRef)) die('wake_webhook references must not name the harness credential')
     wakeWebhook = Object.freeze({ urlRef: refs[0], headersRef: refs[1] })
   }
+  // The channel door carries the channel MCP over HTTPS for a harness host that cannot reach SSH
+  // (channel-https-door.mjs). Its one credential is the SHA-256 of a bearer token, and it joins the
+  // named Docker network of the reverse proxy that terminates TLS, so it publishes no host port.
+  let channelDoor = null
+  if (raw.channel_door != null) {
+    const tokenHashRef = String(raw.channel_door?.token_hash_ref || '')
+    const network = String(raw.channel_door?.network || '')
+    if (!tokenHashRef.startsWith('/etc/nvoy/credentials/') || resolve(tokenHashRef) !== tokenHashRef || /[\s\0]/.test(tokenHashRef)) die('channel_door requires token_hash_ref as an absolute path under /etc/nvoy/credentials')
+    if (!/^[a-z0-9][a-z0-9_.-]{0,63}$/i.test(network)) die('channel_door requires network, the reverse proxy\'s Docker network name')
+    if (brokerMode !== 'local' || deliveryMode !== 'notify_only' || workerEnabled) die('a channel_door requires a local-broker, worker-disabled notify_only manifest')
+    if ([keyRef, bunkerUriRef, bunkerClientRef, harness?.credentialRef, wakeWebhook?.urlRef, wakeWebhook?.headersRef].includes(tokenHashRef)) die('channel_door token_hash_ref must not name another credential')
+    channelDoor = Object.freeze({ tokenHashRef, network })
+  }
+  // An identity may only reply unless its owner opts it in to starting conversations: which of its
+  // Buzz channels, how many posts an hour, and the closed list of keys it may p-tag. A mention entry
+  // is a key, or { name, pubkey } so the agent can name who it means.
+  let mayPost = null
+  if (raw.may_post != null) {
+    const block = raw.may_post
+    if (typeof block !== 'object' || Array.isArray(block) || Object.keys(block).some(k => !['channels', 'per_hour', 'mention'].includes(k))) die('may_post takes only channels, per_hour and mention')
+    if (!buzz) die('may_post requires a buzz block')
+    if (brokerMode !== 'local' || deliveryMode !== 'notify_only' || workerEnabled) die('may_post requires a local-broker, worker-disabled notify_only manifest')
+    const channels = (Array.isArray(block.channels) ? block.channels : []).map(value => String(value || '').toLowerCase())
+    if (!channels.length || !channels.every(validChannel) || new Set(channels).size !== channels.length) die('may_post.channels requires distinct channel UUIDs')
+    if (!channels.every(c => buzz.channels.includes(c))) die('may_post.channels must be a subset of buzz.channels')
+    if (!Number.isInteger(block.per_hour) || block.per_hour < 1 || block.per_hour > 30) die('may_post.per_hour must be an integer from 1 to 30')
+    if (block.mention != null && !Array.isArray(block.mention)) die('may_post.mention must be a list')
+    const mention = (block.mention || []).map(entry => {
+      const named = entry && typeof entry === 'object' && !Array.isArray(entry)
+      if (named && Object.keys(entry).some(k => !['name', 'pubkey'].includes(k))) die('a may_post.mention entry is a pubkey or { name, pubkey }')
+      let pk
+      try { pk = toHex(named ? entry.pubkey : entry) } catch { pk = '' }
+      const name = named ? String(entry.name || '') : ''
+      if (!valid(pk) || (named && !/^[a-z0-9][a-z0-9._-]{0,31}$/i.test(name))) die('a may_post.mention entry is a pubkey or { name, pubkey }')
+      return Object.freeze({ pubkey: pk, name: name || null })
+    })
+    if (new Set(mention.map(m => m.pubkey)).size !== mention.length) die('may_post.mention pubkeys must be distinct')
+    const names = mention.filter(m => m.name).map(m => m.name.toLowerCase())
+    if (new Set(names).size !== names.length) die('may_post.mention names must be distinct')
+    mayPost = Object.freeze({ channels: Object.freeze(channels), perHour: block.per_hour, mention: Object.freeze(mention) })
+  }
+  let maySetProfile = null
+  if (raw.may_set_profile != null) {
+    const block = raw.may_set_profile
+    if (!block || typeof block !== 'object' || Array.isArray(block) ||
+        Object.keys(block).some(key => !['kind', 'pubkey', 'grant_id', 'per_day', 'picture_hosts'].includes(key))) die('may_set_profile has unknown fields')
+    if (!buzz) die('may_set_profile requires a buzz block')
+    if (brokerMode !== 'local' || deliveryMode !== 'notify_only' || workerEnabled) die('may_set_profile requires a local-broker, worker-disabled notify_only manifest')
+    const scopedPubkey = toHex(block.pubkey)
+    if (block.kind !== 0 || scopedPubkey !== pubkey) die('may_set_profile must scope kind 0 to the manifest pubkey')
+    if (!valid(String(block.grant_id || '').toLowerCase())) die('may_set_profile.grant_id must be a 64-hex identifier')
+    const perDay = block.per_day ?? 1
+    if (!Number.isInteger(perDay) || perDay < 1 || perDay > 24) die('may_set_profile.per_day must be an integer from 1 to 24')
+    const pictureHosts = block.picture_hosts ?? ['nave.pub']
+    if (!Array.isArray(pictureHosts) || !pictureHosts.length || !pictureHosts.every(host =>
+      typeof host === 'string' && /^[a-z0-9][a-z0-9.-]*[a-z0-9]$/.test(host) && !host.includes('..')) ||
+      new Set(pictureHosts).size !== pictureHosts.length) die('may_set_profile.picture_hosts requires distinct DNS hosts')
+    maySetProfile = Object.freeze({ kind: 0, pubkey, grantId: block.grant_id.toLowerCase(), perDay,
+      pictureHosts: Object.freeze([...pictureHosts]) })
+  }
+  // The agent card (agent_card.mjs): the broker publishes what this manifest allows, signed by the
+  // agent's own key. Off until the owner turns it on, since the agent's Bunker must allow kind 30078.
+  const agentCard = raw.agent_card ?? false
+  if (typeof agentCard !== 'boolean') die('agent_card must be true or false')
+  if (agentCard && (!buzz || brokerMode !== 'local')) die('agent_card requires a buzz block and a local broker')
+  // The brakes on agent-to-agent traffic (agent_limits.mjs). Always in force; the block only tunes them.
+  let agentLimits = DEFAULT_LIMITS
+  if (raw.agent_limits != null) {
+    const block = raw.agent_limits
+    if (typeof block !== 'object' || Array.isArray(block) || Object.keys(block).some(k => !['max_hops', 'per_sender_per_hour'].includes(k))) die('agent_limits takes only max_hops and per_sender_per_hour')
+    const maxHops = block.max_hops ?? DEFAULT_LIMITS.maxHops, perSenderPerHour = block.per_sender_per_hour ?? DEFAULT_LIMITS.perSenderPerHour
+    if (!Number.isInteger(maxHops) || maxHops < 1 || maxHops > 10) die('agent_limits.max_hops must be an integer from 1 to 10')
+    if (!Number.isInteger(perSenderPerHour) || perSenderPerHour < 1 || perSenderPerHour > 120) die('agent_limits.per_sender_per_hour must be an integer from 1 to 120')
+    agentLimits = Object.freeze({ maxHops, perSenderPerHour })
+  }
   if (brokerMode === 'remote') {
     if (!['codex_app_server', 'macos_desktop'].includes(deliveryMode) || codexTransport !== 'local_control_socket') die('a remote broker is valid only for an exact local Codex Desktop binding')
     if (!/^[a-z_][a-z0-9_-]{0,31}@[a-z0-9.-]+$/i.test(sshTarget) || !sshIdentityFile.startsWith('/') ||
@@ -199,7 +275,7 @@ export function readManifest(root, requestedId) {
     }
   }
   return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, carriers: Object.freeze(carriers), buzz, relays, stateDir, runtimeDir, spoolDir,
-    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, adapterContainer, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath, codexAppBundleId, codexProjectLabel, codexChatLabel, codexUiDriver, harness, wakeWebhook,
+    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, adapterContainer, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath, codexAppBundleId, codexProjectLabel, codexChatLabel, codexUiDriver, harness, wakeWebhook, channelDoor, mayPost, maySetProfile, agentLimits, agentCard,
     sshTarget, sshIdentityFile, sshKnownHostsFile, sshKnownHostsSha256, approvalEndpoint: approvalEndpoint.replace(/\/$/, '') })
 }
 

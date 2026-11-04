@@ -4,11 +4,13 @@
 // crash-left `.inflight` markers are requeued at boot and are harmless because the adapter queue
 // deduplicates on envelope before ACKing.
 
-import { readdirSync, renameSync, readFileSync, lstatSync } from 'node:fs'
+import { appendFileSync, readdirSync, renameSync, readFileSync, lstatSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
-import { isTerminalReplyFailure, loadTerminalReplyIds, recordTerminalReply } from './reply_retry.mjs'
+import { isTerminalReplyFailure, loadTerminalReplyIds, recordTerminalReply, terminalReplyReason } from './reply_retry.mjs'
+import { childVerdict } from './broker_verdict.mjs'
+import { finishedProfileRequests, PROFILE_PUBLIC_RETRY_EXIT } from './agent_profile.mjs'
 
 const die = m => { console.error(`instance-broker-daemon: ${m}`); process.exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -32,6 +34,26 @@ const childEnv = { PATH: process.env.PATH || '', NVOY_INSTANCE_ROOT: root, NVOY_
 const retryAfter = new Map()
 const proposalRetryAfter = new Map()
 const announcedProposals = new Set()
+// Agent-initiated posts (nvoy_channel_post). A refusal by the manifest or the hourly cap is final:
+// recorded by id, with no content, so the queue is not re-proposed every tick or after a restart.
+const terminalPostsPath = resolve(manifest.stateDir, 'terminal-posts.jsonl')
+const postDone = new Set()
+try {
+  for (const line of readFileSync(terminalPostsPath, 'utf8').split('\n')) {
+    try { const x = JSON.parse(line); if (x?.type === 'terminal-post' && /^[0-9a-f]{32}$/.test(String(x.id))) postDone.add(x.id) } catch { /* partial line */ }
+  }
+} catch (e) { if (e.code !== 'ENOENT') die(`cannot load terminal post log: ${e.message}`) }
+const isTerminalPost = stderr => /post refused:|post request has an invalid|post record does not bind/.test(stderr)
+const profileDone = new Set()
+const profileRetryAfter = new Map()
+let profileActive = null
+// Public relays still pending are tried again on a slow clock, across restarts.
+const PROFILE_PUBLIC_RETRY_MS = 10 * 60 * 1000
+if (manifest.maySetProfile) {
+  try {
+    for (const request of finishedProfileRequests(readFileSync(resolve(manifest.runtimeDir, 'profile-results.jsonl'), 'utf8'))) profileDone.add(request)
+  } catch (error) { if (error.code !== 'ENOENT') die(`cannot load profile results: ${error.message}`) }
+}
 
 function recover() {
   let names = []
@@ -67,10 +89,15 @@ function drain() {
     const args = item.native ? [nativeBroker, 'deliver', '--instance', manifest.id, '--event', item.envelope]
       : [broker, 'deliver', '--instance', manifest.id, '--envelope', item.envelope]
     const r = spawnSync(process.execPath, args, { env: childEnv, encoding: 'utf8', timeout: 90000 })
+    const verdict = childVerdict(r)
     if (r.status !== 0) {
       retryAfter.set(key, Date.now() + 5000)
-      console.error(`instance-broker-daemon: ${item.envelope.slice(0, 12)}… held for retry: ${String(r.stderr || '').trim()}`)
-    } else retryAfter.delete(key)
+      console.error(`instance-broker-daemon: ${item.envelope.slice(0, 12)}… held for retry: ${verdict.join(' | ') || `exit ${r.status ?? 'signal'}: ${String(r.stderr || '').trim().slice(0, 240)}`}`)
+    } else {
+      retryAfter.delete(key)
+      // The funnel's only record of what became of a heard message: admitted, or why not.
+      for (const line of verdict) console.log(`instance-broker-daemon: ${line}`)
+    }
   }
   // AD-12: adapter/worker output is a proposal, never standing authority to sign. The daemon may
   // announce a queued proposal, but it must not invoke the keyed reply actuator. A separate,
@@ -96,7 +123,7 @@ function drain() {
           if (isTerminalReplyFailure(stderr)) {
             try {
               if (recordTerminalReply(terminalRepliesPath, terminalReplyIds, request, stderr))
-                console.error(`instance-broker-daemon: ${source} reply proposal ${request.slice(0, 12)}… terminal — its receipt is no longer live`)
+                console.error(`instance-broker-daemon: ${source} reply proposal ${request.slice(0, 12)}… terminal (${terminalReplyReason(stderr)})`)
             } catch (e) { console.error(`instance-broker-daemon: cannot record terminal reply ${request.slice(0, 12)}…: ${e.message || e}`) }
             continue
           }
@@ -119,7 +146,7 @@ function drain() {
             if (isTerminalReplyFailure(stderr)) {
               try {
                 if (recordTerminalReply(terminalRepliesPath, terminalReplyIds, request, stderr))
-                  console.error(`instance-broker-daemon: ${source} reply ${request.slice(0, 12)}… terminal — its receipt is no longer live`)
+                  console.error(`instance-broker-daemon: ${source} reply ${request.slice(0, 12)}… terminal (${terminalReplyReason(stderr)})`)
               } catch (e) { console.error(`instance-broker-daemon: cannot record terminal reply ${request.slice(0, 12)}…: ${e.message || e}`) }
             } else {
               proposalRetryAfter.set(key, Date.now() + 5000)
@@ -137,6 +164,72 @@ function drain() {
     } catch (e) { if (e.code !== 'ENOENT') console.error(`instance-broker-daemon: ${source} reply queue unavailable: ${e.message}`) }
   }
 }
+function drainPosts() {
+  const queue = resolve(manifest.runtimeDir, 'post-requests.jsonl')
+  let ids
+  try {
+    const st = lstatSync(queue)
+    if (!st.isFile() || st.isSymbolicLink()) throw new Error('post queue is not a regular file')
+    ids = new Set(readFileSync(queue, 'utf8').split('\n').flatMap(line => { try { const x = JSON.parse(line); return /^[0-9a-f]{32}$/.test(String(x?.id)) ? [x.id] : [] } catch { return [] } }))
+  } catch (e) { if (e.code !== 'ENOENT') console.error(`instance-broker-daemon: post queue unavailable: ${e.message}`); return }
+  for (const request of ids) {
+    const key = `post:${request}`
+    if (postDone.has(request) || (proposalRetryAfter.get(key) || 0) > Date.now()) continue
+    const r = spawnSync(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-post.mjs'),
+      '--instance', manifest.id, '--request', request], { env: childEnv, encoding: 'utf8', timeout: 90000 })
+    const stderr = String(r.stderr || '').trim()
+    if (r.status === 0) { postDone.add(request); proposalRetryAfter.delete(key); if (/^instance-broker-post: posted/.test(r.stdout)) console.log(r.stdout.trim()); continue }
+    if (isTerminalPost(stderr)) {
+      postDone.add(request)
+      try { appendFileSync(terminalPostsPath, JSON.stringify({ version: 1, type: 'terminal-post', id: request, at: Date.now() }) + '\n', { mode: 0o600 }) }
+      catch (e) { console.error(`instance-broker-daemon: cannot record terminal post ${request.slice(0, 12)}…: ${e.message}`) }
+      console.error(`instance-broker-daemon: post ${request.slice(0, 12)}… terminal: ${stderr.replace(/^instance-broker-post: /, '')}`)
+      continue
+    }
+    proposalRetryAfter.set(key, Date.now() + 5000)
+    console.error(`instance-broker-daemon: post ${request.slice(0, 12)}… held for retry: ${stderr}`)
+  }
+}
+function drainProfiles() {
+  if (profileActive) return
+  let ids
+  try {
+    const path = resolve(manifest.runtimeDir, 'profile-requests.jsonl'), stat = lstatSync(path)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 64 * 1024 * 1024) throw new Error('profile queue is invalid')
+    ids = new Set(readFileSync(path, 'utf8').split('\n').flatMap(line => {
+      try { const row = JSON.parse(line); return /^[0-9a-f]{32}$/.test(String(row?.id)) ? [row.id] : [] } catch { return [] }
+    }))
+  } catch (error) { console.error(`instance-broker-daemon: profile queue unavailable: ${error.message}`); return }
+  for (const request of ids) {
+    if (profileDone.has(request) || (profileRetryAfter.get(request) || 0) > Date.now()) continue
+    const child = spawn(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-profile.mjs'),
+      '--instance', manifest.id, '--request', request], { env: childEnv, stdio: ['ignore', 'ignore', 'pipe'] })
+    profileActive = request
+    let stderr = '', settled = false
+    child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-240) })
+    const timeout = setTimeout(() => child.kill('SIGKILL'), 90000)
+    const complete = (code, error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      profileActive = null
+      if (code === 0) {
+        profileDone.add(request)
+        profileRetryAfter.delete(request)
+        console.log(`instance-broker-daemon: profile ${request.slice(0, 12)}… complete`)
+      } else if (code === PROFILE_PUBLIC_RETRY_EXIT) {
+        profileRetryAfter.set(request, Date.now() + PROFILE_PUBLIC_RETRY_MS)
+        console.log(`instance-broker-daemon: profile ${request.slice(0, 12)}… on Buzz; public relays pending, retrying in 10 min`)
+      } else {
+        profileRetryAfter.set(request, Date.now() + 5000)
+        console.error(`instance-broker-daemon: profile ${request.slice(0, 12)}… held for retry: ${String(error?.message || stderr || `exit ${code}`).trim().slice(0, 240)}`)
+      }
+    }
+    child.on('error', error => complete(null, error))
+    child.on('exit', code => complete(code))
+    break
+  }
+}
 // The keyless Buzz watcher can log in only through this oracle, and the status keeper puts the
 // native 👀/💬 on admitted Buzz messages. Both are supervised here, beside the drain, so they run as
 // the broker and hold the same credential; a crash is restarted with backoff.
@@ -150,9 +243,21 @@ function supervise(script, label, delay = 1000) {
     setTimeout(() => supervise(script, label, next), next).unref?.()
   })
 }
+// The agent card is checked at start and hourly; the child re-signs only when the card is due.
+function publishCard() {
+  const child = spawn(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-card.mjs'), '--instance', manifest.id],
+    { env: childEnv, stdio: ['ignore', 'inherit', 'inherit'] })
+  const timeout = setTimeout(() => child.kill('SIGKILL'), 90000)
+  const complete = code => { clearTimeout(timeout); if (code !== 0) console.error(`instance-broker-daemon: agent card unconfirmed (${code ?? 'signal'}); next check in an hour`) }
+  child.on('error', () => complete(null))
+  child.on('exit', complete)
+}
 recover()
+if (manifest.agentCard) { publishCard(); setInterval(publishCard, 60 * 60 * 1000) }
 if (manifest.buzz) supervise('instance-broker-auth.mjs', 'AUTH oracle')
 if (manifest.buzz?.statusReactions) supervise('instance-broker-status.mjs', 'status keeper')
 drain()
 setInterval(drain, 1000)
+if (manifest.mayPost) { drainPosts(); setInterval(drainPosts, 1000) }
+if (manifest.maySetProfile) { drainProfiles(); setInterval(drainProfiles, 1000) }
 console.log(`instance-broker-daemon: draining ${manifest.id}`)

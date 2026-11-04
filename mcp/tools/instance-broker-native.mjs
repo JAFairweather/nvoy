@@ -9,6 +9,10 @@
 //
 // Admission shares the channel-source index with carried mail, so one signed message heard both
 // natively and through a carrier is admitted once, whichever path gets there first.
+//
+// A message in one of this identity's DMs is held to a narrower rule: its author must be the owner
+// (a manifest grantor), whatever grant anyone else holds. Which channels are DMs is read here, from
+// the relay's own membership notices, never taken from the watcher's marker.
 
 import { readFileSync, lstatSync, renameSync, mkdirSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -18,8 +22,12 @@ import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest
 import { claimChannelSource, completeChannelSource } from './channel_source_dedup.mjs'
 import { claimBrokerLock } from './broker_lock.mjs'
 import { brokerSigner } from './broker_signer.mjs'
-import { nativeMention, openBuzzSession } from './buzz_native.mjs'
+import { channelContext, contextFilters, dmChannels, dmNoticeFilter, nativeGrant, nativeMention, openBuzzSession } from './buzz_native.mjs'
 import { recordStatusAdmission } from './buzz_status.mjs'
+import { grantLookup, noGrantVerdict } from './grant_evidence.mjs'
+import { admissionLimit, hopOf } from './agent_limits.mjs'
+import { validateContext } from './admitted_task.mjs'
+import { recordMentionGrants } from './agent_post.mjs'
 
 const HEX64 = /^[0-9a-f]{64}$/
 let signer
@@ -65,16 +73,36 @@ let me
 try { me = String(await signer.getPublicKey()).toLowerCase() } catch (e) { requeue(`signer unavailable: ${e.message}`) }
 if (me !== manifest.pubkey) die('signer does not match manifest pubkey')
 
-// 1. The event, read as ourselves. Only what the relay returns under this id counts.
-let source
+// 1. The event, read as ourselves. Only what the relay returns under this id counts. On the same
+// login, the conversation around it (#245): best effort, so a failed read costs the context, never the task.
+let source, dms, context = null
 try {
   const session = await openBuzzSession({ relay: manifest.buzz.relay, signer })
-  try { source = (await session.fetch({ ids: [eventId], kinds: [9], '#h': manifest.buzz.channels })).find(ev => ev?.id === eventId) }
-  finally { session.close() }
+  try {
+    dms = dmChannels(await session.fetch(dmNoticeFilter(me)), { me }).filter(ch => !manifest.buzz.channels.includes(ch))
+    source = (await session.fetch({ ids: [eventId], kinds: [9], '#h': [...manifest.buzz.channels, ...dms] })).find(ev => ev?.id === eventId)
+    const filters = source && contextFilters(source)
+    if (filters) {
+      const names = Object.fromEntries((manifest.mayPost?.mention || []).filter(m => m.name).map(m => [m.pubkey, m.name]))
+      // One REQ per filter, so a relay that refuses the thread query still yields the recent messages.
+      const events = []
+      for (const filter of filters) {
+        try { events.push(...await session.fetch(filter)) }
+        catch (e) { console.error(`instance-broker-native: ${eventId.slice(0, 12)}… context read failed: ${e.message}`) }
+      }
+      context = channelContext(events, { source, names })
+      // The adapter refuses a task whose context it cannot accept, and a refused task is retried
+      // forever; so a context that would not pass is dropped here rather than sent.
+      try { validateContext(context) } catch (e) { context = null; console.error(`instance-broker-native: ${eventId.slice(0, 12)}… context dropped: ${e.message}`) }
+    }
+  } finally { session.close() }
 } catch (e) { requeue(`Buzz relay unavailable: ${e.message}`) }
 if (!source) finish('is not stored in any configured channel')
-const mention = nativeMention(source, { me, channels: manifest.buzz.channels })
+const mention = nativeMention(source, { me, channels: [...manifest.buzz.channels, ...dms] })
 if (!mention) finish('is not a signed mention of this identity')
+const dm = dms.includes(mention.channel)
+// Decided before any grant is consulted: no grant could change the answer.
+if (dm && !manifest.grantors.includes(mention.author)) finish(`DM author ${mention.author.slice(0, 8)} is not this identity's owner; heard as data only`)
 
 // 2. Live policy: does the AUTHOR hold a task grant for this identity, right now?
 const attention = resolve(new URL('.', import.meta.url).pathname, 'attention.mjs')
@@ -85,10 +113,19 @@ if (checked.status !== 0) requeue(`policy check failed (${checked.status ?? 'sig
 let policy
 try { policy = JSON.parse(checked.stdout) } catch { requeue('policy check returned invalid JSON') }
 if (policy.me !== me) die('policy was evaluated for a different identity')
-if (!policy.policyUsable) requeue('live grant policy unavailable')
-const grants = (Array.isArray(policy.grants) ? policy.grants : []).filter(g => g?.pubkey === mention.author && manifest.grantors.includes(g.grantor))
-const grant = grants.find(g => g.cap === 'task+act') || grants.find(g => g.cap === 'task')
-if (!grant || !HEX64.test(String(grant.grant_id || ''))) finish('author holds no live task grant; heard as data only')
+const lookup = grantLookup(resolve(manifest.stateDir, 'grant-relays.json'), policy.relays)
+if (!policy.policyUsable) requeue(`live grant policy unavailable (relays ${lookup.summary})`)
+recordMentionGrants(manifest, policy)
+const grant = nativeGrant({ author: mention.author, dm, grants: policy.grants, grantors: manifest.grantors })
+if (!grant) finish(`author ${mention.author.slice(0, 8)} holds no live task grant; heard as data only [${noGrantVerdict(lookup)}]`)
+
+// 2b. The brakes on agents directing agents: a broker-signed chain past max_hops, or a non-grantor
+// sender past its hourly budget, is terminal. The words stay unread.
+const hop = hopOf(source)
+let limited
+try { limited = admissionLimit({ limits: manifest.agentLimits, grantors: manifest.grantors, sender: mention.author, eventId, hop,
+  path: resolve(manifest.stateDir, 'agent-limits', 'admissions.json') }) } catch (e) { die(`cannot read the admission counter: ${e.message}`) }
+if (limited) finish(limited)
 
 // 3. One signed message, one admission — across native and carried paths alike.
 const sourceIndex = resolve(manifest.stateDir, 'channel-source-admissions.jsonl')
@@ -96,14 +133,14 @@ let claim
 try { claim = claimChannelSource(sourceIndex, eventId, eventId) } catch (e) { die(`cannot claim channel source: ${e.message}`) }
 if (!claim.accepted) finish('was already admitted through another path')
 
-// 4. The receipt the reply actuator will require. It records where a reply threads, so the reply
-// needs no second read of the source.
+// 4. The receipt the reply actuator will require. It records where a reply threads, and the hop it
+// continues, so the reply needs no second read of the source.
 const marked = marker => (source.tags || []).find(t => t?.[0] === 'e' && t[3] === marker && HEX64.test(String(t[1])))?.[1]
 const admittedAt = Date.now()
 const receipt = { version: 3, mode: 'buzz-native', instance: manifest.id, broker: me, envelope: eventId,
   sender: mention.author, grant_id: grant.grant_id, grantor: grant.grantor, cap: grant.cap,
   source_event: eventId, reply_channel: mention.channel, reply_root: marked('root') || marked('reply') || eventId,
-  admitted_at: admittedAt, expires_at: admittedAt + 5 * 60 * 1000 }
+  hop: Number.isSafeInteger(hop) ? hop : null, admitted_at: admittedAt, expires_at: admittedAt + 5 * 60 * 1000, ...(dm ? { dm: true } : {}) }
 const receiptDir = resolve(manifest.stateDir, 'receipts')
 try {
   mkdirSync(receiptDir, { recursive: true, mode: 0o700 })
@@ -115,9 +152,10 @@ try {
 // 5. Hand the admitted task to the keyless adapter, and finish only on its acknowledgement.
 const authority = { version: 3, type: 'scoped-instruction', sender: receipt.sender, grant_id: receipt.grant_id,
   grantor: receipt.grantor, cap: receipt.cap, scope_subject: me, policy_checked_at: admittedAt,
-  source_event: eventId, reply_channel: receipt.reply_channel }
+  source_event: eventId, reply_channel: receipt.reply_channel, ...(dm ? { dm: true } : {}) }
 const payload = JSON.stringify({ type: 'admitted-task', instance: manifest.id, envelope: eventId, authority,
-  messages: [{ from: mention.author, at: source.created_at, content: String(source.content), event_id: eventId, kind: 9 }] }) + '\n'
+  messages: [{ from: mention.author, at: source.created_at, content: String(source.content), event_id: eventId, kind: 9 }],
+  ...(context?.messages.length ? { context } : {}) }) + '\n'
 const client = net.createConnection(resolve(manifest.runtimeDir, 'adapter.sock'))
 const timer = setTimeout(() => { client.destroy(); die('adapter acknowledgement timed out') }, 15000)
 client.on('error', e => { clearTimeout(timer); die(`adapter socket unavailable: ${e.message}`) })

@@ -19,11 +19,16 @@ import WebSocket from 'ws'
 import net from 'node:net'
 import { chmodSync, chownSync, unlinkSync } from 'node:fs'
 import { verifyEvent } from 'nostr-tools/pure'
+import { HOP_TAG } from './agent_limits.mjs'
+export { nativeGrant } from './admission.mjs'
 
 const HEX64 = /^[0-9a-f]{64}$/
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '[::1]'])
 export const CHANNEL_KINDS = Object.freeze([9, 40002])
+// Relay-signed membership notices: 44100 added, 44101 removed (block/buzz NOSTR.md "Membership
+// Notifications"). They carry no channel scope, so they are the one stream read without #h.
+export const MEMBERSHIP_KINDS = Object.freeze([44100, 44101])
 // nostr-tools caches a passed verification on the event object under a symbol, and object spread
 // copies it — so a tampered copy of a verified event would verify. Check a clean copy of the fields.
 const verified = (ev, verify = verifyEvent) => {
@@ -68,17 +73,27 @@ export function checkAuthTemplate(ev, { relay, now = Math.floor(Date.now() / 100
 
 // A reply that threads the way Buzz clients do: root = the parent's root marker, else its reply
 // marker, else the parent itself. The mention travels as a p tag — Buzz never resolves @text, so
-// a reply without it reaches no one.
-export function channelReply({ channel, parent, content, now = Math.floor(Date.now() / 1000) }) {
+// a reply without it reaches no one. `hop` is the parent's nvoy-hop + 1 (agent_limits.mjs).
+export function channelReply({ channel, parent, content, hop = 1, mentions = [], now = Math.floor(Date.now() / 1000) }) {
   if (!validChannel(channel)) throw new Error('channel must be a UUID')
   if (!parent || !HEX64.test(String(parent.id)) || !HEX64.test(String(parent.pubkey))) throw new Error('reply needs the verified parent event')
   if (typeof content !== 'string' || !content.trim()) throw new Error('empty reply')
+  if (!Number.isSafeInteger(hop) || hop < 1) throw new Error('hop must be a positive integer')
+  if (!Array.isArray(mentions) || !mentions.every(p => HEX64.test(String(p))) || new Set(mentions).size !== mentions.length) throw new Error('mentions must be distinct hex pubkeys')
   const marked = marker => (parent.tags || []).find(t => t?.[0] === 'e' && t[3] === marker && HEX64.test(String(t[1])))?.[1]
   const root = marked('root') || marked('reply') || parent.id
   const tags = [['h', channel]]
   if (root !== parent.id) tags.push(['e', root, '', 'root'])
-  tags.push(['e', parent.id, '', 'reply'], ['p', parent.pubkey])
+  tags.push(['e', parent.id, '', 'reply'], ['p', parent.pubkey], ...mentions.filter(p => p !== parent.pubkey).map(p => ['p', p]), [HOP_TAG, String(hop)])
   return { kind: 9, created_at: now, content, tags }
+}
+
+// A conversation the identity starts: top level, so no e tags, and hop 1. Each mention is a p tag.
+export function channelPost({ channel, content, mentions = [], now = Math.floor(Date.now() / 1000) }) {
+  if (!validChannel(channel)) throw new Error('channel must be a UUID')
+  if (typeof content !== 'string' || !content.trim()) throw new Error('empty post')
+  if (!Array.isArray(mentions) || !mentions.every(p => HEX64.test(String(p))) || new Set(mentions).size !== mentions.length) throw new Error('mentions must be distinct hex pubkeys')
+  return { kind: 9, created_at: now, content, tags: [['h', channel], ...mentions.map(p => ['p', p]), [HOP_TAG, '1']] }
 }
 
 // Is this a message addressed to `me` in one of `channels`? Returns the facts admission needs,
@@ -91,6 +106,69 @@ export function nativeMention(ev, { me, channels, now = Math.floor(Date.now() / 
   if (![...tagValues(ev, 'p'), ...tagValues(ev, 'mention')].includes(me)) return null
   if (!verified(ev, verify)) return null
   return { channel: h[0], author: ev.pubkey, event_id: ev.id, created_at: ev.created_at }
+}
+
+// The conversation around an admitted message, so the agent can follow the room it was asked in
+// (#245). Background only: context carries no authority, whoever wrote it. One fetch asks for the
+// channel's last messages before the source, the thread's root, and the thread's replies.
+export const CONTEXT_LIMIT = 30
+const CONTEXT_MESSAGE_BYTES = 4000, CONTEXT_BYTES = 48 * 1024
+const threadRoot = ev => {
+  const marked = marker => (ev.tags || []).find(t => t?.[0] === 'e' && t[3] === marker && HEX64.test(String(t[1])))?.[1]
+  return marked('root') || marked('reply') || ev.id
+}
+export function contextFilters(source) {
+  const h = tagValues(source, 'h')
+  if (h.length !== 1 || !validChannel(h[0]) || !Number.isSafeInteger(source.created_at)) return null
+  const root = threadRoot(source)
+  return [{ kinds: [9], '#h': h, until: source.created_at, limit: CONTEXT_LIMIT + 1 },
+    ...(root !== source.id ? [{ kinds: [9], '#h': h, ids: [root] }] : []),
+    { kinds: [9], '#h': h, '#e': [root] }]
+}
+export function channelContext(events, { source, names = {}, limit = CONTEXT_LIMIT, verify = verifyEvent, now = Math.floor(Date.now() / 1000) }) {
+  const [channel] = tagValues(source, 'h'), root = threadRoot(source), byId = new Map()
+  for (const ev of Array.isArray(events) ? events : []) {
+    if (ev?.kind !== 9 || ev.id === source.id || byId.has(ev.id) || !HEX64.test(String(ev.id)) || !HEX64.test(String(ev.pubkey)) ||
+        !Number.isSafeInteger(ev.created_at) || ev.created_at > source.created_at || typeof ev.content !== 'string') continue
+    const h = tagValues(ev, 'h')
+    if (h.length !== 1 || h[0] !== channel || !verified(ev, verify)) continue
+    byId.set(ev.id, ev)
+  }
+  // The thread first, then the most recent channel messages, until the count or byte budget is spent.
+  const inThread = ev => ev.id === root || threadRoot(ev) === root
+  const ranked = [...byId.values()].sort((a, b) => (inThread(b) - inThread(a)) || (b.created_at - a.created_at))
+  const kept = []
+  let bytes = 0
+  for (const ev of ranked) {
+    if (kept.length >= limit) break
+    let content = ev.content
+    if (Buffer.byteLength(content) > CONTEXT_MESSAGE_BYTES) content = `${Buffer.from(content).subarray(0, CONTEXT_MESSAGE_BYTES).toString().replace(/�+$/, '')}…`
+    if (bytes + Buffer.byteLength(content) > CONTEXT_BYTES) break
+    bytes += Buffer.byteLength(content)
+    const replyTo = (ev.tags || []).find(t => t?.[0] === 'e' && t[3] === 'reply' && HEX64.test(String(t[1])))?.[1]
+    const name = names[ev.pubkey]
+    kept.push({ from: ev.pubkey, ...(name ? { name } : {}), at: ev.created_at, content, event_id: ev.id, ...(replyTo ? { reply_to: replyTo } : {}) })
+  }
+  return { channel, fetched_at: now, messages: kept.sort((a, b) => a.at - b.at) }
+}
+
+// A Buzz DM is a channel like any other — kind:9 with an h tag, and clients p-tag every participant
+// — so what makes it a DM is its channel type, `dm`. The relay stamps that type as the first t tag
+// on the channel's 39000 and on every 44100/44101 notice about it, and a client cannot submit a
+// notice of its own (block/buzz NOSTR.md, NIP-CL). The relay also refuses a notice filter whose #p
+// is anyone but the reader, so this one asks only about `me`.
+export const dmNoticeFilter = me => ({ kinds: [...MEMBERSHIP_KINDS], '#p': [me], '#t': ['dm'] })
+
+// The DM channels `me` is in now: the newest signed notice for each channel decides, and a removal
+// stamped in the same second as an add wins, so a tie leaves the identity listening to less.
+export function dmChannels(notices, { me, verify = verifyEvent }) {
+  const latest = new Map()
+  const usable = (Array.isArray(notices) ? notices : []).filter(ev => MEMBERSHIP_KINDS.includes(ev?.kind) &&
+    Number.isSafeInteger(ev.created_at) && tagValues(ev, 'p').includes(me) && tagValues(ev, 't')[0] === 'dm' &&
+    tagValues(ev, 'h').length === 1 && validChannel(tagValues(ev, 'h')[0]) && verified(ev, verify))
+  usable.sort((a, b) => a.created_at - b.created_at || a.kind - b.kind)
+  for (const ev of usable) latest.set(tagValues(ev, 'h')[0], ev.kind === MEMBERSHIP_KINDS[0])
+  return [...latest].filter(([, member]) => member).map(([channel]) => channel).sort()
 }
 
 // One authenticated connection. `signer` is { getPublicKey(), signEvent(template) }; the pubkey
@@ -138,7 +216,14 @@ export async function openBuzzSession({ relay, signer, timeoutMs = 10000, pingMs
   // a timer behind when send throws on a closed socket — one that later rejects with no one listening.
   const sendAndAwaitOk = (frame, id) => { send(frame); return bounded(new Promise((resolve, reject) => waiters.set(id, { resolve, reject })), 'relay OK') }
   const close = () => { closedWith ??= 'session closed'; try { ws.close() } catch { /* already gone */ } }
-  const needsChannels = filters => !filters.length || filters.some(f => !Array.isArray(f?.['#h']) || !f['#h'].length || !f['#h'].every(validChannel))
+  // A membership-notice filter is the one exception, and only for our own notices.
+  const notices = f => Array.isArray(f?.kinds) && f.kinds.length && f.kinds.every(k => MEMBERSHIP_KINDS.includes(k)) &&
+    Array.isArray(f['#p']) && f['#p'].length === 1 && f['#p'][0] === me && f['#h'] === undefined
+  const ownProfile = f => Array.isArray(f?.kinds) && f.kinds.length === 1 && f.kinds[0] === 0 &&
+    Array.isArray(f?.authors) && f.authors.length === 1 && f.authors[0] === me && f['#h'] === undefined &&
+    Number.isInteger(f.limit) && f.limit === 1
+  const needsChannels = filters => !filters.length || filters.some(f => !notices(f) && !ownProfile(f) &&
+    (!Array.isArray(f?.['#h']) || !f['#h'].length || !f['#h'].every(validChannel)))
 
   try {
     const c = challenge ?? await bounded(new Promise((resolve, reject) => { onChallenge = { resolve, reject } }), 'AUTH challenge')
@@ -171,7 +256,8 @@ export async function openBuzzSession({ relay, signer, timeoutMs = 10000, pingMs
     publishSigned,
     // Sign and publish; resolves only on the relay's OK, and reports its refusal verbatim.
     async publish(template) { return publishSigned(await signer.signEvent(template)) },
-    // Stored events up to EOSE. Every filter must name its channels, or Buzz answers with nothing.
+    // Stored events up to EOSE. Channel filters need #h; the two narrow exceptions are our own
+    // membership notices and our own latest kind-0 profile.
     async fetch(...filters) {
       if (needsChannels(filters)) throw new Error('every Buzz filter needs #h channel UUIDs — without it the relay returns nothing')
       const id = `q${++n}`

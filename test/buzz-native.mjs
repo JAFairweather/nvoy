@@ -119,10 +119,10 @@ try {
 
   const top = finalizeEvent({ kind: 9, created_at: now(), content: 'hi', tags: [['h', CH], ['p', agent]] }, humanSk)
   const topReply = channelReply({ channel: CH, parent: top, content: 'hello' })
-  ok('a reply to a top-level message carries only h, reply-e and p', JSON.stringify(topReply.tags) === JSON.stringify([['h', CH], ['e', top.id, '', 'reply'], ['p', human]]))
+  ok('a reply to a top-level message carries only h, reply-e, p and its hop', JSON.stringify(topReply.tags) === JSON.stringify([['h', CH], ['e', top.id, '', 'reply'], ['p', human], ['nvoy-hop', '1']]))
   const deep = finalizeEvent({ kind: 9, created_at: now(), content: 'more', tags: [['h', CH], ['e', top.id, '', 'reply'], ['p', agent]] }, humanSk)
   ok('a reply deeper in a thread keeps the root', JSON.stringify(channelReply({ channel: CH, parent: deep, content: 'x' }).tags) ===
-    JSON.stringify([['h', CH], ['e', top.id, '', 'root'], ['e', deep.id, '', 'reply'], ['p', human]]))
+    JSON.stringify([['h', CH], ['e', top.id, '', 'root'], ['e', deep.id, '', 'reply'], ['p', human], ['nvoy-hop', '1']]))
 
   const opts = { me: agent, channels: [CH] }
   ok('a p-tagged message in an allowed channel is a mention', nativeMention(top, opts)?.author === human)

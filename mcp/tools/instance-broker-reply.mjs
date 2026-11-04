@@ -12,13 +12,16 @@ import { replyRequestDigest, validateOutboundRecord } from './outbound_record.mj
 import { spawnSync } from 'node:child_process'
 import WebSocket from 'ws'
 import { getPublicKey, getEventHash, finalizeEvent, generateSecretKey, verifyEvent } from 'nostr-tools/pure'
-import { decode } from 'nostr-tools/nip19'
 import * as nip44 from 'nostr-tools/nip44'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { makeBunkerSigner } from './nip46-signer.mjs'
+import { secretKey } from './secret_key.mjs'
 import { verifyOutboundApproval } from './outbound_approval.mjs'
-import { channelReply, openBuzzSession } from './buzz_native.mjs'
+import { channelReply, openBuzzSession, validChannel } from './buzz_native.mjs'
 import { recordStatusReplied } from './buzz_status.mjs'
+import { countInWindow, nextHop } from './agent_limits.mjs'
+import { recordMentionGrants, replyMentionShape, validateReplyMention, withMentionGrants } from './agent_post.mjs'
+import { contentHash, credentialIn, withheldMessage } from './outbound_secrets.mjs'
 
 const die = m => { console.error(`instance-broker-reply: ${m}`); process.exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -53,11 +56,14 @@ try {
   }
 } catch (e) { die(`cannot read reply request queue: ${e.message}`) }
 if (!request || typeof request !== 'object') die('reply request is not present in this instance queue')
-const allowedKeys = ['version', 'type', 'id', 'instance', 'receipt', 'content']
+const allowedKeys = ['version', 'type', 'id', 'instance', 'receipt', 'content', 'mention']
 if (Object.keys(request).some(k => !allowedKeys.includes(k)) || request.type !== 'reply-request' || request.instance !== manifest.id ||
   request.version !== 1 || !/^[0-9a-f]{64}$/.test(String(request.receipt || '')) ||
   typeof request.content !== 'string' || !request.content.trim() || Buffer.byteLength(request.content, 'utf8') > 4000) die('reply request has an invalid or overbroad shape')
 request.receipt = request.receipt.toLowerCase()
+// Again here, where the signer is: a client that writes the queue without the tool skips the tool's check.
+const leaked = credentialIn(request.content)
+if (leaked) die(`reply refused: ${withheldMessage(leaked)} [post sha256 ${contentHash(request.content)}] instance ${manifest.id}`)
 
 const receiptBase = resolve(manifest.stateDir, 'receipts', `${request.receipt}.json`)
 const receiptInflight = resolve(manifest.stateDir, 'receipts', `${request.receipt}.${requestId}.inflight`)
@@ -90,12 +96,24 @@ if (receipt.version === 2 && (!channelCarry || !/^[0-9a-f]{64}$/.test(String(rec
   die('channel-carry receipt is not bound to an allowed carrier and channel')
 }
 // v3: heard natively on the Buzz relay, so the answer is a kind:9 in the same channel, signed by
-// this identity and published on the community relay it is a member of.
+// this identity and published on the community relay it is a member of. A DM receipt answers in
+// that DM and nowhere else, and only ever the owner: the relay alone decides who reads a DM.
 const buzzNative = receipt.version === 3 && receipt.mode === 'buzz-native'
+const buzzDm = buzzNative && receipt.dm === true
 if (receipt.version === 3 && (!buzzNative || !manifest.buzz || !/^[0-9a-f]{64}$/.test(String(receipt.source_event || '')) ||
   receipt.source_event !== receipt.envelope || !/^[0-9a-f]{64}$/.test(String(receipt.reply_root || '')) ||
-  !manifest.buzz.channels.includes(receipt.reply_channel))) {
+  (receipt.dm !== undefined && !buzzDm) || (!buzzDm && !manifest.buzz.channels.includes(receipt.reply_channel)))) {
   die('native Buzz receipt is not bound to a configured channel')
+}
+if (buzzDm && (!validChannel(receipt.reply_channel) || manifest.buzz.channels.includes(receipt.reply_channel) || !manifest.grantors.includes(receipt.sender))) {
+  die('native Buzz DM receipt is not bound to a DM from this identity\'s owner')
+}
+// A mention reaches beyond the sender, so it is the post's allowlist, not the receipt, that permits it.
+// Its keys are checked below, once the live policy has said which mention grants hold.
+if (request.mention !== undefined) {
+  if (!buzzNative) die('reply refused: mentions are only for a native Buzz channel reply')
+  if (buzzDm) die('reply refused: a DM reply mentions no one')
+  try { replyMentionShape(request.mention, manifest, receipt.reply_channel) } catch (e) { die(e.message) }
 }
 const credential = process.env.NVOY_BROKER_CREDENTIAL
 if (!credential || !existsSync(credential)) die('broker credential file is unavailable')
@@ -105,9 +123,10 @@ let signer
 let bunkerUri = process.env.NVOY_BUNKER_URI || ''
 if (!bunkerUri && process.env.NVOY_BUNKER_URI_FILE) { try { bunkerUri = readFileSync(process.env.NVOY_BUNKER_URI_FILE, 'utf8').trim() } catch { die('cannot read Bunker URI credential') } }
 if (bunkerUri) {
-  signer = makeBunkerSigner(bunkerUri, raw)
+  signer = makeBunkerSigner(bunkerUri, raw, { clientSource: `broker credential ${credential}` })
 } else {
-  const sk = raw.startsWith('nsec1') ? decode(raw).data : Uint8Array.from(Buffer.from(raw, 'hex'))
+  let sk
+  try { sk = secretKey(raw, `broker credential ${credential}`) } catch (error) { die(error.message) }
   signer = { getPublicKey: async () => getPublicKey(sk), signEvent: async event => finalizeEvent(event, sk),
     nip44Encrypt: async (peer, text) => nip44.encrypt(text, nip44.getConversationKey(sk, peer)) }
 }
@@ -129,7 +148,11 @@ let policy; try { policy = JSON.parse(checked.stdout) } catch { die('live grant 
 if (buzzNative) {
   const live = (Array.isArray(policy.grants) ? policy.grants : []).find(g => g?.pubkey === receipt.sender &&
     g.grant_id === receipt.grant_id && ['task', 'task+act'].includes(g.cap) && manifest.grantors.includes(g.grantor))
+  recordMentionGrants(manifest, policy)
   if (policy.me !== manifest.pubkey || !policy.policyUsable || !live) die('admission receipt no longer has a live matching grant chain')
+  if (request.mention !== undefined) {
+    try { validateReplyMention(request.mention, withMentionGrants(manifest, policy.mentions), receipt.reply_channel) } catch (e) { die(e.message) }
+  }
 }
 const current = Array.isArray(policy.admissions) ? policy.admissions : []
 const liveAdmission = current.length === 1 ? current[0] : null
@@ -137,6 +160,14 @@ if (!buzzNative && (!policy.policyUsable || !liveAdmission || liveAdmission.from
   (channelCarry && (liveAdmission.mode !== 'channel-carry' || liveAdmission.carrier !== receipt.carrier ||
     liveAdmission.carrier_grant_id !== receipt.carrier_grant_id || liveAdmission.reply_channel !== receipt.reply_channel ||
     liveAdmission.source_event !== receipt.source_event)))) die('admission receipt no longer has a live matching grant chain')
+// A mention spends the post budget. Counted before the claim, so a refusal leaves the receipt
+// answerable without one; the count is per request, so a retry of a frozen reply is a repeat.
+if (request.mention !== undefined && !existsSync(resolve(manifest.stateDir, 'outbound', `${requestId}.json`))) {
+  let verdict
+  try { verdict = countInWindow(resolve(manifest.stateDir, 'agent-limits', 'posts.json'), { key: 'post', id: requestId, limit: manifest.mayPost.perHour }) }
+  catch (e) { die(`cannot read the post counter: ${e.message}`) }
+  if (!verdict.allowed) die(`reply refused: over the may_post hourly cap (${verdict.count}/${manifest.mayPost.perHour} in the last hour)`)
+}
 // Claim before stamping. The stamp below writes to `receiptPath`, which is still `receiptBase`
 // until this rename — so stamping first RE-CREATES a receipt another invocation has already
 // claimed, its rename then succeeds, and two different replies get signed from one single-use
@@ -177,7 +208,8 @@ if (existsSync(recordPath)) {
   // fingerprint is its id, and a retry republishes this event rather than authoring a second one.
   const parent = { id: receipt.source_event, pubkey: receipt.sender,
     tags: receipt.reply_root !== receipt.source_event ? [['e', receipt.reply_root, '', 'root']] : [] }
-  const unsignedEvent = { pubkey: manifest.pubkey, ...channelReply({ channel: receipt.reply_channel, parent, content: request.content }) }
+  // One hop further than the message it answers; a receipt from before hops were recorded counts as 0.
+  const unsignedEvent = { pubkey: manifest.pubkey, ...channelReply({ channel: receipt.reply_channel, parent, content: request.content, hop: nextHop(receipt.hop), mentions: request.mention || [] }) }
   record = { version: 3, request_digest: digest, request_id: requestId,
     fingerprint: getEventHash(unsignedEvent), unsigned_event: unsignedEvent, event: null, published: false }
   const tmp = `${recordPath}.${process.pid}.tmp`
@@ -270,8 +302,17 @@ if (buzzNative) {
   // The community relay is the only place this reply means anything; its refusal is reported verbatim.
   try {
     const session = await openBuzzSession({ relay: manifest.buzz.relay, signer })
-    try { const ok = await session.publishSigned(record.event); if (ok.accepted) accepted = 1; else console.error(`instance-broker-reply: Buzz refused the reply: ${ok.message}`) }
-    finally { session.close() }
+    try {
+      const ok = await session.publishSigned(record.event)
+      if (ok.accepted) accepted = 1
+      else {
+        console.error(`instance-broker-reply: Buzz refused the reply: ${ok.message}`)
+        // The event is frozen, so a NIP-01 `invalid:` verdict on it is final — a gone parent, or a
+        // timestamp that only grows staler. Only one stamped in the future can become valid by waiting.
+        if (/^invalid:/.test(String(ok.message || '')) && record.event.created_at <= Math.floor(Date.now() / 1000))
+          die('Buzz rejected the frozen channel reply as invalid; no retry can change it')
+      }
+    } finally { session.close() }
   } catch (e) { console.error(`instance-broker-reply: Buzz relay unavailable: ${e.message}`) }
   if (!accepted) die('the Buzz relay did not accept the persisted channel reply; it remains retryable')
 } else {

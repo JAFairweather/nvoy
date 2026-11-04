@@ -33,10 +33,10 @@ import WebSocket from 'ws'
 import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { resolve } from 'node:path'
-import { decode } from 'nostr-tools/nip19'
 import { getPublicKey } from 'nostr-tools/pure'
 import * as nip44 from 'nostr-tools/nip44'
 import { makeBunkerSigner } from './nip46-signer.mjs'
+import { secretKey } from './secret_key.mjs'
 import { verifyChannelDataCarry } from './channel_task_carry.mjs'
 import { verifyInboxEnvelope } from './inbox_envelope.mjs'
 import { partitionInboxMessages } from './inbox_trust.mjs'
@@ -51,8 +51,9 @@ if (!!bunkerUri !== !!bunkerClient) { console.error('inbox: Bunker URI and clien
 const raw = process.env.NVOY_NSEC || ''
 if (raw && bunkerUri) { console.error('inbox: choose local NVOY_NSEC or the Bunker signer, never both'); process.exit(1) }
 if (!raw && !bunkerUri) { console.error('inbox: set NVOY_NSEC or the Bunker credential-file pair'); process.exit(1) }
-const sk = raw ? (raw.startsWith('nsec1') ? decode(raw).data : Uint8Array.from(Buffer.from(raw, 'hex'))) : null
-const signer = bunkerUri ? makeBunkerSigner(bunkerUri, bunkerClient) : null
+let sk = null
+try { if (raw) sk = secretKey(raw, 'NVOY_NSEC') } catch (error) { console.error(`inbox: ${error.message}`); process.exit(1) }
+const signer = bunkerUri ? makeBunkerSigner(bunkerUri, bunkerClient, { clientSource: `Bunker client credential at ${process.env.NVOY_NIP46_CLIENT_FILE}` }) : null
 const pk = signer ? await signer.getPublicKey() : getPublicKey(sk)
 
 const arg = (n, d) => { const i = process.argv.indexOf(n); return i === -1 ? d : process.argv[i + 1] }

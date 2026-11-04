@@ -33,6 +33,7 @@ import * as nip19 from 'nostr-tools/nip19'
 import * as nip44 from 'nostr-tools/nip44'
 import WebSocket from 'ws'
 import { makeBunkerSigner } from './nip46-signer.mjs'
+import { secretKey } from './secret_key.mjs'
 
 const BRIDGE = String(process.env.WAGGLE_BRIDGE_PUBKEY || '').toLowerCase()
 if (!/^[0-9a-f]{64}$/.test(BRIDGE)) { console.error('relay-send: set WAGGLE_BRIDGE_PUBKEY to waggle\'s 64-hex pubkey — there is no default recipient'); process.exit(1) }
@@ -51,8 +52,9 @@ if (!!bunkerUri !== !!bunkerClient) { console.error('relay-send: Bunker URI and 
 const raw = process.env.NVOY_NSEC || ''
 if (raw && bunkerUri) { console.error('relay-send: choose local NVOY_NSEC or the Bunker signer, never both'); process.exit(1) }
 if (!raw && !bunkerUri) { console.error('relay-send: set NVOY_NSEC or the Bunker credential-file pair'); process.exit(1) }
-const sk = raw ? (raw.startsWith('nsec1') ? nip19.decode(raw).data : Uint8Array.from(Buffer.from(raw, 'hex'))) : null
-const signer = bunkerUri ? makeBunkerSigner(bunkerUri, bunkerClient) : null
+let sk = null
+try { if (raw) sk = secretKey(raw, 'NVOY_NSEC') } catch (error) { console.error(`relay-send: ${error.message}`); process.exit(1) }
+const signer = bunkerUri ? makeBunkerSigner(bunkerUri, bunkerClient, { clientSource: `Bunker client credential at ${process.env.NVOY_NIP46_CLIENT_FILE}` }) : null
 const pk = signer ? await signer.getPublicKey() : getPublicKey(sk)
 const expectedRaw = String(process.env.EXPECT_PUBKEY || '').trim()
 if (expectedRaw) {

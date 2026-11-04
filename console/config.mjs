@@ -1,12 +1,19 @@
 // config.mjs — per-device relay configuration (Nvelope shared/config.mjs
 // pattern, relays only — Nvoy has no blob servers until the M4 outbox).
-// Stored in localStorage (non-secret — endpoints, not keys); defaults are
-// the shipped public relays. ws:// is deliberately allowed alongside wss://
-// so a local test relay (test/wsrelay.mjs) can drive the console offline.
+// Stored in localStorage (non-secret — endpoints, not keys). ws:// is
+// deliberately allowed alongside wss:// so a local test relay
+// (test/wsrelay.mjs) can drive the console offline.
+//
+// Defaults lead with relays that RETAIN grants. nos.lol and primal evict
+// kind 440 grants and credential gift wraps within weeks (all four agents went
+// deaf 2026-10-19; nactor lost every credential 2026-10-22), so a grant
+// issued only to them silently disappears. relay.nave.pub is the fleet's own
+// archive; relay.ditto.pub has kept every grant we checked. The public pair
+// stays for reach.
 //
 // DOM-free: storage is injectable so Node tests exercise the sanitize path.
 
-export const DEFAULT_RELAYS = ['wss://nos.lol', 'wss://relay.primal.net']
+export const DEFAULT_RELAYS = ['wss://relay.nave.pub', 'wss://relay.ditto.pub', 'wss://nos.lol', 'wss://relay.primal.net']
 export const CONFIG_KEY = 'nvoy-config'
 
 export const defaultConfig = () => ({ relays: [...DEFAULT_RELAYS] })

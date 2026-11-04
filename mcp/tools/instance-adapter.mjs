@@ -46,7 +46,7 @@ const server = net.createServer(conn => {
         const input = resolve(workerInputDir, `${packet.envelope}.json`), tmp = `${input}.${process.pid}.tmp`
         writeFileSync(tmp, JSON.stringify(packet.type === 'verified-notification'
           ? { envelope: packet.envelope, notification: packet.notification }
-          : { envelope: packet.envelope, authority: packet.authority || null, messages: packet.messages }), { mode: 0o640 })
+          : { envelope: packet.envelope, authority: packet.authority || null, messages: packet.messages, ...(packet.context ? { context: packet.context } : {}) }), { mode: 0o640 })
         renameSync(tmp, input); chownSync(input, -1, manifest.workerHandoffGid); chmodSync(input, 0o640)
         appendFileSync(queue, JSON.stringify(packet) + '\n', { mode: 0o640 }); chownSync(queue, -1, manifest.workerHandoffGid); chmodSync(queue, 0o640); delivered.add(packet.envelope)
       }

@@ -59,7 +59,7 @@ ok('the Codex release that runs its shell commands is readable too, and nothing 
 ok('its one MCP server is the hardened ssh entry to the channel forced command', (toml.match(/^\[mcp_servers\.[^.\]]+\]$/gm) || []).length === 1 &&
   toml.includes('[mcp_servers.nvoy-cx-test]\ncommand = "/usr/bin/ssh"\n') && JSON.stringify(args) === JSON.stringify(sshChannelEntry(remote).args) && !/NVOY_INSTANCE_ROOT/.test(toml))
 ok('each keyless channel tool, and only those, is pre-approved', CODEX_CHANNEL_TOOLS.every(tool => toml.includes(`[mcp_servers.nvoy-cx-test.tools.${tool}]\napproval_mode = "approve"\n`)) &&
-  (toml.match(/^approval_mode = /gm) || []).length === 3)
+  (toml.match(/^approval_mode = /gm) || []).length === 6)
 // grants: one harness's extra reach, never its own login, keys or the home directory itself
 const gOwn = '/Users/o', gHome = '/Users/o/.nvoy-harness/x/codex', gKeys = ['/Users/o/.nvoy-harness/x/id_channel', '/Users/o/.nvoy-harness/x/id_feed']
 const grant = raw => { try { return codexGrants(raw, { own: gOwn, codexHome: gHome, keys: gKeys }) } catch (e) { return e.message } }
@@ -354,6 +354,7 @@ ok('a CODEX_HOME too deep for its control socket is refused', refused({ ...clien
 
 writeFileSync(queue, record(1))
 const fakeLog = home => readText(join(home, 'fake.jsonl')).split('\n').filter(Boolean).map(JSON.parse)
+const alive = pid => { try { process.kill(pid, 0); return true } catch { return false } }
 function startSupervisor(config = client, env = {}) {
   const child = spawn(process.execPath, ['mcp/tools/codex-harness-portable.mjs', '--instance', 'cx-test', '--config', clientConfig(config)], { cwd: resolve('.'), env: { ...supervisorEnv, ...env } })
   const run = { child, out: '' }
@@ -365,12 +366,18 @@ function startSupervisor(config = client, env = {}) {
 const clientCalls = (method, home = codexHome) => fakeLog(home).filter(m => m.method === method && m.masked)
 const THREAD = '0199a213-81c0-7800-8aa1-bbab2a035a53'
 const socket = join(codexHome, 'ctl', 'as.sock')
+// Codex 0.163 leaves the control socket as a symlink into its own daemon directory; a restart must clear it.
+const staleTarget = join(root, 'codex-daemon-stale')
+writeFileSync(staleTarget, '')
+mkdirSync(join(codexHome, 'ctl'), { recursive: true, mode: 0o700 })
+symlinkSync(staleTarget, socket)
 const s1 = startSupervisor(client, { HARNESS_EXTRA_VAR: 'kept-out' })
 ok('the supervisor starts its thread, baselines the fleet queue, and connects the feed', await waitFor(() => /session ready/.test(s1.out) && /wake feed connected/.test(s1.out)) &&
   /first start: baselined the cx-test queue/.test(s1.out) && clientCalls('thread/start').length === 1 && clientCalls('thread/start')[0].params.cwd === join(codexHome, 'workspace'))
 const attachLine = `attach: CODEX_HOME=${codexHome} codex resume ${THREAD} --remote unix://${socket}`
 // "session ready" and the attach line are two writes, and they can reach this process as two chunks.
 await waitFor(() => /attach: /.test(s1.out))
+ok('a control socket left as a symlink is cleared without touching its target', statSync(socket).isSocket() && existsSync(staleTarget))
 ok('a new thread has no rollout to resume yet, so ready says when the attach command comes instead of printing it (#218)',
   /attach: available after the thread's first turn/.test(s1.out) && !s1.out.includes(attachLine) && attachCommand({ codexHome: '/a b', socket: '/s', threadId: 't' }) === "CODEX_HOME='/a b' codex resume t --remote unix:///s")
 ok('the thread\'s channel is asked before ready, by the channel\'s own tool', clientCalls('mcpServer/tool/call')[0]?.params.server === 'nvoy-cx-test' &&
@@ -382,7 +389,6 @@ ok('the app-server is run by its real path, and its release is the one extra dir
 ok('the new thread is started under the channel profile', clientCalls('thread/start')[0].params.permissions === 'nvoy-channel')
 ok('it opts into the experimental API that thread/queue/add needs', clientCalls('initialize')[0].params.capabilities.experimentalApi === true)
 const pgid = pid => spawnSync('ps', ['-o', 'pgid=', '-p', String(pid)], { encoding: 'utf8' }).stdout.trim()
-const alive = pid => { try { process.kill(pid, 0); return true } catch { return false } }
 const s1Server = fakeLog(codexHome)[0].pid
 ok('the app-server runs in its own session, off the supervisor\'s terminal', pgid(s1Server) === String(s1Server) && pgid(s1.child.pid) !== String(s1Server))
 writeFileSync(join(codexHome, 'hold'), '')
@@ -482,7 +488,8 @@ writeFileSync(join(codexHome, 'stubborn'), ''); writeFileSync(join(codexHome, 'm
 process.kill(JSON.parse(readText(lockPath)).pid, 'SIGKILL')
 ok('a codex app-server that ignores SIGTERM is killed before the restart starts another', await waitFor(() => (s7.out.match(/session ready/g) || []).length === 2) &&
   s7.out.includes(`codex app-server ${s7Server} did not stop when asked; killing it`) && !alive(s7Server))
-rmSync(join(codexHome, 'stubborn'))
+rmSync(join(codexHome, 'stubborn')); rmSync(join(codexHome, 'mcp-dead'), { force: true })
+try { process.kill(s7Server, 'SIGKILL') } catch {}   // a failure leaves no stubborn server behind
 await s7.stop()
 writeFileSync(join(codexHome, 'stubborn'), '')
 const orphan = spawn(fakeCodex, ['app-server', '--listen', `unix://${socket}`], { env: { ...baseEnv, CODEX_HOME: codexHome }, detached: true, stdio: 'ignore' })
@@ -492,6 +499,7 @@ const s8 = startSupervisor(client, { HARNESS_STOP_MS: '300' })
 ok('a codex app-server an earlier run left on the control socket is stopped before the next one starts', await waitFor(() => /session ready/.test(s8.out)) &&
   s8.out.includes(`stopping codex app-server ${orphan.pid}, left on the control socket by an earlier run`) && !alive(orphan.pid))
 rmSync(join(codexHome, 'stubborn'))
+try { process.kill(orphan.pid, 'SIGKILL') } catch {}
 await s8.stop()
 
 // Where the owner runs herdr, the thread is shown there, in a workspace of the identity's own.
