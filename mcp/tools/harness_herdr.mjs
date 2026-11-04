@@ -112,7 +112,15 @@ export function herdrSession({ herdr, name, dir, cwd, file = 'session', launchMs
   // Every launcher this supervisor started, so a session that outlived its launcher, or whose pid file
   // a later launch replaced, is still stopped (mc-claude kept its pane through three restarts, 2026-10-20).
   const launched = new Set()
-  let pane = ''
+  let pane = '', launching = false
+  // The pid a launch in progress has written is that launch's session: record when it started, so the
+  // session is ours from the moment it can be seen, even to a stop that comes before start() returns.
+  const adopt = () => {
+    const pid = readPid()
+    if (!pid || launched.has(pid)) return
+    writeFileSync(startFile, startedAt(pid), { mode: 0o600 })
+    launched.add(pid)
+  }
   const session = {
     started: () => !!pane,
     async start({ command, env, credential = null }) {
@@ -129,24 +137,26 @@ export function herdrSession({ herdr, name, dir, cwd, file = 'session', launchMs
       rmSync(pidFile, { force: true }); rmSync(startFile, { force: true }); rmSync(resolve(dir, `${file}.status`), { force: true })
       writeFileSync(launcher, launcherScript({ env, cwd, command, pidFile, credential }), { mode: 0o700 })
       chmodSync(launcher, 0o700)
-      // The terminal's answers to a stopped session's last queries arrive at the shell's prompt; left
-      // there, they join the launcher's command line (one became `>|libghostty…;22c1`, a redirect that
-      // sent the session's screen to a file; mc-claude, 2026-10-19). Let them land, then clear the line.
-      await sleep(500)
-      herdr.keys(pane, 'ctrl+c')
-      await sleep(200)
-      // The launcher becomes the session, so the shell gives echo back once it ends.
-      herdr.run(pane, `'${launcher.replace(/'/g, `'\\''`)}'; stty echo 2>/dev/null`)
-      // A killed session can leave the pane's terminal in its own modes, where Enter never ends a line
-      // and ctrl+c is inert: the path shows and never runs (mc-claude, 2026-10-20, 12:10 to 12:56).
-      for (const until = Date.now() + launchMs; !readPid() && Date.now() < until;) await sleep(100)
-      if (!readPid()) {
-        herdr.close(name)
-        pane = ''
-        throw new Error(`the ${name} pane did not run the launcher; its workspace is closed and the next start opens a fresh one`)
-      }
-      writeFileSync(startFile, startedAt(readPid()), { mode: 0o600 })
-      launched.add(readPid())
+      launching = true
+      try {
+        // The terminal's answers to a stopped session's last queries arrive at the shell's prompt; left
+        // there, they join the launcher's command line (one became `>|libghostty…;22c1`, a redirect that
+        // sent the session's screen to a file; mc-claude, 2026-10-19). Let them land, then clear the line.
+        await sleep(500)
+        herdr.keys(pane, 'ctrl+c')
+        await sleep(200)
+        // The launcher becomes the session, so the shell gives echo back once it ends.
+        herdr.run(pane, `'${launcher.replace(/'/g, `'\\''`)}'; stty echo 2>/dev/null`)
+        // A killed session can leave the pane's terminal in its own modes, where Enter never ends a line
+        // and ctrl+c is inert: the path shows and never runs (mc-claude, 2026-10-20, 12:10 to 12:56).
+        for (const until = Date.now() + launchMs; !readPid() && Date.now() < until;) await sleep(20)
+        if (!readPid()) {
+          herdr.close(name)
+          pane = ''
+          throw new Error(`the ${name} pane did not run the launcher; its workspace is closed and the next start opens a fresh one`)
+        }
+        adopt()
+      } finally { launching = false }
     },
     screen: () => herdr.read(pane),
     keys: key => herdr.keys(pane, key),
@@ -163,6 +173,9 @@ export function herdrSession({ herdr, name, dir, cwd, file = 'session', launchMs
     // The whole group, until it is gone: Claude Code can outlive its launcher's SIGTERM and keep the
     // pane's foreground, so whatever stays is killed.
     async stop() {
+      // Mid-launch, wait for the launcher's pid: a stop during the handoff must still find the session.
+      while (launching && !readPid()) await sleep(20)
+      if (launching) adopt()
       const pid = readPid()
       const groups = new Set([...(ours(pid) ? [pid] : []), ...[...launched].filter(grouped)])
       for (const group of groups) {
@@ -176,6 +189,7 @@ export function herdrSession({ herdr, name, dir, cwd, file = 'session', launchMs
     },
     // For an exit handler, which cannot wait.
     kill() {
+      if (launching) adopt()
       const pid = readPid()
       for (const group of new Set([...(ours(pid) ? [pid] : []), ...[...launched].filter(grouped)])) signal(group, 'SIGTERM')
     },
