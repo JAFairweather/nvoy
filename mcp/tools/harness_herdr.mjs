@@ -68,7 +68,7 @@ export function herdrClient({ bin = process.env.HARNESS_HERDR_BIN || 'herdr', en
 // launcher left waiting in front of it hid crystalclaude from Moshi (2026-11-04). Echo is off while the session starts: herdr's
 // terminal answers the queries an agent sends at startup, and an echoed answer is drawn over its
 // screen (it hid the development-channels prompt the supervisor answers; mc-claude, 2026-10-19).
-export function launcherScript({ env, cwd, command, pidFile, credential = null }) {
+export function launcherScript({ env, cwd, command, pidFile, cancelFile = '', credential = null }) {
   const q = value => `'${String(value).replace(/'/g, `'\\''`)}'`
   // COLORTERM too: without it an agent falls back to 256 colours, and Codex's composer shading then all
   // but hides its text. Not TERM_PROGRAM: with it, Claude Code stopped taking the keys the supervisor
@@ -83,6 +83,8 @@ export function launcherScript({ env, cwd, command, pidFile, credential = null }
     'fi',
     'unset NVOY_HARNESS_CLEAN',
     `echo $$ > ${q(pidFile)}`,
+    // An exit handler that cannot wait for this launch asks it to stop here instead.
+    ...(cancelFile ? [`[ -e ${q(cancelFile)} ] && exit 0`] : []),
     ...(credential ? [`${credential.env}=$(cat ${q(credential.file)}) || exit 1`, `export ${credential.env}`] : []),
     `cd ${q(cwd)} || exit 1`,
     'stty -echo 2>/dev/null',
@@ -99,6 +101,7 @@ export function launcherScript({ env, cwd, command, pidFile, credential = null }
 // has since reused the number.
 export function herdrSession({ herdr, name, dir, cwd, file = 'session', launchMs = 10000, log = () => {} }) {
   const launcher = resolve(dir, `${file}.sh`), pidFile = resolve(dir, `${file}.pid`), startFile = resolve(dir, `${file}.start`)
+  const cancelFile = resolve(dir, `${file}.cancel`)
   const readPid = () => { try { const pid = readFileSync(pidFile, 'utf8').trim(); return /^\d+$/.test(pid) ? pid : '' } catch { return '' } }
   // When a live process started: exec keeps it, a reused number does not. A zombie has ended.
   const startedAt = pid => {
@@ -117,8 +120,9 @@ export function herdrSession({ herdr, name, dir, cwd, file = 'session', launchMs
   // session is ours from the moment it can be seen, even to a stop that comes before start() returns.
   const adopt = () => {
     const pid = readPid()
-    if (!pid || launched.has(pid)) return
-    writeFileSync(startFile, startedAt(pid), { mode: 0o600 })
+    const at = pid && !launched.has(pid) && startedAt(pid)
+    if (!at) return
+    writeFileSync(startFile, at, { mode: 0o600 })
     launched.add(pid)
   }
   const session = {
@@ -134,8 +138,8 @@ export function herdrSession({ herdr, name, dir, cwd, file = 'session', launchMs
         herdr.close(name)
         pane = herdr.pane({ label: name, cwd })
       }
-      rmSync(pidFile, { force: true }); rmSync(startFile, { force: true }); rmSync(resolve(dir, `${file}.status`), { force: true })
-      writeFileSync(launcher, launcherScript({ env, cwd, command, pidFile, credential }), { mode: 0o700 })
+      rmSync(pidFile, { force: true }); rmSync(startFile, { force: true }); rmSync(cancelFile, { force: true }); rmSync(resolve(dir, `${file}.status`), { force: true })
+      writeFileSync(launcher, launcherScript({ env, cwd, command, pidFile, cancelFile, credential }), { mode: 0o700 })
       chmodSync(launcher, 0o700)
       launching = true
       try {
@@ -187,9 +191,14 @@ export function herdrSession({ herdr, name, dir, cwd, file = 'session', launchMs
       }
       for (const group of launched) if (!grouped(group)) launched.delete(group)
     },
-    // For an exit handler, which cannot wait.
+    // For an exit handler, which cannot wait for start(). Mid-launch, the launcher is told to stop
+    // itself, in case it runs after this process has gone, and given a moment to show its pid.
     kill() {
-      if (launching) adopt()
+      if (launching) {
+        writeFileSync(cancelFile, '', { mode: 0o600 })
+        for (const until = Date.now() + 2000; !readPid() && Date.now() < until;) spawnSync('sleep', ['0.02'])
+        adopt()
+      }
       const pid = readPid()
       for (const group of new Set([...(ours(pid) ? [pid] : []), ...[...launched].filter(grouped)])) signal(group, 'SIGTERM')
     },
