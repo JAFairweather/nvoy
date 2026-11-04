@@ -515,7 +515,7 @@ ok('the viewer attaches to the driven thread over the control socket, in the har
   JSON.stringify(v1.args) === JSON.stringify(['resume', threadNow, '--remote', `unix://${socket}`]) && v1.home === codexHome && v1.pane === 'w1:p1' &&
   !v1.env.includes('HARNESS_EXTRA_VAR') && !v1.env.includes('NVOY_HARNESS_SSH') && v1.env.includes('CODEX_HOME'))
 process.kill(v1.pid, 'SIGKILL')
-ok('a viewer that exits is shown again in the same pane', await waitFor(() => viewers().length === 2 && herdr.state().panes['w1:p1'].name === 'cxtest') &&
+ok('a viewer that exits is shown again in the same pane', await waitFor(() => viewers().length === 2 && herdr.state().panes['w1:p1']?.name === 'cxtest') &&
   viewers()[1].pane === 'w1:p1' && herdr.state().workspaces.length === 1)
 const v2 = viewers()[1], s6Servers = appServers()
 process.kill(fakeLog(codexHome).filter(m => m.start).at(-1).pid, 'SIGKILL')
