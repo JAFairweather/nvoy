@@ -433,15 +433,17 @@ const herdrState1 = herdrFake.state()
 ok('the identity gets its own workspace, labelled with its name, and nothing in tmux', herdrState1.workspaces?.length === 1 && herdrState1.workspaces[0].label === 'mactest' &&
   !existsSync(join(herdrHome, '.nvoy-harness', 'tmux.sock.log')))
 const launcher = join(herdrHome, '.nvoy-harness', 'session.sh')
-ok('the pane is sent only the owner-only launcher\'s path, and the launcher holds no login', herdrCalls().filter(c => c[1] === 'run').every(c => c[3] === `'${launcher}'`) &&
+ok('the pane is sent only the owner-only launcher\'s path, and the launcher holds no login', herdrCalls().filter(c => c[1] === 'run').every(c => c[3] === `'${launcher}'; stty echo 2>/dev/null`) &&
   (statSync(launcher).mode & 0o777) === 0o700 && !readText(launcher).includes('sk-ant-oat') && !JSON.stringify(herdrCalls()).includes('sk-ant-oat'))
 const run1 = claudeRuns()[0] || {}
 ok('claude runs in the pane with the harness home, the login, the channel, and none of the owner\'s environment', run1.home === herdrHome && run1.keyed && run1.configDir === undefined &&
   run1.pane === 'w1:p1' && run1.args.includes('server:nvoy-mac-test') && !run1.args.includes('--continue'))
+ok('the launcher becomes the session, so the pane\'s foreground process is the agent itself', run1.pid === Number(readText(join(herdrHome, '.nvoy-harness', 'session.pid'))) &&
+  /\nexec 'claude' /.test(readText(launcher)))
 ok('herdr is asked to name the agent after the identity', await waitFor(() => herdrFake.state().panes['w1:p1']?.name === 'mactest'))
 process.kill(run1.pid, 'SIGKILL')
 ok('a session that exits restarts in the same pane, resuming, and is named again', await waitFor(() => claudeRuns().length === 2 && herdrFake.state().panes['w1:p1']?.name === 'mactest', 15000) &&
-  /session exited \(status 137\); restarting/.test(herdrOut) && claudeRuns()[1].pane === 'w1:p1' && claudeRuns()[1].args.at(-1) === '--continue' && herdrFake.state().workspaces.length === 1)
+  /session exited \(status gone\); restarting/.test(herdrOut) && claudeRuns()[1].pane === 'w1:p1' && claudeRuns()[1].args.at(-1) === '--continue' && herdrFake.state().workspaces.length === 1)
 const herdrCtl = join(herdrHome, '.fake')
 mkdirSync(herdrCtl, { recursive: true }); writeFileSync(join(herdrCtl, 'ignoreterm'), '')
 const readyCount = () => herdrOut.split('mac-test session ready; its channel to the fleet is up').length - 1
