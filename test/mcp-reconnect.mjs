@@ -67,4 +67,18 @@ proxy.stdin.end()
 const code = await new Promise(done => proxy.on('exit', done))
 ok('closing the client stops the proxy and its server', code !== null)
 
+// A command that cannot start at all: the client's initialize is answered with an error, not left
+// hanging, and the proxy keeps trying to start it.
+const broken = spawn(process.execPath, [resolve('mcp/tools/mcp-reconnect.mjs'), '--max-backoff-ms', '200', '--', join(dir, 'no-such-command')], { stdio: ['pipe', 'pipe', 'pipe'] })
+let brokenErr = ''
+broken.stderr.on('data', d => { brokenErr += d })
+const brokenOut = []
+createInterface({ input: broken.stdout }).on('line', line => brokenOut.push(JSON.parse(line)))
+broken.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '1' } } }) + '\n')
+await pause(1500)
+ok('a command that cannot start: initialize gets an error reply, not silence', brokenOut.some(m => m.id === 1 && m.error?.code === -32000))
+ok('a command that cannot start is retried with backoff', (brokenErr.match(/start failed/g) || []).length >= 2 && /restarting in/.test(brokenErr))
+broken.stdin.end()
+ok('closing the client stops a proxy whose command never started', await Promise.race([new Promise(done => broken.on('exit', () => done(true))), pause(3000).then(() => false)]))
+
 process.exit(fails ? 1 : 0)

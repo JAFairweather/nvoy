@@ -60,7 +60,12 @@ function start() {
     toClient(message)
   })
   proc.stdin.on('error', () => {})
-  proc.on('exit', code => {
+  // Once per process, on exit or on close: a command that cannot start emits error and close but no
+  // exit, and its restart and the answers to requests sent to it must still come.
+  let ended = false
+  const end = code => {
+    if (ended) return
+    ended = true
     if (child !== proc) return
     child = null; ready = false
     for (const id of inFlight) unavailable(id)
@@ -70,7 +75,9 @@ function start() {
     log(`server exited (${code ?? 'signal'}); restarting in ${backoffMs}ms`)
     setTimeout(() => { if (!stopping && gen === generation) start() }, backoffMs)
     backoffMs = Math.min(backoffMs * 2, maxBackoffMs)
-  })
+  }
+  proc.on('exit', end)
+  proc.on('close', end)
   if (initialize) proc.stdin.write(JSON.stringify({ ...initialize, id: replayId() }) + '\n')
 }
 
@@ -87,9 +94,9 @@ createInterface({ input: process.stdin }).on('line', line => {
   child.stdin.write(line + '\n')
 }).on('close', () => {
   stopping = true
-  if (child) child.kill('SIGTERM')
+  if (child?.pid) child.kill('SIGTERM')
   else process.exit(0)
 })
-for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => { stopping = true; if (child) child.kill(signal); else process.exit(0) })
+for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => { stopping = true; if (child?.pid) child.kill(signal); else process.exit(0) })
 
 start()
