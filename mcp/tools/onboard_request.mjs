@@ -11,7 +11,7 @@ import { readPublicKey } from './instance_apply.mjs'
 export const SETUP_KIND = 30078
 export const SETUP_PREFIX = 'nvoy-onboard/'
 export const OPS = Object.freeze(['add_agent', 'bind_runtime'])
-export const HARNESSES = Object.freeze(['claude-code', 'codex', 'pi', 'openclaw', 'grokbot', 'hermes'])
+export const HARNESSES = Object.freeze(['claude-code', 'codex', 'pi', 'openclaw', 'grokbot', 'hermes', 'antigravity'])
 export const MAX_AGE_S = 7 * 24 * 60 * 60
 
 const NAME = /^[a-z0-9][a-z0-9._-]{1,63}$/i
