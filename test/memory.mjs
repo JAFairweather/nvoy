@@ -1402,6 +1402,40 @@ os.execvp("node", ["node", sys.argv[3], "--state", sys.argv[4], "--config", sys.
     }),
     dennis.sk
   )
+  const shadowOps30078 = sign(
+    buildClaimTemplate({
+      pubkey: deadRabbit.pk,
+      scope: 'hive:ops',
+      slug: 'shadow-fallback-30078',
+      topic: 'shadow-fallback',
+      claim: 'Shadow writer first claim published as fallback kind 30078.',
+      because: 'Shadow writers are accepted even when allowMemoryWriteCap is false.',
+      evidence: ['waggle@a2c1781f:docs/DESIGN_HIVE_MEMORY.md'],
+      asOfGit: 'waggle@a2c1781f',
+      memoryGlobalChannelId: GLOBAL_CH,
+      kind: FALLBACK_MEMORY_KIND,
+      nowSec,
+    }),
+    deadRabbit.sk
+  )
+  const memWriteOps30078 = sign(
+    buildClaimTemplate({
+      pubkey: waggleDev.pk,
+      scope: 'hive:ops',
+      slug: 'mem-write-fallback-30078',
+      topic: 'mem-write-fallback',
+      claim: 'Memory-write holder first claim published as fallback kind 30078.',
+      because: 'Discovered from owner kind 440 grant when allowMemoryWriteCap is true.',
+      evidence: ['waggle@a2c1781f:docs/DESIGN_HIVE_MEMORY.md'],
+      asOfGit: 'waggle@a2c1781f',
+      memoryGlobalChannelId: GLOBAL_CH,
+      kind: FALLBACK_MEMORY_KIND,
+      nowSec,
+    }),
+    waggleDev.sk
+  )
+  const shadowGrant30078 = makeGrant(james, deadRabbit.pk, 'shadow', { subject: james.pk, at: nowSec - 120 })
+  const memWriteGrant30078 = makeGrant(james, waggleDev.pk, 'memory-write', { subject: james.pk, at: nowSec - 120 })
 
   const seenChannelReqs = []
   const wss30078 = new WebSocketServer({ port: 0, host: '127.0.0.1' })
@@ -1422,6 +1456,16 @@ os.execvp("node", ["node", sys.argv[3], "--state", sys.argv[4], "--config", sys.
         const subId = msg[1]
         const filters = msg.slice(2)
         if (filters.some(f => Array.isArray(f.kinds) && (f.kinds.includes(440) || f.kinds.includes(441)))) {
+          for (const f of filters) {
+            if (Array.isArray(f.kinds) && f.kinds.includes(440)) {
+              for (const g of [shadowGrant30078, memWriteGrant30078]) {
+                const pTag = g.tags.find(t => t[0] === 'p')?.[1]
+                if (!f['#p'] || f['#p'].includes(pTag)) {
+                  ws.send(JSON.stringify(['EVENT', subId, g]))
+                }
+              }
+            }
+          }
           ws.send(JSON.stringify(['EOSE', subId]))
           return
         }
@@ -1444,8 +1488,12 @@ os.execvp("node", ["node", sys.argv[3], "--state", sys.argv[4], "--config", sys.
               ws.send(JSON.stringify(['EVENT', subId, jamesReadState30078]))
               ws.send(JSON.stringify(['EVENT', subId, jamesTest30078]))
             }
+            if (f.authors.includes(deadRabbit.pk)) {
+              ws.send(JSON.stringify(['EVENT', subId, shadowOps30078]))
+            }
             if (f.authors.includes(waggleDev.pk)) {
               ws.send(JSON.stringify(['EVENT', subId, roomMember30078]))
+              ws.send(JSON.stringify(['EVENT', subId, memWriteOps30078]))
             }
             if (f.authors.includes(dennis.pk)) {
               ws.send(JSON.stringify(['EVENT', subId, stranger30078]))
@@ -1460,8 +1508,9 @@ os.execvp("node", ["node", sys.argv[3], "--state", sys.argv[4], "--config", sys.
   const fbStateDir = join(daemonDir, 'fb-state')
   const fbSockDir = join(daemonDir, 'fb-socks')
   mkdirSync(fbStateDir, { recursive: true, mode: 0o700 })
-  // Pre-seed the store with James's 30078 claim so any failure to match remoteIds on EOSE would
-  // trigger a false RELAY_EVICTED_WARNING.
+  // Pre-seed the store with James's 30078 claim only (no shadow claim pre-seeded) so any failure to
+  // match remoteIds on EOSE would trigger a false RELAY_EVICTED_WARNING, AND deadRabbit's first
+  // claim must be discovered via the shadow grant.
   const preseedStore = new MemoryStore({
     statePath: join(fbStateDir, 'memory_claims.json'),
     ownerPubkey: james.pk,
@@ -1498,7 +1547,7 @@ os.execvp("node", ["node", sys.argv[3], "--state", sys.argv[4], "--config", sys.
   for (let attempt = 0; attempt < 40; attempt++) {
     const gSync = fbDaemon.store.getChannelSync(GLOBAL_CH, nowSec)
     const rSync = fbDaemon.store.getChannelSync(ROOM_A, nowSec)
-    if (gSync.state === 'SYNCED_OK' && gSync.localCount === 1 && rSync.state === 'SYNCED_OK' && rSync.localCount === 1) {
+    if (gSync.state === 'SYNCED_OK' && gSync.localCount === 2 && rSync.state === 'SYNCED_OK' && rSync.localCount === 1) {
       break
     }
     await new Promise(r => setTimeout(r, 25))
@@ -1511,23 +1560,32 @@ os.execvp("node", ["node", sys.argv[3], "--state", sys.argv[4], "--config", sys.
   const anyRequestedStranger = seenChannelReqs.some(r =>
     r.filters.some(f => Array.isArray(f.authors) && f.authors.includes(dennis.pk))
   )
+  const anyGlobalRequestedMemWriteWhileOff = globalReqs.some(r =>
+    r.filters.some(f => Array.isArray(f.authors) && f.authors.includes(waggleDev.pk))
+  )
   const anyUnscoped30078 = seenChannelReqs.some(r =>
     r.filters.some(f => Array.isArray(f.kinds) && f.kinds.includes(FALLBACK_MEMORY_KIND) && (!Array.isArray(f.authors) || f.authors.length === 0))
   )
+  const shadowStored = fbDaemon.store.entries.get(`${deadRabbit.pk}:${shadowOps30078.tags[0][1]}`)
+  const shadowEval = fbDaemon.store.evaluateClaim(shadowStored, { nowSec })
 
-  ok('30078 sync: James test 30078 claim reaches localCount 1 with remoteCount 1 (non-channel read-state 30078 ignored) and no false RELAY_EVICTED_WARNING',
+  ok('30078 sync (allowMemoryWriteCap=false): James test 30078 claim and shadow writer first 30078 claim reach localCount 2 with remoteCount 2 (non-channel read-state and room 30078 ignored) and no false RELAY_EVICTED_WARNING',
     fbGlobalSync.state === 'SYNCED_OK' &&
-    fbGlobalSync.localCount === 1 &&
-    fbGlobalSync.remoteCount === 1 &&
-    fbGlobalSync.missingCount === 0)
+    fbGlobalSync.localCount === 2 &&
+    fbGlobalSync.remoteCount === 2 &&
+    fbGlobalSync.missingCount === 0 &&
+    shadowEval.verification === 'accepted' &&
+    shadowEval.computedRank === 3)
 
-  ok('30078 sync: global REQ scopes 30078 to [ownerPubkey] only, never requests unscoped or stranger 30078, and room REQ re-issues under same subId when 39002 arrives',
+  const lastGlobalReqOff = globalReqs[globalReqs.length - 1]
+  ok('30078 sync (allowMemoryWriteCap=false): global REQ includes [ownerPubkey, shadowWriter], excludes memory-write holder while flag is off and excludes stranger, and room REQ re-issues under same subId when 39002 arrives',
     !anyRequestedStranger &&
+    !anyGlobalRequestedMemWriteWhileOff &&
     !anyUnscoped30078 &&
     globalReqs.length >= 1 &&
-    JSON.stringify(globalReqs[0].filters) === JSON.stringify([
+    JSON.stringify(lastGlobalReqOff.filters) === JSON.stringify([
       { kinds: [MEMORY_KIND, 5], '#h': [GLOBAL_CH] },
-      { kinds: [FALLBACK_MEMORY_KIND], authors: [james.pk] },
+      { kinds: [FALLBACK_MEMORY_KIND], authors: [james.pk, deadRabbit.pk].sort() },
     ]) &&
     roomReqs.length === 2 &&
     roomReqs[0].filters.length === 1 &&
@@ -1540,6 +1598,68 @@ os.execvp("node", ["node", sys.argv[3], "--state", sys.argv[4], "--config", sys.
     fbRoomSync.missingCount === 0)
 
   await fbDaemon.close()
+
+  // Regression case 2: allowMemoryWriteCap=true with an empty local store — a memory-write holder's
+  // VERY FIRST claim is kind 30078 (not yet locally ingested), discovered via owner kind 440 grants.
+  seenChannelReqs.length = 0
+  const capOnStateDir = join(daemonDir, 'fb-cap-on-state')
+  const capOnSockDir = join(daemonDir, 'fb-cap-on-socks')
+  mkdirSync(capOnStateDir, { recursive: true, mode: 0o700 })
+  const capOnCfgPath = join(daemonDir, 'fb-cap-on-config.json')
+  writeFileSync(capOnCfgPath, JSON.stringify({
+    memoryGlobalChannelId: GLOBAL_CH,
+    ownerPubkey: james.pk,
+    subscribedRooms: [],
+    allowMemoryWriteCap: true,
+    relayUrl: relayUrl30078,
+    relayPubkey: relayKey.pk,
+    grantRelays: [relayUrl30078],
+    readers: {
+      biggy: myDude.pk,
+      viewer: null,
+    },
+  }))
+
+  const capOnDaemon = await startMemoryDaemon({
+    stateDir: capOnStateDir,
+    configPath: capOnCfgPath,
+    readers: 'biggy:viewer',
+    socketDir: capOnSockDir,
+    credentialsDir: credDir,
+    makeBunker: () => fakeBunkerDelegate,
+  })
+
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const gSync = capOnDaemon.store.getChannelSync(GLOBAL_CH, nowSec)
+    if (gSync.state === 'SYNCED_OK' && gSync.localCount === 3) {
+      break
+    }
+    await new Promise(r => setTimeout(r, 25))
+  }
+
+  const capOnGlobalSync = capOnDaemon.store.getChannelSync(GLOBAL_CH, nowSec)
+  const capOnGlobalReqs = seenChannelReqs.filter(r => r.subId === 'mem-ch-0')
+  const lastGlobalReqOn = capOnGlobalReqs[capOnGlobalReqs.length - 1]
+  const memWriteStored = capOnDaemon.store.entries.get(`${waggleDev.pk}:${memWriteOps30078.tags[0][1]}`)
+  const memWriteEval = capOnDaemon.store.evaluateClaim(memWriteStored, { nowSec })
+  const capOnRequestedStranger = seenChannelReqs.some(r =>
+    r.filters.some(f => Array.isArray(f.authors) && f.authors.includes(dennis.pk))
+  )
+
+  ok('30078 sync (allowMemoryWriteCap=true): discovers memory-write holder with no prior ingested claim, includes [ownerPubkey, shadowWriter, memWriteWriter] in global 30078 filter, and accepts first 30078 claim',
+    !capOnRequestedStranger &&
+    capOnGlobalSync.state === 'SYNCED_OK' &&
+    capOnGlobalSync.localCount === 3 &&
+    capOnGlobalSync.remoteCount === 3 &&
+    capOnGlobalSync.missingCount === 0 &&
+    memWriteEval.verification === 'accepted' &&
+    memWriteEval.computedRank === 3 &&
+    JSON.stringify(lastGlobalReqOn?.filters) === JSON.stringify([
+      { kinds: [MEMORY_KIND, 5], '#h': [GLOBAL_CH] },
+      { kinds: [FALLBACK_MEMORY_KIND], authors: [james.pk, deadRabbit.pk, waggleDev.pk].sort() },
+    ]))
+
+  await capOnDaemon.close()
   await new Promise(r => wss30078.close(r))
 }
 

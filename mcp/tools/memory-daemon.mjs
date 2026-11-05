@@ -536,13 +536,17 @@ function startCommunityRelaySync({
     const fallbackAuthorsForChannel = ch => {
       const normalizedCh = String(ch || '').toLowerCase()
       if (normalizedCh === String(store.memoryGlobalChannelId || '').toLowerCase()) {
+        if (typeof store.acceptedGlobalWriters === 'function') {
+          return store.acceptedGlobalWriters()
+        }
         const authors = new Set()
         const owner = String(store.ownerPubkey || '').toLowerCase()
         if (HEX64.test(owner)) authors.add(owner)
-        if (store.allowMemoryWriteCap && store.grantView?.writers instanceof Map) {
-          for (const writer of store.grantView.writers.keys()) {
+        if (store.grantView?.writers instanceof Map) {
+          for (const [writer, heldCaps] of store.grantView.writers.entries()) {
             const w = String(writer || '').toLowerCase()
-            if (HEX64.test(w)) authors.add(w)
+            const qualifies = Boolean(heldCaps?.has('shadow')) || (store.allowMemoryWriteCap && Boolean(heldCaps?.has('memory-write')))
+            if (HEX64.test(w) && qualifies) authors.add(w)
           }
         }
         return [...authors].sort()

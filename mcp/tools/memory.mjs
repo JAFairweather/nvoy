@@ -414,17 +414,52 @@ export async function refreshMemoryGrants({
     }
   }
 
-  const phase1Targets = targetWriters.length ? targetWriters : [owner]
   const relayCompletedAll = new Map(relays.map((_, i) => [i, true]))
+  const discoveredByWriterPerRelay = new Map() // writer -> Map(relayIdx -> Set(grantId))
   const grantsByWriterPerRelay = new Map() // writer -> Map(relayIdx -> Set(grantId))
   const validGrants = new Map() // grantId -> event
   const allGrantEvents = new Map() // eventId -> event
+  const discoveredWriters = new Set()
 
   const lookupAnswered = res =>
     res && res.eose === true && !res.closed && Array.isArray(res.events) && res.events.length < limit
 
+  // Phase 0: Discover granted writers from owner's kind 440 grants so a writer whose first claim is
+  // kind 30078 (not yet locally ingested) still enters the grant view and the fallback author filter.
+  await Promise.all(relays.map(async (url, idx) => {
+    let res
+    try {
+      res = await queryFn(url, { kinds: [440], authors: [owner], limit })
+    } catch {
+      res = { events: [], eose: false }
+    }
+    if (!lookupAnswered(res)) {
+      relayCompletedAll.set(idx, false)
+      return
+    }
+    for (const ev of res.events) {
+      if (!ev || ev.kind !== 440 || String(ev.pubkey || '').toLowerCase() !== owner) continue
+      const pTag = String(tagValue(ev, 'p') || '').toLowerCase()
+      if (!HEX64.test(pTag) || pTag === owner) continue
+      const cap = tagValue(ev, 'da-cap')
+      const allowedCap = cap === 'shadow' || (allowMemoryWriteCap && cap === MEMORY_WRITE_CAP)
+      if (!allowedCap && !targetWriters.includes(pTag)) continue
+      let ok = false; try { ok = verifyEvent(ev) } catch { ok = false }
+      if (!ok) continue
+      discoveredWriters.add(pTag)
+      if (!discoveredByWriterPerRelay.has(pTag)) discoveredByWriterPerRelay.set(pTag, new Map())
+      const perRelay = discoveredByWriterPerRelay.get(pTag)
+      if (!perRelay.has(idx)) perRelay.set(idx, new Set())
+      perRelay.get(idx).add(ev.id)
+      validGrants.set(ev.id, ev)
+      allGrantEvents.set(ev.id, ev)
+    }
+  }))
+
+  const allTargetWriters = [...new Set([...targetWriters, ...discoveredWriters])]
+
   // Phase 1: For each writer, ask every relay for kinds: [440], authors: [owner], #p: [writer]
-  for (const writer of phase1Targets) {
+  for (const writer of allTargetWriters) {
     const perRelay = new Map()
     grantsByWriterPerRelay.set(writer, perRelay)
     await Promise.all(relays.map(async (url, idx) => {
@@ -438,7 +473,7 @@ export async function refreshMemoryGrants({
         relayCompletedAll.set(idx, false)
         return
       }
-      const ids = new Set()
+      const ids = new Set(discoveredByWriterPerRelay.get(writer)?.get(idx) || [])
       for (const ev of res.events) {
         if (!ev || ev.kind !== 440 || String(ev.pubkey || '').toLowerCase() !== owner) continue
         const pTag = tagValue(ev, 'p')
@@ -518,7 +553,7 @@ export async function refreshMemoryGrants({
   // might have a live re-grant on the relay that failed to answer.
   const partialWriters = new Set()
   if (!complete) {
-    for (const writer of targetWriters) {
+    for (const writer of allTargetWriters) {
       if (!folded.writers.has(writer)) partialWriters.add(writer)
     }
   }
@@ -821,11 +856,12 @@ export class MemoryStore {
 
   // Runs the two-phase targeted grant refresh and updates the in-memory grant view.
   async refreshGrants({ relays = [], queryFn, nowSec = Math.floor(Date.now() / 1000) }) {
-    const candidateWriters = [...new Set(
-      [...this.entries.values()]
+    const candidateWriters = [...new Set([
+      ...[...this.entries.values()]
         .filter(e => e.status === 'active' && (e.scopeType === 'hive:ops' || e.scopeType === 'hive:canon'))
-        .map(e => e.pubkey)
-    )]
+        .map(e => e.pubkey),
+      ...this.grantView.writers.keys(),
+    ])]
     const res = await refreshMemoryGrants({
       writers: candidateWriters,
       ownerPubkey: this.ownerPubkey,
@@ -867,6 +903,27 @@ export class MemoryStore {
       partialWriters: res.partialWriters,
     }
     return this.grantView
+  }
+
+  qualifiesGlobalOps(heldCaps) {
+    return Boolean(heldCaps?.has('shadow')) || (this.allowMemoryWriteCap && Boolean(heldCaps?.has(MEMORY_WRITE_CAP)))
+  }
+
+  // Returns the sorted set of pubkeys whose global claims (hive:canon or hive:ops) can be accepted
+  // under the current grant view and allowMemoryWriteCap policy: the memory owner, plus any writer
+  // holding a live shadow grant (always) or a live memory-write grant (when allowMemoryWriteCap is true).
+  acceptedGlobalWriters() {
+    const authors = new Set()
+    if (HEX64.test(this.ownerPubkey)) authors.add(this.ownerPubkey)
+    if (this.grantView?.writers instanceof Map) {
+      for (const [writer, heldCaps] of this.grantView.writers.entries()) {
+        const w = String(writer || '').toLowerCase()
+        if (HEX64.test(w) && this.qualifiesGlobalOps(heldCaps)) {
+          authors.add(w)
+        }
+      }
+    }
+    return [...authors].sort()
   }
 
   // Evaluates a stored claim at read time: computes verification ('accepted' | 'unverified' | 'rejected')
@@ -964,7 +1021,7 @@ export class MemoryStore {
         }
       }
 
-      const qualifiesOps = Boolean(heldCaps?.has('shadow')) || (this.allowMemoryWriteCap && Boolean(heldCaps?.has(MEMORY_WRITE_CAP)))
+      const qualifiesOps = this.qualifiesGlobalOps(heldCaps)
       if (!qualifiesOps) {
         return {
           verification: 'unverified',
