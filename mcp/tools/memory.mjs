@@ -813,17 +813,35 @@ export class MemoryStore {
       nowSec,
     })
 
-    // Only a complete refresh advances `grantsCheckedAt`.
-    // A partial refresh still applies revocations/expiries immediately via `writers` and `ended`.
+    // Only a complete refresh advances `grantsCheckedAt` or adds new positive writer rights.
+    // On a partial refresh, keep only the writers/capabilities that were already held from the last
+    // complete refresh and are not ended now; apply revocations and expiries seen by the partial
+    // refresh immediately, but never add a new positive right from a partial refresh.
     const nextCheckedAt = res.complete ? res.checkedAt : this.grantView.grantsCheckedAt
+    let nextWriters = res.writers
+    let nextEnded = res.ended
+    if (!res.complete) {
+      nextWriters = new Map()
+      for (const [writer, prevCaps] of this.grantView.writers.entries()) {
+        const partialCaps = res.writers.get(writer)
+        if (!partialCaps || res.ended.has(writer)) continue
+        const kept = new Map()
+        for (const [cap, info] of prevCaps.entries()) {
+          if (partialCaps.has(cap)) kept.set(cap, partialCaps.get(cap) || info)
+        }
+        if (kept.size > 0) nextWriters.set(writer, kept)
+      }
+      nextEnded = new Map([...this.grantView.ended, ...res.ended])
+      for (const writer of nextWriters.keys()) nextEnded.delete(writer)
+    }
     this.grantView = {
       grantsCheckedAt: nextCheckedAt,
       lastRefreshComplete: res.complete,
       relaysAnswered: res.relaysAnswered,
       relaysTotal: res.relaysTotal,
       disagreeingRelays: res.disagreeingRelays,
-      writers: res.writers,
-      ended: res.ended,
+      writers: nextWriters,
+      ended: nextEnded,
       partialWriters: res.partialWriters,
     }
     return this.grantView
@@ -993,6 +1011,9 @@ export class MemoryStore {
     const acceptedMatches = []
     let unverifiedCount = 0
     const unverifiedReasons = new Set()
+    // Count conflicts over every accepted claim in scope BEFORE applying the text filter (`qText`),
+    // so filtering by `text` never hides the fact that a returned claim is in conflict.
+    const byFactKey = new Map()
 
     for (const entry of this.entries.values()) {
       if (entry.status === 'withdrawn') continue
@@ -1001,26 +1022,25 @@ export class MemoryStore {
       if (roomId && entry.roomId !== String(roomId).toLowerCase()) continue
       if (topic && entry.topic !== topic) continue
       if (d && entry.d !== d) continue
+
+      if (entry.channelId) channelsToCheck.add(entry.channelId)
+      const verdict = this.evaluateClaim(entry, { nowSec, staleFiles })
+      if (verdict.verification === 'accepted') {
+        if (!byFactKey.has(entry.d)) byFactKey.set(entry.d, new Set())
+        byFactKey.get(entry.d).add(entry.claim)
+      }
+
       if (qText) {
         const hay = `${entry.d} ${entry.topic} ${entry.claim} ${entry.because} ${(entry.evidence || []).join(' ')}`.toLowerCase()
         if (!hay.includes(qText)) continue
       }
 
-      if (entry.channelId) channelsToCheck.add(entry.channelId)
-      const verdict = this.evaluateClaim(entry, { nowSec, staleFiles })
       if (verdict.verification === 'accepted') {
         acceptedMatches.push({ entry, verdict })
       } else if (verdict.verification === 'unverified') {
         unverifiedCount++
         if (verdict.verificationReason) unverifiedReasons.add(verdict.verificationReason)
       }
-    }
-
-    // Detect conflicts among accepted claims sharing the same fact key (`d` tag) with different `claim` text.
-    const byFactKey = new Map()
-    for (const item of acceptedMatches) {
-      if (!byFactKey.has(item.entry.d)) byFactKey.set(item.entry.d, new Set())
-      byFactKey.get(item.entry.d).add(item.entry.claim)
     }
 
     acceptedMatches.sort((a, b) => {

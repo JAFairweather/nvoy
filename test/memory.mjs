@@ -550,6 +550,9 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
   const qRoomA = store.query({ scope: `room:${ROOM_A}`, limit: 2, nowSec: T0, staleFiles: staleSet })
   ok('two authors under the same fact key (d) are marked conflict: true',
     qRoomA.records.length === 2 && qRoomA.records.every(r => r.conflict === true))
+  const qRoomATextFiltered = store.query({ scope: `room:${ROOM_A}`, text: 'release-candidate', nowSec: T0 })
+  ok('conflict detection is computed before text filtering so a text-filtered query still marks conflict: true',
+    qRoomATextFiltered.records.length === 1 && qRoomATextFiltered.records[0].conflict === true)
   ok('query larger than its limit reports omitted count and next_cursor',
     qRoomA.total_matched === 3 && qRoomA.returned === 2 && qRoomA.omitted === 1 && qRoomA.next_cursor === '2')
 
@@ -587,6 +590,49 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
     bulkWake.char_length <= 2000 &&
     bulkWake.digest.includes('## Unverified claims (not ranked)') &&
     bulkWake.counts.unverified_total === 68)
+
+  // Partial refresh never adds a positive right: complete empty refresh at T0, then partial refresh at T0+2
+  // where relay A returns a new shadow grant and relay B is CLOSED -> claim stays unverified / grant-missing
+  const partialDir = mkdtempSync(join(tmpdir(), 'mem-partial-'))
+  const partialStore = new MemoryStore({
+    statePath: join(partialDir, 'partial_no_new_right.json'),
+    readerPubkey: myDude.pk,
+    ownerPubkey: james.pk,
+    memoryGlobalChannelId: GLOBAL_CH,
+  })
+  const waggleOpsClaim = signClaim(waggleDev, {
+    scope: 'hive:ops',
+    slug: 'partial-grant-test',
+    claim: 'Partial refresh must not grant new positive rights.',
+    because: 'Only complete refreshes add positive rights.',
+    evidence: ['waggle@a1b2c3d:docs/DESIGN_HIVE_MEMORY.md'],
+    asOfGit: 'waggle@a1b2c3d',
+  })
+  partialStore.ingestEvent(waggleOpsClaim, { nowSec: T0 })
+  await partialStore.refreshGrants({
+    relays: ['wss://relay-a', 'wss://relay-b'],
+    nowSec: T0,
+    queryFn: async () => ({ eose: true, closed: false, limitReached: false, events: [] }),
+  })
+  const shadowGrant = makeGrant(james, waggleDev.pk, 'shadow', {
+    subject: james.pk,
+    at: T0 + 1,
+  })
+  await partialStore.refreshGrants({
+    relays: ['wss://relay-a', 'wss://relay-b'],
+    nowSec: T0 + 2,
+    queryFn: async (relay) => relay === 'wss://relay-a'
+      ? { eose: true, closed: false, limitReached: false, events: [shadowGrant] }
+      : { eose: false, closed: true, limitReached: false, events: [] },
+  })
+  const partialEval = partialStore.evaluateClaim(
+    partialStore.entries.get(`${waggleDev.pk}:${waggleOpsClaim.tags[0][1]}`),
+    { nowSec: T0 + 2 }
+  )
+  ok('partial refresh after a complete empty refresh does not grant a new positive right',
+    partialStore.grantView.lastRefreshComplete === false &&
+    partialEval.verification === 'unverified' &&
+    partialEval.verificationReason === 'grant-missing')
 }
 
 console.log(`\n${passes} passed, ${fails} failed`)
