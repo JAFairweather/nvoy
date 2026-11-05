@@ -18,7 +18,7 @@
 //   4. Keyless readers (configured with pubkey: null) receive hive:canon (Rank 2) and hive:ops (Rank 3)
 //      only; room and self scopes are rejected.
 
-import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { join, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
@@ -651,11 +651,13 @@ export async function startMemoryDaemon({
     }
   } else if (socketDir) {
     const resolvedSockDir = resolve(socketDir)
-    mkdirSync(resolvedSockDir, { recursive: true, mode: 0o755 })
+    mkdirSync(resolvedSockDir, { recursive: true, mode: 0o700 })
+    chmodSync(resolvedSockDir, 0o700)
     for (const readerName of readers) {
       const sockPath = join(resolvedSockDir, `${readerName}.sock`)
       if (existsSync(sockPath)) rmSync(sockPath, { force: true })
       await attachSocketServer(readerName, sockPath)
+      chmodSync(sockPath, 0o600)
     }
   } else {
     throw new Error('memory-daemon requires either systemd LISTEN_FDS socket activation or --socket-dir <dir>')
@@ -721,6 +723,10 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const configPath = flag('--config') || ''
   const readers = flag('--readers') || process.env.LISTEN_FDNAMES || ''
   const socketDir = flag('--socket-dir') || null
+  if (socketDir && process.env.HIVE_MEMORY_ALLOW_SOCKET_DIR !== '1') {
+    console.error('hive-memory: --socket-dir is for local tests only (set HIVE_MEMORY_ALLOW_SOCKET_DIR=1); production requires systemd LISTEN_FDS')
+    process.exit(1)
+  }
 
   startMemoryDaemon({ stateDir, configPath, readers, socketDir }).catch(err => {
     console.error(`hive-memory: ${err.message}`)

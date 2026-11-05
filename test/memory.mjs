@@ -2,7 +2,7 @@
 // Covers all 25 edge-case fixtures from the Slice 0 specification + waggle-dev's review probes.
 
 import { spawn } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { connect } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -765,6 +765,10 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
   })
   ok('memory-daemon initialize binds serverInfo to the socket reader name',
     initBiggy.result?.serverInfo?.name === 'hive-memory-biggy')
+  ok('socketDir mode enforces 0700 on directory and 0600 on reader sockets',
+    (statSync(sockDir).mode & 0o777) === 0o700 &&
+    (statSync(join(sockDir, 'biggy.sock')).mode & 0o777) === 0o600 &&
+    (statSync(join(sockDir, 'hr.sock')).mode & 0o777) === 0o600)
 
   const wakeBiggyResp = await rpcCall(join(sockDir, 'biggy.sock'), {
     jsonrpc: '2.0',

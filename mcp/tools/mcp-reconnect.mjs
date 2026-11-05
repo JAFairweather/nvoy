@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Keep one stdio MCP server alive under a client that does not reconnect. Usage:
-//   mcp-reconnect.mjs [--max-backoff-ms N] -- <command> [args...]
+//   mcp-reconnect.mjs [--max-backoff-ms N] [--wake-herdr <agent>] -- <command> [args...]
 // An interactive Claude Code session holds its channel over `ssh`, and every fleet deploy recreates
 // the broker's container, which ends that ssh. Claude Code then marks the server failed until someone
 // runs /mcp by hand (waggle-dev, after nvoy #264 and #265, 2026-10-27). A supervised harness restarts
@@ -12,14 +12,21 @@
 // already has one. Requests in flight when the command died, and any sent while it is down, are
 // answered with an error rather than left hanging. It reads no message body beyond the JSON-RPC
 // envelope, and it holds no key: authentication stays with the command.
+//
+// --wake-herdr names the herdr agent this client runs as. For a client that does not act on a
+// channel's wake markers itself (agy), each marker is also typed into that agent's pane once it is
+// idle (herdr_wake.mjs). That is the one exception to reading only the envelope: a marker's
+// envelope id is read, checked, and nothing else.
 
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
+import { herdrClient } from './harness_herdr.mjs'
+import { herdrWaker } from './herdr_wake.mjs'
 
 const argv = process.argv.slice(2)
 const split = argv.indexOf('--')
 const die = message => { console.error(`mcp-reconnect: ${message}`); process.exit(2) }
-if (split < 0 || split === argv.length - 1) die('usage: mcp-reconnect.mjs [--max-backoff-ms N] -- <command> [args...]')
+if (split < 0 || split === argv.length - 1) die('usage: mcp-reconnect.mjs [--max-backoff-ms N] [--wake-herdr <agent>] -- <command> [args...]')
 const options = argv.slice(0, split), [command, ...args] = argv.slice(split + 1)
 const flag = name => { const i = options.indexOf(name); return i < 0 ? '' : options[i + 1] || '' }
 const maxBackoffMs = Number(flag('--max-backoff-ms') || 30000)
@@ -27,6 +34,11 @@ const stableMs = Number(flag('--stable-ms') || 60000)
 if (!Number.isInteger(maxBackoffMs) || maxBackoffMs < 100) die('--max-backoff-ms must be an integer >= 100')
 
 const log = message => console.error(`mcp-reconnect: ${message}`)
+const wakeAgent = flag('--wake-herdr')
+if (options.includes('--wake-herdr') && !/^[a-z][a-z0-9_-]{0,31}$/.test(wakeAgent)) die('--wake-herdr must be a herdr agent name')
+const wakeEveryMs = Number(flag('--wake-every-ms') || 2000)
+if (!Number.isInteger(wakeEveryMs) || wakeEveryMs < 100 || wakeEveryMs > 60000) die('--wake-every-ms must be 100..60000')
+const waker = wakeAgent ? herdrWaker({ agent: wakeAgent, herdr: herdrClient(), log, everyMs: wakeEveryMs }) : null
 const toClient = message => process.stdout.write(JSON.stringify(message) + '\n')
 const isRequest = m => m && m.method && m.id !== undefined && m.id !== null
 const isResponse = m => m && !m.method && m.id !== undefined && m.id !== null
@@ -57,6 +69,7 @@ function start() {
       return log('reconnected')
     }
     if (isResponse(message)) inFlight.delete(message.id)
+    waker?.notice(message)
     toClient(message)
   })
   proc.stdin.on('error', () => {})
