@@ -54,7 +54,9 @@ export function herdrClient({ bin = process.env.HARNESS_HERDR_BIN || 'herdr', en
     // prompt or a startup screen that is no longer there.
     read(pane) { return call(['pane', 'read', pane, '--source', 'visible'], { json: false }) },
     keys(pane, ...keys) { call(['pane', 'send-keys', pane, ...keys]) },
+    text(pane, text) { call(['pane', 'send-text', pane, text], { json: false }) },
     agent(pane) { return (call(['agent', 'list']).agents || []).find(a => a.pane_id === pane) || null },
+    agentNamed(name) { return (call(['agent', 'list']).agents || []).find(a => a.name === name) || null },
     name(pane, name) { call(['agent', 'rename', pane, name]) },
   }
   return client
