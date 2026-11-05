@@ -1,11 +1,13 @@
 // test/memory.mjs — acceptance test suite for Hive Shared Memory (docs/DESIGN_HIVE_MEMORY.md).
 // Covers all 25 edge-case fixtures from the Slice 0 specification + waggle-dev's review probes.
 
-import { mkdtempSync, readFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { connect } from 'node:net'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
+import { WebSocketServer } from 'ws'
 import { scopeHash } from '../mcp/tools/grant_fold.mjs'
 import {
   MemoryStore,
@@ -14,7 +16,12 @@ import {
   checkMemorySecrets,
   nip01Newer,
 } from '../mcp/tools/memory.mjs'
-import { parseReadersFlag, startMemoryDaemon } from '../mcp/tools/memory-daemon.mjs'
+import {
+  createNip42AuthOnlySigner,
+  parseReadersFlag,
+  startMemoryDaemon,
+  validateAndResolveConfig,
+} from '../mcp/tools/memory-daemon.mjs'
 
 let passes = 0, fails = 0
 const ok = (name, cond) => {
@@ -818,12 +825,348 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
       readers: 'biggy:hr',
       listenFds: 1,
       listenFdNames: 'biggy',
+      config: {
+        ownerPubkey: james.pk,
+        memoryGlobalChannelId: GLOBAL_CH,
+        readers: { biggy: myDude.pk, hr: null },
+      },
     })
   } catch (err) {
     fdMismatchErr = err
   }
   ok('memory-daemon rejects LISTEN_FDS mismatch against --readers',
     Boolean(fdMismatchErr && /LISTEN_FDS/.test(fdMismatchErr.message)))
+
+  // Config validation checks (Rabid Rabbit #1):
+  // - missing --config fails
+  // - stateDir/config.json is never read
+  // - invalid memoryGlobalChannelId fails
+  // - typo in reader pubkey fails instead of silently making the reader keyless
+  writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
+    ownerPubkey: james.pk,
+    memoryGlobalChannelId: GLOBAL_CH,
+    readers: { biggy: myDude.pk, hr: null },
+  }))
+  let missingCfgErr = null
+  try {
+    await startMemoryDaemon({
+      stateDir,
+      readers: 'biggy:hr',
+      socketDir: sockDir,
+    })
+  } catch (err) {
+    missingCfgErr = err
+  }
+  ok('memory-daemon requires --config and never reads config.json from --state',
+    Boolean(missingCfgErr && /--config <path> is required/.test(missingCfgErr.message)))
+
+  let badUuidErr = null
+  try {
+    validateAndResolveConfig({
+      ownerPubkey: james.pk,
+      memoryGlobalChannelId: 'not-a-uuid',
+      readers: { biggy: myDude.pk },
+    }, ['biggy'])
+  } catch (err) {
+    badUuidErr = err
+  }
+  ok('validateAndResolveConfig rejects non-UUID memoryGlobalChannelId',
+    Boolean(badUuidErr && /memoryGlobalChannelId must be a valid UUID/.test(badUuidErr.message)))
+
+  let typoPubkeyErr = null
+  try {
+    validateAndResolveConfig({
+      ownerPubkey: james.pk,
+      memoryGlobalChannelId: GLOBAL_CH,
+      readers: { biggy: 'zzzz-typo-pubkey' },
+    }, ['biggy'])
+  } catch (err) {
+    typoPubkeyErr = err
+  }
+  ok('validateAndResolveConfig rejects malformed reader pubkey instead of silently making reader keyless',
+    Boolean(typoPubkeyErr && /must be a 64-character hex string or null/.test(typoPubkeyErr.message)))
+
+  let missingReaderErr = null
+  try {
+    validateAndResolveConfig({
+      ownerPubkey: james.pk,
+      memoryGlobalChannelId: GLOBAL_CH,
+      readers: { biggy: myDude.pk },
+    }, ['biggy', 'waggle-dev'])
+  } catch (err) {
+    missingReaderErr = err
+  }
+  ok('validateAndResolveConfig rejects when a --readers entry is missing from config.readers',
+    Boolean(missingReaderErr && /is not listed in config\.readers/.test(missingReaderErr.message)))
+
+  // NIP-42 AUTH-only signer checks (Rabid Rabbit #2):
+  const daemonRelayIdentity = key()
+  const authSigner = createNip42AuthOnlySigner(
+    Buffer.from(daemonRelayIdentity.sk).toString('hex'),
+    'wss://nave.communities.buzz.xyz',
+    { now: () => nowSec }
+  )
+  const signedAuth = await authSigner.signEvent({
+    kind: 22242,
+    created_at: nowSec,
+    content: '',
+    tags: [['relay', 'wss://nave.communities.buzz.xyz'], ['challenge', 'challenge-token-12345']],
+  })
+  ok('createNip42AuthOnlySigner signs a valid kind 22242 NIP-42 AUTH challenge for its configured relay',
+    signedAuth.kind === 22242 && signedAuth.pubkey === daemonRelayIdentity.pk)
+
+  let signClaimRefused = null
+  try {
+    await authSigner.signEvent({
+      kind: 30079,
+      created_at: nowSec,
+      content: '{}',
+      tags: [['d', 'hive-memory:hive:ops:test']],
+    })
+  } catch (err) {
+    signClaimRefused = err
+  }
+  ok('createNip42AuthOnlySigner refuses to sign kind 30079 claims (HIVE_MEMORY_DAEMON_NO_SIGN)',
+    Boolean(signClaimRefused && signClaimRefused.code === 'HIVE_MEMORY_DAEMON_NO_SIGN'))
+
+  // Live relay ingestion (30079 + 39002 + NIP-42 AUTH) & two-phase 440/441 grant refresh in memory-daemon (Rabid Rabbit #3):
+  const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 })
+  await new Promise(r => wss.once('listening', r))
+  const wsPort = wss.address().port
+  const localRelayUrl = `ws://127.0.0.1:${wsPort}`
+
+  const liveOpsClaim = signClaim(deadRabbit, {
+    scope: 'hive:ops',
+    slug: 'live-ingested-ops',
+    claim: 'Daemon ingested this claim over live WebSocket after NIP-42 AUTH.',
+    because: 'Testing end-to-end daemon ingestion.',
+    evidence: ['waggle@a2c1781f:docs/DESIGN_HIVE_MEMORY.md'],
+    asOfGit: 'waggle@a2c1781f',
+    nowSec,
+  })
+  const liveRoomClaim = signClaim(waggleDev, {
+    scope: `room:${ROOM_A}`,
+    slug: 'live-room-claim',
+    claim: 'Room A live claim after 39002 member list.',
+    because: 'Testing 39002 ingestion.',
+    evidence: ['waggle@a2c1781f:docs/DESIGN_HIVE_MEMORY.md'],
+    asOfGit: 'waggle@a2c1781f',
+    nowSec,
+  })
+  const liveRoomList = sign({
+    kind: 39002,
+    created_at: nowSec,
+    content: '',
+    tags: [['d', ROOM_A], ['p', myDude.pk], ['p', waggleDev.pk]],
+  }, relayKey.sk)
+  const liveShadowGrant = makeGrant(james, deadRabbit.pk, 'shadow', { at: nowSec - 60 })
+
+  wss.on('connection', ws => {
+    let authed = false
+    ws.send(JSON.stringify(['AUTH', 'local-challenge-xyz98765']))
+    ws.on('message', raw => {
+      const msg = JSON.parse(raw.toString())
+      if (msg[0] === 'AUTH' && msg[1]?.kind === 22242) {
+        authed = true
+        ws.send(JSON.stringify(['OK', msg[1].id, true, '']))
+        return
+      }
+      if (msg[0] === 'REQ') {
+        const subId = msg[1]
+        const filter = msg[2] || {}
+        // Grant relay lookup (440 / 441)
+        if (Array.isArray(filter.kinds) && filter.kinds.includes(440)) {
+          if (filter['#p']?.includes(deadRabbit.pk)) {
+            ws.send(JSON.stringify(['EVENT', subId, liveShadowGrant]))
+          }
+          ws.send(JSON.stringify(['EOSE', subId]))
+          return
+        }
+        if (Array.isArray(filter.kinds) && filter.kinds.includes(441)) {
+          ws.send(JSON.stringify(['EOSE', subId]))
+          return
+        }
+        if (!authed) {
+          ws.send(JSON.stringify(['CLOSED', subId, 'auth-required: authenticate first']))
+          return
+        }
+        if (Array.isArray(filter.kinds) && filter.kinds.includes(39002)) {
+          ws.send(JSON.stringify(['EVENT', subId, liveRoomList]))
+          ws.send(JSON.stringify(['EOSE', subId]))
+          return
+        }
+        if (filter['#h']?.includes(GLOBAL_CH)) {
+          ws.send(JSON.stringify(['EVENT', subId, canonClaim]))
+          ws.send(JSON.stringify(['EVENT', subId, liveOpsClaim]))
+          ws.send(JSON.stringify(['EOSE', subId]))
+          return
+        }
+        if (filter['#h']?.includes(ROOM_A)) {
+          ws.send(JSON.stringify(['EVENT', subId, liveRoomClaim]))
+          ws.send(JSON.stringify(['EOSE', subId]))
+          return
+        }
+        ws.send(JSON.stringify(['EOSE', subId]))
+      }
+    })
+  })
+
+  const credDir = join(daemonDir, 'creds')
+  mkdirSync(credDir, { recursive: true, mode: 0o700 })
+  writeFileSync(join(credDir, 'relay-identity'), Buffer.from(daemonRelayIdentity.sk).toString('hex') + '\n', { mode: 0o600 })
+
+  const liveCfgPath = join(daemonDir, 'etc-config.json')
+  writeFileSync(liveCfgPath, JSON.stringify({
+    memoryGlobalChannelId: GLOBAL_CH,
+    ownerPubkey: james.pk,
+    subscribedRooms: [ROOM_A],
+    relayUrl: localRelayUrl,
+    relayPubkey: relayKey.pk,
+    grantRelays: [localRelayUrl],
+    readers: {
+      biggy: myDude.pk,
+      crusty: null,
+    },
+  }))
+
+  const liveStateDir = join(daemonDir, 'live-state')
+  const liveSockDir = join(daemonDir, 'live-socks')
+  const liveDaemon = await startMemoryDaemon({
+    stateDir: liveStateDir,
+    configPath: liveCfgPath,
+    readers: 'biggy:crusty',
+    socketDir: liveSockDir,
+    credentialsDir: credDir,
+  })
+
+  // Wait briefly for WebSocket AUTH + REQ + EOSE + grant refresh to complete
+  for (let attempt = 0; attempt < 40; attempt++) {
+    if (
+      liveDaemon.store.getChannelSync(GLOBAL_CH, nowSec).state === 'SYNCED_OK' &&
+      liveDaemon.store.getChannelSync(ROOM_A, nowSec).state === 'SYNCED_OK' &&
+      liveDaemon.store.grantView.writers.has(deadRabbit.pk)
+    ) {
+      break
+    }
+    await new Promise(r => setTimeout(r, 25))
+  }
+
+  const liveWakeResp = await rpcCall(join(liveSockDir, 'biggy.sock'), {
+    jsonrpc: '2.0',
+    id: 10,
+    method: 'tools/call',
+    params: { name: 'memory_wake', arguments: { room_id: ROOM_A } },
+  })
+  const liveWake = JSON.parse(liveWakeResp.result.content[0].text)
+  ok('memory-daemon authenticates via NIP-42, ingests 30079 + 39002, refreshes 440/441 grants, and serves SYNCED_OK',
+    liveDaemon.hasRelayCredential === true &&
+    liveWake.global_sync.state === 'SYNCED_OK' &&
+    liveWake.room_sync.state === 'SYNCED_OK' &&
+    liveWake.counts.canon_shown === 1 &&
+    liveWake.counts.ops_shown === 2 &&
+    liveWake.digest.includes('Daemon ingested this claim over live WebSocket after NIP-42 AUTH.') &&
+    liveWake.digest.includes('Room A live claim after 39002 member list.'))
+
+  await liveDaemon.close()
+  await new Promise(r => wss.close(r))
+
+  // Real systemd LISTEN_FDS / LISTEN_FDNAMES subprocess fd-passing test (Rabid Rabbit #7):
+  // Spawns memory-daemon.mjs with two pre-bound AF_UNIX listening sockets at fds 3 and 4,
+  // LISTEN_FDS=2, LISTEN_FDNAMES=biggy:crusty, and proves socket i answers as reader i
+  // regardless of what the client sends.
+  const sdSockDir = join(daemonDir, 'sd-socks')
+  mkdirSync(sdSockDir, { recursive: true, mode: 0o700 })
+  const sdBiggySock = join(sdSockDir, 'biggy.sock')
+  const sdCrustySock = join(sdSockDir, 'crusty.sock')
+  const sdCfgPath = join(daemonDir, 'sd-config.json')
+  writeFileSync(sdCfgPath, JSON.stringify({
+    memoryGlobalChannelId: GLOBAL_CH,
+    ownerPubkey: james.pk,
+    subscribedRooms: [ROOM_A],
+    readers: {
+      biggy: myDude.pk,
+      crusty: null,
+    },
+  }))
+  const daemonScriptPath = resolve(import.meta.dirname, '../mcp/tools/memory-daemon.mjs')
+
+  const sdChild = spawn(
+    'python3',
+    [
+      '-c',
+      `
+import os, socket, sys
+s0 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s0.bind(sys.argv[1])
+s0.listen(16)
+s1 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s1.bind(sys.argv[2])
+s1.listen(16)
+os.dup2(s0.fileno(), 3)
+os.dup2(s1.fileno(), 4)
+os.set_inheritable(3, True)
+os.set_inheritable(4, True)
+os.environ["LISTEN_PID"] = str(os.getpid())
+os.environ["LISTEN_FDS"] = "2"
+os.environ["LISTEN_FDNAMES"] = "biggy:crusty"
+os.execvp("node", ["node", sys.argv[3], "--state", sys.argv[4], "--config", sys.argv[5], "--readers", "biggy:crusty"])
+      `.trim(),
+      sdBiggySock,
+      sdCrustySock,
+      daemonScriptPath,
+      liveStateDir,
+      sdCfgPath,
+    ],
+    { stdio: ['ignore', 'pipe', 'pipe'] }
+  )
+
+  let sdReady = false
+  for (let attempt = 0; attempt < 40; attempt++) {
+    try {
+      const pingResp = await rpcCall(sdBiggySock, { jsonrpc: '2.0', id: 1, method: 'ping' })
+      if (pingResp?.result) {
+        sdReady = true
+        break
+      }
+    } catch {
+      /* wait for child to attach to fds 3 & 4 */
+    }
+    await new Promise(r => setTimeout(r, 25))
+  }
+
+  const sdBiggyQueryResp = await rpcCall(sdBiggySock, {
+    jsonrpc: '2.0',
+    id: 20,
+    method: 'tools/call',
+    params: {
+      name: 'memory_query',
+      arguments: { scope: 'hive:canon', reader: 'crusty', reader_pubkey: null },
+    },
+  })
+  const sdBiggyQuery = JSON.parse(sdBiggyQueryResp.result.content[0].text)
+
+  const sdCrustyQueryResp = await rpcCall(sdCrustySock, {
+    jsonrpc: '2.0',
+    id: 21,
+    method: 'tools/call',
+    params: {
+      name: 'memory_query',
+      arguments: { scope: 'hive:canon', reader: 'biggy', reader_pubkey: myDude.pk },
+    },
+  })
+  const sdCrustyQuery = JSON.parse(sdCrustyQueryResp.result.content[0].text)
+
+  sdChild.kill('SIGTERM')
+  await new Promise(r => sdChild.once('exit', r))
+
+  ok('systemd LISTEN_FDS/LISTEN_FDNAMES fd-passing: fd 3 (biggy.sock) and fd 4 (crusty.sock) bind to their respective readers regardless of client args',
+    sdReady === true &&
+    sdBiggyQuery.reader === 'biggy' &&
+    sdBiggyQuery.reader_pubkey === myDude.pk &&
+    sdBiggyQuery.answer === 'found' &&
+    sdCrustyQuery.reader === 'crusty' &&
+    sdCrustyQuery.reader_pubkey === null &&
+    sdCrustyQuery.answer === 'found')
 }
 
 console.log(`\n${passes} passed, ${fails} failed`)
