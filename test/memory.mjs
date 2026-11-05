@@ -903,6 +903,52 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
   ok('validateAndResolveConfig rejects when a --readers entry is missing from config.readers',
     Boolean(missingReaderErr && /is not listed in config\.readers/.test(missingReaderErr.message)))
 
+  let missingRelayPubkeyForRoomsErr = null
+  try {
+    validateAndResolveConfig({
+      ownerPubkey: james.pk,
+      memoryGlobalChannelId: GLOBAL_CH,
+      subscribedRooms: [ROOM_A],
+      relayPubkey: null,
+      readers: { biggy: myDude.pk },
+    }, ['biggy'])
+  } catch (err) {
+    missingRelayPubkeyForRoomsErr = err
+  }
+  ok('validateAndResolveConfig rejects non-empty subscribedRooms when relayPubkey is null',
+    Boolean(missingRelayPubkeyForRoomsErr && /relayPubkey.*subscribedRooms/.test(missingRelayPubkeyForRoomsErr.message)))
+
+  // Older replayed 39002 cannot replace a newer 39002 room member list (waggle-dev re-review):
+  {
+    const replayStore = new MemoryStore({
+      statePath: null,
+      readerPubkey: myDude.pk,
+      ownerPubkey: james.pk,
+      memoryGlobalChannelId: GLOBAL_CH,
+      subscribedRooms: [ROOM_A],
+    })
+    const newerList = sign({
+      kind: 39002,
+      created_at: nowSec,
+      content: '',
+      tags: [['d', ROOM_A], ['p', myDude.pk]],
+    }, relayKey.sk)
+    const olderReplayList = sign({
+      kind: 39002,
+      created_at: nowSec - 120,
+      content: '',
+      tags: [['d', ROOM_A], ['p', myDude.pk], ['p', waggleDev.pk]],
+    }, relayKey.sk)
+    const appliedNewer = replayStore.recordRoomMembers(newerList, { relayPubkey: relayKey.pk, checkedAt: nowSec })
+    const appliedOlder = replayStore.recordRoomMembers(olderReplayList, { relayPubkey: relayKey.pk, checkedAt: nowSec })
+    const roomSet = replayStore.roomMembers.get(ROOM_A)?.members
+    ok('recordRoomMembers keeps newer kind 39002 by created_at and ignores older replayed 39002 list',
+      appliedNewer === true &&
+      appliedOlder === false &&
+      roomSet?.has(myDude.pk) === true &&
+      roomSet?.has(waggleDev.pk) === false)
+  }
+
   // NIP-42 AUTH-only signer checks (Rabid Rabbit #2):
   const daemonRelayIdentity = key()
   const authSigner = createNip42AuthOnlySigner(
@@ -1087,6 +1133,7 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
     memoryGlobalChannelId: GLOBAL_CH,
     ownerPubkey: james.pk,
     subscribedRooms: [ROOM_A],
+    relayPubkey: relayKey.pk,
     readers: {
       biggy: myDude.pk,
       crusty: null,

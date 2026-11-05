@@ -110,6 +110,9 @@ export function validateAndResolveConfig(cfg, readers) {
   if (relayPubkey !== null && !HEX64.test(relayPubkey)) {
     throw new Error('config.relayPubkey must be a 64-character hex public key or null')
   }
+  if (subscribedRooms.length > 0 && !relayPubkey) {
+    throw new Error('config.relayPubkey must be a 64-character hex public key when config.subscribedRooms is non-empty')
+  }
 
   const rawReaders = cfg.readers
   if (!rawReaders || typeof rawReaders !== 'object' || Array.isArray(rawReaders)) {

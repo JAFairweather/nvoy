@@ -772,29 +772,46 @@ export class MemoryStore {
     }
   }
 
-  // Updates room membership from a relay-signed kind 39002 event (verifying signature and optional
-  // relayPubkey) or from an explicit member array.
+  // Updates room membership from a relay-signed kind 39002 event (verifying signature, optional
+  // relayPubkey, and NIP-01 created_at monotonicity so an older replay cannot replace a newer list)
+  // or from an explicit member array.
   recordRoomMembers(roomIdOrEvent, membersOrOpts = [], { checkedAt = Math.floor(Date.now() / 1000), relayPubkey = null } = {}) {
     if (roomIdOrEvent && typeof roomIdOrEvent === 'object' && roomIdOrEvent.kind === 39002) {
       const ev = roomIdOrEvent
       const opts = membersOrOpts && typeof membersOrOpts === 'object' && !Array.isArray(membersOrOpts) ? membersOrOpts : { checkedAt, relayPubkey }
       let valid = false; try { valid = verifyEvent(ev) } catch { valid = false }
-      if (!valid) throw new Error('kind 39002 room member list has an invalid signature')
+      if (!valid || !Number.isSafeInteger(ev.created_at)) throw new Error('kind 39002 room member list has an invalid signature')
       if (opts.relayPubkey && String(ev.pubkey || '').toLowerCase() !== String(opts.relayPubkey).toLowerCase()) {
         throw new Error('kind 39002 room member list was not signed by the expected relay key')
       }
       const id = String(tagValue(ev, 'd') || '').toLowerCase()
       if (!UUID.test(id)) throw new Error('kind 39002 d tag is not a valid room UUID')
+      const prev = this.roomMembers.get(id)
+      const evId = String(ev.id || '').toLowerCase()
+      if (
+        prev &&
+        prev.eventCreatedAt !== undefined &&
+        (ev.created_at < prev.eventCreatedAt ||
+          (ev.created_at === prev.eventCreatedAt && evId >= String(prev.eventId || '').toLowerCase()))
+      ) {
+        return false
+      }
       const members = tagValues(ev, 'p').map(m => String(m || '').toLowerCase()).filter(m => HEX64.test(m))
       this.subscribedRooms.add(id)
-      this.roomMembers.set(id, { members: new Set(members), checkedAt: opts.checkedAt ?? Math.floor(Date.now() / 1000) })
-      return
+      this.roomMembers.set(id, {
+        members: new Set(members),
+        checkedAt: opts.checkedAt ?? Math.floor(Date.now() / 1000),
+        eventCreatedAt: ev.created_at,
+        eventId: evId,
+      })
+      return true
     }
     const id = String(roomIdOrEvent || '').toLowerCase()
     if (!UUID.test(id)) throw new Error(`invalid room UUID: ${roomIdOrEvent}`)
     const set = new Set((Array.isArray(membersOrOpts) ? membersOrOpts : []).map(m => String(m).toLowerCase()).filter(m => HEX64.test(m)))
     this.subscribedRooms.add(id)
     this.roomMembers.set(id, { members: set, checkedAt })
+    return true
   }
 
   // Runs the two-phase targeted grant refresh and updates the in-memory grant view.
