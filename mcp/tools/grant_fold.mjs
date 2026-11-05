@@ -19,9 +19,9 @@
 // folded into `mentions`, never `live`: it lets the agent reach a key, never the key task the agent.
 
 import { createHash } from 'node:crypto'
-import { foldGrantsWith } from './admission.mjs'
+import { foldGrantsWith, foldMemoryGrantsWith } from './admission.mjs'
 
-export { TASK_CAPS } from './admission.mjs'
+export { TASK_CAPS, MEMORY_WRITE_CAP, DEFAULT_MEMORY_OWNER } from './admission.mjs'
 
 // The scope is a salted hash of the AGENT a grant is about (for a shadow, of the grantor itself), so
 // a grant for one agent cannot be replayed against another and the agent id does not ride in clear.
@@ -33,3 +33,5 @@ export const scopeHash = (agentHex, saltHex) => createHash('sha256').update(Buff
 // 'expired' for a key whose every grant ended, rejected: how many grantor events failed to verify, and
 // mentions: every live mention grant as { pubkey, name, grantId, grantor, created_at }, oldest first.
 export const foldGrants = (events, { me, grantors }) => foldGrantsWith(events, { me, grantors, scopeHash })
+export const foldMemoryGrants = (events, { owner, allowMemoryWrite = false, nowSec } = {}) =>
+  foldMemoryGrantsWith(events, { owner, allowMemoryWrite, scopeHash, nowSec })

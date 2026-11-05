@@ -6,6 +6,7 @@
 import { verifyEvent } from 'nostr-tools/pure'
 
 export const TASK_CAPS = ['task', 'task+act', 'task-relay']
+export const MEMORY_WRITE_CAP = 'memory-write'
 export const HOP_TAG = 'nvoy-hop'
 // The manifest's rule for a may_post.mention name (runtime_manifest.mjs), compared without case.
 export const MENTION_NAME = /^[a-z0-9][a-z0-9._-]{0,31}$/i
@@ -100,4 +101,87 @@ export function foldGrantsWith(events, { me, grantors, scopeHash }) {
   // none of it. Every live mention grant, in (created_at, id) order; agent_post.mjs merges them.
   const mentions = [...named.values()].sort((a, b) => a.created_at - b.created_at || (a.grantId < b.grantId ? -1 : 1))
   return { live, ended, rejected, mentions }
+}
+
+export const DEFAULT_MEMORY_OWNER = '4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b287ea84d'
+
+// Reader-independent grant fold for Hive Shared Memory (DESIGN_HIVE_MEMORY.md).
+// Uses one single memory owner key (`owner`, defaulting to James `4010ac43...`), never a per-broker
+// manifest `grantors` list, so two brokers with different manifest grantors still compute the exact
+// same verdict. By default (`allowMemoryWrite = false`), only `shadow` grants from `owner` are folded
+// until `memory-write` is enabled. Task grants (`task`, `task+act`, `task-relay`) and `mention`
+// grants are ignored completely.
+export function foldMemoryGrantsWith(events, {
+  owner = DEFAULT_MEMORY_OWNER,
+  allowMemoryWrite = false,
+  scopeHash,
+  nowSec = Math.floor(Date.now() / 1000),
+}) {
+  const ownerHex = String(owner || '').toLowerCase()
+  if (!HEX64.test(ownerHex)) return { writers: new Map(), ended: new Map(), rejected: 0 }
+  const activeById = new Map() // grantId -> { grantId, grantee, grantor, cap, created_at }
+  const endedReasons = new Map() // grantee -> Set<'revoked' | 'expired'>
+  let rejected = 0
+
+  const markEnded = (grantee, why) => {
+    if (!endedReasons.has(grantee)) endedReasons.set(grantee, new Set())
+    endedReasons.get(grantee).add(why)
+  }
+
+  const sorted = [...(Array.isArray(events) ? events : [])].sort((a, b) => {
+    const dt = (a?.created_at || 0) - (b?.created_at || 0)
+    if (dt !== 0) return dt
+    return String(a?.id || '') < String(b?.id || '') ? -1 : String(a?.id || '') > String(b?.id || '') ? 1 : 0
+  })
+
+  const revocations = []
+  for (const ev of sorted) {
+    const author = String(ev?.pubkey || '').toLowerCase()
+    if (author !== ownerHex) continue
+    let ok = false; try { ok = verifyEvent(ev) } catch { ok = false }
+    if (!ok) { rejected++; continue }
+    if (ev.kind === 441) {
+      revocations.push(ev)
+      continue
+    }
+    if (ev.kind !== 440) continue
+    const grantee = String(tag(ev, 'p')?.[1] || '').toLowerCase()
+    const scope = tag(ev, 'da-scope')
+    const cap = tag(ev, 'da-cap')?.[1]
+    if (!HEX64.test(grantee) || !scope || !cap) continue
+    const allowedCap = cap === 'shadow' || (allowMemoryWrite && cap === MEMORY_WRITE_CAP)
+    if (!allowedCap) continue
+    // Both `shadow` and `memory-write` scope to the memory owner's own key.
+    if (scope[1] !== scopeHash(ownerHex, scope[2] || '') || (cap === 'shadow' && grantee === ownerHex)) continue
+    if (grantExpired(ev, nowSec)) {
+      markEnded(grantee, 'expired')
+      continue
+    }
+    activeById.set(ev.id, { grantId: ev.id, grantee, grantor: ownerHex, cap, created_at: ev.created_at || 0 })
+  }
+
+  for (const rev of revocations) {
+    const id = tag(rev, 'e')?.[1]
+    const held = id ? activeById.get(id) : null
+    if (held) {
+      activeById.delete(id)
+      markEnded(held.grantee, 'revoked')
+    }
+  }
+
+  const writers = new Map() // grantee -> Map(cap -> { grantId, grantor, cap, created_at })
+  for (const g of activeById.values()) {
+    if (!writers.has(g.grantee)) writers.set(g.grantee, new Map())
+    const caps = writers.get(g.grantee)
+    const prev = caps.get(g.cap)
+    if (!prev || g.created_at > prev.created_at || (g.created_at === prev.created_at && g.grantId > prev.grantId)) {
+      caps.set(g.cap, { grantId: g.grantId, grantor: g.grantor, cap: g.cap, created_at: g.created_at })
+    }
+  }
+
+  const ended = new Map()
+  for (const [grantee, reasons] of endedReasons) {
+    if (!writers.has(grantee)) ended.set(grantee, reasons.has('revoked') ? 'revoked' : 'expired')
+  }
+  return { writers, ended, rejected }
 }
