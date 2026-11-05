@@ -26,9 +26,9 @@ ok('the typed line names the envelope and the read tool, and holds no control ch
 const wait = ms => new Promise(done => setTimeout(done, ms))
 const fakeClient = () => {
   const calls = []
-  let enterFails = 0
-  return { calls, failEnter(n) { enterFails = n },
-    agentNamed: name => name === 'biggy' ? { name, pane_id: 'w9:p1', agent_status: 'idle' } : null,
+  let enterFails = 0, status = 'idle'
+  return { calls, failEnter(n) { enterFails = n }, setStatus(s) { status = s },
+    agentNamed: name => name === 'biggy' ? { name, pane_id: 'w9:p1', agent_status: status } : null,
     text: (pane, text) => calls.push(['text', pane, text]),
     keys: (pane, key) => { if (enterFails > 0) { enterFails -= 1; throw new Error('send-keys failed') } calls.push(['keys', pane, key]) } }
 }
@@ -60,6 +60,23 @@ const fakeClient = () => {
   waker.stop()
 }
 
+{
+  const herdr = fakeClient(), waker = herdrWaker({ agent: 'biggy', herdr, everyMs: 50, settleMs: 10 })
+  const ids = Array.from({ length: 65 }, (_, i) => i.toString(16).padStart(64, '0'))
+  herdr.setStatus('working')
+  for (const id of ids) waker.notice(marker({ envelope: id }))
+  herdr.setStatus('idle')
+  await wait(200)
+  const first = herdr.calls.filter(c => c[0] === 'text').map(c => c[2])
+  ok('at capacity + 1, one line names the newest 64 and asks for nvoy_channel_list to find the rest',
+    first.length === 1 && !first[0].includes(ids[0]) && ids.slice(1).every(id => first[0].includes(id)) && first[0].includes('Call nvoy_channel_list to find the rest'))
+  waker.notice(marker({ envelope: ids[0] }))
+  waker.notice(marker({ envelope: ids[1] }))
+  await wait(200)
+  const after = herdr.calls.filter(c => c[0] === 'text').map(c => c[2])
+  ok('a reannounced envelope dropped from the full queue is woken for; a submitted one is not', after.length === 2 && after[1].includes(ids[0]) && !after[1].includes(ids[1]) && !after[1].includes('find the rest'))
+  waker.stop()
+}
 const dir = mkdtempSync(join(tmpdir(), 'nvoy-herdrwake-'))
 const state = join(dir, 'herdr.json'), typed = join(dir, 'typed.jsonl')
 const setAgent = status => writeFileSync(state, JSON.stringify({ agents: [{ name: 'biggy', agent: 'agy', pane_id: 'w9:p1', agent_status: status }] }))
