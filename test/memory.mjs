@@ -1660,6 +1660,47 @@ os.execvp("node", ["node", sys.argv[3], "--state", sys.argv[4], "--config", sys.
     ]))
 
   await capOnDaemon.close()
+
+  // Regression case 3: 100+ owner kind 440 grants on a relay — Phase 0 paginates via `until`
+  // past 124 newer task grants to discover the 125th oldest shadow/memory-write grant and marks
+  // the refresh complete (`lastRefreshComplete: true`, `grantsCheckedAt: nowSec`).
+  const historicalTaskGrants = Array.from({ length: 124 }, (_, idx) =>
+    makeGrant(james, myDude.pk, 'task', { subject: myDude.pk, at: nowSec - 1 - idx })
+  )
+  const oldestShadowGrant = makeGrant(james, deadRabbit.pk, 'shadow', { subject: james.pk, at: nowSec - 500 })
+  const oldestMemWriteGrant = makeGrant(james, waggleDev.pk, 'memory-write', { subject: james.pk, at: nowSec - 501 })
+  const all126OwnerGrants = [...historicalTaskGrants, oldestShadowGrant, oldestMemWriteGrant].sort(
+    (a, b) => b.created_at - a.created_at || (a.id < b.id ? -1 : 1)
+  )
+  const paginatedStore = new MemoryStore({
+    ownerPubkey: james.pk,
+    memoryGlobalChannelId: GLOBAL_CH,
+    allowMemoryWriteCap: true,
+  })
+  let phase0Queries = 0
+  await paginatedStore.refreshGrants({
+    relays: ['wss://relay-paginated.example.com'],
+    nowSec,
+    queryFn: async (_url, filter) => {
+      if (filter.kinds?.includes(440)) {
+        if (!filter['#p']) phase0Queries++
+        const matching = all126OwnerGrants.filter(ev => {
+          if (filter['#p'] && !filter['#p'].includes(ev.tags.find(t => t[0] === 'p')?.[1])) return false
+          if (filter.until !== undefined && ev.created_at > filter.until) return false
+          return true
+        })
+        const lim = filter.limit || 100
+        return { events: matching.slice(0, lim), eose: true, closed: false }
+      }
+      return { events: [], eose: true, closed: false }
+    },
+  })
+  ok('30078 sync (100+ owner grants): Phase 0 paginates past 124 newer grants to discover writers at positions 125-126 with lastRefreshComplete=true',
+    phase0Queries === 2 &&
+    paginatedStore.grantView.lastRefreshComplete === true &&
+    paginatedStore.grantView.grantsCheckedAt === nowSec &&
+    JSON.stringify(paginatedStore.acceptedGlobalWriters()) === JSON.stringify([james.pk, deadRabbit.pk, waggleDev.pk].sort()))
+
   await new Promise(r => wss30078.close(r))
 }
 

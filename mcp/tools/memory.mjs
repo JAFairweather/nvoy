@@ -426,33 +426,71 @@ export async function refreshMemoryGrants({
 
   // Phase 0: Discover granted writers from owner's kind 440 grants so a writer whose first claim is
   // kind 30078 (not yet locally ingested) still enters the grant view and the fallback author filter.
+  // Paginates backwards by `until` when a relay has >= `limit` total owner kind 440 grants so new
+  // writer discovery stays complete as historical task/mention grants grow past 100.
+  const maxDiscoveryPages = 20
   await Promise.all(relays.map(async (url, idx) => {
-    let res
-    try {
-      res = await queryFn(url, { kinds: [440], authors: [owner], limit })
-    } catch {
-      res = { events: [], eose: false }
+    let until = null
+    let pageComplete = false
+    const seenOnRelay = new Set()
+    for (let page = 0; page < maxDiscoveryPages; page++) {
+      const filter = until === null
+        ? { kinds: [440], authors: [owner], limit }
+        : { kinds: [440], authors: [owner], until, limit }
+      let res
+      try {
+        res = await queryFn(url, filter)
+      } catch {
+        res = { events: [], eose: false }
+      }
+      if (!res || res.eose !== true || res.closed || !Array.isArray(res.events)) {
+        pageComplete = false
+        break
+      }
+      let newCount = 0
+      let minCreatedAt = Infinity
+      for (const ev of res.events) {
+        if (ev && Number.isSafeInteger(ev.created_at) && ev.created_at < minCreatedAt) {
+          minCreatedAt = ev.created_at
+        }
+        if (ev?.id && !seenOnRelay.has(ev.id)) {
+          seenOnRelay.add(ev.id)
+          newCount++
+        }
+        if (!ev || ev.kind !== 440 || String(ev.pubkey || '').toLowerCase() !== owner) continue
+        const pTag = String(tagValue(ev, 'p') || '').toLowerCase()
+        if (!HEX64.test(pTag) || pTag === owner) continue
+        const cap = tagValue(ev, 'da-cap')
+        const allowedCap = cap === 'shadow' || (allowMemoryWriteCap && cap === MEMORY_WRITE_CAP)
+        if (!allowedCap && !targetWriters.includes(pTag)) continue
+        let ok = false; try { ok = verifyEvent(ev) } catch { ok = false }
+        if (!ok) continue
+        discoveredWriters.add(pTag)
+        if (!discoveredByWriterPerRelay.has(pTag)) discoveredByWriterPerRelay.set(pTag, new Map())
+        const perRelay = discoveredByWriterPerRelay.get(pTag)
+        if (!perRelay.has(idx)) perRelay.set(idx, new Set())
+        perRelay.get(idx).add(ev.id)
+        validGrants.set(ev.id, ev)
+        allGrantEvents.set(ev.id, ev)
+      }
+      if (res.events.length < limit) {
+        pageComplete = true
+        break
+      }
+      // If a full page returned no new event IDs (e.g. >100 identical-second events or a non-paginating relay),
+      // stop and treat discovery on this relay as incomplete.
+      if (newCount === 0 || !Number.isFinite(minCreatedAt)) {
+        pageComplete = false
+        break
+      }
+      until = until !== null && minCreatedAt >= until ? minCreatedAt - 1 : minCreatedAt
+      if (until < 0) {
+        pageComplete = false
+        break
+      }
     }
-    if (!lookupAnswered(res)) {
+    if (!pageComplete) {
       relayCompletedAll.set(idx, false)
-      return
-    }
-    for (const ev of res.events) {
-      if (!ev || ev.kind !== 440 || String(ev.pubkey || '').toLowerCase() !== owner) continue
-      const pTag = String(tagValue(ev, 'p') || '').toLowerCase()
-      if (!HEX64.test(pTag) || pTag === owner) continue
-      const cap = tagValue(ev, 'da-cap')
-      const allowedCap = cap === 'shadow' || (allowMemoryWriteCap && cap === MEMORY_WRITE_CAP)
-      if (!allowedCap && !targetWriters.includes(pTag)) continue
-      let ok = false; try { ok = verifyEvent(ev) } catch { ok = false }
-      if (!ok) continue
-      discoveredWriters.add(pTag)
-      if (!discoveredByWriterPerRelay.has(pTag)) discoveredByWriterPerRelay.set(pTag, new Map())
-      const perRelay = discoveredByWriterPerRelay.get(pTag)
-      if (!perRelay.has(idx)) perRelay.set(idx, new Set())
-      perRelay.get(idx).add(ev.id)
-      validGrants.set(ev.id, ev)
-      allGrantEvents.set(ev.id, ev)
     }
   }))
 
