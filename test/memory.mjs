@@ -2,6 +2,7 @@
 // Covers all 25 edge-case fixtures from the Slice 0 specification + waggle-dev's review probes.
 
 import { mkdtempSync, readFileSync } from 'node:fs'
+import { connect } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
@@ -13,6 +14,7 @@ import {
   checkMemorySecrets,
   nip01Newer,
 } from '../mcp/tools/memory.mjs'
+import { parseReadersFlag, startMemoryDaemon } from '../mcp/tools/memory-daemon.mjs'
 
 let passes = 0, fails = 0
 const ok = (name, cond) => {
@@ -633,6 +635,195 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
     partialStore.grantView.lastRefreshComplete === false &&
     partialEval.verification === 'unverified' &&
     partialEval.verificationReason === 'grant-missing')
+
+  // Partial refresh when G1 has expired and a new G2 for the same cap is returned only by the answering relay
+  // (while G2's 441 sits on the CLOSED relay) must NOT keep the cap via G2's different grantId
+  const g1Expiring = makeGrant(james, waggleDev.pk, 'shadow', {
+    subject: james.pk,
+    at: T0,
+    exp: T0 + 10,
+  })
+  const g2New = makeGrant(james, waggleDev.pk, 'shadow', {
+    subject: james.pk,
+    at: T0 + 15,
+    exp: T0 + 3600,
+  })
+  await partialStore.refreshGrants({
+    relays: ['wss://relay-a', 'wss://relay-b'],
+    nowSec: T0 + 5,
+    queryFn: async () => ({ eose: true, closed: false, limitReached: false, events: [g1Expiring] }),
+  })
+  const evalG1Live = partialStore.evaluateClaim(
+    partialStore.entries.get(`${waggleDev.pk}:${waggleOpsClaim.tags[0][1]}`),
+    { nowSec: T0 + 5 }
+  )
+  await partialStore.refreshGrants({
+    relays: ['wss://relay-a', 'wss://relay-b'],
+    nowSec: T0 + 20,
+    queryFn: async (relay) => relay === 'wss://relay-a'
+      ? { eose: true, closed: false, limitReached: false, events: [g1Expiring, g2New] }
+      : { eose: false, closed: true, limitReached: false, events: [] },
+  })
+  const evalAfterG1ExpiredPartialG2 = partialStore.evaluateClaim(
+    partialStore.entries.get(`${waggleDev.pk}:${waggleOpsClaim.tags[0][1]}`),
+    { nowSec: T0 + 20 }
+  )
+  ok('when G1 expires and partial refresh returns a new G2 (grantId !== G1), writer is not kept accepted on G2',
+    evalG1Live.verification === 'accepted' &&
+    partialStore.grantView.lastRefreshComplete === false &&
+    evalAfterG1ExpiredPartialG2.verification === 'unverified' &&
+    evalAfterG1ExpiredPartialG2.verificationReason === 'grant-missing')
+}
+
+// --- 7. Multi-reader Unix socket daemon (memory-daemon.mjs): socket-bound reader identity & keyless readers ---
+{
+  const daemonDir = mkdtempSync(join(tmpdir(), 'mem-daemon-'))
+  const sockDir = join(daemonDir, 'sockets')
+  const stateDir = join(daemonDir, 'state')
+
+  const parsedReaders = parseReadersFlag('biggy:hr')
+  ok('parseReadersFlag parses colon-separated reader names',
+    parsedReaders.length === 2 && parsedReaders[0] === 'biggy' && parsedReaders[1] === 'hr')
+
+  const daemon = await startMemoryDaemon({
+    stateDir,
+    readers: 'biggy:hr',
+    socketDir: sockDir,
+    config: {
+      ownerPubkey: james.pk,
+      memoryGlobalChannelId: GLOBAL_CH,
+      readers: {
+        biggy: { pubkey: myDude.pk },
+        hr: { pubkey: null }, // keyless reader on herd-cloud
+      },
+    },
+  })
+
+  const nowSec = Math.floor(Date.now() / 1000)
+  const canonClaim = signClaim(james, {
+    scope: 'hive:canon',
+    slug: 'daemon-canon',
+    claim: 'Hive memory runs on herd-cloud as one subsystem.',
+    because: 'Approved by James and drafted by Rabid Rabbit.',
+    evidence: ['waggle@a2c1781f:docs/DESIGN_HIVE_MEMORY.md'],
+    asOfGit: 'waggle@a2c1781f',
+    nowSec,
+  })
+  const roomAClaim = signClaim(waggleDev, {
+    scope: `room:${ROOM_A}`,
+    slug: 'room-a-only',
+    claim: 'Room A coordination note.',
+    because: 'Seated room test.',
+    evidence: ['waggle@a2c1781f:docs/DESIGN_HIVE_MEMORY.md'],
+    asOfGit: 'waggle@a2c1781f',
+    nowSec,
+  })
+  const biggySelfClaim = signClaim(myDude, {
+    scope: `self:${myDude.pk}`,
+    slug: 'biggy-scratch',
+    claim: 'Biggy private scratchpad note.',
+    because: 'Self scope test.',
+    evidence: ['waggle@a2c1781f:README.md'],
+    asOfGit: 'waggle@a2c1781f',
+    nowSec,
+  })
+
+  daemon.store.recordRoomMembers(ROOM_A, [myDude.pk, waggleDev.pk], { checkedAt: nowSec })
+  daemon.store.recordChannelSync(GLOBAL_CH, { reachable: true, eose: true, remoteEvents: [canonClaim], nowSec })
+  daemon.store.recordChannelSync(ROOM_A, { reachable: true, eose: true, remoteEvents: [roomAClaim, biggySelfClaim], nowSec })
+
+  const rpcCall = (sockPath, req) =>
+    new Promise((resolveRpc, rejectRpc) => {
+      const client = connect(sockPath)
+      let buf = ''
+      client.setEncoding('utf8')
+      client.on('error', rejectRpc)
+      client.on('data', chunk => {
+        buf += chunk
+        const nl = buf.indexOf('\n')
+        if (nl >= 0) {
+          const line = buf.slice(0, nl)
+          client.end()
+          resolveRpc(JSON.parse(line))
+        }
+      })
+      client.write(JSON.stringify(req) + '\n')
+    })
+
+  const initBiggy = await rpcCall(join(sockDir, 'biggy.sock'), {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: { protocolVersion: '2024-11-05' },
+  })
+  ok('memory-daemon initialize binds serverInfo to the socket reader name',
+    initBiggy.result?.serverInfo?.name === 'hive-memory-biggy')
+
+  const wakeBiggyResp = await rpcCall(join(sockDir, 'biggy.sock'), {
+    jsonrpc: '2.0',
+    id: 2,
+    method: 'tools/call',
+    params: { name: 'memory_wake', arguments: { room_id: ROOM_A } },
+  })
+  const wakeBiggy = JSON.parse(wakeBiggyResp.result.content[0].text)
+  ok('keyed reader socket (biggy.sock) receives canon, room, and self claims for its bound pubkey',
+    wakeBiggy.reader === 'biggy' &&
+    wakeBiggy.counts.canon_shown === 1 &&
+    wakeBiggy.counts.ops_shown === 1 &&
+    wakeBiggy.counts.self_shown === 1)
+
+  // Keyless reader (hr.sock) tries to spoof reader: "biggy" and reader_pubkey: myDude.pk
+  const wakeHrResp = await rpcCall(join(sockDir, 'hr.sock'), {
+    jsonrpc: '2.0',
+    id: 3,
+    method: 'tools/call',
+    params: {
+      name: 'memory_wake',
+      arguments: { room_id: ROOM_A, reader: 'biggy', reader_pubkey: myDude.pk },
+    },
+  })
+  const wakeHr = JSON.parse(wakeHrResp.result.content[0].text)
+  ok('keyless reader socket (hr.sock) ignores client-supplied reader/pubkey and serves canon/ops only (zero room or self claims)',
+    wakeHr.reader === 'hr' &&
+    wakeHr.reader_pubkey === null &&
+    wakeHr.counts.canon_shown === 1 &&
+    wakeHr.counts.ops_shown === 0 &&
+    wakeHr.counts.self_shown === 0)
+
+  const claimAttempt = await rpcCall(join(sockDir, 'biggy.sock'), {
+    jsonrpc: '2.0',
+    id: 4,
+    method: 'tools/call',
+    params: {
+      name: 'memory_claim',
+      arguments: {
+        scope: 'hive:ops',
+        slug: 'attempt-sign',
+        claim: 'Attempt to sign on daemon.',
+        because: 'Testing read-only daemon invariant.',
+        evidence: ['waggle@a2c1781f:README.md'],
+      },
+    },
+  })
+  const claimErr = JSON.parse(claimAttempt.result.content[0].text)
+  ok('memory-daemon refuses to sign claims (HIVE_MEMORY_DAEMON_NO_SIGN)',
+    claimAttempt.result.isError === true && claimErr.code === 'HIVE_MEMORY_DAEMON_NO_SIGN')
+
+  await daemon.close()
+
+  let fdMismatchErr = null
+  try {
+    await startMemoryDaemon({
+      stateDir,
+      readers: 'biggy:hr',
+      listenFds: 1,
+      listenFdNames: 'biggy',
+    })
+  } catch (err) {
+    fdMismatchErr = err
+  }
+  ok('memory-daemon rejects LISTEN_FDS mismatch against --readers',
+    Boolean(fdMismatchErr && /LISTEN_FDS/.test(fdMismatchErr.message)))
 }
 
 console.log(`\n${passes} passed, ${fails} failed`)

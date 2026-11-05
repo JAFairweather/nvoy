@@ -827,7 +827,7 @@ export class MemoryStore {
         if (!partialCaps || res.ended.has(writer)) continue
         const kept = new Map()
         for (const [cap, info] of prevCaps.entries()) {
-          if (partialCaps.has(cap)) kept.set(cap, partialCaps.get(cap) || info)
+          if (partialCaps.get(cap)?.grantId === info.grantId) kept.set(cap, info)
         }
         if (kept.size > 0) nextWriters.set(writer, kept)
       }
@@ -849,7 +849,8 @@ export class MemoryStore {
 
   // Evaluates a stored claim at read time: computes verification ('accepted' | 'unverified' | 'rejected')
   // and precedence rank (2, 3, or 4).
-  evaluateClaim(entry, { nowSec = Math.floor(Date.now() / 1000), staleFiles = new Set() } = {}) {
+  evaluateClaim(entry, { nowSec = Math.floor(Date.now() / 1000), staleFiles = new Set(), readerPubkey = undefined } = {}) {
+    const activeReaderPubkey = readerPubkey !== undefined ? String(readerPubkey || '').toLowerCase() : this.readerPubkey
     if (!entry || entry.status === 'withdrawn') {
       return { verification: 'withdrawn', verificationReason: 'withdrawn', computedRank: null, checkedAt: null }
     }
@@ -869,18 +870,21 @@ export class MemoryStore {
     }
 
     if (entry.scopeType === 'self') {
-      if (entry.pubkey !== this.readerPubkey) {
+      if (!activeReaderPubkey || entry.pubkey !== activeReaderPubkey) {
         return { verification: 'rejected', verificationReason: 'foreign-self-claim', computedRank: null, checkedAt: nowSec }
       }
       return { verification: 'accepted', verificationReason: null, computedRank: 4, checkedAt: nowSec, staleWarning }
     }
 
     if (entry.scopeType === 'room') {
+      if (!activeReaderPubkey) {
+        return { verification: 'rejected', verificationReason: 'reader-not-in-room', computedRank: null, checkedAt: nowSec, staleWarning }
+      }
       const roomView = this.roomMembers.get(entry.roomId)
       if (!roomView || roomView.checkedAt == null) {
         return { verification: 'unverified', verificationReason: 'room-list-unavailable', computedRank: null, checkedAt: null, staleWarning }
       }
-      if (!roomView.members.has(this.readerPubkey)) {
+      if (!roomView.members.has(activeReaderPubkey)) {
         return { verification: 'rejected', verificationReason: 'reader-not-in-room', computedRank: null, checkedAt: roomView.checkedAt, staleWarning }
       }
       if (nowSec - roomView.checkedAt > this.authMaxAgeSec) {
@@ -989,7 +993,9 @@ export class MemoryStore {
     cursor = 0,
     nowSec = Math.floor(Date.now() / 1000),
     staleFiles = new Set(),
+    readerPubkey = undefined,
   } = {}) {
+    const activeReaderPubkey = readerPubkey !== undefined ? String(readerPubkey || '').toLowerCase() : this.readerPubkey
     const startIdx = Number.isSafeInteger(Number(cursor)) && Number(cursor) >= 0 ? Number(cursor) : 0
     const pageLimit = Number.isSafeInteger(Number(limit)) && Number(limit) > 0 ? Number(limit) : 50
     const qText = text ? String(text).toLowerCase() : null
@@ -1000,7 +1006,7 @@ export class MemoryStore {
       if (this.memoryGlobalChannelId) channelsToCheck.add(this.memoryGlobalChannelId)
       else missingRequiredChannelConfig = true
     }
-    if (!scope) {
+    if (!scope && activeReaderPubkey) {
       for (const r of this.subscribedRooms) channelsToCheck.add(r)
       for (const r of this.roomMembers.keys()) channelsToCheck.add(r)
       for (const ch of this.channelSync.keys()) channelsToCheck.add(ch)
@@ -1023,8 +1029,8 @@ export class MemoryStore {
       if (topic && entry.topic !== topic) continue
       if (d && entry.d !== d) continue
 
-      if (entry.channelId) channelsToCheck.add(entry.channelId)
-      const verdict = this.evaluateClaim(entry, { nowSec, staleFiles })
+      const verdict = this.evaluateClaim(entry, { nowSec, staleFiles, readerPubkey: activeReaderPubkey })
+      if (entry.channelId && verdict.verification !== 'rejected') channelsToCheck.add(entry.channelId)
       if (verdict.verification === 'accepted') {
         if (!byFactKey.has(entry.d)) byFactKey.set(entry.d, new Set())
         byFactKey.get(entry.d).add(entry.claim)
@@ -1112,7 +1118,9 @@ export class MemoryStore {
     staleFiles = new Set(),
     wakeDigestPath = null,
     nowSec = Math.floor(Date.now() / 1000),
+    readerPubkey = undefined,
   } = {}) {
+    const activeReaderPubkey = readerPubkey !== undefined ? String(readerPubkey || '').toLowerCase() : this.readerPubkey
     const budget = Number.isSafeInteger(maxChars) && maxChars >= 1000 ? maxChars : DEFAULT_WAKE_MAX_CHARS
     const headerBudget = Math.min(550, Math.floor(budget * 0.10))
     const unverifiedSectionBudget = Math.min(350, Math.floor(budget * 0.07))
@@ -1133,7 +1141,7 @@ export class MemoryStore {
       if (entry.expiresAt != null && entry.expiresAt <= nowSec) continue
       if (entry.scopeType === 'room' && cleanRoom && entry.roomId !== cleanRoom) continue
 
-      const verdict = this.evaluateClaim(entry, { nowSec, staleFiles })
+      const verdict = this.evaluateClaim(entry, { nowSec, staleFiles, readerPubkey: activeReaderPubkey })
       if (verdict.verification === 'accepted') {
         if (verdict.computedRank === 2) canonAccepted.push({ entry, verdict })
         else if (verdict.computedRank === 3) opsAccepted.push({ entry, verdict })
@@ -1230,7 +1238,7 @@ export class MemoryStore {
 
     const canonSec = fitSection('Rank 2: hive:canon', canonAccepted, canonBudget, 'hive:canon', canonFooter)
     const opsSec = fitSection('Rank 3: room & hive:ops', opsAccepted, opsBudget, 'hive:ops')
-    const selfSec = fitSection('Rank 4: self scratchpad', selfAccepted, selfBudget, `self:${this.readerPubkey}`)
+    const selfSec = fitSection('Rank 4: self scratchpad', selfAccepted, selfBudget, `self:${activeReaderPubkey || 'keyless'}`)
 
     let unverifiedText = ''
     const totalUnverified = unverifiedEntries.length + unverifiedCanonKeys.length
