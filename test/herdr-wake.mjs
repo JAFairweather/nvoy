@@ -6,7 +6,8 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
-import { wakeLine, wakeOf } from '../mcp/tools/herdr_wake.mjs'
+import { herdrWaker, wakeLine, wakeOf } from '../mcp/tools/herdr_wake.mjs'
+import { herdrClient } from '../mcp/tools/harness_herdr.mjs'
 
 let fails = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); if (!value) fails++ }
@@ -21,6 +22,44 @@ const line = wakeLine({ envelopes: [E1], capabilities: false })
 ok('the typed line names the envelope and the read tool, and holds no control character',
   line.includes(E1) && line.includes('nvoy_channel_read') && !/[\x00-\x1f\x7f]/.test(line))
 
+// In process, with a herdr object whose Enter can be made to fail.
+const wait = ms => new Promise(done => setTimeout(done, ms))
+const fakeClient = () => {
+  const calls = []
+  let enterFails = 0
+  return { calls, failEnter(n) { enterFails = n },
+    agentNamed: name => name === 'biggy' ? { name, pane_id: 'w9:p1', agent_status: 'idle' } : null,
+    text: (pane, text) => calls.push(['text', pane, text]),
+    keys: (pane, key) => { if (enterFails > 0) { enterFails -= 1; throw new Error('send-keys failed') } calls.push(['keys', pane, key]) } }
+}
+{
+  const herdr = fakeClient(), waker = herdrWaker({ agent: 'biggy', herdr, everyMs: 50, settleMs: 100 })
+  waker.notice(marker({ envelope: E1 }))
+  await wait(25)
+  waker.notice(marker({ envelope: E2 }))
+  waker.notice(marker({ capabilities: 'h2' }))
+  await wait(400)
+  const texts = herdr.calls.filter(c => c[0] === 'text').map(c => c[2])
+  ok('an envelope arriving during the settle wait is typed in the next batch, not lost', texts.length === 2 && texts[0].includes(E1) && !texts[0].includes(E2) && texts[1].includes(E2))
+  ok('a capabilities change arriving during the settle wait is kept too', texts[1]?.includes('capabilities changed'))
+  waker.notice(marker({ envelope: E2 }))
+  await wait(200)
+  ok('a repeated marker for a submitted envelope is not typed again', herdr.calls.filter(c => c[0] === 'text').length === 2)
+  waker.stop()
+}
+{
+  const herdr = fakeClient(), waker = herdrWaker({ agent: 'biggy', herdr, everyMs: 50, settleMs: 10 })
+  herdr.failEnter(2)
+  waker.notice(marker({ envelope: E1 }))
+  await wait(60)
+  waker.notice(marker({ envelope: E2 }))
+  await wait(400)
+  const kinds = herdr.calls.map(c => `${c[0]}:${c[2].includes(E1) ? 'E1' : ''}${c[2].includes(E2) ? 'E2' : ''}`)
+  ok('a failed Enter is retried without typing the line again', kinds[0] === 'text:E1' && kinds[1] === 'keys:')
+  ok('an envelope that arrived while Enter was failing goes in its own batch afterwards', kinds[2] === 'text:E2' && kinds[3] === 'keys:' && kinds.length === 4)
+  waker.stop()
+}
+
 const dir = mkdtempSync(join(tmpdir(), 'nvoy-herdrwake-'))
 const state = join(dir, 'herdr.json'), typed = join(dir, 'typed.jsonl')
 const setAgent = status => writeFileSync(state, JSON.stringify({ agents: [{ name: 'biggy', agent: 'agy', pane_id: 'w9:p1', agent_status: status }] }))
@@ -33,6 +72,22 @@ else if (noun === 'pane' && (verb === 'send-text' || verb === 'send-keys')) { ap
 else { console.error('unexpected ' + noun + ' ' + verb); process.exit(1) }
 `)
 chmodSync(herdr, 0o755)
+{
+  const failing = join(dir, 'herdr-fails')
+  writeFileSync(failing, `#!/bin/sh
+if [ "$2" = "send-keys" ]; then echo "no such pane" >&2; exit 1; fi
+if [ "$2" = "send-text" ]; then echo '{"result":{}}'; exit 0; fi
+echo '{"result":{"agents":[]}}'
+`)
+  chmodSync(failing, 0o755)
+  const client = herdrClient({ bin: failing })
+  let threw = null
+  try { client.keys('w9:p1', 'Enter') } catch (error) { threw = error.message }
+  ok('a send-keys that exits 1 with only stderr is a failure, not a key sent', /failed: no such pane/.test(threw || ''))
+  let fine = true
+  try { client.text('w9:p1', 'x'); client.agentNamed('biggy') } catch { fine = false }
+  ok('herdr calls that exit 0 still succeed', fine)
+}
 const server = join(dir, 'server.mjs')
 writeFileSync(server, `
 import { createInterface } from 'node:readline'
