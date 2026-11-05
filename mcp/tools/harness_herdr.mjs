@@ -23,7 +23,14 @@ export function herdrClient({ bin = process.env.HARNESS_HERDR_BIN || 'herdr', en
   const call = (args, { json = true } = {}) => {
     const r = spawnSync(bin, args, { encoding: 'utf8', env, timeout: 15000 })
     if (r.error) throw new Error(`herdr ${args[0]} ${args[1] || ''}: ${r.error.code || r.error.message}`)
-    if (!json) { if (r.status !== 0) throw new Error(`herdr ${args.slice(0, 2).join(' ')} failed: ${(r.stderr || r.stdout || '').trim().slice(0, 200)}`); return r.stdout || '' }
+    // A nonzero or signalled exit is a failure in either mode, whatever was printed: a send-keys that
+    // exits 1 must not read as a key sent.
+    if (r.status !== 0 || r.signal) {
+      let why = (r.stderr || r.stdout || '').trim().slice(0, 200)
+      try { const e = JSON.parse(r.stdout || '{}').error; if (e) why = e.message || e.code } catch {}
+      throw new Error(`herdr ${args.slice(0, 2).join(' ')} failed${r.signal ? ` (${r.signal})` : ''}: ${why}`)
+    }
+    if (!json) return r.stdout || ''
     let out
     try { out = JSON.parse(r.stdout || '{}') } catch { throw new Error(`herdr ${args.slice(0, 2).join(' ')} answered: ${(r.stderr || r.stdout || '').trim().slice(0, 200)}`) }
     if (out.error) throw new Error(`herdr ${args.slice(0, 2).join(' ')}: ${out.error.message || out.error.code}`)
@@ -54,7 +61,9 @@ export function herdrClient({ bin = process.env.HARNESS_HERDR_BIN || 'herdr', en
     // prompt or a startup screen that is no longer there.
     read(pane) { return call(['pane', 'read', pane, '--source', 'visible'], { json: false }) },
     keys(pane, ...keys) { call(['pane', 'send-keys', pane, ...keys]) },
+    text(pane, text) { call(['pane', 'send-text', pane, text], { json: false }) },
     agent(pane) { return (call(['agent', 'list']).agents || []).find(a => a.pane_id === pane) || null },
+    agentNamed(name) { return (call(['agent', 'list']).agents || []).find(a => a.name === name) || null },
     name(pane, name) { call(['agent', 'rename', pane, name]) },
   }
   return client
