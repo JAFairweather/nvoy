@@ -10,6 +10,8 @@ import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure
 import { WebSocketServer } from 'ws'
 import { scopeHash } from '../mcp/tools/grant_fold.mjs'
 import {
+  FALLBACK_MEMORY_KIND,
+  MEMORY_KIND,
   MemoryStore,
   buildClaimTemplate,
   buildWithdrawalTemplate,
@@ -1336,6 +1338,209 @@ os.execvp("node", ["node", sys.argv[3], "--state", sys.argv[4], "--config", sys.
     sdCrustyQuery.reader === 'crusty' &&
     sdCrustyQuery.reader_pubkey === null &&
     sdCrustyQuery.answer === 'found')
+
+  // --- Buzz-relay kind 30078 global-only storage sync tests (RabidRabbit) ---
+  // On buzz-relay, KIND_READ_STATE (30078) is in is_global_only_kind, so it is stored with
+  // channel_id = NULL and never returned by a #h-scoped filter. Verify:
+  //   1. Each channel REQ carries {kinds:[30079,5],#h:[ch]} plus {kinds:[30078],authors:[...]}.
+  //   2. Global channel 30078 filter requests [ownerPubkey] only when allowMemoryWriteCap is false
+  //      (another author's 30078 is never requested); room channel re-issues under the same subId
+  //      once 39002 room members arrive.
+  //   3. Pre-EOSE filtering keeps only 30078 events whose h tag matches that channel, so James's
+  //      30078 test claim reaches localCount 1 with no false RELAY_EVICTED_WARNING even when
+  //      unrelated 30078 read-state/room events are returned by the authors filter.
+  const jamesTest30078 = sign(
+    buildClaimTemplate({
+      pubkey: james.pk,
+      scope: 'hive:ops',
+      slug: 'viewer-test-2026-11-05',
+      topic: 'viewer-test',
+      claim: 'hive-memory viewer test, 2026-11-05',
+      because: 'Verify live SSE claim ingestion in memory-viewer on herd-cloud',
+      evidence: ['nvoy@8aa86b82377aed390257abd5fdc76ac8246b30ff:mcp/tools/memory-daemon.mjs'],
+      asOfGit: 'nvoy@8aa86b82377aed390257abd5fdc76ac8246b30ff',
+      memoryGlobalChannelId: GLOBAL_CH,
+      kind: FALLBACK_MEMORY_KIND,
+      nowSec,
+    }),
+    james.sk
+  )
+  const jamesReadState30078 = sign({
+    kind: FALLBACK_MEMORY_KIND,
+    created_at: nowSec,
+    tags: [['d', `read-state:${'a'.repeat(32)}`], ['t', 'read-state']],
+    content: 'encrypted-read-state-blob',
+  }, james.sk)
+  const roomMember30078 = sign(
+    buildClaimTemplate({
+      pubkey: waggleDev.pk,
+      scope: `room:${ROOM_A}`,
+      slug: 'room-fallback-30078',
+      topic: 'room-fallback',
+      claim: 'Room claim published as fallback kind 30078.',
+      because: 'Buzz relay rejects kind 30079.',
+      evidence: ['waggle@a2c1781f:docs/DESIGN_HIVE_MEMORY.md'],
+      asOfGit: 'waggle@a2c1781f',
+      kind: FALLBACK_MEMORY_KIND,
+      nowSec,
+    }),
+    waggleDev.sk
+  )
+  const stranger30078 = sign(
+    buildClaimTemplate({
+      pubkey: dennis.pk,
+      scope: 'hive:ops',
+      slug: 'stranger-fallback-30078',
+      topic: 'stranger-fallback',
+      claim: 'Stranger 30078 claim that must never be requested.',
+      because: 'Stranger has no authority.',
+      evidence: ['waggle@a2c1781f:docs/DESIGN_HIVE_MEMORY.md'],
+      asOfGit: 'waggle@a2c1781f',
+      memoryGlobalChannelId: GLOBAL_CH,
+      kind: FALLBACK_MEMORY_KIND,
+      nowSec,
+    }),
+    dennis.sk
+  )
+
+  const seenChannelReqs = []
+  const wss30078 = new WebSocketServer({ port: 0, host: '127.0.0.1' })
+  const wsPort30078 = await new Promise(res => wss30078.once('listening', () => res(wss30078.address().port)))
+  const relayUrl30078 = `ws://127.0.0.1:${wsPort30078}`
+
+  wss30078.on('connection', ws => {
+    let authed = false
+    ws.send(JSON.stringify(['AUTH', 'challenge-30078-sync']))
+    ws.on('message', raw => {
+      const msg = JSON.parse(raw.toString())
+      if (msg[0] === 'AUTH' && msg[1]?.kind === 22242) {
+        authed = true
+        ws.send(JSON.stringify(['OK', msg[1].id, true, '']))
+        return
+      }
+      if (msg[0] === 'REQ') {
+        const subId = msg[1]
+        const filters = msg.slice(2)
+        if (filters.some(f => Array.isArray(f.kinds) && (f.kinds.includes(440) || f.kinds.includes(441)))) {
+          ws.send(JSON.stringify(['EOSE', subId]))
+          return
+        }
+        if (!authed) {
+          ws.send(JSON.stringify(['CLOSED', subId, 'auth-required: authenticate first']))
+          return
+        }
+        if (filters.some(f => Array.isArray(f.kinds) && f.kinds.includes(39002))) {
+          ws.send(JSON.stringify(['EVENT', subId, liveRoomList]))
+          ws.send(JSON.stringify(['EOSE', subId]))
+          return
+        }
+        seenChannelReqs.push({ subId, filters })
+        // Simulate buzz-relay: #h filter only returns channel-scoped kinds (30079/5), NEVER 30078.
+        // Only a filter WITHOUT #h that specifies kinds:[30078] and authors:[...] returns 30078 events
+        // authored by those pubkeys.
+        for (const f of filters) {
+          if (!f['#h'] && Array.isArray(f.kinds) && f.kinds.includes(FALLBACK_MEMORY_KIND) && Array.isArray(f.authors)) {
+            if (f.authors.includes(james.pk)) {
+              ws.send(JSON.stringify(['EVENT', subId, jamesReadState30078]))
+              ws.send(JSON.stringify(['EVENT', subId, jamesTest30078]))
+            }
+            if (f.authors.includes(waggleDev.pk)) {
+              ws.send(JSON.stringify(['EVENT', subId, roomMember30078]))
+            }
+            if (f.authors.includes(dennis.pk)) {
+              ws.send(JSON.stringify(['EVENT', subId, stranger30078]))
+            }
+          }
+        }
+        ws.send(JSON.stringify(['EOSE', subId]))
+      }
+    })
+  })
+
+  const fbStateDir = join(daemonDir, 'fb-state')
+  const fbSockDir = join(daemonDir, 'fb-socks')
+  mkdirSync(fbStateDir, { recursive: true, mode: 0o700 })
+  // Pre-seed the store with James's 30078 claim so any failure to match remoteIds on EOSE would
+  // trigger a false RELAY_EVICTED_WARNING.
+  const preseedStore = new MemoryStore({
+    statePath: join(fbStateDir, 'memory_claims.json'),
+    ownerPubkey: james.pk,
+    memoryGlobalChannelId: GLOBAL_CH,
+    subscribedRooms: [ROOM_A],
+    allowMemoryWriteCap: false,
+  })
+  preseedStore.ingestEvent(jamesTest30078, { nowSec })
+
+  const fbCfgPath = join(daemonDir, 'fb-config.json')
+  writeFileSync(fbCfgPath, JSON.stringify({
+    memoryGlobalChannelId: GLOBAL_CH,
+    ownerPubkey: james.pk,
+    subscribedRooms: [ROOM_A],
+    allowMemoryWriteCap: false,
+    relayUrl: relayUrl30078,
+    relayPubkey: relayKey.pk,
+    grantRelays: [relayUrl30078],
+    readers: {
+      biggy: myDude.pk,
+      viewer: null,
+    },
+  }))
+
+  const fbDaemon = await startMemoryDaemon({
+    stateDir: fbStateDir,
+    configPath: fbCfgPath,
+    readers: 'biggy:viewer',
+    socketDir: fbSockDir,
+    credentialsDir: credDir,
+    makeBunker: () => fakeBunkerDelegate,
+  })
+
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const gSync = fbDaemon.store.getChannelSync(GLOBAL_CH, nowSec)
+    const rSync = fbDaemon.store.getChannelSync(ROOM_A, nowSec)
+    if (gSync.state === 'SYNCED_OK' && gSync.localCount === 1 && rSync.state === 'SYNCED_OK' && rSync.localCount === 1) {
+      break
+    }
+    await new Promise(r => setTimeout(r, 25))
+  }
+
+  const fbGlobalSync = fbDaemon.store.getChannelSync(GLOBAL_CH, nowSec)
+  const fbRoomSync = fbDaemon.store.getChannelSync(ROOM_A, nowSec)
+  const globalReqs = seenChannelReqs.filter(r => r.subId === 'mem-ch-0')
+  const roomReqs = seenChannelReqs.filter(r => r.subId === 'mem-ch-1')
+  const anyRequestedStranger = seenChannelReqs.some(r =>
+    r.filters.some(f => Array.isArray(f.authors) && f.authors.includes(dennis.pk))
+  )
+  const anyUnscoped30078 = seenChannelReqs.some(r =>
+    r.filters.some(f => Array.isArray(f.kinds) && f.kinds.includes(FALLBACK_MEMORY_KIND) && (!Array.isArray(f.authors) || f.authors.length === 0))
+  )
+
+  ok('30078 sync: James test 30078 claim reaches localCount 1 with remoteCount 1 (non-channel read-state 30078 ignored) and no false RELAY_EVICTED_WARNING',
+    fbGlobalSync.state === 'SYNCED_OK' &&
+    fbGlobalSync.localCount === 1 &&
+    fbGlobalSync.remoteCount === 1 &&
+    fbGlobalSync.missingCount === 0)
+
+  ok('30078 sync: global REQ scopes 30078 to [ownerPubkey] only, never requests unscoped or stranger 30078, and room REQ re-issues under same subId when 39002 arrives',
+    !anyRequestedStranger &&
+    !anyUnscoped30078 &&
+    globalReqs.length >= 1 &&
+    JSON.stringify(globalReqs[0].filters) === JSON.stringify([
+      { kinds: [MEMORY_KIND, 5], '#h': [GLOBAL_CH] },
+      { kinds: [FALLBACK_MEMORY_KIND], authors: [james.pk] },
+    ]) &&
+    roomReqs.length === 2 &&
+    roomReqs[0].filters.length === 1 &&
+    JSON.stringify(roomReqs[1].filters) === JSON.stringify([
+      { kinds: [MEMORY_KIND, 5], '#h': [ROOM_A] },
+      { kinds: [FALLBACK_MEMORY_KIND], authors: [myDude.pk, waggleDev.pk].sort() },
+    ]) &&
+    fbRoomSync.state === 'SYNCED_OK' &&
+    fbRoomSync.localCount === 1 &&
+    fbRoomSync.missingCount === 0)
+
+  await fbDaemon.close()
+  await new Promise(r => wss30078.close(r))
 }
 
 console.log(`\n${passes} passed, ${fails} failed`)

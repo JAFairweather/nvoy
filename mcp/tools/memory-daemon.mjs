@@ -496,6 +496,7 @@ function startCommunityRelaySync({
 }) {
   let stopped = false
   let currentWs = null
+  let currentRefreshAuthors = null
   let reconnectTimer = null
 
   const markAllUnreachable = () => {
@@ -522,17 +523,67 @@ function startCommunityRelaySync({
     let authSentId = null
     let subscribed = false
     const subChannelMap = new Map()
+    const subAuthorsKey = new Map()
     const subEvents = new Map()
     const eoseReceived = new Set()
+
+    const eventChannelTag = ev => {
+      const tags = Array.isArray(ev?.tags) ? ev.tags : []
+      const h = tags.find(t => Array.isArray(t) && t[0] === 'h')
+      return typeof h?.[1] === 'string' ? h[1].toLowerCase() : null
+    }
+
+    const fallbackAuthorsForChannel = ch => {
+      const normalizedCh = String(ch || '').toLowerCase()
+      if (normalizedCh === String(store.memoryGlobalChannelId || '').toLowerCase()) {
+        const authors = new Set()
+        const owner = String(store.ownerPubkey || '').toLowerCase()
+        if (HEX64.test(owner)) authors.add(owner)
+        if (store.allowMemoryWriteCap && store.grantView?.writers instanceof Map) {
+          for (const writer of store.grantView.writers.keys()) {
+            const w = String(writer || '').toLowerCase()
+            if (HEX64.test(w)) authors.add(w)
+          }
+        }
+        return [...authors].sort()
+      }
+      const roomView = store.roomMembers?.get?.(normalizedCh)
+      if (!roomView?.members) return []
+      return [...roomView.members]
+        .map(m => String(m || '').toLowerCase())
+        .filter(m => HEX64.test(m))
+        .sort()
+    }
+
+    const sendChannelReq = (subId, ch) => {
+      const authors = fallbackAuthorsForChannel(ch)
+      subChannelMap.set(subId, ch)
+      subAuthorsKey.set(subId, authors.join(','))
+      subEvents.set(subId, [])
+      eoseReceived.delete(subId)
+      const filters = [{ kinds: [MEMORY_KIND, 5], '#h': [ch] }]
+      if (authors.length > 0) {
+        filters.push({ kinds: [FALLBACK_MEMORY_KIND], authors })
+      }
+      ws.send(JSON.stringify(['REQ', subId, ...filters]))
+    }
+
+    const refreshChannelAuthorsIfNeeded = () => {
+      if (!subscribed || stopped || ws.readyState !== 1) return
+      for (const [subId, ch] of subChannelMap.entries()) {
+        const nextKey = fallbackAuthorsForChannel(ch).join(',')
+        if (nextKey !== subAuthorsKey.get(subId)) {
+          sendChannelReq(subId, ch)
+        }
+      }
+    }
+    currentRefreshAuthors = refreshChannelAuthorsIfNeeded
 
     const sendSubscriptions = () => {
       if (subscribed || stopped) return
       subscribed = true
       channels.forEach((ch, idx) => {
-        const subId = `mem-ch-${idx}`
-        subChannelMap.set(subId, ch)
-        subEvents.set(subId, [])
-        ws.send(JSON.stringify(['REQ', subId, { kinds: [MEMORY_KIND, FALLBACK_MEMORY_KIND, 5], '#h': [ch] }]))
+        sendChannelReq(`mem-ch-${idx}`, ch)
       })
       if (subscribedRooms.length > 0) {
         ws.send(JSON.stringify(['REQ', 'mem-rooms', { kinds: [39002], '#d': subscribedRooms }]))
@@ -592,14 +643,24 @@ function startCommunityRelaySync({
         if (ev.kind === 39002) {
           try {
             store.recordRoomMembers(ev, { relayPubkey })
+            refreshChannelAuthorsIfNeeded()
           } catch {
             /* ignore untrusted or malformed 39002 */
           }
           return
         }
-        if (subChannelMap.has(subId) && !eoseReceived.has(subId)) {
-          subEvents.get(subId).push(ev)
-          return
+        if (subChannelMap.has(subId)) {
+          const targetCh = subChannelMap.get(subId)
+          if (ev.kind !== 5 && eventChannelTag(ev) !== targetCh) {
+            return
+          }
+          if (!eoseReceived.has(subId)) {
+            const list = subEvents.get(subId)
+            if (!ev.id || !list.some(existing => existing.id === ev.id)) {
+              list.push(ev)
+            }
+            return
+          }
         }
         const res = store.ingestEvent(ev)
         if (eoseReceived.has(subId) && res?.accepted) {
@@ -657,6 +718,9 @@ function startCommunityRelaySync({
   connectOnce()
 
   return {
+    refreshChannelAuthors() {
+      currentRefreshAuthors?.()
+    },
     refreshRooms() {
       if (stopped || !subscribedRooms.length || !currentWs || currentWs.readyState !== 1) return false
       try {
@@ -739,6 +803,7 @@ export async function startMemoryDaemon({
         grantRefreshPending = false
         try {
           await store.refreshGrants({ relays: effectiveRelays, queryFn: effectiveQueryFn, nowSec: Math.floor(Date.now() / 1000) || nowSec })
+          relaySyncHandle?.refreshChannelAuthors?.()
         } catch {
           /* keep last grant view */
         }
