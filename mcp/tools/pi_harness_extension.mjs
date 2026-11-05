@@ -84,14 +84,15 @@ export function readPiClientConfig(path, id, own = homedir()) {
   const socket = resolve(stateDir, 'tmux.sock')
   if (Buffer.byteLength(socket) >= 104) throw new Error('state_dir is too deep for its tmux socket; choose a shorter path')
   return Object.freeze({ id: instanceId(id), target, model, pubkey, channels, workTools: raw.work_tools === true, stateDir: resolve(stateDir), socket, identity, feedIdentity,
-    piHome: piHomeDir(String(raw.pi_home || ''), own), knownHosts: knownHostsFile(String(raw.known_hosts_file || '')) })
+    ...piLogin(String(raw.pi_home || ''), own), knownHosts: knownHostsFile(String(raw.known_hosts_file || '')) })
 }
 
-// The harness's own PI_CODING_AGENT_DIR, which its owner has logged in with `/login` (ChatGPT, the
-// openai-codex provider). Never ~/.pi/agent: that one loads the owner's own extensions, and a
+// The harness's own PI_CODING_AGENT_DIR, which its owner has logged in with `/login` (ChatGPT). pi
+// files that login under openai; logins made before pi 1.4 are under openai-codex, its legacy
+// provider. The harness runs pi on whichever holds it. Never ~/.pi/agent: that one loads the owner's own extensions, and a
 // shared auth.json would lose its refresh token to whichever copy refreshed last. Only each
 // credential's `type` is read, and nothing from the file is ever printed.
-function piHomeDir(path, own) {
+function piLogin(path, own) {
   if (!isAbsolute(path)) throw new Error('client config pi_home path must be absolute')
   const home = resolve(path)
   if ([own, resolve(own, '.pi'), resolve(own, '.pi', 'agent')].some(dir => home === resolve(dir))) throw new Error('pi_home must be the harness\'s own directory, never your home or ~/.pi/agent')
@@ -105,8 +106,9 @@ function piHomeDir(path, own) {
   try { auth = JSON.parse(readFileSync(authFile, 'utf8')) } catch { throw new Error('pi login (pi_home/auth.json) is not valid JSON') }
   if (!auth || typeof auth !== 'object' || Array.isArray(auth)) throw new Error('pi login (pi_home/auth.json) must be a JSON object')
   if (Object.values(auth).some(credential => credential?.type !== 'oauth')) throw new Error('pi login in pi_home holds an API key: log in with /login only')
-  if (auth['openai-codex']?.type !== 'oauth') throw new Error('pi login in pi_home is not a ChatGPT login: run pi there and /login to ChatGPT')
-  return home
+  const provider = ['openai', 'openai-codex'].find(name => auth[name]?.type === 'oauth')
+  if (!provider) throw new Error('pi login in pi_home is not a ChatGPT login: run pi there and /login to ChatGPT')
+  return { piHome: home, provider }
 }
 
 // One ssh child speaking newline-delimited JSON-RPC to the fleet's channel MCP. A call that gets no

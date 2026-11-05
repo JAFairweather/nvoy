@@ -80,6 +80,8 @@ ok('pi_home must be the harness\'s own owner-only directory, never ~/.pi/agent',
 ok('pi_home must hold a ChatGPT login and no API key, reading only each credential\'s type', refused({ ...client, pi_home: makePiHome(join(root, 'nologin'), null) }, /auth\.json\) is missing/) &&
   refused({ ...client, pi_home: makePiHome(join(root, 'keyed'), { 'openai-codex': { type: 'oauth' }, openai: { type: 'api_key', key: 'sk-proj-live-value' } }) }, /holds an API key/) &&
   refused({ ...client, pi_home: makePiHome(join(root, 'other'), { anthropic: { type: 'oauth' } }) }, /not a ChatGPT login/))
+ok('a ChatGPT login filed under openai (pi 1.4 and later) runs pi on that provider',
+  readPiClientConfig(clientConfig({ ...client, pi_home: makePiHome(join(root, 'newlogin'), { openai: { type: 'oauth', refresh: 'r' } }) }), 'pd-test', own).provider === 'openai')
 
 // Launcher: a fake tmux whose session is a sleeper, logging what it was asked to run and with what.
 writeFileSync(join(fakeBin, 'tmux'), `#!/usr/bin/env node

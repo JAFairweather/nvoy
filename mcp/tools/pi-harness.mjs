@@ -38,7 +38,7 @@ const STATUS_EXTENSIONS = ['herdr-agent-state.ts', 'moshi-hooks.ts']
 const moshiExtension = piHome => piHome ? STATUS_EXTENSIONS.map(name => resolve(piHome, 'extensions', name))
   .filter(path => existsSync(path)).flatMap(path => ['-e', path]) : []
 // --name: the session's display name, the identity's, which Moshi shows instead of its first prompt.
-const piArgs = ({ id, model, stateDir, workTools, piHome }) => ['--provider', 'openai-codex', '--model', model || 'gpt-5.6-luna',
+const piArgs = ({ id, model, stateDir, workTools, piHome, provider }) => ['--provider', provider, '--model', model || 'gpt-5.6-luna',
   '--no-extensions', '-e', extension, ...moshiExtension(piHome), '--tools', piTools({ workTools }),
   '--no-approve', '--session-dir', resolve(stateDir, 'sessions'), '--name', herdrAgentName(id), '--continue']
 
