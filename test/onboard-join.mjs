@@ -104,11 +104,16 @@ assert.equal(w.logins, 2, 'the proof is a second login, after the claim')
 w = world({ terms: null }); r = await go(w, request({ policy: 'none', ageConfirmed: false }))
 assert.equal(r.state, 'done'); assert.deepEqual(w.posts.map(p => p.url), [`${http}/api/invites/claim`])
 
-// Plaintext invite with no owner seal (hive-memory join path): never calls nip44Decrypt, claims and logs in.
+// Plaintext invite via explicit add.inviteCode (hive-memory join path): never calls nip44Decrypt, claims and logs in.
 w = world(); delete w.signer.nip44Decrypt
-r = await go(w, { invite: CODE, policy: '3', ageConfirmed: true })
+r = await go(w, { inviteCode: CODE, policy: '3', ageConfirmed: true })
 assert.equal(r.state, 'done'); assert.equal(w.decrypts, 0); noCode(r)
 assert.deepEqual(w.posts.map(p => p.url), [`${http}/api/invites/accept-policy`, `${http}/api/invites/claim`])
+
+// An add with invite (not inviteCode) and no owner still requires nip44Decrypt and fails closed.
+w = world(); delete w.signer.nip44Decrypt
+r = await go(w, { invite: CODE, policy: '3', ageConfirmed: true })
+assert.equal(r.state, 'refused'); assert.match(r.detail, /not sealed to this agent/)
 
 // A refused claim that echoes the code: refused, and the code is scrubbed from the receipt.
 w = world({ claimError: `invite ${CODE} already used` }); r = await go(w, request())

@@ -1005,7 +1005,10 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
     },
     close() { bunkerClosed = true },
   }
-  const wrappedBunkerSigner = createNip42AuthOnlySigner(fakeBunkerDelegate, 'wss://nave.communities.buzz.xyz', { now: () => nowSec })
+  const wrappedBunkerSigner = createNip42AuthOnlySigner(fakeBunkerDelegate, 'wss://nave.communities.buzz.xyz', {
+    expectedPubkey: daemonRelayIdentity.pk,
+    now: () => nowSec,
+  })
   let bunkerRefused27235 = null
   try {
     await wrappedBunkerSigner.signEvent({
@@ -1031,12 +1034,42 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
     bunkerAuthEv.pubkey === daemonRelayIdentity.pk &&
     bunkerClosed === true)
 
+  const wrongKeyBunker = {
+    pubkey: deadRabbit.pk,
+    async getPublicKey() { return deadRabbit.pk },
+    async signEvent(tmpl) { return sign(tmpl, deadRabbit.sk) },
+  }
+  const wrongKeyWrapper = createNip42AuthOnlySigner(wrongKeyBunker, 'wss://nave.communities.buzz.xyz', {
+    expectedPubkey: daemonRelayIdentity.pk,
+    now: () => nowSec,
+  })
+  let wrongKeySignErr = null
+  try {
+    await wrongKeyWrapper.signEvent({
+      kind: 22242,
+      created_at: nowSec,
+      content: '',
+      tags: [['relay', 'wss://nave.communities.buzz.xyz'], ['challenge', 'bunker-challenge-99999999']],
+    })
+  } catch (err) {
+    wrongKeySignErr = err
+  }
+  ok('createNip42AuthOnlySigner refuses when Bunker signs with a pubkey other than expectedPubkey',
+    Boolean(wrongKeySignErr && /expected service pubkey/.test(wrongKeySignErr.message)))
+
   const bunkerCredDir = join(daemonDir, 'bunker-creds')
   mkdirSync(bunkerCredDir, { recursive: true, mode: 0o700 })
+  writeFileSync(join(bunkerCredDir, 'relay-identity'), Buffer.from(daemonRelayIdentity.sk).toString('hex') + '\n', { mode: 0o600 })
+  let rawIdentityRejectedErr = null
+  try {
+    loadRelaySignerFromCredentials(bunkerCredDir, 'wss://nave.communities.buzz.xyz', { expectedPubkey: daemonRelayIdentity.pk })
+  } catch (err) {
+    rawIdentityRejectedErr = err
+  }
   writeFileSync(join(bunkerCredDir, 'nip46-client'), Buffer.from(daemonRelayIdentity.sk).toString('hex') + '\n', { mode: 0o600 })
   let incompleteBunkerErr = null
   try {
-    loadRelaySignerFromCredentials(bunkerCredDir, 'wss://nave.communities.buzz.xyz')
+    loadRelaySignerFromCredentials(bunkerCredDir, 'wss://nave.communities.buzz.xyz', { expectedPubkey: daemonRelayIdentity.pk })
   } catch (err) {
     incompleteBunkerErr = err
   }
@@ -1047,12 +1080,14 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
   )
   let constructedUri = null
   const loadedBunkerSigner = loadRelaySignerFromCredentials(bunkerCredDir, 'wss://nave.communities.buzz.xyz', {
+    expectedPubkey: daemonRelayIdentity.pk,
     makeBunker: (uri, _client) => {
       constructedUri = uri
       return fakeBunkerDelegate
     },
   })
-  ok('loadRelaySignerFromCredentials requires both nip46-client and bunker-uri and wraps makeBunkerSigner in createNip42AuthOnlySigner',
+  ok('loadRelaySignerFromCredentials rejects raw relay-identity fallback, requires both nip46-client and bunker-uri, and pins expectedPubkey',
+    Boolean(rawIdentityRejectedErr && /both nip46-client and bunker-uri/.test(rawIdentityRejectedErr.message)) &&
     Boolean(incompleteBunkerErr && /both nip46-client and bunker-uri/.test(incompleteBunkerErr.message)) &&
     Boolean(loadedBunkerSigner) &&
     constructedUri === `bunker://${daemonRelayIdentity.pk}?relay=wss%3A%2F%2Frelay.nsec.app` &&
@@ -1142,9 +1177,11 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
 
   const credDir = join(daemonDir, 'creds')
   mkdirSync(credDir, { recursive: true, mode: 0o700 })
-  writeFileSync(join(credDir, 'relay-identity'), Buffer.from(daemonRelayIdentity.sk).toString('hex') + '\n', { mode: 0o600 })
+  writeFileSync(join(credDir, 'nip46-client'), Buffer.from(daemonRelayIdentity.sk).toString('hex') + '\n', { mode: 0o600 })
+  writeFileSync(join(credDir, 'bunker-uri'), `bunker://${daemonRelayIdentity.pk}?relay=wss%3A%2F%2Frelay.nsec.app\n`, { mode: 0o600 })
 
   const liveCfgPath = join(daemonDir, 'etc-config.json')
+  writeFileSync(join(daemonDir, 'service-pubkey'), daemonRelayIdentity.pk + '\n', { mode: 0o644 })
   writeFileSync(liveCfgPath, JSON.stringify({
     memoryGlobalChannelId: GLOBAL_CH,
     ownerPubkey: james.pk,
@@ -1166,6 +1203,7 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
     readers: 'biggy:crusty',
     socketDir: liveSockDir,
     credentialsDir: credDir,
+    makeBunker: () => fakeBunkerDelegate,
   })
 
   // Wait briefly for WebSocket AUTH + REQ + EOSE + grant refresh to complete
@@ -1239,6 +1277,7 @@ os.set_inheritable(4, True)
 os.environ["LISTEN_PID"] = str(os.getpid())
 os.environ["LISTEN_FDS"] = "2"
 os.environ["LISTEN_FDNAMES"] = "biggy:crusty"
+os.environ["HIVE_MEMORY_ALLOW_NO_CREDENTIALS"] = "1"
 os.execvp("node", ["node", sys.argv[3], "--state", sys.argv[4], "--config", sys.argv[5], "--readers", "biggy:crusty"])
       `.trim(),
       sdBiggySock,
