@@ -20,11 +20,12 @@
 
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
 import { createServer } from 'node:net'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 import { finalizeEvent, getPublicKey, verifyEvent } from 'nostr-tools/pure'
 import WebSocket from 'ws'
 import { authTemplate, checkAuthTemplate, normalizeBuzzRelay } from './buzz_native.mjs'
+import { selfHealingSigner } from './broker_signer.mjs'
 import { grantReadRelays } from './grant_relays.mjs'
 import {
   DEFAULT_MEMORY_OWNER,
@@ -33,6 +34,7 @@ import {
   MEMORY_TOOL_SPECS,
   MemoryStore,
 } from './memory.mjs'
+import { makeBunkerSigner } from './nip46-signer.mjs'
 import { secretKey } from './secret_key.mjs'
 
 const READER_NAME_RE = /^[a-z][a-z0-9-]{0,31}$/
@@ -82,6 +84,16 @@ export function loadDaemonConfig(configPath) {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error('config file must contain a JSON object')
   }
+  if (parsed.servicePubkey === undefined) {
+    const siblingPubkeyPath = join(dirname(resolved), 'service-pubkey')
+    if (existsSync(siblingPubkeyPath)) {
+      const pkSt = lstatSync(siblingPubkeyPath)
+      if (!pkSt.isFile() || pkSt.isSymbolicLink()) {
+        throw new Error('service-pubkey file must be a regular non-symlink file')
+      }
+      parsed.servicePubkey = readFileSync(siblingPubkeyPath, 'utf8').trim()
+    }
+  }
   return parsed
 }
 
@@ -113,6 +125,12 @@ export function validateAndResolveConfig(cfg, readers) {
   if (subscribedRooms.length > 0 && !relayPubkey) {
     throw new Error('config.relayPubkey must be a 64-character hex public key when config.subscribedRooms is non-empty')
   }
+  const servicePubkey = cfg.servicePubkey !== undefined && cfg.servicePubkey !== null
+    ? String(cfg.servicePubkey).toLowerCase()
+    : null
+  if (servicePubkey !== null && !HEX64.test(servicePubkey)) {
+    throw new Error('config.servicePubkey must be a 64-character hex public key or null')
+  }
 
   const rawReaders = cfg.readers
   if (!rawReaders || typeof rawReaders !== 'object' || Array.isArray(rawReaders)) {
@@ -143,6 +161,7 @@ export function validateAndResolveConfig(cfg, readers) {
     allowMemoryWriteCap: Boolean(cfg.allowMemoryWriteCap),
     relayUrl,
     relayPubkey,
+    servicePubkey,
     grantRelays: Array.isArray(cfg.grantRelays) ? cfg.grantRelays : [],
     grantRefreshIntervalMs:
       Number.isInteger(cfg.grantRefreshIntervalMs) && cfg.grantRefreshIntervalMs > 0
@@ -153,16 +172,60 @@ export function validateAndResolveConfig(cfg, readers) {
 }
 
 // Narrow NIP-42 AUTH-only signer: signs ONLY fresh kind 22242 AUTH challenges for the configured
-// community relay. Refuses claims (30079/30078), deletions (5), grants (440/441), or any other event.
-export function createNip42AuthOnlySigner(rawKeyOrBytes, relayUrl, { now = () => Math.floor(Date.now() / 1000) } = {}) {
+// community relay. Wraps a NIP-46 Bunker signer (production, pinned to expectedPubkey) or raw key
+// material (in-memory unit tests). Refuses claims (30079/30078), HTTP auth (27235), deletions (5),
+// grants (440/441), or any other event BEFORE delegating to the underlying signer, and verifies
+// every returned signature and pubkey against the pinned expected identity.
+export function createNip42AuthOnlySigner(
+  signerOrRawKey,
+  relayUrl,
+  { expectedPubkey = null, now = () => Math.floor(Date.now() / 1000) } = {}
+) {
   const targetRelay = normalizeBuzzRelay(relayUrl)
-  const sk = rawKeyOrBytes instanceof Uint8Array ? rawKeyOrBytes : secretKey(rawKeyOrBytes, 'relay-identity')
-  const pubkey = getPublicKey(sk).toLowerCase()
+  const isDelegate =
+    signerOrRawKey &&
+    typeof signerOrRawKey === 'object' &&
+    !(signerOrRawKey instanceof Uint8Array) &&
+    typeof signerOrRawKey.signEvent === 'function'
+
+  let delegate = null
+  let pinnedPubkey = null
+
+  if (isDelegate) {
+    if (!expectedPubkey || !HEX64.test(String(expectedPubkey))) {
+      throw new Error('expectedPubkey (64-character hex) is required for Bunker signer')
+    }
+    pinnedPubkey = String(expectedPubkey).toLowerCase()
+    delegate = signerOrRawKey
+  } else {
+    const sk = signerOrRawKey instanceof Uint8Array ? signerOrRawKey : secretKey(signerOrRawKey, 'relay-identity')
+    const pk = getPublicKey(sk).toLowerCase()
+    if (expectedPubkey && String(expectedPubkey).toLowerCase() !== pk) {
+      throw new Error(`signer pubkey ${pk} does not match expectedPubkey ${String(expectedPubkey).toLowerCase()}`)
+    }
+    pinnedPubkey = pk
+    delegate = {
+      pubkey: pk,
+      async getPublicKey() {
+        return pk
+      },
+      async signEvent(template) {
+        return finalizeEvent(template, sk)
+      },
+    }
+  }
+
   return Object.freeze({
-    pubkey,
+    get pubkey() {
+      return pinnedPubkey
+    },
     relay: targetRelay,
     async getPublicKey() {
-      return pubkey
+      const pk = String(await delegate.getPublicKey()).toLowerCase()
+      if (pk !== pinnedPubkey) {
+        throw new Error(`Bunker signer pubkey mismatch: got ${pk}, expected service pubkey ${pinnedPubkey}`)
+      }
+      return pinnedPubkey
     },
     async signEvent(template) {
       const reason = checkAuthTemplate(template, { relay: targetRelay, now: now() })
@@ -171,9 +234,78 @@ export function createNip42AuthOnlySigner(rawKeyOrBytes, relayUrl, { now = () =>
         err.code = 'HIVE_MEMORY_DAEMON_NO_SIGN'
         throw err
       }
-      return finalizeEvent(template, sk)
+      const signed = await delegate.signEvent(template)
+      let valid = false
+      try {
+        valid = verifyEvent(signed)
+      } catch {
+        valid = false
+      }
+      if (!valid) {
+        throw new Error('Bunker returned an event with an invalid signature')
+      }
+      const actualPk = String(signed.pubkey || '').toLowerCase()
+      if (actualPk !== pinnedPubkey) {
+        throw new Error(`Bunker signed event with pubkey ${actualPk}, expected service pubkey ${pinnedPubkey}`)
+      }
+      const postReason = checkAuthTemplate(
+        { kind: signed.kind, created_at: signed.created_at, content: signed.content, tags: signed.tags },
+        { relay: targetRelay, now: now() }
+      )
+      if (postReason !== null) {
+        throw new Error(`Bunker returned a non-matching AUTH event (${postReason})`)
+      }
+      return signed
+    },
+    close() {
+      try {
+        return delegate.close?.()
+      } catch {
+        /* ignore */
+      }
     },
   })
+}
+
+function assertRegularFile(filePath, label) {
+  const st = lstatSync(filePath)
+  if (!st.isFile() || st.isSymbolicLink()) {
+    throw new Error(`${label} must be a regular non-symlink file`)
+  }
+}
+
+export function loadRelaySignerFromCredentials(
+  credentialsDir,
+  relayUrl,
+  { expectedPubkey = null, makeBunker = makeBunkerSigner } = {}
+) {
+  if (!credentialsDir) {
+    throw new Error('Bunker credentials directory (CREDENTIALS_DIRECTORY) is required')
+  }
+  if (!expectedPubkey || !HEX64.test(String(expectedPubkey))) {
+    throw new Error('config.servicePubkey (64-character hex) is required for Bunker credentials')
+  }
+  const dir = resolve(credentialsDir)
+  const clientPath = existsSync(join(dir, 'nip46-client'))
+    ? join(dir, 'nip46-client')
+    : existsSync(join(dir, 'bunker-client'))
+      ? join(dir, 'bunker-client')
+      : null
+  const uriPath = existsSync(join(dir, 'bunker-uri')) ? join(dir, 'bunker-uri') : null
+
+  if (!clientPath || !uriPath) {
+    throw new Error('both nip46-client and bunker-uri credentials are required in CREDENTIALS_DIRECTORY')
+  }
+  assertRegularFile(clientPath, 'nip46-client credential')
+  assertRegularFile(uriPath, 'bunker-uri credential')
+  const clientRaw = readFileSync(clientPath, 'utf8').trim()
+  const uriRaw = readFileSync(uriPath, 'utf8').trim()
+  secretKey(clientRaw, 'nip46-client credential')
+  if (!/^bunker:\/\/[0-9a-f]{64}/i.test(uriRaw)) {
+    throw new Error('bunker-uri credential is invalid')
+  }
+  const bunker = selfHealingSigner(() => makeBunker(uriRaw, clientRaw, { clientSource: 'nip46-client credential' }))
+  return createNip42AuthOnlySigner(bunker, relayUrl, { expectedPubkey })
 }
 
 export function queryGrantRelay(url, filter, { WS = WebSocket, timeoutMs = 10000 } = {}) {
@@ -525,6 +657,15 @@ function startCommunityRelaySync({
   connectOnce()
 
   return {
+    refreshRooms() {
+      if (stopped || !subscribedRooms.length || !currentWs || currentWs.readyState !== 1) return false
+      try {
+        currentWs.send(JSON.stringify(['REQ', 'mem-rooms', { kinds: [39002], '#d': subscribedRooms }]))
+        return true
+      } catch {
+        return false
+      }
+    },
     stop() {
       stopped = true
       if (reconnectTimer) clearTimeout(reconnectTimer)
@@ -546,6 +687,8 @@ export async function startMemoryDaemon({
   listenFdNames = process.env.LISTEN_FDNAMES || null,
   listenPid = process.env.LISTEN_PID ? Number(process.env.LISTEN_PID) : null,
   credentialsDir = process.env.CREDENTIALS_DIRECTORY || null,
+  relaySigner: injectedRelaySigner = null,
+  makeBunker = makeBunkerSigner,
   config = null,
   store: existingStore = null,
   grantQueryFn = null,
@@ -562,16 +705,15 @@ export async function startMemoryDaemon({
   const validated = validateAndResolveConfig(rawCfg, readers)
   const { readerMap } = validated
 
-  // Load optional systemd LoadCredential relay-identity file without ever logging or exposing its content.
-  const relayCredentialPath = credentialsDir ? join(resolve(credentialsDir), 'relay-identity') : null
-  let relaySigner = null
-  if (relayCredentialPath && existsSync(relayCredentialPath)) {
-    const st = lstatSync(relayCredentialPath)
-    if (!st.isFile() || st.isSymbolicLink()) {
-      throw new Error('relay-identity credential must be a regular non-symlink file')
-    }
-    relaySigner = createNip42AuthOnlySigner(readFileSync(relayCredentialPath, 'utf8'), validated.relayUrl)
-  }
+  // Load systemd LoadCredential Bunker NIP-46 credentials (nip46-client + bunker-uri), pinned to servicePubkey.
+  const relaySigner = injectedRelaySigner
+    ? createNip42AuthOnlySigner(injectedRelaySigner, validated.relayUrl, { expectedPubkey: validated.servicePubkey })
+    : credentialsDir
+      ? loadRelaySignerFromCredentials(credentialsDir, validated.relayUrl, {
+          expectedPubkey: validated.servicePubkey,
+          makeBunker,
+        })
+      : null
 
   const store = existingStore || new MemoryStore({
     statePath: join(resolvedStateDir, 'memory_claims.json'),
@@ -673,6 +815,7 @@ export async function startMemoryDaemon({
   if (shouldAutoSync) {
     refreshDaemonGrants()
     grantTimer = setInterval(() => {
+      relaySyncHandle?.refreshRooms?.()
       refreshDaemonGrants()
     }, validated.grantRefreshIntervalMs)
     grantTimer.unref?.()
@@ -709,6 +852,7 @@ export async function startMemoryDaemon({
     async close() {
       if (grantTimer) clearInterval(grantTimer)
       relaySyncHandle?.stop()
+      relaySigner?.close?.()
       await Promise.all(
         [...servers.values()].map(srv => new Promise(res => srv.close(() => res())))
       )
@@ -728,6 +872,10 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const socketDir = flag('--socket-dir') || null
   if (socketDir && process.env.HIVE_MEMORY_ALLOW_SOCKET_DIR !== '1') {
     console.error('hive-memory: --socket-dir is for local tests only (set HIVE_MEMORY_ALLOW_SOCKET_DIR=1); production requires systemd LISTEN_FDS')
+    process.exit(1)
+  }
+  if (!socketDir && !process.env.CREDENTIALS_DIRECTORY && process.env.HIVE_MEMORY_ALLOW_NO_CREDENTIALS !== '1') {
+    console.error('hive-memory: CREDENTIALS_DIRECTORY with nip46-client and bunker-uri is required in production')
     process.exit(1)
   }
 
