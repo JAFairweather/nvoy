@@ -699,6 +699,15 @@ export class MemoryStore {
       ingestedAt: nowSec,
     }
     this.entries.set(key, stored)
+    const chSync = parsed.channelId ? this.channelSync.get(parsed.channelId) : null
+    if (chSync && (chSync.state === 'SYNCED_OK' || chSync.state === 'SYNCED_EMPTY')) {
+      const localNonExpired = [...this.entries.values()].filter(e =>
+        e.channelId === parsed.channelId && e.status === 'active' && (!e.expiresAt || e.expiresAt > nowSec)
+      ).length
+      chSync.localCount = localNonExpired
+      if (chSync.state === 'SYNCED_EMPTY' && localNonExpired > 0) chSync.state = 'SYNCED_OK'
+      else if (chSync.state === 'SYNCED_OK' && localNonExpired === 0 && (chSync.remoteCount || 0) === 0) chSync.state = 'SYNCED_EMPTY'
+    }
     if (persist) this.persist(nowSec)
     return { accepted: true, status: parsed.status, key, entry: stored }
   }
