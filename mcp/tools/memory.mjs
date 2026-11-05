@@ -1,4 +1,4 @@
-// memory.mjs — Hive Shared Memory ("Waggle Claims & Wake Digest", docs/DESIGN_HIVE_MEMORY.md).
+// memory.mjs — Hive Shared Memory library ("Waggle Claims & Wake Digest", docs/DESIGN_HIVE_MEMORY.md).
 //
 // Core invariants enforced here:
 //   1. Nostr is the replication bus; the local broker (in-memory Map + atomic memory_claims.json)
@@ -7,16 +7,20 @@
 //      `trustedInstruction: false`.
 //   3. Rank and write rights are computed by the reader at read time from scope (`s`), author
 //      `pubkey`, and live grant / room-membership views. No rank tag on the wire is trusted.
-//   4. Memory never stores, caches, or re-broadcasts grants.
+//   4. One memory owner key (`ownerPubkey`, defaulting to James `4010ac43...`), never a per-broker
+//      manifest `grantors` list, governs `hive:canon`, the `hive:ops` owner bypass, and the memory
+//      grant fold so every broker reaches the exact same verdict.
+//   5. Memory never stores, caches, or re-broadcasts grants.
 
 import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
-import { getEventHash, verifyEvent } from 'nostr-tools/pure'
-import { MEMORY_WRITE_CAP } from './admission.mjs'
+import { verifyEvent } from 'nostr-tools/pure'
+import { DEFAULT_MEMORY_OWNER, MEMORY_WRITE_CAP } from './admission.mjs'
 import { foldMemoryGrants } from './grant_fold.mjs'
 import { relayLabel } from './grant_evidence.mjs'
 import { credentialIn } from './outbound_secrets.mjs'
 
+export { DEFAULT_MEMORY_OWNER }
 export const MEMORY_KIND = 30079
 export const FALLBACK_MEMORY_KIND = 30078
 export const MEMORY_D_PREFIX = 'hive-memory:'
@@ -33,6 +37,7 @@ const SLUG = /^[a-z0-9][a-z0-9._-]{0,127}$/
 
 // Memory-specific secret patterns required by DESIGN_HIVE_MEMORY.md in addition to outbound_secrets.mjs.
 // 64-character hex strings (pubkeys, event IDs, git SHAs) and npub1/nevent1 are explicitly permitted.
+// Bracketed IPv6 requires at least one colon so ordinary bracketed hex words like "[dead]" or "[add]" pass.
 const MEMORY_SECRET_PATTERNS = Object.freeze([
   ['a Nostr secret key', /\bnsec1[02-9ac-hj-np-z]{20,}\b/i],
   ['an encrypted Nostr key', /\bncryptsec1[02-9ac-hj-np-z]{20,}\b/i],
@@ -41,7 +46,7 @@ const MEMORY_SECRET_PATTERNS = Object.freeze([
   ['a relay WebSocket URL', /\bwss?:\/\/[^\s"']+/i],
   ['an IPv4 address literal', /\b(?:\d{1,3}\.){3}\d{1,3}\b/],
   ['a Tailscale IPv6 literal', /\bfd7a:[0-9a-f:]+/i],
-  ['a bracketed IPv6 literal', /\[[0-9a-f:]{2,}\]/i],
+  ['a bracketed IPv6 literal', /\[[0-9a-f]*:[0-9a-f:]+\]/i],
   ['an API key prefix', /\b(?:sk-[a-zA-Z0-9_-]{16,}|gh[pousr]_[a-zA-Z0-9]{20,}|github_pat_[a-zA-Z0-9_]{20,}|AIza[0-9A-Za-z-_]{30,})\b/],
 ])
 
@@ -382,20 +387,21 @@ export function buildWithdrawalTemplate({
 }
 
 // Two-phase targeted grant refresh (DESIGN_HIVE_MEMORY.md § "Authorization inputs and offline reads").
-// queryFn(relayUrl, filter) -> Promise<{ events: Event[], eose: boolean, closed?: boolean }>
+// Uses a single configured `ownerPubkey` (James), never a per-broker manifest `grantors` list.
 export async function refreshMemoryGrants({
   writers = [],
-  grantors = [],
+  ownerPubkey = DEFAULT_MEMORY_OWNER,
+  allowMemoryWriteCap = false,
   relays = [],
   queryFn,
   nowSec = Math.floor(Date.now() / 1000),
   limit = GRANT_LOOKUP_LIMIT,
 }) {
-  const cleanGrantors = [...new Set(grantors.map(g => String(g).toLowerCase()).filter(g => HEX64.test(g)))]
-  const targetWriters = [...new Set(writers.map(w => String(w).toLowerCase()).filter(w => HEX64.test(w) && !cleanGrantors.includes(w)))]
+  const owner = String(ownerPubkey || '').toLowerCase()
+  const targetWriters = [...new Set(writers.map(w => String(w).toLowerCase()).filter(w => HEX64.test(w) && w !== owner))]
   const relayLabels = relays.map((url, idx) => relayLabel(url, idx))
 
-  if (!relays.length || !cleanGrantors.length) {
+  if (!relays.length || !HEX64.test(owner)) {
     return {
       complete: false,
       relaysAnswered: 0,
@@ -408,9 +414,7 @@ export async function refreshMemoryGrants({
     }
   }
 
-  // If there are no non-grantor writers to check, still verify that all grant relays answer a lightweight probe
-  // so `grants_checked_at` reflects live relay reachability.
-  const phase1Targets = targetWriters.length ? targetWriters : [cleanGrantors[0]]
+  const phase1Targets = targetWriters.length ? targetWriters : [owner]
   const relayCompletedAll = new Map(relays.map((_, i) => [i, true]))
   const grantsByWriterPerRelay = new Map() // writer -> Map(relayIdx -> Set(grantId))
   const validGrants = new Map() // grantId -> event
@@ -419,14 +423,14 @@ export async function refreshMemoryGrants({
   const lookupAnswered = res =>
     res && res.eose === true && !res.closed && Array.isArray(res.events) && res.events.length < limit
 
-  // Phase 1: For each writer, ask every relay for kinds: [440], authors: grantors, #p: [writer]
+  // Phase 1: For each writer, ask every relay for kinds: [440], authors: [owner], #p: [writer]
   for (const writer of phase1Targets) {
     const perRelay = new Map()
     grantsByWriterPerRelay.set(writer, perRelay)
     await Promise.all(relays.map(async (url, idx) => {
       let res
       try {
-        res = await queryFn(url, { kinds: [440], authors: cleanGrantors, '#p': [writer], limit })
+        res = await queryFn(url, { kinds: [440], authors: [owner], '#p': [writer], limit })
       } catch {
         res = { events: [], eose: false }
       }
@@ -436,7 +440,7 @@ export async function refreshMemoryGrants({
       }
       const ids = new Set()
       for (const ev of res.events) {
-        if (!ev || ev.kind !== 440 || !cleanGrantors.includes(String(ev.pubkey || '').toLowerCase())) continue
+        if (!ev || ev.kind !== 440 || String(ev.pubkey || '').toLowerCase() !== owner) continue
         const pTag = tagValue(ev, 'p')
         if (String(pTag || '').toLowerCase() !== writer) continue
         let ok = false; try { ok = verifyEvent(ev) } catch { ok = false }
@@ -459,7 +463,7 @@ export async function refreshMemoryGrants({
     await Promise.all(relays.map(async (url, idx) => {
       let res
       try {
-        res = await queryFn(url, { kinds: [441], authors: cleanGrantors, '#e': unionGrantIds, limit })
+        res = await queryFn(url, { kinds: [441], authors: [owner], '#e': unionGrantIds, limit })
       } catch {
         res = { events: [], eose: false }
       }
@@ -469,7 +473,7 @@ export async function refreshMemoryGrants({
       }
       const ids = new Set()
       for (const ev of res.events) {
-        if (!ev || ev.kind !== 441 || !cleanGrantors.includes(String(ev.pubkey || '').toLowerCase())) continue
+        if (!ev || ev.kind !== 441 || String(ev.pubkey || '').toLowerCase() !== owner) continue
         const eTag = tagValue(ev, 'e')
         if (!unionGrantIds.includes(eTag)) continue
         let ok = false; try { ok = verifyEvent(ev) } catch { ok = false }
@@ -504,7 +508,11 @@ export async function refreshMemoryGrants({
 
   const relaysAnswered = [...relayCompletedAll.values()].filter(Boolean).length
   const complete = relaysAnswered === relays.length
-  const folded = foldMemoryGrants([...allGrantEvents.values()], { grantors: cleanGrantors, nowSec })
+  const folded = foldMemoryGrants([...allGrantEvents.values()], {
+    owner,
+    allowMemoryWrite: allowMemoryWriteCap,
+    nowSec,
+  })
 
   // If the refresh was partial, any writer that ended (`revoked` or `expired`) or had no grant found
   // might have a live re-grant on the relay that failed to answer.
@@ -564,25 +572,35 @@ export class MemoryStore {
   constructor({
     statePath,
     readerPubkey,
-    grantors = [],
+    // One single configured memory owner key (defaults to James `4010ac43...`), never a per-broker
+    // manifest `grantors` list. Even if a caller passes a manifest `grantors` array, it is ignored
+    // unless `ownerPubkey` is explicitly provided.
+    ownerPubkey = DEFAULT_MEMORY_OWNER,
     memoryGlobalChannelId = '',
+    subscribedRooms = [],
     authMaxAgeSec = DEFAULT_AUTH_MAX_AGE_SEC,
-    // James's decision (2026-11-04): hive:canon is restricted to James (grantors) only by default.
-    // Can be toggled in tests via canonAllowShadow: true to test shadow canon rules.
-    canonAllowShadow = false,
+    // Defaults to false in Slice 1 until James approves the `memory-write` cap on #712.
+    allowMemoryWriteCap = false,
   }) {
     this.statePath = statePath ? resolve(statePath) : null
     this.readerPubkey = String(readerPubkey || '').toLowerCase()
-    this.grantors = [...new Set(grantors.map(g => String(g).toLowerCase()).filter(g => HEX64.test(g)))]
+    const cleanOwner = String(ownerPubkey || '').toLowerCase()
+    if (!HEX64.test(cleanOwner)) throw new Error('ownerPubkey must be a single 64-hex public key')
+    this.ownerPubkey = cleanOwner
     this.memoryGlobalChannelId = String(memoryGlobalChannelId || '').toLowerCase()
+    this.subscribedRooms = new Set(
+      (Array.isArray(subscribedRooms) ? subscribedRooms : [])
+        .map(r => String(r || '').toLowerCase())
+        .filter(r => UUID.test(r))
+    )
     this.authMaxAgeSec = authMaxAgeSec
-    this.canonAllowShadow = canonAllowShadow
+    this.allowMemoryWriteCap = Boolean(allowMemoryWriteCap)
 
     // Map<compositeKey `${pubkey}:${d}`, StoredEntry>
     this.entries = new Map()
-    // Channel sync watermarks: channelId -> { state, lastEoseAt, remoteCount }
+    // Channel sync watermarks: channelId -> { state, lastEoseAt, localCount, remoteCount, missingCount }
     this.channelSync = new Map()
-    // Room member lists: roomId -> { members: Set<pubkey>, checkedAt: number, relaySigned: boolean }
+    // Room member lists: roomId -> { members: Set<pubkey>, checkedAt: number }
     this.roomMembers = new Map()
     // In-memory grant state (never persisted to disk!)
     this.grantView = {
@@ -671,6 +689,8 @@ export class MemoryStore {
       ? withdrawnExp + TOMBSTONE_GRACE_SEC
       : null
 
+    if (parsed.roomId) this.subscribedRooms.add(parsed.roomId)
+
     const stored = {
       ...parsed,
       event: JSON.parse(JSON.stringify(ev)),
@@ -684,17 +704,24 @@ export class MemoryStore {
   }
 
   // Updates per-channel sync watermark after a relay subscription EOSE or connection failure.
+  // Detects both full and partial relay eviction by comparing remote event IDs against local active,
+  // non-expired claims for that channel.
   recordChannelSync(channelId, { reachable = true, eose = false, remoteEvents = [], nowSec = Math.floor(Date.now() / 1000) } = {}) {
     const ch = String(channelId || '').toLowerCase()
     if (!ch) return null
+    if (UUID.test(ch) && ch !== this.memoryGlobalChannelId) this.subscribedRooms.add(ch)
+
+    const remoteIds = new Set()
     for (const ev of Array.isArray(remoteEvents) ? remoteEvents : []) {
+      if (ev?.id) remoteIds.add(ev.id)
       this.ingestEvent(ev, { persist: false, nowSec })
     }
     if (remoteEvents?.length) this.persist(nowSec)
 
-    const localNonExpired = [...this.entries.values()].filter(e =>
+    const localActive = [...this.entries.values()].filter(e =>
       e.channelId === ch && e.status === 'active' && (!e.expiresAt || e.expiresAt > nowSec)
-    ).length
+    )
+    const localNonExpired = localActive.length
 
     const prev = this.channelSync.get(ch)
     if (!reachable || !eose) {
@@ -703,14 +730,16 @@ export class MemoryStore {
         lastEoseAt: prev?.lastEoseAt || null,
         localCount: localNonExpired,
         remoteCount: null,
+        missingCount: null,
       }
       this.channelSync.set(ch, state)
       return state
     }
 
     const remoteCount = Array.isArray(remoteEvents) ? remoteEvents.length : 0
+    const missingFromRelay = localActive.filter(e => !remoteIds.has(e.event.id)).length
     let syncState = 'SYNCED_OK'
-    if (remoteCount === 0 && localNonExpired > 0) {
+    if (missingFromRelay > 0) {
       syncState = 'RELAY_EVICTED_WARNING'
     } else if (remoteCount === 0 && localNonExpired === 0) {
       syncState = 'SYNCED_EMPTY'
@@ -721,6 +750,7 @@ export class MemoryStore {
       lastEoseAt: nowSec,
       localCount: localNonExpired,
       remoteCount,
+      missingCount: missingFromRelay,
     }
     this.channelSync.set(ch, state)
     return state
@@ -738,14 +768,32 @@ export class MemoryStore {
       lastEoseAt: null,
       localCount: localNonExpired,
       remoteCount: null,
+      missingCount: null,
     }
   }
 
-  // Updates room membership from a relay-signed kind 39002 event or explicit member list.
-  recordRoomMembers(roomId, members, { checkedAt = Math.floor(Date.now() / 1000) } = {}) {
-    const id = String(roomId || '').toLowerCase()
-    if (!UUID.test(id)) throw new Error(`invalid room UUID: ${roomId}`)
-    const set = new Set((Array.isArray(members) ? members : []).map(m => String(m).toLowerCase()).filter(m => HEX64.test(m)))
+  // Updates room membership from a relay-signed kind 39002 event (verifying signature and optional
+  // relayPubkey) or from an explicit member array.
+  recordRoomMembers(roomIdOrEvent, membersOrOpts = [], { checkedAt = Math.floor(Date.now() / 1000), relayPubkey = null } = {}) {
+    if (roomIdOrEvent && typeof roomIdOrEvent === 'object' && roomIdOrEvent.kind === 39002) {
+      const ev = roomIdOrEvent
+      const opts = membersOrOpts && typeof membersOrOpts === 'object' && !Array.isArray(membersOrOpts) ? membersOrOpts : { checkedAt, relayPubkey }
+      let valid = false; try { valid = verifyEvent(ev) } catch { valid = false }
+      if (!valid) throw new Error('kind 39002 room member list has an invalid signature')
+      if (opts.relayPubkey && String(ev.pubkey || '').toLowerCase() !== String(opts.relayPubkey).toLowerCase()) {
+        throw new Error('kind 39002 room member list was not signed by the expected relay key')
+      }
+      const id = String(tagValue(ev, 'd') || '').toLowerCase()
+      if (!UUID.test(id)) throw new Error('kind 39002 d tag is not a valid room UUID')
+      const members = tagValues(ev, 'p').map(m => String(m || '').toLowerCase()).filter(m => HEX64.test(m))
+      this.subscribedRooms.add(id)
+      this.roomMembers.set(id, { members: new Set(members), checkedAt: opts.checkedAt ?? Math.floor(Date.now() / 1000) })
+      return
+    }
+    const id = String(roomIdOrEvent || '').toLowerCase()
+    if (!UUID.test(id)) throw new Error(`invalid room UUID: ${roomIdOrEvent}`)
+    const set = new Set((Array.isArray(membersOrOpts) ? membersOrOpts : []).map(m => String(m).toLowerCase()).filter(m => HEX64.test(m)))
+    this.subscribedRooms.add(id)
     this.roomMembers.set(id, { members: set, checkedAt })
   }
 
@@ -758,7 +806,8 @@ export class MemoryStore {
     )]
     const res = await refreshMemoryGrants({
       writers: candidateWriters,
-      grantors: this.grantors,
+      ownerPubkey: this.ownerPubkey,
+      allowMemoryWriteCap: this.allowMemoryWriteCap,
       relays,
       queryFn,
       nowSec,
@@ -825,60 +874,53 @@ export class MemoryStore {
       return { verification: 'accepted', verificationReason: null, computedRank: 3, checkedAt: roomView.checkedAt, staleWarning }
     }
 
-    // Global scopes: hive:canon (Rank 2) and hive:ops (Rank 3)
-    const gv = this.grantView
-    const checkedAt = gv.grantsCheckedAt
-    const authFresh = checkedAt != null && (nowSec - checkedAt) <= this.authMaxAgeSec
-    const isGrantor = this.grantors.includes(entry.pubkey)
-    const heldCaps = gv.writers.get(entry.pubkey)
-    const endedReason = gv.ended.get(entry.pubkey)
+    const isOwner = entry.pubkey === this.ownerPubkey
 
-    // Positive revocation/expiry evidence from a complete refresh rejects immediately, even if auth is old.
-    if (!isGrantor && gv.lastRefreshComplete && endedReason && !heldCaps) {
-      return {
-        verification: 'rejected',
-        verificationReason: endedReason === 'revoked' ? 'grant-revoked' : 'grant-expired',
-        computedRank: null,
-        checkedAt,
-        staleWarning,
-      }
-    }
-
-    // If a partial refresh saw a revocation/expiry for this writer, it is not accepted;
-    // if another relay did not answer, it may hold a live re-grant, so mark unverified ('grant-missing').
-    if (!isGrantor && !gv.lastRefreshComplete && (endedReason || gv.partialWriters.has(entry.pubkey)) && !heldCaps) {
-      return {
-        verification: 'unverified',
-        verificationReason: 'grant-missing',
-        computedRank: null,
-        checkedAt,
-        staleWarning,
-      }
-    }
-
+    // Rank 2 (`hive:canon`): James's decision (waggle#712 at a2c1781f) restricts `hive:canon` to
+    // the memory owner key alone, checked by signature alone with no grant-freshness gate.
     if (entry.scopeType === 'hive:canon') {
-      const qualifiesCanon = isGrantor || (this.canonAllowShadow && Boolean(heldCaps?.has('shadow')))
-      if (!qualifiesCanon) {
-        // Under James-only canon rule, any non-grantor claim in hive:canon is rejected unless canonAllowShadow is enabled.
-        if (!this.canonAllowShadow && !isGrantor) {
-          return { verification: 'rejected', verificationReason: 'canon-owner-only', computedRank: null, checkedAt, staleWarning }
-        }
-        return { verification: 'unverified', verificationReason: 'grant-missing', computedRank: null, checkedAt, staleWarning }
+      if (isOwner) {
+        return { verification: 'accepted', verificationReason: null, computedRank: 2, checkedAt: entry.createdAt, staleWarning }
       }
-      if (!authFresh) {
+      return { verification: 'rejected', verificationReason: 'canon-owner-only', computedRank: null, checkedAt: nowSec, staleWarning }
+    }
+
+    // Rank 3 (`hive:ops`): Owner's own `hive:ops` claims also depend on signature alone and do not go stale on grant age.
+    if (entry.scopeType === 'hive:ops') {
+      if (isOwner) {
+        return { verification: 'accepted', verificationReason: null, computedRank: 3, checkedAt: entry.createdAt, staleWarning }
+      }
+
+      const gv = this.grantView
+      const checkedAt = gv.grantsCheckedAt
+      const authFresh = checkedAt != null && (nowSec - checkedAt) <= this.authMaxAgeSec
+      const heldCaps = gv.writers.get(entry.pubkey)
+      const endedReason = gv.ended.get(entry.pubkey)
+
+      // Positive revocation/expiry evidence from a complete refresh rejects immediately, even if auth is old.
+      if (gv.lastRefreshComplete && endedReason && !heldCaps) {
         return {
-          verification: 'unverified',
-          verificationReason: checkedAt == null ? 'grants-uninitialized' : 'grants-stale',
+          verification: 'rejected',
+          verificationReason: endedReason === 'revoked' ? 'grant-revoked' : 'grant-expired',
           computedRank: null,
           checkedAt,
           staleWarning,
         }
       }
-      return { verification: 'accepted', verificationReason: null, computedRank: 2, checkedAt, staleWarning }
-    }
 
-    if (entry.scopeType === 'hive:ops') {
-      const qualifiesOps = isGrantor || Boolean(heldCaps?.has('shadow')) || Boolean(heldCaps?.has(MEMORY_WRITE_CAP))
+      // If a partial refresh saw a revocation/expiry for this writer, it is not accepted;
+      // if another relay did not answer, it may hold a live re-grant, so mark unverified ('grant-missing').
+      if (!gv.lastRefreshComplete && (endedReason || gv.partialWriters.has(entry.pubkey)) && !heldCaps) {
+        return {
+          verification: 'unverified',
+          verificationReason: 'grant-missing',
+          computedRank: null,
+          checkedAt,
+          staleWarning,
+        }
+      }
+
+      const qualifiesOps = Boolean(heldCaps?.has('shadow')) || (this.allowMemoryWriteCap && Boolean(heldCaps?.has(MEMORY_WRITE_CAP)))
       if (!qualifiesOps) {
         return {
           verification: 'unverified',
@@ -935,8 +977,15 @@ export class MemoryStore {
     const qText = text ? String(text).toLowerCase() : null
 
     const channelsToCheck = new Set()
+    let missingRequiredChannelConfig = false
     if (scope === 'hive:ops' || scope === 'hive:canon' || !scope) {
       if (this.memoryGlobalChannelId) channelsToCheck.add(this.memoryGlobalChannelId)
+      else missingRequiredChannelConfig = true
+    }
+    if (!scope) {
+      for (const r of this.subscribedRooms) channelsToCheck.add(r)
+      for (const r of this.roomMembers.keys()) channelsToCheck.add(r)
+      for (const ch of this.channelSync.keys()) channelsToCheck.add(ch)
     }
     if (roomId) channelsToCheck.add(String(roomId).toLowerCase())
     if (scope && String(scope).startsWith('room:')) channelsToCheck.add(String(scope).slice(5).toLowerCase())
@@ -992,8 +1041,9 @@ export class MemoryStore {
     const omitted = Math.max(0, totalMatched - (startIdx + records.length))
     const nextCursor = omitted > 0 ? String(startIdx + records.length) : null
 
+    const isSelfScope = Boolean(scope && String(scope).startsWith('self:'))
     const channels = {}
-    let allChannelsSynced = true
+    let allChannelsSynced = !missingRequiredChannelConfig && (isSelfScope || channelsToCheck.size > 0)
     for (const ch of channelsToCheck) {
       const st = this.getChannelSync(ch, nowSec)
       channels[ch] = st
@@ -1033,6 +1083,8 @@ export class MemoryStore {
   }
 
   // Builds the bounded 6,000-character Wake Digest (DESIGN_HIVE_MEMORY.md § "Bounded wake digest").
+  // Every section (including unverified canon keys and the Unverified summary) has its own bounded
+  // budget so nothing is ever silently cut off by a trailing slice.
   wake({
     roomId = null,
     maxChars = DEFAULT_WAKE_MAX_CHARS,
@@ -1042,10 +1094,11 @@ export class MemoryStore {
     nowSec = Math.floor(Date.now() / 1000),
   } = {}) {
     const budget = Number.isSafeInteger(maxChars) && maxChars >= 1000 ? maxChars : DEFAULT_WAKE_MAX_CHARS
-    const headerBudget = Math.min(600, Math.floor(budget * 0.12))
+    const headerBudget = Math.min(550, Math.floor(budget * 0.10))
+    const unverifiedSectionBudget = Math.min(350, Math.floor(budget * 0.07))
     const canonBudget = Math.floor(budget * 0.25)
-    const opsBudget = Math.floor(budget * 0.50)
-    const selfBudget = budget - headerBudget - canonBudget - opsBudget
+    const opsBudget = Math.floor(budget * 0.45)
+    const selfBudget = Math.max(200, budget - headerBudget - unverifiedSectionBudget - canonBudget - opsBudget - 16)
 
     const canonAccepted = []
     const opsAccepted = []
@@ -1114,16 +1167,16 @@ export class MemoryStore {
       return `- ${conflictTag}${staleTag}[${entry.d}] (by ${entry.pubkey.slice(0, 8)}, as_of ${entry.asOfGit || entry.asOfEvt}): ${entry.claim} — Because: ${entry.because} [evidence: ${(entry.evidence || []).join(', ')}]`
     }
 
-    const fitSection = (title, items, sectionBudget, scopeHint) => {
+    const fitSection = (title, items, sectionBudget, scopeHint, extraFooter = '') => {
+      const reserve = 85 + (extraFooter ? extraFooter.length + 1 : 0)
       const lines = [`\n## ${title}`]
       let used = lines[0].length + 1
       let shown = 0
       for (const item of items) {
         const line = formatItem(item)
-        const footerReserve = 75
-        if (used + line.length + 1 + footerReserve > sectionBudget && shown > 0) break
-        if (used + line.length + 1 > sectionBudget && shown === 0) {
-          lines.push(line.slice(0, Math.max(40, sectionBudget - used - footerReserve)))
+        if (used + line.length + 1 + reserve > sectionBudget && shown > 0) break
+        if (used + line.length + 1 + reserve > sectionBudget && shown === 0) {
+          lines.push(line.slice(0, Math.max(40, sectionBudget - used - reserve)))
           shown++
           break
         }
@@ -1136,31 +1189,51 @@ export class MemoryStore {
       if (omitted > 0) {
         lines.push(`+${omitted} ${scopeHint} claims not shown; memory_query scope=${scopeHint}`)
       }
+      if (extraFooter) lines.push(extraFooter)
       return { text: lines.join('\n'), shown, omitted }
     }
 
-    const canonSec = fitSection('Rank 2: hive:canon', canonAccepted, canonBudget, 'hive:canon')
+    let canonFooter = ''
     if (unverifiedCanonKeys.length > 0) {
-      canonSec.text += `\n(${unverifiedCanonKeys.length} unverified hive:canon claim(s) withheld from Rank 2: ${unverifiedCanonKeys.map(k => `${k.d} [${k.reason}]`).join(', ')})`
+      const maxCanonFooter = Math.min(240, Math.floor(canonBudget * 0.25))
+      const shownKeys = []
+      let len = 0
+      for (const k of unverifiedCanonKeys) {
+        const token = `${k.d} [${k.reason}]`
+        if (len + token.length + 2 > maxCanonFooter - 90 && shownKeys.length > 0) break
+        shownKeys.push(token)
+        len += token.length + 2
+      }
+      const more = unverifiedCanonKeys.length - shownKeys.length
+      canonFooter = `(${unverifiedCanonKeys.length} unverified hive:canon claim(s) withheld from Rank 2: ${shownKeys.join(', ')}${more > 0 ? `, +${more} more` : ''})`
     }
+
+    const canonSec = fitSection('Rank 2: hive:canon', canonAccepted, canonBudget, 'hive:canon', canonFooter)
     const opsSec = fitSection('Rank 3: room & hive:ops', opsAccepted, opsBudget, 'hive:ops')
     const selfSec = fitSection('Rank 4: self scratchpad', selfAccepted, selfBudget, `self:${this.readerPubkey}`)
 
     let unverifiedText = ''
-    if (unverifiedEntries.length > 0) {
+    const totalUnverified = unverifiedEntries.length + unverifiedCanonKeys.length
+    if (totalUnverified > 0) {
       const byReason = new Map()
       for (const u of unverifiedEntries) {
         const r = u.verdict.verificationReason || 'unverified'
         byReason.set(r, (byReason.get(r) || 0) + 1)
       }
+      for (const c of unverifiedCanonKeys) {
+        const r = c.reason || 'unverified'
+        byReason.set(r, (byReason.get(r) || 0) + 1)
+      }
       const summary = [...byReason.entries()].map(([r, c]) => `${c} (${r})`).join(', ')
-      unverifiedText = `\n## Unverified claims (not ranked)\n${unverifiedEntries.length} claim(s) held back: ${summary}`
+      const rawUnverified = `\n## Unverified claims (not ranked)\n${totalUnverified} claim(s) held back: ${summary}`
+      unverifiedText = rawUnverified.length <= unverifiedSectionBudget
+        ? rawUnverified
+        : `${rawUnverified.slice(0, unverifiedSectionBudget - 12)}... (+more)`
     }
 
     const fullDigest = [headerBlock, canonSec.text, opsSec.text, selfSec.text, unverifiedText]
       .filter(Boolean)
       .join('\n')
-      .slice(0, budget)
 
     const targetPath = wakeDigestPath ? resolve(wakeDigestPath) : null
     if (targetPath) {
@@ -1190,7 +1263,7 @@ export class MemoryStore {
         ops_omitted: opsSec.omitted,
         self_shown: selfSec.shown,
         self_omitted: selfSec.omitted,
-        unverified_total: unverifiedEntries.length + unverifiedCanonKeys.length,
+        unverified_total: totalUnverified,
       },
       records: [
         ...canonAccepted.slice(0, canonSec.shown),
@@ -1273,4 +1346,3 @@ export const MEMORY_TOOL_SPECS = Object.freeze([
     },
   },
 ])
-

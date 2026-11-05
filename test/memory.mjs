@@ -1,5 +1,5 @@
 // test/memory.mjs — acceptance test suite for Hive Shared Memory (docs/DESIGN_HIVE_MEMORY.md).
-// Covers all 25 edge-case fixtures from the Slice 0 specification.
+// Covers all 25 edge-case fixtures from the Slice 0 specification + waggle-dev's review probes.
 
 import { mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -7,7 +7,6 @@ import { join } from 'node:path'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
 import { scopeHash } from '../mcp/tools/grant_fold.mjs'
 import {
-  MEMORY_KIND,
   MemoryStore,
   buildClaimTemplate,
   buildWithdrawalTemplate,
@@ -25,11 +24,12 @@ const key = () => { const sk = generateSecretKey(); return { sk, pk: getPublicKe
 const sign = (tmpl, sk) => finalizeEvent(tmpl, sk)
 
 const james = key()
+const luke = key()
 const deadRabbit = key()
 const waggleDev = key()
 const myDude = key()
 const dennis = key()
-const stranger = key()
+const relayKey = key()
 
 const GLOBAL_CH = '11111111-2222-4333-8444-555555555555'
 const ROOM_A = 'a8186b53-537d-46ad-a7e7-b6486c58970e'
@@ -55,7 +55,7 @@ const signClaim = (signer, opts) => {
   return sign(tmpl, signer.sk)
 }
 
-// --- 1. Secret guard patterns & 64-hex allowlist ---
+// --- 1. Secret guard patterns & 64-hex / bracketed word allowlist ---
 ok('secret guard blocks nsec1', !!checkMemorySecrets('leak nsec1' + 'q'.repeat(52)))
 ok('secret guard blocks ncryptsec1', !!checkMemorySecrets('leak ncryptsec1' + 'q'.repeat(56)))
 ok('secret guard blocks bunker://', !!checkMemorySecrets('bunker://' + james.pk + '?relay=wss://x.y'))
@@ -63,6 +63,8 @@ ok('secret guard blocks nostrconnect://', !!checkMemorySecrets('nostrconnect://'
 ok('secret guard blocks ws:// and wss:// relay URLs', !!checkMemorySecrets('wss://relay.example.com') && !!checkMemorySecrets('ws://localhost:7777'))
 ok('secret guard blocks IPv4 literals', !!checkMemorySecrets('connect to 100.64.1.25 or 192.168.1.1'))
 ok('secret guard blocks Tailscale and bracketed IPv6', !!checkMemorySecrets('fd7a:115c:a1e0::ab36:5615') && !!checkMemorySecrets('[fe80::1]:8080'))
+ok('secret guard allows ordinary bracketed hex words like [dead] and [add]',
+  checkMemorySecrets('status [dead] or [add] or [cafe]') === null)
 ok('secret guard blocks OpenAI/GitHub/Google API keys',
   !!checkMemorySecrets('sk-proj-1234567890abcdefghij12345') &&
   !!checkMemorySecrets('ghp_1234567890abcdefghijklmnopqrstuv') &&
@@ -70,14 +72,14 @@ ok('secret guard blocks OpenAI/GitHub/Google API keys',
 ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
   checkMemorySecrets(`author ${james.pk} event ${'f'.repeat(64)} commit waggle@a1b2c3d`) === null)
 
-// --- 2. Relay down at wake & restart with no grant refresh yet ---
+// --- 2. Relay down at wake, restart with no grant refresh yet, and owner canon/ops signature-only rule ---
 {
   const dir = mkdtempSync(join(tmpdir(), 'mem-wake-'))
   const statePath = join(dir, 'memory_claims.json')
   const store1 = new MemoryStore({
     statePath,
     readerPubkey: myDude.pk,
-    grantors: [james.pk],
+    ownerPubkey: james.pk,
     memoryGlobalChannelId: GLOBAL_CH,
   })
   store1.recordRoomMembers(ROOM_A, [myDude.pk, waggleDev.pk], { checkedAt: T0 })
@@ -89,7 +91,7 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
     evidence: ['waggle@a1b2c3d:docs/DESIGN_RELAY_INGRESS.md'],
     asOfGit: 'waggle@a1b2c3d',
   })
-  const opsClaim = signClaim(waggleDev, {
+  const opsByAgent = signClaim(waggleDev, {
     scope: 'hive:ops',
     slug: 'fleet-deploy',
     claim: 'nvoy #301 is deployed on the fleet box.',
@@ -97,14 +99,32 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
     evidence: ['waggle@f7a109b:docs/AGENT_LIFECYCLE.md'],
     asOfGit: 'waggle@f7a109b',
   })
+  const canonByJames = signClaim(james, {
+    scope: 'hive:canon',
+    slug: 'canon-no-grant-needed',
+    claim: 'James canon claims verify by signature alone.',
+    because: 'Owner key does not depend on a grant.',
+    evidence: ['waggle@a2c1781f:docs/DESIGN_HIVE_MEMORY.md'],
+    asOfGit: 'waggle@a2c1781f',
+  })
+  const opsByJames = signClaim(james, {
+    scope: 'hive:ops',
+    slug: 'ops-no-grant-needed',
+    claim: 'James ops claims verify by signature alone.',
+    because: 'Owner key does not depend on a grant.',
+    evidence: ['waggle@a2c1781f:docs/DESIGN_HIVE_MEMORY.md'],
+    asOfGit: 'waggle@a2c1781f',
+  })
   store1.ingestEvent(roomClaim, { nowSec: T0 })
-  store1.ingestEvent(opsClaim, { nowSec: T0 })
+  store1.ingestEvent(opsByAgent, { nowSec: T0 })
+  store1.ingestEvent(canonByJames, { nowSec: T0 })
+  store1.ingestEvent(opsByJames, { nowSec: T0 })
 
   // Simulate broker restart from disk with relay down and no grant refresh yet
   const restarted = new MemoryStore({
     statePath,
     readerPubkey: myDude.pk,
-    grantors: [james.pk],
+    ownerPubkey: james.pk,
     memoryGlobalChannelId: GLOBAL_CH,
   })
   restarted.recordChannelSync(GLOBAL_CH, { reachable: false, eose: false, nowSec: T0 + 10 })
@@ -114,11 +134,12 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
   const wakeRes = restarted.wake({ roomId: ROOM_A, nowSec: T0 + 10, wakeDigestPath: join(dir, 'WAKE_DIGEST.md') })
   ok('memory_wake answers while relay is down from persisted memory_claims.json',
     wakeRes.global_sync.state === 'RELAY_UNREACHABLE_SERVING_LOCAL' &&
-    wakeRes.counts.ops_shown === 1 &&
     readFileSync(join(dir, 'WAKE_DIGEST.md'), 'utf8').includes('relay-auth-membership'))
-  ok('broker restarted with no grant refresh yet marks grant-dependent claims Unverified',
+  ok('James own hive:canon and hive:ops claims are accepted by signature alone with no grant refresh',
+    wakeRes.counts.canon_shown === 1 && wakeRes.counts.ops_shown === 2)
+  ok('broker restarted with no grant refresh yet marks grant-dependent agent claims Unverified',
     wakeRes.counts.unverified_total === 1 &&
-    restarted.evaluateClaim(restarted.entries.get(`${waggleDev.pk}:${opsClaim.tags[0][1]}`), { nowSec: T0 + 10 }).verification === 'unverified')
+    restarted.evaluateClaim(restarted.entries.get(`${waggleDev.pk}:${opsByAgent.tags[0][1]}`), { nowSec: T0 + 10 }).verification === 'unverified')
 }
 
 // --- 3. Same-second withdrawal & relay wiped then re-seeded from stale vs tombstone broker ---
@@ -127,13 +148,13 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
   const brokerA = new MemoryStore({
     statePath: join(dir, 'brokerA.json'),
     readerPubkey: myDude.pk,
-    grantors: [james.pk],
+    ownerPubkey: james.pk,
     memoryGlobalChannelId: GLOBAL_CH,
   })
   const brokerB = new MemoryStore({
     statePath: join(dir, 'brokerB.json'),
     readerPubkey: dennis.pk,
-    grantors: [james.pk],
+    ownerPubkey: james.pk,
     memoryGlobalChannelId: GLOBAL_CH,
   })
 
@@ -170,13 +191,12 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
   const brokerC = new MemoryStore({
     statePath: join(dir, 'brokerC.json'),
     readerPubkey: myDude.pk,
-    grantors: [james.pk],
+    ownerPubkey: james.pk,
     memoryGlobalChannelId: GLOBAL_CH,
   })
   for (const ev of [...brokerA.reseedCandidates(T0 + 5), ...brokerB.reseedCandidates(T0 + 5)]) {
     brokerC.ingestEvent(ev, { nowSec: T0 + 5 })
   }
-  // Even if Broker A's stale claim is replayed after Broker B's tombstone:
   for (const ev of brokerA.reseedCandidates(T0 + 5)) {
     brokerC.ingestEvent(ev, { nowSec: T0 + 6 })
   }
@@ -185,13 +205,14 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
     finalEntry?.status === 'withdrawn')
 }
 
-// --- 4. Grant refresh edge cases (eviction, mixed-cap eviction, split grant/441 across relays, >500 deep, 4 in 1s, G1+441+G2 in 1s, limit/CLOSED, partial refreshes) ---
+// --- 4. Grant refresh edge cases (eviction, partial eviction, mixed-cap eviction, split grant/441, >500 deep, 4 in 1s, G1+441+G2 in 1s, limit/CLOSED, partial refreshes) ---
 {
   const store = new MemoryStore({
     readerPubkey: myDude.pk,
-    grantors: [james.pk],
+    ownerPubkey: james.pk,
     memoryGlobalChannelId: GLOBAL_CH,
     authMaxAgeSec: 900,
+    allowMemoryWriteCap: true,
   })
   const opsClaim = signClaim(waggleDev, {
     scope: 'hive:ops',
@@ -201,8 +222,23 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
     evidence: ['waggle@a1b2c3d:deploy/Dockerfile'],
     asOfGit: 'waggle@a1b2c3d',
   })
+  const opsClaim2 = signClaim(deadRabbit, {
+    scope: 'hive:ops',
+    slug: 'ops-fact-2',
+    claim: 'Second local active claim.',
+    because: 'Testing partial relay eviction.',
+    evidence: ['waggle@a1b2c3d:deploy/Dockerfile'],
+    asOfGit: 'waggle@a1b2c3d',
+  })
   store.ingestEvent(opsClaim, { nowSec: T0 })
-  store.recordChannelSync(GLOBAL_CH, { reachable: true, eose: true, remoteEvents: [opsClaim], nowSec: T0 })
+  store.ingestEvent(opsClaim2, { nowSec: T0 })
+
+  // Partial eviction on channel sync: 2 local active claims, relay returns only 1 of them -> RELAY_EVICTED_WARNING
+  const partialSync = store.recordChannelSync(GLOBAL_CH, { reachable: true, eose: true, remoteEvents: [opsClaim], nowSec: T0 })
+  ok('partial channel eviction (relay returns 1 of 2 local active claims) raises RELAY_EVICTED_WARNING',
+    partialSync.state === 'RELAY_EVICTED_WARNING' && partialSync.missingCount === 1)
+
+  store.recordChannelSync(GLOBAL_CH, { reachable: true, eose: true, remoteEvents: [opsClaim, opsClaim2], nowSec: T0 })
 
   // Case 4a: Writer's grant evicted from every grant relay with no revocation -> Unverified (grant-missing), query -> unknown
   await store.refreshGrants({
@@ -215,7 +251,7 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
   ok('grant evicted from every relay with no 441 is Unverified with grant-missing',
     vEvicted.verification === 'unverified' && vEvicted.verificationReason === 'grant-missing')
   ok('query matching only an Unverified claim answers unknown with unverified > 0, never none',
-    qEvicted.answer === 'unknown' && qEvicted.unverified === 1)
+    qEvicted.answer === 'unknown' && qEvicted.unverified === 2)
 
   // Case 4b: Writer holding memory-write and task-relay, with only memory-write evicted (task-relay visible) -> still Unverified (grant-missing), never rejected
   const taskRelayGrant = makeGrant(james, waggleDev.pk, 'task-relay', { subject: myDude.pk, at: T0 - 400 })
@@ -229,17 +265,15 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
     vMixed.verification === 'unverified' && vMixed.verificationReason === 'grant-missing')
 
   // Case 4c: Grant G held only on relay A while relay B has evicted G but kept its kind 441 -> Phase 2 asks B about G -> rejected!
-  // Also tests disagreeing relay detection!
   const memGrant = makeGrant(james, waggleDev.pk, 'memory-write', { subject: james.pk, at: T0 - 400 })
   const memRevoke = makeRevoke(james, memGrant.id, T0 - 100)
   await store.refreshGrants({
     relays: ['wss://relay-a.example.com', 'wss://relay-b.example.com'],
     queryFn: async (url, filter) => {
       if (filter.kinds.includes(440)) {
-        return { events: url.includes('relay-a') ? [memGrant] : [], eose: true }
+        return { events: url.includes('relay-a') && filter['#p']?.includes(waggleDev.pk) ? [memGrant] : [], eose: true }
       }
       if (filter.kinds.includes(441)) {
-        // Relay B holds the 441 even though it evicted the 440, and sits >500 events deep in general history!
         return { events: url.includes('relay-b') && filter['#e']?.includes(memGrant.id) ? [memRevoke] : [], eose: true }
       }
       return { events: [], eose: true }
@@ -278,7 +312,7 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
   await store.refreshGrants({
     relays: ['wss://relay-a.example.com', 'wss://relay-b.example.com'],
     queryFn: async (_url, filter) => {
-      if (filter.kinds.includes(440)) return { events: [g1, other1, g2], eose: true }
+      if (filter.kinds.includes(440)) return { events: filter['#p']?.includes(waggleDev.pk) ? [g1, other1, g2] : [], eose: true }
       if (filter.kinds.includes(441)) return { events: [revG1], eose: true }
       return { events: [], eose: true }
     },
@@ -293,8 +327,8 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
   await store.refreshGrants({
     relays: ['wss://relay-a.example.com', 'wss://relay-b.example.com'],
     queryFn: async (url, filter) => {
-      if (url.includes('relay-b')) return { events: [], eose: false, closed: true } // Relay B holding G2 refuses with CLOSED!
-      if (filter.kinds.includes(440)) return { events: [g1], eose: true }
+      if (url.includes('relay-b')) return { events: [], eose: false, closed: true }
+      if (filter.kinds.includes(440)) return { events: filter['#p']?.includes(waggleDev.pk) ? [g1] : [], eose: true }
       if (filter.kinds.includes(441)) return { events: [revG1], eose: true }
       return { events: [], eose: true }
     },
@@ -319,16 +353,15 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
   // Case 4g: Repeated partial refreshes past maximum age (900s) where one relay returns G2 and the other never answers -> becomes Unverified!
   await store.refreshGrants({
     relays: ['wss://relay-a.example.com', 'wss://relay-b.example.com'],
-    queryFn: async (_url, filter) => ({ events: filter.kinds.includes(440) ? [g2] : [], eose: true }),
+    queryFn: async (_url, filter) => ({ events: filter.kinds.includes(440) && filter['#p']?.includes(waggleDev.pk) ? [g2] : [], eose: true }),
     nowSec: T0,
   })
   ok('complete refresh at T0 sets grants_checked_at = T0', store.grantView.grantsCheckedAt === T0)
 
-  // Partial refresh at T0 + 500s and T0 + 950s (past 900s max age)
   await store.refreshGrants({
     relays: ['wss://relay-a.example.com', 'wss://relay-b.example.com'],
     queryFn: async (url, filter) => url.includes('relay-a')
-      ? { events: filter.kinds.includes(440) ? [g2] : [], eose: true }
+      ? { events: filter.kinds.includes(440) && filter['#p']?.includes(waggleDev.pk) ? [g2] : [], eose: true }
       : { events: [], eose: false },
     nowSec: T0 + 950,
   })
@@ -337,15 +370,18 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
     vPastAge.verification === 'unverified' && vPastAge.verificationReason === 'grants-stale')
 }
 
-// --- 5. Two brokers holding disjoint task grants give identical verdicts on hive:ops & hive:canon ---
+// --- 5. Two brokers holding disjoint task grants AND different manifest grantors ([james, luke] vs [james]) give identical verdicts; memory-write default-off until enabled ---
 {
   const brokerMyDude = new MemoryStore({
     readerPubkey: myDude.pk,
-    grantors: [james.pk],
+    ownerPubkey: james.pk,
+    // Even if a caller passes a manifest grantors list with Luke, MemoryStore uses only ownerPubkey!
+    grantors: [james.pk, luke.pk],
     memoryGlobalChannelId: GLOBAL_CH,
   })
   const brokerDennis = new MemoryStore({
     readerPubkey: dennis.pk,
+    ownerPubkey: james.pk,
     grantors: [james.pk],
     memoryGlobalChannelId: GLOBAL_CH,
   })
@@ -358,6 +394,14 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
     evidence: ['waggle@f8798fd1:docs/DESIGN_HIVE_MEMORY.md'],
     asOfGit: 'waggle@f8798fd1',
   })
+  const canonByLuke = signClaim(luke, {
+    scope: 'hive:canon',
+    slug: 'luke-canon-attempt',
+    claim: 'Luke attempting to write canon via per-broker grantors.',
+    because: 'Probing single memory owner invariant.',
+    evidence: ['waggle@f8798fd1:docs/DESIGN_HIVE_MEMORY.md'],
+    asOfGit: 'waggle@f8798fd1',
+  })
   const canonByShadow = signClaim(deadRabbit, {
     scope: 'hive:canon',
     slug: 'shadow-canon-attempt',
@@ -366,27 +410,36 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
     evidence: ['waggle@f8798fd1:docs/DESIGN_HIVE_MEMORY.md'],
     asOfGit: 'waggle@f8798fd1',
   })
-  const opsByWriter = signClaim(waggleDev, {
+  const opsByShadow = signClaim(deadRabbit, {
     scope: 'hive:ops',
-    slug: 'shared-ops-claim',
-    claim: 'All brokers share the memory-write policy.',
-    because: 'memory-write scopes to James.',
+    slug: 'shadow-ops-claim',
+    claim: 'Dead Rabbit can write hive:ops via live shadow grant.',
+    because: 'shadow scopes to James.',
+    evidence: ['waggle@f8798fd1:docs/DESIGN_HIVE_MEMORY.md'],
+    asOfGit: 'waggle@f8798fd1',
+  })
+  const opsByMemWriter = signClaim(waggleDev, {
+    scope: 'hive:ops',
+    slug: 'mem-write-ops-claim',
+    claim: 'waggle-dev writing hive:ops via memory-write grant.',
+    because: 'Gated behind allowMemoryWriteCap until approved.',
     evidence: ['waggle@f8798fd1:docs/DESIGN_HIVE_MEMORY.md'],
     asOfGit: 'waggle@f8798fd1',
   })
 
   const gMemWrite = makeGrant(james, waggleDev.pk, 'memory-write', { subject: james.pk, at: T0 - 300 })
   const gShadow = makeGrant(james, deadRabbit.pk, 'shadow', { subject: james.pk, at: T0 - 300 })
+  const gShadowByLuke = makeGrant(luke, waggleDev.pk, 'shadow', { subject: luke.pk, at: T0 - 300 })
   const gTaskMyDudeOnly = makeGrant(james, waggleDev.pk, 'task+act', { subject: myDude.pk, at: T0 - 300 })
 
   for (const b of [brokerMyDude, brokerDennis]) {
-    b.ingestEvent(canonByJames, { nowSec: T0 })
-    b.ingestEvent(canonByShadow, { nowSec: T0 })
-    b.ingestEvent(opsByWriter, { nowSec: T0 })
+    for (const ev of [canonByJames, canonByLuke, canonByShadow, opsByShadow, opsByMemWriter]) {
+      b.ingestEvent(ev, { nowSec: T0 })
+    }
     await b.refreshGrants({
       relays: ['wss://relay-a.example.com'],
       queryFn: async (_url, filter) => ({
-        events: filter.kinds.includes(440) ? [gMemWrite, gShadow, gTaskMyDudeOnly] : [],
+        events: filter.kinds.includes(440) ? [gMemWrite, gShadow, gShadowByLuke, gTaskMyDudeOnly] : [],
         eose: true,
       }),
       nowSec: T0,
@@ -395,26 +448,54 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
 
   const d1 = brokerMyDude.wake({ nowSec: T0 })
   const d2 = brokerDennis.wake({ nowSec: T0 })
-  ok('two brokers holding disjoint task grants reach the exact same verdict on hive:ops and hive:canon',
+  ok('two brokers with disjoint task grants and different manifest grantors ([james, luke] vs [james]) reach the exact same verdict',
     d1.counts.canon_shown === 1 &&
     d2.counts.canon_shown === 1 &&
     d1.counts.ops_shown === 1 &&
     d2.counts.ops_shown === 1 &&
     d1.records.map(r => r.event_id).join(',') === d2.records.map(r => r.event_id).join(','))
-  ok('under James-only canon rule, shadow voice cannot write hive:canon (rejected as canon-owner-only)',
+  ok('Luke hive:canon claim is rejected even on a broker whose manifest grantors list included Luke',
+    brokerMyDude.evaluateClaim(brokerMyDude.entries.get(`${luke.pk}:${canonByLuke.tags[0][1]}`), { nowSec: T0 }).verification === 'rejected')
+  ok('shadow voice cannot write hive:canon (rejected as canon-owner-only)',
     brokerMyDude.evaluateClaim(brokerMyDude.entries.get(`${deadRabbit.pk}:${canonByShadow.tags[0][1]}`), { nowSec: T0 }).verification === 'rejected')
+  ok('memory-write cap is not honoured by default (allowMemoryWriteCap defaults to false)',
+    brokerMyDude.evaluateClaim(brokerMyDude.entries.get(`${waggleDev.pk}:${opsByMemWriter.tags[0][1]}`), { nowSec: T0 }).verification === 'unverified')
 }
 
-// --- 6. Conflicts (same d key vs same topic), room membership, expired claims, changed evidence, instruction envelope, pagination ---
+// --- 6. Conflicts (same d key vs same topic), room membership (including signed kind 39002), expired claims, changed evidence, instruction envelope, pagination, unsynced query, wake budget ---
 {
+  const unconfiguredStore = new MemoryStore({
+    readerPubkey: myDude.pk,
+    ownerPubkey: james.pk,
+    memoryGlobalChannelId: '',
+  })
+  ok('query with no global channel configured and no synced channels answers unknown, never none',
+    unconfiguredStore.query({ nowSec: T0 }).answer === 'unknown')
+
   const store = new MemoryStore({
     readerPubkey: myDude.pk,
-    grantors: [james.pk],
+    ownerPubkey: james.pk,
     memoryGlobalChannelId: GLOBAL_CH,
+    subscribedRooms: [ROOM_A],
   })
+  // Global channel is synced, but ROOM_A has not synced yet -> unscoped query must answer unknown!
+  store.recordChannelSync(GLOBAL_CH, { reachable: true, eose: true, remoteEvents: [], nowSec: T0 })
+  ok('unscoped query when a subscribed room channel is not synced answers unknown, never none',
+    store.query({ nowSec: T0 }).answer === 'unknown')
+
   store.recordChannelSync(ROOM_A, { reachable: true, eose: true, remoteEvents: [], nowSec: T0 })
-  store.recordRoomMembers(ROOM_A, [myDude.pk, waggleDev.pk, dennis.pk], { checkedAt: T0 })
-  store.recordRoomMembers(ROOM_B, [waggleDev.pk, dennis.pk], { checkedAt: T0 }) // myDude is NOT in ROOM_B
+  ok('unscoped query when both global and subscribed room channels are synced answers none when empty',
+    store.query({ nowSec: T0 }).answer === 'none')
+
+  // Verify signed kind 39002 room member list ingestion
+  const kind39002 = sign({
+    kind: 39002,
+    created_at: T0,
+    content: '',
+    tags: [['d', ROOM_A], ['p', myDude.pk], ['p', waggleDev.pk], ['p', dennis.pk]],
+  }, relayKey.sk)
+  store.recordRoomMembers(kind39002, { checkedAt: T0, relayPubkey: relayKey.pk })
+  store.recordRoomMembers(ROOM_B, [waggleDev.pk, dennis.pk], { checkedAt: T0 })
 
   // Two authors in conflict under the same fact key (d tag)
   const c1 = signClaim(waggleDev, {
@@ -435,7 +516,6 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
     evidence: ['waggle@a1b2c3d:docs/DEPLOY.md'],
     asOfGit: 'waggle@a1b2c3d',
   })
-  // Third claim with the same topic ('deployment') but a different fact key slug ('deploy-time')
   const c3 = signClaim(waggleDev, {
     scope: `room:${ROOM_A}`,
     slug: 'deploy-time',
@@ -445,7 +525,6 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
     evidence: ['waggle@a1b2c3d:docs/DEPLOY.md'],
     asOfGit: 'waggle@a1b2c3d',
   })
-  // Claim from ROOM_B (reader not in room)
   const cForeignRoom = signClaim(waggleDev, {
     scope: `room:${ROOM_B}`,
     slug: 'secret-room-fact',
@@ -454,7 +533,6 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
     evidence: ['waggle@a1b2c3d:README.md'],
     asOfGit: 'waggle@a1b2c3d',
   })
-  // Expired claim
   const cExpired = signClaim(waggleDev, {
     scope: `room:${ROOM_A}`,
     slug: 'old-fact',
@@ -492,6 +570,23 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
   const qNoRoomList = store.query({ scope: `room:${ROOM_A}`, nowSec: T0 })
   ok('when room member list is unavailable, room claims are Unverified and query answers unknown',
     qNoRoomList.answer === 'unknown' && qNoRoomList.unverified === 3 && qNoRoomList.unverified_reasons.includes('room-list-unavailable'))
+
+  // Many unverified claims (65+) must never truncate the Unverified claims section out of the wake digest
+  for (let i = 0; i < 65; i++) {
+    store.ingestEvent(signClaim(waggleDev, {
+      scope: 'hive:ops',
+      slug: `bulk-unverified-${i}`,
+      claim: `Unverified claim number ${i} with extra padding text.`,
+      because: 'No grant refresh yet.',
+      evidence: ['waggle@a1b2c3d:README.md'],
+      asOfGit: 'waggle@a1b2c3d',
+    }), { nowSec: T0 })
+  }
+  const bulkWake = store.wake({ roomId: ROOM_A, maxChars: 2000, nowSec: T0 })
+  ok('wake digest with 65+ unverified claims stays within budget and preserves the Unverified claims section',
+    bulkWake.char_length <= 2000 &&
+    bulkWake.digest.includes('## Unverified claims (not ranked)') &&
+    bulkWake.counts.unverified_total === 68)
 }
 
 console.log(`\n${passes} passed, ${fails} failed`)

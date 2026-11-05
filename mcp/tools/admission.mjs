@@ -103,13 +103,22 @@ export function foldGrantsWith(events, { me, grantors, scopeHash }) {
   return { live, ended, rejected, mentions }
 }
 
+export const DEFAULT_MEMORY_OWNER = '4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b287ea84d'
+
 // Reader-independent grant fold for Hive Shared Memory (DESIGN_HIVE_MEMORY.md).
-// Only `shadow` and `memory-write` grants count, both scoped to the GRANTOR's own key so every
-// broker computes the exact same verdict regardless of its own identity (`me`).
-// Task grants (`task`, `task+act`, `task-relay`) and `mention` grants are ignored completely:
-// they neither grant memory write rights nor count as evidence when a memory grant is missing.
-export function foldMemoryGrantsWith(events, { grantors, scopeHash, nowSec = Math.floor(Date.now() / 1000) }) {
-  const by = (Array.isArray(grantors) ? grantors : []).map(g => String(g).toLowerCase())
+// Uses one single memory owner key (`owner`, defaulting to James `4010ac43...`), never a per-broker
+// manifest `grantors` list, so two brokers with different manifest grantors still compute the exact
+// same verdict. By default (`allowMemoryWrite = false`), only `shadow` grants from `owner` are folded
+// until `memory-write` is enabled. Task grants (`task`, `task+act`, `task-relay`) and `mention`
+// grants are ignored completely.
+export function foldMemoryGrantsWith(events, {
+  owner = DEFAULT_MEMORY_OWNER,
+  allowMemoryWrite = false,
+  scopeHash,
+  nowSec = Math.floor(Date.now() / 1000),
+}) {
+  const ownerHex = String(owner || '').toLowerCase()
+  if (!HEX64.test(ownerHex)) return { writers: new Map(), ended: new Map(), rejected: 0 }
   const activeById = new Map() // grantId -> { grantId, grantee, grantor, cap, created_at }
   const endedReasons = new Map() // grantee -> Set<'revoked' | 'expired'>
   let rejected = 0
@@ -119,9 +128,6 @@ export function foldMemoryGrantsWith(events, { grantors, scopeHash, nowSec = Mat
     endedReasons.get(grantee).add(why)
   }
 
-  // First pass: collect all valid 440 memory-write / shadow grants from grantors.
-  // Second pass: apply all valid 441 revocations and NIP-40 expirations.
-  // Separating 440s and 441s guarantees same-second revocations and re-grants never depend on arrival order.
   const sorted = [...(Array.isArray(events) ? events : [])].sort((a, b) => {
     const dt = (a?.created_at || 0) - (b?.created_at || 0)
     if (dt !== 0) return dt
@@ -131,7 +137,7 @@ export function foldMemoryGrantsWith(events, { grantors, scopeHash, nowSec = Mat
   const revocations = []
   for (const ev of sorted) {
     const author = String(ev?.pubkey || '').toLowerCase()
-    if (!by.includes(author)) continue
+    if (author !== ownerHex) continue
     let ok = false; try { ok = verifyEvent(ev) } catch { ok = false }
     if (!ok) { rejected++; continue }
     if (ev.kind === 441) {
@@ -143,14 +149,15 @@ export function foldMemoryGrantsWith(events, { grantors, scopeHash, nowSec = Mat
     const scope = tag(ev, 'da-scope')
     const cap = tag(ev, 'da-cap')?.[1]
     if (!HEX64.test(grantee) || !scope || !cap) continue
-    if (cap !== 'shadow' && cap !== MEMORY_WRITE_CAP) continue
-    // Both `shadow` and `memory-write` scope to the grantor's own key.
-    if (scope[1] !== scopeHash(author, scope[2] || '') || (cap === 'shadow' && grantee === author)) continue
+    const allowedCap = cap === 'shadow' || (allowMemoryWrite && cap === MEMORY_WRITE_CAP)
+    if (!allowedCap) continue
+    // Both `shadow` and `memory-write` scope to the memory owner's own key.
+    if (scope[1] !== scopeHash(ownerHex, scope[2] || '') || (cap === 'shadow' && grantee === ownerHex)) continue
     if (grantExpired(ev, nowSec)) {
       markEnded(grantee, 'expired')
       continue
     }
-    activeById.set(ev.id, { grantId: ev.id, grantee, grantor: author, cap, created_at: ev.created_at || 0 })
+    activeById.set(ev.id, { grantId: ev.id, grantee, grantor: ownerHex, cap, created_at: ev.created_at || 0 })
   }
 
   for (const rev of revocations) {
