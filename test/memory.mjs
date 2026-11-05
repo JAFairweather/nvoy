@@ -10,6 +10,8 @@ import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure
 import { WebSocketServer } from 'ws'
 import { scopeHash } from '../mcp/tools/grant_fold.mjs'
 import {
+  FALLBACK_MEMORY_KIND,
+  MEMORY_KIND,
   MemoryStore,
   buildClaimTemplate,
   buildWithdrawalTemplate,
@@ -1336,6 +1338,370 @@ os.execvp("node", ["node", sys.argv[3], "--state", sys.argv[4], "--config", sys.
     sdCrustyQuery.reader === 'crusty' &&
     sdCrustyQuery.reader_pubkey === null &&
     sdCrustyQuery.answer === 'found')
+
+  // --- Buzz-relay kind 30078 global-only storage sync tests (RabidRabbit) ---
+  // On buzz-relay, KIND_READ_STATE (30078) is in is_global_only_kind, so it is stored with
+  // channel_id = NULL and never returned by a #h-scoped filter. Verify:
+  //   1. Each channel REQ carries {kinds:[30079,5],#h:[ch]} plus {kinds:[30078],authors:[...]}.
+  //   2. Global channel 30078 filter requests [ownerPubkey] only when allowMemoryWriteCap is false
+  //      (another author's 30078 is never requested); room channel re-issues under the same subId
+  //      once 39002 room members arrive.
+  //   3. Pre-EOSE filtering keeps only 30078 events whose h tag matches that channel, so James's
+  //      30078 test claim reaches localCount 1 with no false RELAY_EVICTED_WARNING even when
+  //      unrelated 30078 read-state/room events are returned by the authors filter.
+  const jamesTest30078 = sign(
+    buildClaimTemplate({
+      pubkey: james.pk,
+      scope: 'hive:ops',
+      slug: 'viewer-test-2026-11-05',
+      topic: 'viewer-test',
+      claim: 'hive-memory viewer test, 2026-11-05',
+      because: 'Verify live SSE claim ingestion in memory-viewer on herd-cloud',
+      evidence: ['nvoy@8aa86b82377aed390257abd5fdc76ac8246b30ff:mcp/tools/memory-daemon.mjs'],
+      asOfGit: 'nvoy@8aa86b82377aed390257abd5fdc76ac8246b30ff',
+      memoryGlobalChannelId: GLOBAL_CH,
+      kind: FALLBACK_MEMORY_KIND,
+      nowSec,
+    }),
+    james.sk
+  )
+  const jamesReadState30078 = sign({
+    kind: FALLBACK_MEMORY_KIND,
+    created_at: nowSec,
+    tags: [['d', `read-state:${'a'.repeat(32)}`], ['t', 'read-state']],
+    content: 'encrypted-read-state-blob',
+  }, james.sk)
+  const roomMember30078 = sign(
+    buildClaimTemplate({
+      pubkey: waggleDev.pk,
+      scope: `room:${ROOM_A}`,
+      slug: 'room-fallback-30078',
+      topic: 'room-fallback',
+      claim: 'Room claim published as fallback kind 30078.',
+      because: 'Buzz relay rejects kind 30079.',
+      evidence: ['waggle@a2c1781f:docs/DESIGN_HIVE_MEMORY.md'],
+      asOfGit: 'waggle@a2c1781f',
+      kind: FALLBACK_MEMORY_KIND,
+      nowSec,
+    }),
+    waggleDev.sk
+  )
+  const stranger30078 = sign(
+    buildClaimTemplate({
+      pubkey: dennis.pk,
+      scope: 'hive:ops',
+      slug: 'stranger-fallback-30078',
+      topic: 'stranger-fallback',
+      claim: 'Stranger 30078 claim that must never be requested.',
+      because: 'Stranger has no authority.',
+      evidence: ['waggle@a2c1781f:docs/DESIGN_HIVE_MEMORY.md'],
+      asOfGit: 'waggle@a2c1781f',
+      memoryGlobalChannelId: GLOBAL_CH,
+      kind: FALLBACK_MEMORY_KIND,
+      nowSec,
+    }),
+    dennis.sk
+  )
+  const shadowOps30078 = sign(
+    buildClaimTemplate({
+      pubkey: deadRabbit.pk,
+      scope: 'hive:ops',
+      slug: 'shadow-fallback-30078',
+      topic: 'shadow-fallback',
+      claim: 'Shadow writer first claim published as fallback kind 30078.',
+      because: 'Shadow writers are accepted even when allowMemoryWriteCap is false.',
+      evidence: ['waggle@a2c1781f:docs/DESIGN_HIVE_MEMORY.md'],
+      asOfGit: 'waggle@a2c1781f',
+      memoryGlobalChannelId: GLOBAL_CH,
+      kind: FALLBACK_MEMORY_KIND,
+      nowSec,
+    }),
+    deadRabbit.sk
+  )
+  const memWriteOps30078 = sign(
+    buildClaimTemplate({
+      pubkey: waggleDev.pk,
+      scope: 'hive:ops',
+      slug: 'mem-write-fallback-30078',
+      topic: 'mem-write-fallback',
+      claim: 'Memory-write holder first claim published as fallback kind 30078.',
+      because: 'Discovered from owner kind 440 grant when allowMemoryWriteCap is true.',
+      evidence: ['waggle@a2c1781f:docs/DESIGN_HIVE_MEMORY.md'],
+      asOfGit: 'waggle@a2c1781f',
+      memoryGlobalChannelId: GLOBAL_CH,
+      kind: FALLBACK_MEMORY_KIND,
+      nowSec,
+    }),
+    waggleDev.sk
+  )
+  const shadowGrant30078 = makeGrant(james, deadRabbit.pk, 'shadow', { subject: james.pk, at: nowSec - 120 })
+  const memWriteGrant30078 = makeGrant(james, waggleDev.pk, 'memory-write', { subject: james.pk, at: nowSec - 120 })
+
+  const seenChannelReqs = []
+  const wss30078 = new WebSocketServer({ port: 0, host: '127.0.0.1' })
+  const wsPort30078 = await new Promise(res => wss30078.once('listening', () => res(wss30078.address().port)))
+  const relayUrl30078 = `ws://127.0.0.1:${wsPort30078}`
+
+  wss30078.on('connection', ws => {
+    let authed = false
+    ws.send(JSON.stringify(['AUTH', 'challenge-30078-sync']))
+    ws.on('message', raw => {
+      const msg = JSON.parse(raw.toString())
+      if (msg[0] === 'AUTH' && msg[1]?.kind === 22242) {
+        authed = true
+        ws.send(JSON.stringify(['OK', msg[1].id, true, '']))
+        return
+      }
+      if (msg[0] === 'REQ') {
+        const subId = msg[1]
+        const filters = msg.slice(2)
+        if (filters.some(f => Array.isArray(f.kinds) && (f.kinds.includes(440) || f.kinds.includes(441)))) {
+          for (const f of filters) {
+            if (Array.isArray(f.kinds) && f.kinds.includes(440)) {
+              for (const g of [shadowGrant30078, memWriteGrant30078]) {
+                const pTag = g.tags.find(t => t[0] === 'p')?.[1]
+                if (!f['#p'] || f['#p'].includes(pTag)) {
+                  ws.send(JSON.stringify(['EVENT', subId, g]))
+                }
+              }
+            }
+          }
+          ws.send(JSON.stringify(['EOSE', subId]))
+          return
+        }
+        if (!authed) {
+          ws.send(JSON.stringify(['CLOSED', subId, 'auth-required: authenticate first']))
+          return
+        }
+        if (filters.some(f => Array.isArray(f.kinds) && f.kinds.includes(39002))) {
+          ws.send(JSON.stringify(['EVENT', subId, liveRoomList]))
+          ws.send(JSON.stringify(['EOSE', subId]))
+          return
+        }
+        seenChannelReqs.push({ subId, filters })
+        // Simulate buzz-relay: #h filter only returns channel-scoped kinds (30079/5), NEVER 30078.
+        // Only a filter WITHOUT #h that specifies kinds:[30078] and authors:[...] returns 30078 events
+        // authored by those pubkeys.
+        for (const f of filters) {
+          if (!f['#h'] && Array.isArray(f.kinds) && f.kinds.includes(FALLBACK_MEMORY_KIND) && Array.isArray(f.authors)) {
+            if (f.authors.includes(james.pk)) {
+              ws.send(JSON.stringify(['EVENT', subId, jamesReadState30078]))
+              ws.send(JSON.stringify(['EVENT', subId, jamesTest30078]))
+            }
+            if (f.authors.includes(deadRabbit.pk)) {
+              ws.send(JSON.stringify(['EVENT', subId, shadowOps30078]))
+            }
+            if (f.authors.includes(waggleDev.pk)) {
+              ws.send(JSON.stringify(['EVENT', subId, roomMember30078]))
+              ws.send(JSON.stringify(['EVENT', subId, memWriteOps30078]))
+            }
+            if (f.authors.includes(dennis.pk)) {
+              ws.send(JSON.stringify(['EVENT', subId, stranger30078]))
+            }
+          }
+        }
+        ws.send(JSON.stringify(['EOSE', subId]))
+      }
+    })
+  })
+
+  const fbStateDir = join(daemonDir, 'fb-state')
+  const fbSockDir = join(daemonDir, 'fb-socks')
+  mkdirSync(fbStateDir, { recursive: true, mode: 0o700 })
+  // Pre-seed the store with James's 30078 claim only (no shadow claim pre-seeded) so any failure to
+  // match remoteIds on EOSE would trigger a false RELAY_EVICTED_WARNING, AND deadRabbit's first
+  // claim must be discovered via the shadow grant.
+  const preseedStore = new MemoryStore({
+    statePath: join(fbStateDir, 'memory_claims.json'),
+    ownerPubkey: james.pk,
+    memoryGlobalChannelId: GLOBAL_CH,
+    subscribedRooms: [ROOM_A],
+    allowMemoryWriteCap: false,
+  })
+  preseedStore.ingestEvent(jamesTest30078, { nowSec })
+
+  const fbCfgPath = join(daemonDir, 'fb-config.json')
+  writeFileSync(fbCfgPath, JSON.stringify({
+    memoryGlobalChannelId: GLOBAL_CH,
+    ownerPubkey: james.pk,
+    subscribedRooms: [ROOM_A],
+    allowMemoryWriteCap: false,
+    relayUrl: relayUrl30078,
+    relayPubkey: relayKey.pk,
+    grantRelays: [relayUrl30078],
+    readers: {
+      biggy: myDude.pk,
+      viewer: null,
+    },
+  }))
+
+  const fbDaemon = await startMemoryDaemon({
+    stateDir: fbStateDir,
+    configPath: fbCfgPath,
+    readers: 'biggy:viewer',
+    socketDir: fbSockDir,
+    credentialsDir: credDir,
+    makeBunker: () => fakeBunkerDelegate,
+  })
+
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const gSync = fbDaemon.store.getChannelSync(GLOBAL_CH, nowSec)
+    const rSync = fbDaemon.store.getChannelSync(ROOM_A, nowSec)
+    if (gSync.state === 'SYNCED_OK' && gSync.localCount === 2 && rSync.state === 'SYNCED_OK' && rSync.localCount === 1) {
+      break
+    }
+    await new Promise(r => setTimeout(r, 25))
+  }
+
+  const fbGlobalSync = fbDaemon.store.getChannelSync(GLOBAL_CH, nowSec)
+  const fbRoomSync = fbDaemon.store.getChannelSync(ROOM_A, nowSec)
+  const globalReqs = seenChannelReqs.filter(r => r.subId === 'mem-ch-0')
+  const roomReqs = seenChannelReqs.filter(r => r.subId === 'mem-ch-1')
+  const anyRequestedStranger = seenChannelReqs.some(r =>
+    r.filters.some(f => Array.isArray(f.authors) && f.authors.includes(dennis.pk))
+  )
+  const anyGlobalRequestedMemWriteWhileOff = globalReqs.some(r =>
+    r.filters.some(f => Array.isArray(f.authors) && f.authors.includes(waggleDev.pk))
+  )
+  const anyUnscoped30078 = seenChannelReqs.some(r =>
+    r.filters.some(f => Array.isArray(f.kinds) && f.kinds.includes(FALLBACK_MEMORY_KIND) && (!Array.isArray(f.authors) || f.authors.length === 0))
+  )
+  const shadowStored = fbDaemon.store.entries.get(`${deadRabbit.pk}:${shadowOps30078.tags[0][1]}`)
+  const shadowEval = fbDaemon.store.evaluateClaim(shadowStored, { nowSec })
+
+  ok('30078 sync (allowMemoryWriteCap=false): James test 30078 claim and shadow writer first 30078 claim reach localCount 2 with remoteCount 2 (non-channel read-state and room 30078 ignored) and no false RELAY_EVICTED_WARNING',
+    fbGlobalSync.state === 'SYNCED_OK' &&
+    fbGlobalSync.localCount === 2 &&
+    fbGlobalSync.remoteCount === 2 &&
+    fbGlobalSync.missingCount === 0 &&
+    shadowEval.verification === 'accepted' &&
+    shadowEval.computedRank === 3)
+
+  const lastGlobalReqOff = globalReqs[globalReqs.length - 1]
+  ok('30078 sync (allowMemoryWriteCap=false): global REQ includes [ownerPubkey, shadowWriter], excludes memory-write holder while flag is off and excludes stranger, and room REQ re-issues under same subId when 39002 arrives',
+    !anyRequestedStranger &&
+    !anyGlobalRequestedMemWriteWhileOff &&
+    !anyUnscoped30078 &&
+    globalReqs.length >= 1 &&
+    JSON.stringify(lastGlobalReqOff.filters) === JSON.stringify([
+      { kinds: [MEMORY_KIND, 5], '#h': [GLOBAL_CH] },
+      { kinds: [FALLBACK_MEMORY_KIND], authors: [james.pk, deadRabbit.pk].sort() },
+    ]) &&
+    roomReqs.length === 2 &&
+    roomReqs[0].filters.length === 1 &&
+    JSON.stringify(roomReqs[1].filters) === JSON.stringify([
+      { kinds: [MEMORY_KIND, 5], '#h': [ROOM_A] },
+      { kinds: [FALLBACK_MEMORY_KIND], authors: [myDude.pk, waggleDev.pk].sort() },
+    ]) &&
+    fbRoomSync.state === 'SYNCED_OK' &&
+    fbRoomSync.localCount === 1 &&
+    fbRoomSync.missingCount === 0)
+
+  await fbDaemon.close()
+
+  // Regression case 2: allowMemoryWriteCap=true with an empty local store — a memory-write holder's
+  // VERY FIRST claim is kind 30078 (not yet locally ingested), discovered via owner kind 440 grants.
+  seenChannelReqs.length = 0
+  const capOnStateDir = join(daemonDir, 'fb-cap-on-state')
+  const capOnSockDir = join(daemonDir, 'fb-cap-on-socks')
+  mkdirSync(capOnStateDir, { recursive: true, mode: 0o700 })
+  const capOnCfgPath = join(daemonDir, 'fb-cap-on-config.json')
+  writeFileSync(capOnCfgPath, JSON.stringify({
+    memoryGlobalChannelId: GLOBAL_CH,
+    ownerPubkey: james.pk,
+    subscribedRooms: [],
+    allowMemoryWriteCap: true,
+    relayUrl: relayUrl30078,
+    relayPubkey: relayKey.pk,
+    grantRelays: [relayUrl30078],
+    readers: {
+      biggy: myDude.pk,
+      viewer: null,
+    },
+  }))
+
+  const capOnDaemon = await startMemoryDaemon({
+    stateDir: capOnStateDir,
+    configPath: capOnCfgPath,
+    readers: 'biggy:viewer',
+    socketDir: capOnSockDir,
+    credentialsDir: credDir,
+    makeBunker: () => fakeBunkerDelegate,
+  })
+
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const gSync = capOnDaemon.store.getChannelSync(GLOBAL_CH, nowSec)
+    if (gSync.state === 'SYNCED_OK' && gSync.localCount === 3) {
+      break
+    }
+    await new Promise(r => setTimeout(r, 25))
+  }
+
+  const capOnGlobalSync = capOnDaemon.store.getChannelSync(GLOBAL_CH, nowSec)
+  const capOnGlobalReqs = seenChannelReqs.filter(r => r.subId === 'mem-ch-0')
+  const lastGlobalReqOn = capOnGlobalReqs[capOnGlobalReqs.length - 1]
+  const memWriteStored = capOnDaemon.store.entries.get(`${waggleDev.pk}:${memWriteOps30078.tags[0][1]}`)
+  const memWriteEval = capOnDaemon.store.evaluateClaim(memWriteStored, { nowSec })
+  const capOnRequestedStranger = seenChannelReqs.some(r =>
+    r.filters.some(f => Array.isArray(f.authors) && f.authors.includes(dennis.pk))
+  )
+
+  ok('30078 sync (allowMemoryWriteCap=true): discovers memory-write holder with no prior ingested claim, includes [ownerPubkey, shadowWriter, memWriteWriter] in global 30078 filter, and accepts first 30078 claim',
+    !capOnRequestedStranger &&
+    capOnGlobalSync.state === 'SYNCED_OK' &&
+    capOnGlobalSync.localCount === 3 &&
+    capOnGlobalSync.remoteCount === 3 &&
+    capOnGlobalSync.missingCount === 0 &&
+    memWriteEval.verification === 'accepted' &&
+    memWriteEval.computedRank === 3 &&
+    JSON.stringify(lastGlobalReqOn?.filters) === JSON.stringify([
+      { kinds: [MEMORY_KIND, 5], '#h': [GLOBAL_CH] },
+      { kinds: [FALLBACK_MEMORY_KIND], authors: [james.pk, deadRabbit.pk, waggleDev.pk].sort() },
+    ]))
+
+  await capOnDaemon.close()
+
+  // Regression case 3: 100+ owner kind 440 grants on a relay — Phase 0 paginates via `until`
+  // past 124 newer task grants to discover the 125th oldest shadow/memory-write grant and marks
+  // the refresh complete (`lastRefreshComplete: true`, `grantsCheckedAt: nowSec`).
+  const historicalTaskGrants = Array.from({ length: 124 }, (_, idx) =>
+    makeGrant(james, myDude.pk, 'task', { subject: myDude.pk, at: nowSec - 1 - idx })
+  )
+  const oldestShadowGrant = makeGrant(james, deadRabbit.pk, 'shadow', { subject: james.pk, at: nowSec - 500 })
+  const oldestMemWriteGrant = makeGrant(james, waggleDev.pk, 'memory-write', { subject: james.pk, at: nowSec - 501 })
+  const all126OwnerGrants = [...historicalTaskGrants, oldestShadowGrant, oldestMemWriteGrant].sort(
+    (a, b) => b.created_at - a.created_at || (a.id < b.id ? -1 : 1)
+  )
+  const paginatedStore = new MemoryStore({
+    ownerPubkey: james.pk,
+    memoryGlobalChannelId: GLOBAL_CH,
+    allowMemoryWriteCap: true,
+  })
+  let phase0Queries = 0
+  await paginatedStore.refreshGrants({
+    relays: ['wss://relay-paginated.example.com'],
+    nowSec,
+    queryFn: async (_url, filter) => {
+      if (filter.kinds?.includes(440)) {
+        if (!filter['#p']) phase0Queries++
+        const matching = all126OwnerGrants.filter(ev => {
+          if (filter['#p'] && !filter['#p'].includes(ev.tags.find(t => t[0] === 'p')?.[1])) return false
+          if (filter.until !== undefined && ev.created_at > filter.until) return false
+          return true
+        })
+        const lim = filter.limit || 100
+        return { events: matching.slice(0, lim), eose: true, closed: false }
+      }
+      return { events: [], eose: true, closed: false }
+    },
+  })
+  ok('30078 sync (100+ owner grants): Phase 0 paginates past 124 newer grants to discover writers at positions 125-126 with lastRefreshComplete=true',
+    phase0Queries === 2 &&
+    paginatedStore.grantView.lastRefreshComplete === true &&
+    paginatedStore.grantView.grantsCheckedAt === nowSec &&
+    JSON.stringify(paginatedStore.acceptedGlobalWriters()) === JSON.stringify([james.pk, deadRabbit.pk, waggleDev.pk].sort()))
+
+  await new Promise(r => wss30078.close(r))
 }
 
 console.log(`\n${passes} passed, ${fails} failed`)
