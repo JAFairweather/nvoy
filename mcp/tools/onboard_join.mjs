@@ -76,15 +76,20 @@ export async function readTerms(relay, { fetchImpl = globalThis.fetch, ms = HTTP
 }
 
 // Step "hive": the agent is a member when the relay accepts its login. Otherwise open the sealed
-// invite and claim it, then log in again as the proof.
+// invite (or take a plaintext invite when no owner seal is present) and claim it, then log in again as the proof.
 export async function joinHive({ add, relay, signer, open, fetchImpl = globalThis.fetch, ms = HTTP_TIMEOUT_MS }) {
   try { return result('done', 'a member of the hive already', { session: await open() }) }
   catch (error) { if (!refusedLogin(error)) return result('pending', `the hive relay did not answer: ${error.message}`) }
-  if (!add.invite) return result('pending', 'not a member, and the request carries no invite; the owner signs again from the page')
+  const rawInvite = typeof add.inviteCode === 'string' ? add.inviteCode : add.invite
+  if (!rawInvite) return result('pending', 'not a member, and the request carries no invite; the owner signs again from the page')
 
   let code = ''
-  try { code = await signer.nip44Decrypt(add.owner, add.invite) } catch { code = '' }
-  code = typeof code === 'string' ? code.trim() : ''
+  if (typeof add.inviteCode === 'string' || !add.owner) {
+    code = typeof rawInvite === 'string' ? rawInvite.trim() : ''
+  } else {
+    try { code = await signer.nip44Decrypt(add.owner, add.invite) } catch { code = '' }
+    code = typeof code === 'string' ? code.trim() : ''
+  }
   if (!code) return result('refused', 'the invite was not sealed to this agent')
 
   const terms = await readTerms(relay, { fetchImpl, ms })

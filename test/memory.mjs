@@ -18,6 +18,7 @@ import {
 } from '../mcp/tools/memory.mjs'
 import {
   createNip42AuthOnlySigner,
+  loadRelaySignerFromCredentials,
   parseReadersFlag,
   startMemoryDaemon,
   validateAndResolveConfig,
@@ -978,6 +979,84 @@ ok('secret guard allows 64-hex pubkeys, event IDs, and git SHAs',
   }
   ok('createNip42AuthOnlySigner refuses to sign kind 30079 claims (HIVE_MEMORY_DAEMON_NO_SIGN)',
     Boolean(signClaimRefused && signClaimRefused.code === 'HIVE_MEMORY_DAEMON_NO_SIGN'))
+
+  // NIP-46 Bunker delegate signer wrapper & credential loading + quiet room 39002 checkedAt refresh (#305):
+  const quietRoomStore = new MemoryStore({ memoryGlobalChannelId: GLOBAL_CH, ownerPubkey: james.pk })
+  const quietRoomList = sign({
+    kind: 39002,
+    created_at: nowSec,
+    content: '',
+    tags: [['d', ROOM_A], ['p', myDude.pk]],
+  }, relayKey.sk)
+  quietRoomStore.recordRoomMembers(quietRoomList, { relayPubkey: relayKey.pk, checkedAt: nowSec })
+  const refreshedIdentical39002 = quietRoomStore.recordRoomMembers(quietRoomList, { relayPubkey: relayKey.pk, checkedAt: nowSec + 500 })
+  ok('recordRoomMembers advances checkedAt when an identical kind 39002 event is re-observed on a quiet room (#305)',
+    refreshedIdentical39002 === true &&
+    quietRoomStore.roomMembers.get(ROOM_A).checkedAt === nowSec + 500)
+
+  let bunkerSignCalls = 0
+  let bunkerClosed = false
+  const fakeBunkerDelegate = {
+    pubkey: daemonRelayIdentity.pk,
+    async getPublicKey() { return daemonRelayIdentity.pk },
+    async signEvent(tmpl) {
+      bunkerSignCalls++
+      return sign(tmpl, daemonRelayIdentity.sk)
+    },
+    close() { bunkerClosed = true },
+  }
+  const wrappedBunkerSigner = createNip42AuthOnlySigner(fakeBunkerDelegate, 'wss://nave.communities.buzz.xyz', { now: () => nowSec })
+  let bunkerRefused27235 = null
+  try {
+    await wrappedBunkerSigner.signEvent({
+      kind: 27235,
+      created_at: nowSec,
+      content: '',
+      tags: [['u', 'https://nave.communities.buzz.xyz/api/invites/claim'], ['method', 'POST']],
+    })
+  } catch (err) {
+    bunkerRefused27235 = err
+  }
+  const bunkerAuthEv = await wrappedBunkerSigner.signEvent({
+    kind: 22242,
+    created_at: nowSec,
+    content: '',
+    tags: [['relay', 'wss://nave.communities.buzz.xyz'], ['challenge', 'bunker-challenge-99999999']],
+  })
+  wrappedBunkerSigner.close()
+  ok('createNip42AuthOnlySigner wrapping a Bunker signer refuses kind 27235 before calling Bunker RPC and delegates kind 22242 only',
+    Boolean(bunkerRefused27235 && bunkerRefused27235.code === 'HIVE_MEMORY_DAEMON_NO_SIGN') &&
+    bunkerSignCalls === 1 &&
+    bunkerAuthEv.kind === 22242 &&
+    bunkerAuthEv.pubkey === daemonRelayIdentity.pk &&
+    bunkerClosed === true)
+
+  const bunkerCredDir = join(daemonDir, 'bunker-creds')
+  mkdirSync(bunkerCredDir, { recursive: true, mode: 0o700 })
+  writeFileSync(join(bunkerCredDir, 'nip46-client'), Buffer.from(daemonRelayIdentity.sk).toString('hex') + '\n', { mode: 0o600 })
+  let incompleteBunkerErr = null
+  try {
+    loadRelaySignerFromCredentials(bunkerCredDir, 'wss://nave.communities.buzz.xyz')
+  } catch (err) {
+    incompleteBunkerErr = err
+  }
+  writeFileSync(
+    join(bunkerCredDir, 'bunker-uri'),
+    `bunker://${daemonRelayIdentity.pk}?relay=wss%3A%2F%2Frelay.nsec.app\n`,
+    { mode: 0o600 }
+  )
+  let constructedUri = null
+  const loadedBunkerSigner = loadRelaySignerFromCredentials(bunkerCredDir, 'wss://nave.communities.buzz.xyz', {
+    makeBunker: (uri, _client) => {
+      constructedUri = uri
+      return fakeBunkerDelegate
+    },
+  })
+  ok('loadRelaySignerFromCredentials requires both nip46-client and bunker-uri and wraps makeBunkerSigner in createNip42AuthOnlySigner',
+    Boolean(incompleteBunkerErr && /both nip46-client and bunker-uri/.test(incompleteBunkerErr.message)) &&
+    Boolean(loadedBunkerSigner) &&
+    constructedUri === `bunker://${daemonRelayIdentity.pk}?relay=wss%3A%2F%2Frelay.nsec.app` &&
+    loadedBunkerSigner.pubkey === daemonRelayIdentity.pk)
 
   // Live relay ingestion (30079 + 39002 + NIP-42 AUTH) & two-phase 440/441 grant refresh in memory-daemon (Rabid Rabbit #3):
   const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 })

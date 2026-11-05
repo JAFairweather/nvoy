@@ -25,6 +25,7 @@ import { createInterface } from 'node:readline'
 import { finalizeEvent, getPublicKey, verifyEvent } from 'nostr-tools/pure'
 import WebSocket from 'ws'
 import { authTemplate, checkAuthTemplate, normalizeBuzzRelay } from './buzz_native.mjs'
+import { selfHealingSigner } from './broker_signer.mjs'
 import { grantReadRelays } from './grant_relays.mjs'
 import {
   DEFAULT_MEMORY_OWNER,
@@ -33,6 +34,7 @@ import {
   MEMORY_TOOL_SPECS,
   MemoryStore,
 } from './memory.mjs'
+import { makeBunkerSigner } from './nip46-signer.mjs'
 import { secretKey } from './secret_key.mjs'
 
 const READER_NAME_RE = /^[a-z][a-z0-9-]{0,31}$/
@@ -153,16 +155,49 @@ export function validateAndResolveConfig(cfg, readers) {
 }
 
 // Narrow NIP-42 AUTH-only signer: signs ONLY fresh kind 22242 AUTH challenges for the configured
-// community relay. Refuses claims (30079/30078), deletions (5), grants (440/441), or any other event.
-export function createNip42AuthOnlySigner(rawKeyOrBytes, relayUrl, { now = () => Math.floor(Date.now() / 1000) } = {}) {
+// community relay. Wraps either a NIP-46 Bunker signer (production) or raw key material (unit tests).
+// Refuses claims (30079/30078), HTTP auth (27235), deletions (5), grants (440/441), or any other event
+// BEFORE delegating to the underlying signer.
+export function createNip42AuthOnlySigner(signerOrRawKey, relayUrl, { now = () => Math.floor(Date.now() / 1000) } = {}) {
   const targetRelay = normalizeBuzzRelay(relayUrl)
-  const sk = rawKeyOrBytes instanceof Uint8Array ? rawKeyOrBytes : secretKey(rawKeyOrBytes, 'relay-identity')
-  const pubkey = getPublicKey(sk).toLowerCase()
+  const isDelegate =
+    signerOrRawKey &&
+    typeof signerOrRawKey === 'object' &&
+    !(signerOrRawKey instanceof Uint8Array) &&
+    typeof signerOrRawKey.signEvent === 'function'
+
+  let delegate = null
+  let cachedPubkey = null
+
+  if (isDelegate) {
+    delegate = signerOrRawKey
+    if (typeof delegate.pubkey === 'string' && HEX64.test(delegate.pubkey)) {
+      cachedPubkey = delegate.pubkey.toLowerCase()
+    }
+  } else {
+    const sk = signerOrRawKey instanceof Uint8Array ? signerOrRawKey : secretKey(signerOrRawKey, 'relay-identity')
+    const pk = getPublicKey(sk).toLowerCase()
+    cachedPubkey = pk
+    delegate = {
+      pubkey: pk,
+      async getPublicKey() {
+        return pk
+      },
+      async signEvent(template) {
+        return finalizeEvent(template, sk)
+      },
+    }
+  }
+
   return Object.freeze({
-    pubkey,
+    get pubkey() {
+      return cachedPubkey
+    },
     relay: targetRelay,
     async getPublicKey() {
-      return pubkey
+      const pk = String(await delegate.getPublicKey()).toLowerCase()
+      if (HEX64.test(pk)) cachedPubkey = pk
+      return pk
     },
     async signEvent(template) {
       const reason = checkAuthTemplate(template, { relay: targetRelay, now: now() })
@@ -171,9 +206,61 @@ export function createNip42AuthOnlySigner(rawKeyOrBytes, relayUrl, { now = () =>
         err.code = 'HIVE_MEMORY_DAEMON_NO_SIGN'
         throw err
       }
-      return finalizeEvent(template, sk)
+      const signed = await delegate.signEvent(template)
+      if (signed && typeof signed.pubkey === 'string' && HEX64.test(signed.pubkey)) {
+        cachedPubkey = signed.pubkey.toLowerCase()
+      }
+      return signed
+    },
+    close() {
+      try {
+        return delegate.close?.()
+      } catch {
+        /* ignore */
+      }
     },
   })
+}
+
+function assertRegularFile(filePath, label) {
+  const st = lstatSync(filePath)
+  if (!st.isFile() || st.isSymbolicLink()) {
+    throw new Error(`${label} must be a regular non-symlink file`)
+  }
+}
+
+export function loadRelaySignerFromCredentials(credentialsDir, relayUrl, { makeBunker = makeBunkerSigner } = {}) {
+  if (!credentialsDir) return null
+  const dir = resolve(credentialsDir)
+  const clientPath = existsSync(join(dir, 'nip46-client'))
+    ? join(dir, 'nip46-client')
+    : existsSync(join(dir, 'bunker-client'))
+      ? join(dir, 'bunker-client')
+      : null
+  const uriPath = existsSync(join(dir, 'bunker-uri')) ? join(dir, 'bunker-uri') : null
+
+  if (clientPath || uriPath) {
+    if (!clientPath || !uriPath) {
+      throw new Error('both nip46-client and bunker-uri credentials are required when pairing with Bunker')
+    }
+    assertRegularFile(clientPath, 'nip46-client credential')
+    assertRegularFile(uriPath, 'bunker-uri credential')
+    const clientRaw = readFileSync(clientPath, 'utf8').trim()
+    const uriRaw = readFileSync(uriPath, 'utf8').trim()
+    secretKey(clientRaw, 'nip46-client credential')
+    if (!/^bunker:\/\/[0-9a-f]{64}/i.test(uriRaw)) {
+      throw new Error('bunker-uri credential is invalid')
+    }
+    const bunker = selfHealingSigner(() => makeBunker(uriRaw, clientRaw, { clientSource: 'nip46-client credential' }))
+    return createNip42AuthOnlySigner(bunker, relayUrl)
+  }
+
+  const relayCredentialPath = join(dir, 'relay-identity')
+  if (existsSync(relayCredentialPath)) {
+    assertRegularFile(relayCredentialPath, 'relay-identity credential')
+    return createNip42AuthOnlySigner(readFileSync(relayCredentialPath, 'utf8'), relayUrl)
+  }
+  return null
 }
 
 export function queryGrantRelay(url, filter, { WS = WebSocket, timeoutMs = 10000 } = {}) {
@@ -525,6 +612,15 @@ function startCommunityRelaySync({
   connectOnce()
 
   return {
+    refreshRooms() {
+      if (stopped || !subscribedRooms.length || !currentWs || currentWs.readyState !== 1) return false
+      try {
+        currentWs.send(JSON.stringify(['REQ', 'mem-rooms', { kinds: [39002], '#d': subscribedRooms }]))
+        return true
+      } catch {
+        return false
+      }
+    },
     stop() {
       stopped = true
       if (reconnectTimer) clearTimeout(reconnectTimer)
@@ -546,6 +642,8 @@ export async function startMemoryDaemon({
   listenFdNames = process.env.LISTEN_FDNAMES || null,
   listenPid = process.env.LISTEN_PID ? Number(process.env.LISTEN_PID) : null,
   credentialsDir = process.env.CREDENTIALS_DIRECTORY || null,
+  relaySigner: injectedRelaySigner = null,
+  makeBunker = makeBunkerSigner,
   config = null,
   store: existingStore = null,
   grantQueryFn = null,
@@ -562,16 +660,10 @@ export async function startMemoryDaemon({
   const validated = validateAndResolveConfig(rawCfg, readers)
   const { readerMap } = validated
 
-  // Load optional systemd LoadCredential relay-identity file without ever logging or exposing its content.
-  const relayCredentialPath = credentialsDir ? join(resolve(credentialsDir), 'relay-identity') : null
-  let relaySigner = null
-  if (relayCredentialPath && existsSync(relayCredentialPath)) {
-    const st = lstatSync(relayCredentialPath)
-    if (!st.isFile() || st.isSymbolicLink()) {
-      throw new Error('relay-identity credential must be a regular non-symlink file')
-    }
-    relaySigner = createNip42AuthOnlySigner(readFileSync(relayCredentialPath, 'utf8'), validated.relayUrl)
-  }
+  // Load systemd LoadCredential Bunker NIP-46 credentials (nip46-client + bunker-uri) or unit-test relay-identity.
+  const relaySigner = injectedRelaySigner
+    ? createNip42AuthOnlySigner(injectedRelaySigner, validated.relayUrl)
+    : loadRelaySignerFromCredentials(credentialsDir, validated.relayUrl, { makeBunker })
 
   const store = existingStore || new MemoryStore({
     statePath: join(resolvedStateDir, 'memory_claims.json'),
@@ -673,6 +765,7 @@ export async function startMemoryDaemon({
   if (shouldAutoSync) {
     refreshDaemonGrants()
     grantTimer = setInterval(() => {
+      relaySyncHandle?.refreshRooms?.()
       refreshDaemonGrants()
     }, validated.grantRefreshIntervalMs)
     grantTimer.unref?.()
@@ -709,6 +802,7 @@ export async function startMemoryDaemon({
     async close() {
       if (grantTimer) clearInterval(grantTimer)
       relaySyncHandle?.stop()
+      relaySigner?.close?.()
       await Promise.all(
         [...servers.values()].map(srv => new Promise(res => srv.close(() => res())))
       )

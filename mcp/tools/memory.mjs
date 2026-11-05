@@ -788,19 +788,24 @@ export class MemoryStore {
       if (!UUID.test(id)) throw new Error('kind 39002 d tag is not a valid room UUID')
       const prev = this.roomMembers.get(id)
       const evId = String(ev.id || '').toLowerCase()
-      if (
-        prev &&
-        prev.eventCreatedAt !== undefined &&
-        (ev.created_at < prev.eventCreatedAt ||
-          (ev.created_at === prev.eventCreatedAt && evId >= String(prev.eventId || '').toLowerCase()))
-      ) {
-        return false
+      const nextCheckedAt = opts.checkedAt ?? Math.floor(Date.now() / 1000)
+      if (prev && prev.eventCreatedAt !== undefined) {
+        if (ev.created_at === prev.eventCreatedAt && evId === String(prev.eventId || '').toLowerCase()) {
+          prev.checkedAt = Math.max(prev.checkedAt || 0, nextCheckedAt)
+          return true
+        }
+        if (
+          ev.created_at < prev.eventCreatedAt ||
+          (ev.created_at === prev.eventCreatedAt && evId > String(prev.eventId || '').toLowerCase())
+        ) {
+          return false
+        }
       }
       const members = tagValues(ev, 'p').map(m => String(m || '').toLowerCase()).filter(m => HEX64.test(m))
       this.subscribedRooms.add(id)
       this.roomMembers.set(id, {
         members: new Set(members),
-        checkedAt: opts.checkedAt ?? Math.floor(Date.now() / 1000),
+        checkedAt: nextCheckedAt,
         eventCreatedAt: ev.created_at,
         eventId: evId,
       })

@@ -65,13 +65,13 @@ const exists = path => { try { lstatSync(path); return true } catch (e) { if (e.
  * Pair and seat. `pair` is nave-connect's nostrConnectSigner (injected for tests). Resolves to
  * { npub, written: [paths] }; throws with nothing written on any refusal.
  */
-export async function pairInstance(manifest, { pair, relays = manifest.relays, timeoutMs = 300000, onUri = () => {}, onLog = () => {}, now = () => Math.floor(Date.now() / 1000) }) {
+export async function pairInstance(manifest, { pair, relays = manifest.relays, perms = manifest.perms || brokerPerms(), timeoutMs = 300000, onUri = () => {}, onLog = () => {}, now = () => Math.floor(Date.now() / 1000) }) {
   const refs = [manifest.bunkerClientRef, manifest.bunkerUriRef]
   if (!refs.every(r => typeof r === 'string' && r.startsWith('/'))) throw new Error('the manifest names no Bunker credential files; this identity does not pair through a Bunker')
   for (const r of refs) if (exists(r)) throw new Error(`${r} already exists; nothing was paired. To re-pair, remove both credential files first`)
   for (const d of new Set(refs.map(r => dirname(r)))) if (!exists(d)) throw new Error(`${d} does not exist`)
 
-  const signer = await pair({ relays, perms: brokerPerms(), appName: `nvoy ${manifest.id}`, onUri, onLog, timeoutMs })
+  const signer = await pair({ relays, perms, appName: `nvoy ${manifest.id}`, onUri, onLog, timeoutMs })
   try {
     const pk = String(await signer.getPublicKey()).toLowerCase()
     if (pk !== manifest.pubkey) {
