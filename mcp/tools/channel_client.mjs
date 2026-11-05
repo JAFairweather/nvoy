@@ -81,7 +81,33 @@ export function sshChannelEntry({ identity, knownHosts, target }) {
 // A portable harness's whole configuration. It names paths, never values, and it can hold nothing
 // that signs: like a remote-broker manifest, a field that could carry a Nostr key or Bunker
 // credential refuses the file rather than being ignored.
-const CLIENT_FIELDS = new Set(['instance', 'ssh_target', 'identity_file', 'known_hosts_file', 'credential_file', 'home', 'model', 'pubkey', 'channels'])
+const CLIENT_FIELDS = new Set(['instance', 'ssh_target', 'identity_file', 'known_hosts_file', 'credential_file', 'home', 'model', 'pubkey', 'channels', 'mcp_servers'])
+const MCP_SERVER_NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/i
+const MCP_ENTRY_FIELDS = new Set(['command', 'args'])
+
+export function readExtraMcpServers(raw, channelServerName) {
+  if (raw === undefined) return Object.freeze({})
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('client config mcp_servers must be a JSON object')
+  const out = {}
+  for (const [name, spec] of Object.entries(raw)) {
+    if (!MCP_SERVER_NAME.test(name)) throw new Error(`client config mcp_servers entry ${name} must be a valid server name`)
+    if (name === channelServerName) throw new Error(`client config mcp_servers cannot override the channel server ${channelServerName}`)
+    if (!spec || typeof spec !== 'object' || Array.isArray(spec)) throw new Error(`client config mcp_servers.${name} must be a JSON object`)
+    const unknown = Object.keys(spec).filter(key => !MCP_ENTRY_FIELDS.has(key))
+    if (unknown.length) throw new Error(`client config mcp_servers.${name} has unsupported field ${unknown.join(', ')} (only command and args are allowed)`)
+    const command = spec.command
+    if (typeof command !== 'string' || !command || !isAbsolute(command) || /\s/.test(command)) {
+      throw new Error(`client config mcp_servers.${name}.command must be an absolute path`)
+    }
+    const args = spec.args === undefined ? [] : spec.args
+    if (!Array.isArray(args) || !args.every(arg => typeof arg === 'string')) {
+      throw new Error(`client config mcp_servers.${name}.args must be an array of strings`)
+    }
+    out[name] = Object.freeze({ command, args: Object.freeze([...args]) })
+  }
+  return Object.freeze(out)
+}
+
 export function readClientConfig(path, id) {
   const file = fixedPath(path, 'client config', 64 * 1024)
   if ((file.stat.mode & 0o022) !== 0) throw new Error('client config must not be group/world writable')
@@ -95,6 +121,7 @@ export function readClientConfig(path, id) {
   const unknown = Object.keys(raw).filter(key => !CLIENT_FIELDS.has(key))
   if (unknown.length) throw new Error(`client config has unknown field ${unknown.join(', ')}`)
   if (raw.instance !== id) throw new Error('client config names a different instance')
+  const normalizedId = instanceId(id)
   const target = String(raw.ssh_target || '')
   if (!SSH_TARGET.test(target)) throw new Error('client config ssh_target must be a fixed user@host')
   const own = resolve(homedir())
@@ -107,8 +134,9 @@ export function readClientConfig(path, id) {
   if (pubkey && !/^[0-9a-f]{64}$/.test(pubkey)) throw new Error('client config pubkey must be 64 lowercase hex characters')
   const channels = raw.channels === undefined ? [] : raw.channels
   if (!Array.isArray(channels) || !channels.every(c => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(c))) throw new Error('client config channels must be Buzz channel ids')
+  const mcpServers = readExtraMcpServers(raw.mcp_servers, `nvoy-${normalizedId}`)
   return Object.freeze({
-    id: instanceId(id), target, home: resolve(home), model, pubkey, channels,
+    id: normalizedId, target, home: resolve(home), model, pubkey, channels, mcpServers,
     identity: privateFile(String(raw.identity_file || ''), 'SSH identity file'),
     knownHosts: knownHostsFile(String(raw.known_hosts_file || '')),
     credentialFile: privateFile(String(raw.credential_file || ''), 'Claude login credential file'),

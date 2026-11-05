@@ -12,7 +12,15 @@ export const serverName = manifest => `nvoy-${manifest.id}`
 // command would use, so it keeps exactly the queue permissions that path has. Off the fleet it is
 // that SSH forced command, reached with the same entry claude-channel-doctor renders for a client.
 export function mcpConfig({ manifest, root, remote = null }) {
-  if (remote) return { mcpServers: { [serverName(manifest)]: sshChannelEntry(remote) } }
+  if (remote) {
+    const channelServer = serverName(manifest)
+    const extra = {}
+    for (const [name, spec] of Object.entries(remote.mcpServers || {})) {
+      if (name === channelServer) continue
+      extra[name] = { command: spec.command, args: [...(spec.args || [])] }
+    }
+    return { mcpServers: { [channelServer]: sshChannelEntry(remote), ...extra } }
+  }
   return { mcpServers: { [serverName(manifest)]: {
     command: 'node',
     args: ['/srv/nvoy/mcp/tools/claude-channel.mjs', '--instance', manifest.id],
@@ -34,12 +42,15 @@ export function seedClaudeJson(existing, workdir) {
 // Nobody is at the keyboard, so a permission prompt would stall the session for good. The channel's
 // tools are allowed; anything else is refused rather than asked about, unless the operator has
 // chosen another mode or added rules in this persistent file.
-export function seedSettings(existing, server) {
+export function seedSettings(existing, server, extraServers = []) {
   const out = existing && typeof existing === 'object' && !Array.isArray(existing) ? { ...existing } : {}
   const permissions = out.permissions && typeof out.permissions === 'object' ? { ...out.permissions } : {}
   const allow = Array.isArray(permissions.allow) ? [...permissions.allow] : []
-  const rule = `mcp__${server}`
-  if (!allow.includes(rule)) allow.push(rule)
+  for (const name of [server, ...extraServers]) {
+    if (!name) continue
+    const rule = `mcp__${name}`
+    if (!allow.includes(rule)) allow.push(rule)
+  }
   permissions.allow = allow
   if (!permissions.defaultMode) permissions.defaultMode = 'dontAsk'
   out.permissions = permissions

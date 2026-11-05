@@ -94,6 +94,8 @@ ok('first-run and folder-trust flags are asserted and everything Claude Code alr
 ok('a malformed ~/.claude.json is replaced, not trusted', seedClaudeJson([1, 2], '/w').hasCompletedOnboarding === true && seedClaudeJson(null, '/w').projects['/w'].hasTrustDialogAccepted)
 const settings = seedSettings({}, 'nvoy-mc-test')
 ok('the channel tools are allowed and anything else is refused rather than asked about', JSON.stringify(settings.permissions.allow) === '["mcp__nvoy-mc-test"]' && settings.permissions.defaultMode === 'dontAsk')
+const settingsWithExtra = seedSettings({}, 'nvoy-mc-test', ['hive-memory'])
+ok('extra MCP servers from client config are also allowed in settings.json', JSON.stringify(settingsWithExtra.permissions.allow) === '["mcp__nvoy-mc-test","mcp__hive-memory"]')
 const operator = seedSettings({ model: 'kept', permissions: { allow: ['Read', 'mcp__nvoy-mc-test'], deny: ['Bash'], defaultMode: 'default' } }, 'nvoy-mc-test')
 ok('seeding is idempotent and keeps the operator\'s own rules and mode', operator.model === 'kept' && JSON.stringify(operator.permissions.allow) === '["Read","mcp__nvoy-mc-test"]' &&
   operator.permissions.deny[0] === 'Bash' && operator.permissions.defaultMode === 'default')
@@ -353,12 +355,30 @@ ok('a portable config refuses an SSH key or login that group or other can read',
 ok('a portable config refuses another instance, an unknown field, a writable config, and the owner\'s own home', refused({ ...client, instance: 'other-test' }, /different instance/) &&
   refused({ ...client, extra: 1 }, /unknown field extra/) && refused(client, /client config must not be group\/world writable/, 0o666) &&
   refused({ ...client, home: ownHome }, /never your home/) && refused({ ...client, ssh_target: '-oProxyCommand=x@h' }, /fixed user@host/))
+ok('a portable config refuses mcp_servers with a non-absolute command, a name colliding with nvoy-<instance>, or any field besides command and args',
+  refused({ ...client, mcp_servers: { 'hive-memory': { command: 'hive-memory/connect', args: [] } } }, /command must be an absolute path/) &&
+  refused({ ...client, mcp_servers: { 'nvoy-mac-test': { command: '/usr/local/lib/hive-memory/connect', args: [] } } }, /cannot override the channel server nvoy-mac-test/) &&
+  refused({ ...client, mcp_servers: { 'hive-memory': { command: '/usr/local/lib/hive-memory/connect', args: [], env: { FOO: '1' } } } }, /only command and args are allowed/) &&
+  refused({ ...client, mcp_servers: { 'hive-memory': { command: '/usr/local/lib/hive-memory/connect', args: [123] } } }, /args must be an array of strings/))
 const doctor = spawnSync(process.execPath, ['mcp/tools/claude-channel-doctor.mjs', '--mode', 'client', '--server', 'nvoy-mac-test', '--claude', fakeClaude,
   '--identity-file', keyFile, '--known-hosts-file', knownFile, '--ssh-target', client.ssh_target], { cwd: resolve('.'), encoding: 'utf8' })
 const doctorConfig = JSON.parse(doctor.stdout || '{}').mcpConfig
 const pureRemote = mcpConfig({ manifest: { id: 'mac-test' }, root, remote: { identity: doctorConfig?.mcpServers['nvoy-mac-test'].args.at(-2), knownHosts: resolve(knownFile), target: client.ssh_target } })
 ok('the portable channel entry is the doctor\'s client entry, from the one shared function', doctor.status === 0 && Object.keys(pureRemote.mcpServers).length === 1 &&
   JSON.stringify(pureRemote.mcpServers['nvoy-mac-test']) === JSON.stringify(sshChannelEntry({ identity: doctorConfig.mcpServers['nvoy-mac-test'].args.at(-2), knownHosts: resolve(knownFile), target: client.ssh_target })))
+const remoteWithExtra = mcpConfig({
+  manifest: { id: 'mac-test' },
+  root,
+  remote: {
+    identity: doctorConfig?.mcpServers['nvoy-mac-test'].args.at(-2),
+    knownHosts: resolve(knownFile),
+    target: client.ssh_target,
+    mcpServers: { 'hive-memory': { command: '/usr/local/lib/hive-memory/connect', args: [] } },
+  },
+})
+ok('mcpConfig merges extra mcp_servers from client.json after the instance channel server',
+  JSON.stringify(Object.keys(remoteWithExtra.mcpServers)) === '["nvoy-mac-test","hive-memory"]' &&
+  JSON.stringify(remoteWithExtra.mcpServers['hive-memory']) === JSON.stringify({ command: '/usr/local/lib/hive-memory/connect', args: [] }))
 const fleetRoot = mkdtempSync(join(root, 'instances-'))
 writeFileSync(join(fleetRoot, 'mac-test.json'), JSON.stringify({ ...base('mac-test'), harness }))
 const localLock = join(root, 'run-mac-test', 'claude-channel-state', 'channel.lock')
