@@ -20,7 +20,7 @@ function provision(path, uid, gid, mode, label) {
   try { const s = lstatSync(path); if (!s.isDirectory() || s.isSymbolicLink()) die(`${label} root is not a real directory`) }
   catch (e) { if (e.code === 'ENOENT') mkdirSync(path, { recursive: true, mode }); else throw e }
   chownSync(path, uid, gid); chmodSync(path, mode)
-  const s = statSync(path), actual = s.mode & 0o777
+  const s = statSync(path), actual = s.mode & 0o7777
   if (s.uid !== uid || s.gid !== gid || actual !== mode) die(`${label} root ownership/mode verification failed`)
 }
 provision(m.stateDir, m.brokerUid, m.brokerAdapterGid, 0o700, 'broker state')
@@ -47,7 +47,10 @@ if (m.deliveryMode === 'notify_only' && m.buzz?.statusReactions) provisionFile(`
 // nvoy_channel_post's requests, for an identity whose owner opted it in; broker-group readable.
 if (m.mayPost) provisionFile(`${m.runtimeDir}/post-requests.jsonl`, m.workerUid, m.brokerAdapterGid, 0o640, 'post request queue')
 // memory_claim and memory_withdraw requests, for an identity opted in by may_remember; broker-group readable.
-if (m.mayRemember) provisionFile(`${m.runtimeDir}/memory-requests.jsonl`, m.workerUid, m.brokerAdapterGid, 0o640, 'memory request queue')
+// One file per memory request: worker-created, broker-group-readable through the setgid bit, and
+// unlinked by the broker once the store answers. The rate log holds ids and times only.
+if (m.mayRemember) provision(`${m.runtimeDir}/memory-requests`, m.workerUid, m.brokerAdapterGid, 0o2770, 'memory request spool')
+if (m.mayRemember) provisionFile(`${m.runtimeDir}/memory-rate.jsonl`, m.workerUid, m.workerUid, 0o600, 'memory rate log')
 // The brokers' last reading of the live mention grants, for the keyless channel MCPs; worker-group readable.
 if (m.mayPost) provisionFile(`${m.runtimeDir}/mention-grants.json`, m.brokerUid, m.workerHandoffGid, 0o640, 'mention grant snapshot')
 if (m.maySetProfile) {

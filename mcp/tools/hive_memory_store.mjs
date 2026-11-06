@@ -1,0 +1,1155 @@
+// hive_memory_store.mjs — the private Hive memory store (PLANS/HIVE_MEMORY_PRIVATE_STORE.md §2-§4).
+//
+// Signed claims live in SQLite (node:sqlite, WAL, synchronous = FULL) beside a metadata-only
+// accepted-write ledger. Every write commits in three phases: SQLite first (with the exact ledger
+// line staged in store_meta.pending_ledger_json), then the fsynced ledger append, then the reply.
+// A restore that commits several ops in one transaction stages all their lines, newline-joined.
+// Startup reconciles the two and refuses to serve ('unknown', never 'none') until they agree.
+// Nothing here opens a network connection.
+
+import { DatabaseSync, backup as sqliteBackup } from 'node:sqlite'
+import { randomUUID } from 'node:crypto'
+import {
+  closeSync, copyFileSync, existsSync, fsyncSync, ftruncateSync, linkSync, lstatSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, writeSync,
+} from 'node:fs'
+import { dirname, join } from 'node:path'
+import { verifyEvent } from 'nostr-tools/pure'
+import {
+  DEFAULT_QUERY_LIMIT, DEFAULT_WAKE_MAX_CHARS, FALLBACK_MEMORY_KIND, MAX_LINK_HOPS, MAX_QUERY_LIMIT, MEMORY_KIND, nip01Newer, parseFactKey,
+  validateMemoryEvent,
+} from './memory.mjs'
+
+export const RETENTION_PURGE_AFTER_SEC = 90 * 86400
+export const MAX_EVENT_BYTES = 64 * 1024
+const ALLOWED_KINDS = [MEMORY_KIND, FALLBACK_MEMORY_KIND]
+const HEX64 = /^[0-9a-f]{64}$/
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+export const SOCKET_NAME = /^[a-z][a-z0-9-]{0,31}$/
+const EVENT_KEYS = ['content', 'created_at', 'id', 'kind', 'pubkey', 'sig', 'tags']
+const LEDGER_OPS = new Set(['init', 'cutover', 'submit', 'purge', 'restore-gap-ack'])
+const CONFIG_KEYS = ['memoryGlobalChannelId', 'ownerPubkey', 'maxUnbackedSec', 'globalWriters', 'readers', 'writers', 'rooms']
+const RECEIPT_SKEW_SEC = 300
+
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS store_meta (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  store_id TEXT NOT NULL,
+  write_seq INTEGER NOT NULL,
+  last_event_id TEXT,
+  pending_ledger_json TEXT NOT NULL,
+  initialized_at INTEGER NOT NULL,
+  last_purge_seq INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS events (
+  id TEXT PRIMARY KEY,
+  pubkey TEXT NOT NULL,
+  kind INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  d TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  scope_type TEXT NOT NULL,
+  room_id TEXT,
+  topic TEXT,
+  status TEXT NOT NULL,
+  retention TEXT NOT NULL,
+  as_of_git TEXT,
+  as_of_evt TEXT,
+  exp INTEGER,
+  raw_json TEXT NOT NULL,
+  ingested_at INTEGER NOT NULL,
+  is_current INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_events_current_head ON events(pubkey, d) WHERE is_current = 1;
+CREATE INDEX IF NOT EXISTS idx_events_scope_current ON events(scope, is_current, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_events_room_current ON events(room_id, is_current, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_events_topic_current ON events(topic, is_current, created_at DESC);
+CREATE TABLE IF NOT EXISTS links (
+  from_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+  relation TEXT NOT NULL,
+  target TEXT NOT NULL,
+  PRIMARY KEY (from_id, relation, target)
+);
+CREATE INDEX IF NOT EXISTS idx_links_target ON links(relation, target);
+CREATE TABLE IF NOT EXISTS writer_rate_log (
+  event_id TEXT PRIMARY KEY,
+  pubkey TEXT NOT NULL,
+  accepted_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_writer_rate_pubkey_time ON writer_rate_log(pubkey, accepted_at);
+`
+
+export class HiveMemoryError extends Error {
+  constructor(code, message) {
+    super(message)
+    this.code = code
+  }
+}
+const refusal = (code, message) => ({ accepted: false, code, message })
+const isObj = v => v !== null && typeof v === 'object' && !Array.isArray(v)
+const nowSecDefault = () => Math.floor(Date.now() / 1000)
+const prefix = id => `${String(id).slice(0, 12)}…`
+
+// --- config (/etc/hive-memory/config.json) ---
+
+export function validateAndResolveConfig(cfg) {
+  const fail = m => { throw new Error(`invalid hive-memory config: ${m}`) }
+  if (!isObj(cfg)) fail('not a JSON object')
+  const unknown = Object.keys(cfg).filter(k => !CONFIG_KEYS.includes(k))
+  if (unknown.length) fail(`unknown keys ${unknown.join(', ')}`)
+  const missing = CONFIG_KEYS.filter(k => !Object.hasOwn(cfg, k))
+  if (missing.length) fail(`missing keys ${missing.join(', ')}`)
+  const hex = (v, what) => { if (typeof v !== 'string' || !HEX64.test(v)) fail(`${what} must be 64 lowercase hex characters`); return v }
+  const names = (obj, what) => { if (!isObj(obj)) fail(`${what} must be an object`); for (const n of Object.keys(obj)) if (!SOCKET_NAME.test(n)) fail(`${what} name ${JSON.stringify(n)} is invalid`); return Object.entries(obj) }
+  if (typeof cfg.memoryGlobalChannelId !== 'string' || !UUID.test(cfg.memoryGlobalChannelId)) fail('memoryGlobalChannelId must be a lowercase UUID')
+  const ownerPubkey = hex(cfg.ownerPubkey, 'ownerPubkey')
+  if (!Number.isSafeInteger(cfg.maxUnbackedSec) || cfg.maxUnbackedSec <= 0) fail('maxUnbackedSec must be an explicit positive integer')
+  if (!Array.isArray(cfg.globalWriters)) fail('globalWriters must be an array')
+  const globalWriters = new Set(cfg.globalWriters.map((p, i) => hex(p, `globalWriters[${i}]`)))
+  const readers = new Map(names(cfg.readers, 'readers').map(([n, p]) => [n, p === null ? '' : hex(p, `readers.${n}`)]))
+  const writers = new Map(names(cfg.writers, 'writers').map(([n, w]) => {
+    if (!isObj(w) || Object.keys(w).some(k => !['pubkey', 'perHour', 'allowSelf'].includes(k))) fail(`writers.${n} takes only pubkey, perHour and allowSelf`)
+    if (!Number.isSafeInteger(w.perHour) || w.perHour < 1 || w.perHour > 3600) fail(`writers.${n}.perHour must be an integer from 1 to 3600`)
+    if (w.allowSelf !== undefined && typeof w.allowSelf !== 'boolean') fail(`writers.${n}.allowSelf must be a boolean`)
+    return [n, Object.freeze({ name: n, pubkey: hex(w.pubkey, `writers.${n}.pubkey`), perHour: w.perHour, allowSelf: w.allowSelf === true })]
+  }))
+  if (new Set([...writers.values()].map(w => w.pubkey)).size !== writers.size) fail('two writers share a pubkey')
+  if (!isObj(cfg.rooms)) fail('rooms must be an object')
+  const rooms = new Map(Object.entries(cfg.rooms).map(([id, r]) => {
+    if (!UUID.test(id)) fail(`room id ${JSON.stringify(id)} must be a lowercase UUID`)
+    if (!isObj(r) || Object.keys(r).some(k => !['members', 'writers'].includes(k)) || !Array.isArray(r.members) || !Array.isArray(r.writers)) {
+      fail(`rooms.${id} takes members and writers arrays`)
+    }
+    const members = new Set(r.members.map((p, i) => hex(p, `rooms.${id}.members[${i}]`)))
+    const roomWriters = new Set(r.writers.map((p, i) => hex(p, `rooms.${id}.writers[${i}]`)))
+    for (const w of roomWriters) if (!members.has(w)) fail(`rooms.${id}.writers is not a subset of its members`)
+    return [id, Object.freeze({ members, writers: roomWriters })]
+  }))
+  return Object.freeze({ memoryGlobalChannelId: cfg.memoryGlobalChannelId, ownerPubkey, maxUnbackedSec: cfg.maxUnbackedSec, globalWriters, readers, writers, rooms })
+}
+
+export function loadConfigFile(path) {
+  if (!path) throw new Error('--config <path> is required')
+  const st = lstatSync(path)
+  if (!st.isFile() || st.isSymbolicLink()) throw new Error('config file must be a regular non-symlink file')
+  let raw
+  try { raw = JSON.parse(readFileSync(path, 'utf8')) } catch (e) { throw new Error(`invalid JSON in config file: ${e.message}`) }
+  return validateAndResolveConfig(raw)
+}
+
+// The read predicate, applied to every row, every link end and every count.
+export function canRead(readerPubkey, row, config) {
+  if (!config || !row) return false
+  if (row.scope_type === 'hive:canon') return row.pubkey === config.ownerPubkey
+  if (row.scope_type === 'hive:ops') return row.pubkey === config.ownerPubkey || config.globalWriters.has(row.pubkey)
+  if (row.scope_type === 'room') {
+    const room = config.rooms.get(row.room_id)
+    return Boolean(readerPubkey) && Boolean(room) && room.members.has(readerPubkey) && room.members.has(row.pubkey)
+  }
+  return false
+}
+
+// Whether `pubkey` may write `scope` (a parseFactKey result); `writer` is null for migration.
+export function writeRefusal(config, writer, pubkey, parsed) {
+  if (parsed.scope === 'hive:canon') return pubkey === config.ownerPubkey ? null : 'hive:canon is written by the owner only'
+  if (parsed.scope === 'hive:ops') {
+    return pubkey === config.ownerPubkey || config.globalWriters.has(pubkey) ? null : 'hive:ops is written by the owner and globalWriters only'
+  }
+  if (parsed.roomId) {
+    const room = config.rooms.get(parsed.roomId)
+    return room?.writers.has(pubkey) && room.members.has(pubkey) ? null : 'this key is not a writer and member of that room'
+  }
+  if (parsed.pubkey) return writer?.allowSelf && parsed.pubkey === pubkey ? null : 'self scopes are not enabled for this writer'
+  return 'unknown scope'
+}
+
+// --- the accepted-write ledger ---
+
+function writeAll(fd, data) {
+  let off = 0
+  while (off < data.length) off += writeSync(fd, data, off, data.length - off)
+}
+
+export function fsyncDir(dir) {
+  const fd = openSync(dir, 'r')
+  try { fsyncSync(fd) } finally { closeSync(fd) }
+}
+
+function ledgerShapeError(rec, index, storeId) {
+  if (!isObj(rec)) return 'not an object'
+  if (rec.seq !== index + 1) return `seq ${rec.seq} where ${index + 1} was expected`
+  if (!LEDGER_OPS.has(rec.op)) return `unknown op ${rec.op}`
+  if (typeof rec.store_id !== 'string' || !rec.store_id) return 'missing store_id'
+  if (index > 0 && rec.store_id !== storeId) return 'store_id changes mid-ledger'
+  if ((index === 0) !== (rec.op === 'init' || rec.op === 'cutover')) return 'init and cutover come first, and only first'
+  const ids = rec.op === 'submit' ? [rec.id] : rec.op === 'purge' ? rec.purged_ids : rec.op === 'restore-gap-ack' ? rec.acked_ids : rec.event_ids
+  if (!Array.isArray(ids) || !ids.every(id => typeof id === 'string' && HEX64.test(id))) return 'malformed event ids'
+  if (rec.op === 'init' && ids.length) return 'init carries event ids'
+  return null
+}
+
+// Reads the ledger; a torn final line (a crash mid-append) is cut back to the last complete line
+// when `repair` is set. Any earlier damage is LEDGER_CORRUPT.
+export function readLedger(path, { repair = false } = {}) {
+  let buf
+  try { buf = readFileSync(path) } catch (e) {
+    if (e.code === 'ENOENT') return { missing: true, lines: [], truncated: false }
+    throw new HiveMemoryError('LEDGER_IO_ERROR', `cannot read the ledger: ${e.code || e.message}`)
+  }
+  const segments = []
+  let start = 0
+  for (let i = 0; i < buf.length; i++) if (buf[i] === 0x0a) { segments.push([start, i]); start = i + 1 }
+  let keepBytes = start
+  const tail = buf.length > start
+  const parse = ([a, b]) => { try { return JSON.parse(buf.subarray(a, b).toString('utf8')) } catch { return undefined } }
+  const lines = []
+  for (let i = 0; i < segments.length; i++) {
+    const rec = parse(segments[i])
+    if (rec === undefined) {
+      if (i === segments.length - 1 && !tail) { keepBytes = segments[i][0]; break }
+      throw new HiveMemoryError('LEDGER_CORRUPT', `ledger line ${i + 1} is not JSON`)
+    }
+    const bad = ledgerShapeError(rec, i, lines[0]?.rec.store_id)
+    if (bad) throw new HiveMemoryError('LEDGER_CORRUPT', `ledger line ${i + 1}: ${bad}`)
+    lines.push({ raw: buf.subarray(...segments[i]).toString('utf8'), rec })
+  }
+  const truncated = keepBytes < buf.length
+  if (truncated && repair) {
+    try {
+      const fd = openSync(path, 'r+')
+      try { ftruncateSync(fd, keepBytes); fsyncSync(fd) } finally { closeSync(fd) }
+    } catch (e) { throw new HiveMemoryError('LEDGER_IO_ERROR', `cannot repair the torn ledger tail: ${e.code || e.message}`) }
+  }
+  return { missing: false, lines, truncated }
+}
+
+export function applyLedgerRecord(fold, rec) {
+  fold.storeId ??= rec.store_id
+  fold.maxSeq = rec.seq
+  if (rec.op === 'cutover') for (const id of rec.event_ids) fold.expected.add(id)
+  if (rec.op === 'submit') fold.expected.add(rec.id)
+  if (rec.op === 'purge') {
+    for (const id of rec.purged_ids) { fold.expected.delete(id); fold.purged.add(id) }
+    fold.lastPurgeSeq = rec.seq
+  }
+  if (rec.op === 'restore-gap-ack') for (const id of rec.acked_ids) fold.expected.delete(id)
+  return fold
+}
+
+export function foldLedger(lines) {
+  const fold = { storeId: null, maxSeq: 0, expected: new Set(), purged: new Set(), lastPurgeSeq: 0, lastRaw: null }
+  for (const { raw, rec } of lines) { applyLedgerRecord(fold, rec); fold.lastRaw = raw }
+  return fold
+}
+
+export function appendLedgerLine(path, line, hooks = {}) {
+  const created = !existsSync(path)
+  const fd = openSync(path, 'a', 0o600)
+  try {
+    const data = Buffer.from(`${line}\n`)
+    if (hooks.ledgerWrite) hooks.ledgerWrite(fd, data)
+    else writeAll(fd, data)
+    fsyncSync(fd)
+  } finally { closeSync(fd) }
+  if (created) fsyncDir(dirname(path))
+}
+
+// Superseded, withdrawn and expired rows whose end of life is more than 90 days past.
+function retentionDue(db, nowSec) {
+  const cutoff = nowSec - RETENTION_PURGE_AFTER_SEC
+  return db.prepare(`SELECT e.id FROM events e WHERE
+    (e.is_current = 0 AND COALESCE((SELECT MIN(n.created_at) FROM events n WHERE n.pubkey = e.pubkey AND n.d = e.d AND n.id <> e.id AND n.created_at >= e.created_at), e.created_at) <= ?)
+    OR (e.is_current = 1 AND e.status = 'withdrawn' AND e.created_at <= ?)
+    OR (e.is_current = 1 AND e.status = 'active' AND e.exp IS NOT NULL AND e.exp <= ?)`).all(cutoff, cutoff, cutoff).map(r => r.id)
+}
+
+// --- the exclusive store lock (daemon and maintenance tools never write at once) ---
+
+export function acquireStoreLock(dbPath) {
+  const path = `${dbPath}.lock`
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = openSync(path, 'wx', 0o600)
+      writeAll(fd, Buffer.from(String(process.pid)))
+      closeSync(fd)
+      return { path, release: () => { try { if (readFileSync(path, 'utf8') === String(process.pid)) rmSync(path, { force: true }) } catch { /* already gone */ } } }
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw new HiveMemoryError('HIVE_MEMORY_STORE_LOCKED', `cannot take the store lock: ${e.code || e.message}`)
+      const pid = Number(readFileSync(path, 'utf8').trim())
+      let alive = false
+      if (Number.isSafeInteger(pid) && pid > 0) { try { process.kill(pid, 0); alive = true } catch (err) { alive = err.code === 'EPERM' } }
+      if (alive) throw new HiveMemoryError('HIVE_MEMORY_STORE_LOCKED', `the store is held by pid ${pid}; stop hive-memory.service first`)
+      rmSync(path, { force: true })
+    }
+  }
+  throw new HiveMemoryError('HIVE_MEMORY_STORE_LOCKED', 'cannot take the store lock')
+}
+
+// --- SQLite helpers ---
+
+export function openDb(path) {
+  const db = new DatabaseSync(path)
+  db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;')
+  return db
+}
+
+function inTransaction(db, fn, hooks = {}, op = '') {
+  db.exec('BEGIN IMMEDIATE')
+  let committed = false
+  try {
+    const out = fn()
+    if (out?.abort) return out
+    hooks.beforeCommit?.(op)
+    db.exec('COMMIT')
+    committed = true
+    return out
+  } finally {
+    if (!committed) db.exec('ROLLBACK')
+  }
+}
+
+const readMeta = db => db.prepare('SELECT store_id, write_seq, last_event_id, pending_ledger_json, last_purge_seq FROM store_meta WHERE singleton = 1').get()
+const dbEventIds = db => new Set(db.prepare('SELECT id FROM events').all().map(r => r.id))
+const setsEqual = (a, b) => a.size === b.size && [...a].every(x => b.has(x))
+const difference = (a, b) => new Set([...a].filter(x => !b.has(x)))
+
+// The signed event, re-checked from a fresh copy (nostr-tools caches a verdict on the object).
+export function checkEvent(event, config) {
+  if (!isObj(event)) return { ok: false, reason: 'event is not an object' }
+  const keys = Object.keys(event).sort()
+  if (keys.join() !== EVENT_KEYS.join()) return { ok: false, reason: 'event must carry exactly the NIP-01 fields' }
+  const raw = JSON.stringify(event)
+  if (Buffer.byteLength(raw) > MAX_EVENT_BYTES) return { ok: false, reason: `event exceeds ${MAX_EVENT_BYTES} bytes` }
+  const ev = JSON.parse(raw)
+  let sig = false
+  try { sig = verifyEvent(JSON.parse(raw)) } catch { sig = false }
+  if (!sig) return { ok: false, reason: 'invalid event signature or id' }
+  const v = validateMemoryEvent(ev, { memoryGlobalChannelId: config.memoryGlobalChannelId, allowedKinds: ALLOWED_KINDS, verifySignature: false })
+  if (!v.ok) return v
+  return { ...v, ev, raw }
+}
+
+function insertEvent(db, { ev, raw, ...v }, isCurrent, nowSec) {
+  db.prepare(`INSERT INTO events (id, pubkey, kind, created_at, d, scope, scope_type, room_id, topic, status, retention, as_of_git, as_of_evt, exp, raw_json, ingested_at, is_current)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    ev.id, v.pubkey, ev.kind, ev.created_at, v.d, v.scope, v.scopeType, v.roomId, v.topic, v.status, v.retention,
+    v.asOfGit, v.asOfEvt, v.expiresAt, raw, nowSec, isCurrent ? 1 : 0)
+  const link = db.prepare('INSERT OR IGNORE INTO links (from_id, relation, target) VALUES (?, ?, ?)')
+  for (const t of v.supersedes) link.run(ev.id, 'supersedes', String(t))
+  if (v.topic) link.run(ev.id, 'topic', v.topic)
+  for (const e of v.evidence) link.run(ev.id, 'evidence', e)
+  if (v.asOfEvt) link.run(ev.id, 'as_of', v.asOfEvt)
+  if (v.asOfGit) link.run(ev.id, 'as_of', v.asOfGit)
+}
+
+function dbFileState(dbPath) {
+  let st
+  try { st = lstatSync(dbPath) } catch { return 'absent' }
+  if (!st.isFile() || st.isSymbolicLink()) return 'not-regular'
+  return st.size === 0 ? 'empty' : 'present'
+}
+
+function hasStoreMeta(db) {
+  try { return Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'store_meta'").get()) && Boolean(readMeta(db)) } catch { return false }
+}
+
+// --- genesis: --init-empty and --migrate-store-json ---
+
+function genesis({ dbPath, ledgerPath, op, events = [], nowSec, hooks = {} }) {
+  const lock = acquireStoreLock(dbPath)
+  try {
+    const file = dbFileState(dbPath)
+    if (file === 'not-regular') throw new HiveMemoryError('HIVE_MEMORY_GENESIS_REFUSED', 'the database path is not a regular file')
+    if (file === 'present') {
+      const probe = new DatabaseSync(dbPath)
+      const tables = probe.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type = 'table'").get().n
+      probe.close()
+      if (tables) throw new HiveMemoryError('HIVE_MEMORY_GENESIS_REFUSED', 'the database already exists; genesis never overwrites a store')
+    }
+    let ledgerSize = 0
+    try { ledgerSize = lstatSync(ledgerPath).size } catch { /* absent */ }
+    if (ledgerSize > 0) throw new HiveMemoryError('HIVE_MEMORY_GENESIS_REFUSED', 'the ledger already has records; genesis never overwrites a ledger')
+    const storeId = randomUUID()
+    const eventIds = events.map(e => e.ev.id).sort()
+    const line = JSON.stringify({ seq: 1, op, store_id: storeId, event_ids: eventIds, at: nowSec })
+    const db = openDb(dbPath)
+    try {
+      inTransaction(db, () => {
+        db.exec(SCHEMA)
+        const heads = new Map()
+        for (const e of events) {
+          const key = `${e.pubkey}\n${e.d}`
+          if (nip01Newer(e.ev, heads.get(key)?.ev)) heads.set(key, e)
+        }
+        for (const e of events) insertEvent(db, e, heads.get(`${e.pubkey}\n${e.d}`) === e, nowSec)
+        db.prepare('INSERT INTO store_meta (singleton, store_id, write_seq, last_event_id, pending_ledger_json, initialized_at) VALUES (1, ?, 1, ?, ?, ?)')
+          .run(storeId, eventIds.at(-1) ?? null, line, nowSec)
+      }, hooks, op)
+    } finally { db.close() }
+    fsyncDir(dirname(dbPath))
+    hooks.afterCommit?.(op)
+    appendLedgerLine(ledgerPath, line, hooks)
+    return { storeId, writeSeq: 1, eventIds }
+  } finally { lock.release() }
+}
+
+export function initEmptyStore({ dbPath, ledgerPath, nowSec = nowSecDefault(), hooks }) {
+  return genesis({ dbPath, ledgerPath, op: 'init', nowSec, hooks })
+}
+
+// Imports a pre-cutover store.json ({ version: 1, entries: [{ event }] }) with exact event-ID parity.
+export function migrateStoreJson({ storeJsonPath, dbPath, ledgerPath, config, requireMigratedIds = [], nowSec = nowSecDefault(), hooks }) {
+  const st = lstatSync(storeJsonPath)
+  if (!st.isFile() || st.isSymbolicLink()) throw new HiveMemoryError('HIVE_MEMORY_MIGRATION_REFUSED', 'store.json must be a regular non-symlink file')
+  const raw = JSON.parse(readFileSync(storeJsonPath, 'utf8'))
+  if (raw?.version !== 1 || !Array.isArray(raw.entries)) throw new HiveMemoryError('HIVE_MEMORY_MIGRATION_REFUSED', 'store.json is not a version 1 entries file')
+  const events = []
+  const seen = new Set()
+  for (const [i, entry] of raw.entries.entries()) {
+    const v = checkEvent(entry?.event, config)
+    if (!v.ok) throw new HiveMemoryError('HIVE_MEMORY_MIGRATION_REFUSED', `entry ${i}: ${v.reason}`)
+    if (seen.has(v.ev.id)) throw new HiveMemoryError('HIVE_MEMORY_MIGRATION_REFUSED', `entry ${i}: duplicate event ${prefix(v.ev.id)}`)
+    const denied = writeRefusal(config, null, v.pubkey, parseFactKey(v.d))
+    if (denied) throw new HiveMemoryError('HIVE_MEMORY_MIGRATION_REFUSED', `entry ${i} (${prefix(v.ev.id)}): ${denied}`)
+    seen.add(v.ev.id)
+    events.push(v)
+  }
+  const absent = requireMigratedIds.filter(id => !seen.has(id))
+  if (absent.length) throw new HiveMemoryError('HIVE_MEMORY_MIGRATION_REFUSED', `required event ids are absent from store.json: ${absent.map(prefix).join(', ')}`)
+  const out = genesis({ dbPath, ledgerPath, op: 'cutover', events, nowSec, hooks })
+  const migrated = `${storeJsonPath}.migrated-${nowSec}`
+  renameSync(storeJsonPath, migrated)
+  return { ...out, migratedPath: migrated }
+}
+
+// --- the store ---
+
+export class HiveMemoryStore {
+  constructor({ dbPath, ledgerPath, receiptPath, config = null, configError = null, requireMigratedIds = [], hooks = {}, log = () => {}, lock = true }) {
+    Object.assign(this, { dbPath, ledgerPath, receiptPath, config, configError, requireMigratedIds, hooks, log, useLock: lock })
+    this.db = null
+    this.state = 'DB_MISSING_OR_UNINITIALIZED'
+    this.detail = null
+    this.ledgerMaxSeq = 0
+    this.purgedIds = new Set()
+    this.lockHandle = null
+  }
+
+  start() {
+    if (this.useLock && !this.lockHandle) this.lockHandle = acquireStoreLock(this.dbPath)
+    this.reconcile()
+    return this.isReady()
+  }
+
+  close() {
+    try { this.db?.close() } catch { /* already closed */ }
+    this.db = null
+    this.lockHandle?.release()
+    this.lockHandle = null
+  }
+
+  isReady() { return { ready: this.state === 'READY', state: this.state } }
+
+  // SIGHUP: a valid config swaps in and re-runs reconciliation when not READY; an invalid one fails closed.
+  setConfig(config, error = null) {
+    if (!config) {
+      this.config = null
+      this.configError = error
+      this.state = 'CONFIG_INVALID'
+      this.detail = error
+      this.log(`hive-memory: CONFIG_INVALID ${error || ''}`.trim())
+      return this.isReady()
+    }
+    this.config = config
+    this.configError = null
+    if (this.state !== 'READY') this.reconcile()
+    return this.isReady()
+  }
+
+  #fail(state, detail) {
+    this.state = state
+    this.detail = detail
+    this.log(`hive-memory: ${state}${detail ? ` (${detail})` : ''}`)
+    return this.isReady()
+  }
+
+  reconcile() {
+    try { this.db?.close() } catch { /* reopen below */ }
+    this.db = null
+    if (!this.config) return this.#fail('CONFIG_INVALID', this.configError)
+    const file = dbFileState(this.dbPath)
+    if (file !== 'present') return this.#fail('DB_MISSING_OR_UNINITIALIZED', `database is ${file}`)
+    let db
+    try { db = openDb(this.dbPath) } catch (e) { return this.#fail('DB_MISSING_OR_UNINITIALIZED', e.code || e.message) }
+    if (!hasStoreMeta(db)) { db.close(); return this.#fail('DB_MISSING_OR_UNINITIALIZED', 'store_meta is missing') }
+    this.db = db
+    const meta = readMeta(db)
+    const ids = dbEventIds(db)
+    let ledger
+    try { ledger = readLedger(this.ledgerPath, { repair: true }) } catch (e) { return this.#fail(e.code || 'LEDGER_IO_ERROR', e.message) }
+    if (ledger.truncated) this.log('hive-memory: truncated a torn final ledger line')
+    if (!ledger.lines.length) {
+      if (meta.write_seq > 1) return this.#fail('LEDGER_MISSING_FOR_ESTABLISHED_STORE', `write_seq ${meta.write_seq}`)
+      const bad = this.#genesisReplayError(meta, ids)
+      if (bad) return this.#fail('GENESIS_REPLAY_INVALID', bad)
+      try { appendLedgerLine(this.ledgerPath, meta.pending_ledger_json) } catch (e) { return this.#fail('LEDGER_IO_ERROR', e.code || e.message) }
+      this.log('hive-memory: replayed the genesis ledger line')
+      ledger = { lines: [{ raw: meta.pending_ledger_json, rec: JSON.parse(meta.pending_ledger_json) }] }
+    }
+    const fold = foldLedger(ledger.lines)
+    if (meta.store_id !== fold.storeId) return this.#fail('STORE_ID_MISMATCH', null)
+    const resurrected = [...ids].filter(id => fold.purged.has(id))
+    if (resurrected.length) return this.#fail('DB_HAS_UNEXPECTED_OR_PURGED_EVENTS', `${resurrected.length} purged event(s) present`)
+    if (meta.write_seq > fold.maxSeq) {
+      const replay = this.#pendingReplay(meta, ids, fold, ledger.lines)
+      if (typeof replay === 'string') return this.#fail('DB_AHEAD_OF_LEDGER', replay)
+      try { appendLedgerLine(this.ledgerPath, replay.map(l => l.raw).join('\n')) } catch (e) { return this.#fail('LEDGER_IO_ERROR', e.code || e.message) }
+      this.log(`hive-memory: flushed ${replay.length} pending ledger line(s) through seq ${meta.write_seq}`)
+      for (const { rec } of replay) applyLedgerRecord(fold, rec)
+    }
+    if (meta.write_seq < fold.maxSeq) return this.#fail('DB_BEHIND_LEDGER', `write_seq ${meta.write_seq}, ledger ${fold.maxSeq}`)
+    const missing = difference(fold.expected, ids)
+    if (missing.size) return this.#fail('DB_BEHIND_LEDGER', `${missing.size} accepted event(s) missing`)
+    const extra = difference(ids, fold.expected)
+    if (extra.size) return this.#fail('DB_HAS_UNEXPECTED_OR_PURGED_EVENTS', `${extra.size} unrecorded event(s) present`)
+    if (meta.last_purge_seq !== fold.lastPurgeSeq) return this.#fail('PURGE_SEQ_MISMATCH', `last_purge_seq ${meta.last_purge_seq}, ledger ${fold.lastPurgeSeq}`)
+    this.ledgerMaxSeq = fold.maxSeq
+    this.purgedIds = fold.purged
+    this.state = 'READY'
+    this.detail = null
+    this.log(`hive-memory: READY at write_seq ${meta.write_seq}`)
+    return this.isReady()
+  }
+
+  #rowsValidError(ids) {
+    for (const id of ids) {
+      const row = this.db.prepare('SELECT raw_json FROM events WHERE id = ?').get(id)
+      const v = row ? checkEvent(JSON.parse(row.raw_json), this.config) : { ok: false, reason: 'row is missing' }
+      if (!v.ok) return `event ${prefix(id)}: ${v.reason}`
+      if (v.ev.id !== id) return `event ${prefix(id)} is stored under the wrong id`
+    }
+    return null
+  }
+
+  #genesisReplayError(meta, ids) {
+    let pending
+    try { pending = JSON.parse(meta.pending_ledger_json) } catch { return 'pending_ledger_json is not JSON' }
+    if (meta.write_seq !== 1 || ledgerShapeError(pending, 0, null) || pending.store_id !== meta.store_id) return 'pending_ledger_json is not this store\'s genesis record'
+    if (!setsEqual(new Set(pending.event_ids), ids)) return 'genesis event ids do not match the database'
+    if (pending.op === 'init' && ids.size) return 'init genesis with events'
+    if (pending.op === 'cutover' && this.requireMigratedIds.some(id => !ids.has(id))) return 'a required migrated id is absent'
+    return this.#rowsValidError(ids)
+  }
+
+  // The ledger lines the DB is ahead by, or why they cannot be replayed. The staged lines the ledger
+  // already ends with (a torn multi-line append) must match it byte for byte; the rest must continue it.
+  #pendingReplay(meta, ids, fold, ledgerLines) {
+    const raws = meta.pending_ledger_json.split('\n')
+    const ahead = meta.write_seq - fold.maxSeq
+    if (ahead > raws.length) return `write_seq ${meta.write_seq}, ledger ${fold.maxSeq}, ${raws.length} pending line(s)`
+    const landed = raws.length - ahead
+    const tail = ledgerLines.slice(ledgerLines.length - landed)
+    if (tail.length !== landed || tail.some((l, i) => l.raw !== raws[i])) return 'pending lines already in the ledger do not match it'
+    const next = { ...fold, expected: new Set(fold.expected), purged: new Set(fold.purged) }
+    const replay = []
+    for (const raw of raws.slice(landed)) {
+      let rec
+      try { rec = JSON.parse(raw) } catch { return 'pending_ledger_json is not JSON' }
+      if (ledgerShapeError(rec, next.maxSeq, next.storeId)) return 'pending_ledger_json does not continue the ledger'
+      applyLedgerRecord(next, rec)
+      replay.push({ raw, rec })
+    }
+    if (!setsEqual(next.expected, ids)) return 'pending records do not reproduce the stored event ids'
+    if ([...ids].some(id => next.purged.has(id))) return 'pending records leave purged events stored'
+    const submitted = replay.filter(l => l.rec.op === 'submit').map(l => l.rec.id)
+    return (submitted.length && this.#rowsValidError(submitted)) || replay
+  }
+
+  readReceipt() { return readReceiptFile(this.receiptPath) }
+
+  // The unbacked-purge barrier (§4.5): no write until a verified backup covers the last op purge.
+  purgeFence() {
+    const why = purgeBackupIncomplete(readMeta(this.db).last_purge_seq, this.readReceipt())
+    if (why) this.log(`hive-memory: HIVE_MEMORY_PURGE_BACKUP_INCOMPLETE ${why}`)
+    return why
+  }
+
+  // The stale-backup admission gate: refuses every new write, even the first after an idle outage.
+  backupFence(nowSec) {
+    const receipt = this.readReceipt()
+    const seq = readMeta(this.db).write_seq
+    const why = !receipt ? 'no verified backup receipt'
+      : receipt.write_seq > seq ? 'backup receipt is ahead of the store'
+        : receipt.at > nowSec + RECEIPT_SKEW_SEC ? 'backup receipt is from the future'
+          : nowSec - receipt.at > this.config.maxUnbackedSec ? `last verified backup is ${nowSec - receipt.at}s old (max ${this.config.maxUnbackedSec}s)`
+            : null
+    if (why) this.log(`hive-memory: HIVE_MEMORY_BACKUP_STALE ${why}`)
+    return why
+  }
+
+  // Phase 2 and 3 for any committed write: append the staged line and fsync, or fail closed.
+  #phase2(line, seq) {
+    try { appendLedgerLine(this.ledgerPath, line, this.hooks) } catch (e) {
+      this.#fail('LEDGER_IO_ERROR', e.code || e.message)
+      return false
+    }
+    this.ledgerMaxSeq = seq
+    return true
+  }
+
+  #stage(meta, op, fields, nowSec, lastEventId) {
+    const seq = meta.write_seq + 1
+    const line = JSON.stringify({ seq, op, store_id: meta.store_id, ...fields, at: nowSec })
+    this.db.prepare('UPDATE store_meta SET write_seq = ?, last_event_id = ?, pending_ledger_json = ? WHERE singleton = 1').run(seq, lastEventId, line)
+    return { seq, line }
+  }
+
+  #flushPendingIfAhead() {
+    const meta = readMeta(this.db)
+    if (meta.write_seq === this.ledgerMaxSeq + 1) return this.#phase2(meta.pending_ledger_json, meta.write_seq)
+    return meta.write_seq === this.ledgerMaxSeq
+  }
+
+  lookupPrior({ writer: writerName, d, nowSec = nowSecDefault() } = {}) {
+    void nowSec
+    if (!this.isReady().ready) return refusal('HIVE_MEMORY_STORE_NOT_READY', `store not ready: ${this.state}`)
+    const writer = this.config.writers.get(writerName)
+    if (!writer) return refusal('HIVE_MEMORY_WRITER_MISMATCH', 'this socket is not bound to a configured writer')
+    const parsed = parseFactKey(d)
+    if (!parsed) return refusal('HIVE_MEMORY_INVALID_EVENT', 'd is not a Hive memory fact key')
+    const denied = writeRefusal(this.config, writer, writer.pubkey, parsed)
+    if (denied) return refusal('HIVE_MEMORY_SCOPE_NOT_AUTHORIZED', denied)
+    const row = this.db.prepare('SELECT id, pubkey, d, scope, created_at, status FROM events WHERE pubkey = ? AND d = ? AND is_current = 1').get(writer.pubkey, parsed.d)
+    return row ? { found: true, id: row.id, pubkey: row.pubkey, d: row.d, scope: row.scope, created_at: row.created_at, status: row.status } : { found: false }
+  }
+
+  submit({ writer: writerName, event, expectedPriorId = null, nowSec = nowSecDefault() } = {}) {
+    if (!this.isReady().ready) return refusal('HIVE_MEMORY_STORE_NOT_READY', `store not ready: ${this.state}`)
+    const unbacked = this.purgeFence()
+    if (unbacked) return refusal('HIVE_MEMORY_PURGE_BACKUP_INCOMPLETE', unbacked)
+    const stale = this.backupFence(nowSec)
+    if (stale) return refusal('HIVE_MEMORY_BACKUP_STALE_WRITES_FENCED', stale)
+    const writer = this.config.writers.get(writerName)
+    if (!writer || !isObj(event) || event.pubkey !== writer.pubkey) return refusal('HIVE_MEMORY_WRITER_MISMATCH', 'event.pubkey is not the key bound to this writer socket')
+    const dTag = Array.isArray(event.tags) ? event.tags.find(t => Array.isArray(t) && t[0] === 'd')?.[1] : null
+    const parsed = parseFactKey(dTag)
+    if (!parsed) return refusal('HIVE_MEMORY_INVALID_EVENT', 'missing or malformed d tag')
+    const denied = writeRefusal(this.config, writer, writer.pubkey, parsed)
+    if (denied) return refusal('HIVE_MEMORY_SCOPE_NOT_AUTHORIZED', denied)
+    const v = checkEvent(event, this.config)
+    if (!v.ok) return refusal('HIVE_MEMORY_INVALID_EVENT', v.reason)
+    if (expectedPriorId !== null && !(typeof expectedPriorId === 'string' && HEX64.test(expectedPriorId))) {
+      return refusal('HIVE_MEMORY_PRIOR_MISMATCH', 'expected_prior_id must be a 64-hex event id or null')
+    }
+    if (this.purgedIds.has(v.ev.id)) return refusal('HIVE_MEMORY_PURGED_EVENT', 'this event was purged and is never stored again')
+    const db = this.db
+    let staged
+    try {
+      staged = inTransaction(db, () => {
+        const existing = db.prepare('SELECT id, status FROM events WHERE id = ?').get(v.ev.id)
+        if (existing) return { abort: true, replay: { accepted: true, id: existing.id, status: existing.status, replay: true } }
+        const current = db.prepare('SELECT id, created_at, status FROM events WHERE pubkey = ? AND d = ? AND is_current = 1').get(v.pubkey, v.d)
+        if ((current?.id ?? null) !== expectedPriorId) return { abort: true, refused: refusal('HIVE_MEMORY_PRIOR_MISMATCH', `the current event at this fact key is ${current ? prefix(current.id) : 'none'}`) }
+        if (current && !nip01Newer(v.ev, current)) return { abort: true, refused: refusal('HIVE_MEMORY_NOT_NEWER', 'the event is not newer than the current event at this fact key') }
+        if (v.status === 'withdrawn' && (!current || current.status === 'withdrawn')) return { abort: true, refused: refusal('HIVE_MEMORY_NOTHING_TO_WITHDRAW', 'there is no active claim at this fact key to withdraw') }
+        const used = db.prepare('SELECT count(*) AS n FROM writer_rate_log WHERE pubkey = ? AND accepted_at > ?').get(v.pubkey, nowSec - 3600).n
+        if (used >= writer.perHour) return { abort: true, refused: refusal('HIVE_MEMORY_RATE_LIMITED', `over the hourly cap (${used}/${writer.perHour})`) }
+        if (current) db.prepare('UPDATE events SET is_current = 0 WHERE id = ?').run(current.id)
+        insertEvent(db, v, true, nowSec)
+        db.prepare('INSERT INTO writer_rate_log (event_id, pubkey, accepted_at) VALUES (?, ?, ?)').run(v.ev.id, v.pubkey, nowSec)
+        return this.#stage(readMeta(db), 'submit', { id: v.ev.id, pubkey: v.pubkey, d: v.d, scope: v.scope, status: v.status }, nowSec, v.ev.id)
+      }, this.hooks, 'submit')
+    } catch (e) {
+      this.log(`hive-memory: submit ${prefix(v.ev.id)} failed in phase 1: ${e.code || e.message}`)
+      return refusal('HIVE_MEMORY_STORE_NOT_READY', 'the SQLite transaction failed')
+    }
+    if (staged.replay) {
+      if (!this.#flushPendingIfAhead()) return refusal('HIVE_MEMORY_LEDGER_IO_ERROR', 'the accepted-write ledger could not be appended')
+      return staged.replay
+    }
+    if (staged.refused) return staged.refused
+    this.hooks.afterCommit?.('submit')
+    if (!this.#phase2(staged.line, staged.seq)) return refusal('HIVE_MEMORY_LEDGER_IO_ERROR', 'the accepted-write ledger could not be appended')
+    this.log(`hive-memory: accepted ${prefix(v.ev.id)} ${v.status} at ${v.d} (seq ${staged.seq})`)
+    return { accepted: true, id: v.ev.id, status: v.status, replay: false }
+  }
+
+  // --- purge (retention and owner hard delete) ---
+
+  // Every op purge, retention or hard delete, goes through here and so through the same completion barrier.
+  #purge(ids, reason, nowSec) {
+    if (!this.isReady().ready) throw new HiveMemoryError('HIVE_MEMORY_STORE_NOT_READY', `store not ready: ${this.state}`)
+    if (!ids.length) return { purged: [] }
+    const db = this.db
+    const staged = inTransaction(db, () => {
+      const list = JSON.stringify(ids)
+      db.prepare('DELETE FROM events WHERE id IN (SELECT value FROM json_each(?))').run(list)
+      db.prepare('DELETE FROM writer_rate_log WHERE event_id IN (SELECT value FROM json_each(?)) OR accepted_at < ?').run(list, nowSec - 86400)
+      const last = db.prepare('SELECT id FROM events ORDER BY ingested_at DESC, rowid DESC LIMIT 1').get()?.id ?? null
+      const staged = this.#stage(readMeta(db), 'purge', { purged_ids: [...ids].sort(), reason }, nowSec, last)
+      db.prepare('UPDATE store_meta SET last_purge_seq = ? WHERE singleton = 1').run(staged.seq)
+      return staged
+    }, this.hooks, 'purge')
+    this.hooks.afterCommit?.('purge')
+    if (!this.#phase2(staged.line, staged.seq)) throw new HiveMemoryError('HIVE_MEMORY_LEDGER_IO_ERROR', 'the accepted-write ledger could not be appended')
+    for (const id of ids) this.purgedIds.add(id)
+    db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+    db.exec('VACUUM')
+    db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+    this.log(`hive-memory: purged ${ids.length} event(s) (${reason}, seq ${staged.seq}); writes stay fenced until a verified backup covers it`)
+    return { purged: ids, seq: staged.seq }
+  }
+
+  retentionCandidates(nowSec = nowSecDefault()) { return retentionDue(this.db, nowSec) }
+
+  purgeRetention({ nowSec = nowSecDefault() } = {}) {
+    if (!this.isReady().ready) throw new HiveMemoryError('HIVE_MEMORY_STORE_NOT_READY', `store not ready: ${this.state}`)
+    return this.#purge(this.retentionCandidates(nowSec), 'retention', nowSec)
+  }
+
+  hardDelete({ d = null, id = null, nowSec = nowSecDefault() } = {}) {
+    if (!this.isReady().ready) throw new HiveMemoryError('HIVE_MEMORY_STORE_NOT_READY', `store not ready: ${this.state}`)
+    if ((d == null) === (id == null)) throw new HiveMemoryError('HIVE_MEMORY_PURGE_USAGE', 'name exactly one of --d or --id')
+    const ids = d != null
+      ? this.db.prepare('SELECT id FROM events WHERE d = ?').all(String(d)).map(r => r.id)
+      : this.db.prepare('SELECT id FROM events WHERE id = ?').all(String(id)).map(r => r.id)
+    if (!ids.length) throw new HiveMemoryError('HIVE_MEMORY_PURGE_NO_MATCH', 'no stored event matches')
+    return this.#purge(ids, 'hard-delete', nowSec)
+  }
+
+  // --- reads ---
+
+  storeState(readerPubkey, nowSec = nowSecDefault()) {
+    if (!this.isReady().ready) return { state: this.state, write_seq: null, current_claims: null, last_backup_age_sec: null, unbacked_writes: null }
+    const seq = readMeta(this.db).write_seq
+    const receipt = this.readReceipt()
+    return {
+      state: 'READY',
+      write_seq: seq,
+      current_claims: this.#activeRows(readerPubkey, nowSec).length,
+      last_backup_age_sec: receipt ? nowSec - receipt.at : null,
+      unbacked_writes: receipt ? Math.max(0, seq - receipt.write_seq) : seq,
+    }
+  }
+
+  #activeRows(readerPubkey, nowSec, where = '', params = []) {
+    return this.db.prepare(`SELECT * FROM events WHERE is_current = 1 AND status = 'active' AND (exp IS NULL OR exp > ?) ${where}`).all(nowSec, ...params)
+      .filter(r => canRead(readerPubkey, r, this.config))
+  }
+
+  #targetHidden(readerPubkey, target) {
+    const row = HEX64.test(target) ? this.db.prepare('SELECT pubkey, scope_type, room_id FROM events WHERE id = ?').get(target) : null
+    return row ? !canRead(readerPubkey, row, this.config) : false
+  }
+
+  // Event ids reached from `start` along supersedes edges, at most MAX_LINK_HOPS hops, both ends readable.
+  #lineage(readerPubkey, start) {
+    if (this.#targetHidden(readerPubkey, start)) return new Set()
+    const found = new Set()
+    let frontier = [start]
+    const edge = this.db.prepare("SELECT e.* FROM links l JOIN events e ON e.id = l.from_id WHERE l.relation = 'supersedes' AND l.target = ?")
+    for (let hop = 0; hop < MAX_LINK_HOPS && frontier.length; hop++) {
+      const next = []
+      for (const target of frontier) {
+        for (const row of edge.all(target)) {
+          if (found.has(row.id) || !canRead(readerPubkey, row, this.config)) continue
+          found.add(row.id)
+          next.push(row.id)
+        }
+      }
+      frontier = next
+    }
+    return found
+  }
+
+  query({
+    readerPubkey = '', scope = null, roomId = null, topic = null, d = null, author = null, since = null, until = null, text = null,
+    linkedTo = null, supersedesOf = null, includeHistory = false, limit = DEFAULT_QUERY_LIMIT, cursor = 0, staleFiles = new Set(),
+    nowSec = nowSecDefault(),
+  } = {}) {
+    const empty = (answer, reason) => ({
+      answer, answer_reason: reason, records: [], total_matched: 0, returned: 0, omitted: 0, next_cursor: null, unverified: 0, scope_counts: {},
+      store_state: this.storeState(readerPubkey, nowSec),
+    })
+    if (!this.isReady().ready) return empty('unknown', `store-not-ready:${this.state}`)
+    const pageLimit = Math.min(MAX_QUERY_LIMIT, Number.isSafeInteger(Number(limit)) && Number(limit) > 0 ? Number(limit) : DEFAULT_QUERY_LIMIT)
+    const startIdx = Number.isSafeInteger(Number(cursor)) && Number(cursor) >= 0 ? Number(cursor) : 0
+    const where = [includeHistory ? '1 = 1' : 'is_current = 1']
+    const params = []
+    const add = (sql, value) => { where.push(sql); params.push(value) }
+    if (scope) add('scope = ?', String(scope))
+    if (roomId) add('room_id = ?', String(roomId).toLowerCase())
+    if (topic) add('topic = ?', String(topic))
+    if (d) add('d = ?', String(d))
+    if (author) add('pubkey = ?', String(author).toLowerCase())
+    if (since != null) add('created_at >= ?', Number(since))
+    if (until != null) add('created_at <= ?', Number(until))
+    if (linkedTo) {
+      if (this.#targetHidden(readerPubkey, String(linkedTo))) return empty('none', null)
+      add('id IN (SELECT from_id FROM links WHERE target = ?)', String(linkedTo))
+    }
+    if (supersedesOf) add('id IN (SELECT value FROM json_each(?))', JSON.stringify([...this.#lineage(readerPubkey, String(supersedesOf))]))
+    const rows = this.db.prepare(`SELECT * FROM events WHERE ${where.join(' AND ')}`).all(...params)
+      .filter(r => canRead(readerPubkey, r, this.config))
+      .map(r => ({ row: r, verdict: verdictOf(r, nowSec, staleFiles), body: JSON.parse(JSON.parse(r.raw_json).content) }))
+      .filter(x => includeHistory || x.verdict.verification === 'accepted')
+    const byFactKey = new Map()
+    for (const { row, verdict, body } of rows) {
+      if (verdict.verification !== 'accepted' || !row.is_current) continue
+      if (!byFactKey.has(row.d)) byFactKey.set(row.d, new Set())
+      byFactKey.get(row.d).add(body.claim)
+    }
+    const conflict = dk => (byFactKey.get(dk)?.size || 0) > 1
+    const qText = text ? String(text).toLowerCase() : null
+    const matched = rows.filter(({ row, body }) => !qText ||
+      `${row.d} ${row.topic} ${body.claim} ${body.because} ${(body.evidence || []).join(' ')}`.toLowerCase().includes(qText))
+    matched.sort((a, b) => (conflict(b.row.d) - conflict(a.row.d)) || ((a.verdict.computedRank ?? 9) - (b.verdict.computedRank ?? 9)) ||
+      (b.row.created_at - a.row.created_at) || (a.row.id < b.row.id ? -1 : 1))
+    const scopeCounts = {}
+    for (const { row } of matched) scopeCounts[row.scope] = (scopeCounts[row.scope] || 0) + 1
+    const page = matched.slice(startIdx, startIdx + pageLimit)
+    const omitted = Math.max(0, matched.length - (startIdx + page.length))
+    return {
+      answer: matched.length ? 'found' : 'none',
+      answer_reason: null,
+      records: page.map(x => ({ ...envelope(x), conflict: conflict(x.row.d) })),
+      total_matched: matched.length,
+      returned: page.length,
+      omitted,
+      next_cursor: omitted > 0 ? String(startIdx + page.length) : null,
+      unverified: 0,
+      scope_counts: scopeCounts,
+      store_state: this.storeState(readerPubkey, nowSec),
+    }
+  }
+
+  wake({ readerPubkey = '', roomId = null, maxChars = DEFAULT_WAKE_MAX_CHARS, gitBanner = null, staleFiles = new Set(), nowSec = nowSecDefault() } = {}) {
+    const budget = Number.isSafeInteger(maxChars) && maxChars >= 1000 ? maxChars : DEFAULT_WAKE_MAX_CHARS
+    const storeState = this.storeState(readerPubkey, nowSec)
+    const title = '=== HIVE WAKE DIGEST (authority: null, trustedInstruction: false) ==='
+    const base = { record_type: 'memory-wake-digest', authority: null, trustedInstruction: false, max_chars: budget, store_state: storeState }
+    if (!storeState.state || storeState.state !== 'READY') {
+      const digest = `${title}\nstore_state: ${storeState.state} — store not ready; claims withheld until verified restore`
+      return { ...base, digest, char_length: digest.length, counts: { canon_shown: 0, canon_omitted: 0, ops_shown: 0, ops_omitted: 0 }, records: [] }
+    }
+    const cleanRoom = roomId ? String(roomId).toLowerCase() : null
+    const items = this.#activeRows(readerPubkey, nowSec)
+      .filter(r => r.scope_type !== 'room' || !cleanRoom || r.room_id === cleanRoom)
+      .map(r => ({ row: r, verdict: verdictOf(r, nowSec, staleFiles), body: JSON.parse(JSON.parse(r.raw_json).content) }))
+    const factKeyClaims = new Map()
+    for (const { row, body } of items) {
+      if (!factKeyClaims.has(row.d)) factKeyClaims.set(row.d, new Set())
+      factKeyClaims.get(row.d).add(body.claim)
+    }
+    const isConflict = dk => (factKeyClaims.get(dk)?.size || 0) > 1
+    const sort = list => list.sort((a, b) => (isConflict(b.row.d) - isConflict(a.row.d)) || (b.row.created_at - a.row.created_at) || (a.row.id < b.row.id ? -1 : 1))
+    const canon = sort(items.filter(x => x.verdict.computedRank === 2))
+    const ops = sort(items.filter(x => x.verdict.computedRank === 3))
+    const header = [
+      title,
+      `store_state: READY (write_seq: ${storeState.write_seq}, current_claims: ${storeState.current_claims}, last_backup_age_sec: ${storeState.last_backup_age_sec ?? 'none'}, unbacked_writes: ${storeState.unbacked_writes})`,
+      ...(gitBanner ? [`git_check: ${String(gitBanner).slice(0, 500)}`] : []),
+    ].join('\n')
+    const formatItem = ({ row, verdict, body }) => {
+      const tags = `${isConflict(row.d) ? '[CONFLICT] ' : ''}${verdict.staleWarning ? `${verdict.staleWarning} ` : ''}`
+      return `- ${tags}[${row.d}] (by ${row.pubkey.slice(0, 8)}, as_of ${row.as_of_git || row.as_of_evt}): ${body.claim} — Because: ${body.because} [evidence: ${(body.evidence || []).join(', ')}]`
+    }
+    const fitSection = (title2, list, sectionBudget, scopeHint) => {
+      const lines = [`\n## ${title2}`]
+      let used = lines[0].length + 1
+      let shown = 0
+      for (const item of list) {
+        const line = formatItem(item)
+        if (used + line.length + 1 + 85 > sectionBudget) {
+          if (shown === 0) { lines.push(line.slice(0, Math.max(40, sectionBudget - used - 85))); shown++ }
+          break
+        }
+        lines.push(line)
+        used += line.length + 1
+        shown++
+      }
+      if (!list.length) lines.push('(none)')
+      if (list.length - shown > 0) lines.push(`+${list.length - shown} ${scopeHint} claims not shown; memory_query scope=${scopeHint}`)
+      return { text: lines.join('\n'), shown, omitted: list.length - shown }
+    }
+    const rest = budget - header.length - 8
+    const canonSec = fitSection('Rank 2: hive:canon', canon, Math.floor(rest * 0.35), 'hive:canon')
+    const opsSec = fitSection('Rank 3: room & hive:ops', ops, rest - Math.floor(rest * 0.35), 'hive:ops')
+    const digest = [header, canonSec.text, opsSec.text].join('\n')
+    return {
+      ...base,
+      digest,
+      char_length: digest.length,
+      counts: { canon_shown: canonSec.shown, canon_omitted: canonSec.omitted, ops_shown: opsSec.shown, ops_omitted: opsSec.omitted },
+      records: [...canon.slice(0, canonSec.shown), ...ops.slice(0, opsSec.shown)].map(x => ({ ...envelope(x), conflict: isConflict(x.row.d) })),
+    }
+  }
+}
+
+function verdictOf(row, nowSec, staleFiles) {
+  const rank = row.scope_type === 'hive:canon' ? 2 : row.scope_type === 'hive:ops' || row.scope_type === 'room' ? 3 : null
+  let staleWarning = null
+  if (row.as_of_git) {
+    const evidence = JSON.parse(JSON.parse(row.raw_json).content).evidence || []
+    if (evidence.some(ref => staleFiles.has(ref) || staleFiles.has(`${row.as_of_git}:${ref}`))) staleWarning = `[STALE: evidence file changed since ${row.as_of_git}]`
+  }
+  const verification = row.status === 'withdrawn' ? 'withdrawn' : !row.is_current ? 'superseded'
+    : row.exp != null && row.exp <= nowSec ? 'expired' : 'accepted'
+  return { verification, computedRank: verification === 'accepted' ? rank : null, staleWarning }
+}
+
+// Data-only envelope: memory records never carry authority and are never trusted instructions.
+function envelope({ row, verdict, body }) {
+  return {
+    record_type: 'memory-claim',
+    authority: null,
+    trustedInstruction: false,
+    verification: verdict.verification,
+    verification_reason: verdict.verification === 'accepted' ? null : verdict.verification,
+    computed_rank: verdict.computedRank,
+    event_id: row.id,
+    author_pubkey: row.pubkey,
+    scope: row.scope,
+    d: row.d,
+    topic: row.topic,
+    status: row.status,
+    is_current: Boolean(row.is_current),
+    retention: row.retention,
+    claim: body.claim,
+    because: body.because,
+    evidence: body.evidence || [],
+    as_of_git: row.as_of_git,
+    as_of_evt: row.as_of_evt,
+    created_at: row.created_at,
+    expires_at: row.exp,
+    stale_warning: verdict.staleWarning,
+  }
+}
+
+// --- backup (snapshot + ledger cut at the same write_seq) and the verified-backup receipt ---
+
+// snapshotAt is taken before the copy starts, so the receipt can never claim a backup newer than it is.
+export async function snapshotStore({ dbPath, ledgerPath, snapshotPath, ledgerCutPath, nowSec = nowSecDefault() }) {
+  if (existsSync(snapshotPath) || existsSync(ledgerCutPath)) throw new HiveMemoryError('HIVE_MEMORY_BACKUP_REFUSED', 'snapshot paths already exist')
+  const snapshotAt = nowSec
+  const db = new DatabaseSync(dbPath, { readOnly: true })
+  try { await sqliteBackup(db, snapshotPath) } finally { db.close() }
+  const snap = new DatabaseSync(snapshotPath, { readOnly: true })
+  let snapshotSeq
+  try { snapshotSeq = readMeta(snap).write_seq } finally { snap.close() }
+  const { lines } = readLedger(ledgerPath)
+  if (lines.length < snapshotSeq) {
+    rmSync(snapshotPath, { force: true })
+    throw new HiveMemoryError('HIVE_MEMORY_BACKUP_REFUSED', `the ledger (${lines.length}) is behind the snapshot (${snapshotSeq}); retry`)
+  }
+  const cut = lines.slice(0, snapshotSeq)
+  writeFileSync(ledgerCutPath, cut.map(l => `${l.raw}\n`).join(''), { mode: 0o600 })
+  return { snapshotSeq, snapshotAt, snapshotPath, ledgerCutPath, lastPurgeSeq: foldLedger(cut).lastPurgeSeq }
+}
+
+export function purgeBackupIncomplete(lastPurgeSeq, receipt) {
+  if (!lastPurgeSeq || (receipt && receipt.write_seq >= lastPurgeSeq)) return null
+  return `local SQLite and ledger purged at write_seq ${lastPurgeSeq}, but off-host B2 backup failed; writers remain FENCED and full-host loss before a verified backup would lack the purge in B2`
+}
+
+// `writers on` opens the sockets only when a verified receipt covers exactly the ledger head.
+export function backupGate({ ledgerPath, receiptPath }) {
+  const { lines } = readLedger(ledgerPath)
+  if (!lines.length) throw new HiveMemoryError('HIVE_MEMORY_BACKUP_GATE_CLOSED', 'the ledger is missing or empty')
+  const fold = foldLedger(lines)
+  const receipt = readReceiptFile(receiptPath)
+  const unbacked = purgeBackupIncomplete(fold.lastPurgeSeq, receipt)
+  if (unbacked) throw Object.assign(new HiveMemoryError('HIVE_MEMORY_PURGE_BACKUP_INCOMPLETE', unbacked), { purgeSeq: fold.lastPurgeSeq })
+  if (!receipt) throw new HiveMemoryError('HIVE_MEMORY_BACKUP_GATE_CLOSED', 'no valid verified backup receipt with a 64-hex snapshot_id')
+  if (receipt.write_seq !== fold.maxSeq) throw new HiveMemoryError('HIVE_MEMORY_BACKUP_GATE_CLOSED', `receipt write_seq ${receipt.write_seq} does not match the ledger head ${fold.maxSeq}`)
+  return { write_seq: fold.maxSeq, snapshot_id: receipt.snapshot_id, last_purge_seq: fold.lastPurgeSeq }
+}
+
+// A receipt counts only with a positive at and write_seq and the restic snapshot's exact 64-hex id.
+export function readReceiptFile(path) {
+  try {
+    const st = lstatSync(path)
+    if (!st.isFile() || st.isSymbolicLink()) return null
+    const r = JSON.parse(readFileSync(path, 'utf8'))
+    return Number.isSafeInteger(r?.at) && r.at > 0 && Number.isSafeInteger(r.write_seq) && r.write_seq >= 1 && typeof r.snapshot_id === 'string' && HEX64.test(r.snapshot_id)
+      ? { at: r.at, write_seq: r.write_seq, snapshot_id: r.snapshot_id } : null
+  } catch { return null }
+}
+
+// at is when the snapshot was taken, not when it was verified: the write fence measures from it.
+export function recordVerifiedBackup({ receiptPath, writeSeq, snapshotId, at = nowSecDefault(), nowSec = nowSecDefault() }) {
+  if (!Number.isSafeInteger(writeSeq) || writeSeq < 1 || !Number.isSafeInteger(at) || at < 1) throw new HiveMemoryError('HIVE_MEMORY_BACKUP_REFUSED', 'write_seq and at must be positive integers')
+  if (typeof snapshotId !== 'string' || !HEX64.test(snapshotId)) throw new HiveMemoryError('HIVE_MEMORY_BACKUP_REFUSED', 'snapshot_id must be the 64-hex restic snapshot id')
+  if (at > nowSec + RECEIPT_SKEW_SEC) throw new HiveMemoryError('HIVE_MEMORY_BACKUP_REFUSED', 'the snapshot time is in the future')
+  const receipt = { at, write_seq: writeSeq, snapshot_id: snapshotId }
+  const tmp = `${receiptPath}.${process.pid}.tmp`
+  const fd = openSync(tmp, 'w', 0o600)
+  try { writeAll(fd, Buffer.from(`${JSON.stringify(receipt)}\n`)); fsyncSync(fd) } finally { closeSync(fd) }
+  renameSync(tmp, receiptPath)
+  fsyncDir(dirname(receiptPath))
+  return receipt
+}
+
+// --- restore: bidirectional reconciliation of a decrypted snapshot against the ledger ---
+
+// The restore authority is restic content herd-infra has dumped and checked against each snapshot's SHA256SUMS:
+// the ledger of the newest verified hive-memory snapshot, and a directory holding <snapshot_id>/accepted-ledger.jsonl
+// for every hive-memory-purge snapshot, each of which must be a prefix of the head. A candidate snapshot's own
+// ledger is never the authority.
+const AUTHORITY_LEDGER = 'accepted-ledger.jsonl'
+const authorityUnavailable = why => new HiveMemoryError('HIVE_MEMORY_RESTORE_AUTHORITY_UNAVAILABLE', why)
+
+function readAuthorityLedger(path) {
+  let bytes, ledger
+  try {
+    bytes = readFileSync(path)
+    ledger = readLedger(path)
+  } catch (e) { throw authorityUnavailable(`${path}: ${e.code === 'ENOENT' ? 'missing' : e.message}`) }
+  if (!ledger.lines.length || ledger.truncated) throw authorityUnavailable(`${path} holds no complete ledger`)
+  return { lines: ledger.lines, bytes }
+}
+
+export function loadRestoreAuthority({ ledger, purgeRecords } = {}) {
+  if (!ledger) throw authorityUnavailable('no authority ledger from the newest verified hive-memory snapshot was given')
+  if (!purgeRecords) throw authorityUnavailable('no hive-memory-purge records directory was given')
+  const head = readAuthorityLedger(ledger)
+  let entries
+  try { entries = readdirSync(purgeRecords, { withFileTypes: true }) } catch (e) { throw authorityUnavailable(`cannot list the purge records: ${e.code || e.message}`) }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !HEX64.test(entry.name)) throw authorityUnavailable(`unexpected entry ${entry.name} in the purge records`)
+    const { lines } = readAuthorityLedger(join(purgeRecords, entry.name, AUTHORITY_LEDGER))
+    if (lines.length > head.lines.length || lines.some((l, i) => l.raw !== head.lines[i].raw)) {
+      throw new HiveMemoryError('HIVE_MEMORY_RESTORE_AUTHORITY_MISMATCH', `the hive-memory-purge ledger of ${prefix(entry.name)} is not a prefix of the authority ledger`)
+    }
+  }
+  return { ...head, fold: foldLedger(head.lines) }
+}
+
+const pathExists = p => { try { lstatSync(p); return true } catch { return false } }
+
+// Full-host: the head ledger goes in place before the candidate is judged, and an existing ledger is never
+// overwritten (an identical one, from an earlier refused attempt, is left as it is).
+function installAuthorityLedger(ledgerPath, auth) {
+  if (pathExists(ledgerPath)) {
+    let same = false
+    try { same = readFileSync(ledgerPath).equals(auth.bytes) } catch { /* unreadable: refuse below */ }
+    if (!same) throw new HiveMemoryError('HIVE_MEMORY_RESTORE_LEDGER_EXISTS', 'the local ledger exists and is never overwritten; restore without --with-ledger')
+    return
+  }
+  const tmp = `${ledgerPath}.${process.pid}.tmp`
+  const fd = openSync(tmp, 'wx', 0o600)
+  try { writeAll(fd, auth.bytes); fsyncSync(fd) } finally { closeSync(fd) }
+  try { linkSync(tmp, ledgerPath) } finally { rmSync(tmp, { force: true }) }
+  fsyncDir(dirname(ledgerPath))
+}
+
+export function restoreSnapshot({
+  snapshotPath, dbPath, ledgerPath, config, authority = null, withLedger = false, reapplyPurges = false, acknowledgeGap = null,
+  nowSec = nowSecDefault(), hooks = {},
+}) {
+  const fail = (code, message, extra = {}) => { throw Object.assign(new HiveMemoryError(code, message), extra) }
+  const lock = acquireStoreLock(dbPath)
+  const work = `${dbPath}.restore-${process.pid}`
+  let db = null
+  try {
+    const auth = loadRestoreAuthority(authority ?? {})
+    if (withLedger) installAuthorityLedger(ledgerPath, auth)
+    for (const p of [work, `${work}-wal`, `${work}-shm`]) rmSync(p, { force: true })
+    copyFileSync(snapshotPath, work)
+    db = openDb(work)
+    const integrity = db.prepare('PRAGMA integrity_check').get()
+    if (Object.values(integrity)[0] !== 'ok') fail('HIVE_MEMORY_RESTORE_INTEGRITY', 'snapshot fails PRAGMA integrity_check')
+    if (!hasStoreMeta(db)) fail('HIVE_MEMORY_RESTORE_INTEGRITY', 'snapshot has no store_meta')
+    const { lines } = readLedger(ledgerPath, { repair: true })
+    if (!lines.length) fail('HIVE_MEMORY_RESTORE_LEDGER_MISSING', 'the ledger is missing or empty')
+    if (lines.length < auth.lines.length || auth.lines.some((l, i) => l.raw !== lines[i].raw)) {
+      fail('HIVE_MEMORY_RESTORE_AUTHORITY_STALE', `the local ledger (${lines.length}) is behind or diverges from the newest verified backup (${auth.lines.length})`)
+    }
+    const fold = foldLedger(lines)
+    let meta = readMeta(db)
+    if (meta.store_id !== fold.storeId) fail(withLedger ? 'HIVE_MEMORY_RESTORE_AUTHORITY_MISMATCH' : 'HIVE_MEMORY_RESTORE_STORE_ID_MISMATCH', 'snapshot store_id does not match the ledger')
+    if (meta.write_seq > fold.maxSeq) fail(withLedger ? 'HIVE_MEMORY_RESTORE_AUTHORITY_MISMATCH' : 'HIVE_MEMORY_RESTORE_SNAPSHOT_AHEAD', `snapshot write_seq ${meta.write_seq} is ahead of the ledger (${fold.maxSeq})`)
+    for (const row of db.prepare('SELECT id, raw_json FROM events').all()) {
+      const v = checkEvent(JSON.parse(row.raw_json), config)
+      if (!v.ok || v.ev.id !== row.id) fail('HIVE_MEMORY_RESTORE_INVALID_EVENT', `event ${prefix(row.id)}: ${v.reason || 'stored under the wrong id'}`)
+    }
+    let ids = dbEventIds(db)
+    const extra = difference(ids, fold.expected)
+    const unknown = [...extra].filter(id => !fold.purged.has(id))
+    if (unknown.length) fail('HIVE_MEMORY_RESTORE_UNKNOWN_EVENT', `snapshot contains ${unknown.length} unrecorded events: [${unknown.map(prefix).join(', ')}]`)
+    let missing = difference(fold.expected, ids)
+    if (extra.size && !reapplyPurges) {
+      fail('HIVE_MEMORY_RESTORE_PRE_PURGE_SNAPSHOT', `snapshot contains ${extra.size} purged events: [${[...extra].map(prefix).join(', ')}]`)
+    }
+    if (!extra.size && !missing.size && meta.write_seq < fold.maxSeq && !reapplyPurges) {
+      fail('HIVE_MEMORY_RESTORE_PRE_PURGE_SNAPSHOT', `snapshot write_seq ${meta.write_seq} is behind the ledger (${fold.maxSeq}) with no missing writes; rerun with --reapply-purges`)
+    }
+    if (reapplyPurges) {
+      inTransaction(db, () => {
+        db.prepare('DELETE FROM events WHERE id IN (SELECT value FROM json_each(?))').run(JSON.stringify([...fold.purged]))
+        db.prepare('DELETE FROM writer_rate_log WHERE event_id IN (SELECT value FROM json_each(?))').run(JSON.stringify([...fold.purged]))
+        const last = db.prepare('SELECT id FROM events ORDER BY ingested_at DESC, rowid DESC LIMIT 1').get()?.id ?? null
+        db.prepare('UPDATE store_meta SET last_event_id = ? WHERE singleton = 1').run(last)
+        db.prepare('UPDATE store_meta SET last_purge_seq = ? WHERE singleton = 1').run(fold.lastPurgeSeq)
+        if (!missing.size) db.prepare('UPDATE store_meta SET write_seq = ?, pending_ledger_json = ? WHERE singleton = 1').run(fold.maxSeq, fold.lastRaw)
+      })
+      db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+      db.exec('VACUUM')
+      db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+      ids = dbEventIds(db)
+      if (difference(ids, fold.expected).size) fail('HIVE_MEMORY_RESTORE_UNKNOWN_EVENT', 'events beyond the ledger remain after reapplying purges')
+      missing = difference(fold.expected, ids)
+    }
+    let acked = []
+    if (missing.size) {
+      const report = lines.filter(l => l.rec.op === 'submit' && missing.has(l.rec.id))
+        .map(({ rec }) => ({ seq: rec.seq, id: rec.id, pubkey: rec.pubkey, d: rec.d, scope: rec.scope, status: rec.status, at: rec.at }))
+      const cutoverOnly = [...missing].filter(id => !report.some(r => r.id === id)).map(id => ({ id }))
+      if (acknowledgeGap !== fold.maxSeq) {
+        fail('HIVE_MEMORY_RESTORE_GAP_DETECTED', `missing ${missing.size} accepted writes: ${JSON.stringify([...report, ...cutoverOnly])}`, { gap: [...report, ...cutoverOnly], ledgerMaxSeq: fold.maxSeq })
+      }
+      acked = [...missing].sort()
+    }
+    // A 90-day purge whose backup never landed is not in any ledger restore can see; its rows are still due.
+    const due = retentionDue(db, nowSec).sort()
+    if (due.length && !reapplyPurges) {
+      fail('HIVE_MEMORY_RESTORE_PRE_PURGE_SNAPSHOT', `snapshot holds ${due.length} events past the 90-day retention window: [${due.map(prefix).join(', ')}]; rerun with --reapply-purges`)
+    }
+    const staged = []
+    if (acked.length || due.length) {
+      inTransaction(db, () => {
+        let seq = fold.maxSeq
+        if (acked.length) staged.push(JSON.stringify({ seq: ++seq, op: 'restore-gap-ack', store_id: fold.storeId, acked_ids: acked, at: nowSec }))
+        if (due.length) {
+          db.prepare('DELETE FROM events WHERE id IN (SELECT value FROM json_each(?))').run(JSON.stringify(due))
+          db.prepare('DELETE FROM writer_rate_log WHERE event_id IN (SELECT value FROM json_each(?))').run(JSON.stringify(due))
+          const last = db.prepare('SELECT id FROM events ORDER BY ingested_at DESC, rowid DESC LIMIT 1').get()?.id ?? null
+          db.prepare('UPDATE store_meta SET last_event_id = ? WHERE singleton = 1').run(last)
+          staged.push(JSON.stringify({ seq: ++seq, op: 'purge', store_id: fold.storeId, purged_ids: due, reason: 'retention', at: nowSec }))
+        }
+        db.prepare('UPDATE store_meta SET write_seq = ?, pending_ledger_json = ?, last_purge_seq = ? WHERE singleton = 1').run(seq, staged.join('\n'), due.length ? seq : fold.lastPurgeSeq)
+      }, hooks, acked.length ? 'restore-gap-ack' : 'purge')
+      if (due.length) {
+        db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+        db.exec('VACUUM')
+      }
+    }
+    const writeSeq = fold.maxSeq + staged.length
+    meta = readMeta(db)
+    if (meta.write_seq !== writeSeq) fail('HIVE_MEMORY_RESTORE_GAP_DETECTED', `snapshot write_seq ${meta.write_seq} does not match the ledger (${fold.maxSeq})`)
+    db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+    db.close()
+    db = null
+    for (const p of [`${dbPath}-wal`, `${dbPath}-shm`, `${work}-wal`, `${work}-shm`]) rmSync(p, { force: true })
+    renameSync(work, dbPath)
+    fsyncDir(dirname(dbPath))
+    if (staged.length) {
+      hooks.afterCommit?.(acked.length ? 'restore-gap-ack' : 'purge')
+      appendLedgerLine(ledgerPath, staged.join('\n'), hooks)
+    }
+    return { installed: true, writeSeq, reappliedPurges: reapplyPurges, acknowledgedGap: acked, retentionPurged: due }
+  } finally {
+    try { db?.close() } catch { /* closed */ }
+    for (const p of [work, `${work}-wal`, `${work}-shm`]) rmSync(p, { force: true })
+    lock.release()
+  }
+}

@@ -1,13 +1,14 @@
 // test/memory-viewer.mjs — Unit and integration tests for mcp/tools/memory-viewer.mjs.
 
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { request as httpRequest } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
 import { buildClaimTemplate } from '../mcp/tools/memory.mjs'
 import { startMemoryDaemon } from '../mcp/tools/memory-daemon.mjs'
+import { initEmptyStore, recordVerifiedBackup } from '../mcp/tools/hive_memory_store.mjs'
 import {
   diffViewerSnapshots,
   escapeHtml,
@@ -17,6 +18,8 @@ import {
   safeJsonForScript,
   startMemoryViewer,
 } from '../mcp/tools/memory-viewer.mjs'
+
+const SNAP_ID = 'c'.repeat(64)
 
 let passed = 0
 let failed = 0
@@ -97,7 +100,7 @@ await test('escapeHtml and safeJsonForScript neutralize HTML, script tags, and m
     connected: true,
     reader: 'viewer',
     server_name: 'hive-memory-viewer',
-    global_sync: { state: 'SYNCED_OK' },
+    store_state: { state: 'READY', write_seq: 2 },
     records: [
       {
         record_type: 'memory-claim',
@@ -120,38 +123,25 @@ await test('escapeHtml and safeJsonForScript neutralize HTML, script tags, and m
   assert(!/<a\s/i.test(html), 'viewer HTML must never render clickable <a> links')
 })
 
-await test('diffViewerSnapshots logs sync, relay, grant, and record additions/updates/removals', () => {
+await test('diffViewerSnapshots logs store state, write_seq, backup and record additions/updates/removals', () => {
   const s0 = diffViewerSnapshots(
     null,
-    {
-      connected: true,
-      global_sync: { state: 'SYNCED_EMPTY', lastEoseAt: 1000 },
-      relays_answered: '4/4',
-      disagreeing_relays: [],
-      grants_checked_at: 1000,
-      scope_counts: { unverified_total: 0 },
-      records: [],
-    },
+    { connected: true, store_state: { state: 'READY', write_seq: 1, unbacked_writes: 0 }, scope_counts: { unverified_total: 0 }, records: [] },
     1000
   )
   assert.equal(s0.length, 1)
   assert.equal(s0[0].kind, 'init')
+  assert(s0[0].summary.includes('store_state=READY'))
 
   const prev = {
     connected: true,
-    global_sync: { state: 'SYNCED_EMPTY', lastEoseAt: 1000 },
-    relays_answered: '4/4',
-    disagreeing_relays: [],
-    grants_checked_at: 1000,
+    store_state: { state: 'DB_BEHIND_LEDGER', write_seq: null, unbacked_writes: null },
     scope_counts: { unverified_total: 0 },
     records: [],
   }
   const next = {
     connected: true,
-    global_sync: { state: 'SYNCED_OK', lastEoseAt: 1010 },
-    relays_answered: '4/4',
-    disagreeing_relays: ['nos.lol'],
-    grants_checked_at: 1010,
+    store_state: { state: 'READY', write_seq: 2, unbacked_writes: 1 },
     scope_counts: { unverified_total: 1 },
     records: [
       {
@@ -166,53 +156,44 @@ await test('diffViewerSnapshots logs sync, relay, grant, and record additions/up
   }
   const diffs = diffViewerSnapshots(prev, next, 1010)
   const kinds = diffs.map(d => d.kind)
-  assert(kinds.includes('sync'))
-  assert(kinds.includes('relays'))
-  assert(kinds.includes('grants'))
+  assert(kinds.includes('store'))
+  assert(kinds.includes('write'))
+  assert(kinds.includes('backup'))
   assert(kinds.includes('unverified'))
   assert(kinds.includes('claim-added'))
+  assert(!diffs.some(d => /relay|sync/i.test(d.summary)))
 })
 
 await test('live integration: memory-viewer polls memory-daemon viewer socket, streams SSE, and refuses non-GET', async () => {
   const tmp = mkdtempSync(join(tmpdir(), 'nvoy-mem-viewer-'))
-  const stateDir = join(tmp, 'state')
   const sockDir = join(tmp, 'sock')
-  const cfgPath = join(tmp, 'config.json')
+  const db = join(tmp, 'memory.sqlite'), ledger = join(tmp, 'ledger.jsonl'), receipt = join(tmp, 'receipt.json')
   const globalChannel = 'a8186b53-537d-46ad-a7e7-b6486c58970e'
 
   const ownerSk = generateSecretKey()
   const ownerPk = getPublicKey(ownerSk)
+  const nowSec = Math.floor(Date.now() / 1000)
 
-  writeFileSync(
-    cfgPath,
-    JSON.stringify({
+  initEmptyStore({ dbPath: db, ledgerPath: ledger })
+  recordVerifiedBackup({ receiptPath: receipt, snapshotId: SNAP_ID, writeSeq: 1, at: nowSec })
+  const daemon = await startMemoryDaemon({
+    dbPath: db,
+    ledgerPath: ledger,
+    receiptPath: receipt,
+    config: {
       memoryGlobalChannelId: globalChannel,
       ownerPubkey: ownerPk,
-      subscribedRooms: [],
-      allowMemoryWriteCap: true,
-      readers: {
-        viewer: null,
-      },
-    })
-  )
-
-  const daemon = await startMemoryDaemon({
-    stateDir,
-    configPath: cfgPath,
+      maxUnbackedSec: 3600,
+      globalWriters: [],
+      readers: { viewer: null },
+      writers: { owner: { pubkey: ownerPk, perHour: 100 } },
+      rooms: {},
+    },
     readers: 'viewer',
+    writers: 'owner',
     socketDir: sockDir,
-    autoSync: false,
-    grantQueryFn: async () => ({ events: [], eose: true }),
+    log: () => {},
   })
-
-  const nowSec = Math.floor(Date.now() / 1000)
-  daemon.store.recordChannelSync(globalChannel, {
-    reachable: true,
-    eose: true,
-    remoteEvents: [],
-    nowSec,
-  })
-  await daemon.refreshDaemonGrants(nowSec)
 
   const viewer = await startMemoryViewer({
     socketPath: join(sockDir, 'viewer.sock'),
@@ -227,7 +208,8 @@ await test('live integration: memory-viewer polls memory-daemon viewer socket, s
     assert.equal(htmlRes.status, 200)
     assert(String(htmlRes.headers['content-security-policy']).includes("default-src 'none'"))
     assert(htmlRes.body.includes('Hive Shared Memory'))
-    assert(htmlRes.body.includes('SYNCED_EMPTY'))
+    assert(htmlRes.body.includes('READY'))
+    assert(!/relay|SYNCED/i.test(htmlRes.body.replace('never synced to a relay', '')))
 
     const stateRes1 = await httpGet(viewer.port, '/api/state')
     assert.equal(stateRes1.status, 200)
@@ -236,8 +218,10 @@ await test('live integration: memory-viewer polls memory-daemon viewer socket, s
     assert.equal(state1.reader, 'viewer')
     assert.equal(state1.authority, null)
     assert.equal(state1.trustedInstruction, false)
-    assert.equal(state1.global_sync.state, 'SYNCED_EMPTY')
-    assert.equal(state1.relays_answered, '4/4')
+    assert.equal(state1.store_state.state, 'READY')
+    assert.equal(state1.store_state.write_seq, 1)
+    assert.equal(state1.query_answer, 'none')
+    assert(!('global_sync' in state1) && !('relays_answered' in state1) && !('grants_checked_at' in state1))
     assert.equal(state1.records.length, 0)
 
     // 2. Non-GET/HEAD requests are refused with 405
@@ -284,8 +268,8 @@ await test('live integration: memory-viewer polls memory-daemon viewer socket, s
       nowSec: nowSec + 1,
     })
     const signedClaim = finalizeEvent(claimTemplate, ownerSk)
-    const ingestRes = daemon.store.ingestEvent(signedClaim, { nowSec: nowSec + 1 })
-    assert.equal(ingestRes.accepted, true)
+    const submitRes = daemon.store.submit({ writer: 'owner', event: signedClaim, expectedPriorId: null })
+    assert.equal(submitRes.accepted, true)
 
     await viewer.pollOnce()
 
@@ -294,8 +278,9 @@ await test('live integration: memory-viewer polls memory-daemon viewer socket, s
     }
     assert(sseMessages.length >= 2)
     const latest = sseMessages.at(-1)
-    assert.equal(latest.global_sync.state, 'SYNCED_OK')
-    assert.equal(latest.global_sync.localCount, 1)
+    assert.equal(latest.store_state.state, 'READY')
+    assert.equal(latest.store_state.write_seq, 2)
+    assert.equal(latest.store_state.unbacked_writes, 1)
     assert.equal(latest.scope_counts.canon, 1)
     assert.equal(latest.records.length, 1)
     assert.equal(latest.records[0].authority, null)
@@ -308,6 +293,13 @@ await test('live integration: memory-viewer polls memory-daemon viewer socket, s
     assert(htmlRes2.body.includes('\\u003cscript\\u003ealert(1)\\u003c/script\\u003e'))
 
     sseReq.destroy()
+
+    // A store that stops being ready answers unknown, never none, and the viewer shows it.
+    daemon.store.setConfig(null, new Error('fixture: config withdrawn'))
+    const notReady = await viewer.pollOnce()
+    assert.equal(notReady.query_answer, 'unknown')
+    assert.equal(notReady.records.length, 0)
+    assert.notEqual(notReady.store_state.state, 'READY')
   } finally {
     await viewer.stop()
     await daemon.close()
