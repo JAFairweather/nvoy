@@ -324,7 +324,17 @@ function publishCard() {
   child.on('error', () => complete(null))
   child.on('exit', complete)
 }
+// Room members for the channel MCPs' mention lists (#321): at start and every five minutes.
+function refreshRooms() {
+  const child = spawn(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-rooms.mjs'), '--instance', manifest.id],
+    { env: childEnv, stdio: ['ignore', 'inherit', 'inherit'] })
+  const timeout = setTimeout(() => child.kill('SIGKILL'), 90000)
+  const complete = code => { clearTimeout(timeout); if (code !== 0) console.error(`instance-broker-daemon: room members unrefreshed (${code ?? 'signal'}); next read in five minutes`) }
+  child.on('error', () => complete(null))
+  child.on('exit', complete)
+}
 recover()
+if (manifest.mayPost?.mentionRooms) { refreshRooms(); setInterval(refreshRooms, 5 * 60 * 1000) }
 if (manifest.agentCard) { publishCard(); setInterval(publishCard, 60 * 60 * 1000) }
 if (manifest.buzz) supervise('instance-broker-auth.mjs', 'AUTH oracle')
 if (manifest.buzz?.statusReactions) supervise('instance-broker-status.mjs', 'status keeper')

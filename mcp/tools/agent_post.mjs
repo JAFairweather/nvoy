@@ -12,6 +12,7 @@ import { resolve } from 'node:path'
 import { HOUR_MS } from './agent_limits.mjs'
 import { MENTION_NAME } from './admission.mjs'
 import { credentialIn, withheld } from './outbound_secrets.mjs'
+import { readMentionRooms } from './room_roster.mjs'
 
 const HEX64 = /^[0-9a-f]{64}$/
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
@@ -81,11 +82,47 @@ export function readMentionGrants(manifest) {
     return x?.version === 1 && x.instance === manifest.id && Array.isArray(x.mentions) ? x.mentions : null
   } catch { return null }
 }
-// What a channel MCP resolves and tells against: the manifest with the last recorded grants, re-read on use.
+// What a channel MCP resolves and tells against: the manifest with the last recorded grants and, when
+// mention_rooms is on, the last recorded room members (mention-rooms.json), both re-read on use.
 export function mentionView(manifest) {
-  let last = []
-  return () => withMentionGrants(manifest, last = readMentionGrants(manifest) || last)
+  let last = [], lastRooms = {}
+  return () => {
+    const view = withMentionGrants(manifest, last = readMentionGrants(manifest) || last)
+    if (!view.mayPost?.mentionRooms) return view
+    lastRooms = readMentionRooms(manifest) || lastRooms
+    return Object.freeze({ ...view, mayPost: Object.freeze({ ...view.mayPost, rooms: lastRooms }) })
+  }
 }
+
+// The members of `channel` a room roster adds (#321): keys not already listed, each named only when
+// no listed entry holds that name, so a manifest or grant name always wins. Discovery only: the
+// broker re-reads the roster before it signs a mention that only a room allows.
+export function roomEntries(m, channel) {
+  if (!m?.mentionRooms || !channel || !Array.isArray(m.rooms?.[channel])) return []
+  const held = new Set(m.mention.filter(e => e.name).map(e => fold(e.name)))
+  return m.rooms[channel].filter(r => HEX64.test(String(r?.pubkey || '')) && !m.mention.some(e => e.pubkey === r.pubkey))
+    .map(r => ({ pubkey: r.pubkey, name: r.name && MENTION_NAME.test(r.name) && !held.has(fold(r.name)) ? r.name : null, source: 'room', room: channel }))
+}
+// Everyone this identity may mention in `channel`: the manifest list and grants, then that room's members.
+export const mentionable = (m, channel) => m ? [...m.mention, ...roomEntries(m, channel)] : []
+// The effective list with where each entry comes from: 'manifest', 'grant' or 'room' (the owner's view).
+export function effectiveMentions(manifest, { grants = [], rooms = null } = {}, channel) {
+  const m = manifest.mayPost
+  if (!m) return []
+  const base = Array.isArray(grants) && grants.length ? mergeMentions(m.mention, grants, () => {}).mention : m.mention
+  const tagged = base.map((e, i) => ({ ...e, source: i < m.mention.length ? 'manifest' : 'grant' }))
+  const view = { ...m, mention: tagged, rooms: rooms || {} }
+  const chans = channel ? [channel] : m.channels
+  return [...tagged, ...chans.flatMap(c => roomEntries(view, c))]
+}
+// Broker side: the requested keys the manifest list and live grants do not cover. With mention_rooms
+// on, these can only be room-derived, and the broker confirms them against a fresh roster.
+export const offList = (manifest, keys) => keys.filter(p => !manifest.mayPost.mention.some(e => e.pubkey === p))
+const offListMessage = (m, who, channel) => `${who} is not on may_post.mention${m.mentionRooms && channel ? ` or in room ${channel}` : ''}`
+const roomNames = m => m?.mentionRooms ? m.channels.map(c => {
+  const names = roomEntries(m, c).map(e => e.name || e.pubkey)
+  return ` In room ${c}, also its members: ${names.join(', ') || 'none read yet'}.`
+}).join('') : ''
 
 // How to take part, beside what the manifest allows. Agents left to their defaults answered and
 // stopped, and wrote "@name" in text, which Buzz never resolves; the others never woke (10-23).
@@ -113,7 +150,7 @@ export function capabilitySummary(manifest) {
     'What this identity may do, from its manifest:',
     'reply to a delivered envelope with nvoy_channel_reply;',
     m ? `start a new message with nvoy_channel_post in channel ${m.channels.join(', ')} (default ${m.channels[0]}), at most ${m.perHour} an hour;` +
-      ` mention, in a post or a reply, ${names || 'nobody'};` : `not post: nvoy_channel_post is refused, ${POST_ONLY_REPLY};`,
+      ` mention, in a post or a reply, ${names || 'nobody'};${roomNames(m)}` : `not post: nvoy_channel_post is refused, ${POST_ONLY_REPLY};`,
     manifest.maySetProfile
       ? `set this seat's kind-0 profile with nvoy_profile_set under manifest grant ${manifest.maySetProfile.grantId}, at most ${manifest.maySetProfile.perDay} per rolling 24 hours; scope kind 0 and pubkey ${manifest.pubkey}; picture hosts ${manifest.maySetProfile.pictureHosts.join(', ')};`
       : 'not set profile: nvoy_profile_set is refused without may_set_profile;',
@@ -134,7 +171,7 @@ export const capabilityInstructions = manifest => `${capabilitySummary(manifest)
 export function postToolSpec(manifest) {
   const m = manifest.mayPost
   const scope = m ? ` Channels: ${m.channels.join(', ')} (default ${m.channels[0]}). Mentionable: ${
-    m.mention.map(e => e.name || e.pubkey).join(', ') || 'nobody'}. At most ${m.perHour} an hour.` : ` ${POST_ONLY_REPLY[0].toUpperCase()}${POST_ONLY_REPLY.slice(1)}.`
+    m.mention.map(e => e.name || e.pubkey).join(', ') || 'nobody'}.${roomNames(m)} At most ${m.perHour} an hour.` : ` ${POST_ONLY_REPLY[0].toUpperCase()}${POST_ONLY_REPLY.slice(1)}.`
   return {
     name: 'nvoy_channel_post',
     description: `Start a new top-level message in a Buzz channel, optionally mentioning allowed participants by name or hex key. The broker checks the manifest's may_post block, signs and publishes.${scope}`,
@@ -154,18 +191,18 @@ export function resolvePost(manifest, args = {}) {
   if (!content || Buffer.byteLength(content) > MAX_BYTES) return { code: 'NVOY_BAD_POST', message: `text must be 1..${MAX_BYTES} bytes` }
   const channel = args.channel == null ? m.channels[0] : String(args.channel).toLowerCase()
   if (!m.channels.includes(channel)) return { code: 'NVOY_POST_CHANNEL_REFUSED', message: `channel is not in may_post.channels (${m.channels.join(', ')})` }
-  const text = textMentions(m, content)
-  const resolved = resolveMentions(m, withTextMentions(args.mention, text), 'NVOY_BAD_POST', 'NVOY_POST_MENTION_REFUSED')
+  const text = textMentions(m, content, channel)
+  const resolved = resolveMentions(m, withTextMentions(args.mention, text), 'NVOY_BAD_POST', 'NVOY_POST_MENTION_REFUSED', channel)
   return resolved.code ? resolved : { channel, mention: resolved.mention, content, unresolved: text.unresolved }
 }
 
 // Buzz wakes only a p-tagged key, never "@name" text, yet that is how agents write a mention: on
 // 10-23 mc-claude had named others in 10 replies and woken none of them. An @name on
 // may_post.mention becomes a mention; any other is handed back so the agent sees it reached no one.
-export function textMentions(m, content) {
-  const found = [], unresolved = []
+export function textMentions(m, content, channel) {
+  const found = [], unresolved = [], list = mentionable(m, channel)
   for (const [, token] of String(content).matchAll(/(?:^|[^\w@])@([a-z0-9][\w-]{0,63})/gi)) {
-    const entry = m?.mention.find(e => e.name && fold(e.name) === fold(token))
+    const entry = list.find(e => e.name && fold(e.name) === fold(token))
     if (entry) { if (!found.includes(entry.name)) found.push(entry.name) }
     else if (!unresolved.includes(`@${token}`)) unresolved.push(`@${token}`)
   }
@@ -173,17 +210,17 @@ export function textMentions(m, content) {
 }
 const withTextMentions = (list, text) => list == null ? text.found : Array.isArray(list) ? [...list, ...text.found] : list
 // What the agent is shown when some @text named no one it may mention.
-export const notMentioned = (m, unresolved) => unresolved?.length
-  ? { not_mentioned: unresolved, mentionable: m.mention.map(e => e.name || e.pubkey) } : {}
+export const notMentioned = (m, unresolved, channel) => unresolved?.length
+  ? { not_mentioned: unresolved, mentionable: mentionable(m, channel).map(e => e.name || e.pubkey) } : {}
 
 // Names or hex keys to the distinct keys may_post.mention allows, or the refusal the agent is shown.
-function resolveMentions(m, list, badCode, refusedCode) {
+function resolveMentions(m, list, badCode, refusedCode, channel) {
   if (list != null && !Array.isArray(list)) return { code: badCode, message: 'mention must be a list' }
-  const mention = []
+  const mention = [], allowed = mentionable(m, channel)
   for (const raw of list || []) {
     const value = String(raw).trim().toLowerCase()
-    const entry = m.mention.find(e => e.pubkey === value || (e.name && fold(e.name) === fold(value)))
-    if (!entry) return { code: refusedCode, message: `${HEX64.test(value) ? value.slice(0, 8) : value} is not on may_post.mention` }
+    const entry = allowed.find(e => e.pubkey === value || (e.name && fold(e.name) === fold(value)))
+    if (!entry) return { code: refusedCode, message: offListMessage(m, HEX64.test(value) ? value.slice(0, 8) : value, channel) }
     if (!mention.includes(entry.pubkey)) mention.push(entry.pubkey)
   }
   return { mention }
@@ -192,12 +229,12 @@ function resolveMentions(m, list, badCode, refusedCode) {
 // nvoy_channel_reply's optional mention, plus any @name in its text: a reply that brings someone
 // new into the thread is held to the same allowlist as a post. With neither, or without a may_post
 // block for @text, the reply is exactly as it was.
-export function resolveReplyMention(manifest, list, content = '') {
-  const text = manifest.mayPost ? textMentions(manifest.mayPost, content) : { found: [], unresolved: [] }
+export function resolveReplyMention(manifest, list, content = '', channel) {
+  const text = manifest.mayPost ? textMentions(manifest.mayPost, content, channel) : { found: [], unresolved: [] }
   const all = withTextMentions(list, text)
   if (all == null || (Array.isArray(all) && !all.length)) return { mention: [], unresolved: text.unresolved }
   if (!manifest.mayPost) return { code: 'NVOY_REPLY_MENTION_NOT_PERMITTED', message: 'mentioning anyone beyond the sender needs the manifest\'s may_post block' }
-  const resolved = resolveMentions(manifest.mayPost, all, 'NVOY_BAD_REPLY', 'NVOY_REPLY_MENTION_REFUSED')
+  const resolved = resolveMentions(manifest.mayPost, all, 'NVOY_BAD_REPLY', 'NVOY_REPLY_MENTION_REFUSED', channel)
   return resolved.code ? resolved : { ...resolved, unresolved: text.unresolved }
 }
 
@@ -212,7 +249,8 @@ export function replyMentionShape(mention, manifest, channel) {
 }
 export function validateReplyMention(mention, manifest, channel) {
   replyMentionShape(mention, manifest, channel)
-  const off = mention.find(p => !manifest.mayPost.mention.some(e => e.pubkey === p))
+  // With mention_rooms on, an off-list key may be room-derived: the broker confirms it against a fresh roster.
+  const off = manifest.mayPost.mentionRooms ? undefined : offList(manifest, mention)[0]
   if (off !== undefined) throw new Error(`reply refused: ${off.slice(0, 8)} is not on may_post.mention`)
 }
 
@@ -226,9 +264,9 @@ export function validatePostRequest(row, manifest) {
       !Array.isArray(row.mention) || !Number.isFinite(row.requested_at)) throw new Error('post request has an invalid or overbroad shape')
   if (!manifest.mayPost) throw new Error(`post refused: ${POST_ONLY_REPLY}`)
   if (!manifest.mayPost.channels.includes(row.channel)) throw new Error('post refused: channel is not in may_post.channels')
-  const allowed = manifest.mayPost.mention.map(e => e.pubkey)
-  if (new Set(row.mention).size !== row.mention.length) throw new Error('post request has an invalid or overbroad shape')
-  const off = row.mention.find(p => !allowed.includes(p))
+  if (new Set(row.mention).size !== row.mention.length || !row.mention.every(p => HEX64.test(String(p)))) throw new Error('post request has an invalid or overbroad shape')
+  // With mention_rooms on, an off-list key may be room-derived: the broker confirms it against a fresh roster.
+  const off = manifest.mayPost.mentionRooms ? undefined : offList(manifest, row.mention)[0]
   if (off !== undefined) throw new Error(`post refused: ${String(off).slice(0, 8)} is not on may_post.mention`)
   return row
 }
@@ -255,6 +293,6 @@ export function queuePost(manifest, args, now = Date.now()) {
     const row = { version: 1, type: 'post-request', id: randomBytes(16).toString('hex'), instance: manifest.id,
       channel: resolved.channel, mention: resolved.mention, content: resolved.content, requested_at: now }
     appendFileSync(path, JSON.stringify(row) + '\n')
-    return { ok: { queued: true, request: row.id, channel: row.channel, mention: row.mention, ...notMentioned(manifest.mayPost, resolved.unresolved) } }
+    return { ok: { queued: true, request: row.id, channel: row.channel, mention: row.mention, ...notMentioned(manifest.mayPost, resolved.unresolved, resolved.channel) } }
   } catch (error) { return { error: { code: 'NVOY_POST_QUEUE_FAILED', message: error.message } } }
 }

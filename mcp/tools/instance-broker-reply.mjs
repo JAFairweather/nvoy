@@ -20,7 +20,8 @@ import { verifyOutboundApproval } from './outbound_approval.mjs'
 import { channelReply, openBuzzSession, validChannel } from './buzz_native.mjs'
 import { recordStatusReplied } from './buzz_status.mjs'
 import { countInWindow, nextHop } from './agent_limits.mjs'
-import { recordMentionGrants, replyMentionShape, validateReplyMention, withMentionGrants } from './agent_post.mjs'
+import { offList, recordMentionGrants, replyMentionShape, validateReplyMention, withMentionGrants } from './agent_post.mjs'
+import { confirmMembers, readRooms, recordMentionRooms } from './room_roster.mjs'
 import { contentHash, credentialIn, withheldMessage } from './outbound_secrets.mjs'
 
 const die = m => { console.error(`instance-broker-reply: ${m}`); process.exit(1) }
@@ -131,6 +132,18 @@ if (bunkerUri) {
     nip44Encrypt: async (peer, text) => nip44.encrypt(text, nip44.getConversationKey(sk, peer)) }
 }
 if (await signer.getPublicKey() !== manifest.pubkey) die('signer does not match manifest pubkey')
+// With mention_rooms on, a mentioned key neither the manifest nor a live grant covers can only be
+// room-derived (#321). The relay's own member list is read fresh, never the discovery file: here,
+// and again in the session that publishes, so a member who leaves in between is not tagged.
+let roomDerived = []
+async function confirmRoom(session) {
+  let absent
+  try { absent = await confirmMembers({ session, room: receipt.reply_channel, keys: roomDerived, relaySigner: manifest.buzz.relaySigner }) }
+  catch (e) { die(`room member list unavailable: ${e.message}; held for retry`) }
+  // The discovery file catches up from the same session, a refusal included; best effort.
+  try { recordMentionRooms(manifest, await readRooms({ session, rooms: [receipt.reply_channel], relaySigner: manifest.buzz.relaySigner, me: manifest.pubkey })) } catch { /* the timer refresh retries */ }
+  if (absent !== undefined) die(`reply refused: ${absent.slice(0, 8)} is not on may_post.mention or in room ${receipt.reply_channel}`)
+}
 
 // A receipt is only a short-lived capability, never a substitute for present-tense policy.
 // Re-open the exact envelope through the same signer and require the recorded grant to remain
@@ -151,7 +164,15 @@ if (buzzNative) {
   recordMentionGrants(manifest, policy)
   if (policy.me !== manifest.pubkey || !policy.policyUsable || !live) die('admission receipt no longer has a live matching grant chain')
   if (request.mention !== undefined) {
-    try { validateReplyMention(request.mention, withMentionGrants(manifest, policy.mentions), receipt.reply_channel) } catch (e) { die(e.message) }
+    const allowed = withMentionGrants(manifest, policy.mentions)
+    try { validateReplyMention(request.mention, allowed, receipt.reply_channel) } catch (e) { die(e.message) }
+    roomDerived = manifest.mayPost.mentionRooms ? offList(allowed, request.mention) : []
+    // Before the claim, so a member who has left costs neither the receipt nor the post budget.
+    if (roomDerived.length) {
+      let check
+      try { check = await openBuzzSession({ relay: manifest.buzz.relay, signer }) } catch (e) { die(`room member list unavailable: ${e.message}; held for retry`) }
+      try { await confirmRoom(check) } finally { check.close() }
+    }
   }
 }
 const current = Array.isArray(policy.admissions) ? policy.admissions : []
@@ -303,6 +324,7 @@ if (buzzNative) {
   try {
     const session = await openBuzzSession({ relay: manifest.buzz.relay, signer })
     try {
+      if (roomDerived.length) await confirmRoom(session)
       const ok = await session.publishSigned(record.event)
       if (ok.accepted) accepted = 1
       else {

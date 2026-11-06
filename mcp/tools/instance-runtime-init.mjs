@@ -53,6 +53,8 @@ if (m.mayRemember) provision(`${m.runtimeDir}/memory-requests`, m.workerUid, m.b
 if (m.mayRemember) provisionFile(`${m.runtimeDir}/memory-rate.jsonl`, m.workerUid, m.workerUid, 0o600, 'memory rate log')
 // The brokers' last reading of the live mention grants, for the keyless channel MCPs; worker-group readable.
 if (m.mayPost) provisionFile(`${m.runtimeDir}/mention-grants.json`, m.brokerUid, m.workerHandoffGid, 0o640, 'mention grant snapshot')
+// The broker's last reading of its rooms' members (#321), for the same readers; discovery only.
+if (m.mayPost?.mentionRooms) provisionFile(`${m.runtimeDir}/mention-rooms.json`, m.brokerUid, m.workerHandoffGid, 0o640, 'room member snapshot')
 if (m.maySetProfile) {
   provisionFile(`${m.runtimeDir}/profile-requests.jsonl`, m.workerUid, m.brokerAdapterGid, 0o640, 'profile request queue')
   provisionFile(`${m.runtimeDir}/profile-results.jsonl`, m.brokerUid, m.workerHandoffGid, 0o640, 'profile result log')
