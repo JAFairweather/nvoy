@@ -900,10 +900,20 @@ export class HiveMemoryStore {
     const names = this.#writerNames()
     const topics = {}
     for (const { row } of ops) { const t = topicOf(row); topics[t] = (topics[t] || 0) + 1 }
-    const topicDirectory = Object.fromEntries(Object.entries(topics).sort((a, b) => (b[1] - a[1]) || (a[0] < b[0] ? -1 : 1)))
+    // The directory gets at most a quarter of the budget, largest topics first; the rest are counted, not listed.
+    const dirParts = []
+    let dirLen = 'topics: '.length + 24
+    for (const [t, n] of Object.entries(topics).sort((a, b) => (b[1] - a[1]) || (a[0] < b[0] ? -1 : 1))) {
+      const part = `${t} ${n}`
+      if (dirLen + part.length + 2 > Math.floor(budget / 4)) break
+      dirParts.push([t, n])
+      dirLen += part.length + 2
+    }
+    const topicDirectory = Object.fromEntries(dirParts)
+    const topicsOmitted = Object.keys(topics).length - dirParts.length
     const ageOf = sec => { const m = Math.max(0, Math.floor((nowSec - sec) / 60)); return m < 120 ? `${m}m` : m < 2880 ? `${Math.floor(m / 60)}h` : `${Math.floor(m / 1440)}d` }
     const hint = 'more: memory_query topic=<topic> lists index cards; memory_query d=<fact key> returns one claim in full'
-    const dirLine = `topics: ${Object.entries(topicDirectory).map(([t, n]) => `${t} ${n}`).join(', ') || '(none)'}`
+    const dirLine = `topics: ${dirParts.map(([t, n]) => `${t} ${n}`).join(', ') || '(none)'}${topicsOmitted ? `, +${topicsOmitted} more topics` : ''}`
     const fixed = header.length + 1 + '\n## Rank 3: room & hive:ops (index)'.length + 1 + dirLine.length + 1 + hint.length + 40
     const lines = ['\n## Rank 3: room & hive:ops (index)']
     let used = fixed
@@ -926,7 +936,7 @@ export class HiveMemoryStore {
       digest,
       char_length: digest.length,
       canon_char_length: canonText.length,
-      counts: { canon_shown: canon.length, canon_omitted: 0, ops_shown: shown, ops_omitted: ops.length - shown, consolidated_hidden: consolidatedHidden },
+      counts: { canon_shown: canon.length, canon_omitted: 0, ops_shown: shown, ops_omitted: ops.length - shown, consolidated_hidden: consolidatedHidden, topics_omitted: topicsOmitted },
       topic_directory: topicDirectory,
       records: [...canon, ...ops.slice(0, shown)].map(({ row }) => ({ authority: null, trustedInstruction: false, event_id: row.id, d: row.d, scope: row.scope, author_pubkey: row.pubkey })),
     }

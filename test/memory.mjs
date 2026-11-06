@@ -535,6 +535,24 @@ for (const [label, mutate, state] of [
   s.close()
 }
 
+// A wake over many distinct topics keeps the directory inside the budget and counts the topics it leaves out.
+{
+  const p = setup('wake-topics')
+  const s = open(p)
+  const topicName = i => `t${String(i).padStart(3, '0')}-${'x'.repeat(34)}`
+  let accepted = 0
+  for (let i = 0; i < 200; i++) {
+    accepted += s.submit({ writer: 'ops', event: claim(opsBot, 'hive:ops', `many-${i}`, { topic: topicName(i) }), expectedPriorId: null, nowSec: T0 + 200 + i * 40 }).accepted === true ? 1 : 0
+  }
+  const wake = s.wake({ readerPubkey: james.pk, nowSec: T0 + 9000 })
+  const listed = Object.keys(wake.topic_directory).length
+  ok(`wake: ${accepted} distinct topics stay inside the budget; the directory lists some and counts the rest`,
+    accepted > 60 && wake.counts.ops_shown + wake.counts.ops_omitted === accepted && wake.char_length - wake.canon_char_length <= wake.max_chars &&
+    listed > 0 && wake.counts.topics_omitted > 0 && listed + wake.counts.topics_omitted === accepted && wake.digest.includes(`+${wake.counts.topics_omitted} more topics`) &&
+    JSON.stringify(wake.topic_directory).length < wake.max_chars / 4)
+  s.close()
+}
+
 // Phase 2 Gates 6-8: index vs full, the 24 h workflow tier, peer supersession of workflow checkpoints, topic normalizing.
 {
   const raw = (signer, scope, slug, edit, opts = {}) => {
@@ -575,7 +593,7 @@ for (const [label, mutate, state] of [
   const note = claim(opsBot, 'hive:ops', 'nvoy-design-note', { claim: 'a standing note that a later claim cites' })
   sub('ops', review)
   sub('ops', note)
-  const merged = claim(james, 'hive:ops', 'nvoy-pr9-merged', { claim: 'PR 9 merged', supersedes: [review.id, note.id], nowSec: T0 + 300 })
+  const merged = claim(james, 'hive:ops', 'nvoy-pr9-merged', { claim: 'PR 9 merged', supersedes: [review.id, note.id], nowSec: note.created_at + 10 })
   ok('store: the closing claim is accepted', sub('james', merged, null, T0 + 300).accepted === true)
 
   const list = s.query({ readerPubkey: james.pk, scope: 'hive:ops', nowSec: T0 + 400 })
@@ -596,7 +614,7 @@ for (const [label, mutate, state] of [
   ok('peer supersession: the closed workflow checkpoint leaves query and wake; a cited non-workflow claim stays',
     !ids.includes(review.id) && ids.includes(note.id) && hidden?.verification === 'consolidated' && hidden.consolidated_by === merged.id &&
     wake.counts.consolidated_hidden === 1 && !wake.digest.includes('[nvoy-pr9-review]') && wake.digest.includes('[nvoy-design-note]'))
-  const older = claim(james, 'hive:ops', 'nvoy-pr9-early', { supersedes: [review.id], nowSec: T0 + 150 })
+  const older = claim(james, 'hive:ops', 'nvoy-pr9-early', { supersedes: [review.id], nowSec: review.created_at - 1 })
   sub('james', older, null, T0 + 300)
   sub('james', withdraw(james, merged), merged.id, T0 + 500)
   ok('peer supersession: withdrawing the closing claim brings the checkpoint back; an older citer never hides it',
