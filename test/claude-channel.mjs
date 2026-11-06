@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
@@ -150,6 +150,22 @@ const selfLocked = spawnSync('sh', ['-c', 'printf \'{"version":1,"instance":"%s"
     CHANNEL: resolve('mcp/tools/claude-channel.mjs') }, encoding: 'utf8', timeout: 8000, input: '' })
 ok('a lock naming the channel\'s own PID is stale, not a live rival',
   selfLocked.status === 0 && !/already runs as pid/.test(selfLocked.stderr) && !existsSync(lockPath))
+
+// After a container recreate the old PID can belong to another user's process: the probe answers
+// EPERM, not ESRCH. The channel must reclaim that lock, not exit and leave the agent's tools
+// "reconnecting" (2026-11-06). Lock a real process that answers EPERM here; where none exists
+// (the runner alone in a container as PID 1), say so rather than pass on another path.
+const epermPid = existsSync('/proc/self') ? readdirSync('/proc').filter(n => /^\d+$/.test(n)).map(Number).find(pid => {
+  if (pid === process.pid) return false
+  try { process.kill(pid, 0); return false } catch (error) { return error.code === 'EPERM' }
+}) : undefined
+if (epermPid) {
+  writeFileSync(lockPath, JSON.stringify({ version: 1, instance: manifest.id, pid: epermPid, started_at: 0 }))
+  const foreign = spawnSync(process.execPath, [resolve('mcp/tools/claude-channel.mjs'), '--instance', manifest.id, '--poll-ms', '250', '--handshake-ms', '1000'],
+    { env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, encoding: 'utf8', timeout: 8000, input: '' })
+  ok(`a lock naming another user's process (pid ${epermPid}, probe EPERM) is stale, not a live rival`,
+    foreign.status === 0 && !/already runs as pid|EPERM/.test(foreign.stderr) && !existsSync(lockPath))
+} else console.log('skip — no process here answers EPERM; the pid_lock unit test forces that case')
 
 // Negative control. Without this, "releases the lock" is indistinguishable from "exits on a timer",
 // which would replace a stuck lane with one that dies under a working session — a real session is

@@ -8,7 +8,7 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, EmptyResultSchema, ErrorCode, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
-import { appendFileSync, chmodSync, closeSync, existsSync, lstatSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { appendFileSync, chmodSync, existsSync, lstatSync, readFileSync, writeFileSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { resolve } from 'node:path'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
@@ -17,6 +17,7 @@ import { requestWorkingStatus } from './buzz_status.mjs'
 import { MENTION_SCHEMA, capabilityHash, capabilityInstructions, capabilitySummary, mentionView, notMentioned, postToolSpec, queuePost, resolveReplyMention } from './agent_post.mjs'
 import { profileToolSpec, profileStatusToolSpec, queueProfile, profileStatus, waitProfile } from './agent_profile.mjs'
 import { memoryToolSpec, queueMemory } from './agent_memory.mjs'
+import { claimPidLock } from './pid_lock.mjs'
 import { credentialIn, withheld } from './outbound_secrets.mjs'
 
 const die = message => { console.error(`nvoy-claude-channel: ${message}`); process.exit(1) }
@@ -107,32 +108,14 @@ if (!Number.isInteger(heartbeatMisses) || heartbeatMisses < 1 || heartbeatMisses
 if (!Number.isInteger(handshakeMs) || handshakeMs < 1000 || handshakeMs > 3600000) die('--handshake-ms must be 1000..3600000')
 
 // One participant identity may bind one live Claude channel only. A second session would receive
-// the same marker and become a duplicate responder. Reclaim only a lock whose recorded PID is
-// demonstrably gone; malformed/foreign locks fail closed. A lock naming this very process is stale:
-// PIDs restart in a new container, so a restarted stack can hand the new channel the PID its
-// predecessor recorded, and "that PID is alive" is then only this process looking at itself.
+// the same marker and become a duplicate responder. pid_lock reclaims only a lock whose recorded PID
+// is demonstrably gone, is this very process, or (by /proc) is not a claude-channel.mjs for this
+// instance: a recreated container hands old PIDs to strangers, often another user's process, where
+// the liveness probe answers EPERM (2026-11-06, Biggy). Malformed/foreign locks fail closed.
 const lockPath = resolve(channelStateDir, 'channel.lock')
-function claimLock() {
-  try {
-    const fd = openSync(lockPath, 'wx', 0o600)
-    writeFileSync(fd, JSON.stringify({ version: 1, instance: manifest.id, pid: process.pid, started_at: Date.now() }))
-    closeSync(fd)
-    return
-  } catch (error) { if (error.code !== 'EEXIST') throw error }
-  let prior
-  try {
-    const stat = lstatSync(lockPath)
-    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('channel lock is not a regular file')
-    prior = JSON.parse(readFileSync(lockPath, 'utf8'))
-  } catch (error) { throw new Error(`cannot validate existing channel lock: ${error.message}`) }
-  if (prior?.version !== 1 || prior?.instance !== manifest.id || !Number.isInteger(prior?.pid) || prior.pid < 1) throw new Error('channel lock does not bind this instance')
-  if (prior.pid !== process.pid) try { process.kill(prior.pid, 0); throw new Error(`Claude channel already runs as pid ${prior.pid}`) }
-  catch (error) { if (error.code !== 'ESRCH') throw error }
-  unlinkSync(lockPath)
-  claimLock()
-}
-try { claimLock() } catch (error) { die(error.message) }
-process.on('exit', () => { try { unlinkSync(lockPath) } catch {} })
+let releaseLock
+try { releaseLock = claimPidLock(lockPath, manifest.id, 'Claude channel', { program: 'claude-channel.mjs' }) } catch (error) { die(error.message) }
+process.on('exit', () => releaseLock())
 
 function regular(path, label, required = true) {
   if (!existsSync(path)) {
