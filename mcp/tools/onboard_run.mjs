@@ -174,10 +174,20 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
     }],
     ['givers', () => {
       const seats = add.givers.filter(giver => giver.seat)
-      const missing = seats.filter(giver => !mentions(JSON.parse(readFileSync(join(root, `${giver.seat}.json`), 'utf8')), add.pubkey))
+      // A giver with mention_rooms on that shares a room with the new agent needs no rewrite (#321):
+      // the rooms step proves the join, and its roster makes the agent mentionable there.
+      const viaRoom = new Map()
+      const missing = seats.filter(giver => {
+        const raw = JSON.parse(readFileSync(join(root, `${giver.seat}.json`), 'utf8'))
+        if (mentions(raw, add.pubkey)) return false
+        const shared = raw?.may_post?.mention_rooms === true && (raw.may_post.channels || []).find(c => add.rooms.includes(String(c).toLowerCase()))
+        if (shared) { viaRoom.set(giver.seat, String(shared).toLowerCase()); return false }
+        return true
+      })
+      const rooms = [...viaRoom].map(([seat, room]) => `; ${seat} can mention ${name} through room ${room}`).join('')
       const outside = add.givers.filter(giver => giver.outside).map(giver => giver.pubkey.slice(0, 8))
       const tail = outside.length ? `; outside the fleet, nothing run: ${outside.join(', ')}` : ''
-      if (!missing.length) return receipt('givers', outside.length ? 'pending' : 'done', `every seat giver can mention ${name}${tail}`)
+      if (!missing.length) return receipt('givers', outside.length ? 'pending' : 'done', `every seat giver can mention ${name}${rooms}${tail}`)
       if (!giversRedeploy) return receipt('givers', 'pending', `run again with --givers-redeploy: it redeploys ${missing.map(giver => giver.seat).join(', ')}${tail}`)
       for (const giver of missing) rewrite(root, giver.seat, raw => {
         if (!raw.may_post) throw new OnboardRefusal('ONBOARD_GIVER_NO_POST', `${giver.seat} has no may_post block`)
@@ -199,7 +209,7 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
     }],
     ['rooms', async () => {
       if (!session) return receipt('rooms', 'pending', 'waiting for the hive')
-      const rooms = await joinRooms({ add, session, now })
+      const rooms = await joinRooms({ add, session, now, relaySigner: manifests.get(name)?.buzz?.relaySigner || null })
       return receipt('rooms', rooms.state, rooms.detail)
     }],
   ]

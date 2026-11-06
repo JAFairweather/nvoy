@@ -226,7 +226,11 @@ export async function openBuzzSession({ relay, signer, timeoutMs = 10000, pingMs
   const ownAppData = f => Array.isArray(f?.kinds) && f.kinds.length === 1 && f.kinds[0] === 30078 &&
     Array.isArray(f?.authors) && f.authors.length === 1 && f.authors[0] === me && f['#h'] === undefined &&
     Array.isArray(f['#d']) && f['#d'].length === 1 && typeof f['#d'][0] === 'string' && f.limit === 1
-  const needsChannels = filters => !filters.length || filters.some(f => !notices(f) && !ownProfile(f) && !ownAppData(f) &&
+  // Room members' kind-0 profiles, for their mention names (#321): kind 0 only, 1..100 exact keys, nothing else.
+  const profiles = f => f && Object.keys(f).every(k => k === 'kinds' || k === 'authors') && Array.isArray(f.kinds) &&
+    f.kinds.length === 1 && f.kinds[0] === 0 && Array.isArray(f.authors) && f.authors.length >= 1 && f.authors.length <= 100 &&
+    f.authors.every(a => /^[0-9a-f]{64}$/.test(String(a)))
+  const needsChannels = filters => !filters.length || filters.some(f => !notices(f) && !ownProfile(f) && !ownAppData(f) && !profiles(f) &&
     (!Array.isArray(f?.['#h']) || !f['#h'].length || !f['#h'].every(validChannel)))
 
   try {

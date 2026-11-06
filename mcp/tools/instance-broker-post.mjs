@@ -20,11 +20,12 @@ import { brokerSigner } from './broker_signer.mjs'
 import { channelPost, openBuzzSession } from './buzz_native.mjs'
 import { replyRequestDigest } from './outbound_record.mjs'
 import { countInWindow } from './agent_limits.mjs'
-import { POST_ONLY_REPLY, postQueuePath, recordMentionGrants, validatePostRequest, withMentionGrants } from './agent_post.mjs'
+import { POST_ONLY_REPLY, offList, postQueuePath, recordMentionGrants, validatePostRequest, withMentionGrants } from './agent_post.mjs'
+import { confirmMembers, readRooms, recordMentionRooms } from './room_roster.mjs'
 import { contentHash, credentialIn, withheldMessage } from './outbound_secrets.mjs'
 
-let signer, attentionEnv
-const exit = code => { try { signer?.close?.() } catch { /* best effort */ } process.exit(code) }
+let signer, attentionEnv, session
+const exit = code => { try { session?.close() } catch { /* best effort */ } try { signer?.close?.() } catch { /* best effort */ } process.exit(code) }
 const die = m => { console.error(`instance-broker-post: ${m}`); exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
 const id = flag('--instance'), requestId = flag('--request').toLowerCase()
@@ -62,6 +63,23 @@ try { validatePostRequest(request, allowed) } catch (e) { die(e.message) }
 const leaked = credentialIn(request.content)
 if (leaked) die(`post refused: ${withheldMessage(leaked)} [post sha256 ${contentHash(request.content)}] instance ${manifest.id}`)
 const digest = replyRequestDigest(request)
+// With mention_rooms on, a key neither the manifest nor a live grant covers can only be room-derived
+// (#321). The file the channel MCPs resolved it from is never authority: on every attempt, retries of
+// a signed post included, the relay's own member list is read fresh before counting, signing or
+// publishing. Absent is a refusal; unreadable holds the post for retry.
+const roomDerived = manifest.mayPost.mentionRooms ? offList(allowed, request.mention) : []
+async function confirmRoom() {
+  if (!roomDerived.length) return
+  if (!signer) ({ signer } = brokerSigner(die, { idleMs: 30000 }))
+  let absent
+  try {
+    session = await openBuzzSession({ relay: manifest.buzz.relay, signer })
+    absent = await confirmMembers({ session, room: request.channel, keys: roomDerived, relaySigner: manifest.buzz.relaySigner })
+  } catch (e) { die(`room member list unavailable: ${e.message}; held for retry`) }
+  // The discovery file catches up from the same session, a refusal included; best effort, never a condition of the post.
+  try { recordMentionRooms(manifest, await readRooms({ session, rooms: [request.channel], relaySigner: manifest.buzz.relaySigner, me: manifest.pubkey })) } catch { /* the timer refresh retries */ }
+  if (absent !== undefined) die(`post refused: ${absent.slice(0, 8)} is not on may_post.mention or in room ${request.channel}`)
+}
 
 const postsDir = resolve(manifest.stateDir, 'posts')
 mkdirSync(postsDir, { recursive: true, mode: 0o700 })
@@ -79,7 +97,9 @@ if (existsSync(recordPath)) {
   if (record?.version !== 1 || record.request_id !== requestId || record.request_digest !== digest || !ev || getEventHash(ev) !== record.fingerprint ||
       (record.event && (record.event.id !== record.fingerprint || !verifyEvent(JSON.parse(JSON.stringify(record.event)))))) die('post record does not bind this request')
   if (record.published === true) { console.log(JSON.stringify({ request: requestId, accepted: record.accepted, replay: true })); exit(0) }
-} else {
+}
+await confirmRoom()
+if (!record) {
   // Counted before anything exists to sign, so a crash after signing can never buy an extra post.
   let verdict
   try { verdict = countInWindow(resolve(manifest.stateDir, 'agent-limits', 'posts.json'), { key: 'post', id: requestId, limit: manifest.mayPost.perHour }) }
@@ -104,9 +124,9 @@ if (!record.event) {
 }
 let accepted = 0
 try {
-  const session = await openBuzzSession({ relay: manifest.buzz.relay, signer })
+  session ??= await openBuzzSession({ relay: manifest.buzz.relay, signer })
   try { const r = await session.publishSigned(record.event); if (r.accepted) accepted = 1; else console.error(`instance-broker-post: Buzz refused the post: ${r.message}`) }
-  finally { session.close() }
+  finally { session.close(); session = null }
 } catch (e) { console.error(`instance-broker-post: Buzz relay unavailable: ${e.message}`) }
 if (!accepted) die('the Buzz relay did not accept the persisted post; it remains retryable')
 record.published = true; record.published_at = Date.now(); record.accepted = accepted

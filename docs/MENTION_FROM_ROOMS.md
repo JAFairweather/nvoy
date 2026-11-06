@@ -1,6 +1,6 @@
 # Mention lists from room membership (#321)
 
-Status: spec for review. No code yet.
+Status: built on this branch (nvoy #321, PR #338); spec settled in review 2026-11-06. Live proof not yet run.
 
 ## The decision
 
@@ -103,7 +103,11 @@ The broker refreshes the file:
   the grants check uses, `instance-broker-post.mjs:51`);
 - in the hourly card run.
 
-A failed read keeps the last good file, and logs it. That file is for **discovery** only: what the
+A failed read keeps the last good file, and logs it. `recordMentionRooms` merges: a room not read this
+time (it failed, or a single-room refresh in the post path skipped it) keeps its last list, and when
+the profiles can't be read a member keeps the name it last had. The pre-signing read in §4 records
+what it read even when it then refuses the post. The agent card reads the file and never refreshes
+it. That file is for **discovery** only: what the
 channel MCPs show and resolve `@name` against. The broker never signs a room-derived mention on the
 strength of the file (see §4).
 
@@ -129,6 +133,12 @@ Who uses it:
   - the key is not in it: refuse, with the existing `NVOY_POST_MENTION_REFUSED`;
   - the roster can't be read, or no event passes the checks: hold the post for retry, as the grants
     path does today (`instance-broker-post.mjs:56`). Don't refuse it, and don't fall back to the file.
+
+  The invariant is **every publish attempt**: the read sits after the published-replay check and
+  before counting, signing and publishing, so a retry of a post that was signed but never published
+  reads the roster again. A replay of a post already published reads nothing, since it publishes
+  nothing. The read happens only when a room-derived key is present; a post that mentions only
+  manifest or grant keys never touches the roster.
 
   The fresh read also rewrites `mention-rooms.json`, so the discovery view catches up.
 - **Broker, reply path:** the same check, with the same pre-signing read
