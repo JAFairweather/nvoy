@@ -110,11 +110,11 @@ export function instructionsUpdate(current, manifest) {
   return `${text.replace(/\n*$/, '\n\n')}${rule}`
 }
 
-// The instructions file only when it is a regular file of its own, opened without following a link:
-// { text }, { missing: true }, or null for a symlink or anything else, which is left alone.
+// The instructions file only when it is a regular file of its own, opened without following a link or
+// waiting on a FIFO: { text }, { missing: true }, or null for a symlink or anything else, which is left alone.
 function ownInstructions(path) {
   let fd
-  try { fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW) } catch (error) { return error.code === 'ENOENT' ? { missing: true } : null }
+  try { fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK) } catch (error) { return error.code === 'ENOENT' ? { missing: true } : null }
   try { return fstatSync(fd).isFile() ? { text: readFileSync(fd, 'utf8') } : null } finally { closeSync(fd) }
 }
 

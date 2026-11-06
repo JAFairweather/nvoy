@@ -128,6 +128,12 @@ ok('the rule never asks the agent to read memory it has no tool for', !/memory_q
     readFileSync(outside, 'utf8') === own && (statSync(outside).mode & 0o777) === 0o644 && lstatSync(link).isSymbolicLink())
   const dangling = join(dir, 'dangling'); mkdirSync(dangling, { recursive: true }); symlinkSync(join(root, 'nowhere.md'), join(dangling, 'CLAUDE.md'))
   ok('a dangling symlink is not followed to create its target', !ensureInstructions(join(dangling, 'CLAUDE.md'), rememberer) && !existsSync(join(root, 'nowhere.md')))
+  const piped = join(dir, 'piped'), fifo = join(piped, 'AGENTS.md'); mkdirSync(piped, { recursive: true })
+  const made = spawnSync('mkfifo', [fifo]).status === 0
+  const probe = spawnSync(process.execPath, ['--input-type=module', '-e',
+    `import { ensureInstructions } from ${JSON.stringify(resolve('mcp/tools/harness_session.mjs'))}; process.stdout.write(String(ensureInstructions(${JSON.stringify(fifo)}, ${JSON.stringify(rememberer)})))`],
+  { timeout: 5000, encoding: 'utf8' })
+  ok('a FIFO instructions file is left alone without waiting for a writer', made && probe.status === 0 && probe.stdout === 'false' && lstatSync(fifo).isFIFO())
 }
 const fresh = claudeArgs({ server: 'nvoy-mc-test', mcpConfigPath: '/home/harness/.nvoy-harness/mcp.json', resume: false })
 ok('the session loads exactly its own channel server and no ambient MCP configuration', JSON.stringify(fresh) === JSON.stringify(['--dangerously-load-development-channels', 'server:nvoy-mc-test', '--mcp-config', '/home/harness/.nvoy-harness/mcp.json', '--strict-mcp-config']))
