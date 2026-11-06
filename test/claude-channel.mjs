@@ -151,6 +151,16 @@ const selfLocked = spawnSync('sh', ['-c', 'printf \'{"version":1,"instance":"%s"
 ok('a lock naming the channel\'s own PID is stale, not a live rival',
   selfLocked.status === 0 && !/already runs as pid/.test(selfLocked.stderr) && !existsSync(lockPath))
 
+// After a container recreate the old PID can belong to another user's process (EPERM, not ESRCH).
+// The channel must reclaim that lock, not exit and leave the agent's tools "reconnecting" (2026-11-06).
+if (existsSync('/proc/1/cmdline')) {
+  writeFileSync(lockPath, JSON.stringify({ version: 1, instance: manifest.id, pid: 1, started_at: 0 }))
+  const foreign = spawnSync(process.execPath, [resolve('mcp/tools/claude-channel.mjs'), '--instance', manifest.id, '--poll-ms', '250', '--handshake-ms', '1000'],
+    { env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, encoding: 'utf8', timeout: 8000, input: '' })
+  ok('a lock whose PID now runs another program is stale, not a live rival',
+    foreign.status === 0 && !/already runs as pid/.test(foreign.stderr) && !existsSync(lockPath))
+}
+
 // Negative control. Without this, "releases the lock" is indistinguishable from "exits on a timer",
 // which would replace a stuck lane with one that dies under a working session — a real session is
 // legitimately silent for hours, so silence must never be the eviction signal. A live client is

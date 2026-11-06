@@ -207,6 +207,14 @@ ok('a feed lock whose live PID /proc shows running another program, or the feed 
 ok('a live PID running this instance\'s feed, or one /proc cannot describe, still holds the lock', /already runs as pid/.test(liveFeed) && /already runs as pid/.test(noProc) &&
   /already runs as pid/.test(noProgram))
 rmSync(strangerLock, { force: true })
+// A recreated container can hand the old PID to another user's process, where the liveness probe
+// answers EPERM rather than ESRCH (2026-11-06, Biggy's channel). /proc decides it as for any stranger.
+mkdirSync(join(proc, '1'), { recursive: true }); writeFileSync(join(proc, '1', 'cmdline'), '/sbin/init\0')
+writeFileSync(strangerLock, JSON.stringify({ version: 1, instance: 'cx-test', pid: 1, started_at: 1 }))
+let foreignUser
+try { claimPidLock(strangerLock, 'cx-test', 'Claude channel', { program: 'claude-channel.mjs', procRoot: proc })(); foreignUser = 'claimed' } catch (error) { foreignUser = error.message }
+ok('a lock whose PID now belongs to another user\'s unrelated process is reclaimed', foreignUser === 'claimed')
+rmSync(strangerLock, { force: true })
 const quiet = spawn(process.execPath, ['mcp/tools/codex-channel-feed.mjs', '--instance', 'cx-test', '--client-timeout-ms', '600'], { cwd: resolve('.'), env: { ...process.env, NVOY_INSTANCE_ROOT: fleet } })
 let quietErr = ''
 quiet.stdin.on('error', () => {})
