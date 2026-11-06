@@ -8,7 +8,7 @@ import { symlinkSync, lstatSync, appendFileSync, chmodSync, existsSync, mkdtempS
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
-import { sshChannelEntry } from '../mcp/tools/channel_client.mjs'
+import { HIVE_CONNECT, sshChannelEntry } from '../mcp/tools/channel_client.mjs'
 import { fakeHerdr } from './fake-herdr.mjs'
 import { CODEX_CHANNEL_TOOLS, channelProcessUp, classifyPane, claudeArgs, codexConfigToml, codexTurnText, defaultInstructions, ensureInstructions, hasPriorSession, instructionsUpdate, MEMORY_RULE_MARKER, mcpConfig, RECALL_RULE_MARKER, pendingEnvelopes, seedClaudeJson, seedSettings, serverName } from '../mcp/tools/harness_session.mjs'
 
@@ -107,6 +107,9 @@ const recallMcp = mcpConfig({ manifest: { id: 'mc-test', recall: reader }, root:
 ok('a recall block mounts the instance\'s own reader beside its channel, over its own key and pinned host', Object.keys(recallMcp).join() === 'nvoy-mc-test,hive-memory' &&
   recallMcp['hive-memory'].args.at(-1) === reader.target && recallMcp['hive-memory'].args.includes('/keys/mc-read') && recallMcp['hive-memory'].args.includes('UserKnownHostsFile=/keys/herd_known_hosts') &&
   !recallMcp['hive-memory'].args.includes('/keys/mc-channel') && recallMcp['hive-memory'].args.includes('IdentitiesOnly=yes'))
+const localMcp = mcpConfig({ manifest: { id: 'mc-test', recall: { local: true } }, root: '', remote: channelRemote }).mcpServers
+ok('local recall mounts the box\'s own bridge with no arguments, no key and no ssh', Object.keys(localMcp).join() === 'nvoy-mc-test,hive-memory' &&
+  JSON.stringify(localMcp['hive-memory']) === JSON.stringify({ command: HIVE_CONNECT, args: [] }) && HIVE_CONNECT === '/usr/local/lib/hive-memory/connect')
 ok('without a recall block the session mounts only its channel', Object.keys(mcpConfig({ manifest: { id: 'mc-test' }, root: '', remote: channelRemote }).mcpServers).join() === 'nvoy-mc-test')
 const recallAllow = seedSettings({}, 'nvoy-mc-test', { recall: true }).permissions.allow
 ok('recall allows the two read tools by name, never the whole server', JSON.stringify(recallAllow) === '["mcp__nvoy-mc-test","mcp__hive-memory__memory_wake","mcp__hive-memory__memory_query"]' &&
@@ -119,6 +122,7 @@ const savedOnly = instructionsUpdate(null, { ...recaller, recall: undefined })
 const gained = instructionsUpdate(savedOnly, recaller)
 ok('a file that has the memory rule gains the recall rule, appended once, and is then left alone', gained.startsWith(savedOnly) && gained.split(RECALL_RULE_MARKER).length === 2 &&
   gained.split(MEMORY_RULE_MARKER).length === 2 && instructionsUpdate(gained, recaller) === null)
+ok('local recall carries the same recall rule', instructionsUpdate(null, { ...recaller, recall: { local: true } }) === both)
 ok('without a recall block there is no recall rule', !instructionsUpdate(null, { ...recaller, recall: undefined }).includes(RECALL_RULE_MARKER))
 const rememberer = { id: 'mc-test', pubkey: 'c'.repeat(64), buzz: { channels: [channel] }, mayRemember: { rooms: ['r'], perHour: 10 } }
 const created = instructionsUpdate(null, rememberer)
