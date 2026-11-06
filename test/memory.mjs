@@ -772,6 +772,65 @@ const loseHost = p => { for (const f of [p.db, `${p.db}-wal`, `${p.db}-shm`, p.l
     s2.submit({ writer: 'james', event: claim(james, 'hive:ops', 'after', { nowSec: now + 11 }), expectedPriorId: null, nowSec: now + 11 }).code === 'HIVE_MEMORY_PURGE_BACKUP_INCOMPLETE')
   s2.close()
 }
+{
+  // One restore that both acknowledges a lost write and purges a row past retention stages two ops in one
+  // SQLite commit; startup replays both pending lines, and only when they match exactly.
+  const combined = async name => {
+    const p = setup(name)
+    const s = open(p)
+    const old = claim(james, 'hive:ops', 'rolling', { ttlSec: 0 })
+    const succ = claim(james, 'hive:ops', 'rolling', { ttlSec: 0, priorCreatedAt: old.created_at })
+    s.submit({ writer: 'james', event: old, expectedPriorId: null, nowSec: T0 + 50 })
+    s.submit({ writer: 'james', event: succ, expectedPriorId: old.id, nowSec: T0 + 51 })
+    const S = await backupDir(p, 'S')
+    s.submit({ writer: 'james', event: claim(james, 'hive:ops', 'lost'), expectedPriorId: null, nowSec: T0 + 52 })
+    s.close()
+    const now = succ.created_at + RETENTION_PURGE_AFTER_SEC + 1
+    const run = hooks => restoreSnapshot({ snapshotPath: S.snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG, authority: S.authority, acknowledgeGap: 4, reapplyPurges: true, nowSec: now, hooks })
+    return { p, run, old }
+  }
+  const ops = p => readLedger(p.ledger).lines.map(l => l.rec.op).join(',')
+  const c = await combined('restore-combined')
+  ok('[gap-ack + retention purge] crash after COMMIT and install, before the ledger append, throws with the DB two ahead',
+    throwsCode(() => c.run({ afterCommit: crash }), 'SIMULATED_CRASH') && ledgerSeqs(c.p).length === 4 &&
+    withDb(c.p.db, d => d.prepare('SELECT write_seq FROM store_meta').get().write_seq) === 6)
+  const s1 = open(c.p)
+  ok('[gap-ack + retention purge] startup replays both pending lines in order and reaches READY at N+2',
+    s1.state === 'READY' && seqOf(s1) === 6 && ops(c.p) === 'init,submit,submit,submit,restore-gap-ack,purge' &&
+    !s1.db.prepare('SELECT 1 FROM events WHERE id = ?').get(c.old.id))
+  ok('[gap-ack + retention purge] writers stay fenced until a verified backup covers the replayed purge',
+    s1.submit({ writer: 'james', event: claim(james, 'hive:ops', 'after', { nowSec: T0 + 60 }), expectedPriorId: null, nowSec: T0 + 60 }).code === 'HIVE_MEMORY_PURGE_BACKUP_INCOMPLETE')
+  s1.close()
+
+  const t = await combined('restore-combined-torn')
+  ok('[gap-ack + retention purge] a crash mid-append, after the first line lands, throws',
+    throwsCode(() => t.run({ ledgerWrite: (fd, data) => { writeSync(fd, data, 0, data.indexOf(10) + 12); crash() } }), 'SIMULATED_CRASH'))
+  const s2 = open(t.p)
+  ok('[gap-ack + retention purge] startup truncates the torn line, appends only the missing purge, and reaches READY at N+2',
+    s2.state === 'READY' && seqOf(s2) === 6 && ops(t.p) === 'init,submit,submit,submit,restore-gap-ack,purge')
+  s2.close()
+
+  const tamper = [
+    ['a pending list one line short', d => d.prepare("UPDATE store_meta SET pending_ledger_json = substr(pending_ledger_json, instr(pending_ledger_json, char(10)) + 1)").run()],
+    ['a pending list whose lines are reordered', d => {
+      const [a, b] = d.prepare('SELECT pending_ledger_json AS j FROM store_meta').get().j.split('\n')
+      d.prepare('UPDATE store_meta SET pending_ledger_json = ?').run(`${b}\n${a}`)
+    }],
+    ['a pending purge that names a different row', d => {
+      const [a, b] = d.prepare('SELECT pending_ledger_json AS j FROM store_meta').get().j.split('\n')
+      d.prepare('UPDATE store_meta SET pending_ledger_json = ?').run(`${a}\n${JSON.stringify({ ...JSON.parse(b), purged_ids: ['ab'.repeat(32)] })}`)
+    }],
+  ]
+  for (const [label, edit] of tamper) {
+    const m = await combined(`restore-combined-${tamper.findIndex(x => x[0] === label)}`)
+    throwsCode(() => m.run({ afterCommit: crash }), 'SIMULATED_CRASH')
+    withDb(m.p.db, edit)
+    const s3 = open(m.p)
+    ok(`[gap-ack + retention purge] ${label} fails closed (DB_AHEAD_OF_LEDGER) and appends nothing`,
+      s3.state === 'DB_AHEAD_OF_LEDGER' && unknownAnswer(s3, 'DB_AHEAD_OF_LEDGER') && ledgerSeqs(m.p).length === 4)
+    s3.close()
+  }
+}
 
 // --- Retention purge and owner hard delete ---
 {

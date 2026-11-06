@@ -3,6 +3,7 @@
 // Signed claims live in SQLite (node:sqlite, WAL, synchronous = FULL) beside a metadata-only
 // accepted-write ledger. Every write commits in three phases: SQLite first (with the exact ledger
 // line staged in store_meta.pending_ledger_json), then the fsynced ledger append, then the reply.
+// A restore that commits several ops in one transaction stages all their lines, newline-joined.
 // Startup reconciles the two and refuses to serve ('unknown', never 'none') until they agree.
 // Nothing here opens a network connection.
 
@@ -498,14 +499,13 @@ export class HiveMemoryStore {
     if (meta.store_id !== fold.storeId) return this.#fail('STORE_ID_MISMATCH', null)
     const resurrected = [...ids].filter(id => fold.purged.has(id))
     if (resurrected.length) return this.#fail('DB_HAS_UNEXPECTED_OR_PURGED_EVENTS', `${resurrected.length} purged event(s) present`)
-    if (meta.write_seq === fold.maxSeq + 1) {
-      const bad = this.#pendingReplayError(meta, ids, fold)
-      if (bad) return this.#fail('DB_AHEAD_OF_LEDGER', bad)
-      try { appendLedgerLine(this.ledgerPath, meta.pending_ledger_json) } catch (e) { return this.#fail('LEDGER_IO_ERROR', e.code || e.message) }
-      this.log(`hive-memory: flushed pending ledger line seq ${meta.write_seq}`)
-      applyLedgerRecord(fold, JSON.parse(meta.pending_ledger_json))
+    if (meta.write_seq > fold.maxSeq) {
+      const replay = this.#pendingReplay(meta, ids, fold, ledger.lines)
+      if (typeof replay === 'string') return this.#fail('DB_AHEAD_OF_LEDGER', replay)
+      try { appendLedgerLine(this.ledgerPath, replay.map(l => l.raw).join('\n')) } catch (e) { return this.#fail('LEDGER_IO_ERROR', e.code || e.message) }
+      this.log(`hive-memory: flushed ${replay.length} pending ledger line(s) through seq ${meta.write_seq}`)
+      for (const { rec } of replay) applyLedgerRecord(fold, rec)
     }
-    if (meta.write_seq > fold.maxSeq) return this.#fail('DB_AHEAD_OF_LEDGER', `write_seq ${meta.write_seq}, ledger ${fold.maxSeq}`)
     if (meta.write_seq < fold.maxSeq) return this.#fail('DB_BEHIND_LEDGER', `write_seq ${meta.write_seq}, ledger ${fold.maxSeq}`)
     const missing = difference(fold.expected, ids)
     if (missing.size) return this.#fail('DB_BEHIND_LEDGER', `${missing.size} accepted event(s) missing`)
@@ -540,14 +540,28 @@ export class HiveMemoryStore {
     return this.#rowsValidError(ids)
   }
 
-  #pendingReplayError(meta, ids, fold) {
-    let pending
-    try { pending = JSON.parse(meta.pending_ledger_json) } catch { return 'pending_ledger_json is not JSON' }
-    if (ledgerShapeError(pending, meta.write_seq - 1, fold.storeId)) return 'pending_ledger_json does not continue the ledger'
-    const next = applyLedgerRecord({ ...fold, expected: new Set(fold.expected), purged: new Set(fold.purged) }, pending)
-    if (!setsEqual(next.expected, ids)) return 'pending record does not reproduce the stored event ids'
-    if ([...ids].some(id => next.purged.has(id))) return 'pending record leaves purged events stored'
-    return pending.op === 'submit' ? this.#rowsValidError([pending.id]) : null
+  // The ledger lines the DB is ahead by, or why they cannot be replayed. The staged lines the ledger
+  // already ends with (a torn multi-line append) must match it byte for byte; the rest must continue it.
+  #pendingReplay(meta, ids, fold, ledgerLines) {
+    const raws = meta.pending_ledger_json.split('\n')
+    const ahead = meta.write_seq - fold.maxSeq
+    if (ahead > raws.length) return `write_seq ${meta.write_seq}, ledger ${fold.maxSeq}, ${raws.length} pending line(s)`
+    const landed = raws.length - ahead
+    const tail = ledgerLines.slice(ledgerLines.length - landed)
+    if (tail.length !== landed || tail.some((l, i) => l.raw !== raws[i])) return 'pending lines already in the ledger do not match it'
+    const next = { ...fold, expected: new Set(fold.expected), purged: new Set(fold.purged) }
+    const replay = []
+    for (const raw of raws.slice(landed)) {
+      let rec
+      try { rec = JSON.parse(raw) } catch { return 'pending_ledger_json is not JSON' }
+      if (ledgerShapeError(rec, next.maxSeq, next.storeId)) return 'pending_ledger_json does not continue the ledger'
+      applyLedgerRecord(next, rec)
+      replay.push({ raw, rec })
+    }
+    if (!setsEqual(next.expected, ids)) return 'pending records do not reproduce the stored event ids'
+    if ([...ids].some(id => next.purged.has(id))) return 'pending records leave purged events stored'
+    const submitted = replay.filter(l => l.rec.op === 'submit').map(l => l.rec.id)
+    return (submitted.length && this.#rowsValidError(submitted)) || replay
   }
 
   readReceipt() { return readReceiptFile(this.receiptPath) }
@@ -1112,7 +1126,7 @@ export function restoreSnapshot({
           db.prepare('UPDATE store_meta SET last_event_id = ? WHERE singleton = 1').run(last)
           staged.push(JSON.stringify({ seq: ++seq, op: 'purge', store_id: fold.storeId, purged_ids: due, reason: 'retention', at: nowSec }))
         }
-        db.prepare('UPDATE store_meta SET write_seq = ?, pending_ledger_json = ?, last_purge_seq = ? WHERE singleton = 1').run(seq, staged.at(-1), due.length ? seq : fold.lastPurgeSeq)
+        db.prepare('UPDATE store_meta SET write_seq = ?, pending_ledger_json = ?, last_purge_seq = ? WHERE singleton = 1').run(seq, staged.join('\n'), due.length ? seq : fold.lastPurgeSeq)
       }, hooks, acked.length ? 'restore-gap-ack' : 'purge')
       if (due.length) {
         db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
