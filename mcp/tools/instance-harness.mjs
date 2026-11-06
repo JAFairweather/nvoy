@@ -24,7 +24,7 @@ import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest
 import { readClientConfig } from './channel_client.mjs'
 import { runCodexHarness } from './codex_harness.mjs'
 import { herdrAgentName, herdrClient, herdrSession } from './harness_herdr.mjs'
-import { channelProcessUp, classifyPane, claudeArgs, defaultInstructions, hasPriorSession, mcpConfig, seedClaudeJson, seedSettings, serverName } from './harness_session.mjs'
+import { channelProcessUp, classifyPane, claudeArgs, ensureInstructions, hasPriorSession, mcpConfig, seedClaudeJson, seedSettings, serverName } from './harness_session.mjs'
 
 const die = message => { console.error(`instance-harness: ${message}`); process.exit(1) }
 const log = message => console.log(`instance-harness: ${message}`)
@@ -35,7 +35,8 @@ const root = process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances'
 let manifest, remote = null
 if (process.argv.includes('--remote')) {
   try { remote = readClientConfig(flag('--remote'), id) } catch (error) { die(error.message) }
-  manifest = { id: remote.id, pubkey: remote.pubkey, buzz: { channels: remote.channels }, harness: { runner: 'claude', model: remote.model } }
+  manifest = { id: remote.id, pubkey: remote.pubkey, buzz: { channels: remote.channels }, harness: { runner: 'claude', model: remote.model },
+    ...(remote.remember ? { mayRemember: { remote: true } } : {}) }
 } else {
   try { manifest = readManifest(root, instanceId(id)); assertNoCollisions(root, manifest) } catch (error) { die(error.message) }
   if (!manifest.harness) die('manifest has no harness block')
@@ -85,7 +86,7 @@ const settings = seedSettings(readJson(settingsPath), server)
 writePrivate(settingsPath, JSON.stringify(settings, null, 2))
 const sessionMcp = mcpConfig({ manifest, root, remote })
 writePrivate(mcpConfigPath, JSON.stringify(sessionMcp, null, 2))
-if (!existsSync(resolve(workdir, 'CLAUDE.md'))) writePrivate(resolve(workdir, 'CLAUDE.md'), defaultInstructions(manifest))
+ensureInstructions(resolve(workdir, 'CLAUDE.md'), manifest)
 // The channel lock lives on the runtime volume, so it outlives the container whose channel wrote it.
 // PIDs restart with the container, so its PID can name a live process here and the new channel
 // refuses to start, leaving a "ready" session with no ears (MC Claude, 2026-09-25 01:44 UTC).

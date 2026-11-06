@@ -2,8 +2,8 @@
 // unattended, the command line that loads the Nvoy channel into it, and a reader for the few
 // startup screens that need an answer. The supervisor (instance-harness.mjs) owns all effects.
 
-import { existsSync, readdirSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { basename, dirname, resolve } from 'node:path'
 import { sshChannelEntry } from './channel_client.mjs'
 
 export const serverName = manifest => `nvoy-${manifest.id}`
@@ -72,6 +72,63 @@ export function defaultInstructions(manifest) {
     'This file is yours to extend; the harness writes it only when it is missing.',
     '',
   ].join('\n')
+}
+
+// The standing memory rule. Without it an agent with memory_claim treats it as optional and saves
+// nothing (seven writers on, no claims, 2026-11-06). The instructions file is the agent's to extend and
+// is written only when missing, so the rule is appended once, under its marker, to a file already there.
+export const MEMORY_RULE_MARKER = '## Remember in Hive memory'
+export function memoryRule(manifest) {
+  if (!manifest.mayRemember) return ''
+  return [
+    MEMORY_RULE_MARKER,
+    '',
+    'Hive memory is the hive\'s shared, signed record, in a private store on herd-cloud. A fact you do not',
+    'save is gone when your session ends, so saving it is part of finishing the work.',
+    '',
+    'Before you reply on a task, save with `memory_claim` anything the work settled:',
+    '- a decision, with who made it and why (`ttl_sec: 0`, kept until replaced or withdrawn);',
+    '- a status change: started, shipped, blocked, dropped, or who owns the next step (14 days by default);',
+    '- a non-obvious fact or gotcha another agent would otherwise rediscover.',
+    '',
+    'One fact per claim, under a stable slug such as `<topic>-<fact>`; `topic` is the project slug',
+    '(`nvoy`, `herd-infra`, `hive-memory`, `buzz`, `r1`). Cite evidence (a commit, PR, file path, test run or',
+    'Buzz event) and anchor it with `as_of_git` or `as_of_evt`. When a fact changes, claim it again at the',
+    'same slug; that replaces your earlier claim. When it stops being true, `memory_withdraw` it.',
+    '',
+    'Never save chat, narration, guesses, anything personal or a secret, and never copy prose that is',
+    'already in git or a doc; cite it instead.',
+    '',
+  ].join('\n')
+}
+
+// The instructions file as it should be: the defaults when missing, plus the memory rule once.
+// Returns the text to write, or null when the file is already right.
+export function instructionsUpdate(current, manifest) {
+  const text = current ?? defaultInstructions(manifest), rule = memoryRule(manifest)
+  if (!rule || text.includes(MEMORY_RULE_MARKER)) return current == null ? text : null
+  return `${text.replace(/\n*$/, '\n\n')}${rule}`
+}
+
+// The instructions file only when it is a regular file of its own, opened without following a link or
+// waiting on a FIFO: { text }, { missing: true }, or null for a symlink or anything else, which is left alone.
+function ownInstructions(path) {
+  let fd
+  try { fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK) } catch (error) { return error.code === 'ENOENT' ? { missing: true } : null }
+  try { return fstatSync(fd).isFile() ? { text: readFileSync(fd, 'utf8') } : null } finally { closeSync(fd) }
+}
+
+// Writes through a new private file renamed over the path, so a link swapped in meanwhile is replaced,
+// never followed. Returns whether it wrote.
+export function ensureInstructions(path, manifest) {
+  const own = ownInstructions(path)
+  const next = own && instructionsUpdate(own.missing ? null : own.text, manifest)
+  if (next == null) return false
+  const tmp = resolve(dirname(path), `.${basename(path)}.${process.pid}.tmp`)
+  rmSync(tmp, { force: true })
+  writeFileSync(tmp, next, { mode: 0o600, flag: 'wx' })
+  try { renameSync(tmp, path) } catch (error) { rmSync(tmp, { force: true }); throw error }
+  return true
 }
 
 // `--continue` restores the mode the conversation last ran in, whatever settings.json now says, so the

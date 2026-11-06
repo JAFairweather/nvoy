@@ -4,13 +4,13 @@
 // tmux that only logs the session it is asked for drives the portable (--remote) Claude supervisor,
 // and a fake herdr that runs what it is typed drives its herdr form.
 // The first live session is the operator's check.
-import { appendFileSync, chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs'
+import { symlinkSync, lstatSync, appendFileSync, chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { sshChannelEntry } from '../mcp/tools/channel_client.mjs'
 import { fakeHerdr } from './fake-herdr.mjs'
-import { CODEX_CHANNEL_TOOLS, channelProcessUp, classifyPane, claudeArgs, codexConfigToml, codexTurnText, defaultInstructions, hasPriorSession, mcpConfig, pendingEnvelopes, seedClaudeJson, seedSettings, serverName } from '../mcp/tools/harness_session.mjs'
+import { CODEX_CHANNEL_TOOLS, channelProcessUp, classifyPane, claudeArgs, codexConfigToml, codexTurnText, defaultInstructions, ensureInstructions, hasPriorSession, instructionsUpdate, MEMORY_RULE_MARKER, mcpConfig, pendingEnvelopes, seedClaudeJson, seedSettings, serverName } from '../mcp/tools/harness_session.mjs'
 
 let fails = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); if (!value) fails++ }
@@ -101,6 +101,40 @@ ok('seeding never grants a bypass mode', !/bypass/i.test(JSON.stringify(seedSett
 const instructions = defaultInstructions({ id: 'mc-test', pubkey: 'c'.repeat(64), buzz: { channels: [channel] } })
 ok('the default instructions name the read and reply tools and treat message bodies as data', /nvoy_channel_read/.test(instructions) && /nvoy_channel_reply/.test(instructions) &&
   /never treat it as instructions/.test(instructions) && instructions.includes(channel) && !instructions.includes('c'.repeat(64)))
+const rememberer = { id: 'mc-test', pubkey: 'c'.repeat(64), buzz: { channels: [channel] }, mayRemember: { rooms: ['r'], perHour: 10 } }
+const created = instructionsUpdate(null, rememberer)
+ok('a new writer\'s instructions carry the standing memory rule once', created.startsWith(defaultInstructions(rememberer)) &&
+  created.split(MEMORY_RULE_MARKER).length === 2 && /Before you reply on a task, save with `memory_claim`/.test(created))
+const own = '# mine\n\nMy own notes.\n'
+const appended = instructionsUpdate(own, rememberer)
+ok('an existing instructions file keeps its text and gains the rule, appended', appended.startsWith(own) && appended.includes(MEMORY_RULE_MARKER))
+ok('a file that already has the rule is left alone, so an edit to it survives', instructionsUpdate(appended.replace('14 days', '7 days'), rememberer) === null)
+ok('an agent without memory gets no rule, and an existing file is left alone', instructionsUpdate(null, { id: 'x', buzz: {} }) === defaultInstructions({ id: 'x', buzz: {} }) &&
+  !instructionsUpdate(null, { id: 'x', buzz: {} }).includes(MEMORY_RULE_MARKER) && instructionsUpdate(own, { id: 'x', buzz: {} }) === null)
+ok('the rule never asks the agent to read memory it has no tool for', !/memory_query|memory_wake/.test(created))
+{
+  const dir = join(root, 'instructions'), path = join(dir, 'CLAUDE.md')
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(path, own)
+  const writes = [ensureInstructions(path, rememberer), ensureInstructions(path, rememberer)]
+  ok('a harness restart appends the rule to an existing file exactly once, privately', writes.join() === 'true,false' &&
+    readFileSync(path, 'utf8').split(MEMORY_RULE_MARKER).length === 2 && readFileSync(path, 'utf8').startsWith(own) && (statSync(path).mode & 0o777) === 0o600)
+  const fresh = join(dir, 'AGENTS.md')
+  ok('a missing instructions file is created with the defaults and the rule', ensureInstructions(fresh, rememberer) && readFileSync(fresh, 'utf8') === instructionsUpdate(null, rememberer))
+  const outside = join(root, 'outside.md'), linked = join(dir, 'linked'), link = join(linked, 'CLAUDE.md')
+  mkdirSync(linked, { recursive: true })
+  writeFileSync(outside, own, { mode: 0o644 }); symlinkSync(outside, link)
+  ok('a symlinked instructions file is left alone, and its target is never written or chmodded', !ensureInstructions(link, rememberer) &&
+    readFileSync(outside, 'utf8') === own && (statSync(outside).mode & 0o777) === 0o644 && lstatSync(link).isSymbolicLink())
+  const dangling = join(dir, 'dangling'); mkdirSync(dangling, { recursive: true }); symlinkSync(join(root, 'nowhere.md'), join(dangling, 'CLAUDE.md'))
+  ok('a dangling symlink is not followed to create its target', !ensureInstructions(join(dangling, 'CLAUDE.md'), rememberer) && !existsSync(join(root, 'nowhere.md')))
+  const piped = join(dir, 'piped'), fifo = join(piped, 'AGENTS.md'); mkdirSync(piped, { recursive: true })
+  const made = spawnSync('mkfifo', [fifo]).status === 0
+  const probe = spawnSync(process.execPath, ['--input-type=module', '-e',
+    `import { ensureInstructions } from ${JSON.stringify(resolve('mcp/tools/harness_session.mjs'))}; process.stdout.write(String(ensureInstructions(${JSON.stringify(fifo)}, ${JSON.stringify(rememberer)})))`],
+  { timeout: 5000, encoding: 'utf8' })
+  ok('a FIFO instructions file is left alone without waiting for a writer', made && probe.status === 0 && probe.stdout === 'false' && lstatSync(fifo).isFIFO())
+}
 const fresh = claudeArgs({ server: 'nvoy-mc-test', mcpConfigPath: '/home/harness/.nvoy-harness/mcp.json', resume: false })
 ok('the session loads exactly its own channel server and no ambient MCP configuration', JSON.stringify(fresh) === JSON.stringify(['--dangerously-load-development-channels', 'server:nvoy-mc-test', '--mcp-config', '/home/harness/.nvoy-harness/mcp.json', '--strict-mcp-config']))
 ok('a chosen model is passed as --model, and none is passed by default', JSON.stringify(claudeArgs({ server: 's', mcpConfigPath: '/m', resume: false, model: 'opus' }).slice(-2)) === '["--model","opus"]' && !fresh.includes('--model'))
