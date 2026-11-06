@@ -38,7 +38,9 @@ try {
   ok('the Codex instructions tell the agent what its manifest lets it do',
     /What this identity may do, from its manifest:.*not post: nvoy_channel_post is refused.*stops at 3 hops.*This runtime is release/.test(client.getInstructions()))
   const tools = (await client.listTools()).tools.map(tool => tool.name)
-  ok('fixed Codex MCP exposes bounded channel and manifest-gated profile tools', tools.join(',') === 'nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply,nvoy_channel_post,nvoy_profile_set,nvoy_profile_status')
+  ok('fixed Codex MCP exposes bounded channel and manifest-gated profile and memory tools', tools.join(',') === 'nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply,nvoy_channel_post,nvoy_profile_set,nvoy_profile_status,memory_claim,memory_withdraw')
+  const remembered = await client.callTool({ name: 'memory_withdraw', arguments: { slug: 'x', because: 'x' } })
+  ok('without may_remember the Codex memory tool refuses', remembered.isError === true && /NVOY_MEMORY_NOT_PERMITTED/.test(remembered.content[0].text))
   const post = await client.callTool({ name: 'nvoy_channel_post', arguments: { text: 'hello room' } })
   ok('without may_post the Codex post tool refuses: this identity may only reply', post.isError === true && /may only reply/.test(post.content[0].text))
   const listed = JSON.parse((await client.callTool({ name: 'nvoy_channel_list', arguments: {} })).content[0].text)

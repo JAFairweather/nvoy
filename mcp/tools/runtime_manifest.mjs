@@ -233,6 +233,20 @@ export function readManifest(root, requestedId) {
     if (new Set(names).size !== names.length) die('may_post.mention names must be distinct')
     mayPost = Object.freeze({ channels: Object.freeze(channels), perHour: block.per_hour, mention: Object.freeze(mention) })
   }
+  // Room-scoped Hive memory claims under the identity's own key (agent_memory.mjs), off until the
+  // owner names the rooms and an hourly cap. Every claim and withdrawal is a kind 30078 the broker signs.
+  let mayRemember = null
+  if (raw.may_remember != null) {
+    const block = raw.may_remember
+    if (typeof block !== 'object' || Array.isArray(block) || Object.keys(block).some(k => !['rooms', 'per_hour'].includes(k))) die('may_remember takes only rooms and per_hour')
+    if (!buzz) die('may_remember requires a buzz block')
+    if (brokerMode !== 'local' || deliveryMode !== 'notify_only' || workerEnabled) die('may_remember requires a local-broker, worker-disabled notify_only manifest')
+    const rooms = (Array.isArray(block.rooms) ? block.rooms : []).map(value => String(value || '').toLowerCase())
+    if (!rooms.length || !rooms.every(validChannel) || new Set(rooms).size !== rooms.length) die('may_remember.rooms requires distinct room UUIDs')
+    if (!rooms.every(r => buzz.channels.includes(r))) die('may_remember.rooms must be a subset of buzz.channels')
+    if (!Number.isInteger(block.per_hour) || block.per_hour < 1 || block.per_hour > 30) die('may_remember.per_hour must be an integer from 1 to 30')
+    mayRemember = Object.freeze({ rooms: Object.freeze(rooms), perHour: block.per_hour })
+  }
   let maySetProfile = null
   if (raw.may_set_profile != null) {
     const block = raw.may_set_profile
@@ -275,7 +289,7 @@ export function readManifest(root, requestedId) {
     }
   }
   return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, carriers: Object.freeze(carriers), buzz, relays, stateDir, runtimeDir, spoolDir,
-    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, adapterContainer, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath, codexAppBundleId, codexProjectLabel, codexChatLabel, codexUiDriver, harness, wakeWebhook, channelDoor, mayPost, maySetProfile, agentLimits, agentCard,
+    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, adapterContainer, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath, codexAppBundleId, codexProjectLabel, codexChatLabel, codexUiDriver, harness, wakeWebhook, channelDoor, mayPost, mayRemember, maySetProfile, agentLimits, agentCard,
     sshTarget, sshIdentityFile, sshKnownHostsFile, sshKnownHostsSha256, approvalEndpoint: approvalEndpoint.replace(/\/$/, '') })
 }
 
