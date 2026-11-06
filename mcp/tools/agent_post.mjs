@@ -117,6 +117,9 @@ export function capabilitySummary(manifest) {
     manifest.maySetProfile
       ? `set this seat's kind-0 profile with nvoy_profile_set under manifest grant ${manifest.maySetProfile.grantId}, at most ${manifest.maySetProfile.perDay} per rolling 24 hours; scope kind 0 and pubkey ${manifest.pubkey}; picture hosts ${manifest.maySetProfile.pictureHosts.join(', ')};`
       : 'not set profile: nvoy_profile_set is refused without may_set_profile;',
+    manifest.mayRemember
+      ? `write room memory with memory_claim and memory_withdraw in room ${manifest.mayRemember.rooms.join(', ')} (default ${manifest.mayRemember.rooms[0]}), at most ${manifest.mayRemember.perHour} an hour;`
+      : 'not write memory: memory_claim and memory_withdraw are refused without may_remember;',
     `a chain of agent messages stops at ${limits.maxHops} hops, and at most ${limits.perSenderPerHour} messages an hour from one sender are admitted.`,
     ...(m ? [PARTICIPATION] : []),
   ].join(' ')

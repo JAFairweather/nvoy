@@ -59,7 +59,7 @@ ok('the Codex release that runs its shell commands is readable too, and nothing 
 ok('its one MCP server is the hardened ssh entry to the channel forced command', (toml.match(/^\[mcp_servers\.[^.\]]+\]$/gm) || []).length === 1 &&
   toml.includes('[mcp_servers.nvoy-cx-test]\ncommand = "/usr/bin/ssh"\n') && JSON.stringify(args) === JSON.stringify(sshChannelEntry(remote).args) && !/NVOY_INSTANCE_ROOT/.test(toml))
 ok('each keyless channel tool, and only those, is pre-approved', CODEX_CHANNEL_TOOLS.every(tool => toml.includes(`[mcp_servers.nvoy-cx-test.tools.${tool}]\napproval_mode = "approve"\n`)) &&
-  (toml.match(/^approval_mode = /gm) || []).length === 6)
+  (toml.match(/^approval_mode = /gm) || []).length === 8)
 // grants: one harness's extra reach, never its own login, keys or the home directory itself
 const gOwn = '/Users/o', gHome = '/Users/o/.nvoy-harness/x/codex', gKeys = ['/Users/o/.nvoy-harness/x/id_channel', '/Users/o/.nvoy-harness/x/id_feed']
 const grant = raw => { try { return codexGrants(raw, { own: gOwn, codexHome: gHome, keys: gKeys }) } catch (e) { return e.message } }
@@ -207,6 +207,27 @@ ok('a feed lock whose live PID /proc shows running another program, or the feed 
 ok('a live PID running this instance\'s feed, or one /proc cannot describe, still holds the lock', /already runs as pid/.test(liveFeed) && /already runs as pid/.test(noProc) &&
   /already runs as pid/.test(noProgram))
 rmSync(strangerLock, { force: true })
+// A recreated container can hand the old PID to another user's process, where the liveness probe
+// answers EPERM rather than ESRCH (2026-11-06, Biggy's channel). The probe is forced to EPERM so the
+// case cannot pass through the self-PID exception; /proc then decides it as for any stranger.
+const foreignPid = process.pid + 100000
+mkdirSync(join(proc, String(foreignPid)), { recursive: true })
+const epermOver = (...argv) => {
+  writeFileSync(join(proc, String(foreignPid), 'cmdline'), argv.join('\0') + '\0')
+  writeFileSync(strangerLock, JSON.stringify({ version: 1, instance: 'cx-test', pid: foreignPid, started_at: 1 }))
+  const probed = []
+  const probe = pid => { probed.push(pid); throw Object.assign(new Error(`kill EPERM ${pid}`), { code: 'EPERM' }) }
+  let outcome
+  try { claimPidLock(strangerLock, 'cx-test', 'Claude channel', { program: 'claude-channel.mjs', procRoot: proc, probe })(); outcome = 'claimed' } catch (error) { outcome = error.message }
+  rmSync(strangerLock, { force: true })
+  return { outcome, probed }
+}
+const foreignUser = epermOver('node', '/srv/nvoy/mcp/tools/instance-adapter.mjs', '--instance', 'cx-test')
+const foreignChannel = epermOver('node', '/srv/nvoy/mcp/tools/claude-channel.mjs', '--instance', 'cx-test')
+ok('a lock whose PID answers EPERM and /proc shows running another program is reclaimed',
+  foreignUser.outcome === 'claimed' && foreignUser.probed.includes(foreignPid))
+ok('a lock whose PID answers EPERM but /proc shows this instance\'s channel still holds',
+  /EPERM/.test(foreignChannel.outcome) && foreignChannel.probed.includes(foreignPid))
 const quiet = spawn(process.execPath, ['mcp/tools/codex-channel-feed.mjs', '--instance', 'cx-test', '--client-timeout-ms', '600'], { cwd: resolve('.'), env: { ...process.env, NVOY_INSTANCE_ROOT: fleet } })
 let quietErr = ''
 quiet.stdin.on('error', () => {})

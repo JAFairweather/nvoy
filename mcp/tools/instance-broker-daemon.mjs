@@ -4,13 +4,14 @@
 // crash-left `.inflight` markers are requeued at boot and are harmless because the adapter queue
 // deduplicates on envelope before ACKing.
 
-import { appendFileSync, readdirSync, renameSync, readFileSync, lstatSync } from 'node:fs'
+import { appendFileSync, readdirSync, renameSync, readFileSync, lstatSync, rmSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { isTerminalReplyFailure, loadTerminalReplyIds, recordTerminalReply, terminalReplyReason } from './reply_retry.mjs'
 import { childVerdict } from './broker_verdict.mjs'
 import { finishedProfileRequests, PROFILE_PUBLIC_RETRY_EXIT } from './agent_profile.mjs'
+import { MEMORY_REQUEST_FILE, memoryQueueDir } from './agent_memory.mjs'
 
 const die = m => { console.error(`instance-broker-daemon: ${m}`); process.exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -44,6 +45,15 @@ try {
   }
 } catch (e) { if (e.code !== 'ENOENT') die(`cannot load terminal post log: ${e.message}`) }
 const isTerminalPost = stderr => /post refused:|post request has an invalid|post record does not bind/.test(stderr)
+// Agent memory writes (memory_claim, memory_withdraw), terminal on the same terms as posts.
+const terminalMemoryPath = resolve(manifest.stateDir, 'terminal-memory.jsonl')
+const memoryDone = new Set()
+try {
+  for (const line of readFileSync(terminalMemoryPath, 'utf8').split('\n')) {
+    try { const x = JSON.parse(line); if (x?.type === 'terminal-memory' && /^[0-9a-f]{32}$/.test(String(x.id))) memoryDone.add(x.id) } catch { /* partial line */ }
+  }
+} catch (e) { if (e.code !== 'ENOENT') die(`cannot load terminal memory log: ${e.message}`) }
+const isTerminalMemory = stderr => /memory refused:|memory request has an invalid|memory record does not bind/.test(stderr)
 const profileDone = new Set()
 const profileRetryAfter = new Map()
 let profileActive = null
@@ -190,6 +200,68 @@ function drainPosts() {
     console.error(`instance-broker-daemon: post ${request.slice(0, 12)}… held for retry: ${stderr}`)
   }
 }
+// The spool holds one <id>.json per request. Success and terminal outcomes unlink it, so the
+// claim text lives on this host only while a write is pending; a .tmp the writer never renamed is
+// swept once it is stale.
+const STALE_MEMORY_TMP_MS = 5 * 60 * 1000
+const MEMORY_RECORD_KEEP_MS = 30 * 24 * 3600 * 1000
+let memoryRecordsSweptAt = 0
+// A scrubbed enactment record keeps only ids and times; after 30 days it goes too. A record still
+// holding an event is pending and is never swept.
+function sweepMemoryRecords() {
+  if (Date.now() - memoryRecordsSweptAt < 3600 * 1000) return
+  memoryRecordsSweptAt = Date.now()
+  const dir = resolve(manifest.stateDir, 'memory')
+  let names
+  try { names = readdirSync(dir) } catch { return }
+  for (const name of names) {
+    if (!MEMORY_REQUEST_FILE.test(name)) continue
+    try {
+      const path = resolve(dir, name), x = JSON.parse(readFileSync(path, 'utf8'))
+      const at = x?.published === true ? x.published_at : x?.refused_at
+      if (!x?.unsigned_event && !x?.event && Number.isFinite(at) && Date.now() - at > MEMORY_RECORD_KEEP_MS) rmSync(path, { force: true })
+    } catch { /* unreadable records are left for the operator */ }
+  }
+}
+function drainMemory() {
+  sweepMemoryRecords()
+  const dir = memoryQueueDir(manifest)
+  let names
+  try {
+    const st = lstatSync(dir)
+    if (!st.isDirectory() || st.isSymbolicLink()) throw new Error('memory spool is not a directory')
+    names = readdirSync(dir)
+  } catch (e) { if (e.code !== 'ENOENT') console.error(`instance-broker-daemon: memory spool unavailable: ${e.message}`); return }
+  const unlink = name => { try { rmSync(resolve(dir, name), { force: true }) } catch (e) { console.error(`instance-broker-daemon: cannot unlink memory spool ${name.slice(0, 12)}…: ${e.code || e.message}`) } }
+  for (const name of names) {
+    if (!name.endsWith('.tmp')) continue
+    try { if (Date.now() - lstatSync(resolve(dir, name)).mtimeMs > STALE_MEMORY_TMP_MS) unlink(name) } catch { /* already gone */ }
+  }
+  for (const name of names) {
+    if (!MEMORY_REQUEST_FILE.test(name)) continue
+    const request = name.slice(0, 32), key = `memory:${request}`
+    if (memoryDone.has(request)) { unlink(name); continue }
+    if ((proposalRetryAfter.get(key) || 0) > Date.now()) continue
+    const r = spawnSync(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-memory.mjs'),
+      '--instance', manifest.id, '--request', request], { env: childEnv, encoding: 'utf8', timeout: 90000 })
+    const stderr = String(r.stderr || '').trim()
+    if (r.status === 0) {
+      memoryDone.add(request); proposalRetryAfter.delete(key); unlink(name)
+      if (/^instance-broker-memory: (claimed|withdrew)/.test(r.stdout)) console.log(r.stdout.trim())
+      continue
+    }
+    if (isTerminalMemory(stderr)) {
+      memoryDone.add(request)
+      try { appendFileSync(terminalMemoryPath, JSON.stringify({ version: 1, type: 'terminal-memory', id: request, at: Date.now() }) + '\n', { mode: 0o600 }) }
+      catch (e) { console.error(`instance-broker-daemon: cannot record terminal memory write ${request.slice(0, 12)}…: ${e.message}`) }
+      unlink(name)
+      console.error(`instance-broker-daemon: memory ${request.slice(0, 12)}… terminal: ${stderr.replace(/^instance-broker-memory: /, '')}`)
+      continue
+    }
+    proposalRetryAfter.set(key, Date.now() + 5000)
+    console.error(`instance-broker-daemon: memory ${request.slice(0, 12)}… held for retry: ${stderr}`)
+  }
+}
 function drainProfiles() {
   if (profileActive) return
   let ids
@@ -259,5 +331,6 @@ if (manifest.buzz?.statusReactions) supervise('instance-broker-status.mjs', 'sta
 drain()
 setInterval(drain, 1000)
 if (manifest.mayPost) { drainPosts(); setInterval(drainPosts, 1000) }
+if (manifest.mayRemember) { drainMemory(); setInterval(drainMemory, 1000) }
 if (manifest.maySetProfile) { drainProfiles(); setInterval(drainProfiles, 1000) }
 console.log(`instance-broker-daemon: draining ${manifest.id}`)

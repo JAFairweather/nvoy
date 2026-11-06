@@ -68,7 +68,7 @@ try:
     base = ["--rm", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges:true",
             "--tmpfs", "/tmp:mode=1777", *mount("instances", "/etc/nvoy/instances:ro")]
     expect("root-only initializer provisions isolated volumes", docker(["run", *base, "--user", "0:0",
-        "--cap-add=CHOWN", "--cap-add=FOWNER", "--cap-add=DAC_OVERRIDE",
+        "--cap-add=CHOWN", "--cap-add=FOWNER", "--cap-add=DAC_OVERRIDE", "--cap-add=FSETID",
         "-e", "NVOY_WORKER_PROVIDER_SOURCE=/run/nvoy-provider/provider",
         *mount("state", manifest["state_dir"]), *mount("spool", manifest["spool_dir"]),
         *mount("runtime", manifest["runtime_dir"]), *mount("provider", "/run/nvoy-provider:ro"),

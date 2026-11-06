@@ -18,7 +18,7 @@ services:
     user: "0:0"
     read_only: true
     cap_drop: [ALL]
-    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE]
+    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE, FSETID]
     security_opt: [no-new-privileges:true]
     tmpfs: [/tmp:mode=1777]
     environment:

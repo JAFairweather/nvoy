@@ -222,7 +222,11 @@ export async function openBuzzSession({ relay, signer, timeoutMs = 10000, pingMs
   const ownProfile = f => Array.isArray(f?.kinds) && f.kinds.length === 1 && f.kinds[0] === 0 &&
     Array.isArray(f?.authors) && f.authors.length === 1 && f.authors[0] === me && f['#h'] === undefined &&
     Number.isInteger(f.limit) && f.limit === 1
-  const needsChannels = filters => !filters.length || filters.some(f => !notices(f) && !ownProfile(f) &&
+  // Our own latest kind 30078 at one d tag: the relay stores it with no channel, so #h finds nothing.
+  const ownAppData = f => Array.isArray(f?.kinds) && f.kinds.length === 1 && f.kinds[0] === 30078 &&
+    Array.isArray(f?.authors) && f.authors.length === 1 && f.authors[0] === me && f['#h'] === undefined &&
+    Array.isArray(f['#d']) && f['#d'].length === 1 && typeof f['#d'][0] === 'string' && f.limit === 1
+  const needsChannels = filters => !filters.length || filters.some(f => !notices(f) && !ownProfile(f) && !ownAppData(f) &&
     (!Array.isArray(f?.['#h']) || !f['#h'].length || !f['#h'].every(validChannel)))
 
   try {
@@ -256,8 +260,8 @@ export async function openBuzzSession({ relay, signer, timeoutMs = 10000, pingMs
     publishSigned,
     // Sign and publish; resolves only on the relay's OK, and reports its refusal verbatim.
     async publish(template) { return publishSigned(await signer.signEvent(template)) },
-    // Stored events up to EOSE. Channel filters need #h; the two narrow exceptions are our own
-    // membership notices and our own latest kind-0 profile.
+    // Stored events up to EOSE. Channel filters need #h; the narrow exceptions are our own
+    // membership notices, our own latest kind-0 profile and our own latest kind 30078 at one d tag.
     async fetch(...filters) {
       if (needsChannels(filters)) throw new Error('every Buzz filter needs #h channel UUIDs — without it the relay returns nothing')
       const id = `q${++n}`

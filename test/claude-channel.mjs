@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
@@ -67,10 +67,14 @@ try {
     /stops at 3 hops/.test(client.getInstructions()) && /This runtime is release (unknown|[0-9a-f]{40})\./.test(client.getInstructions()))
   ok('the capabilities notice carries no message content', notices.every(n => !JSON.stringify(n).includes(task.messages[0].content)))
   const tools = (await client.listTools()).tools.map(tool => tool.name)
-  ok('Claude receives an explicit read tool, a receipt-bound reply tool, a body-free discovery tool, and the post tool',
-    tools.length === 6 && tools.includes('nvoy_channel_read') && tools.includes('nvoy_channel_reply') &&
+  ok('Claude receives an explicit read tool, a receipt-bound reply tool, a body-free discovery tool, the post tool and the memory tools',
+    tools.length === 8 && tools.includes('nvoy_channel_read') && tools.includes('nvoy_channel_reply') &&
     tools.includes('nvoy_channel_list') && tools.includes('nvoy_channel_post') &&
-    tools.includes('nvoy_profile_set') && tools.includes('nvoy_profile_status'))
+    tools.includes('nvoy_profile_set') && tools.includes('nvoy_profile_status') &&
+    tools.includes('memory_claim') && tools.includes('memory_withdraw'))
+  const remembered = await client.callTool({ name: 'memory_claim', arguments: { slug: 'x', claim: 'x', because: 'x', evidence: ['x'], as_of_git: 'x' } })
+  ok('without may_remember the memory tool refuses and queues nothing',
+    remembered.isError === true && /NVOY_MEMORY_NOT_PERMITTED/.test(remembered.content[0].text) && !existsSync(join(runtime, 'memory-requests')))
   const post = await client.callTool({ name: 'nvoy_channel_post', arguments: { text: 'hello room' } })
   ok('without may_post the post tool refuses: this identity may only reply',
     post.isError === true && /may only reply/.test(post.content[0].text) && !existsSync(join(runtime, 'post-requests.jsonl')))
@@ -146,6 +150,22 @@ const selfLocked = spawnSync('sh', ['-c', 'printf \'{"version":1,"instance":"%s"
     CHANNEL: resolve('mcp/tools/claude-channel.mjs') }, encoding: 'utf8', timeout: 8000, input: '' })
 ok('a lock naming the channel\'s own PID is stale, not a live rival',
   selfLocked.status === 0 && !/already runs as pid/.test(selfLocked.stderr) && !existsSync(lockPath))
+
+// After a container recreate the old PID can belong to another user's process: the probe answers
+// EPERM, not ESRCH. The channel must reclaim that lock, not exit and leave the agent's tools
+// "reconnecting" (2026-11-06). Lock a real process that answers EPERM here; where none exists
+// (the runner alone in a container as PID 1), say so rather than pass on another path.
+const epermPid = existsSync('/proc/self') ? readdirSync('/proc').filter(n => /^\d+$/.test(n)).map(Number).find(pid => {
+  if (pid === process.pid) return false
+  try { process.kill(pid, 0); return false } catch (error) { return error.code === 'EPERM' }
+}) : undefined
+if (epermPid) {
+  writeFileSync(lockPath, JSON.stringify({ version: 1, instance: manifest.id, pid: epermPid, started_at: 0 }))
+  const foreign = spawnSync(process.execPath, [resolve('mcp/tools/claude-channel.mjs'), '--instance', manifest.id, '--poll-ms', '250', '--handshake-ms', '1000'],
+    { env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, encoding: 'utf8', timeout: 8000, input: '' })
+  ok(`a lock naming another user's process (pid ${epermPid}, probe EPERM) is stale, not a live rival`,
+    foreign.status === 0 && !/already runs as pid|EPERM/.test(foreign.stderr) && !existsSync(lockPath))
+} else console.log('skip — no process here answers EPERM; the pid_lock unit test forces that case')
 
 // Negative control. Without this, "releases the lock" is indistinguishable from "exits on a timer",
 // which would replace a stuck lane with one that dies under a working session — a real session is

@@ -6,7 +6,7 @@
 // the same structural validation and duplicate-identity check.
 
 import { lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs'
-import { resolve, dirname, relative, sep } from 'node:path'
+import { resolve, dirname, isAbsolute, relative, sep } from 'node:path'
 import { decode } from 'nostr-tools/nip19'
 import { codexThreadId as validCodexThreadId, localControlSocket } from './codex_app_server.mjs'
 import { normalizeBuzzRelay } from './buzz_native.mjs'
@@ -233,6 +233,29 @@ export function readManifest(root, requestedId) {
     if (new Set(names).size !== names.length) die('may_post.mention names must be distinct')
     mayPost = Object.freeze({ channels: Object.freeze(channels), perHour: block.per_hour, mention: Object.freeze(mention) })
   }
+  // Room-scoped Hive memory claims under the identity's own key (agent_memory.mjs), off until the
+  // owner names the rooms, an hourly cap and the writer transport to the private store. Every claim
+  // and withdrawal is a kind 30078 the broker signs and submits there: `submit` is either the local
+  // writer socket or the forced-command SSH bridge to it, never a relay.
+  let mayRemember = null
+  if (raw.may_remember != null) {
+    const block = raw.may_remember
+    if (typeof block !== 'object' || Array.isArray(block) || Object.keys(block).some(k => !['rooms', 'per_hour', 'submit'].includes(k))) die('may_remember takes only rooms, per_hour and submit')
+    const transport = block.submit
+    if (!transport || typeof transport !== 'object' || Array.isArray(transport) || Object.keys(transport).length !== 1 ||
+        !(typeof transport.socket === 'string' ? isAbsolute(transport.socket) && !transport.socket.includes('\0')
+          : Array.isArray(transport.command) && transport.command.length > 0 && transport.command.every(a => typeof a === 'string' && a.length > 0 && !a.includes('\0')) && isAbsolute(transport.command[0]))) {
+      die('may_remember.submit takes exactly one of socket (an absolute path) or command (an absolute executable and its arguments)')
+    }
+    if (!buzz) die('may_remember requires a buzz block')
+    if (brokerMode !== 'local' || deliveryMode !== 'notify_only' || workerEnabled) die('may_remember requires a local-broker, worker-disabled notify_only manifest')
+    const rooms = (Array.isArray(block.rooms) ? block.rooms : []).map(value => String(value || '').toLowerCase())
+    if (!rooms.length || !rooms.every(validChannel) || new Set(rooms).size !== rooms.length) die('may_remember.rooms requires distinct room UUIDs')
+    if (!rooms.every(r => buzz.channels.includes(r))) die('may_remember.rooms must be a subset of buzz.channels')
+    if (!Number.isInteger(block.per_hour) || block.per_hour < 1 || block.per_hour > 30) die('may_remember.per_hour must be an integer from 1 to 30')
+    const submit = transport.socket ? Object.freeze({ socket: transport.socket }) : Object.freeze({ command: Object.freeze([...transport.command]) })
+    mayRemember = Object.freeze({ rooms: Object.freeze(rooms), perHour: block.per_hour, submit })
+  }
   let maySetProfile = null
   if (raw.may_set_profile != null) {
     const block = raw.may_set_profile
@@ -275,7 +298,7 @@ export function readManifest(root, requestedId) {
     }
   }
   return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, carriers: Object.freeze(carriers), buzz, relays, stateDir, runtimeDir, spoolDir,
-    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, adapterContainer, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath, codexAppBundleId, codexProjectLabel, codexChatLabel, codexUiDriver, harness, wakeWebhook, channelDoor, mayPost, maySetProfile, agentLimits, agentCard,
+    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, adapterContainer, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath, codexAppBundleId, codexProjectLabel, codexChatLabel, codexUiDriver, harness, wakeWebhook, channelDoor, mayPost, mayRemember, maySetProfile, agentLimits, agentCard,
     sshTarget, sshIdentityFile, sshKnownHostsFile, sshKnownHostsSha256, approvalEndpoint: approvalEndpoint.replace(/\/$/, '') })
 }
 
