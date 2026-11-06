@@ -81,12 +81,29 @@ export function sshChannelEntry({ identity, knownHosts, target }) {
 // A portable harness's whole configuration. It names paths, never values, and it can hold nothing
 // that signs: like a remote-broker manifest, a field that could carry a Nostr key or Bunker
 // credential refuses the file rather than being ignored.
-const CLIENT_FIELDS = new Set(['instance', 'ssh_target', 'identity_file', 'known_hosts_file', 'credential_file', 'home', 'model', 'pubkey', 'channels', 'remember'])
+const CLIENT_FIELDS = new Set(['instance', 'ssh_target', 'identity_file', 'known_hosts_file', 'credential_file', 'home', 'model', 'pubkey', 'channels', 'remember', 'recall'])
 // `remember` says the fleet manifest grants this instance memory, so its instructions carry the memory
 // rule. It only adds instructions; the fleet broker alone decides whether a memory write is allowed.
 export function rememberFlag(value) {
   if (value !== undefined && typeof value !== 'boolean') throw new Error('client config remember must be true or false')
   return value === true
+}
+
+// `recall` names the instance's own Hive memory read key: { identity_file, known_hosts_file, ssh_target }. The
+// session then mounts that reader as the hive-memory MCP server and its instructions carry the recall rule. The
+// gateway's forced command binds the key to one reader socket, which serves only memory_wake and memory_query.
+const RECALL_FIELDS = ['identity_file', 'known_hosts_file', 'ssh_target']
+export function recallEntry(value) {
+  if (value === undefined) return null
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('client config recall must be an object')
+  const keys = Object.keys(value)
+  if (keys.length !== RECALL_FIELDS.length || !RECALL_FIELDS.every(k => keys.includes(k))) {
+    throw new Error(`client config recall takes exactly ${RECALL_FIELDS.join(', ')}`)
+  }
+  const target = String(value.ssh_target)
+  if (!SSH_TARGET.test(target)) throw new Error('client config recall ssh_target must be a fixed user@host')
+  return Object.freeze({ identity: privateFile(String(value.identity_file), 'Hive memory read key'),
+    knownHosts: knownHostsFile(String(value.known_hosts_file)), target })
 }
 
 export function readClientConfig(path, id) {
@@ -114,10 +131,13 @@ export function readClientConfig(path, id) {
   if (pubkey && !/^[0-9a-f]{64}$/.test(pubkey)) throw new Error('client config pubkey must be 64 lowercase hex characters')
   const channels = raw.channels === undefined ? [] : raw.channels
   if (!Array.isArray(channels) || !channels.every(c => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(c))) throw new Error('client config channels must be Buzz channel ids')
-  return Object.freeze({
+  const config = Object.freeze({
     id: instanceId(id), target, home: resolve(home), model, pubkey, channels, remember: rememberFlag(raw.remember),
+    recall: recallEntry(raw.recall),
     identity: privateFile(String(raw.identity_file || ''), 'SSH identity file'),
     knownHosts: knownHostsFile(String(raw.known_hosts_file || '')),
     credentialFile: privateFile(String(raw.credential_file || ''), 'Claude login credential file'),
   })
+  if (config.recall && config.recall.identity === config.identity) throw new Error('the channel and Hive memory read keys must be two keys: each forced command admits exactly one')
+  return config
 }

@@ -88,6 +88,12 @@ ok('a reviewer is user unless auto_review is chosen, and goes into config.toml',
   /^approvals_reviewer = "auto_review"$/m.test(codexConfigToml({ manifest: { id: 'cx-test' }, root: '', auth: 'chatgpt', remote, approvals: approve({ policy: 'on-request', reviewer: 'auto_review' }) })) &&
   typeof approve({ policy: 'on-request', reviewer: 'guardian' }) === 'string')
 ok('approvals stay out of grants', typeof grant({ approvals: { policy: 'on-request' } }) === 'string')
+const recallToml = codexConfigToml({ manifest: { id: 'cx-test', recall: { identity: '/keys/cx-read', knownHosts: '/keys/herd_known_hosts', target: 'hive-memory-gw@herd-cloud' } }, root: '', auth: 'chatgpt', remote })
+ok('a recall block mounts the reader with its own key and host, and approves only its two read tools', /^\[mcp_servers\.hive-memory\]$/m.test(recallToml) &&
+  /"-i", "\/keys\/cx-read", "hive-memory-gw@herd-cloud"\]/.test(recallToml) && recallToml.includes('UserKnownHostsFile=/keys/herd_known_hosts') &&
+  /^\[mcp_servers\.hive-memory\.tools\.memory_wake\]$/m.test(recallToml) && /^\[mcp_servers\.hive-memory\.tools\.memory_query\]$/m.test(recallToml) &&
+  (recallToml.match(/^\[mcp_servers\.hive-memory\.tools\./gm) || []).length === 2 && recallToml.startsWith(toml))
+ok('without a recall block there is no reader', !toml.includes('hive-memory'))
 ok('a model is set only when chosen', !/^model = /m.test(toml) && /^model = "gpt-5\.5"$/m.test(codexConfigToml({ manifest: { id: 'cx-test' }, root: '', model: 'gpt-5.5', auth: 'chatgpt', remote })))
 ok('a ChatGPT config without the SSH channel, or an unknown auth mode, is refused', (() => { try { codexConfigToml({ manifest: { id: 'x' }, root: '', auth: 'chatgpt' }); return false } catch { return true } })() &&
   (() => { try { codexConfigToml({ manifest: { id: 'x' }, root: '', auth: 'env' }); return false } catch { return true } })())

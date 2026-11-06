@@ -12,7 +12,7 @@ import { join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
 import {
-  buildClaimTemplate, buildWithdrawalTemplate, checkMemorySecrets, nip01Newer, validateMemoryEvent,
+  DEFAULT_WAKE_MAX_CHARS, MIN_WAKE_MAX_CHARS, buildClaimTemplate, buildWithdrawalTemplate, checkMemorySecrets, nip01Newer, validateMemoryEvent,
 } from '../mcp/tools/memory.mjs'
 import {
   HiveMemoryStore, RETENTION_PURGE_AFTER_SEC, acquireStoreLock, initEmptyStore, migrateStoreJson, readLedger, recordVerifiedBackup,
@@ -511,6 +511,166 @@ for (const [label, mutate, state] of [
   ok(`${label}: writes are refused and the wake digest withholds claims`, w.code === 'HIVE_MEMORY_STORE_NOT_READY' && wake.records.length === 0 && wake.digest.includes(`store_state: ${state}`))
   s.close()
   if (!existsSync(p.db)) ok(`${label}: startup never creates a database implicitly`, !existsSync(p.db))
+}
+
+// 3.4b Canon is a handful of standing decisions; the wake digest shows all of it before room notes take the rest.
+// With a fixed 35% canon share, five canon claims of the real length lost the oldest, James's priorities (2026-11-06).
+{
+  const p = setup('wake-canon')
+  const s = open(p)
+  const long = n => `${'standing decision '.repeat(18)}${n}`
+  const canonEvents = [1, 2, 3, 4, 5].map(n => claim(james, 'hive:canon', `canon-${n}`, { ttlSec: 0, claim: long(n) }))
+  for (const ev of canonEvents) s.submit({ writer: 'james', event: ev, expectedPriorId: null, nowSec: T0 + 200 })
+  for (let n = 0; n < 40; n++) s.submit({ writer: 'ops', event: claim(opsBot, 'hive:ops', `ops-${n}`, { claim: `${'room note '.repeat(25)}${n}` }), expectedPriorId: null, nowSec: T0 + 200 })
+  const wake = s.wake({ readerPubkey: james.pk, nowSec: T0 + 300 })
+  ok('the wake digest shows every canon claim, the oldest included, and fills the rest with ops within budget',
+    wake.counts.canon_shown === 5 && wake.counts.canon_omitted === 0 && wake.digest.includes('canon-1]') &&
+    wake.counts.ops_shown > 0 && wake.counts.ops_omitted > 0 && wake.non_canon_bytes <= wake.max_chars)
+  const tight = s.wake({ readerPubkey: james.pk, maxChars: 2000, nowSec: T0 + 300 })
+  ok('the wake indexes at most 8 room and ops claims and lists every topic with its count',
+    wake.counts.ops_shown <= 8 && wake.topic_directory['ops-0'] === 1 && Object.keys(wake.topic_directory).length === 40 &&
+    wake.digest.includes('topics: ') && wake.records.every(r => r.claim === undefined && r.authority === null))
+  ok('a tight budget keeps all canon, still shows ops, and holds the rest within it',
+    tight.non_canon_bytes <= 2000 && tight.counts.canon_shown === 5 && tight.counts.ops_shown >= 1 && tight.digest.includes('Rank 3'))
+  s.close()
+}
+
+// A wake over many distinct topics keeps the directory inside the budget and counts the topics it leaves out.
+{
+  const p = setup('wake-topics')
+  const s = open(p)
+  const topicName = i => `t${String(i).padStart(3, '0')}-${'x'.repeat(34)}`
+  let accepted = 0
+  for (let i = 0; i < 200; i++) {
+    accepted += s.submit({ writer: 'ops', event: claim(opsBot, 'hive:ops', `many-${i}`, { topic: topicName(i) }), expectedPriorId: null, nowSec: T0 + 200 + i * 40 }).accepted === true ? 1 : 0
+  }
+  const wake = s.wake({ readerPubkey: james.pk, nowSec: T0 + 9000 })
+  const listed = Object.keys(wake.topic_directory).length
+  ok(`wake: ${accepted} distinct topics stay inside the budget; the directory lists some and counts the rest`,
+    accepted > 60 && wake.counts.ops_shown + wake.counts.ops_omitted === accepted && wake.non_canon_bytes <= wake.max_chars &&
+    listed > 0 && wake.counts.topics_omitted > 0 && listed + wake.counts.topics_omitted === accepted && wake.digest.includes(`+${wake.counts.topics_omitted} more topics`) &&
+    JSON.stringify(wake.topic_directory).length < wake.max_chars / 4)
+  s.close()
+}
+
+// The budget is bytes, not UTF-16 units: multibyte claims and topics must not push the response past it.
+{
+  const p = setup('wake-utf8')
+  const s = open(p)
+  for (let i = 0; i < 12; i++) {
+    s.submit({ writer: 'ops', event: claim(opsBot, 'hive:ops', `wide-${i}`, { claim: `${'記憶🐝'.repeat(60)} ${i}` }), expectedPriorId: null, nowSec: T0 + 200 })
+  }
+  const wake = s.wake({ readerPubkey: james.pk, nowSec: T0 + 300 })
+  const nonCanon = Buffer.byteLength(JSON.stringify({ ...wake, records: wake.records }))
+  ok('wake: multibyte claims are budgeted in UTF-8 bytes; the serialized response stays within max_chars',
+    wake.counts.ops_shown > 0 && wake.byte_length > wake.char_length && wake.non_canon_bytes <= wake.max_chars && nonCanon <= wake.max_chars)
+  const tight = s.wake({ readerPubkey: james.pk, maxChars: 1500, nowSec: T0 + 300 })
+  ok('wake: a tight byte budget drops cards rather than overrun', Buffer.byteLength(JSON.stringify(tight)) <= 1500 && tight.counts.ops_omitted > 0)
+  // At the smallest accepted budget, with every card gone, the topic list, hint and long git banner go too; it still fits.
+  for (let i = 0; i < 30; i++) s.submit({ writer: 'ops', event: claim(opsBot, 'hive:ops', `topic-${i}`, { topic: `floor-budget-topic-number-${i}` }), expectedPriorId: null, nowSec: T0 + 200 })
+  const floor = s.wake({ readerPubkey: james.pk, maxChars: MIN_WAKE_MAX_CHARS, gitBanner: '⚠'.repeat(500), nowSec: T0 + 300 })
+  ok('wake: at the minimum budget with zero cards, optional text is dropped and the response still fits',
+    floor.counts.ops_shown === 0 && floor.counts.ops_omitted > 0 && !floor.budget_exceeded && Buffer.byteLength(JSON.stringify(floor)) <= MIN_WAKE_MAX_CHARS &&
+    Object.keys(floor.topic_directory).length === 0 && floor.counts.topics_omitted > 0 && floor.digest.includes(`+${floor.counts.topics_omitted} topics`) && !floor.digest.includes('more: memory_query'))
+  const below = s.wake({ readerPubkey: james.pk, maxChars: MIN_WAKE_MAX_CHARS - 1, nowSec: T0 + 300 })
+  ok('wake: a max_chars below the minimum falls back to the default', below.max_chars === DEFAULT_WAKE_MAX_CHARS)
+  s.close()
+}
+
+// The budget covers the text the daemon actually sends (reader fields, pretty-printing), not just the store's object.
+{
+  const p = setup('wake-daemon-bytes')
+  const sockDir = join(p.dir, 's')
+  const daemon = await startMemoryDaemon({
+    dbPath: p.db, ledgerPath: p.ledger, receiptPath: p.receipt, config: rawConfig(), socketDir: sockDir,
+    readers: 'biggy', writers: 'ops', now: () => T0 + 300, log: () => {},
+  })
+  for (let i = 0; i < 30; i++) {
+    await callTool(join(sockDir, 'writers', 'ops.sock'), 'memory_submit', {
+      event: claim(opsBot, 'hive:ops', `sent-${i}`, { topic: `floor-budget-topic-number-${i}`, claim: `${'記憶🐝'.repeat(40)} ${i}` }), expected_prior_id: null })
+  }
+  const text = async args => {
+    const r = await rpcCall(join(sockDir, 'biggy.sock'), { jsonrpc: '2.0', id: ++rid, method: 'tools/call', params: { name: 'memory_wake', arguments: args } })
+    return r.result.content[0].text
+  }
+  const sizes = []
+  for (const args of [{}, { max_chars: MIN_WAKE_MAX_CHARS }, { max_chars: MIN_WAKE_MAX_CHARS, git_banner: '⚠'.repeat(500) }, { max_chars: 2500, git_banner: 'checkout is 3 commits behind origin/main' }]) {
+    const t = await text(args)
+    const w = JSON.parse(t)
+    sizes.push([Buffer.byteLength(t), w.max_chars, w.non_canon_bytes, w.counts.ops_shown])
+  }
+  ok(`wake over the daemon: the sent text, reader fields included, stays within max_chars (${sizes.map(x => `${x[0]}/${x[1]}`).join(', ')})`,
+    sizes.every(([sent, max, measured]) => sent <= max && sent <= measured && measured - sent <= 1) && sizes[0][3] > 0 && sizes[2][3] === 0)
+  await daemon.close()
+}
+
+// Phase 2 Gates 6-8: index vs full, the 24 h workflow tier, peer supersession of workflow checkpoints, topic normalizing.
+{
+  const raw = (signer, scope, slug, edit, opts = {}) => {
+    const t = buildClaimTemplate({ pubkey: signer.pk, scope, slug, claim: `raw ${slug}`, because: 'fixture', evidence: ['nvoy@abc1234:README.md'],
+      asOfGit: 'abc1234', memoryGlobalChannelId: GLOBAL_CH, nowSec: T0 + 150, ...opts })
+    edit(t)
+    return finalizeEvent(t, signer.sk)
+  }
+  const expTag = (t, v) => { t.tags = t.tags.filter(x => x[0] !== 'exp'); if (v != null) t.tags.push(['exp', String(v)]) }
+  const wf = claim(opsBot, 'hive:ops', 'nvoy-pr9-review')
+  const wfLong = claim(opsBot, 'hive:ops', 'nvoy-pr9-status', { ttlSec: 5 * DAY })
+  ok('builder: a workflow checkpoint defaults to 24 h and is capped at 48 h',
+    Number(wf.tags.find(t => t[0] === 'exp')[1]) - wf.created_at === DAY &&
+    Number(wfLong.tags.find(t => t[0] === 'exp')[1]) - wfLong.created_at === 2 * DAY)
+  let threw = null
+  try { claim(opsBot, 'hive:ops', 'nvoy-pr9-owner', { ttlSec: 0 }) } catch (e) { threw = e.message }
+  ok('builder: a workflow checkpoint cannot be a durable decision', /workflow checkpoint/.test(threw || ''))
+  const aliased = claim(opsBot, 'hive:ops', 'lesson-pacing', { topic: 'Primer' })
+  threw = null
+  try { claim(opsBot, 'hive:ops', 'odd-topic', { topic: 'Where Things Live!' }) } catch (e) { threw = e.message }
+  ok('builder: topics are normalized through the alias table and refused when not kebab-case',
+    aliased.tags.find(t => t[0] === 'topic')[1] === 'illustrated-primer' && /not a project slug/.test(threw || ''))
+
+  const p = setup('phase2')
+  const s = open(p)
+  const sub = (writer, event, prior = null, at = T0 + 200) => s.submit({ writer, event, expectedPriorId: prior, nowSec: at })
+  const badTopic = sub('ops', raw(opsBot, 'hive:ops', 'bad-topic', t => { t.tags = t.tags.map(x => x[0] === 'topic' ? ['topic', 'Not A Topic'] : x) }))
+  const wfDecision = sub('ops', raw(opsBot, 'hive:ops', 'herd-infra-pr15-review', t => { expTag(t, null); t.tags.push(['retention', 'decision']) }))
+  const wfWeek = sub('ops', raw(opsBot, 'hive:ops', 'herd-infra-pr15-handoff', t => expTag(t, T0 + 150 + 7 * DAY)))
+  const canonWf = sub('james', claim(james, 'hive:canon', 'merge-review', { ttlSec: 0 }))
+  ok('store: an unnormalizable topic is refused with HIVE_MEMORY_INVALID_TOPIC', badTopic.code === 'HIVE_MEMORY_INVALID_TOPIC')
+  ok('store: a workflow checkpoint that never expires, or lasts past 48 h, is refused',
+    wfDecision.code === 'HIVE_MEMORY_INVALID_EVENT' && /durable/.test(wfDecision.message) && wfWeek.code === 'HIVE_MEMORY_INVALID_EVENT' && /48 hours/.test(wfWeek.message))
+  ok('store: canon is not held to the workflow tier', canonWf.accepted === true)
+
+  ok('store: an alias topic is accepted', sub('ops', aliased).accepted === true)
+  const review = claim(opsBot, 'hive:ops', 'nvoy-pr9-review', { claim: 'PR 9 reviewed clean at abc1234' })
+  const note = claim(opsBot, 'hive:ops', 'nvoy-design-note', { claim: 'a standing note that a later claim cites' })
+  sub('ops', review)
+  sub('ops', note)
+  const merged = claim(james, 'hive:ops', 'nvoy-pr9-merged', { claim: 'PR 9 merged', supersedes: [review.id, note.id], nowSec: note.created_at + 10 })
+  ok('store: the closing claim is accepted', sub('james', merged, null, T0 + 300).accepted === true)
+
+  const list = s.query({ readerPubkey: james.pk, scope: 'hive:ops', nowSec: T0 + 400 })
+  const card = list.records.find(r => r.event_id === merged.id)
+  ok('query: without d the default is index cards, with no because, evidence or as_of',
+    list.format === 'index' && card?.record_type === 'memory-index-card' && card.author === 'james' && card.claim_preview === 'PR 9 merged' &&
+    card.because === undefined && card.evidence === undefined && card.as_of_git === undefined && card.authority === null && card.trustedInstruction === false)
+  const one = s.query({ readerPubkey: james.pk, d: merged.tags.find(t => t[0] === 'd')[1], nowSec: T0 + 400 })
+  const full = s.query({ readerPubkey: james.pk, scope: 'hive:ops', format: 'full', nowSec: T0 + 400 })
+  ok('query: d defaults to full, and format full returns whole envelopes',
+    one.format === 'full' && one.records[0].because === 'observed in the test fixture' && full.records.every(r => r.record_type === 'memory-claim' && Array.isArray(r.evidence)))
+  ok('query: a topic alias finds the normalized claim', s.query({ readerPubkey: james.pk, topic: 'primer', nowSec: T0 + 400 }).records.map(r => r.event_id).join() === aliased.id)
+
+  const ids = list.records.map(r => r.event_id)
+  const hist = s.query({ readerPubkey: james.pk, scope: 'hive:ops', includeHistory: true, nowSec: T0 + 400 })
+  const hidden = hist.records.find(r => r.event_id === review.id)
+  const wake = s.wake({ readerPubkey: james.pk, nowSec: T0 + 400 })
+  ok('peer supersession: the closed workflow checkpoint leaves query and wake; a cited non-workflow claim stays',
+    !ids.includes(review.id) && ids.includes(note.id) && hidden?.verification === 'consolidated' && hidden.consolidated_by === merged.id &&
+    wake.counts.consolidated_hidden === 1 && !wake.digest.includes('[nvoy-pr9-review]') && wake.digest.includes('[nvoy-design-note]'))
+  const older = claim(james, 'hive:ops', 'nvoy-pr9-early', { supersedes: [review.id], nowSec: review.created_at - 1 })
+  sub('james', older, null, T0 + 300)
+  sub('james', withdraw(james, merged), merged.id, T0 + 500)
+  ok('peer supersession: withdrawing the closing claim brings the checkpoint back; an older citer never hides it',
+    s.query({ readerPubkey: james.pk, scope: 'hive:ops', nowSec: T0 + 600 }).records.some(r => r.event_id === review.id))
+  s.close()
 }
 
 // 3.5 A failed Phase 2 append moves the store to LEDGER_IO_ERROR and never returns accepted.
@@ -1173,7 +1333,7 @@ os.execv(sys.argv[3], [sys.argv[3], sys.argv[4], "--db", sys.argv[5], "--ledger"
   ok('5,000 claims: a topic query with history returns every version on that topic', topicQ.total_matched === 100)
   ok('5,000 claims: supersedes_of follows at most 3 hops', chain.total_matched === 3)
   ok('5,000 claims: a keyless reader sees only the 625 hive:ops heads', kiosk.total_matched === 625)
-  ok('5,000 claims: wake stays within its character budget', wake.char_length <= 6000 && wake.counts.ops_omitted > 0)
+  ok('5,000 claims: wake stays within its character budget', wake.non_canon_bytes <= wake.max_chars && wake.counts.ops_omitted > 0)
   ok('5,000 claims: every query and the wake finish within 1.5 s', Math.max(worst, tTopic, tChain, tKiosk, tWake) < 1500)
   s.close()
 }

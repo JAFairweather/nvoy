@@ -1976,14 +1976,15 @@ export async function startMemoryViewer({
     let nextSnapshot
     try {
       const wake = await client.callReadTool('memory_wake', {})
-      const query = await client.callReadTool('memory_query', { limit: 100 })
+      const query = await client.callReadTool('memory_query', { limit: 100, format: 'full' })
 
       const byKey = new Map()
       for (const r of Array.isArray(query?.records) ? query.records : []) {
         const clean = sanitizeMemoryRecord(r)
         if (clean) byKey.set(`${clean.author_pubkey}:${clean.d}`, clean)
       }
-      for (const r of Array.isArray(wake?.records) ? wake.records : []) {
+      // Since Phase 2 wake records are bare references (no claim); only full records are shown.
+      for (const r of Array.isArray(wake?.records) ? wake.records.filter(x => typeof x?.claim === 'string') : []) {
         const clean = sanitizeMemoryRecord(r)
         if (clean && !byKey.has(`${clean.author_pubkey}:${clean.d}`)) {
           byKey.set(`${clean.author_pubkey}:${clean.d}`, clean)
