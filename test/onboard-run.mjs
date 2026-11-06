@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
@@ -96,7 +96,21 @@ assert.equal(queued.length, 1); assert.deepEqual(queued[0].fields, { name: 'HR',
 assert.equal(queued[0].instance, 'hr'); assert.equal(queued[0].dry_run, false)
 await run(); events = [sign(add.tags, at + 1), bind]; await run(); events = [add, bind]
 assert.equal(readFileSync(queue, 'utf8').trim().split('\n').length, 1, 'a run again, or the same request signed again, queues nothing new')
-writeFileSync(join(hrRun, 'profile-results.jsonl'), JSON.stringify({ version: 1, type: 'profile-result', instance: 'hr', request: queued[0].id, published: true }) + '\n')
+// Only an absent results log waits. One that is there but unreadable is a fault, not a wait.
+const results = join(hrRun, 'profile-results.jsonl'), profileOf = r => r.receipts.find(row => row.step === 'profile')
+const elsewhere = join(tmp, 'elsewhere.jsonl'); writeFileSync(elsewhere, '')
+symlinkSync(elsewhere, results); result = await run()
+assert.equal(profileOf(result).state, 'refused'); assert.match(profileOf(result).detail, /cannot read hr's profile results: profile result log is invalid/)
+rmSync(results); mkdirSync(results); result = await run()
+assert.equal(profileOf(result).state, 'refused', 'a directory where the log should be is a fault')
+rmSync(results, { recursive: true })
+writeFileSync(results, JSON.stringify({ version: 1, type: 'profile-result', instance: 'hr', request: queued[0].id, error: true, code: 'NVOY_PROFILE_RATE_LIMITED' }) + '\n')
+result = await run()
+assert.equal(profileOf(result).state, 'refused'); assert.match(profileOf(result).detail, /the broker refused it: NVOY_PROFILE_RATE_LIMITED/)
+writeFileSync(results, '')
+result = await run()
+assert.equal(profileOf(result).state, 'pending', 'a log with no answer for this request yet is waiting')
+writeFileSync(results, JSON.stringify({ version: 1, type: 'profile-result', instance: 'hr', request: queued[0].id, published: true }) + '\n')
 result = await run()
 assert.equal(states(result).profile, 'done'); assert.match(result.receipts.find(row => row.step === 'profile').detail, /hr's broker published "HR"/)
 

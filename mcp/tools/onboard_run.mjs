@@ -5,13 +5,13 @@
 // after the owner approves the pairing, after the box's bind_runtime arrives, or after the operator
 // agrees to redeploy the givers. Receipts record what each run found; they never hold a secret.
 
-import { appendFileSync, constants, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync, chownSync } from 'node:fs'
+import { appendFileSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync, chownSync } from 'node:fs'
 import { createHash, randomBytes } from 'node:crypto'
 import { join } from 'node:path'
 import { readManifest } from './runtime_manifest.mjs'
 import { newestRequest, OnboardRefusal, parseSetupRequest } from './onboard_request.mjs'
 import { joinHive, joinRooms } from './onboard_join.mjs'
-import { profileRequestIdsPath, profileStatus, queueProfile } from './agent_profile.mjs'
+import { profileRequestIdsPath, profileResultsPath, profileStatus, queueProfile } from './agent_profile.mjs'
 
 const PENDING_RELAY = 'the relay writer list is nave.pub #157; until it lands, add the key to deploy/relay/allowlist.json by PR'
 
@@ -151,9 +151,16 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
       }
       // Run as root, the reservation is made root's; give it to the agent's worker, like its own.
       if (process.getuid?.() === 0) chownSync(join(profileRequestIdsPath(manifest), request), manifest.workerUid, manifest.workerUid)
+      const queuedLine = `"${add.profile.name}" queued for ${name}'s broker to sign and publish`
+      // Only a results log that is not there yet is waiting: the broker writes it on its first answer.
+      // A log that is there but cannot be read (a link, not a file, unreadable) is a fault to surface.
+      let absent = false
+      try { lstatSync(profileResultsPath(manifest)) } catch (error) { absent = error?.code === 'ENOENT' }
+      if (absent) return receipt('profile', 'pending', queuedLine)
       const status = profileStatus(manifest, request)
-      if (status.error && status.error.code !== 'NVOY_PROFILE_STATUS_FAILED') return receipt('profile', 'refused', `the broker refused it: ${status.error.code || 'error'}`)
-      if (status.error || status.ok.pending) return receipt('profile', 'pending', `"${add.profile.name}" queued for ${name}'s broker to sign and publish`)
+      if (status.error?.code === 'NVOY_PROFILE_STATUS_FAILED') return receipt('profile', 'refused', `cannot read ${name}'s profile results: ${status.error.message || 'unknown error'}`)
+      if (status.error) return receipt('profile', 'refused', `the broker refused it: ${status.error.code || 'error'}`)
+      if (status.ok.pending) return receipt('profile', 'pending', queuedLine)
       return receipt('profile', 'done', `${name}'s broker published "${add.profile.name}"`)
     }],
     ['givers', () => {
