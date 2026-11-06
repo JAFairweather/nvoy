@@ -38,7 +38,7 @@ export function memoryToolSpec(manifest, op) {
       ' Check memory_query first to avoid duplicates. When a claim becomes wrong, withdraw it, or supersede it with a new claim at the same slug.' +
       ' Do not record narration, guesses, chat, anything personal, or what is already in git or docs: cite that as evidence instead.' +
       ' A claim expires after ttl_sec (default 14 days, at most 30).'
-    : 'Withdraw your room memory claim at one slug when it is wrong or finished. The broker publishes a replacement marked withdrawn, with a later created_at, and a NIP-09 deletion of the claim it replaces.'
+    : 'Withdraw your room memory claim at one slug when it is wrong or finished. The broker publishes a replacement marked withdrawn, with a later created_at.'
   return {
     name: TOOLS[op],
     description: `${what} The broker checks the manifest's may_remember block, signs a kind ${REMEMBER_KIND} and publishes it to the room. Only room:<uuid> scopes; hive:ops, hive:canon and self are refused.${limits}`,
@@ -82,16 +82,17 @@ export const memorySecretIn = fields => checkClaimPayloadSecrets({ claim: fields
   tags: [[fields.slug, fields.topic, fields.as_of_git, fields.as_of_evt, ...(fields.supersedes || [])].filter(x => x != null)] })
 
 // The unsigned kind 30078 a request builds, after `prior`, this identity's latest event at the
-// fact key; a withdrawal of a known prior also builds its NIP-09 deletion, in the same room.
+// fact key. A withdrawal is that replacement alone: Buzz takes a kind 5 with exactly one target, the
+// replaced claim is already gone, and an `a` target would also delete the replacement itself.
 export function memoryTemplates(manifest, { op, scope, fields }, prior = null, nowSec = Math.floor(Date.now() / 1000)) {
   if (op === 'claim') {
     return { event: buildClaimTemplate({ pubkey: manifest.pubkey, scope, slug: fields.slug, topic: fields.topic, claim: fields.claim,
       because: fields.because, evidence: fields.evidence, asOfGit: fields.as_of_git, asOfEvt: fields.as_of_evt, ttlSec: fields.ttl_sec,
-      supersedes: fields.supersedes, kind: REMEMBER_KIND, nowSec, priorCreatedAt: prior?.created_at || 0 }), deletion: null }
+      supersedes: fields.supersedes, kind: REMEMBER_KIND, nowSec, priorCreatedAt: prior?.created_at || 0 }) }
   }
-  const { replacement, nip09Delete } = buildWithdrawalTemplate({ pubkey: manifest.pubkey, priorEvent: prior, scope, slug: fields.slug,
+  const { replacement } = buildWithdrawalTemplate({ pubkey: manifest.pubkey, priorEvent: prior, scope, slug: fields.slug,
     because: fields.because, kind: REMEMBER_KIND, nowSec })
-  return { event: replacement, deletion: nip09Delete ? { ...nip09Delete, tags: [...nip09Delete.tags, ['h', parseScope(scope).roomId]] } : null }
+  return { event: replacement }
 }
 
 // Broker side: the one shape a memory request may have, re-checked against the manifest. The

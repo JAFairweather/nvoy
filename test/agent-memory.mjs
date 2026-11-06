@@ -168,6 +168,11 @@ const future = queueMemory(mm, 'claim', { ...claimArgs, claim: 'Dennis reviews i
 const priorAt = claim1.created_at + 120
 const ahead = finalizeEvent({ kind: 30078, created_at: priorAt, tags: claim1.tags, content: claim1.content }, agentSk)
 stored.push(ahead)
+failLookups = true
+r = await write(mf, 'memory', future.ok.request)
+ok('a claim that cannot look up its prior is held for retry, never signed without one',
+  r.status === 1 && /cannot look up the latest claim/.test(r.stderr) && /held for retry/.test(r.stderr) && !existsSync(join(mf.state, 'memory', `${future.ok.request}.json`)))
+failLookups = false
 r = await write(mf, 'memory', future.ok.request)
 const claim2 = stored.find(ev => ev.kind === 30078 && JSON.parse(ev.content).claim?.startsWith('Dennis'))
 ok('a replacement claim is created strictly after the prior event the relay returned', r.status === 0 && claim2?.created_at === priorAt + 1)
@@ -184,13 +189,10 @@ ok('a withdrawal that cannot look up its claim is held for retry, not guessed or
 failLookups = false
 r = await write(mf, 'memory', w1.ok.request)
 const withdrawal = stored.find(ev => ev.kind === 30078 && JSON.parse(ev.content).status === 'withdrawn')
-const deletion = stored.find(ev => ev.kind === 5)
 ok('the retry publishes a withdrawn replacement at the same fact key, strictly later than the claim',
   r.status === 0 && withdrawal && tag(withdrawal, 'd') === q1.ok.d && tag(withdrawal, 'h') === ROOM && withdrawal.created_at > claim2.created_at &&
   validateMemoryEvent(withdrawal).status === 'withdrawn')
-ok('and the companion kind 5 deletes the claim it replaces, in the same room',
-  deletion?.pubkey === agent && verifyEvent(deletion) && tag(deletion, 'e') === claim2.id && tag(deletion, 'a') === `30078:${agent}:${q1.ok.d}` &&
-  tag(deletion, 'k') === '30078' && tag(deletion, 'h') === ROOM && /deletion accepted/.test(r.stdout))
+ok('and no kind 5 is sent: Buzz takes one target, and an a target would delete the replacement too', !stored.some(ev => ev.kind === 5))
 
 // --- 6. the broker re-checks what the keyless side wrote ---
 const forge = row => { writeFileSync(queuePath, readFileSync(queuePath, 'utf8') + JSON.stringify({ version: 1, type: 'memory-request', instance: 'memory', op: 'claim',
@@ -220,7 +222,7 @@ await forged('a withdrawal with no claim of this identity at the fact key is ref
 ok('the tool tells the agent at once when the hour is spent', queueMemory(mm, 'claim', { ...claimArgs, slug: 'fourth' }).error?.code === 'NVOY_MEMORY_RATE_LIMITED')
 await forged('the broker\'s durable counter refuses a write over per_hour', '5', { fields: { ...claimArgs, slug: 'fourth' } }, /memory refused: over the hourly cap \(3\/3/)
 ok('the counter lives in the broker state root', existsSync(join(mf.state, 'agent-limits', 'memory.json')))
-ok('only kind 30078 and its kind 5 ever reached the relay', stored.every(ev => ev.kind === 30078 || ev.kind === 5) && stored.filter(ev => ev.kind === 30078).length === 3)
+ok('only kind 30078 ever reached the relay', stored.every(ev => ev.kind === 30078) && stored.filter(ev => ev.kind === 30078).length === 3)
 
 const nf = fixture('nomemory')
 writeFileSync(join(nf.run, 'memory-requests.jsonl'), JSON.stringify({ version: 1, type: 'memory-request', id: '6'.repeat(32), instance: 'nomemory', op: 'claim',

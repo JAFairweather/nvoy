@@ -7,9 +7,9 @@
 // from it. Only room:<uuid> scopes and only kind 30078, which the Bunker pairing already allows.
 //
 // The relay is asked first for this identity's latest event at the fact key, so a replacement is
-// strictly later than what it replaces; a withdrawal that cannot ask is held rather than guessed.
-// Then the post discipline: the cap is counted before the event exists, the exact event (and a
-// withdrawal's kind 5) is frozen before it is signed, and a retry republishes that event.
+// strictly later than what it replaces; a request that cannot ask is held rather than guessed.
+// Then the post discipline: the cap is counted before the event exists, the exact event is frozen
+// before it is signed, and a retry republishes that event.
 
 import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -72,10 +72,9 @@ if (existsSync(recordPath)) {
   const st = lstatSync(recordPath)
   if (!st.isFile() || st.isSymbolicLink()) die('memory record must be a regular non-symlink file')
   try { record = JSON.parse(readFileSync(recordPath, 'utf8')) } catch { die('memory record is invalid') }
-  const ev = record?.unsigned_event, del = record?.unsigned_deletion
+  const ev = record?.unsigned_event
   if (record?.version !== 1 || record.request_id !== requestId || record.request_digest !== digest || !ev || getEventHash(ev) !== record.fingerprint || unsignedOk(ev) ||
-      (record.event && !signedOk(record.event, record.fingerprint)) ||
-      (del && (getEventHash(del) !== record.deletion_fingerprint || (record.deletion && !signedOk(record.deletion, record.deletion_fingerprint))))) die('memory record does not bind this request')
+      (record.event && !signedOk(record.event, record.fingerprint))) die('memory record does not bind this request')
   if (record.published === true) { console.log(JSON.stringify({ request: requestId, accepted: record.accepted, replay: true })); exit(0) }
 }
 
@@ -93,8 +92,8 @@ if (!record) {
       if (ev?.kind === REMEMBER_KIND && ev.pubkey === me && tagOf(ev, 'd') === checked.d && verifyEvent(ev) && nip01Newer(ev, prior)) prior = ev
     }
   } catch (e) {
-    if (request.op === 'withdraw') die(`cannot look up the claim to withdraw: ${e.message}; held for retry`)
-    console.error(`instance-broker-memory: prior lookup failed (${e.message}); the claim proceeds without one`)
+    die(request.op === 'withdraw' ? `cannot look up the claim to withdraw: ${e.message}; held for retry`
+      : `cannot look up the latest claim at ${checked.d}: ${e.message}; held for retry`)
   }
   if (request.op === 'withdraw') {
     if (!prior) die(`memory refused: no claim by this identity at ${checked.d} to withdraw`)
@@ -109,17 +108,15 @@ if (!record) {
   try { built = memoryTemplates(manifest, request, prior) } catch (e) { die(`memory refused: ${e.message}`) }
   const bad = unsignedOk(built.event)
   if (bad) die(`memory refused: ${bad}`)
-  record = { version: 1, request_id: requestId, request_digest: digest, op: request.op, fingerprint: getEventHash(built.event), unsigned_event: built.event, event: null,
-    ...(built.deletion ? { deletion_fingerprint: getEventHash(built.deletion), unsigned_deletion: built.deletion, deletion: null } : {}), published: false }
+  record = { version: 1, request_id: requestId, request_digest: digest, op: request.op, fingerprint: getEventHash(built.event), unsigned_event: built.event, event: null, published: false }
   persist()
 }
 
-for (const [field, unsigned, fingerprint] of [['event', record.unsigned_event, record.fingerprint], ['deletion', record.unsigned_deletion, record.deletion_fingerprint]]) {
-  if (!unsigned || record[field]) continue
+if (!record.event) {
   let ev
-  try { ev = await signer.signEvent(unsigned) } catch (e) { die(`signer refused the memory ${field}: ${e.message}`) }
-  if (!signedOk(ev, fingerprint)) die(`signer changed or invalidly signed the frozen memory ${field}`)
-  record[field] = ev
+  try { ev = await signer.signEvent(record.unsigned_event) } catch (e) { die(`signer refused the memory event: ${e.message}`) }
+  if (!signedOk(ev, record.fingerprint)) die('signer changed or invalidly signed the frozen memory event')
+  record.event = ev
   persist()
 }
 if (!validateMemoryEvent(record.event, { allowedKinds: [REMEMBER_KIND] }).ok) die('memory refused: the signed event does not validate')
@@ -127,14 +124,8 @@ let accepted = 0
 try { const r = await session.publishSigned(record.event); if (r.accepted) accepted = 1; else console.error(`instance-broker-memory: Buzz refused the memory event: ${r.message}`) }
 catch (e) { console.error(`instance-broker-memory: Buzz relay unavailable: ${e.message}`) }
 if (!accepted) die('the Buzz relay did not accept the persisted memory event; it remains retryable')
-// The replacement is the withdrawal; the kind 5 only asks relays to drop the claim it replaced,
-// so its refusal is recorded and never holds the withdrawal back.
-if (record.deletion && record.deleted !== true) {
-  try { const r = await session.publishSigned(record.deletion); record.deleted = r.accepted === true; if (!r.accepted) console.error(`instance-broker-memory: Buzz refused the deletion: ${r.message}`) }
-  catch (e) { record.deleted = false; console.error(`instance-broker-memory: deletion not published: ${e.message}`) }
-}
 record.published = true; record.published_at = Date.now(); record.accepted = accepted
 persist()
 // The audit line: which event, where. Never the words.
-console.log(`instance-broker-memory: ${request.op === 'claim' ? 'claimed' : 'withdrew'} ${record.fingerprint.slice(0, 12)}… in ${request.scope}${record.deletion ? ` (deletion ${record.deleted ? 'accepted' : 'refused'})` : ''}`)
+console.log(`instance-broker-memory: ${request.op === 'claim' ? 'claimed' : 'withdrew'} ${record.fingerprint.slice(0, 12)}… in ${request.scope}`)
 exit(0)
