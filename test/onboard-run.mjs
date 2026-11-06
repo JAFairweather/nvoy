@@ -30,7 +30,7 @@ const KEY = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK0' + 'a'.repeat(40) + ' hr@bo
 const at = Math.floor(Date.now() / 1000)
 const sign = (tags, created_at = at) => finalizeEvent({ kind: SETUP_KIND, created_at, content: '', tags }, owner)
 const add = sign([['d', 'nvoy-onboard/hr/add_agent'], ['op', 'add_agent'], ['p', agent], ['harness', 'claude-code'],
-  ['like', 'crystalclaude'], ['giver', pi.pubkey], ['giver', ownerHex], ['giver', outsider], ['room', channel]])
+  ['like', 'crystalclaude'], ['giver', pi.pubkey], ['giver', ownerHex], ['giver', outsider], ['room', channel], ['display_name', 'HR'], ['about', 'People and pay.']])
 const bind = sign([['d', 'nvoy-onboard/hr/bind_runtime'], ['op', 'bind_runtime'], ['p', agent], ['harness', 'claude-code'],
   ['like', 'crystalclaude'], ['channel_key', KEY]])
 
@@ -84,6 +84,22 @@ assert.equal(states(result)['relay writer'], 'pending'); assert.equal(states(res
 assert.match(result.receipts.find(row => row.step === 'hive').detail, /carries no invite/)
 assert.equal(joins, 1, 'the agent connection opens only once it is installed')
 
+// The name the owner gave waits for the agent's own profile queue, made when its container starts,
+// then is queued once for its broker to sign; done only on the broker's result (waggle #717).
+assert.equal(states(result).profile, 'pending'); assert.match(result.receipts.find(row => row.step === 'profile').detail, /queue is not there yet/)
+const hrRun = join(tmp, 'var', 'hr', 'run'), queue = join(hrRun, 'profile-requests.jsonl')
+writeFileSync(queue, ''); mkdirSync(join(hrRun, 'profile-request-ids'))
+result = await run()
+assert.equal(states(result).profile, 'pending'); assert.match(result.receipts.find(row => row.step === 'profile').detail, /"HR" queued for hr's broker/)
+const queued = readFileSync(queue, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+assert.equal(queued.length, 1); assert.deepEqual(queued[0].fields, { name: 'HR', display_name: 'HR', about: 'People and pay.' })
+assert.equal(queued[0].instance, 'hr'); assert.equal(queued[0].dry_run, false)
+await run(); events = [sign(add.tags, at + 1), bind]; await run(); events = [add, bind]
+assert.equal(readFileSync(queue, 'utf8').trim().split('\n').length, 1, 'a run again, or the same request signed again, queues nothing new')
+writeFileSync(join(hrRun, 'profile-results.jsonl'), JSON.stringify({ version: 1, type: 'profile-result', instance: 'hr', request: queued[0].id, published: true }) + '\n')
+result = await run()
+assert.equal(states(result).profile, 'done'); assert.match(result.receipts.find(row => row.step === 'profile').detail, /hr's broker published "HR"/)
+
 // Agreed: pi-dog may now mention hr, with a backup taken first, and the manifest still reads. The
 // giver outside the fleet stays pending, named, and nothing ran for it.
 result = await run({ giversRedeploy: true })
@@ -111,7 +127,7 @@ assert.deepEqual(calls, ['allocate', 'pair', 'pair', 'check', 'check', 'apply'])
 // to the hive with nothing reinstalled. A re-sign that changes its harness is refused.
 events = [sign(add.tags, at + 1), bind]
 result = await run({ giversRedeploy: true })
-assert.deepEqual(states(result), { staged: 'done', paired: 'done', checked: 'done', started: 'done', givers: 'pending', 'relay writer': 'pending', hive: 'pending', rooms: 'pending' })
+assert.deepEqual(states(result), { staged: 'done', paired: 'done', checked: 'done', started: 'done', profile: 'done', givers: 'pending', 'relay writer': 'pending', hive: 'pending', rooms: 'pending' })
 assert.match(result.receipts.find(row => row.step === 'started').detail, /^installed$/)
 assert.deepEqual(calls, ['allocate', 'pair', 'pair', 'check', 'check', 'apply'])
 events = [sign(add.tags.map(tag => tag[0] === 'harness' ? ['harness', 'codex'] : tag), at + 2), bind]

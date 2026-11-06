@@ -18,8 +18,12 @@ const NAME = /^[a-z0-9][a-z0-9._-]{1,63}$/i
 const HEX = /^[0-9a-f]{64}$/
 const ROOM = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const SECRETISH = /nsec1|bunker:|nostrconnect:|PRIVATE KEY|secret=/i
-const ONE = ['d', 'op', 'p', 'harness', 'like', 'channel_key', 'invite', 'policy', 'age']
+const ONE = ['d', 'op', 'p', 'harness', 'like', 'channel_key', 'invite', 'policy', 'age', 'display_name', 'about']
 const JOIN_TAGS = ['invite', 'policy', 'age']
+const PROFILE_TAGS = ['display_name', 'about']
+// Shown text, one line for the name: no control characters, and short enough for a member list.
+const CONTROL = /[\u0000-\u001f\u007f]/
+const ABOUT_CONTROL = /[\u0000-\u0009\u000b-\u001f\u007f]/
 const POLICY = /^[A-Za-z0-9._:-]{1,64}$/
 const BASE64 = /^[A-Za-z0-9+/]+={0,2}$/
 
@@ -98,10 +102,15 @@ export function parseSetupRequest(event, { name, manifests, seen = new Set(), in
     if ('invite' in one && !('policy' in one)) refuse('ONBOARD_BAD_TAG', 'an invite needs the policy the owner agreed to, or none')
     if ('policy' in one && !POLICY.test(one.policy)) refuse('ONBOARD_BAD_TAG', 'policy is a terms version, or none')
     if ('age' in one && one.age !== 'confirmed') refuse('ONBOARD_BAD_TAG', 'age is confirmed, or absent')
+    if ('display_name' in one && (!one.display_name.trim() || one.display_name.length > 64 || CONTROL.test(one.display_name)))
+      refuse('ONBOARD_BAD_PROFILE', 'display_name is one line of 1 to 64 characters')
+    if ('about' in one && (one.about.length > 500 || ABOUT_CONTROL.test(one.about))) refuse('ONBOARD_BAD_PROFILE', 'about is at most 500 characters')
+    if ('about' in one && !('display_name' in one)) refuse('ONBOARD_BAD_PROFILE', 'about needs a display_name: a first profile must set a name')
   } else {
     if (installed && installed.id !== name) refuse('ONBOARD_EXISTS', `that key is already ${installed.id}`)
     if (!('channel_key' in one)) refuse('ONBOARD_BAD_TAG', 'bind_runtime needs channel_key')
     if (JOIN_TAGS.some(key => key in one)) refuse('ONBOARD_BAD_TAG', 'the invite belongs to add_agent')
+    if (PROFILE_TAGS.some(key => key in one)) refuse('ONBOARD_BAD_TAG', 'the profile belongs to add_agent')
   }
   if (!HARNESSES.includes(one.harness)) refuse('ONBOARD_BAD_HARNESS', `harness must be one of ${HARNESSES.join(', ')}`)
 
@@ -117,6 +126,10 @@ export function parseSetupRequest(event, { name, manifests, seen = new Set(), in
   const rooms = [...new Set(many.room)]
   if (rooms.some(room => !ROOM.test(room))) refuse('ONBOARD_BAD_ROOM', 'a room is a Buzz room id')
 
+  // The agent's first kind 0, which its own broker signs and publishes on first start (waggle #717).
+  const name0 = (one.display_name || '').trim()
+  const profile = name0 ? Object.freeze({ name: name0, display_name: name0, ...(one.about ? { about: one.about } : {}) }) : null
+
   let channelKey = null
   if ('channel_key' in one) {
     try { channelKey = readPublicKey(one.channel_key) } catch (error) { refuse('ONBOARD_BAD_CHANNEL_KEY', error.message) }
@@ -124,5 +137,5 @@ export function parseSetupRequest(event, { name, manifests, seen = new Set(), in
 
   return Object.freeze({ id: event.id, owner: event.pubkey, created_at: event.created_at, name, op: one.op,
     pubkey, harness: one.harness, like: template.id, givers, rooms, channelKey,
-    invite: one.invite || '', policy: one.policy || '', ageConfirmed: one.age === 'confirmed' })
+    invite: one.invite || '', policy: one.policy || '', ageConfirmed: one.age === 'confirmed', profile })
 }

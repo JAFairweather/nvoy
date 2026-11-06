@@ -6,11 +6,12 @@
 // agrees to redeploy the givers. Receipts record what each run found; they never hold a secret.
 
 import { appendFileSync, constants, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync, chownSync } from 'node:fs'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { join } from 'node:path'
 import { readManifest } from './runtime_manifest.mjs'
 import { newestRequest, OnboardRefusal, parseSetupRequest } from './onboard_request.mjs'
 import { joinHive, joinRooms } from './onboard_join.mjs'
+import { profileRequestIdsPath, profileStatus, queueProfile } from './agent_profile.mjs'
 
 const PENDING_RELAY = 'the relay writer list is nave.pub #157; until it lands, add the key to deploy/relay/allowlist.json by PR'
 
@@ -133,6 +134,27 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
       manifests = installed(root)
       return code === 0 && isInstalled() ? receipt('started', 'done', 'applied, principal seated, channel baselined') :
         receipt('started', code === 3 ? 'pending' : 'refused', `apply exited ${code}`)
+    }],
+    // The name the owner gave, queued for the agent's own broker to sign and publish as its first
+    // kind 0 (waggle #717). The request id comes from the name and the fields, so a run again, or the
+    // same request signed again, queues nothing new; a changed name is a new request.
+    ['profile', () => {
+      if (!add.profile) return receipt('profile', 'done', 'no name in the request; the agent sets its own profile')
+      if (!isInstalled()) return receipt('profile', 'pending', 'waiting for the agent to start')
+      const manifest = manifests.get(name)
+      const request = createHash('sha256').update(JSON.stringify([name, add.profile])).digest('hex').slice(0, 32)
+      if (!manifest.maySetProfile) return receipt('profile', 'refused', `${name} has no may_set_profile grant`)
+      const queued = queueProfile(manifest, { fields: { ...add.profile }, request })
+      if (queued.error) {
+        const waiting = queued.error.code === 'NVOY_PROFILE_QUEUE_FAILED' && /not provisioned/.test(queued.error.message || '')
+        return receipt('profile', waiting ? 'pending' : 'refused', waiting ? 'waiting for the agent to start: its profile queue is not there yet' : `${queued.error.code}${queued.error.message ? `: ${queued.error.message}` : ''}`)
+      }
+      // Run as root, the reservation is made root's; give it to the agent's worker, like its own.
+      if (process.getuid?.() === 0) chownSync(join(profileRequestIdsPath(manifest), request), manifest.workerUid, manifest.workerUid)
+      const status = profileStatus(manifest, request)
+      if (status.error && status.error.code !== 'NVOY_PROFILE_STATUS_FAILED') return receipt('profile', 'refused', `the broker refused it: ${status.error.code || 'error'}`)
+      if (status.error || status.ok.pending) return receipt('profile', 'pending', `"${add.profile.name}" queued for ${name}'s broker to sign and publish`)
+      return receipt('profile', 'done', `${name}'s broker published "${add.profile.name}"`)
     }],
     ['givers', () => {
       const seats = add.givers.filter(giver => giver.seat)
