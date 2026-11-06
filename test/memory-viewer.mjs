@@ -254,6 +254,61 @@ await test('computeCoherence calculates 5-axis HCI score and retroactive incepti
   assert.equal(coh2.total_events, 4)
   assert.equal(coh2.history.at(-1).events, 4)
   assert.equal(coh2.history.at(-1).claims, 2)
+
+  // Verify post-event expiration at now_sec and cross-author checkpoint consolidation
+  const crossAuthorHistory = [
+    {
+      event_id: 'e1'.padEnd(64, '0'),
+      author_pubkey: '2'.repeat(64),
+      scope: 'room:a8186b53-537d-46ad-a7e7-b6486c58970e',
+      d: 'hive-memory:room:a8186b53-537d-46ad-a7e7-b6486c58970e:pr-status',
+      topic: 'nvoy',
+      claim: 'PR #336 opened',
+      evidence: ['nvoy@1111111'],
+      as_of_git: '1'.repeat(40),
+      created_at: 100,
+      expires_at: 150,
+      verification: 'expired',
+    },
+    {
+      event_id: 'e2'.padEnd(64, '0'),
+      author_pubkey: '2'.repeat(64),
+      scope: 'room:a8186b53-537d-46ad-a7e7-b6486c58970e',
+      d: 'hive-memory:room:a8186b53-537d-46ad-a7e7-b6486c58970e:pr-review',
+      topic: 'nvoy',
+      claim: 'PR #336 checkpoint',
+      evidence: ['nvoy@2222222'],
+      as_of_git: '2'.repeat(40),
+      created_at: 105,
+      expires_at: 500,
+      verification: 'consolidated',
+      consolidated_by: 'e3'.padEnd(64, '0'),
+    },
+    {
+      event_id: 'e3'.padEnd(64, '0'),
+      author_pubkey: '3'.repeat(64),
+      scope: 'room:a8186b53-537d-46ad-a7e7-b6486c58970e',
+      d: 'hive-memory:room:a8186b53-537d-46ad-a7e7-b6486c58970e:pr-merged',
+      topic: 'nvoy',
+      claim: 'PR #336 merged',
+      evidence: ['nvoy@3333333'],
+      as_of_git: '3'.repeat(40),
+      created_at: 110,
+      expires_at: 500,
+      verification: 'accepted',
+      supersedes: ['e2'.padEnd(64, '0')],
+    },
+  ]
+  const coh3 = computeCoherence({
+    records: [crossAuthorHistory[2]],
+    history_records: crossAuthorHistory,
+    agent_roster: roster,
+    now_sec: 200,
+    history_complete: false,
+  })
+  assert.equal(coh3.history.at(-1).claims, 1, 'current coherence must exclude expired and cross-author consolidated claims')
+  assert.equal(coh3.history_complete, false)
+  assert.equal(coh3.history_window, 'truncated-5000')
 })
 
 await test('computeAgentHealth: classifies 5m active, 5-20m warm, >20m stale, error, and preserves telemetry across rollover', () => {

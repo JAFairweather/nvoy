@@ -128,6 +128,8 @@ export function sanitizeMemoryRecord(rec) {
     created_at: Number.isFinite(rec.created_at) ? Number(rec.created_at) : null,
     expires_at: Number.isFinite(rec.expires_at) ? Number(rec.expires_at) : null,
     stale_warning: rec.stale_warning ? String(rec.stale_warning) : null,
+    consolidated_by: rec.consolidated_by ? String(rec.consolidated_by) : null,
+    supersedes: Array.isArray(rec.supersedes) ? rec.supersedes.map(s => String(s)) : [],
     conflict: Boolean(rec.conflict),
   }
 }
@@ -287,16 +289,42 @@ function evaluateCoherenceSlice(slice, rosterByPk, expectedRosterSize, writeSeqE
   }
 }
 
+function filterActiveAtEpoch(heads, epochAt, isCurrentFinal = false) {
+  const unexpired = heads.filter(r => {
+    if (!r || r.status === 'withdrawn' || r.verification === 'withdrawn') return false
+    if (isCurrentFinal && (r.verification === 'expired' || r.verification === 'consolidated' || r.verification === 'superseded')) {
+      return false
+    }
+    return r.expires_at === null || r.expires_at === undefined || r.expires_at > epochAt
+  })
+  const activeIds = new Set(unexpired.map(r => r.event_id).filter(Boolean))
+  const supersededByPeer = new Set()
+  for (const c of unexpired) {
+    if (Array.isArray(c.supersedes)) {
+      for (const tid of c.supersedes) {
+        if (tid && tid !== c.event_id) supersededByPeer.add(String(tid))
+      }
+    }
+  }
+  return unexpired.filter(r => {
+    if (r.scope === 'hive:canon') return true
+    if (r.consolidated_by && activeIds.has(r.consolidated_by)) return false
+    if (r.event_id && supersededByPeer.has(r.event_id)) return false
+    return true
+  })
+}
+
 export function computeCoherence({
   records = [],
   history_records = null,
   agent_roster = [],
   recent_activity = [],
   store_state = {},
+  now_sec = null,
+  history_complete = true,
 } = {}) {
-  const sourceEvents = Array.isArray(history_records) && history_records.length > 0
-    ? history_records
-    : (Array.isArray(records) ? records : [])
+  const hasHistory = Array.isArray(history_records) && history_records.length > 0
+  const sourceEvents = hasHistory ? history_records : (Array.isArray(records) ? records : [])
   const chronological = [...sourceEvents]
     .filter(Boolean)
     .sort((a, b) => (a.created_at || 0) - (b.created_at || 0) || (String(a.event_id || '') < String(b.event_id || '') ? -1 : 1))
@@ -316,6 +344,8 @@ export function computeCoherence({
       delta_since_inception: 0,
       total_events: 0,
       shared_artifacts: 0,
+      history_complete: Boolean(history_complete),
+      history_window: history_complete ? '90d-retained' : 'truncated-5000',
       axes: { alignment: 0, grounding: 0, convergence: 0, coupling: 0, consolidation: 0 },
       history: [],
     }
@@ -329,7 +359,7 @@ export function computeCoherence({
   }
   if (uniqueSteps[uniqueSteps.length - 1] !== total) uniqueSteps.push(total)
 
-  // Replay historical events (including supersessions and withdrawals) chronologically from inception.
+  // Replay retained historical events (including supersessions, cross-author checkpoints, and withdrawals).
   const stepSet = new Set(uniqueSteps)
   const activeHeads = new Map()
   const history = []
@@ -343,11 +373,18 @@ export function computeCoherence({
     }
     const stepNum = i + 1
     if (stepSet.has(stepNum)) {
-      const epochAt = ev.created_at || 0
-      const activeAtEpoch = [...activeHeads.values()].filter(
-        r => r.expires_at === null || r.expires_at === undefined || r.expires_at > epochAt
-      )
-      const writeSeqAtEpoch = stepNum === total && Number.isSafeInteger(store_state?.write_seq)
+      const isFinalStep = stepNum === total
+      const epochAt = isFinalStep && Number.isSafeInteger(now_sec)
+        ? Math.max(ev.created_at || 0, now_sec)
+        : (ev.created_at || 0)
+      let activeAtEpoch = filterActiveAtEpoch([...activeHeads.values()], epochAt, isFinalStep)
+      if (isFinalStep && hasHistory && Array.isArray(records)) {
+        const reconciled = filterActiveAtEpoch(records, epochAt, true)
+        if (reconciled.length > 0 || records.length === 0) {
+          activeAtEpoch = reconciled
+        }
+      }
+      const writeSeqAtEpoch = isFinalStep && Number.isSafeInteger(store_state?.write_seq)
         ? Math.max(stepNum, store_state.write_seq)
         : stepNum
       const snap = evaluateCoherenceSlice(activeAtEpoch, rosterByPk, expectedRosterSize, writeSeqAtEpoch)
@@ -380,6 +417,8 @@ export function computeCoherence({
     delta_since_inception: Math.round((current.score - inception.score) * 10) / 10,
     total_events: total,
     shared_artifacts: current.shared_refs,
+    history_complete: Boolean(history_complete),
+    history_window: history_complete ? '90d-retained' : 'truncated-5000',
     axes: current.axes,
     history,
   }
@@ -2132,7 +2171,8 @@ export function renderViewerHtml(initialState) {
 
           var hist = Array.isArray(coh.history) ? coh.history : [];
           if (hist.length > 0) {
-            var sparkTitle = makeDiv('inspect-kicker', 'Retroactive Trajectory (Inception -> Now)');
+            var windowNote = coh.history_complete === false ? ' [TRUNCATED AT 5,000 EVENTS]' : ' (90d retained history)';
+            var sparkTitle = makeDiv('inspect-kicker', 'Retroactive Trajectory (Inception -> Now)' + windowNote);
             sparkTitle.style.marginTop = '6px';
             box.appendChild(sparkTitle);
             var sparkCanvas = document.createElement('canvas');
@@ -2987,12 +3027,15 @@ export async function startMemoryViewer({
       })
       const agentRoster = healthResult.roster
       const storeState = wake?.store_state || firstQuery?.store_state || { state: 'UNKNOWN', write_seq: null, current_claims: null, last_backup_age_sec: null, unbacked_writes: null }
+      const historyComplete = cursor === null
       const coherence = computeCoherence({
         records,
         history_records: historyRecords,
         agent_roster: agentRoster,
         recent_activity: recentActivity,
         store_state: storeState,
+        now_sec: nowSec,
+        history_complete: historyComplete,
       })
       const queryAnswer = firstQuery?.answer === 'unknown'
         ? 'unknown'
