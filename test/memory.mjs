@@ -105,6 +105,17 @@ const runBin = (script, args) => new Promise(res => {
   child.stdout.on('data', c => { stdout += c }); child.stderr.on('data', c => { stderr += c })
   child.on('close', status => res({ status, stdout, stderr }))
 })
+// herd-infra's --purge-records: <snapshot_id>/accepted-ledger.jsonl for each hive-memory-purge snapshot.
+const purgeRecords = (p, name, ...backups) => {
+  const dir = join(p.dir, name)
+  mkdirSync(dir)
+  for (const b of backups) {
+    const id = join(dir, createHash('sha256').update(b.dir).digest('hex'))
+    mkdirSync(id)
+    copyFileSync(b.ledger, join(id, 'accepted-ledger.jsonl'))
+  }
+  return dir
+}
 // A verified backup as herd-infra dumps it from restic: memory.sqlite, accepted-ledger.jsonl and SHA256SUMS.
 const backupDir = async (p, name) => {
   const dir = join(p.dir, name)
@@ -113,7 +124,8 @@ const backupDir = async (p, name) => {
   const out = await snapshotStore({ dbPath: p.db, ledgerPath: p.ledger, snapshotPath: snap, ledgerCutPath: join(dir, 'accepted-ledger.jsonl') })
   const sum = f => `${createHash('sha256').update(readFileSync(join(dir, f))).digest('hex')}  ${f}\n`
   writeFileSync(join(dir, 'SHA256SUMS'), sum('memory.sqlite') + sum('accepted-ledger.jsonl'))
-  return { dir, snap, out, authority: { headDir: dir } }
+  const ledger = join(dir, 'accepted-ledger.jsonl')
+  return { dir, snap, out, ledger, authority: { ledger, purgeRecords: purgeRecords(p, `${name}-purges`) } }
 }
 const withDb = (path, fn) => { const db = new DatabaseSync(path); try { return fn(db) } finally { db.close() } }
 
@@ -670,18 +682,22 @@ const loseHost = p => { for (const f of [p.db, `${p.db}-wal`, `${p.db}-shm`, p.l
   const full = (extra = {}) => restoreSnapshot({ snapshotPath: S2.snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG, withLedger: true, nowSec: T0 + 20, ...extra })
   ok('a full-host restore with no authority fails closed (HIVE_MEMORY_RESTORE_AUTHORITY_UNAVAILABLE) and installs nothing',
     throwsCode(() => full(), 'HIVE_MEMORY_RESTORE_AUTHORITY_UNAVAILABLE') && !existsSync(p.ledger) && !existsSync(p.db))
-  const forged = join(p.dir, 'S3-forged')
-  mkdirSync(forged)
-  copyFileSync(join(S3.dir, 'SHA256SUMS'), join(forged, 'SHA256SUMS'))
-  writeFileSync(join(forged, 'accepted-ledger.jsonl'), readFileSync(join(S2.dir, 'accepted-ledger.jsonl')))
-  const unsummed = join(p.dir, 'S3-unsummed')
-  mkdirSync(unsummed)
-  copyFileSync(join(S3.dir, 'accepted-ledger.jsonl'), join(unsummed, 'accepted-ledger.jsonl'))
-  ok('an authority whose ledger fails its SHA256SUMS, or has none, fails closed (HIVE_MEMORY_RESTORE_AUTHORITY_UNAVAILABLE)',
-    [forged, unsummed].every(headDir => throwsCode(() => full({ authority: { headDir } }), 'HIVE_MEMORY_RESTORE_AUTHORITY_UNAVAILABLE')) && !existsSync(p.ledger))
-  ok('a hive-memory-purge ledger ahead of the head fails closed (HIVE_MEMORY_RESTORE_AUTHORITY_MISMATCH)',
-    throwsCode(() => full({ authority: { headDir: S2.dir, purgeDirs: [S3.dir] } }), 'HIVE_MEMORY_RESTORE_AUTHORITY_MISMATCH') && !existsSync(p.ledger))
-  const authority = { headDir: S3.dir, purgeDirs: [S3.dir] }
+  const records = purgeRecords(p, 'purges', S3)
+  const torn = join(p.dir, 'torn.jsonl')
+  writeFileSync(torn, readFileSync(S3.ledger).subarray(0, -5))
+  const gappy = join(p.dir, 'gappy.jsonl')
+  writeFileSync(gappy, readFileSync(S3.ledger, 'utf8').split('\n').filter((_, i) => i !== 1).join('\n'))
+  const stray = purgeRecords(p, 'stray-purges')
+  writeFileSync(join(stray, 'notes.txt'), 'x')
+  const unavailable = [
+    { ledger: join(p.dir, 'absent.jsonl'), purgeRecords: records }, { ledger: S3.ledger }, { ledger: S3.ledger, purgeRecords: join(p.dir, 'absent') },
+    { ledger: torn, purgeRecords: records }, { ledger: gappy, purgeRecords: records }, { ledger: S3.ledger, purgeRecords: stray },
+  ]
+  ok('a missing, torn or broken-chain authority ledger, or missing or malformed purge records, fails closed (HIVE_MEMORY_RESTORE_AUTHORITY_UNAVAILABLE)',
+    unavailable.every(authority => throwsCode(() => full({ authority }), 'HIVE_MEMORY_RESTORE_AUTHORITY_UNAVAILABLE')) && !existsSync(p.ledger))
+  ok('a hive-memory-purge ledger ahead of the authority ledger fails closed (HIVE_MEMORY_RESTORE_AUTHORITY_MISMATCH)',
+    throwsCode(() => full({ authority: { ledger: S2.ledger, purgeRecords: records } }), 'HIVE_MEMORY_RESTORE_AUTHORITY_MISMATCH') && !existsSync(p.ledger))
+  const authority = { ledger: S3.ledger, purgeRecords: records }
   let err = null
   try { full({ authority }) } catch (e) { err = e }
   const installed = readLedger(p.ledger).lines
@@ -714,11 +730,13 @@ const loseHost = p => { for (const f of [p.db, `${p.db}-wal`, `${p.db}-shm`, p.l
   writeFileSync(cfgPath, JSON.stringify(rawConfig()))
   const base = ['--snapshot', S2.snap, '--db', p.db, '--ledger', p.ledger, '--config', cfgPath]
   const none = await runBin('hive-memory-restore.mjs', base)
-  const both = await runBin('hive-memory-restore.mjs', [...base, '--with-ledger', S3.dir, '--authority', S3.dir])
-  const refused = await runBin('hive-memory-restore.mjs', [...base, '--with-ledger', S3.dir, '--purge-authority', S3.dir])
-  const done = await runBin('hive-memory-restore.mjs', [...base, '--with-ledger', S3.dir, '--purge-authority', S3.dir, '--reapply-purges'])
-  ok('bin/hive-memory-restore: no authority exits 1 (AUTHORITY_UNAVAILABLE), both head flags exit 2, S2 is refused, then installs with --reapply-purges',
-    none.status === 1 && /HIVE_MEMORY_RESTORE_AUTHORITY_UNAVAILABLE/.test(none.stderr) && both.status === 2 &&
+  const auth = ['--authority-ledger', S3.ledger, '--purge-records', records]
+  const unknown = await Promise.all([['--authority', S3.dir], ['--purge-authority', S3.dir], ['--reapply-purge'], ['--with-ledger', '--with-ledger']]
+    .map(extra => runBin('hive-memory-restore.mjs', [...base, ...auth, ...extra])))
+  const refused = await runBin('hive-memory-restore.mjs', [...base, ...auth, '--with-ledger'])
+  const done = await runBin('hive-memory-restore.mjs', [...base, ...auth, '--with-ledger', '--reapply-purges'])
+  ok('bin/hive-memory-restore: no authority exits 1 (AUTHORITY_UNAVAILABLE), unknown or repeated flags exit 2, S2 is refused, then installs with --reapply-purges',
+    none.status === 1 && /HIVE_MEMORY_RESTORE_AUTHORITY_UNAVAILABLE/.test(none.stderr) && unknown.every(r => r.status === 2) &&
     refused.status === 1 && /HIVE_MEMORY_RESTORE_PRE_PURGE_SNAPSHOT/.test(refused.stderr) && done.status === 0 && JSON.parse(done.stdout).write_seq === 3)
 }
 {
@@ -735,11 +753,11 @@ const loseHost = p => { for (const f of [p.db, `${p.db}-wal`, `${p.db}-shm`, p.l
   const S3 = await backupDir(p, 'S3')
   s.close()
   loseHost(p)
-  const full = (headDir, extra = {}) => restoreSnapshot({ snapshotPath: S2.snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG, authority: { headDir, purgeDirs: [S3.dir] }, withLedger: true, nowSec: now + 10, ...extra })
+  const full = extra => restoreSnapshot({ snapshotPath: S2.snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG, authority: { ledger: S3.ledger, purgeRecords: purgeRecords(p, 'purges', S3) }, withLedger: true, nowSec: now + 10, ...extra })
   ok('[maintenance, S3 verified] --with-ledger restore of S2 is refused against S3\'s ledger (HIVE_MEMORY_RESTORE_PRE_PURGE_SNAPSHOT)',
-    purged.seq === 4 && throwsCode(() => full(S3.dir), 'HIVE_MEMORY_RESTORE_PRE_PURGE_SNAPSHOT') && readLedger(p.ledger).lines.length === 4 && !existsSync(p.db))
+    purged.seq === 4 && throwsCode(() => full(), 'HIVE_MEMORY_RESTORE_PRE_PURGE_SNAPSHOT') && readLedger(p.ledger).lines.length === 4 && !existsSync(p.db))
   loseHost(p)
-  const noS3 = (extra = {}) => restoreSnapshot({ snapshotPath: S2.snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG, authority: { headDir: S2.dir }, nowSec: now + 10, ...extra })
+  const noS3 = (extra = {}) => restoreSnapshot({ snapshotPath: S2.snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG, authority: S2.authority, nowSec: now + 10, ...extra })
   let err = null
   try { noS3({ withLedger: true }) } catch (e) { err = e }
   ok('[maintenance, backup lost with the host] restore of S2, the newest backup, still refuses E past the retention window (HIVE_MEMORY_RESTORE_PRE_PURGE_SNAPSHOT)',
@@ -832,8 +850,13 @@ const loseHost = p => { for (const f of [p.db, `${p.db}-wal`, `${p.db}-shm`, p.l
   const snapClean = JSON.parse((await runBin('hive-memory-backup.mjs', snapArgs(2))).stdout || '{}')
   ok('a snapshot once the purge is covered no longer asks for the purge tag', snapClean.purge === false && snapClean.last_purge_seq === 4)
   s.close()
-  const hd = await runBin('hive-memory-purge.mjs', ['--db', p.db, '--ledger', p.ledger, '--backup-receipt', p.receipt, '--config', cfgPath, '--id', succ.id])
-  const hdSeq = JSON.parse(hd.stdout || '{}').write_seq
+  const purgeBase = ['--db', p.db, '--ledger', p.ledger, '--backup-receipt', p.receipt, '--config', cfgPath]
+  const typo = await runBin('hive-memory-purge.mjs', [...purgeBase, '--id', succ.id, '--dry-run'])
+  ok('bin/hive-memory-purge refuses an unknown flag and purges nothing', typo.status === 2 && /unknown argument --dry-run/.test(typo.stderr) && readLedger(p.ledger).lines.length === 5)
+  const hd = await runBin('hive-memory-purge.mjs', [...purgeBase, '--id', succ.id])
+  const hdOut = JSON.parse(hd.stdout || '{}')
+  const hdSeq = hdOut.write_seq
+  ok('bin/hive-memory-purge prints exactly { purged: <count>, write_seq }', JSON.stringify(Object.keys(hdOut)) === '["purged","write_seq"]' && hdOut.purged === 1)
   const hdGate = await runBin('hive-memory-backup.mjs', gateArgs)
   ok('a hard delete through bin/hive-memory-purge goes through the same barrier',
     hd.status === 0 && hdSeq === 6 && hdGate.status === 1 && hdGate.stderr.includes(`HIVE_MEMORY_PURGE_BACKUP_INCOMPLETE: local SQLite and ledger purged at write_seq ${hdSeq},`))
@@ -845,6 +868,29 @@ const loseHost = p => { for (const f of [p.db, `${p.db}-wal`, `${p.db}-shm`, p.l
   const s3 = open(p)
   ok('a store_meta.last_purge_seq that disagrees with the ledger fails closed (PURGE_SEQ_MISMATCH)', s3.state === 'PURGE_SEQ_MISMATCH' && unknownAnswer(s3, 'PURGE_SEQ_MISMATCH'))
   s3.close()
+}
+
+{
+  // The daemon never purges on its own: retention runs only through bin/hive-memory-purge --retention (§4.5).
+  const p = setup('daemon-no-purge')
+  const s = open(p)
+  const old = claim(james, 'hive:ops', 'rolling', { ttlSec: 0 })
+  const succ = claim(james, 'hive:ops', 'rolling', { ttlSec: 0, priorCreatedAt: old.created_at })
+  s.submit({ writer: 'james', event: old, expectedPriorId: null, nowSec: T0 + 50 })
+  s.submit({ writer: 'james', event: succ, expectedPriorId: old.id, nowSec: T0 + 51 })
+  s.close()
+  const cfgPath = join(p.dir, 'config.json')
+  writeFileSync(cfgPath, JSON.stringify(rawConfig()))
+  const daemon = await startMemoryDaemon({
+    dbPath: p.db, ledgerPath: p.ledger, receiptPath: p.receipt, configPath: cfgPath, socketDir: join(p.dir, 's'),
+    readers: 'owner', writers: 'james', now: () => succ.created_at + RETENTION_PURGE_AFTER_SEC * 2, retentionIntervalMs: 5, log: () => {},
+  })
+  await new Promise(r => setTimeout(r, 150))
+  const due = daemon.store.retentionCandidates(succ.created_at + RETENTION_PURGE_AFTER_SEC * 2)
+  await daemon.close()
+  const daemonSrc = readFileSync('mcp/tools/memory-daemon.mjs', 'utf8')
+  ok('the daemon never purges on its own, even with rows long past the 90-day window and a short interval asked for',
+    due.includes(old.id) && !readLedger(p.ledger).lines.some(l => l.rec.op === 'purge') && !/purgeRetention|hardDelete|retentionTimer|setInterval/.test(daemonSrc))
 }
 
 // --- 5. Read ACL, graph traversal, SIGHUP revocation, and the 5,000-claim fixture (§5 test 5) ---

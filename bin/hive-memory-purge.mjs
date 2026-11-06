@@ -4,7 +4,8 @@
 //   node bin/hive-memory-purge.mjs --db … --ledger … --backup-receipt … --config … (--d <fact key> | --id <event id>)
 //   node bin/hive-memory-purge.mjs --db … --ledger … --backup-receipt … --config … --retention
 //
-// --retention is the daily 90-day pass; with nothing past the window it writes no op purge.
+// --retention is the daily 90-day pass; with nothing past the window it writes no op purge. Prints
+// { purged: <count>, write_seq: <the purge's write_seq, or null when nothing was purged> }. Unknown flags are refused.
 // Stop hive-memory.service first; the purge takes the store lock and refuses while the daemon holds it.
 // The store must reconcile to READY. A hard delete removes every version at that fact key (or the one
 // event); every purge then checkpoints and VACUUMs so the rows leave the SQLite pages.
@@ -14,17 +15,25 @@
 import { HiveMemoryStore, loadConfigFile } from '../mcp/tools/hive_memory_store.mjs'
 
 const args = process.argv.slice(2)
-const flag = name => {
-  const i = args.indexOf(name)
-  return i < 0 ? null : args[i + 1] ?? ''
-}
+const VALUED = ['--db', '--ledger', '--backup-receipt', '--config', '--d', '--id']
 const fail = (msg, code = 1) => { console.error(`hive-memory-purge: ${msg}`); process.exit(code) }
+const given = {}
+for (let i = 0; i < args.length; i++) {
+  const a = args[i]
+  if (a !== '--retention' && !VALUED.includes(a)) fail(`unknown argument ${a}`, 2)
+  if (Object.hasOwn(given, a)) fail(`${a} is given twice`, 2)
+  if (a === '--retention') { given[a] = true; continue }
+  const v = args[++i]
+  if (!v || v.startsWith('--')) fail(`${a} takes a value`, 2)
+  given[a] = v
+}
+const flag = name => given[name] ?? null
 const dbPath = flag('--db')
 const ledgerPath = flag('--ledger')
 const receiptPath = flag('--backup-receipt')
 const configPath = flag('--config')
 if (!dbPath || !ledgerPath || !receiptPath || !configPath) fail('--db, --ledger, --backup-receipt and --config are required', 2)
-const retention = args.includes('--retention')
+const retention = given['--retention'] === true
 const d = flag('--d')
 const id = flag('--id')
 if (retention ? d !== null || id !== null : (d === null) === (id === null)) fail('name exactly one of --d, --id or --retention', 2)

@@ -7,11 +7,11 @@
 // Nothing here opens a network connection.
 
 import { DatabaseSync, backup as sqliteBackup } from 'node:sqlite'
-import { createHash, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import {
-  closeSync, copyFileSync, existsSync, fsyncSync, ftruncateSync, linkSync, lstatSync, openSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync,
+  closeSync, copyFileSync, existsSync, fsyncSync, ftruncateSync, linkSync, lstatSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, writeSync,
 } from 'node:fs'
-import { basename, dirname, join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { verifyEvent } from 'nostr-tools/pure'
 import {
   DEFAULT_QUERY_LIMIT, DEFAULT_WAKE_MAX_CHARS, FALLBACK_MEMORY_KIND, MAX_LINK_HOPS, MAX_QUERY_LIMIT, MEMORY_KIND, nip01Newer, parseFactKey,
@@ -977,39 +977,37 @@ export function recordVerifiedBackup({ receiptPath, writeSeq, snapshotId, at = n
 
 // --- restore: bidirectional reconciliation of a decrypted snapshot against the ledger ---
 
-// The restore authority is restic snapshot content that herd-infra has dumped to local directories, each
-// holding accepted-ledger.jsonl and the SHA256SUMS staged beside it (sha256sum format). The head is the
-// newest verified hive-memory snapshot; purgeDirs are hive-memory-purge snapshots, each of which must be a
-// prefix of the head. A candidate snapshot's own ledger is never the authority.
+// The restore authority is restic content herd-infra has dumped and checked against each snapshot's SHA256SUMS:
+// the ledger of the newest verified hive-memory snapshot, and a directory holding <snapshot_id>/accepted-ledger.jsonl
+// for every hive-memory-purge snapshot, each of which must be a prefix of the head. A candidate snapshot's own
+// ledger is never the authority.
 const AUTHORITY_LEDGER = 'accepted-ledger.jsonl'
+const authorityUnavailable = why => new HiveMemoryError('HIVE_MEMORY_RESTORE_AUTHORITY_UNAVAILABLE', why)
 
-function readAuthorityDir(dir) {
-  const unavailable = why => new HiveMemoryError('HIVE_MEMORY_RESTORE_AUTHORITY_UNAVAILABLE', why)
-  let sums, buf
+function readAuthorityLedger(path) {
+  let bytes, ledger
   try {
-    sums = readFileSync(join(dir, 'SHA256SUMS'), 'utf8')
-    buf = readFileSync(join(dir, AUTHORITY_LEDGER))
-  } catch (e) { throw unavailable(`cannot read ${dir}: ${e.code || e.message}`) }
-  const named = sums.split('\n').map(l => /^([0-9a-f]{64}) [ *](.+)$/.exec(l)).filter(m => m && basename(m[2]) === AUTHORITY_LEDGER)
-  if (named.length !== 1) throw unavailable(`SHA256SUMS in ${dir} does not name ${AUTHORITY_LEDGER} exactly once`)
-  if (createHash('sha256').update(buf).digest('hex') !== named[0][1]) throw unavailable(`${AUTHORITY_LEDGER} in ${dir} does not match its SHA256SUMS`)
-  let ledger
-  try { ledger = readLedger(join(dir, AUTHORITY_LEDGER)) } catch (e) { throw unavailable(`${dir}: ${e.message}`) }
-  if (!ledger.lines.length || ledger.truncated) throw unavailable(`${dir} holds no complete ledger`)
-  return { lines: ledger.lines, bytes: buf }
+    bytes = readFileSync(path)
+    ledger = readLedger(path)
+  } catch (e) { throw authorityUnavailable(`${path}: ${e.code === 'ENOENT' ? 'missing' : e.message}`) }
+  if (!ledger.lines.length || ledger.truncated) throw authorityUnavailable(`${path} holds no complete ledger`)
+  return { lines: ledger.lines, bytes }
 }
 
-export function loadRestoreAuthority({ headDir, purgeDirs = [] } = {}) {
-  if (!headDir) throw new HiveMemoryError('HIVE_MEMORY_RESTORE_AUTHORITY_UNAVAILABLE', 'no verified hive-memory snapshot was given as the restore authority')
-  const head = readAuthorityDir(headDir)
-  const fold = foldLedger(head.lines)
-  for (const dir of purgeDirs) {
-    const { lines } = readAuthorityDir(dir)
+export function loadRestoreAuthority({ ledger, purgeRecords } = {}) {
+  if (!ledger) throw authorityUnavailable('no authority ledger from the newest verified hive-memory snapshot was given')
+  if (!purgeRecords) throw authorityUnavailable('no hive-memory-purge records directory was given')
+  const head = readAuthorityLedger(ledger)
+  let entries
+  try { entries = readdirSync(purgeRecords, { withFileTypes: true }) } catch (e) { throw authorityUnavailable(`cannot list the purge records: ${e.code || e.message}`) }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !HEX64.test(entry.name)) throw authorityUnavailable(`unexpected entry ${entry.name} in the purge records`)
+    const { lines } = readAuthorityLedger(join(purgeRecords, entry.name, AUTHORITY_LEDGER))
     if (lines.length > head.lines.length || lines.some((l, i) => l.raw !== head.lines[i].raw)) {
-      throw new HiveMemoryError('HIVE_MEMORY_RESTORE_AUTHORITY_MISMATCH', `the hive-memory-purge ledger in ${dir} is not a prefix of the head ledger`)
+      throw new HiveMemoryError('HIVE_MEMORY_RESTORE_AUTHORITY_MISMATCH', `the hive-memory-purge ledger of ${prefix(entry.name)} is not a prefix of the authority ledger`)
     }
   }
-  return { ...head, fold }
+  return { ...head, fold: foldLedger(head.lines) }
 }
 
 const pathExists = p => { try { lstatSync(p); return true } catch { return false } }
