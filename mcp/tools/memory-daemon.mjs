@@ -232,6 +232,7 @@ export function handleSocketJsonRpc({ store, binding, message, nowSec, activity 
     includeHistory: args.include_history === true,
     limit: args.limit !== undefined ? Number(args.limit) : undefined,
     cursor: args.cursor !== undefined ? Number(args.cursor) : 0,
+    format: str(args.format),
     staleFiles,
     nowSec,
   })

@@ -525,9 +525,82 @@ for (const [label, mutate, state] of [
   const wake = s.wake({ readerPubkey: james.pk, nowSec: T0 + 300 })
   ok('the wake digest shows every canon claim, the oldest included, and fills the rest with ops within budget',
     wake.counts.canon_shown === 5 && wake.counts.canon_omitted === 0 && wake.digest.includes('canon-1]') &&
-    wake.counts.ops_shown > 0 && wake.counts.ops_omitted > 0 && wake.char_length <= wake.max_chars)
+    wake.counts.ops_shown > 0 && wake.counts.ops_omitted > 0 && wake.char_length - wake.canon_char_length <= wake.max_chars)
   const tight = s.wake({ readerPubkey: james.pk, maxChars: 1000, nowSec: T0 + 300 })
-  ok('a tight budget still keeps room for ops and stays within it', tight.char_length <= 1000 && tight.counts.canon_shown >= 1 && tight.digest.includes('Rank 3'))
+  ok('the wake indexes at most 8 room and ops claims and lists every topic with its count',
+    wake.counts.ops_shown <= 8 && wake.topic_directory['ops-0'] === 1 && Object.keys(wake.topic_directory).length === 40 &&
+    wake.digest.includes('topics: ') && wake.records.every(r => r.claim === undefined && r.authority === null))
+  ok('a tight budget keeps all canon, still shows ops, and holds the rest within it',
+    tight.char_length - tight.canon_char_length <= 1000 && tight.counts.canon_shown === 5 && tight.counts.ops_shown >= 1 && tight.digest.includes('Rank 3'))
+  s.close()
+}
+
+// Phase 2 Gates 6-8: index vs full, the 24 h workflow tier, peer supersession of workflow checkpoints, topic normalizing.
+{
+  const raw = (signer, scope, slug, edit, opts = {}) => {
+    const t = buildClaimTemplate({ pubkey: signer.pk, scope, slug, claim: `raw ${slug}`, because: 'fixture', evidence: ['nvoy@abc1234:README.md'],
+      asOfGit: 'abc1234', memoryGlobalChannelId: GLOBAL_CH, nowSec: T0 + 150, ...opts })
+    edit(t)
+    return finalizeEvent(t, signer.sk)
+  }
+  const expTag = (t, v) => { t.tags = t.tags.filter(x => x[0] !== 'exp'); if (v != null) t.tags.push(['exp', String(v)]) }
+  const wf = claim(opsBot, 'hive:ops', 'nvoy-pr9-review')
+  const wfLong = claim(opsBot, 'hive:ops', 'nvoy-pr9-status', { ttlSec: 5 * DAY })
+  ok('builder: a workflow checkpoint defaults to 24 h and is capped at 48 h',
+    Number(wf.tags.find(t => t[0] === 'exp')[1]) - wf.created_at === DAY &&
+    Number(wfLong.tags.find(t => t[0] === 'exp')[1]) - wfLong.created_at === 2 * DAY)
+  let threw = null
+  try { claim(opsBot, 'hive:ops', 'nvoy-pr9-owner', { ttlSec: 0 }) } catch (e) { threw = e.message }
+  ok('builder: a workflow checkpoint cannot be a durable decision', /workflow checkpoint/.test(threw || ''))
+  const aliased = claim(opsBot, 'hive:ops', 'lesson-pacing', { topic: 'Primer' })
+  threw = null
+  try { claim(opsBot, 'hive:ops', 'odd-topic', { topic: 'Where Things Live!' }) } catch (e) { threw = e.message }
+  ok('builder: topics are normalized through the alias table and refused when not kebab-case',
+    aliased.tags.find(t => t[0] === 'topic')[1] === 'illustrated-primer' && /not a project slug/.test(threw || ''))
+
+  const p = setup('phase2')
+  const s = open(p)
+  const sub = (writer, event, prior = null, at = T0 + 200) => s.submit({ writer, event, expectedPriorId: prior, nowSec: at })
+  const badTopic = sub('ops', raw(opsBot, 'hive:ops', 'bad-topic', t => { t.tags = t.tags.map(x => x[0] === 'topic' ? ['topic', 'Not A Topic'] : x) }))
+  const wfDecision = sub('ops', raw(opsBot, 'hive:ops', 'herd-infra-pr15-review', t => { expTag(t, null); t.tags.push(['retention', 'decision']) }))
+  const wfWeek = sub('ops', raw(opsBot, 'hive:ops', 'herd-infra-pr15-handoff', t => expTag(t, T0 + 150 + 7 * DAY)))
+  const canonWf = sub('james', claim(james, 'hive:canon', 'merge-review', { ttlSec: 0 }))
+  ok('store: an unnormalizable topic is refused with HIVE_MEMORY_INVALID_TOPIC', badTopic.code === 'HIVE_MEMORY_INVALID_TOPIC')
+  ok('store: a workflow checkpoint that never expires, or lasts past 48 h, is refused',
+    wfDecision.code === 'HIVE_MEMORY_INVALID_EVENT' && /durable/.test(wfDecision.message) && wfWeek.code === 'HIVE_MEMORY_INVALID_EVENT' && /48 hours/.test(wfWeek.message))
+  ok('store: canon is not held to the workflow tier', canonWf.accepted === true)
+
+  ok('store: an alias topic is accepted', sub('ops', aliased).accepted === true)
+  const review = claim(opsBot, 'hive:ops', 'nvoy-pr9-review', { claim: 'PR 9 reviewed clean at abc1234' })
+  const note = claim(opsBot, 'hive:ops', 'nvoy-design-note', { claim: 'a standing note that a later claim cites' })
+  sub('ops', review)
+  sub('ops', note)
+  const merged = claim(james, 'hive:ops', 'nvoy-pr9-merged', { claim: 'PR 9 merged', supersedes: [review.id, note.id], nowSec: T0 + 300 })
+  ok('store: the closing claim is accepted', sub('james', merged, null, T0 + 300).accepted === true)
+
+  const list = s.query({ readerPubkey: james.pk, scope: 'hive:ops', nowSec: T0 + 400 })
+  const card = list.records.find(r => r.event_id === merged.id)
+  ok('query: without d the default is index cards, with no because, evidence or as_of',
+    list.format === 'index' && card?.record_type === 'memory-index-card' && card.author === 'james' && card.claim_preview === 'PR 9 merged' &&
+    card.because === undefined && card.evidence === undefined && card.as_of_git === undefined && card.authority === null && card.trustedInstruction === false)
+  const one = s.query({ readerPubkey: james.pk, d: merged.tags.find(t => t[0] === 'd')[1], nowSec: T0 + 400 })
+  const full = s.query({ readerPubkey: james.pk, scope: 'hive:ops', format: 'full', nowSec: T0 + 400 })
+  ok('query: d defaults to full, and format full returns whole envelopes',
+    one.format === 'full' && one.records[0].because === 'observed in the test fixture' && full.records.every(r => r.record_type === 'memory-claim' && Array.isArray(r.evidence)))
+  ok('query: a topic alias finds the normalized claim', s.query({ readerPubkey: james.pk, topic: 'primer', nowSec: T0 + 400 }).records.map(r => r.event_id).join() === aliased.id)
+
+  const ids = list.records.map(r => r.event_id)
+  const hist = s.query({ readerPubkey: james.pk, scope: 'hive:ops', includeHistory: true, nowSec: T0 + 400 })
+  const hidden = hist.records.find(r => r.event_id === review.id)
+  const wake = s.wake({ readerPubkey: james.pk, nowSec: T0 + 400 })
+  ok('peer supersession: the closed workflow checkpoint leaves query and wake; a cited non-workflow claim stays',
+    !ids.includes(review.id) && ids.includes(note.id) && hidden?.verification === 'consolidated' && hidden.consolidated_by === merged.id &&
+    wake.counts.consolidated_hidden === 1 && !wake.digest.includes('[nvoy-pr9-review]') && wake.digest.includes('[nvoy-design-note]'))
+  const older = claim(james, 'hive:ops', 'nvoy-pr9-early', { supersedes: [review.id], nowSec: T0 + 150 })
+  sub('james', older, null, T0 + 300)
+  sub('james', withdraw(james, merged), merged.id, T0 + 500)
+  ok('peer supersession: withdrawing the closing claim brings the checkpoint back; an older citer never hides it',
+    s.query({ readerPubkey: james.pk, scope: 'hive:ops', nowSec: T0 + 600 }).records.some(r => r.event_id === review.id))
   s.close()
 }
 
@@ -1191,7 +1264,7 @@ os.execv(sys.argv[3], [sys.argv[3], sys.argv[4], "--db", sys.argv[5], "--ledger"
   ok('5,000 claims: a topic query with history returns every version on that topic', topicQ.total_matched === 100)
   ok('5,000 claims: supersedes_of follows at most 3 hops', chain.total_matched === 3)
   ok('5,000 claims: a keyless reader sees only the 625 hive:ops heads', kiosk.total_matched === 625)
-  ok('5,000 claims: wake stays within its character budget', wake.char_length <= 6000 && wake.counts.ops_omitted > 0)
+  ok('5,000 claims: wake stays within its character budget', wake.char_length - wake.canon_char_length <= wake.max_chars && wake.counts.ops_omitted > 0)
   ok('5,000 claims: every query and the wake finish within 1.5 s', Math.max(worst, tTopic, tChain, tKiosk, tWake) < 1500)
   s.close()
 }

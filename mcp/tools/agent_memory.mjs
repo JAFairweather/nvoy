@@ -43,8 +43,10 @@ export function memoryToolSpec(manifest, op) {
       ' (3) a project status change (started, blocked, shipped, dropped), or (4) who owns what next.' +
       ' One fact per claim at a stable slug; set topic to the project slug (e.g. nvoy, herd-infra, hive-memory, buzz, r1).' +
       ' Cite concrete evidence (commit, PR, file path, message id) and an as_of_git (<repo>@<sha>) or as_of_evt (<64-hex>) anchor.' +
-      ' Retention (ttl_sec): 1..2592000 (default 1209600, 14 days; at most 30 days) for a Class A status or handoff claim that expires;' +
+      ' Retention (ttl_sec): 1..2592000 (default 1209600, 14 days; at most 30 days) for a Class A status claim that expires;' +
+      ' a workflow checkpoint (slug ending -review, -status, -owner, -wip or -handoff) defaults to 86400 (24 h) and is capped at 48 h;' +
       ' 0 for a Class B durable decision or standing project fact that stays active until withdrawn or superseded.' +
+      ' When your claim closes another agent\'s checkpoint (you merged the PR they reviewed), name its event id in supersedes so it leaves the default view.' +
       ' Check memory_query first to avoid duplicates. When a fact changes, supersede it at the same slug (supersedes: [<prior event id>]); when it stops being true, call memory_withdraw.' +
       ' Never record chatter, narration, guesses, personal details, secrets, or prose already in git or docs: cite those in evidence instead.'
     : 'Withdraw your room memory claim at one slug as soon as it stops being true, is resolved, or was wrong.' +

@@ -15,8 +15,8 @@ import {
 import { dirname, join } from 'node:path'
 import { verifyEvent } from 'nostr-tools/pure'
 import {
-  DEFAULT_QUERY_LIMIT, DEFAULT_WAKE_MAX_CHARS, FALLBACK_MEMORY_KIND, MAX_LINK_HOPS, MAX_QUERY_LIMIT, MEMORY_KIND, nip01Newer, parseFactKey,
-  validateMemoryEvent,
+  DEFAULT_QUERY_LIMIT, DEFAULT_WAKE_MAX_CHARS, FALLBACK_MEMORY_KIND, MAX_LINK_HOPS, MAX_QUERY_LIMIT, MEMORY_KIND, WAKE_INDEX_LIMIT,
+  isWorkflowSlug, memoryWritePolicy, nip01Newer, normalizeMemoryTopic, parseFactKey, validateMemoryEvent,
 } from './memory.mjs'
 
 export const RETENTION_PURGE_AFTER_SEC = 90 * 86400
@@ -333,7 +333,9 @@ export function checkEvent(event, config) {
   return { ...v, ev, raw }
 }
 
+// Topics are stored normalized so the topic index groups aliases; the signed tag keeps what the writer sent.
 function insertEvent(db, { ev, raw, ...v }, isCurrent, nowSec) {
+  v.topic = normalizeMemoryTopic(v.topic) ?? v.topic
   db.prepare(`INSERT INTO events (id, pubkey, kind, created_at, d, scope, scope_type, room_id, topic, status, retention, as_of_git, as_of_evt, exp, raw_json, ingested_at, is_current)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
     ev.id, v.pubkey, ev.kind, ev.created_at, v.d, v.scope, v.scopeType, v.roomId, v.topic, v.status, v.retention,
@@ -642,6 +644,9 @@ export class HiveMemoryStore {
     if (denied) return refusal('HIVE_MEMORY_SCOPE_NOT_AUTHORIZED', denied)
     const v = checkEvent(event, this.config)
     if (!v.ok) return refusal('HIVE_MEMORY_INVALID_EVENT', v.reason)
+    // Submit-only: rows already stored are never re-judged by these rules on reconcile or restore.
+    const policy = memoryWritePolicy(v)
+    if (!policy.ok) return refusal(policy.code, policy.reason)
     if (expectedPriorId !== null && !(typeof expectedPriorId === 'string' && HEX64.test(expectedPriorId))) {
       return refusal('HIVE_MEMORY_PRIOR_MISMATCH', 'expected_prior_id must be a 64-hex event id or null')
     }
@@ -772,11 +777,32 @@ export class HiveMemoryStore {
     return found
   }
 
+  // Gate 7 peer supersession: a workflow checkpoint (see isWorkflowSlug) named in `supersedes` by a live, newer claim in
+  // the same scope leaves the default view as 'consolidated'. Canon is never hidden this way. Withdrawing or expiring
+  // the superseding claim brings the checkpoint back, since this is computed at read time and nothing is rewritten.
+  #consolidatedBy(nowSec) {
+    const out = new Map()
+    const rows = this.db.prepare(`SELECT s.id AS sid, s.d AS sd, c.id AS cid FROM links l
+      JOIN events c ON c.id = l.from_id JOIN events s ON s.id = l.target
+      WHERE l.relation = 'supersedes' AND c.is_current = 1 AND c.status = 'active' AND (c.exp IS NULL OR c.exp > ?)
+        AND c.scope = s.scope AND c.created_at >= s.created_at AND c.id <> s.id AND s.scope_type <> 'hive:canon'
+      ORDER BY c.created_at DESC, c.id`).all(nowSec)
+    for (const r of rows) if (!out.has(r.sid) && isWorkflowSlug(parseFactKey(r.sd)?.slug)) out.set(r.sid, r.cid)
+    return out
+  }
+
+  #writerNames() {
+    const names = new Map()
+    for (const [name, w] of this.config?.writers || []) if (w?.pubkey && !names.has(w.pubkey)) names.set(w.pubkey, name)
+    return names
+  }
+
   query({
     readerPubkey = '', scope = null, roomId = null, topic = null, d = null, author = null, since = null, until = null, text = null,
     linkedTo = null, supersedesOf = null, includeHistory = false, limit = DEFAULT_QUERY_LIMIT, cursor = 0, staleFiles = new Set(),
-    nowSec = nowSecDefault(),
+    format = null, nowSec = nowSecDefault(),
   } = {}) {
+    const fmt = format === 'index' || format === 'full' ? format : d ? 'full' : 'index'
     const empty = (answer, reason) => ({
       answer, answer_reason: reason, records: [], total_matched: 0, returned: 0, omitted: 0, next_cursor: null, unverified: 0, scope_counts: {},
       store_state: this.storeState(readerPubkey, nowSec),
@@ -789,7 +815,6 @@ export class HiveMemoryStore {
     const add = (sql, value) => { where.push(sql); params.push(value) }
     if (scope) add('scope = ?', String(scope))
     if (roomId) add('room_id = ?', String(roomId).toLowerCase())
-    if (topic) add('topic = ?', String(topic))
     if (d) add('d = ?', String(d))
     if (author) add('pubkey = ?', String(author).toLowerCase())
     if (since != null) add('created_at >= ?', Number(since))
@@ -799,9 +824,11 @@ export class HiveMemoryStore {
       add('id IN (SELECT from_id FROM links WHERE target = ?)', String(linkedTo))
     }
     if (supersedesOf) add('id IN (SELECT value FROM json_each(?))', JSON.stringify([...this.#lineage(readerPubkey, String(supersedesOf))]))
+    const wantTopic = topic ? normalizeMemoryTopic(topic) ?? String(topic) : null
+    const consolidated = this.#consolidatedBy(nowSec)
     const rows = this.db.prepare(`SELECT * FROM events WHERE ${where.join(' AND ')}`).all(...params)
-      .filter(r => canRead(readerPubkey, r, this.config))
-      .map(r => ({ row: r, verdict: verdictOf(r, nowSec, staleFiles), body: JSON.parse(JSON.parse(r.raw_json).content) }))
+      .filter(r => canRead(readerPubkey, r, this.config) && (!wantTopic || topicOf(r) === wantTopic))
+      .map(r => ({ row: r, verdict: verdictOf(r, nowSec, staleFiles, consolidated), body: JSON.parse(JSON.parse(r.raw_json).content) }))
       .filter(x => includeHistory || x.verdict.verification === 'accepted')
     const byFactKey = new Map()
     for (const { row, verdict, body } of rows) {
@@ -819,10 +846,12 @@ export class HiveMemoryStore {
     for (const { row } of matched) scopeCounts[row.scope] = (scopeCounts[row.scope] || 0) + 1
     const page = matched.slice(startIdx, startIdx + pageLimit)
     const omitted = Math.max(0, matched.length - (startIdx + page.length))
+    const names = fmt === 'index' ? this.#writerNames() : null
     return {
       answer: matched.length ? 'found' : 'none',
       answer_reason: null,
-      records: page.map(x => ({ ...envelope(x), conflict: conflict(x.row.d) })),
+      format: fmt,
+      records: page.map(x => fmt === 'index' ? indexCard(x, names, conflict(x.row.d)) : { ...envelope(x), conflict: conflict(x.row.d) }),
       total_matched: matched.length,
       returned: page.length,
       omitted,
@@ -843,11 +872,14 @@ export class HiveMemoryStore {
       return { ...base, digest, char_length: digest.length, counts: { canon_shown: 0, canon_omitted: 0, ops_shown: 0, ops_omitted: 0 }, records: [] }
     }
     const cleanRoom = roomId ? String(roomId).toLowerCase() : null
+    const consolidated = this.#consolidatedBy(nowSec)
     const items = this.#activeRows(readerPubkey, nowSec)
       .filter(r => r.scope_type !== 'room' || !cleanRoom || r.room_id === cleanRoom)
-      .map(r => ({ row: r, verdict: verdictOf(r, nowSec, staleFiles), body: JSON.parse(JSON.parse(r.raw_json).content) }))
+      .map(r => ({ row: r, verdict: verdictOf(r, nowSec, staleFiles, consolidated), body: JSON.parse(JSON.parse(r.raw_json).content) }))
+    const consolidatedHidden = items.filter(x => x.verdict.verification === 'consolidated').length
     const factKeyClaims = new Map()
-    for (const { row, body } of items) {
+    for (const { row, body, verdict } of items) {
+      if (verdict.verification !== 'accepted') continue
       if (!factKeyClaims.has(row.d)) factKeyClaims.set(row.d, new Set())
       factKeyClaims.get(row.d).add(body.claim)
     }
@@ -860,45 +892,51 @@ export class HiveMemoryStore {
       `store_state: READY (write_seq: ${storeState.write_seq}, current_claims: ${storeState.current_claims}, last_backup_age_sec: ${storeState.last_backup_age_sec ?? 'none'}, unbacked_writes: ${storeState.unbacked_writes})`,
       ...(gitBanner ? [`git_check: ${String(gitBanner).slice(0, 500)}`] : []),
     ].join('\n')
-    const formatItem = ({ row, verdict, body }) => {
-      const tags = `${isConflict(row.d) ? '[CONFLICT] ' : ''}${verdict.staleWarning ? `${verdict.staleWarning} ` : ''}`
-      return `- ${tags}[${row.d}] (by ${row.pubkey.slice(0, 8)}, as_of ${row.as_of_git || row.as_of_evt}): ${body.claim} — Because: ${body.because} [evidence: ${(body.evidence || []).join(', ')}]`
+    // Canon is James's handful of standing decisions: always shown in full and outside the budget (Phase 2 design call a).
+    const canonText = ['\n## Rank 2: hive:canon', ...(canon.length ? canon.map(({ row, verdict, body }) =>
+      `- ${isConflict(row.d) ? '[CONFLICT] ' : ''}${verdict.staleWarning ? `${verdict.staleWarning} ` : ''}[${row.d}] (by ${row.pubkey.slice(0, 8)}, as_of ${row.as_of_git || row.as_of_evt}): ${body.claim} — Because: ${body.because} [evidence: ${(body.evidence || []).join(', ')}]`)
+      : ['(none)'])].join('\n')
+    // Everything else is an index: at most WAKE_INDEX_LIMIT one-line cards, then counts per topic, inside the budget.
+    const names = this.#writerNames()
+    const topics = {}
+    for (const { row } of ops) { const t = topicOf(row); topics[t] = (topics[t] || 0) + 1 }
+    const topicDirectory = Object.fromEntries(Object.entries(topics).sort((a, b) => (b[1] - a[1]) || (a[0] < b[0] ? -1 : 1)))
+    const ageOf = sec => { const m = Math.max(0, Math.floor((nowSec - sec) / 60)); return m < 120 ? `${m}m` : m < 2880 ? `${Math.floor(m / 60)}h` : `${Math.floor(m / 1440)}d` }
+    const hint = 'more: memory_query topic=<topic> lists index cards; memory_query d=<fact key> returns one claim in full'
+    const dirLine = `topics: ${Object.entries(topicDirectory).map(([t, n]) => `${t} ${n}`).join(', ') || '(none)'}`
+    const fixed = header.length + 1 + '\n## Rank 3: room & hive:ops (index)'.length + 1 + dirLine.length + 1 + hint.length + 40
+    const lines = ['\n## Rank 3: room & hive:ops (index)']
+    let used = fixed
+    let shown = 0
+    for (const x of ops) {
+      if (shown >= WAKE_INDEX_LIMIT) break
+      const slug = parseFactKey(x.row.d)?.slug || x.row.d
+      const line = `- ${isConflict(x.row.d) ? '[CONFLICT] ' : ''}[${slug}] ${topicOf(x.row)}, by ${names.get(x.row.pubkey) || x.row.pubkey.slice(0, 12)}, ${ageOf(x.row.created_at)}: ${preview(x.body.claim, 100)}`
+      if (used + line.length + 1 > budget) break
+      lines.push(line)
+      used += line.length + 1
+      shown++
     }
-    const fitSection = (title2, list, sectionBudget, scopeHint) => {
-      const lines = [`\n## ${title2}`]
-      let used = lines[0].length + 1
-      let shown = 0
-      for (const item of list) {
-        const line = formatItem(item)
-        if (used + line.length + 1 + 85 > sectionBudget) {
-          if (shown === 0) { lines.push(line.slice(0, Math.max(40, sectionBudget - used - 85))); shown++ }
-          break
-        }
-        lines.push(line)
-        used += line.length + 1
-        shown++
-      }
-      if (!list.length) lines.push('(none)')
-      if (list.length - shown > 0) lines.push(`+${list.length - shown} ${scopeHint} claims not shown; memory_query scope=${scopeHint}`)
-      return { text: lines.join('\n'), shown, omitted: list.length - shown }
-    }
-    // Canon is James's handful of standing decisions, so it goes first and may use up to 60% of the budget; room and
-    // ops claims take what it leaves. A fixed 35% share dropped the oldest of five canon claims (2026-11-06).
-    const rest = budget - header.length - 8
-    const canonSec = fitSection('Rank 2: hive:canon', canon, Math.floor(rest * 0.6), 'hive:canon')
-    const opsSec = fitSection('Rank 3: room & hive:ops', ops, rest - canonSec.text.length - 1, 'hive:ops')
-    const digest = [header, canonSec.text, opsSec.text].join('\n')
+    if (!ops.length) lines.push('(none)')
+    if (ops.length > shown) lines.push(`+${ops.length - shown} more`)
+    lines.push(dirLine, hint)
+    const digest = [header, canonText, lines.join('\n')].join('\n')
     return {
       ...base,
       digest,
       char_length: digest.length,
-      counts: { canon_shown: canonSec.shown, canon_omitted: canonSec.omitted, ops_shown: opsSec.shown, ops_omitted: opsSec.omitted },
-      records: [...canon.slice(0, canonSec.shown), ...ops.slice(0, opsSec.shown)].map(x => ({ ...envelope(x), conflict: isConflict(x.row.d) })),
+      canon_char_length: canonText.length,
+      counts: { canon_shown: canon.length, canon_omitted: 0, ops_shown: shown, ops_omitted: ops.length - shown, consolidated_hidden: consolidatedHidden },
+      topic_directory: topicDirectory,
+      records: [...canon, ...ops.slice(0, shown)].map(({ row }) => ({ authority: null, trustedInstruction: false, event_id: row.id, d: row.d, scope: row.scope, author_pubkey: row.pubkey })),
     }
   }
 }
 
-function verdictOf(row, nowSec, staleFiles) {
+const topicOf = row => normalizeMemoryTopic(row.topic) ?? row.topic
+const preview = (text, n) => { const t = String(text ?? '').replace(/\s+/g, ' ').trim(); return t.length > n ? `${t.slice(0, n - 1)}…` : t }
+
+function verdictOf(row, nowSec, staleFiles, consolidated = new Map()) {
   const rank = row.scope_type === 'hive:canon' ? 2 : row.scope_type === 'hive:ops' || row.scope_type === 'room' ? 3 : null
   let staleWarning = null
   if (row.as_of_git) {
@@ -906,8 +944,30 @@ function verdictOf(row, nowSec, staleFiles) {
     if (evidence.some(ref => staleFiles.has(ref) || staleFiles.has(`${row.as_of_git}:${ref}`))) staleWarning = `[STALE: evidence file changed since ${row.as_of_git}]`
   }
   const verification = row.status === 'withdrawn' ? 'withdrawn' : !row.is_current ? 'superseded'
-    : row.exp != null && row.exp <= nowSec ? 'expired' : 'accepted'
-  return { verification, computedRank: verification === 'accepted' ? rank : null, staleWarning }
+    : row.exp != null && row.exp <= nowSec ? 'expired' : consolidated.has(row.id) ? 'consolidated' : 'accepted'
+  return { verification, computedRank: verification === 'accepted' ? rank : null, staleWarning, consolidatedBy: consolidated.get(row.id) ?? null }
+}
+
+// Gate 6 discovery card: enough to choose what to open, without because, evidence or as_of. Still data only.
+function indexCard({ row, verdict, body }, names, conflict) {
+  return {
+    record_type: 'memory-index-card',
+    authority: null,
+    trustedInstruction: false,
+    event_id: row.id,
+    scope: row.scope,
+    d: row.d,
+    topic: topicOf(row),
+    author: names.get(row.pubkey) || row.pubkey.slice(0, 12),
+    author_pubkey: row.pubkey,
+    created_at: row.created_at,
+    expires_at: row.exp,
+    retention: row.retention,
+    verification: verdict.verification,
+    ...(verdict.consolidatedBy ? { consolidated_by: verdict.consolidatedBy } : {}),
+    conflict,
+    claim_preview: preview(body.claim, 120),
+  }
 }
 
 // Data-only envelope: memory records never carry authority and are never trusted instructions.
@@ -935,6 +995,7 @@ function envelope({ row, verdict, body }) {
     created_at: row.created_at,
     expires_at: row.exp,
     stale_warning: verdict.staleWarning,
+    ...(verdict.consolidatedBy ? { consolidated_by: verdict.consolidatedBy } : {}),
   }
 }
 

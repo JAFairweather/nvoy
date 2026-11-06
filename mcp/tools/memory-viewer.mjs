@@ -1976,7 +1976,7 @@ export async function startMemoryViewer({
     let nextSnapshot
     try {
       const wake = await client.callReadTool('memory_wake', {})
-      const query = await client.callReadTool('memory_query', { limit: 100 })
+      const query = await client.callReadTool('memory_query', { limit: 100, format: 'full' })
 
       const byKey = new Map()
       for (const r of Array.isArray(query?.records) ? query.records : []) {
