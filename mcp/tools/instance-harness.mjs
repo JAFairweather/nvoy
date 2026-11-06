@@ -36,7 +36,7 @@ let manifest, remote = null
 if (process.argv.includes('--remote')) {
   try { remote = readClientConfig(flag('--remote'), id) } catch (error) { die(error.message) }
   manifest = { id: remote.id, pubkey: remote.pubkey, buzz: { channels: remote.channels }, harness: { runner: 'claude', model: remote.model },
-    ...(remote.remember ? { mayRemember: { remote: true } } : {}) }
+    ...(remote.remember ? { mayRemember: { remote: true } } : {}), ...(remote.recall ? { recall: remote.recall } : {}) }
 } else {
   try { manifest = readManifest(root, instanceId(id)); assertNoCollisions(root, manifest) } catch (error) { die(error.message) }
   if (!manifest.harness) die('manifest has no harness block')
@@ -82,7 +82,7 @@ mkdirSync(privateDir, { recursive: true, mode: 0o700 })
 mkdirSync(resolve(home, '.claude'), { recursive: true, mode: 0o700 })
 writePrivate(resolve(home, '.claude.json'), JSON.stringify(seedClaudeJson(readJson(resolve(home, '.claude.json')), workdir), null, 2))
 const settingsPath = resolve(home, '.claude', 'settings.json')
-const settings = seedSettings(readJson(settingsPath), server)
+const settings = seedSettings(readJson(settingsPath), server, { recall: Boolean(manifest.recall) })
 writePrivate(settingsPath, JSON.stringify(settings, null, 2))
 const sessionMcp = mcpConfig({ manifest, root, remote })
 writePrivate(mcpConfigPath, JSON.stringify(sessionMcp, null, 2))
