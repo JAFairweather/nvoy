@@ -110,9 +110,31 @@ assert.equal(profileOf(result).state, 'refused'); assert.match(profileOf(result)
 writeFileSync(results, '')
 result = await run()
 assert.equal(profileOf(result).state, 'pending', 'a log with no answer for this request yet is waiting')
-writeFileSync(results, JSON.stringify({ version: 1, type: 'profile-result', instance: 'hr', request: queued[0].id, published: true }) + '\n')
+// The broker's own row shape (instance-broker-profile.mjs). Done needs Buzz's field-by-field read-back
+// and every public relay's acceptance; a partial row is still retrying, and a failed relay fails it.
+const R1 = 'wss://one.example', R2 = 'wss://two.example', readback = { name: { expected: 'HR', actual: 'HR', match: true } }
+const answer = row => writeFileSync(results, JSON.stringify({ version: 1, type: 'profile-result', instance: 'hr', request: queued[0].id,
+  event_id: 'e'.repeat(64), relay: { accepted: true, message: '' }, changed: ['name'], readback, ...row }) + '\n')
+answer({ public_relays: [{ relay: R1, state: 'accepted' }, { relay: R2, state: 'pending' }], partial: true, retry: true })
 result = await run()
-assert.equal(states(result).profile, 'done'); assert.match(result.receipts.find(row => row.step === 'profile').detail, /hr's broker published "HR"/)
+assert.equal(profileOf(result).state, 'pending', 'a partial row, still retrying, is not done')
+assert.match(profileOf(result).detail, /"HR" is on Buzz; hr's broker is still retrying wss:\/\/two\.example/)
+answer({ public_relays: [{ relay: R1, state: 'accepted' }, { relay: R2, state: 'gave_up' }], partial: true, retry: false })
+result = await run()
+assert.equal(profileOf(result).state, 'refused'); assert.match(profileOf(result).detail, /did not reach wss:\/\/two\.example/)
+answer({ public_relays: [{ relay: R1, state: 'refused', message: 'blocked' }, { relay: R2, state: 'accepted' }] })
+result = await run()
+assert.equal(profileOf(result).state, 'refused', 'a public relay that refused it fails the step')
+answer({ public_relays: [{ relay: R1, state: 'accepted' }], readback: false })
+result = await run()
+assert.equal(profileOf(result).state, 'refused', 'a row with no Buzz read-back is never done')
+answer({ public_relays: [{ relay: R1, state: 'accepted' }], readback: { name: { expected: 'HR', actual: 'H R', match: false } } })
+result = await run()
+assert.equal(profileOf(result).state, 'refused', 'a read-back whose fields differ is never done')
+answer({ public_relays: [{ relay: R1, state: 'accepted' }, { relay: R2, state: 'accepted' }] })
+result = await run()
+assert.equal(states(result).profile, 'done')
+assert.match(profileOf(result).detail, /hr's broker published "HR", read back from Buzz and accepted by 2 public relays/)
 
 // Agreed: pi-dog may now mention hr, with a backup taken first, and the manifest still reads. The
 // giver outside the fleet stays pending, named, and nothing ran for it.

@@ -161,7 +161,16 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
       if (status.error?.code === 'NVOY_PROFILE_STATUS_FAILED') return receipt('profile', 'refused', `cannot read ${name}'s profile results: ${status.error.message || 'unknown error'}`)
       if (status.error) return receipt('profile', 'refused', `the broker refused it: ${status.error.code || 'error'}`)
       if (status.ok.pending) return receipt('profile', 'pending', queuedLine)
-      return receipt('profile', 'done', `${name}'s broker published "${add.profile.name}"`)
+      // Done only when Buzz read the signed profile back field for field and every public relay took
+      // it. A partial row is still retrying; a relay that refused, or that the broker gave up on, fails.
+      const row = status.ok, legs = Array.isArray(row.public_relays) ? row.public_relays : []
+      const failed = legs.filter(leg => leg?.state === 'refused' || leg?.state === 'gave_up').map(leg => leg.relay)
+      if (failed.length) return receipt('profile', 'refused', `${name}'s profile did not reach ${failed.join(', ')}`)
+      const waiting = legs.filter(leg => leg?.state === 'pending').map(leg => leg.relay)
+      if (row.partial || waiting.length) return receipt('profile', 'pending', `"${add.profile.name}" is on Buzz; ${name}'s broker is still retrying ${waiting.join(', ') || 'the public relays'}`)
+      const fields = row.readback && typeof row.readback === 'object' ? Object.values(row.readback) : []
+      if (!fields.length || !fields.every(field => field?.match === true)) return receipt('profile', 'refused', `${name}'s broker could not read "${add.profile.name}" back from Buzz`)
+      return receipt('profile', 'done', `${name}'s broker published "${add.profile.name}", read back from Buzz and accepted by ${legs.length} public relay${legs.length === 1 ? '' : 's'}`)
     }],
     ['givers', () => {
       const seats = add.givers.filter(giver => giver.seat)
