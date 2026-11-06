@@ -67,10 +67,14 @@ try {
     /stops at 3 hops/.test(client.getInstructions()) && /This runtime is release (unknown|[0-9a-f]{40})\./.test(client.getInstructions()))
   ok('the capabilities notice carries no message content', notices.every(n => !JSON.stringify(n).includes(task.messages[0].content)))
   const tools = (await client.listTools()).tools.map(tool => tool.name)
-  ok('Claude receives an explicit read tool, a receipt-bound reply tool, a body-free discovery tool, and the post tool',
-    tools.length === 6 && tools.includes('nvoy_channel_read') && tools.includes('nvoy_channel_reply') &&
+  ok('Claude receives an explicit read tool, a receipt-bound reply tool, a body-free discovery tool, the post tool and the memory tools',
+    tools.length === 8 && tools.includes('nvoy_channel_read') && tools.includes('nvoy_channel_reply') &&
     tools.includes('nvoy_channel_list') && tools.includes('nvoy_channel_post') &&
-    tools.includes('nvoy_profile_set') && tools.includes('nvoy_profile_status'))
+    tools.includes('nvoy_profile_set') && tools.includes('nvoy_profile_status') &&
+    tools.includes('memory_claim') && tools.includes('memory_withdraw'))
+  const remembered = await client.callTool({ name: 'memory_claim', arguments: { slug: 'x', claim: 'x', because: 'x', evidence: ['x'], as_of_git: 'x' } })
+  ok('without may_remember the memory tool refuses and queues nothing',
+    remembered.isError === true && /NVOY_MEMORY_NOT_PERMITTED/.test(remembered.content[0].text) && !existsSync(join(runtime, 'memory-requests.jsonl')))
   const post = await client.callTool({ name: 'nvoy_channel_post', arguments: { text: 'hello room' } })
   ok('without may_post the post tool refuses: this identity may only reply',
     post.isError === true && /may only reply/.test(post.content[0].text) && !existsSync(join(runtime, 'post-requests.jsonl')))

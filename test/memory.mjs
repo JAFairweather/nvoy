@@ -1434,6 +1434,29 @@ os.execvp("node", ["node", sys.argv[3], "--state", sys.argv[4], "--config", sys.
     }),
     waggleDev.sk
   )
+  // The global channel can also be a room (waggle-test is both): a member's room claim there.
+  const globalRoomList = sign({
+    kind: 39002,
+    created_at: nowSec,
+    content: '',
+    tags: [['d', GLOBAL_CH], ['p', myDude.pk], ['p', waggleDev.pk]],
+  }, relayKey.sk)
+  const globalRoomClaim30078 = sign(
+    buildClaimTemplate({
+      pubkey: myDude.pk,
+      scope: `room:${GLOBAL_CH}`,
+      slug: 'global-room-30078',
+      topic: 'global-room',
+      claim: 'Room claim in the channel that is also the memory global channel.',
+      because: 'Agents write room memory under their own key as kind 30078.',
+      evidence: ['nvoy@f8b6a82:mcp/tools/memory-daemon.mjs'],
+      asOfGit: 'nvoy@f8b6a82',
+      kind: FALLBACK_MEMORY_KIND,
+      nowSec,
+    }),
+    myDude.sk
+  )
+  let serveGlobalRoom = false
   const shadowGrant30078 = makeGrant(james, deadRabbit.pk, 'shadow', { subject: james.pk, at: nowSec - 120 })
   const memWriteGrant30078 = makeGrant(james, waggleDev.pk, 'memory-write', { subject: james.pk, at: nowSec - 120 })
 
@@ -1474,7 +1497,10 @@ os.execvp("node", ["node", sys.argv[3], "--state", sys.argv[4], "--config", sys.
           return
         }
         if (filters.some(f => Array.isArray(f.kinds) && f.kinds.includes(39002))) {
-          ws.send(JSON.stringify(['EVENT', subId, liveRoomList]))
+          const wanted = filters.flatMap(f => f['#d'] || [])
+          for (const list of [liveRoomList, globalRoomList]) {
+            if (wanted.includes(list.tags[0][1])) ws.send(JSON.stringify(['EVENT', subId, list]))
+          }
           ws.send(JSON.stringify(['EOSE', subId]))
           return
         }
@@ -1497,6 +1523,9 @@ os.execvp("node", ["node", sys.argv[3], "--state", sys.argv[4], "--config", sys.
             }
             if (f.authors.includes(dennis.pk)) {
               ws.send(JSON.stringify(['EVENT', subId, stranger30078]))
+            }
+            if (serveGlobalRoom && f.authors.includes(myDude.pk)) {
+              ws.send(JSON.stringify(['EVENT', subId, globalRoomClaim30078]))
             }
           }
         }
@@ -1660,6 +1689,55 @@ os.execvp("node", ["node", sys.argv[3], "--state", sys.argv[4], "--config", sys.
     ]))
 
   await capOnDaemon.close()
+
+  // Regression case: the global channel is also a subscribed room. Its 30078 filter asks for the
+  // room's members as well as the global writers, or a member's room claim there is never fetched.
+  seenChannelReqs.length = 0
+  serveGlobalRoom = true
+  const grStateDir = join(daemonDir, 'fb-global-room-state')
+  const grSockDir = join(daemonDir, 'fb-global-room-socks')
+  mkdirSync(grStateDir, { recursive: true, mode: 0o700 })
+  const grCfgPath = join(daemonDir, 'fb-global-room-config.json')
+  writeFileSync(grCfgPath, JSON.stringify({
+    memoryGlobalChannelId: GLOBAL_CH,
+    ownerPubkey: james.pk,
+    subscribedRooms: [GLOBAL_CH],
+    allowMemoryWriteCap: false,
+    relayUrl: relayUrl30078,
+    relayPubkey: relayKey.pk,
+    grantRelays: [relayUrl30078],
+    readers: {
+      biggy: myDude.pk,
+      viewer: null,
+    },
+  }))
+  const grDaemon = await startMemoryDaemon({
+    stateDir: grStateDir,
+    configPath: grCfgPath,
+    readers: 'biggy:viewer',
+    socketDir: grSockDir,
+    credentialsDir: credDir,
+    makeBunker: () => fakeBunkerDelegate,
+  })
+  const grKey = `${myDude.pk}:${globalRoomClaim30078.tags[0][1]}`
+  const grAuthors = [james.pk, deadRabbit.pk, myDude.pk, waggleDev.pk].sort()
+  let grReqs = []
+  for (let attempt = 0; attempt < 80; attempt++) {
+    grReqs = seenChannelReqs.filter(r => r.subId === 'mem-ch-0')
+    if (grDaemon.store.entries.get(grKey) && JSON.stringify(grReqs[grReqs.length - 1]?.filters[1]?.authors) === JSON.stringify(grAuthors)) break
+    await new Promise(r => setTimeout(r, 25))
+  }
+  const grStored = grDaemon.store.entries.get(grKey)
+  ok('30078 sync (global channel also a subscribed room): one global REQ whose 30078 authors are the global writers and the room members, and a member\'s room claim there is fetched and accepted',
+    seenChannelReqs.every(r => r.subId === 'mem-ch-0') &&
+    JSON.stringify(grReqs[grReqs.length - 1]?.filters) === JSON.stringify([
+      { kinds: [MEMORY_KIND, 5], '#h': [GLOBAL_CH] },
+      { kinds: [FALLBACK_MEMORY_KIND], authors: grAuthors },
+    ]) &&
+    Boolean(grStored) &&
+    grDaemon.store.evaluateClaim(grStored, { nowSec, readerPubkey: myDude.pk }).verification === 'accepted')
+  serveGlobalRoom = false
+  await grDaemon.close()
 
   // Regression case 3: 100+ owner kind 440 grants on a relay — Phase 0 paginates via `until`
   // past 124 newer task grants to discover the 125th oldest shadow/memory-write grant and marks

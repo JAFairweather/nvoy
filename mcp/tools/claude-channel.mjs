@@ -16,6 +16,7 @@ import { validateDesktopDelivery } from './admitted_task.mjs'
 import { requestWorkingStatus } from './buzz_status.mjs'
 import { MENTION_SCHEMA, capabilityHash, capabilityInstructions, capabilitySummary, mentionView, notMentioned, postToolSpec, queuePost, resolveReplyMention } from './agent_post.mjs'
 import { profileToolSpec, profileStatusToolSpec, queueProfile, profileStatus, waitProfile } from './agent_profile.mjs'
+import { memoryToolSpec, queueMemory } from './agent_memory.mjs'
 import { credentialIn, withheld } from './outbound_secrets.mjs'
 
 const die = message => { console.error(`nvoy-claude-channel: ${message}`); process.exit(1) }
@@ -205,6 +206,7 @@ const mcp = new Server(
       'To respond, call nvoy_channel_reply with the same envelope. The broker alone chooses the recipient and signs.',
       'To start a new conversation, call nvoy_channel_post; it is refused unless this identity\'s manifest allows posting.',
       'To update your public profile, call nvoy_profile_set; it is refused unless this identity\'s manifest allows profile changes.',
+      'To record or withdraw a room memory claim under your own key, call memory_claim or memory_withdraw; they are refused unless this identity\'s manifest allows memory writes.',
       capabilityInstructions(view()),
     ].join(' '),
   },
@@ -233,6 +235,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [
   postToolSpec(view()),
   profileToolSpec(manifest),
   profileStatusToolSpec(),
+  memoryToolSpec(manifest, 'claim'),
+  memoryToolSpec(manifest, 'withdraw'),
 ] }))
 
 mcp.setRequestHandler(CallToolRequestSchema, async request => {
@@ -270,6 +274,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async request => {
   }
   if (request.params.name === 'nvoy_channel_post') {
     const { ok, error } = queuePost(view(), args)
+    return error ? toolResult(error, true) : toolResult(ok)
+  }
+  if (request.params.name === 'memory_claim' || request.params.name === 'memory_withdraw') {
+    const { ok, error } = queueMemory(manifest, request.params.name === 'memory_claim' ? 'claim' : 'withdraw', args)
     return error ? toolResult(error, true) : toolResult(ok)
   }
   const envelope = String(args.envelope || '').toLowerCase()
