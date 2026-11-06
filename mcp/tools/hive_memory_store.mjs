@@ -731,6 +731,12 @@ export class HiveMemoryStore {
     }
   }
 
+  // Accepted writes by `pubkey` in the last hour, as the submit cap counts them; null when not READY.
+  writerRateCount(pubkey, nowSec = nowSecDefault()) {
+    if (!this.isReady().ready) return null
+    return this.db.prepare('SELECT count(*) AS n FROM writer_rate_log WHERE pubkey = ? AND accepted_at > ?').get(pubkey, nowSec - 3600).n
+  }
+
   #activeRows(readerPubkey, nowSec, where = '', params = []) {
     return this.db.prepare(`SELECT * FROM events WHERE is_current = 1 AND status = 'active' AND (exp IS NULL OR exp > ?) ${where}`).all(nowSec, ...params)
       .filter(r => canRead(readerPubkey, r, this.config))

@@ -25,15 +25,18 @@
 import { chmodSync, existsSync, mkdirSync, rmSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { join, resolve } from 'node:path'
-import { MEMORY_TOOL_SPECS } from './memory.mjs'
+import { MEMORY_TOOL_SPECS, parseFactKey } from './memory.mjs'
 import {
-  HiveMemoryStore, SOCKET_NAME, initEmptyStore, loadConfigFile, migrateStoreJson, validateAndResolveConfig,
+  HiveMemoryStore, SOCKET_NAME, canRead, initEmptyStore, loadConfigFile, migrateStoreJson, validateAndResolveConfig,
 } from './hive_memory_store.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const SD_LISTEN_FDS_START = 3
 export const MAX_LINE_BYTES = 1024 * 1024
 const WRITER_FD_PREFIX = 'writer.'
+export const ACTIVITY_MAX = 80
+const ACTIVITY_IDS_MAX = 20
+const VIEWER_READER = 'viewer'
 
 const withStaleFiles = t => ({
   ...t,
@@ -77,7 +80,57 @@ export function bindingSignature(config, { kind, name }) {
   return JSON.stringify(['writer', w.pubkey, w.perHour, w.allowSelf, rooms, config.ownerPubkey === w.pubkey, config.globalWriters.has(w.pubkey)])
 }
 
-export function handleSocketJsonRpc({ store, binding, message, nowSec }) {
+const isViewer = binding => binding.kind === 'reader' && binding.name === VIEWER_READER
+
+// In-memory telemetry for the viewer only: metadata, never claim text, because, evidence or query text, and
+// never the viewer's own calls. Each ref keeps its claim's scope and author so viewerActivity can apply the
+// viewer's read ACL when it serves the ring.
+function noteActivity(activity, binding, nowSec, { kind, count = null, refs = [], filter = null, accepted = null, code = null }) {
+  if (!activity || isViewer(binding)) return
+  activity.seq += 1
+  activity.events.push({ seq: activity.seq, at: nowSec, kind, actor: binding.name, count, refs, filter, accepted, code })
+  if (activity.events.length > ACTIVITY_MAX) activity.events.shift()
+}
+
+const recordRefs = records => (Array.isArray(records) ? records : []).map(r => ({ id: r.event_id, d: null, scope: r.scope, pubkey: r.author_pubkey }))
+
+function viewerActivity(activity, config) {
+  const pk = config?.readers.get(VIEWER_READER) || ''
+  const readable = ({ scope, pubkey }) => typeof scope === 'string' &&
+    canRead(pk, scope.startsWith('room:') ? { scope_type: 'room', room_id: scope.slice(5), pubkey } : { scope_type: scope, pubkey }, config)
+  const scopeShown = s => Boolean(config) && (s === 'hive:canon' || s === 'hive:ops' ||
+    (s.startsWith('room:') && Boolean(pk) && Boolean(config.rooms.get(s.slice(5))?.members.has(pk))))
+  return activity.events.map(({ refs, filter, ...e }) => {
+    const shown = refs.filter(readable)
+    const target = filter ? null : shown[0] || null
+    const filterOk = Boolean(filter) && (!filter.scope || scopeShown(filter.scope))
+    return {
+      ...e,
+      event_ids: shown.map(r => r.id).filter(Boolean).slice(0, ACTIVITY_IDS_MAX),
+      d: target?.d ?? null,
+      topic: filterOk ? filter.topic : null,
+      scope: filter ? (filterOk ? filter.scope : null) : target?.scope ?? null,
+    }
+  })
+}
+
+function agentRoster(store, nowSec) {
+  const config = store.config
+  if (!config) return []
+  const roster = new Map()
+  const entry = name => {
+    if (!roster.has(name)) roster.set(name, { id: name, pubkey: null, is_reader: false, is_writer: false, is_owner: false, per_hour: 0, used_last_hour: null })
+    return roster.get(name)
+  }
+  for (const [name, pk] of config.readers) if (name !== VIEWER_READER) Object.assign(entry(name), { pubkey: pk || null, is_reader: true })
+  for (const [name, w] of config.writers) {
+    Object.assign(entry(name), { pubkey: w.pubkey, is_writer: true, per_hour: w.perHour, used_last_hour: store.writerRateCount(w.pubkey, nowSec) })
+  }
+  for (const a of roster.values()) a.is_owner = a.pubkey === config.ownerPubkey
+  return [...roster.values()]
+}
+
+export function handleSocketJsonRpc({ store, binding, message, nowSec, activity = null }) {
   if (!message || typeof message !== 'object' || Array.isArray(message) || message.jsonrpc !== '2.0') {
     return { jsonrpc: '2.0', id: message?.id ?? null, error: { code: -32600, message: 'Invalid Request' } }
   }
@@ -85,6 +138,7 @@ export function handleSocketJsonRpc({ store, binding, message, nowSec }) {
   const { id, method, params } = message
   const reply = result => ({ jsonrpc: '2.0', id, result })
   const writer = binding.kind === 'writer'
+  const note = entry => noteActivity(activity, binding, nowSec, entry)
 
   if (method === 'initialize') {
     const readerPubkey = writer ? null : store.config?.readers.get(binding.name)
@@ -107,24 +161,34 @@ export function handleSocketJsonRpc({ store, binding, message, nowSec }) {
   const unknownTool = { jsonrpc: '2.0', id, error: { code: -32601, message: `Unknown tool: ${String(toolName || '')}` } }
 
   if (writer) {
+    const writerPk = store.config?.writers.get(binding.name)?.pubkey || null
+    const noteWrite = (kind, out, d, id) => {
+      const parsed = parseFactKey(d)
+      const refs = parsed ? [{ id: typeof id === 'string' ? id : null, d: parsed.d, scope: parsed.scope, pubkey: writerPk }] : []
+      note({ kind: out.accepted === false ? 'refused' : kind, refs, accepted: out.accepted !== false, code: out.code || null })
+    }
     if (toolName === 'memory_lookup_prior') {
       const out = store.lookupPrior({ writer: binding.name, d: str(args.d), nowSec })
+      noteWrite('lookup', out, str(args.d), out.id)
       return reply(mcpToolResult(out, out.accepted === false))
     }
     if (toolName === 'memory_submit') {
-      if (!Object.hasOwn(args, 'expected_prior_id')) {
-        return reply(mcpToolResult({ accepted: false, code: 'HIVE_MEMORY_PRIOR_MISMATCH', message: 'expected_prior_id is required (null for a first claim)' }, true))
-      }
-      const out = store.submit({ writer: binding.name, event: args.event, expectedPriorId: args.expected_prior_id, nowSec })
+      const out = Object.hasOwn(args, 'expected_prior_id')
+        ? store.submit({ writer: binding.name, event: args.event, expectedPriorId: args.expected_prior_id, nowSec })
+        : { accepted: false, code: 'HIVE_MEMORY_PRIOR_MISMATCH', message: 'expected_prior_id is required (null for a first claim)' }
+      const tags = Array.isArray(args.event?.tags) ? args.event.tags : []
+      noteWrite('submit', out, str(tags.find(t => Array.isArray(t) && t[0] === 'd')?.[1]), out.id)
       return reply(mcpToolResult(out, out.accepted === false))
     }
     return unknownTool
   }
 
   if (toolName === 'memory_lookup_prior' || toolName === 'memory_submit') {
+    note({ kind: 'refused', accepted: false, code: 'HIVE_MEMORY_READ_ONLY_SOCKET' })
     return reply(mcpToolResult({ accepted: false, code: 'HIVE_MEMORY_READ_ONLY_SOCKET', message: 'reader sockets are read-only; submit through your writer socket' }, true))
   }
   if (toolName === 'memory_claim' || toolName === 'memory_withdraw') {
+    note({ kind: 'refused', accepted: false, code: 'HIVE_MEMORY_DAEMON_NO_SIGN' })
     return reply(mcpToolResult({ error: true, code: 'HIVE_MEMORY_DAEMON_NO_SIGN', message: 'the hive-memory service never signs events; claims are signed by their author and submitted on a writer socket' }, true))
   }
   if (toolName !== 'memory_wake' && toolName !== 'memory_query') return unknownTool
@@ -149,7 +213,9 @@ export function handleSocketJsonRpc({ store, binding, message, nowSec }) {
       staleFiles,
       nowSec,
     })
-    return reply(mcpToolResult({ ...who, ...out }))
+    note({ kind: 'wake', count: Array.isArray(out.records) ? out.records.length : 0, refs: recordRefs(out.records) })
+    const telemetry = activity && isViewer(binding) ? { recent_activity: viewerActivity(activity, store.config), agent_roster: agentRoster(store, nowSec) } : {}
+    return reply(mcpToolResult({ ...who, ...out, ...telemetry }))
   }
   const out = store.query({
     readerPubkey,
@@ -169,6 +235,8 @@ export function handleSocketJsonRpc({ store, binding, message, nowSec }) {
     staleFiles,
     nowSec,
   })
+  const filter = { scope: str(args.scope)?.slice(0, 120) ?? null, topic: str(args.topic)?.slice(0, 120) ?? null }
+  note({ kind: 'query', count: Number.isSafeInteger(out.returned) ? out.returned : 0, refs: recordRefs(out.records), filter })
   return reply(mcpToolResult({ ...who, ...out }))
 }
 
@@ -231,6 +299,7 @@ export async function startMemoryDaemon({
 
   const servers = []
   const connections = new Set()
+  const activity = { seq: 0, events: [] }
   const attach = (binding, target) => new Promise((resolveListen, rejectListen) => {
     const srv = createServer(conn => {
       const entry = { conn, binding, signature: bindingSignature(store.config, binding) }
@@ -252,7 +321,7 @@ export async function startMemoryDaemon({
             continue
           }
           let resp
-          try { resp = handleSocketJsonRpc({ store, binding, message: msg, nowSec: now() }) } catch (e) {
+          try { resp = handleSocketJsonRpc({ store, binding, message: msg, nowSec: now(), activity }) } catch (e) {
             log(`hive-memory: request failed on ${binding.kind} ${binding.name}: ${e.code || e.message}`)
             resp = { jsonrpc: '2.0', id: msg?.id ?? null, error: { code: -32603, message: 'Internal error' } }
           }
