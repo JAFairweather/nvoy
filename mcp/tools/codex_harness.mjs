@@ -104,7 +104,7 @@ export async function runCodexHarness({ manifest, root, home, credential, log, s
   const writePrivate = (path, value) => { writeFileSync(path, value, { mode: 0o600 }); chmodSync(path, 0o600) }
   for (const dir of [codexHome, workdir, privateDir]) mkdirSync(dir, { recursive: true, mode: 0o700 })
   writePrivate(resolve(codexHome, 'config.toml'), codexConfigToml({ manifest, root, model: manifest.harness.model }))
-  ensureInstructions(resolve(workdir, 'AGENTS.md'), manifest, writePrivate)
+  ensureInstructions(resolve(workdir, 'AGENTS.md'), manifest)
 
   const queueText = () => { try { return readFileSync(queuePath, 'utf8') } catch { return '' } }
   const delivered = () => existsSync(deliveredPath)

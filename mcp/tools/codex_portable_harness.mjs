@@ -215,7 +215,7 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
     remote: { identity: config.identity, knownHosts: config.knownHosts, target: config.target } }))
   const rules = codexRules(config.approvals), rulesFile = resolve(codexHome, 'rules', 'nvoy.rules')
   if (rules) { mkdirSync(dirname(rulesFile), { recursive: true, mode: 0o700 }); writePrivate(rulesFile, rules) } else rmSync(rulesFile, { force: true })
-  ensureInstructions(resolve(workdir, 'AGENTS.md'), manifest, writePrivate)
+  ensureInstructions(resolve(workdir, 'AGENTS.md'), manifest)
 
   const delivered = new Set(existsSync(deliveredPath)
     ? readFileSync(deliveredPath, 'utf8').split('\n').filter(Boolean).map(line => { try { return JSON.parse(line).envelope } catch { return '' } }) : [])

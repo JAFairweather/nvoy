@@ -86,7 +86,7 @@ const settings = seedSettings(readJson(settingsPath), server)
 writePrivate(settingsPath, JSON.stringify(settings, null, 2))
 const sessionMcp = mcpConfig({ manifest, root, remote })
 writePrivate(mcpConfigPath, JSON.stringify(sessionMcp, null, 2))
-ensureInstructions(resolve(workdir, 'CLAUDE.md'), manifest, writePrivate)
+ensureInstructions(resolve(workdir, 'CLAUDE.md'), manifest)
 // The channel lock lives on the runtime volume, so it outlives the container whose channel wrote it.
 // PIDs restart with the container, so its PID can name a live process here and the new channel
 // refuses to start, leaving a "ready" session with no ears (MC Claude, 2026-09-25 01:44 UTC).

@@ -2,8 +2,8 @@
 // unattended, the command line that loads the Nvoy channel into it, and a reader for the few
 // startup screens that need an answer. The supervisor (instance-harness.mjs) owns all effects.
 
-import { existsSync, readFileSync, readdirSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { basename, dirname, resolve } from 'node:path'
 import { sshChannelEntry } from './channel_client.mjs'
 
 export const serverName = manifest => `nvoy-${manifest.id}`
@@ -110,9 +110,25 @@ export function instructionsUpdate(current, manifest) {
   return `${text.replace(/\n*$/, '\n\n')}${rule}`
 }
 
-export function ensureInstructions(path, manifest, write) {
-  const next = instructionsUpdate(existsSync(path) ? readFileSync(path, 'utf8') : null, manifest)
-  if (next != null) write(path, next)
+// The instructions file only when it is a regular file of its own, opened without following a link:
+// { text }, { missing: true }, or null for a symlink or anything else, which is left alone.
+function ownInstructions(path) {
+  let fd
+  try { fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW) } catch (error) { return error.code === 'ENOENT' ? { missing: true } : null }
+  try { return fstatSync(fd).isFile() ? { text: readFileSync(fd, 'utf8') } : null } finally { closeSync(fd) }
+}
+
+// Writes through a new private file renamed over the path, so a link swapped in meanwhile is replaced,
+// never followed. Returns whether it wrote.
+export function ensureInstructions(path, manifest) {
+  const own = ownInstructions(path)
+  const next = own && instructionsUpdate(own.missing ? null : own.text, manifest)
+  if (next == null) return false
+  const tmp = resolve(dirname(path), `.${basename(path)}.${process.pid}.tmp`)
+  rmSync(tmp, { force: true })
+  writeFileSync(tmp, next, { mode: 0o600, flag: 'wx' })
+  try { renameSync(tmp, path) } catch (error) { rmSync(tmp, { force: true }); throw error }
+  return true
 }
 
 // `--continue` restores the mode the conversation last ran in, whatever settings.json now says, so the

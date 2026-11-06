@@ -4,7 +4,7 @@
 // tmux that only logs the session it is asked for drives the portable (--remote) Claude supervisor,
 // and a fake herdr that runs what it is typed drives its herdr form.
 // The first live session is the operator's check.
-import { appendFileSync, chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs'
+import { symlinkSync, lstatSync, appendFileSync, chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
@@ -113,14 +113,21 @@ ok('an agent without memory gets no rule, and an existing file is left alone', i
   !instructionsUpdate(null, { id: 'x', buzz: {} }).includes(MEMORY_RULE_MARKER) && instructionsUpdate(own, { id: 'x', buzz: {} }) === null)
 ok('the rule never asks the agent to read memory it has no tool for', !/memory_query|memory_wake/.test(created))
 {
-  const dir = join(root, 'instructions'), path = join(dir, 'CLAUDE.md'), writes = []
+  const dir = join(root, 'instructions'), path = join(dir, 'CLAUDE.md')
   mkdirSync(dir, { recursive: true })
-  const write = (p, v) => { writes.push(p); writeFileSync(p, v) }
   writeFileSync(path, own)
-  ensureInstructions(path, rememberer, write)
-  ensureInstructions(path, rememberer, write)
-  ok('a harness restart appends the rule to an existing file exactly once', writes.length === 1 && readFileSync(path, 'utf8').split(MEMORY_RULE_MARKER).length === 2 &&
-    readFileSync(path, 'utf8').startsWith(own))
+  const writes = [ensureInstructions(path, rememberer), ensureInstructions(path, rememberer)]
+  ok('a harness restart appends the rule to an existing file exactly once, privately', writes.join() === 'true,false' &&
+    readFileSync(path, 'utf8').split(MEMORY_RULE_MARKER).length === 2 && readFileSync(path, 'utf8').startsWith(own) && (statSync(path).mode & 0o777) === 0o600)
+  const fresh = join(dir, 'AGENTS.md')
+  ok('a missing instructions file is created with the defaults and the rule', ensureInstructions(fresh, rememberer) && readFileSync(fresh, 'utf8') === instructionsUpdate(null, rememberer))
+  const outside = join(root, 'outside.md'), linked = join(dir, 'linked'), link = join(linked, 'CLAUDE.md')
+  mkdirSync(linked, { recursive: true })
+  writeFileSync(outside, own, { mode: 0o644 }); symlinkSync(outside, link)
+  ok('a symlinked instructions file is left alone, and its target is never written or chmodded', !ensureInstructions(link, rememberer) &&
+    readFileSync(outside, 'utf8') === own && (statSync(outside).mode & 0o777) === 0o644 && lstatSync(link).isSymbolicLink())
+  const dangling = join(dir, 'dangling'); mkdirSync(dangling, { recursive: true }); symlinkSync(join(root, 'nowhere.md'), join(dangling, 'CLAUDE.md'))
+  ok('a dangling symlink is not followed to create its target', !ensureInstructions(join(dangling, 'CLAUDE.md'), rememberer) && !existsSync(join(root, 'nowhere.md')))
 }
 const fresh = claudeArgs({ server: 'nvoy-mc-test', mcpConfigPath: '/home/harness/.nvoy-harness/mcp.json', resume: false })
 ok('the session loads exactly its own channel server and no ambient MCP configuration', JSON.stringify(fresh) === JSON.stringify(['--dangerously-load-development-channels', 'server:nvoy-mc-test', '--mcp-config', '/home/harness/.nvoy-harness/mcp.json', '--strict-mcp-config']))
