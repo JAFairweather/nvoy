@@ -309,6 +309,71 @@ await test('computeCoherence calculates 5-axis HCI score and retroactive incepti
   assert.equal(coh3.history.at(-1).claims, 1, 'current coherence must exclude expired and cross-author consolidated claims')
   assert.equal(coh3.history_complete, false)
   assert.equal(coh3.history_window, 'truncated-5000')
+
+  // Verify historical cross-author consolidation when the superseding claim later expires (so consolidated_by is absent)
+  const hist4 = [
+    {
+      event_id: 'c1'.padEnd(64, '0'),
+      author_pubkey: '2'.repeat(64),
+      scope: 'room:a8186b53-537d-46ad-a7e7-b6486c58970e',
+      d: 'hive-memory:room:a8186b53-537d-46ad-a7e7-b6486c58970e:task-review',
+      topic: 'nvoy',
+      claim: 'Checkpoint 1',
+      evidence: ['nvoy@1111111'],
+      as_of_git: '1'.repeat(40),
+      created_at: 100,
+      expires_at: 1000,
+      verification: 'accepted',
+    },
+    ...Array.from({ length: 3 }, (_, idx) => ({
+      event_id: `f${idx}`.padEnd(64, '0'),
+      author_pubkey: '1'.repeat(64),
+      scope: 'hive:canon',
+      d: `hive-memory:hive:canon:p${idx}`,
+      topic: 'hive',
+      claim: `Canon ${idx}`,
+      evidence: ['nvoy@1111111'],
+      as_of_git: '1'.repeat(40),
+      created_at: 101 + idx,
+      expires_at: null,
+      verification: 'accepted',
+    })),
+    {
+      event_id: 'c2'.padEnd(64, '0'),
+      author_pubkey: '3'.repeat(64),
+      scope: 'room:a8186b53-537d-46ad-a7e7-b6486c58970e',
+      d: 'hive-memory:room:a8186b53-537d-46ad-a7e7-b6486c58970e:task-status',
+      topic: 'nvoy',
+      claim: 'Supersedes c1 while active until t=200',
+      evidence: ['nvoy@2222222'],
+      as_of_git: '2'.repeat(40),
+      created_at: 110,
+      expires_at: 200,
+      verification: 'expired',
+      supersedes: ['c1'.padEnd(64, '0')],
+    },
+    {
+      event_id: 'c3'.padEnd(64, '0'),
+      author_pubkey: '1'.repeat(64),
+      scope: 'hive:canon',
+      d: 'hive-memory:hive:canon:p9',
+      topic: 'hive',
+      claim: 'Later event after c2 expired',
+      evidence: ['nvoy@3333333'],
+      as_of_git: '3'.repeat(40),
+      created_at: 250,
+      expires_at: null,
+      verification: 'accepted',
+    },
+  ]
+  const coh4 = computeCoherence({
+    records: hist4.filter(r => r.verification === 'accepted'),
+    history_records: hist4,
+    agent_roster: roster,
+    now_sec: 300,
+  })
+  const step5 = coh4.history.find(h => h.events === 5)
+  assert.equal(step5.claims, 4, 'at step 5 (t=110), c2 is active and consolidates c1 via supersedes even after c2 later expires')
 })
 
 await test('computeAgentHealth: classifies 5m active, 5-20m warm, >20m stale, error, and preserves telemetry across rollover', () => {

@@ -997,6 +997,8 @@ function indexCard({ row, verdict, body }, names, conflict) {
 
 // Data-only envelope: memory records never carry authority and are never trusted instructions.
 function envelope({ row, verdict, body }) {
+  const tags = JSON.parse(row.raw_json).tags || []
+  const supersedes = tags.filter(t => Array.isArray(t) && t[0] === 'supersedes' && typeof t[1] === 'string').map(t => t[1])
   return {
     record_type: 'memory-claim',
     authority: null,
@@ -1020,6 +1022,7 @@ function envelope({ row, verdict, body }) {
     created_at: row.created_at,
     expires_at: row.exp,
     stale_warning: verdict.staleWarning,
+    ...(supersedes.length ? { supersedes } : {}),
     ...(verdict.consolidatedBy ? { consolidated_by: verdict.consolidatedBy } : {}),
   }
 }

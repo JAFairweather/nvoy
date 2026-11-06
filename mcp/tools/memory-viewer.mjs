@@ -289,6 +289,8 @@ function evaluateCoherenceSlice(slice, rosterByPk, expectedRosterSize, writeSeqE
   }
 }
 
+const WORKFLOW_SLUG_RE = /-(?:review|status|owner|wip|handoff)$/
+
 function filterActiveAtEpoch(heads, epochAt, isCurrentFinal = false) {
   const unexpired = heads.filter(r => {
     if (!r || r.status === 'withdrawn' || r.verification === 'withdrawn') return false
@@ -297,18 +299,31 @@ function filterActiveAtEpoch(heads, epochAt, isCurrentFinal = false) {
     }
     return r.expires_at === null || r.expires_at === undefined || r.expires_at > epochAt
   })
-  const activeIds = new Set(unexpired.map(r => r.event_id).filter(Boolean))
+  const byEventId = new Map()
+  for (const r of unexpired) {
+    if (r.event_id) byEventId.set(r.event_id, r)
+  }
   const supersededByPeer = new Set()
   for (const c of unexpired) {
     if (Array.isArray(c.supersedes)) {
       for (const tid of c.supersedes) {
-        if (tid && tid !== c.event_id) supersededByPeer.add(String(tid))
+        const s = byEventId.get(String(tid))
+        if (
+          s &&
+          c.event_id !== s.event_id &&
+          c.scope === s.scope &&
+          (c.created_at || 0) >= (s.created_at || 0) &&
+          s.scope !== 'hive:canon' &&
+          WORKFLOW_SLUG_RE.test(String(s.d || '').split(':').pop() || '')
+        ) {
+          supersededByPeer.add(s.event_id)
+        }
       }
     }
   }
   return unexpired.filter(r => {
     if (r.scope === 'hive:canon') return true
-    if (r.consolidated_by && activeIds.has(r.consolidated_by)) return false
+    if (isCurrentFinal && r.consolidated_by && byEventId.has(r.consolidated_by)) return false
     if (r.event_id && supersededByPeer.has(r.event_id)) return false
     return true
   })
@@ -1912,8 +1927,50 @@ export function renderViewerHtml(initialState) {
         logStream('sim', 'SIM recall wave: ' + agent.name + ' <- ' + recalled.length + ' engrams (nothing queried)');
       }
 
+      function isWorkflowCheckpoint(rec) {
+        return /-(?:review|status|owner|wip|handoff)$/.test(slugOf(rec));
+      }
+
+      function computeDreamingTelemetry() {
+        var recs = nodes.map(function (n) { return n.rec; });
+        var fullBytes = JSON.stringify(recs).length;
+        var indexBytes = 0;
+        var canonBytes = 0;
+        var wfCount = 0;
+        var shortTtlCount = 0;
+        var classBCount = 0;
+        var byTopic = {};
+        recs.forEach(function (r) {
+          indexBytes += 140 + Math.min(120, String(r.claim || '').length) + String(r.d || '').length;
+          if (isCanon(r)) canonBytes += JSON.stringify(r).length;
+          else if (r.expires_at === null || r.expires_at === undefined) classBCount += 1;
+          else {
+            var top = topicOf(r);
+            byTopic[top] = (byTopic[top] || 0) + 1;
+            if (r.created_at && (r.expires_at - r.created_at) <= 172800) shortTtlCount += 1;
+          }
+          if (isWorkflowCheckpoint(r)) wfCount += 1;
+        });
+        var wakeBytes = canonBytes + Math.min(4000, indexBytes);
+        var indexSavings = fullBytes > 0 ? Math.round((1 - indexBytes / fullBytes) * 1000) / 10 : 0;
+        var wakeSavings = fullBytes > 0 ? Math.round((1 - wakeBytes / fullBytes) * 1000) / 10 : 0;
+        var topicList = Object.keys(byTopic).map(function (k) { return { topic: k, count: byTopic[k] }; })
+          .sort(function (a, b) { return b.count - a.count; });
+        return {
+          total: recs.length,
+          fullBytes: fullBytes,
+          indexBytes: indexBytes,
+          wakeBytes: wakeBytes,
+          indexSavings: indexSavings,
+          wakeSavings: wakeSavings,
+          wfCount: wfCount,
+          shortTtlCount: shortTtlCount,
+          classBCount: classBCount,
+          topicList: topicList
+        };
+      }
+
       function simConsolidate() {
-        if (consolidator) return;
         var best = null;
         var bestNodes = [];
         topics.forEach(function (t) {
@@ -1923,9 +1980,15 @@ export function renderViewerHtml(initialState) {
           });
           if (cands.length > bestNodes.length) { best = t; bestNodes = cands; }
         });
-        if (bestNodes.length < 2) return logStream('sim', 'SIM consolidator preview: no topic holds 2+ Class A claims');
-        consolidator = { topic: best, targets: bestNodes.slice(0, 4), x: best.x, y: best.y, progress: 0 };
-        logStream('sim', 'SIM consolidator preview in #' + best.id + ': folding ' + consolidator.targets.length + ' Class A claims (nothing written)');
+        selected = { type: 'dreaming', data: computeDreamingTelemetry() };
+        hovered = null;
+        if (width <= 1024) setDrawer('none');
+        renderAgentRoster();
+        renderInspector();
+        if (!consolidator && best && bestNodes.length >= 2) {
+          consolidator = { topic: best, targets: bestNodes.slice(0, 5), x: best.x, y: best.y, progress: 0 };
+          logStream('sim', 'SIM consolidator preview in #' + best.id + ': folding ' + consolidator.targets.length + ' Class A claims (nothing written)');
+        }
       }
 
       function simRefuse() {
@@ -2228,6 +2291,33 @@ export function renderViewerHtml(initialState) {
             });
             box.appendChild(hList);
           }
+        } else if (target.type === 'dreaming') {
+          var dr = computeDreamingTelemetry();
+          box.appendChild(inspectHeader(
+            'Phase 2 Cortex Dreaming & Consolidation',
+            '-' + dr.wakeSavings.toFixed(1) + '% Wake Bytes',
+            'GATES 6-8 LIVE',
+            'ok',
+            '#a78bfa'
+          ));
+          var dkv = makeDiv('kv-list');
+          dkv.appendChild(kvRow('Full store payload', Math.round(dr.fullBytes / 1024) + ' KB (~' + Math.round(dr.fullBytes / 4) + ' tok)', '#94a3b8'));
+          dkv.appendChild(kvRow('Gate 6 · Index cards', Math.round(dr.indexBytes / 1024) + ' KB (-' + dr.indexSavings.toFixed(1) + '%)', '#38bdf8'));
+          dkv.appendChild(kvRow('Gate 6 · Wake digest', Math.round(dr.wakeBytes / 1024) + ' KB (-' + dr.wakeSavings.toFixed(1) + '% vs dump)', '#34d399'));
+          dkv.appendChild(kvRow('Gate 7 · Workflow slugs', dr.wfCount + ' active (' + dr.shortTtlCount + ' on <=48h TTL)', '#fbbf24'));
+          dkv.appendChild(kvRow('Gate 7 · Class B durable', dr.classBCount + ' permanent decisions', '#a78bfa'));
+          box.appendChild(dkv);
+          if (dr.topicList.length > 0) {
+            var qTitle = makeDiv('inspect-kicker', 'Gate 8 · Topic Grooming Pressure (>8 Class A = consolidate)');
+            qTitle.style.marginTop = '6px';
+            box.appendChild(qTitle);
+            var tWrap = makeDiv('kv-list');
+            dr.topicList.slice(0, 6).forEach(function (item) {
+              var over = item.count > 8;
+              tWrap.appendChild(kvRow('#' + item.topic, item.count + ' Class A' + (over ? ' · READY TO FOLD' : ''), over ? '#fbbf24' : '#cbd5e1'));
+            });
+            box.appendChild(tWrap);
+          }
         }
       }
 
@@ -2464,6 +2554,7 @@ export function renderViewerHtml(initialState) {
           n.y += n.vy;
           if (n.birthGlow > 0) n.birthGlow = Math.max(0, n.birthGlow - 0.015);
         }
+
         if (consolidator) {
           consolidator.progress += 0.012;
           if (consolidator.progress >= 1) {
@@ -2568,6 +2659,23 @@ export function renderViewerHtml(initialState) {
           ctx.lineWidth = lit ? 1.6 : 0.8;
           ctx.stroke();
         });
+
+        if (selected && selected.type === 'dreaming') {
+          ctx.save();
+          ctx.setLineDash([4, 4]);
+          nodes.forEach(function (n) {
+            if (isCanon(n.rec) || !isWorkflowCheckpoint(n.rec)) return;
+            var tp = topicById(topicOf(n.rec));
+            if (!tp) return;
+            ctx.beginPath();
+            ctx.moveTo(n.x, n.y);
+            ctx.lineTo(tp.x, tp.y);
+            ctx.strokeStyle = 'rgba(167, 139, 250, 0.55)';
+            ctx.lineWidth = 1.4;
+            ctx.stroke();
+          });
+          ctx.restore();
+        }
 
         if (consolidator) {
           var c = consolidator;
