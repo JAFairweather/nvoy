@@ -12,7 +12,7 @@ import { join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
 import {
-  buildClaimTemplate, buildWithdrawalTemplate, checkMemorySecrets, nip01Newer, validateMemoryEvent,
+  DEFAULT_WAKE_MAX_CHARS, MIN_WAKE_MAX_CHARS, buildClaimTemplate, buildWithdrawalTemplate, checkMemorySecrets, nip01Newer, validateMemoryEvent,
 } from '../mcp/tools/memory.mjs'
 import {
   HiveMemoryStore, RETENTION_PURGE_AFTER_SEC, acquireStoreLock, initEmptyStore, migrateStoreJson, readLedger, recordVerifiedBackup,
@@ -566,6 +566,14 @@ for (const [label, mutate, state] of [
     wake.counts.ops_shown > 0 && wake.byte_length > wake.char_length && wake.non_canon_bytes <= wake.max_chars && nonCanon <= wake.max_chars)
   const tight = s.wake({ readerPubkey: james.pk, maxChars: 1500, nowSec: T0 + 300 })
   ok('wake: a tight byte budget drops cards rather than overrun', Buffer.byteLength(JSON.stringify(tight)) <= 1500 && tight.counts.ops_omitted > 0)
+  // At the smallest accepted budget, with every card gone, the topic list, hint and long git banner go too; it still fits.
+  for (let i = 0; i < 30; i++) s.submit({ writer: 'ops', event: claim(opsBot, 'hive:ops', `topic-${i}`, { topic: `floor-budget-topic-number-${i}` }), expectedPriorId: null, nowSec: T0 + 200 })
+  const floor = s.wake({ readerPubkey: james.pk, maxChars: MIN_WAKE_MAX_CHARS, gitBanner: '⚠'.repeat(500), nowSec: T0 + 300 })
+  ok('wake: at the minimum budget with zero cards, optional text is dropped and the response still fits',
+    floor.counts.ops_shown === 0 && floor.counts.ops_omitted > 0 && !floor.budget_exceeded && Buffer.byteLength(JSON.stringify(floor)) <= MIN_WAKE_MAX_CHARS &&
+    Object.keys(floor.topic_directory).length === 0 && floor.counts.topics_omitted > 0 && floor.digest.includes(`+${floor.counts.topics_omitted} topics`) && !floor.digest.includes('more: memory_query'))
+  const below = s.wake({ readerPubkey: james.pk, maxChars: MIN_WAKE_MAX_CHARS - 1, nowSec: T0 + 300 })
+  ok('wake: a max_chars below the minimum falls back to the default', below.max_chars === DEFAULT_WAKE_MAX_CHARS)
   s.close()
 }
 

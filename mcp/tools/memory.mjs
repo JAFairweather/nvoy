@@ -18,6 +18,8 @@ export const MEMORY_D_PREFIX = 'hive-memory:'
 export const DEFAULT_TTL_SEC = 14 * 86400
 export const MAX_TTL_SEC = 30 * 86400
 export const DEFAULT_WAKE_MAX_CHARS = 4000
+// The smallest wake budget accepted: the zero-card digest, with every optional part dropped, always fits in it.
+export const MIN_WAKE_MAX_CHARS = 1500
 export const DECISION_RETENTION = 'decision'
 export const WORKFLOW_TTL_SEC = 86400
 export const MAX_WORKFLOW_TTL_SEC = 2 * 86400
@@ -422,7 +424,7 @@ export const MEMORY_TOOL_SPECS = Object.freeze([
       type: 'object',
       properties: {
         room_id: { type: 'string', pattern: UUID.source },
-        max_chars: { type: 'integer', minimum: 1000, maximum: 24000 },
+        max_chars: { type: 'integer', minimum: MIN_WAKE_MAX_CHARS, maximum: 24000 },
         git_banner: { type: 'string', maxLength: 500 },
         stale_files: { type: 'array', items: { type: 'string', maxLength: 300 }, maxItems: 200 },
       },

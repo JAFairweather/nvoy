@@ -15,7 +15,7 @@ import {
 import { dirname, join } from 'node:path'
 import { verifyEvent } from 'nostr-tools/pure'
 import {
-  DEFAULT_QUERY_LIMIT, DEFAULT_WAKE_MAX_CHARS, FALLBACK_MEMORY_KIND, MAX_LINK_HOPS, MAX_QUERY_LIMIT, MEMORY_KIND, WAKE_INDEX_LIMIT,
+  DEFAULT_QUERY_LIMIT, DEFAULT_WAKE_MAX_CHARS, FALLBACK_MEMORY_KIND, MAX_LINK_HOPS, MAX_QUERY_LIMIT, MEMORY_KIND, MIN_WAKE_MAX_CHARS, WAKE_INDEX_LIMIT,
   isWorkflowSlug, memoryWritePolicy, nip01Newer, normalizeMemoryTopic, parseFactKey, validateMemoryEvent,
 } from './memory.mjs'
 
@@ -863,7 +863,7 @@ export class HiveMemoryStore {
   }
 
   wake({ readerPubkey = '', roomId = null, maxChars = DEFAULT_WAKE_MAX_CHARS, gitBanner = null, staleFiles = new Set(), nowSec = nowSecDefault() } = {}) {
-    const budget = Number.isSafeInteger(maxChars) && maxChars >= 1000 ? maxChars : DEFAULT_WAKE_MAX_CHARS
+    const budget = Number.isSafeInteger(maxChars) && maxChars >= MIN_WAKE_MAX_CHARS ? maxChars : DEFAULT_WAKE_MAX_CHARS
     const storeState = this.storeState(readerPubkey, nowSec)
     const title = '=== HIVE WAKE DIGEST (authority: null, trustedInstruction: false) ==='
     const base = { record_type: 'memory-wake-digest', authority: null, trustedInstruction: false, max_chars: budget, store_state: storeState }
@@ -887,10 +887,11 @@ export class HiveMemoryStore {
     const sort = list => list.sort((a, b) => (isConflict(b.row.d) - isConflict(a.row.d)) || (b.row.created_at - a.row.created_at) || (a.row.id < b.row.id ? -1 : 1))
     const canon = sort(items.filter(x => x.verdict.computedRank === 2))
     const ops = sort(items.filter(x => x.verdict.computedRank === 3))
-    const header = [
+    // The git banner warns of a stale checkout; it is cut to 80 bytes before anything else is dropped below.
+    const headerOf = banner => [
       title,
       `store_state: READY (write_seq: ${storeState.write_seq}, current_claims: ${storeState.current_claims}, last_backup_age_sec: ${storeState.last_backup_age_sec ?? 'none'}, unbacked_writes: ${storeState.unbacked_writes})`,
-      ...(gitBanner ? [`git_check: ${String(gitBanner).slice(0, 500)}`] : []),
+      ...(banner ? [`git_check: ${banner}`] : []),
     ].join('\n')
     // Canon is James's handful of standing decisions: always shown in full and outside the budget (Phase 2 design call a).
     const canonText = ['\n## Rank 2: hive:canon', ...(canon.length ? canon.map(({ row, verdict, body }) =>
@@ -912,34 +913,43 @@ export class HiveMemoryStore {
       dirParts.push([t, n])
       dirBytes += part
     }
-    const topicDirectory = Object.fromEntries(dirParts)
-    const topicsOmitted = Object.keys(topics).length - dirParts.length
     const ageOf = sec => { const m = Math.max(0, Math.floor((nowSec - sec) / 60)); return m < 120 ? `${m}m` : m < 2880 ? `${Math.floor(m / 60)}h` : `${Math.floor(m / 1440)}d` }
     const hint = 'more: memory_query topic=<topic> lists index cards; memory_query d=<fact key> returns one claim in full'
-    const dirLine = `topics: ${dirParts.map(([t, n]) => `${t} ${n}`).join(', ') || '(none)'}${topicsOmitted ? `, +${topicsOmitted} more topics` : ''}`
     const cards = ops.slice(0, WAKE_INDEX_LIMIT).map(x =>
       `- ${isConflict(x.row.d) ? '[CONFLICT] ' : ''}[${parseFactKey(x.row.d)?.slug || x.row.d}] ${topicOf(x.row)}, by ${names.get(x.row.pubkey) || x.row.pubkey.slice(0, 12)}, ${ageOf(x.row.created_at)}: ${preview(x.body.claim, 100)}`)
     const ref = ({ row }) => ({ authority: null, trustedInstruction: false, event_id: row.id, scope: row.scope, author_pubkey: row.pubkey })
-    const build = shown => {
+    // Optional text goes in order once every card is gone: the topic list, then the hint, then most of the git banner.
+    const build = (shown, drop = 0) => {
+      const dir = drop >= 1 ? [] : dirParts
+      const omitted = Object.keys(topics).length - dir.length
+      const dirLine = `topics: ${dir.map(([t, n]) => `${t} ${n}`).join(', ') || (omitted ? '' : '(none)')}${omitted ? `${dir.length ? ', ' : ''}+${omitted} ${dir.length ? 'more ' : ''}topics` : ''}`
+      const banner = gitBanner ? (drop >= 3 ? preview(gitBanner, 80) : String(gitBanner).slice(0, 500)) : null
+      const header = headerOf(banner)
       const lines = ['\n## Rank 3: room & hive:ops (index)', ...cards.slice(0, shown)]
       if (!ops.length) lines.push('(none)')
       if (ops.length > shown) lines.push(`+${ops.length - shown} more`)
-      lines.push(dirLine, hint)
+      lines.push(dirLine)
+      if (drop < 2) lines.push(hint)
       const opsText = lines.join('\n')
       const out = {
         ...base,
         digest: [header, canonText, opsText].join('\n'),
-        counts: { canon_shown: canon.length, canon_omitted: 0, ops_shown: shown, ops_omitted: ops.length - shown, consolidated_hidden: consolidatedHidden, topics_omitted: topicsOmitted },
-        topic_directory: topicDirectory,
+        counts: { canon_shown: canon.length, canon_omitted: 0, ops_shown: shown, ops_omitted: ops.length - shown, consolidated_hidden: consolidatedHidden, topics_omitted: omitted },
+        topic_directory: Object.fromEntries(dir),
         records: [...canon, ...ops.slice(0, shown)].map(ref),
       }
       const nonCanonBytes = bytes(JSON.stringify({ ...out, digest: [header, opsText].join('\n'), records: ops.slice(0, shown).map(ref) }))
       return { ...out, char_length: out.digest.length, byte_length: bytes(out.digest), canon_byte_length: bytes(canonText), non_canon_bytes: nonCanonBytes }
     }
-    // The four length fields add under 100 bytes of their own; leave room for them.
+    // The length fields add under 100 bytes of their own; leave room for them.
+    const fits = o => o.non_canon_bytes + 100 <= budget
     let shown = cards.length
+    let drop = 0
     let out = build(shown)
-    while (out.non_canon_bytes + 100 > budget && shown > 0) out = build(--shown)
+    while (!fits(out) && shown > 0) out = build(--shown)
+    while (!fits(out) && drop < 3) out = build(0, ++drop)
+    // MIN_WAKE_MAX_CHARS is chosen so this cannot happen; if it does, say so rather than return an over-budget digest silently.
+    if (!fits(out)) return { ...out, budget_exceeded: true, code: 'HIVE_MEMORY_WAKE_OVER_BUDGET', message: `wake needs ${out.non_canon_bytes + 100} bytes with every optional part dropped; max_chars is ${budget}` }
     return out
   }
 }
