@@ -74,7 +74,7 @@ try {
     tools.includes('memory_claim') && tools.includes('memory_withdraw'))
   const remembered = await client.callTool({ name: 'memory_claim', arguments: { slug: 'x', claim: 'x', because: 'x', evidence: ['x'], as_of_git: 'x' } })
   ok('without may_remember the memory tool refuses and queues nothing',
-    remembered.isError === true && /NVOY_MEMORY_NOT_PERMITTED/.test(remembered.content[0].text) && !existsSync(join(runtime, 'memory-requests.jsonl')))
+    remembered.isError === true && /NVOY_MEMORY_NOT_PERMITTED/.test(remembered.content[0].text) && !existsSync(join(runtime, 'memory-requests')))
   const post = await client.callTool({ name: 'nvoy_channel_post', arguments: { text: 'hello room' } })
   ok('without may_post the post tool refuses: this identity may only reply',
     post.isError === true && /may only reply/.test(post.content[0].text) && !existsSync(join(runtime, 'post-requests.jsonl')))

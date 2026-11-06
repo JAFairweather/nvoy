@@ -3,22 +3,27 @@
 //
 // The keyless channel MCP can only ask. It resolves the room, refuses every scope but room:<uuid>,
 // runs the memory secret guard and test-builds the claim with memory.mjs, so the agent hears a
-// refusal at once, then appends one bounded `memory-request`. The broker (instance-broker-memory.mjs)
-// re-checks every field against the manifest's may_remember block, counts the hourly cap on its own
-// durable counter, builds the kind 30078 from those fields, signs and publishes. The agent never
-// supplies an event.
+// refusal at once, then spools one bounded `memory-request` file (`<id>.tmp`, fsynced, renamed to
+// `<id>.json`). The broker (instance-broker-memory.mjs) re-checks every field against the manifest's
+// may_remember block, counts the hourly cap on its own durable counter, builds the kind 30078 from
+// those fields, signs it and submits it to the private Hive memory store, then unlinks the request.
+// The agent never supplies an event, and the rate log beside the spool holds only ids and times.
 
-import { appendFileSync, existsSync, lstatSync, readFileSync } from 'node:fs'
+import { appendFileSync, closeSync, fsyncSync, lstatSync, openSync, readFileSync, renameSync, rmSync, writeSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { resolve } from 'node:path'
 import { HOUR_MS } from './agent_limits.mjs'
 import { FALLBACK_MEMORY_KIND, MEMORY_TOOL_SPECS, buildClaimTemplate, buildWithdrawalTemplate, checkClaimPayloadSecrets, formatFactKey, parseScope } from './memory.mjs'
 import { withheld } from './outbound_secrets.mjs'
 
-// buzz-relay refuses kind 30079, so agent claims use the fallback kind the Bunker already allows.
+// Agent claims use the fallback kind the Bunker pairing already allows.
 export const REMEMBER_KIND = FALLBACK_MEMORY_KIND
 export const MEMORY_NOT_PERMITTED = 'this identity may not write memory'
-export const memoryQueuePath = manifest => resolve(manifest.runtimeDir, 'memory-requests.jsonl')
+export const MEMORY_REQUEST_FILE = /^[0-9a-f]{32}\.json$/
+export const MAX_MEMORY_REQUEST_BYTES = 64 * 1024
+export const memoryQueueDir = manifest => resolve(manifest.runtimeDir, 'memory-requests')
+export const memoryRequestPath = (manifest, id) => resolve(memoryQueueDir(manifest), `${id}.json`)
+export const memoryRatePath = manifest => resolve(manifest.runtimeDir, 'memory-rate.jsonl')
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const TOOLS = Object.freeze({ claim: 'memory_claim', withdraw: 'memory_withdraw' })
 const FIELDS = Object.freeze({
@@ -38,10 +43,10 @@ export function memoryToolSpec(manifest, op) {
       ' Check memory_query first to avoid duplicates. When a claim becomes wrong, withdraw it, or supersede it with a new claim at the same slug.' +
       ' Do not record narration, guesses, chat, anything personal, or what is already in git or docs: cite that as evidence instead.' +
       ' A claim expires after ttl_sec (default 14 days, at most 30).'
-    : 'Withdraw your room memory claim at one slug when it is wrong or finished. The broker publishes a replacement marked withdrawn, with a later created_at.'
+    : 'Withdraw your room memory claim at one slug when it is wrong or finished. The broker submits a replacement marked withdrawn, with a later created_at.'
   return {
     name: TOOLS[op],
-    description: `${what} The broker checks the manifest's may_remember block, signs a kind ${REMEMBER_KIND} and publishes it to the room. Only room:<uuid> scopes; hive:ops, hive:canon and self are refused.${limits}`,
+    description: `${what} The broker checks the manifest's may_remember block, signs a kind ${REMEMBER_KIND} and submits it to the private Hive memory store, never to a relay. Only room:<uuid> scopes; hive:ops, hive:canon and self are refused.${limits}`,
     inputSchema: { type: 'object', properties: { room: { type: 'string', pattern: UUID.source }, scope, ...properties },
       required: schema.required.filter(k => k !== 'scope'), additionalProperties: false },
   }
@@ -111,14 +116,25 @@ export function validateMemoryRequest(row, manifest) {
   return { ...row, d: formatFactKey(resolved.scope, row.fields.slug), roomId: resolved.roomId }
 }
 
-function queueRows(path) {
+// The memory rate log: one { id, requested_at } line per spooled request, never the words.
+function rateRows(path) {
   const st = lstatSync(path)
-  if (!st.isFile() || st.isSymbolicLink()) throw new Error('memory request queue must be a regular non-symlink file')
-  if (st.size > 64 * 1024 * 1024) throw new Error('memory request queue exceeds its 64 MiB bound')
+  if (!st.isFile() || st.isSymbolicLink()) throw new Error('memory rate log must be a regular non-symlink file')
+  if (st.size > 16 * 1024 * 1024) throw new Error('memory rate log exceeds its 16 MiB bound')
   return readFileSync(path, 'utf8').split('\n').filter(Boolean).map(line => { try { return JSON.parse(line) } catch { return null } })
 }
 
-// The keyless tool: resolve, guard, test-build, advise on the cap, append. Returns the tool's JSON answer.
+function writeDurably(path, body, mode) {
+  const fd = openSync(path, 'wx', mode)
+  try {
+    const data = Buffer.from(body)
+    let off = 0
+    while (off < data.length) off += writeSync(fd, data, off, data.length - off)
+    fsyncSync(fd)
+  } finally { closeSync(fd) }
+}
+
+// The keyless tool: resolve, guard, test-build, advise on the cap, spool. Returns the tool's JSON answer.
 export function queueMemory(manifest, op, args = {}, now = Date.now()) {
   const resolved = resolveMemoryScope(manifest, args)
   if (resolved.code) return { error: resolved }
@@ -133,14 +149,28 @@ export function queueMemory(manifest, op, args = {}, now = Date.now()) {
   }
   try { memoryTemplates(manifest, { op, scope: resolved.scope, fields }, null, Math.floor(now / 1000)) }
   catch (error) { return { error: { code: 'NVOY_BAD_MEMORY', message: error.message } } }
-  const path = memoryQueuePath(manifest)
-  // Provisioned by instance-runtime-init for a may_remember manifest; the reader never creates it.
-  if (!existsSync(path)) return { error: { code: 'NVOY_MEMORY_QUEUE_FAILED', message: 'memory request queue is not provisioned; re-run the runtime init' } }
+  const dir = memoryQueueDir(manifest), ratePath = memoryRatePath(manifest)
+  // Provisioned by instance-runtime-init for a may_remember manifest; the reader never creates them.
   try {
-    const recent = queueRows(path).filter(r => r?.type === 'memory-request' && Number.isFinite(r.requested_at) && now - r.requested_at < HOUR_MS).length
+    const st = lstatSync(dir)
+    if (!st.isDirectory() || st.isSymbolicLink()) throw new Error('not a directory')
+    lstatSync(ratePath)
+  } catch { return { error: { code: 'NVOY_MEMORY_QUEUE_FAILED', message: 'memory request spool is not provisioned; re-run the runtime init' } } }
+  let tmp = null
+  try {
+    const recent = rateRows(ratePath).filter(r => /^[0-9a-f]{32}$/.test(String(r?.id)) && Number.isFinite(r.requested_at) && now - r.requested_at < HOUR_MS).length
     if (recent >= manifest.mayRemember.perHour) return { error: { code: 'NVOY_MEMORY_RATE_LIMITED', message: `over the hourly cap: ${recent}/${manifest.mayRemember.perHour} memory writes in the last hour` } }
     const row = { version: 1, type: 'memory-request', id: randomBytes(16).toString('hex'), instance: manifest.id, op, scope: resolved.scope, fields, requested_at: now }
-    appendFileSync(path, JSON.stringify(row) + '\n')
+    const body = JSON.stringify(row)
+    if (Buffer.byteLength(body) > MAX_MEMORY_REQUEST_BYTES) return { error: { code: 'NVOY_BAD_MEMORY', message: 'memory request exceeds its 64 KiB bound' } }
+    tmp = resolve(dir, `${row.id}.tmp`)
+    writeDurably(tmp, body, 0o640)
+    renameSync(tmp, memoryRequestPath(manifest, row.id))
+    tmp = null
+    appendFileSync(ratePath, JSON.stringify({ id: row.id, requested_at: now }) + '\n')
     return { ok: { queued: true, request: row.id, op, scope: row.scope, d: formatFactKey(row.scope, fields.slug) } }
-  } catch (error) { return { error: { code: 'NVOY_MEMORY_QUEUE_FAILED', message: error.message } } }
+  } catch (error) {
+    if (tmp) rmSync(tmp, { force: true })
+    return { error: { code: 'NVOY_MEMORY_QUEUE_FAILED', message: error.message } }
+  }
 }
