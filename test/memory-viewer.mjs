@@ -19,6 +19,8 @@ import {
   startMemoryViewer,
 } from '../mcp/tools/memory-viewer.mjs'
 
+const SNAP_ID = 'c'.repeat(64)
+
 let passed = 0
 let failed = 0
 
@@ -173,7 +175,7 @@ await test('live integration: memory-viewer polls memory-daemon viewer socket, s
   const nowSec = Math.floor(Date.now() / 1000)
 
   initEmptyStore({ dbPath: db, ledgerPath: ledger })
-  recordVerifiedBackup({ receiptPath: receipt, writeSeq: 1, at: nowSec })
+  recordVerifiedBackup({ receiptPath: receipt, snapshotId: SNAP_ID, writeSeq: 1, at: nowSec })
   const daemon = await startMemoryDaemon({
     dbPath: db,
     ledgerPath: ledger,

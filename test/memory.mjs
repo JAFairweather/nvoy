@@ -40,6 +40,7 @@ const ROOM_A = 'a8186b53-537d-46ad-a7e7-b6486c58970e'
 const ROOM_B = 'b9297c64-648e-47be-b8f8-c7597d69081f'
 const T0 = 1793822400
 const DAY = 86400
+const SNAP_ID = createHash('sha256').update('restic snapshot').digest('hex')
 
 const rawConfig = (over = {}) => ({
   memoryGlobalChannelId: GLOBAL_CH,
@@ -84,7 +85,7 @@ const setup = (name, { at = T0 } = {}) => {
   const dir = mkdtempSync(join(tmpdir(), `hm-${name}-`))
   const p = { dir, db: join(dir, 'memory.sqlite'), ledger: join(dir, 'ledger.jsonl'), receipt: join(dir, 'receipt.json') }
   initEmptyStore({ dbPath: p.db, ledgerPath: p.ledger, nowSec: T0 - 10 })
-  recordVerifiedBackup({ receiptPath: p.receipt, writeSeq: 1, at })
+  recordVerifiedBackup({ receiptPath: p.receipt, snapshotId: SNAP_ID, writeSeq: 1, at })
   return p
 }
 const open = (p, extra = {}) => {
@@ -253,7 +254,7 @@ for (const maxUnbackedSec of [3600, 7200]) {
   const st = s.storeState(james.pk, T0 + maxUnbackedSec + 5)
   ok(`[max ${maxUnbackedSec}] after an outage past the threshold later writes are fenced while the earlier write stays unbacked`,
     after.code === 'HIVE_MEMORY_BACKUP_STALE_WRITES_FENCED' && st.unbacked_writes === 1 && st.last_backup_age_sec === maxUnbackedSec + 5)
-  recordVerifiedBackup({ receiptPath: p.receipt, writeSeq: seqOf(s), at: T0 + maxUnbackedSec + 6 })
+  recordVerifiedBackup({ receiptPath: p.receipt, snapshotId: SNAP_ID, writeSeq: seqOf(s), at: T0 + maxUnbackedSec + 6 })
   const resumed = s.submit({ writer: 'james', event: claim(james, 'hive:ops', 'after-backup'), expectedPriorId: null, nowSec: T0 + maxUnbackedSec + 7 })
   ok(`[max ${maxUnbackedSec}] a fresh verified backup reopens writes`, resumed.accepted === true)
   s.close()
@@ -261,14 +262,18 @@ for (const maxUnbackedSec of [3600, 7200]) {
 {
   const p = setup('fence-bad')
   const s = open(p)
-  writeFileSync(p.receipt, JSON.stringify({ at: T0, write_seq: 99 }))
+  writeFileSync(p.receipt, JSON.stringify({ at: T0, write_seq: 99, snapshot_id: SNAP_ID }))
   const ahead = s.submit({ writer: 'james', event: claim(james, 'hive:ops', 'x1'), expectedPriorId: null, nowSec: T0 + 5 })
-  writeFileSync(p.receipt, JSON.stringify({ at: T0 + 10000, write_seq: 1 }))
+  writeFileSync(p.receipt, JSON.stringify({ at: T0 + 10000, write_seq: 1, snapshot_id: SNAP_ID }))
   const future = s.submit({ writer: 'james', event: claim(james, 'hive:ops', 'x2'), expectedPriorId: null, nowSec: T0 + 5 })
+  writeFileSync(p.receipt, JSON.stringify({ at: T0, write_seq: 1 }))
+  const noId = s.submit({ writer: 'james', event: claim(james, 'hive:ops', 'x4'), expectedPriorId: null, nowSec: T0 + 5 })
+  writeFileSync(p.receipt, JSON.stringify({ at: T0, write_seq: 1, snapshot_id: SNAP_ID.slice(0, 8) }))
+  const shortId = s.submit({ writer: 'james', event: claim(james, 'hive:ops', 'x5'), expectedPriorId: null, nowSec: T0 + 5 })
   rmSync(p.receipt)
   const missing = s.submit({ writer: 'james', event: claim(james, 'hive:ops', 'x3'), expectedPriorId: null, nowSec: T0 + 5 })
-  ok('a receipt ahead of the store, from the future, or missing fences writes',
-    [ahead, future, missing].every(r => r.code === 'HIVE_MEMORY_BACKUP_STALE_WRITES_FENCED'))
+  ok('a receipt ahead of the store, from the future, without a 64-hex snapshot_id, or missing fences writes',
+    [ahead, future, noId, shortId, missing].every(r => r.code === 'HIVE_MEMORY_BACKUP_STALE_WRITES_FENCED'))
   s.close()
 }
 {
@@ -284,22 +289,31 @@ for (const maxUnbackedSec of [3600, 7200]) {
   const snap = await backupCli(['snapshot', '--db', p.db, '--ledger', p.ledger, '--out-db', join(p.dir, 'snap.sqlite'), '--out-ledger', join(p.dir, 'snap.ledger')])
   const snapOut = JSON.parse(snap.stdout || '{}')
   ok('backup snapshot prints its write_seq and the snapshot time', snap.status === 0 && snapOut.write_seq === 1 && Math.abs(snapOut.snapshot_at - now) <= 5)
-  const late = await backupCli(['record-verified', '--backup-receipt', p.receipt, '--write-seq', '1', '--at', String(now - 3601)])
+  const late = await backupCli(['record-verified', '--backup-receipt', p.receipt, '--snapshot-id', SNAP_ID, '--write-seq', '1', '--at', String(now - 3601)])
   const lateReceipt = JSON.parse(readFileSync(p.receipt, 'utf8'))
   const s = open(p, { config: validateAndResolveConfig(rawConfig({ maxUnbackedSec: 3600 })) })
   const fenced = s.submit({ writer: 'james', event: claim(james, 'hive:ops', 'late-verify', { nowSec: now }), expectedPriorId: null, nowSec: now })
   ok('record-verified --at stores the snapshot time, and a snapshot older than maxUnbackedSec fences writes though it was verified just now',
     late.status === 0 && lateReceipt.at === now - 3601 && fenced.code === 'HIVE_MEMORY_BACKUP_STALE_WRITES_FENCED')
-  const fresh = await backupCli(['record-verified', '--backup-receipt', p.receipt, '--write-seq', '1', '--at', String(snapOut.snapshot_at)])
+  const fresh = await backupCli(['record-verified', '--backup-receipt', p.receipt, '--snapshot-id', SNAP_ID, '--write-seq', '1', '--at', String(snapOut.snapshot_at)])
   const opened = s.submit({ writer: 'james', event: claim(james, 'hive:ops', 'fresh-snapshot', { nowSec: now + 1 }), expectedPriorId: null, nowSec: now + 1 })
   ok('a receipt at the snapshot time printed by snapshot reopens writes', fresh.status === 0 && opened.accepted === true)
   s.close()
-  const dflt = await backupCli(['record-verified', '--backup-receipt', p.receipt, '--write-seq', '2'])
+  const dflt = await backupCli(['record-verified', '--backup-receipt', p.receipt, '--snapshot-id', SNAP_ID, '--write-seq', '2'])
   ok('record-verified without --at defaults to now', dflt.status === 0 && Math.abs(JSON.parse(readFileSync(p.receipt, 'utf8')).at - now) <= 5)
-  const future = await backupCli(['record-verified', '--backup-receipt', p.receipt, '--write-seq', '2', '--at', String(now + 3600)])
-  const junk = await backupCli(['record-verified', '--backup-receipt', p.receipt, '--write-seq', '2', '--at', 'yesterday'])
+  const future = await backupCli(['record-verified', '--backup-receipt', p.receipt, '--snapshot-id', SNAP_ID, '--write-seq', '2', '--at', String(now + 3600)])
+  const junk = await backupCli(['record-verified', '--backup-receipt', p.receipt, '--snapshot-id', SNAP_ID, '--write-seq', '2', '--at', 'yesterday'])
   ok('record-verified refuses a future or malformed --at and leaves the receipt alone',
     future.status === 1 && /in the future/.test(future.stderr) && junk.status === 2 && JSON.parse(readFileSync(p.receipt, 'utf8')).write_seq === 2)
+  ok('the receipt is exactly { at, write_seq, snapshot_id } with the restic id given',
+    JSON.stringify(Object.keys(JSON.parse(readFileSync(p.receipt, 'utf8')))) === '["at","write_seq","snapshot_id"]' && JSON.parse(readFileSync(p.receipt, 'utf8')).snapshot_id === SNAP_ID)
+  const plain = ['record-verified', '--backup-receipt', p.receipt, '--write-seq', '3']
+  const badIds = [[], ['--snapshot-id', SNAP_ID.slice(0, 8)], ['--snapshot-id', SNAP_ID.toUpperCase()], ['--snapshot-id', `${SNAP_ID}0`], ['--snapshot-id', 'latest']]
+  const refused = await Promise.all(badIds.map(extra => backupCli([...plain, ...extra])))
+  ok('record-verified refuses a missing, short, uppercase, overlong or "latest" --snapshot-id and leaves the receipt alone',
+    refused.every(r => r.status === 2 && /--snapshot-id/.test(r.stderr)) && JSON.parse(readFileSync(p.receipt, 'utf8')).write_seq === 2)
+  ok('recordVerifiedBackup refuses a malformed snapshot id too',
+    throwsCode(() => recordVerifiedBackup({ receiptPath: p.receipt, writeSeq: 3, snapshotId: 'abc' }), 'HIVE_MEMORY_BACKUP_REFUSED'))
 }
 
 // --- 3. Crash-boundary reconciliation and persistent readiness (§5 test 3) ---
@@ -647,7 +661,7 @@ for (const [label, mutate, state] of [
   const early = s.retentionCandidates(succ.created_at + RETENTION_PURGE_AFTER_SEC - 10)
   ok('nothing is purged before 90 days past end of life', early.length === 0)
   const now = Math.max(succ.created_at, tomb.created_at, shortLived.created_at + 60) + RETENTION_PURGE_AFTER_SEC + 1
-  recordVerifiedBackup({ receiptPath: p.receipt, writeSeq: seqOf(s), at: now, nowSec: now })
+  recordVerifiedBackup({ receiptPath: p.receipt, snapshotId: SNAP_ID, writeSeq: seqOf(s), at: now, nowSec: now })
   const out = s.purgeRetention({ nowSec: now })
   const left = s.db.prepare('SELECT id FROM events').all().map(r => r.id).sort()
   const rate = s.db.prepare('SELECT count(*) AS n FROM writer_rate_log').get().n
@@ -772,7 +786,7 @@ for (const [label, mutate, state] of [
   const p = setup('sd')
   const cfgPath = join(p.dir, 'config.json')
   writeFileSync(cfgPath, JSON.stringify(rawConfig({ maxUnbackedSec: 10 ** 9 })))
-  recordVerifiedBackup({ receiptPath: p.receipt, writeSeq: 1, at: Math.floor(Date.now() / 1000) })
+  recordVerifiedBackup({ receiptPath: p.receipt, snapshotId: SNAP_ID, writeSeq: 1, at: Math.floor(Date.now() / 1000) })
   const sock = join(p.dir, 'k.sock'); const wsock = join(p.dir, 'w.sock')
   const child = spawn('python3', ['-c', `
 import os, socket, sys
@@ -854,7 +868,7 @@ os.execv(sys.argv[3], [sys.argv[3], sys.argv[4], "--db", sys.argv[5], "--ledger"
   big.exec('COMMIT')
   big.close()
   writeFileSync(p.ledger, `${line}\n`)
-  recordVerifiedBackup({ receiptPath: p.receipt, writeSeq: 1, at: T0 })
+  recordVerifiedBackup({ receiptPath: p.receipt, snapshotId: SNAP_ID, writeSeq: 1, at: T0 })
   const t0 = performance.now()
   const s = open(p)
   const tOpen = performance.now() - t0

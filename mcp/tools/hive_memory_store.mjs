@@ -536,14 +536,7 @@ export class HiveMemoryStore {
     return pending.op === 'submit' ? this.#rowsValidError([pending.id]) : null
   }
 
-  readReceipt() {
-    try {
-      const st = lstatSync(this.receiptPath)
-      if (!st.isFile() || st.isSymbolicLink()) return null
-      const r = JSON.parse(readFileSync(this.receiptPath, 'utf8'))
-      return Number.isSafeInteger(r?.at) && r.at > 0 && Number.isSafeInteger(r.write_seq) && r.write_seq >= 1 ? { at: r.at, write_seq: r.write_seq } : null
-    } catch { return null }
-  }
+  readReceipt() { return readReceiptFile(this.receiptPath) }
 
   // The stale-backup admission gate: refuses every new write, even the first after an idle outage.
   backupFence(nowSec) {
@@ -918,16 +911,29 @@ export async function snapshotStore({ dbPath, ledgerPath, snapshotPath, ledgerCu
   return { snapshotSeq, snapshotAt, snapshotPath, ledgerCutPath }
 }
 
+// A receipt counts only with a positive at and write_seq and the restic snapshot's exact 64-hex id.
+export function readReceiptFile(path) {
+  try {
+    const st = lstatSync(path)
+    if (!st.isFile() || st.isSymbolicLink()) return null
+    const r = JSON.parse(readFileSync(path, 'utf8'))
+    return Number.isSafeInteger(r?.at) && r.at > 0 && Number.isSafeInteger(r.write_seq) && r.write_seq >= 1 && typeof r.snapshot_id === 'string' && HEX64.test(r.snapshot_id)
+      ? { at: r.at, write_seq: r.write_seq, snapshot_id: r.snapshot_id } : null
+  } catch { return null }
+}
+
 // at is when the snapshot was taken, not when it was verified: the write fence measures from it.
-export function recordVerifiedBackup({ receiptPath, writeSeq, at = nowSecDefault(), nowSec = nowSecDefault() }) {
+export function recordVerifiedBackup({ receiptPath, writeSeq, snapshotId, at = nowSecDefault(), nowSec = nowSecDefault() }) {
   if (!Number.isSafeInteger(writeSeq) || writeSeq < 1 || !Number.isSafeInteger(at) || at < 1) throw new HiveMemoryError('HIVE_MEMORY_BACKUP_REFUSED', 'write_seq and at must be positive integers')
+  if (typeof snapshotId !== 'string' || !HEX64.test(snapshotId)) throw new HiveMemoryError('HIVE_MEMORY_BACKUP_REFUSED', 'snapshot_id must be the 64-hex restic snapshot id')
   if (at > nowSec + RECEIPT_SKEW_SEC) throw new HiveMemoryError('HIVE_MEMORY_BACKUP_REFUSED', 'the snapshot time is in the future')
+  const receipt = { at, write_seq: writeSeq, snapshot_id: snapshotId }
   const tmp = `${receiptPath}.${process.pid}.tmp`
   const fd = openSync(tmp, 'w', 0o600)
-  try { writeAll(fd, Buffer.from(`${JSON.stringify({ at, write_seq: writeSeq })}\n`)); fsyncSync(fd) } finally { closeSync(fd) }
+  try { writeAll(fd, Buffer.from(`${JSON.stringify(receipt)}\n`)); fsyncSync(fd) } finally { closeSync(fd) }
   renameSync(tmp, receiptPath)
   fsyncDir(dirname(receiptPath))
-  return { at, write_seq: writeSeq }
+  return receipt
 }
 
 // --- restore: bidirectional reconciliation of a decrypted snapshot against the ledger ---

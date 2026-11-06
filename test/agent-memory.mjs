@@ -37,6 +37,7 @@ const root = mkdtempSync(join(tmpdir(), 'am-'))
 const storeDir = join(root, 'store'), sockDir = join(root, 's')
 mkdirSync(storeDir)
 const store = { db: join(storeDir, 'memory.sqlite'), ledger: join(storeDir, 'ledger.jsonl'), receipt: join(storeDir, 'receipt.json') }
+const SNAP_ID = 'c'.repeat(64)
 const storeConfig = {
   memoryGlobalChannelId: '11111111-2222-4333-8444-555555555555',
   ownerPubkey: owner,
@@ -48,7 +49,7 @@ const storeConfig = {
 }
 validateAndResolveConfig(storeConfig)
 initEmptyStore({ dbPath: store.db, ledgerPath: store.ledger })
-recordVerifiedBackup({ receiptPath: store.receipt, writeSeq: 1, at: Math.floor(Date.now() / 1000) })
+recordVerifiedBackup({ receiptPath: store.receipt, snapshotId: SNAP_ID, writeSeq: 1, at: Math.floor(Date.now() / 1000) })
 const daemon = await startMemoryDaemon({ dbPath: store.db, ledgerPath: store.ledger, receiptPath: store.receipt, config: storeConfig, socketDir: sockDir,
   readers: 'owner', writers: 'agent', log: () => {} })
 const writerSocket = join(sockDir, 'writers', 'agent.sock')
