@@ -10,6 +10,9 @@ import { buildClaimTemplate } from '../mcp/tools/memory.mjs'
 import { ACTIVITY_MAX, handleSocketJsonRpc, startMemoryDaemon } from '../mcp/tools/memory-daemon.mjs'
 import { initEmptyStore, recordVerifiedBackup } from '../mcp/tools/hive_memory_store.mjs'
 import {
+  computeAgentHealth,
+  computeCoherence,
+  computeDreamingTelemetry,
   diffViewerSnapshots,
   escapeHtml,
   parseListenTarget,
@@ -165,6 +168,319 @@ await test('diffViewerSnapshots logs store state, write_seq, backup and record a
   assert(!diffs.some(d => /relay|sync/i.test(d.summary)))
 })
 
+await test('computeCoherence calculates 5-axis HCI score and retroactive inception-to-now trajectory', () => {
+  const empty = computeCoherence()
+  assert.equal(empty.score, 0)
+  assert.deepEqual(empty.history, [])
+
+  const roster = [
+    { id: 'james', pubkey: '1'.repeat(64), is_writer: true },
+    { id: 'mydude', pubkey: '2'.repeat(64), is_writer: true },
+    { id: 'neil', pubkey: '3'.repeat(64), is_writer: true },
+  ]
+  const records = [
+    {
+      scope: 'room:a8186b53-537d-46ad-a7e7-b6486c58970e',
+      d: 'hive-memory:room:a8186b53-537d-46ad-a7e7-b6486c58970e:init-spec',
+      topic: 'hive-memory',
+      claim: 'Initial spec for PR #335',
+      author_pubkey: '2'.repeat(64),
+      as_of_git: 'nvoy@9c995af',
+      evidence: ['nvoy@9c995af:mcp/tools/memory-daemon.mjs'],
+      created_at: 1000,
+      expires_at: 2000,
+      conflict: false,
+      stale_warning: null,
+    },
+    {
+      scope: 'hive:canon',
+      d: 'hive-memory:hive:canon:priorities',
+      topic: 'hive',
+      claim: 'Active Hive priorities',
+      author_pubkey: '1'.repeat(64),
+      as_of_git: 'nvoy@9c995af',
+      evidence: ['nvoy@9c995af:README.md'],
+      created_at: 1100,
+      expires_at: null,
+      conflict: false,
+      stale_warning: null,
+    },
+    {
+      scope: 'room:a8186b53-537d-46ad-a7e7-b6486c58970e',
+      d: 'hive-memory:room:a8186b53-537d-46ad-a7e7-b6486c58970e:deploy-status',
+      topic: 'herd-infra',
+      claim: 'Holding PR #335 deploy at nvoy@9c995af',
+      author_pubkey: '3'.repeat(64),
+      as_of_git: 'nvoy@9c995af',
+      evidence: ['nvoy@9c995af:mcp/tools/memory-viewer.mjs'],
+      created_at: 1200,
+      expires_at: null,
+      conflict: false,
+      stale_warning: null,
+    },
+  ]
+  const coh = computeCoherence({
+    records,
+    agent_roster: roster,
+    recent_activity: [{ kind: 'wake', actor: 'neil' }, { kind: 'submit', actor: 'neil' }],
+    store_state: { write_seq: 6 },
+  })
+  assert.equal(coh.inception_at, 1000)
+  assert(coh.score > coh.inception_score, 'coherence should improve as canon and shared PR/commit refs converge')
+  assert(coh.delta_since_inception > 0)
+  assert(coh.shared_artifacts >= 2)
+  assert.equal(coh.axes.grounding, 100)
+  assert.equal(coh.history.length, 2)
+  assert.equal(coh.history[0].claims, 1)
+  assert.equal(coh.history[1].claims, 3)
+
+  // Verify history_records folds supersessions and withdrawals at their chronological epoch
+  const historyWithWithdrawal = [
+    ...records,
+    {
+      ...records[0],
+      event_id: 'w'.repeat(64),
+      status: 'withdrawn',
+      verification: 'withdrawn',
+      is_current: true,
+      created_at: 1300,
+    },
+  ]
+  const coh2 = computeCoherence({
+    records: records.slice(1),
+    history_records: historyWithWithdrawal,
+    agent_roster: roster,
+    store_state: { write_seq: 7 },
+  })
+  assert.equal(coh2.total_events, 4)
+  assert.equal(coh2.history.at(-1).events, 4)
+  assert.equal(coh2.history.at(-1).claims, 2)
+
+  // Verify post-event expiration at now_sec and cross-author checkpoint consolidation
+  const crossAuthorHistory = [
+    {
+      event_id: 'e1'.padEnd(64, '0'),
+      author_pubkey: '2'.repeat(64),
+      scope: 'room:a8186b53-537d-46ad-a7e7-b6486c58970e',
+      d: 'hive-memory:room:a8186b53-537d-46ad-a7e7-b6486c58970e:pr-status',
+      topic: 'nvoy',
+      claim: 'PR #336 opened',
+      evidence: ['nvoy@1111111'],
+      as_of_git: '1'.repeat(40),
+      created_at: 100,
+      expires_at: 150,
+      verification: 'expired',
+    },
+    {
+      event_id: 'e2'.padEnd(64, '0'),
+      author_pubkey: '2'.repeat(64),
+      scope: 'room:a8186b53-537d-46ad-a7e7-b6486c58970e',
+      d: 'hive-memory:room:a8186b53-537d-46ad-a7e7-b6486c58970e:pr-review',
+      topic: 'nvoy',
+      claim: 'PR #336 checkpoint',
+      evidence: ['nvoy@2222222'],
+      as_of_git: '2'.repeat(40),
+      created_at: 105,
+      expires_at: 500,
+      verification: 'consolidated',
+      consolidated_by: 'e3'.padEnd(64, '0'),
+    },
+    {
+      event_id: 'e3'.padEnd(64, '0'),
+      author_pubkey: '3'.repeat(64),
+      scope: 'room:a8186b53-537d-46ad-a7e7-b6486c58970e',
+      d: 'hive-memory:room:a8186b53-537d-46ad-a7e7-b6486c58970e:pr-merged',
+      topic: 'nvoy',
+      claim: 'PR #336 merged',
+      evidence: ['nvoy@3333333'],
+      as_of_git: '3'.repeat(40),
+      created_at: 110,
+      expires_at: 500,
+      verification: 'accepted',
+      supersedes: ['e2'.padEnd(64, '0')],
+    },
+  ]
+  const coh3 = computeCoherence({
+    records: [crossAuthorHistory[2]],
+    history_records: crossAuthorHistory,
+    agent_roster: roster,
+    now_sec: 200,
+    history_complete: false,
+  })
+  assert.equal(coh3.history.at(-1).claims, 1, 'current coherence must exclude expired and cross-author consolidated claims')
+  assert.equal(coh3.history_complete, false)
+  assert.equal(coh3.history_window, 'truncated-5000')
+
+  // Verify historical cross-author consolidation when the superseding claim later expires (so consolidated_by is absent)
+  const hist4 = [
+    {
+      event_id: 'c1'.padEnd(64, '0'),
+      author_pubkey: '2'.repeat(64),
+      scope: 'room:a8186b53-537d-46ad-a7e7-b6486c58970e',
+      d: 'hive-memory:room:a8186b53-537d-46ad-a7e7-b6486c58970e:task-review',
+      topic: 'nvoy',
+      claim: 'Checkpoint 1',
+      evidence: ['nvoy@1111111'],
+      as_of_git: '1'.repeat(40),
+      created_at: 100,
+      expires_at: 1000,
+      verification: 'accepted',
+    },
+    ...Array.from({ length: 3 }, (_, idx) => ({
+      event_id: `f${idx}`.padEnd(64, '0'),
+      author_pubkey: '1'.repeat(64),
+      scope: 'hive:canon',
+      d: `hive-memory:hive:canon:p${idx}`,
+      topic: 'hive',
+      claim: `Canon ${idx}`,
+      evidence: ['nvoy@1111111'],
+      as_of_git: '1'.repeat(40),
+      created_at: 101 + idx,
+      expires_at: null,
+      verification: 'accepted',
+    })),
+    {
+      event_id: 'c2'.padEnd(64, '0'),
+      author_pubkey: '3'.repeat(64),
+      scope: 'room:a8186b53-537d-46ad-a7e7-b6486c58970e',
+      d: 'hive-memory:room:a8186b53-537d-46ad-a7e7-b6486c58970e:task-status',
+      topic: 'nvoy',
+      claim: 'Supersedes c1 while active until t=200',
+      evidence: ['nvoy@2222222'],
+      as_of_git: '2'.repeat(40),
+      created_at: 110,
+      expires_at: 200,
+      verification: 'expired',
+      supersedes: ['c1'.padEnd(64, '0')],
+    },
+    {
+      event_id: 'c3'.padEnd(64, '0'),
+      author_pubkey: '1'.repeat(64),
+      scope: 'hive:canon',
+      d: 'hive-memory:hive:canon:p9',
+      topic: 'hive',
+      claim: 'Later event after c2 expired',
+      evidence: ['nvoy@3333333'],
+      as_of_git: '3'.repeat(40),
+      created_at: 250,
+      expires_at: null,
+      verification: 'accepted',
+    },
+  ]
+  const coh4 = computeCoherence({
+    records: hist4.filter(r => r.verification === 'accepted'),
+    history_records: hist4,
+    agent_roster: roster,
+    now_sec: 300,
+  })
+  const step5 = coh4.history.find(h => h.events === 5)
+  assert.equal(step5.claims, 4, 'at step 5 (t=110), c2 is active and consolidates c1 via supersedes even after c2 later expires')
+})
+
+await test('computeAgentHealth: classifies 5m active, 5-20m warm, >20m stale, error, and preserves telemetry across rollover', () => {
+  const nowSec = 10_000
+  const roster = [
+    { id: 'mydude', pubkey: '1'.repeat(64), is_reader: true, is_writer: true },
+    { id: 'crusty', pubkey: '2'.repeat(64), is_reader: true, is_writer: true },
+    { id: 'silent-agent', pubkey: '3'.repeat(64), is_reader: true, is_writer: true },
+    { id: 'refused-agent', pubkey: '4'.repeat(64), is_reader: true, is_writer: false },
+  ]
+  const telemetry = new Map()
+  const pass1 = computeAgentHealth({
+    agent_roster: roster,
+    recent_activity: [
+      { kind: 'query', actor: 'mydude', at: nowSec - 120 },
+      { kind: 'wake', actor: 'crusty', at: nowSec - 750 },
+      { kind: 'refused', actor: 'refused-agent', at: nowSec - 60, code: 'ACL_DENIED' },
+    ],
+    records: [
+      { author_pubkey: '1'.repeat(64), d: 'hive:ops:nvoy:review', created_at: nowSec - 45 },
+    ],
+    prior_telemetry: telemetry,
+    now_sec: nowSec,
+  })
+  assert.equal(pass1.summary.active_5m, 1)
+  assert.equal(pass1.summary.warm_20m, 1)
+  assert.equal(pass1.summary.stale, 1)
+  assert.equal(pass1.summary.error, 1)
+  const byId1 = new Map(pass1.roster.map(a => [a.id, a]))
+  assert.equal(byId1.get('mydude').health, 'active')
+  assert.equal(byId1.get('mydude').reads_5m, 1)
+  assert.equal(byId1.get('mydude').last_write_at, nowSec - 45)
+  assert.equal(byId1.get('crusty').health, 'warm')
+  assert.equal(byId1.get('silent-agent').health, 'stale')
+  assert.equal(byId1.get('refused-agent').health, 'error')
+
+  // Simulate activity ring rollover (empty recent_activity on next poll 30s later): telemetry is preserved
+  const pass2 = computeAgentHealth({
+    agent_roster: roster,
+    recent_activity: [],
+    records: [],
+    prior_telemetry: telemetry,
+    now_sec: nowSec + 30,
+  })
+  const byId2 = new Map(pass2.roster.map(a => [a.id, a]))
+  assert.equal(byId2.get('mydude').health, 'active')
+  assert.equal(byId2.get('mydude').last_read_at, nowSec - 120)
+  assert.equal(byId2.get('crusty').health, 'warm')
+})
+
+await test('computeDreamingTelemetry: groups Gate 8 Class A by scope+topic, restricts shortTtlCount to workflow slugs, and marks estimates', () => {
+  const recs = [
+    ...Array.from({ length: 5 }, (_, i) => ({
+      scope: 'room:1',
+      d: `hive-memory:room:1:item-${i}`,
+      topic: 'ops',
+      claim: `Room 1 ops claim ${i}`,
+      created_at: 1000,
+      expires_at: 1000 + 86400, // 24h TTL, but NOT a workflow checkpoint slug
+    })),
+    ...Array.from({ length: 5 }, (_, i) => ({
+      scope: 'room:2',
+      d: `hive-memory:room:2:item-${i}`,
+      topic: 'ops',
+      claim: `Room 2 ops claim ${i}`,
+      created_at: 1000,
+      expires_at: 1000 + 86400,
+    })),
+    {
+      scope: 'room:1',
+      d: 'hive-memory:room:1:pr336-status',
+      topic: 'nvoy',
+      claim: 'PR 336 status checkpoint on 24h TTL',
+      created_at: 1000,
+      expires_at: 1000 + 86400,
+    },
+    {
+      scope: 'room:1',
+      d: 'hive-memory:room:1:pr336-review',
+      topic: 'nvoy',
+      claim: 'PR 336 review checkpoint on 7d TTL',
+      created_at: 1000,
+      expires_at: 1000 + 7 * 86400,
+    },
+    {
+      scope: 'room:1',
+      d: 'hive-memory:room:1:decision-1',
+      topic: 'decisions',
+      claim: 'Permanent Class B decision',
+      created_at: 1000,
+      expires_at: null,
+    },
+  ]
+  const dt = computeDreamingTelemetry(recs)
+  assert.equal(dt.estimated_from_visible, true)
+  assert.equal(dt.wfCount, 2, 'only -status and -review slugs are workflow checkpoints')
+  assert.equal(dt.shortTtlCount, 1, 'shortTtlCount must only count workflow checkpoints with <=48h TTL')
+  assert.equal(dt.classBCount, 1)
+  const room1Ops = dt.topicList.find(x => x.scope === 'room:1' && x.topic === 'ops')
+  const room2Ops = dt.topicList.find(x => x.scope === 'room:2' && x.topic === 'ops')
+  assert.equal(room1Ops?.count, 5)
+  assert.equal(room1Ops?.ready, false, '5 claims in room:1 must not trigger >8 curation ready')
+  assert.equal(room2Ops?.count, 5)
+  assert.equal(room2Ops?.ready, false, '5 claims in room:2 must not trigger >8 curation ready')
+})
+
 await test('live integration: memory-viewer polls memory-daemon viewer socket, streams SSE, and refuses non-GET', async () => {
   const tmp = mkdtempSync(join(tmpdir(), 'nvoy-mem-viewer-'))
   const sockDir = join(tmp, 'sock')
@@ -210,6 +526,14 @@ await test('live integration: memory-viewer polls memory-daemon viewer socket, s
     assert(String(htmlRes.headers['content-security-policy']).includes("default-src 'none'"))
     assert(htmlRes.body.includes('Hive Shared Memory'))
     assert(htmlRes.body.includes('READY'))
+    assert(htmlRes.body.includes('viewport-fit=cover'))
+    assert(htmlRes.body.includes('100dvh'))
+    assert(htmlRes.body.includes('id="mobile-dock"'))
+    assert(htmlRes.body.includes('id="dock-agents"'))
+    assert(htmlRes.body.includes('id="dock-pulses"'))
+    assert(htmlRes.body.includes('id="dock-tools"'))
+    assert(htmlRes.body.includes('id="btn-zoom-in"'))
+    assert(htmlRes.body.includes('inspect-close'))
     assert(!/relay|SYNCED/i.test(htmlRes.body.replace('never synced to a relay', '')))
 
     const stateRes1 = await httpGet(viewer.port, '/api/state')
@@ -303,6 +627,23 @@ await test('live integration: memory-viewer polls memory-daemon viewer socket, s
     assert.equal(notReady.query_answer, 'unknown')
     assert.equal(notReady.records.length, 0)
     assert.notEqual(notReady.store_state.state, 'READY')
+
+    // Verify viewer.stop() closes keep-alive sockets immediately (< 500ms) instead of hanging on SIGTERM.
+    const keepAliveReq = httpRequest({
+      host: '127.0.0.1',
+      port: viewer.port,
+      path: '/api/state',
+      method: 'GET',
+      headers: { Connection: 'keep-alive' },
+    })
+    keepAliveReq.end()
+    await new Promise(resolveResp => keepAliveReq.on('response', res => {
+      res.resume()
+      res.on('end', resolveResp)
+    }))
+    const stopStart = Date.now()
+    await viewer.stop()
+    assert(Date.now() - stopStart < 500, 'viewer.stop() should terminate keep-alive connections quickly')
   } finally {
     await viewer.stop()
     await daemon.close()
