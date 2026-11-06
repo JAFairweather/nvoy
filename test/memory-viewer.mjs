@@ -10,6 +10,7 @@ import { buildClaimTemplate } from '../mcp/tools/memory.mjs'
 import { ACTIVITY_MAX, handleSocketJsonRpc, startMemoryDaemon } from '../mcp/tools/memory-daemon.mjs'
 import { initEmptyStore, recordVerifiedBackup } from '../mcp/tools/hive_memory_store.mjs'
 import {
+  computeAgentHealth,
   computeCoherence,
   diffViewerSnapshots,
   escapeHtml,
@@ -253,6 +254,54 @@ await test('computeCoherence calculates 5-axis HCI score and retroactive incepti
   assert.equal(coh2.total_events, 4)
   assert.equal(coh2.history.at(-1).events, 4)
   assert.equal(coh2.history.at(-1).claims, 2)
+})
+
+await test('computeAgentHealth: classifies 5m active, 5-20m warm, >20m stale, error, and preserves telemetry across rollover', () => {
+  const nowSec = 10_000
+  const roster = [
+    { id: 'mydude', pubkey: '1'.repeat(64), is_reader: true, is_writer: true },
+    { id: 'crusty', pubkey: '2'.repeat(64), is_reader: true, is_writer: true },
+    { id: 'silent-agent', pubkey: '3'.repeat(64), is_reader: true, is_writer: true },
+    { id: 'refused-agent', pubkey: '4'.repeat(64), is_reader: true, is_writer: false },
+  ]
+  const telemetry = new Map()
+  const pass1 = computeAgentHealth({
+    agent_roster: roster,
+    recent_activity: [
+      { kind: 'query', actor: 'mydude', at: nowSec - 120 },
+      { kind: 'wake', actor: 'crusty', at: nowSec - 750 },
+      { kind: 'refused', actor: 'refused-agent', at: nowSec - 60, code: 'ACL_DENIED' },
+    ],
+    records: [
+      { author_pubkey: '1'.repeat(64), d: 'hive:ops:nvoy:review', created_at: nowSec - 45 },
+    ],
+    prior_telemetry: telemetry,
+    now_sec: nowSec,
+  })
+  assert.equal(pass1.summary.active_5m, 1)
+  assert.equal(pass1.summary.warm_20m, 1)
+  assert.equal(pass1.summary.stale, 1)
+  assert.equal(pass1.summary.error, 1)
+  const byId1 = new Map(pass1.roster.map(a => [a.id, a]))
+  assert.equal(byId1.get('mydude').health, 'active')
+  assert.equal(byId1.get('mydude').reads_5m, 1)
+  assert.equal(byId1.get('mydude').last_write_at, nowSec - 45)
+  assert.equal(byId1.get('crusty').health, 'warm')
+  assert.equal(byId1.get('silent-agent').health, 'stale')
+  assert.equal(byId1.get('refused-agent').health, 'error')
+
+  // Simulate activity ring rollover (empty recent_activity on next poll 30s later): telemetry is preserved
+  const pass2 = computeAgentHealth({
+    agent_roster: roster,
+    recent_activity: [],
+    records: [],
+    prior_telemetry: telemetry,
+    now_sec: nowSec + 30,
+  })
+  const byId2 = new Map(pass2.roster.map(a => [a.id, a]))
+  assert.equal(byId2.get('mydude').health, 'active')
+  assert.equal(byId2.get('mydude').last_read_at, nowSec - 120)
+  assert.equal(byId2.get('crusty').health, 'warm')
 })
 
 await test('live integration: memory-viewer polls memory-daemon viewer socket, streams SSE, and refuses non-GET', async () => {

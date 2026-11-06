@@ -385,6 +385,148 @@ export function computeCoherence({
   }
 }
 
+export const ACTIVE_WINDOW_SEC = 300
+export const WARM_WINDOW_SEC = 1200
+
+export function computeAgentHealth({
+  agent_roster = [],
+  recent_activity = [],
+  records = [],
+  history_records = [],
+  prior_telemetry = null,
+  now_sec = Math.floor(Date.now() / 1000),
+} = {}) {
+  const telemetry = prior_telemetry instanceof Map ? prior_telemetry : new Map()
+  const rosterByPk = new Map()
+  for (const a of Array.isArray(agent_roster) ? agent_roster : []) {
+    if (a?.pubkey && a?.id) rosterByPk.set(a.pubkey, a.id)
+  }
+
+  const getEntry = id => {
+    let e = telemetry.get(id)
+    if (!e) {
+      e = {
+        last_read_at: null,
+        last_read_kind: null,
+        last_write_at: null,
+        last_write_d: null,
+        last_refused_at: null,
+        last_refused_code: null,
+      }
+      telemetry.set(id, e)
+    }
+    return e
+  }
+
+  const allRecords = [
+    ...(Array.isArray(records) ? records : []),
+    ...(Array.isArray(history_records) ? history_records : []),
+  ]
+  for (const r of allRecords) {
+    if (!r || typeof r !== 'object') continue
+    const actor = rosterByPk.get(String(r.author_pubkey || ''))
+    const at = Number.isSafeInteger(r.created_at) ? r.created_at : null
+    if (!actor || !at) continue
+    const e = getEntry(actor)
+    if (e.last_write_at === null || at >= e.last_write_at) {
+      e.last_write_at = at
+      if (r.d) e.last_write_d = String(r.d)
+    }
+  }
+
+  const reads5mByActor = new Map()
+  const writes5mByActor = new Map()
+  for (const a of Array.isArray(recent_activity) ? recent_activity : []) {
+    if (!a || typeof a !== 'object' || !a.actor) continue
+    const actor = String(a.actor)
+    const at = Number.isSafeInteger(a.at) ? a.at : null
+    if (!at) continue
+    const e = getEntry(actor)
+    const in5m = Math.max(0, now_sec - at) <= ACTIVE_WINDOW_SEC
+    if (a.kind === 'wake' || a.kind === 'query' || a.kind === 'lookup') {
+      if (e.last_read_at === null || at >= e.last_read_at) {
+        e.last_read_at = at
+        e.last_read_kind = a.kind
+      }
+      if (in5m) reads5mByActor.set(actor, (reads5mByActor.get(actor) || 0) + 1)
+    } else if (a.kind === 'submit') {
+      if (e.last_write_at === null || at >= e.last_write_at) {
+        e.last_write_at = at
+        if (a.d) e.last_write_d = String(a.d)
+      }
+      if (in5m) writes5mByActor.set(actor, (writes5mByActor.get(actor) || 0) + 1)
+    } else if (a.kind === 'refused') {
+      if (e.last_refused_at === null || at >= e.last_refused_at) {
+        e.last_refused_at = at
+        e.last_refused_code = a.code || 'REFUSED'
+      }
+    }
+  }
+
+  const summary = {
+    active_5m: 0,
+    warm_20m: 0,
+    stale: 0,
+    error: 0,
+    total: 0,
+    window_sec: ACTIVE_WINDOW_SEC,
+  }
+
+  const enrichedRoster = (Array.isArray(agent_roster) ? agent_roster : []).map(agent => {
+    const e = telemetry.get(agent.id) || {
+      last_read_at: null,
+      last_read_kind: null,
+      last_write_at: null,
+      last_write_d: null,
+      last_refused_at: null,
+      last_refused_code: null,
+    }
+    const lastSeen = Math.max(e.last_read_at || 0, e.last_write_at || 0) || null
+    const ageSec = lastSeen !== null ? Math.max(0, now_sec - lastSeen) : null
+    const active5m = ageSec !== null && ageSec <= ACTIVE_WINDOW_SEC
+    let health = 'stale'
+    if (
+      e.last_refused_at !== null &&
+      (lastSeen === null || e.last_refused_at > lastSeen) &&
+      Math.max(0, now_sec - e.last_refused_at) <= 900
+    ) {
+      health = 'error'
+      summary.error += 1
+    } else if (active5m) {
+      health = 'active'
+      summary.active_5m += 1
+    } else if (ageSec !== null && ageSec <= WARM_WINDOW_SEC) {
+      health = 'warm'
+      summary.warm_20m += 1
+    } else {
+      health = 'stale'
+      summary.stale += 1
+    }
+    summary.total += 1
+    return {
+      ...agent,
+      last_read_at: e.last_read_at,
+      last_read_kind: e.last_read_kind,
+      last_write_at: e.last_write_at,
+      last_write_d: e.last_write_d,
+      last_refused_at: e.last_refused_at,
+      last_refused_code: e.last_refused_code,
+      last_seen_at: lastSeen,
+      age_sec: ageSec,
+      active_5m: active5m,
+      reads_5m: reads5mByActor.get(agent.id) || 0,
+      writes_5m: writes5mByActor.get(agent.id) || 0,
+      health,
+    }
+  })
+
+  return {
+    roster: enrichedRoster,
+    summary,
+    telemetry,
+  }
+}
+
 export function diffViewerSnapshots(prev, next, nowSec = Math.floor(Date.now() / 1000)) {
   const events = []
   const push = (kind, summary) => events.push({ at: nowSec, kind, summary: String(summary) })
@@ -1102,12 +1244,14 @@ export function renderViewerHtml(initialState) {
       <div id="agent-list" class="agent-list"></div>
     </div>
     <div class="glass-box panel legend-box">
-      <div class="box-title">Engram Morphology &amp; Decay</div>
+      <div class="box-title">Engram &amp; Ganglion Key</div>
       <div class="legend-grid">
         <div class="legend-item"><span class="shape canon"></span><span>Rank 2 canon (owner)</span></div>
         <div class="legend-item"><span class="shape decision"></span><span>Class B decision (no expiry)</span></div>
         <div class="legend-item"><span class="shape fresh"></span><span>Class A status, fresh</span></div>
         <div class="legend-item"><span class="shape aging"></span><span>Class A status, near expiry</span></div>
+        <div class="legend-item"><span class="shape" style="background:#10b981;border-radius:999px;box-shadow:0 0 8px #10b981;"></span><span>Ganglion active (&le;5m R/W)</span></div>
+        <div class="legend-item"><span class="shape" style="background:#475569;border-radius:999px;border:1px dashed #94a3b8;"></span><span>Ganglion silent (&gt;20m)</span></div>
       </div>
     </div>
     <div class="glass-box panel feed-box">
@@ -1265,6 +1409,22 @@ export function renderViewerHtml(initialState) {
         return Math.floor(diff / 3600) + 'h ' + Math.floor((diff % 3600) / 60) + 'm ago';
       }
 
+      function fmtShortAge(sec, nowSec) {
+        if (!sec || typeof sec !== 'number') return 'silent';
+        var diff = Math.max(0, (nowSec || Math.floor(Date.now() / 1000)) - sec);
+        if (diff < 60) return diff + 's';
+        if (diff < 3600) return Math.floor(diff / 60) + 'm';
+        if (diff < 86400) return Math.floor(diff / 3600) + 'h';
+        return Math.floor(diff / 86400) + 'd';
+      }
+
+      function healthColor(h) {
+        if (h === 'active') return '#10b981';
+        if (h === 'warm') return '#f59e0b';
+        if (h === 'error') return '#ef4444';
+        return '#475569';
+      }
+
       function syncBadgeClass(state) {
         if (state === 'READY') return 'badge ok';
         return 'badge err';
@@ -1402,6 +1562,17 @@ export function renderViewerHtml(initialState) {
           is_owner: false,
           per_hour: 0,
           used_last_hour: null,
+          last_read_at: null,
+          last_read_kind: null,
+          last_write_at: null,
+          last_write_d: null,
+          last_refused_at: null,
+          last_refused_code: null,
+          last_seen_at: null,
+          active_5m: false,
+          reads_5m: 0,
+          writes_5m: 0,
+          health: 'stale',
           listed: true,
           energy: 0,
           x: 0,
@@ -1465,9 +1636,48 @@ export function renderViewerHtml(initialState) {
 
       function syncAgents(s) {
         var roster = Array.isArray(s.agent_roster) ? s.agent_roster : [];
+        var activity = Array.isArray(s.recent_activity) ? s.recent_activity : [];
+        var recs = Array.isArray(s.records) ? s.records : [];
+        var refNow = s.polled_at || nowSec();
         var next = [];
         roster.forEach(function (r) {
           var prev = agentById(r.id);
+          var lastRead = typeof r.last_read_at === 'number' ? r.last_read_at : (prev ? prev.last_read_at : null);
+          var lastReadKind = r.last_read_kind || (prev ? prev.last_read_kind : null);
+          var lastWrite = typeof r.last_write_at === 'number' ? r.last_write_at : (prev ? prev.last_write_at : null);
+          var lastWriteD = r.last_write_d || (prev ? prev.last_write_d : null);
+          var lastRefused = typeof r.last_refused_at === 'number' ? r.last_refused_at : (prev ? prev.last_refused_at : null);
+          var lastRefusedCode = r.last_refused_code || (prev ? prev.last_refused_code : null);
+          var reads5m = typeof r.reads_5m === 'number' ? r.reads_5m : 0;
+          var writes5m = typeof r.writes_5m === 'number' ? r.writes_5m : 0;
+          if (!r.health) {
+            recs.forEach(function (rec) {
+              if (r.pubkey && rec.author_pubkey === r.pubkey && typeof rec.created_at === 'number') {
+                if (!lastWrite || rec.created_at >= lastWrite) { lastWrite = rec.created_at; lastWriteD = rec.d || lastWriteD; }
+              }
+            });
+            activity.forEach(function (act) {
+              if (!act || act.actor !== r.id || typeof act.at !== 'number') return;
+              var in5 = Math.max(0, refNow - act.at) <= 300;
+              if (act.kind === 'wake' || act.kind === 'query' || act.kind === 'lookup') {
+                if (!lastRead || act.at >= lastRead) { lastRead = act.at; lastReadKind = act.kind; }
+                if (in5) reads5m += 1;
+              } else if (act.kind === 'submit') {
+                if (!lastWrite || act.at >= lastWrite) { lastWrite = act.at; lastWriteD = act.d || lastWriteD; }
+                if (in5) writes5m += 1;
+              } else if (act.kind === 'refused') {
+                if (!lastRefused || act.at >= lastRefused) { lastRefused = act.at; lastRefusedCode = act.code || 'REFUSED'; }
+              }
+            });
+          }
+          var lastSeen = typeof r.last_seen_at === 'number' ? r.last_seen_at : (Math.max(lastRead || 0, lastWrite || 0) || null);
+          var ageSec = lastSeen !== null ? Math.max(0, refNow - lastSeen) : null;
+          var active5m = typeof r.active_5m === 'boolean' ? r.active_5m : (ageSec !== null && ageSec <= 300);
+          var health = r.health || (
+            lastRefused !== null && (lastSeen === null || lastRefused > lastSeen) && Math.max(0, refNow - lastRefused) <= 900
+              ? 'error'
+              : (active5m ? 'active' : (ageSec !== null && ageSec <= 1200 ? 'warm' : 'stale'))
+          );
           next.push(makeAgent(r.id, {
             pubkey: r.pubkey || null,
             is_reader: Boolean(r.is_reader),
@@ -1475,12 +1685,23 @@ export function renderViewerHtml(initialState) {
             is_owner: Boolean(r.is_owner),
             per_hour: r.per_hour || 0,
             used_last_hour: typeof r.used_last_hour === 'number' ? r.used_last_hour : null,
+            last_read_at: lastRead,
+            last_read_kind: lastReadKind,
+            last_write_at: lastWrite,
+            last_write_d: lastWriteD,
+            last_refused_at: lastRefused,
+            last_refused_code: lastRefusedCode,
+            last_seen_at: lastSeen,
+            active_5m: active5m,
+            reads_5m: reads5m,
+            writes_5m: writes5m,
+            health: health,
             energy: prev ? prev.energy : 0
           }));
         });
         var known = {};
         next.forEach(function (a) { if (a.pubkey) known[a.pubkey] = true; });
-        (Array.isArray(s.records) ? s.records : []).forEach(function (rec) {
+        recs.forEach(function (rec) {
           var pk = rec.author_pubkey;
           if (!pk || known[pk]) return;
           known[pk] = true;
@@ -1680,23 +1901,43 @@ export function renderViewerHtml(initialState) {
       function renderAgentRoster() {
         var list = el('agent-list');
         list.textContent = '';
-        el('roster-count').textContent = agents.length + (agents.length === 1 ? ' agent' : ' agents');
+        var activeCount = agents.filter(function (a) { return a.listed && a.health === 'active'; }).length;
+        var listedCount = agents.filter(function (a) { return a.listed; }).length || agents.length;
+        el('roster-count').textContent = activeCount + '/' + listedCount + ' active (<=5m)';
+        var curNow = nowSec();
         agents.forEach(function (a) {
           var count = nodes.filter(function (n) { return a.pubkey && n.rec.author_pubkey === a.pubkey; }).length;
           var row = makeDiv('agent-row' + (selected && selected.type === 'agent' && selected.data.id === a.id ? ' active' : ''));
           var ident = makeDiv('agent-ident');
           var dot = document.createElement('span');
           dot.className = 'agent-dot';
+          var hCol = healthColor(a.health);
           dot.style.background = a.color;
-          dot.style.boxShadow = '0 0 8px ' + a.color;
+          dot.style.boxShadow = '0 0 0 2px ' + hCol + ', 0 0 8px ' + hCol;
           ident.appendChild(dot);
           var names = makeDiv('');
           names.appendChild(makeDiv('agent-name', a.name));
-          names.appendChild(makeDiv('agent-model', a.model || (a.listed ? a.id : 'not in roster')));
+          var quotaTxt = a.is_writer ? (a.used_last_hour === null ? '?' : a.used_last_hour) + '/' + a.per_hour : 'RO';
+          names.appendChild(makeDiv('agent-model', (a.model || (a.listed ? a.id : 'unlisted')) + ' · ' + count + 'm · ' + quotaTxt));
           ident.appendChild(names);
           row.appendChild(ident);
-          var stats = makeDiv('agent-stats', count + 'm ' + (a.is_writer ? (a.used_last_hour === null ? '?' : a.used_last_hour) + '/' + a.per_hour : 'RO'));
-          stats.style.color = a.is_writer ? '#6ee7b7' : '#fca5a5';
+          var lastOp = (a.last_write_at && (!a.last_read_at || a.last_write_at >= a.last_read_at)) ? 'W' : 'R';
+          var statText = '○ silent';
+          var statColor = '#64748b';
+          if (a.health === 'active') {
+            statText = '● ' + fmtShortAge(a.last_seen_at, curNow) + ' ' + lastOp;
+            statColor = '#34d399';
+          } else if (a.health === 'warm') {
+            statText = '◐ ' + fmtShortAge(a.last_seen_at, curNow) + ' ' + lastOp;
+            statColor = '#fbbf24';
+          } else if (a.health === 'error') {
+            statText = '✕ ERR ' + fmtShortAge(a.last_refused_at, curNow);
+            statColor = '#f87171';
+          } else if (a.last_seen_at) {
+            statText = '○ ' + fmtShortAge(a.last_seen_at, curNow);
+          }
+          var stats = makeDiv('agent-stats', statText);
+          stats.style.color = statColor;
           row.appendChild(stats);
           row.addEventListener('click', function () {
             selected = { type: 'agent', data: a };
@@ -1814,9 +2055,36 @@ export function renderViewerHtml(initialState) {
         } else if (target.type === 'agent') {
           var a = target.data;
           var authored = nodes.filter(function (n) { return a.pubkey && n.rec.author_pubkey === a.pubkey; });
-          box.appendChild(inspectHeader('Agent ganglion', a.name, !a.listed ? 'NOT IN ROSTER' : (a.is_writer ? 'WRITER SOCKET' : 'READ-ONLY SOCKET'), a.is_writer ? 'ok' : 'warn', a.color));
-          if (a.model) box.appendChild(makeDiv('metric-sub', 'harness: ' + a.model));
+          var curNow = nowSec();
+          var hBadge = a.health === 'active'
+            ? 'ACTIVE <=5M'
+            : (a.health === 'warm' ? 'IDLE 5-20M' : (a.health === 'error' ? 'TOOL ERROR' : 'SILENT >20M'));
+          var hBadgeCls = a.health === 'active' ? 'ok' : (a.health === 'error' ? 'err' : 'warn');
+          box.appendChild(inspectHeader('Agent ganglion', a.name, hBadge, hBadgeCls, a.color));
+          if (a.model) box.appendChild(makeDiv('metric-sub', 'harness: ' + a.model + ' · ' + (!a.listed ? 'NOT IN ROSTER' : (a.is_writer ? 'WRITER SOCKET' : 'READ-ONLY SOCKET'))));
           var akv = makeDiv('kv-list');
+          var hText = a.health === 'active'
+            ? 'ACTIVE (<=5m) · tool link healthy'
+            : (a.health === 'warm'
+              ? 'IDLE (5-20m) · quiet'
+              : (a.health === 'error'
+                ? 'ERROR · last call refused (' + (a.last_refused_code || 'REFUSED') + ')'
+                : 'SILENT (>20m) · no recent reads/writes (check MCP bridge)'));
+          akv.appendChild(kvRow('Tool health (5m)', hText, healthColor(a.health)));
+          akv.appendChild(kvRow(
+            'Last read',
+            a.last_read_at ? fmtAge(a.last_read_at, curNow) + ' (' + (a.last_read_kind || 'read') + ')' : 'none observed',
+            a.last_read_at && (curNow - a.last_read_at) <= 300 ? '#34d399' : null
+          ));
+          akv.appendChild(kvRow(
+            'Last write',
+            a.last_write_at ? fmtAge(a.last_write_at, curNow) + (a.last_write_d ? ' (' + a.last_write_d + ')' : '') : 'none observed',
+            a.last_write_at && (curNow - a.last_write_at) <= 300 ? '#34d399' : null
+          ));
+          akv.appendChild(kvRow('Activity in last 5m', (a.reads_5m || 0) + ' reads · ' + (a.writes_5m || 0) + ' writes'));
+          if (a.last_refused_at) {
+            akv.appendChild(kvRow('Last refusal', fmtAge(a.last_refused_at, curNow) + ' (' + (a.last_refused_code || 'REFUSED') + ')', '#fca5a5'));
+          }
           akv.appendChild(kvRow('Binding', a.id));
           akv.appendChild(kvRow('Pubkey', a.pubkey ? a.pubkey.slice(0, 22) + '…' : '(keyless)'));
           akv.appendChild(kvRow('Owner', a.is_owner ? 'yes' : 'no'));
@@ -2374,15 +2642,20 @@ export function renderViewerHtml(initialState) {
           ctx.restore();
         });
 
+        var drawNow = nowSec();
         agents.forEach(function (a) {
           var isSel = (hovered && hovered.data === a) || (selected && selected.data === a);
+          var isStale = a.health === 'stale' && !isSel;
+          var hCol = healthColor(a.health);
           if (a.energy > 0 || isSel) glow(a.x, a.y, a.radius * 0.4, a.radius * (2.1 + a.energy * 1.1), a.color + '77');
+          else if (a.health === 'active') glow(a.x, a.y, a.radius * 0.5, a.radius * 1.65, 'rgba(16, 185, 129, 0.26)');
+          ctx.save();
+          if (isStale) ctx.globalAlpha = 0.52;
           ctx.beginPath();
           ctx.arc(a.x, a.y, a.radius, 0, Math.PI * 2);
           ctx.fillStyle = '#0b1325';
           ctx.fill();
-          ctx.save();
-          if (!a.listed) ctx.setLineDash([3, 3]);
+          if (!a.listed || isStale) ctx.setLineDash([4, 3]);
           ctx.strokeStyle = a.color;
           ctx.lineWidth = isSel ? 3 : 2;
           ctx.stroke();
@@ -2394,12 +2667,27 @@ export function renderViewerHtml(initialState) {
             ctx.lineWidth = 2.2;
             ctx.stroke();
           }
+          // Health beacon dot on top-right rim of ganglion
+          var bx = a.x + a.radius * 0.72;
+          var by = a.y - a.radius * 0.72;
+          var br = width < 680 ? 4.2 : 5.2;
+          if (a.health === 'active' || a.health === 'error') {
+            glow(bx, by, 1, br * 2.4, a.health === 'active' ? 'rgba(16, 185, 129, 0.65)' : 'rgba(239, 68, 68, 0.65)');
+          }
+          ctx.beginPath();
+          ctx.arc(bx, by, br, 0, Math.PI * 2);
+          ctx.fillStyle = hCol;
+          ctx.fill();
+          ctx.strokeStyle = '#040711';
+          ctx.lineWidth = 1.6;
+          ctx.stroke();
+
           ctx.textBaseline = 'middle';
           ctx.font = (width < 680 ? '700 9.5px' : '700 10.5px') + ' -apple-system, BlinkMacSystemFont, sans-serif';
-          ctx.fillStyle = '#f8fafc';
+          ctx.fillStyle = isStale ? '#94a3b8' : '#f8fafc';
           ctx.fillText(a.is_owner ? '\\u2605' : a.name.slice(0, 2).toUpperCase(), a.x, a.y);
           ctx.font = (width < 680 ? '600 10.5px' : '600 11.5px') + ' -apple-system, BlinkMacSystemFont, sans-serif';
-          ctx.fillStyle = isSel ? '#ffffff' : '#cbd5e1';
+          ctx.fillStyle = isSel ? '#ffffff' : (isStale ? '#64748b' : '#cbd5e1');
           var labelDist = a.radius + (width < 680 ? 13 : 17);
           var lx = a.x + Math.cos(a.angle) * labelDist;
           var ly = a.y + Math.sin(a.angle) * labelDist;
@@ -2409,6 +2697,16 @@ export function renderViewerHtml(initialState) {
             lx = Math.max(-maxX, Math.min(maxX, lx));
           }
           ctx.fillText(a.name, lx, ly);
+          var subTag = a.health === 'active'
+            ? ('\\u25cf ' + fmtShortAge(a.last_seen_at, drawNow))
+            : (a.health === 'warm'
+              ? ('\\u25d0 ' + fmtShortAge(a.last_seen_at, drawNow))
+              : (a.health === 'error'
+                ? '\\u2715 err'
+                : (a.last_seen_at ? ('\\u25cb ' + fmtShortAge(a.last_seen_at, drawNow)) : '\\u25cb silent')));
+          ctx.font = (width < 680 ? '600 8.5px' : '600 9.5px') + ' ui-monospace, SFMono-Regular, Menlo, monospace';
+          ctx.fillStyle = a.health === 'active' ? '#34d399' : (a.health === 'warm' ? '#fbbf24' : (a.health === 'error' ? '#f87171' : '#64748b'));
+          ctx.fillText(subTag, lx, ly + (width < 680 ? 10.5 : 12));
           ctx.textBaseline = 'alphabetic';
         });
       }
@@ -2597,6 +2895,7 @@ export async function startMemoryViewer({
   const client = createSingleSocketMcpClient(socketPath)
   const sseClients = new Set()
   const eventLog = []
+  const agentTelemetry = new Map()
   let pollSeq = 0
   let stopped = false
 
@@ -2613,6 +2912,7 @@ export async function startMemoryViewer({
     store_state: { state: 'CONNECTING', write_seq: null, current_claims: null, last_backup_age_sec: null, unbacked_writes: null },
     scope_counts: { canon: 0, ops: 0, rooms: 0, self: 0, canon_unverified: 0, unverified_total: 0 },
     coherence: computeCoherence(),
+    agent_health: { active_5m: 0, warm_20m: 0, stale: 0, error: 0, total: 0, window_sec: ACTIVE_WINDOW_SEC },
     query_answer: null,
     records: [],
     agent_roster: [],
@@ -2675,8 +2975,17 @@ export async function startMemoryViewer({
       )
       const historyRecords = [...byEventId.values()]
       const scopeCounts = computeScopeCounts(wake?.counts, records)
-      const agentRoster = (Array.isArray(wake?.agent_roster) ? wake.agent_roster : []).map(sanitizeRosterEntry).filter(Boolean)
+      const rawRoster = (Array.isArray(wake?.agent_roster) ? wake.agent_roster : []).map(sanitizeRosterEntry).filter(Boolean)
       const recentActivity = (Array.isArray(wake?.recent_activity) ? wake.recent_activity : []).map(sanitizeActivity).filter(Boolean)
+      const healthResult = computeAgentHealth({
+        agent_roster: rawRoster,
+        recent_activity: recentActivity,
+        records,
+        history_records: historyRecords,
+        prior_telemetry: agentTelemetry,
+        now_sec: nowSec,
+      })
+      const agentRoster = healthResult.roster
       const storeState = wake?.store_state || firstQuery?.store_state || { state: 'UNKNOWN', write_seq: null, current_claims: null, last_backup_age_sec: null, unbacked_writes: null }
       const coherence = computeCoherence({
         records,
@@ -2702,6 +3011,7 @@ export async function startMemoryViewer({
         store_state: storeState,
         scope_counts: scopeCounts,
         coherence,
+        agent_health: healthResult.summary,
         query_answer: queryAnswer,
         records,
         agent_roster: agentRoster,
