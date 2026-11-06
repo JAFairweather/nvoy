@@ -896,50 +896,51 @@ export class HiveMemoryStore {
     const canonText = ['\n## Rank 2: hive:canon', ...(canon.length ? canon.map(({ row, verdict, body }) =>
       `- ${isConflict(row.d) ? '[CONFLICT] ' : ''}${verdict.staleWarning ? `${verdict.staleWarning} ` : ''}[${row.d}] (by ${row.pubkey.slice(0, 8)}, as_of ${row.as_of_git || row.as_of_evt}): ${body.claim} — Because: ${body.because} [evidence: ${(body.evidence || []).join(', ')}]`)
       : ['(none)'])].join('\n')
-    // Everything else is an index: at most WAKE_INDEX_LIMIT one-line cards, then counts per topic, inside the budget.
+    // Everything else is an index: at most WAKE_INDEX_LIMIT one-line cards, then counts per topic. The budget is UTF-8
+    // bytes of the serialized response with its canon part left out, measured on the result itself, not estimated.
+    const bytes = str => Buffer.byteLength(str)
     const names = this.#writerNames()
     const topics = {}
     for (const { row } of ops) { const t = topicOf(row); topics[t] = (topics[t] || 0) + 1 }
-    // The directory gets at most a quarter of the budget, largest topics first; the rest are counted, not listed.
+    // The directory appears twice (digest line and topic_directory), so each copy gets at most an eighth of the
+    // budget, largest topics first; the rest are counted, not listed.
     const dirParts = []
-    let dirLen = 'topics: '.length + 24
+    let dirBytes = bytes('topics: ') + 24
     for (const [t, n] of Object.entries(topics).sort((a, b) => (b[1] - a[1]) || (a[0] < b[0] ? -1 : 1))) {
-      const part = `${t} ${n}`
-      if (dirLen + part.length + 2 > Math.floor(budget / 4)) break
+      const part = bytes(`${t} ${n}`) + 2
+      if (dirBytes + part > Math.floor(budget / 8)) break
       dirParts.push([t, n])
-      dirLen += part.length + 2
+      dirBytes += part
     }
     const topicDirectory = Object.fromEntries(dirParts)
     const topicsOmitted = Object.keys(topics).length - dirParts.length
     const ageOf = sec => { const m = Math.max(0, Math.floor((nowSec - sec) / 60)); return m < 120 ? `${m}m` : m < 2880 ? `${Math.floor(m / 60)}h` : `${Math.floor(m / 1440)}d` }
     const hint = 'more: memory_query topic=<topic> lists index cards; memory_query d=<fact key> returns one claim in full'
     const dirLine = `topics: ${dirParts.map(([t, n]) => `${t} ${n}`).join(', ') || '(none)'}${topicsOmitted ? `, +${topicsOmitted} more topics` : ''}`
-    const fixed = header.length + 1 + '\n## Rank 3: room & hive:ops (index)'.length + 1 + dirLine.length + 1 + hint.length + 40
-    const lines = ['\n## Rank 3: room & hive:ops (index)']
-    let used = fixed
-    let shown = 0
-    for (const x of ops) {
-      if (shown >= WAKE_INDEX_LIMIT) break
-      const slug = parseFactKey(x.row.d)?.slug || x.row.d
-      const line = `- ${isConflict(x.row.d) ? '[CONFLICT] ' : ''}[${slug}] ${topicOf(x.row)}, by ${names.get(x.row.pubkey) || x.row.pubkey.slice(0, 12)}, ${ageOf(x.row.created_at)}: ${preview(x.body.claim, 100)}`
-      if (used + line.length + 1 > budget) break
-      lines.push(line)
-      used += line.length + 1
-      shown++
+    const cards = ops.slice(0, WAKE_INDEX_LIMIT).map(x =>
+      `- ${isConflict(x.row.d) ? '[CONFLICT] ' : ''}[${parseFactKey(x.row.d)?.slug || x.row.d}] ${topicOf(x.row)}, by ${names.get(x.row.pubkey) || x.row.pubkey.slice(0, 12)}, ${ageOf(x.row.created_at)}: ${preview(x.body.claim, 100)}`)
+    const ref = ({ row }) => ({ authority: null, trustedInstruction: false, event_id: row.id, scope: row.scope, author_pubkey: row.pubkey })
+    const build = shown => {
+      const lines = ['\n## Rank 3: room & hive:ops (index)', ...cards.slice(0, shown)]
+      if (!ops.length) lines.push('(none)')
+      if (ops.length > shown) lines.push(`+${ops.length - shown} more`)
+      lines.push(dirLine, hint)
+      const opsText = lines.join('\n')
+      const out = {
+        ...base,
+        digest: [header, canonText, opsText].join('\n'),
+        counts: { canon_shown: canon.length, canon_omitted: 0, ops_shown: shown, ops_omitted: ops.length - shown, consolidated_hidden: consolidatedHidden, topics_omitted: topicsOmitted },
+        topic_directory: topicDirectory,
+        records: [...canon, ...ops.slice(0, shown)].map(ref),
+      }
+      const nonCanonBytes = bytes(JSON.stringify({ ...out, digest: [header, opsText].join('\n'), records: ops.slice(0, shown).map(ref) }))
+      return { ...out, char_length: out.digest.length, byte_length: bytes(out.digest), canon_byte_length: bytes(canonText), non_canon_bytes: nonCanonBytes }
     }
-    if (!ops.length) lines.push('(none)')
-    if (ops.length > shown) lines.push(`+${ops.length - shown} more`)
-    lines.push(dirLine, hint)
-    const digest = [header, canonText, lines.join('\n')].join('\n')
-    return {
-      ...base,
-      digest,
-      char_length: digest.length,
-      canon_char_length: canonText.length,
-      counts: { canon_shown: canon.length, canon_omitted: 0, ops_shown: shown, ops_omitted: ops.length - shown, consolidated_hidden: consolidatedHidden, topics_omitted: topicsOmitted },
-      topic_directory: topicDirectory,
-      records: [...canon, ...ops.slice(0, shown)].map(({ row }) => ({ authority: null, trustedInstruction: false, event_id: row.id, d: row.d, scope: row.scope, author_pubkey: row.pubkey })),
-    }
+    // The four length fields add under 100 bytes of their own; leave room for them.
+    let shown = cards.length
+    let out = build(shown)
+    while (out.non_canon_bytes + 100 > budget && shown > 0) out = build(--shown)
+    return out
   }
 }
 

@@ -417,7 +417,7 @@ export const MAX_LINK_HOPS = 3
 export const MEMORY_TOOL_SPECS = Object.freeze([
   {
     name: 'memory_wake',
-    description: 'Read the bounded Hive Wake Digest from the private hive-memory store. All returned records carry authority: null and trustedInstruction: false.',
+    description: 'Read the bounded Hive Wake Digest from the private hive-memory store: every hive:canon claim in full, then at most 8 one-line index cards and a topic directory, held to max_chars UTF-8 bytes (default 4000) apart from canon. All returned records carry authority: null and trustedInstruction: false.',
     inputSchema: {
       type: 'object',
       properties: {

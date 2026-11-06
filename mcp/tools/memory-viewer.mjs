@@ -1983,7 +1983,8 @@ export async function startMemoryViewer({
         const clean = sanitizeMemoryRecord(r)
         if (clean) byKey.set(`${clean.author_pubkey}:${clean.d}`, clean)
       }
-      for (const r of Array.isArray(wake?.records) ? wake.records : []) {
+      // Since Phase 2 wake records are bare references (no claim); only full records are shown.
+      for (const r of Array.isArray(wake?.records) ? wake.records.filter(x => typeof x?.claim === 'string') : []) {
         const clean = sanitizeMemoryRecord(r)
         if (clean && !byKey.has(`${clean.author_pubkey}:${clean.d}`)) {
           byKey.set(`${clean.author_pubkey}:${clean.d}`, clean)

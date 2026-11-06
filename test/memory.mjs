@@ -525,13 +525,13 @@ for (const [label, mutate, state] of [
   const wake = s.wake({ readerPubkey: james.pk, nowSec: T0 + 300 })
   ok('the wake digest shows every canon claim, the oldest included, and fills the rest with ops within budget',
     wake.counts.canon_shown === 5 && wake.counts.canon_omitted === 0 && wake.digest.includes('canon-1]') &&
-    wake.counts.ops_shown > 0 && wake.counts.ops_omitted > 0 && wake.char_length - wake.canon_char_length <= wake.max_chars)
-  const tight = s.wake({ readerPubkey: james.pk, maxChars: 1000, nowSec: T0 + 300 })
+    wake.counts.ops_shown > 0 && wake.counts.ops_omitted > 0 && wake.non_canon_bytes <= wake.max_chars)
+  const tight = s.wake({ readerPubkey: james.pk, maxChars: 2000, nowSec: T0 + 300 })
   ok('the wake indexes at most 8 room and ops claims and lists every topic with its count',
     wake.counts.ops_shown <= 8 && wake.topic_directory['ops-0'] === 1 && Object.keys(wake.topic_directory).length === 40 &&
     wake.digest.includes('topics: ') && wake.records.every(r => r.claim === undefined && r.authority === null))
   ok('a tight budget keeps all canon, still shows ops, and holds the rest within it',
-    tight.char_length - tight.canon_char_length <= 1000 && tight.counts.canon_shown === 5 && tight.counts.ops_shown >= 1 && tight.digest.includes('Rank 3'))
+    tight.non_canon_bytes <= 2000 && tight.counts.canon_shown === 5 && tight.counts.ops_shown >= 1 && tight.digest.includes('Rank 3'))
   s.close()
 }
 
@@ -547,9 +547,25 @@ for (const [label, mutate, state] of [
   const wake = s.wake({ readerPubkey: james.pk, nowSec: T0 + 9000 })
   const listed = Object.keys(wake.topic_directory).length
   ok(`wake: ${accepted} distinct topics stay inside the budget; the directory lists some and counts the rest`,
-    accepted > 60 && wake.counts.ops_shown + wake.counts.ops_omitted === accepted && wake.char_length - wake.canon_char_length <= wake.max_chars &&
+    accepted > 60 && wake.counts.ops_shown + wake.counts.ops_omitted === accepted && wake.non_canon_bytes <= wake.max_chars &&
     listed > 0 && wake.counts.topics_omitted > 0 && listed + wake.counts.topics_omitted === accepted && wake.digest.includes(`+${wake.counts.topics_omitted} more topics`) &&
     JSON.stringify(wake.topic_directory).length < wake.max_chars / 4)
+  s.close()
+}
+
+// The budget is bytes, not UTF-16 units: multibyte claims and topics must not push the response past it.
+{
+  const p = setup('wake-utf8')
+  const s = open(p)
+  for (let i = 0; i < 12; i++) {
+    s.submit({ writer: 'ops', event: claim(opsBot, 'hive:ops', `wide-${i}`, { claim: `${'記憶🐝'.repeat(60)} ${i}` }), expectedPriorId: null, nowSec: T0 + 200 })
+  }
+  const wake = s.wake({ readerPubkey: james.pk, nowSec: T0 + 300 })
+  const nonCanon = Buffer.byteLength(JSON.stringify({ ...wake, records: wake.records }))
+  ok('wake: multibyte claims are budgeted in UTF-8 bytes; the serialized response stays within max_chars',
+    wake.counts.ops_shown > 0 && wake.byte_length > wake.char_length && wake.non_canon_bytes <= wake.max_chars && nonCanon <= wake.max_chars)
+  const tight = s.wake({ readerPubkey: james.pk, maxChars: 1500, nowSec: T0 + 300 })
+  ok('wake: a tight byte budget drops cards rather than overrun', Buffer.byteLength(JSON.stringify(tight)) <= 1500 && tight.counts.ops_omitted > 0)
   s.close()
 }
 
@@ -1282,7 +1298,7 @@ os.execv(sys.argv[3], [sys.argv[3], sys.argv[4], "--db", sys.argv[5], "--ledger"
   ok('5,000 claims: a topic query with history returns every version on that topic', topicQ.total_matched === 100)
   ok('5,000 claims: supersedes_of follows at most 3 hops', chain.total_matched === 3)
   ok('5,000 claims: a keyless reader sees only the 625 hive:ops heads', kiosk.total_matched === 625)
-  ok('5,000 claims: wake stays within its character budget', wake.char_length - wake.canon_char_length <= wake.max_chars && wake.counts.ops_omitted > 0)
+  ok('5,000 claims: wake stays within its character budget', wake.non_canon_bytes <= wake.max_chars && wake.counts.ops_omitted > 0)
   ok('5,000 claims: every query and the wake finish within 1.5 s', Math.max(worst, tTopic, tChain, tKiosk, tWake) < 1500)
   s.close()
 }
