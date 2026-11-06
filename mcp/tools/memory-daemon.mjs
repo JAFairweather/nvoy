@@ -212,6 +212,9 @@ export function handleSocketJsonRpc({ store, binding, message, nowSec, activity 
       gitBanner: typeof args.git_banner === 'string' ? args.git_banner.slice(0, 500) : null,
       staleFiles,
       nowSec,
+      // Budget the text this reply sends, reader fields included. The viewer's activity telemetry is added after; it
+      // goes only to the viewer binding (a UI, not an agent's context) and is capped by ACTIVITY_MAX on its own.
+      frame: o => mcpToolResult({ ...who, ...o }).content[0].text,
     })
     note({ kind: 'wake', count: Array.isArray(out.records) ? out.records.length : 0, refs: recordRefs(out.records) })
     const telemetry = activity && isViewer(binding) ? { recent_activity: viewerActivity(activity, store.config), agent_roster: agentRoster(store, nowSec) } : {}

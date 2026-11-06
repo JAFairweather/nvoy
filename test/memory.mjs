@@ -577,6 +577,33 @@ for (const [label, mutate, state] of [
   s.close()
 }
 
+// The budget covers the text the daemon actually sends (reader fields, pretty-printing), not just the store's object.
+{
+  const p = setup('wake-daemon-bytes')
+  const sockDir = join(p.dir, 's')
+  const daemon = await startMemoryDaemon({
+    dbPath: p.db, ledgerPath: p.ledger, receiptPath: p.receipt, config: rawConfig(), socketDir: sockDir,
+    readers: 'biggy', writers: 'ops', now: () => T0 + 300, log: () => {},
+  })
+  for (let i = 0; i < 30; i++) {
+    await callTool(join(sockDir, 'writers', 'ops.sock'), 'memory_submit', {
+      event: claim(opsBot, 'hive:ops', `sent-${i}`, { topic: `floor-budget-topic-number-${i}`, claim: `${'記憶🐝'.repeat(40)} ${i}` }), expected_prior_id: null })
+  }
+  const text = async args => {
+    const r = await rpcCall(join(sockDir, 'biggy.sock'), { jsonrpc: '2.0', id: ++rid, method: 'tools/call', params: { name: 'memory_wake', arguments: args } })
+    return r.result.content[0].text
+  }
+  const sizes = []
+  for (const args of [{}, { max_chars: MIN_WAKE_MAX_CHARS }, { max_chars: MIN_WAKE_MAX_CHARS, git_banner: '⚠'.repeat(500) }, { max_chars: 2500, git_banner: 'checkout is 3 commits behind origin/main' }]) {
+    const t = await text(args)
+    const w = JSON.parse(t)
+    sizes.push([Buffer.byteLength(t), w.max_chars, w.non_canon_bytes, w.counts.ops_shown])
+  }
+  ok(`wake over the daemon: the sent text, reader fields included, stays within max_chars (${sizes.map(x => `${x[0]}/${x[1]}`).join(', ')})`,
+    sizes.every(([sent, max, measured]) => sent <= max && sent <= measured && measured - sent <= 1) && sizes[0][3] > 0 && sizes[2][3] === 0)
+  await daemon.close()
+}
+
 // Phase 2 Gates 6-8: index vs full, the 24 h workflow tier, peer supersession of workflow checkpoints, topic normalizing.
 {
   const raw = (signer, scope, slug, edit, opts = {}) => {

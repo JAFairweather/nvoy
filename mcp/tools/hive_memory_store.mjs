@@ -862,7 +862,9 @@ export class HiveMemoryStore {
     }
   }
 
-  wake({ readerPubkey = '', roomId = null, maxChars = DEFAULT_WAKE_MAX_CHARS, gitBanner = null, staleFiles = new Set(), nowSec = nowSecDefault() } = {}) {
+  // `frame` turns the wake into the text the caller actually returns (the daemon adds its reader fields and pretty-prints);
+  // the budget is measured on that text, canon left out.
+  wake({ readerPubkey = '', roomId = null, maxChars = DEFAULT_WAKE_MAX_CHARS, gitBanner = null, staleFiles = new Set(), nowSec = nowSecDefault(), frame = o => JSON.stringify(o, null, 2) } = {}) {
     const budget = Number.isSafeInteger(maxChars) && maxChars >= MIN_WAKE_MAX_CHARS ? maxChars : DEFAULT_WAKE_MAX_CHARS
     const storeState = this.storeState(readerPubkey, nowSec)
     const title = '=== HIVE WAKE DIGEST (authority: null, trustedInstruction: false) ==='
@@ -938,18 +940,20 @@ export class HiveMemoryStore {
         topic_directory: Object.fromEntries(dir),
         records: [...canon, ...ops.slice(0, shown)].map(ref),
       }
-      const nonCanonBytes = bytes(JSON.stringify({ ...out, digest: [header, opsText].join('\n'), records: ops.slice(0, shown).map(ref) }))
-      return { ...out, char_length: out.digest.length, byte_length: bytes(out.digest), canon_byte_length: bytes(canonText), non_canon_bytes: nonCanonBytes }
+      const lengths = { char_length: out.digest.length, byte_length: bytes(out.digest), canon_byte_length: bytes(canonText) }
+      // Only canon claims and their record refs are left out; the canon heading counts. non_canon_bytes is measured with a
+      // five-digit stand-in for itself; max_chars is at most 24000, so it never grows.
+      const nonCanonBytes = bytes(frame({ ...out, digest: [header, canon.length ? '\n## Rank 2: hive:canon' : canonText, opsText].join('\n'), records: ops.slice(0, shown).map(ref), ...lengths, non_canon_bytes: 99999 }))
+      return { ...out, ...lengths, non_canon_bytes: nonCanonBytes }
     }
-    // The length fields add under 100 bytes of their own; leave room for them.
-    const fits = o => o.non_canon_bytes + 100 <= budget
+    const fits = o => o.non_canon_bytes <= budget
     let shown = cards.length
     let drop = 0
     let out = build(shown)
     while (!fits(out) && shown > 0) out = build(--shown)
     while (!fits(out) && drop < 3) out = build(0, ++drop)
     // MIN_WAKE_MAX_CHARS is chosen so this cannot happen; if it does, say so rather than return an over-budget digest silently.
-    if (!fits(out)) return { ...out, budget_exceeded: true, code: 'HIVE_MEMORY_WAKE_OVER_BUDGET', message: `wake needs ${out.non_canon_bytes + 100} bytes with every optional part dropped; max_chars is ${budget}` }
+    if (!fits(out)) return { ...out, budget_exceeded: true, code: 'HIVE_MEMORY_WAKE_OVER_BUDGET', message: `wake needs ${out.non_canon_bytes} bytes with every optional part dropped; max_chars is ${budget}` }
     return out
   }
 }
