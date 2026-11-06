@@ -107,6 +107,10 @@ ok('memory_claim reuses the memory.mjs schema, adds room, needs no scope, and sa
   /kind 30078/.test(claimSpec.description) && /never to a relay/.test(claimSpec.description) && claimSpec.description.includes(ROOM))
 ok('memory_withdraw takes a room, a slug and a reason', withdrawSpec.name === 'memory_withdraw' && withdrawSpec.inputSchema.required.join() === 'slug,because' &&
   /Refused: this identity may not write memory/.test(memoryToolSpec(plain, 'withdraw').description))
+ok('the claim tool and its ttl_sec field tell the agent the two retention classes: 0 for a durable decision, 1..2592000 for an expiring status',
+  /0 for a Class B durable decision/.test(claimSpec.description) && /1\.\.2592000/.test(claimSpec.description) &&
+  /0: Class B durable decision/.test(claimSpec.inputSchema.properties.ttl_sec.description) && claimSpec.inputSchema.properties.ttl_sec.minimum === 0 &&
+  claimSpec.inputSchema.properties.ttl_sec.maximum === MAX_TTL_SEC && !!claimSpec.inputSchema.properties.topic.description)
 ok('the Codex harness pre-approves both memory tools', CODEX_CHANNEL_TOOLS.includes('memory_claim') && CODEX_CHANNEL_TOOLS.includes('memory_withdraw'))
 
 // --- 3. the keyless tool's refusals ---
@@ -122,6 +126,8 @@ ok('missing evidence is refused', /evidence is required/.test(queueMemory(rememb
 ok('a claim with no as_of anchor is refused by the memory builder', /as_of_git or as_of_evt/.test(queueMemory(rememberer, 'claim', { ...claimArgs, as_of_git: undefined }).error?.message || ''))
 ok('a ttl past 30 days is refused', queueMemory(rememberer, 'claim', { ...claimArgs, ttl_sec: MAX_TTL_SEC + 1 }).error?.code === 'NVOY_BAD_MEMORY')
 ok('a field the tool does not take is refused', /kind is not a memory_claim field/.test(queueMemory(rememberer, 'claim', { ...claimArgs, kind: 30079 }).error?.message || ''))
+const decision = queueMemory(rememberer, 'claim', { ...claimArgs, ttl_sec: 0 })
+ok('ttl_sec 0 passes the tool\'s field check (it fails only later, on the unprovisioned spool)', decision.error?.code === 'NVOY_MEMORY_QUEUE_FAILED')
 
 // --- 4. end to end: spool → broker → signed kind 30078 in the private store ---
 const credential = join(root, 'agent.key'); writeFileSync(credential, Buffer.from(agentSk).toString('hex'), { mode: 0o600 })

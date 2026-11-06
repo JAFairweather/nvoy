@@ -38,12 +38,17 @@ export function memoryToolSpec(manifest, op) {
   const limits = m ? ` Rooms: ${m.rooms.join(', ')} (default ${m.rooms[0]}). At most ${m.perHour} memory writes an hour.`
     : ` Refused: ${MEMORY_NOT_PERMITTED}.`
   const what = op === 'claim'
-    ? 'Record a room memory claim under your own key. Record a decision, a fact others would otherwise rediscover, a project status change, or who owns what next.' +
-      ' One fact per claim; topic is the project name. Cite evidence (commit, PR, message id) and an as_of_git or as_of_evt anchor.' +
-      ' Check memory_query first to avoid duplicates. When a claim becomes wrong, withdraw it, or supersede it with a new claim at the same slug.' +
-      ' Do not record narration, guesses, chat, anything personal, or what is already in git or docs: cite that as evidence instead.' +
-      ' A claim expires after ttl_sec (default 14 days, at most 30).'
-    : 'Withdraw your room memory claim at one slug when it is wrong or finished. The broker submits a replacement marked withdrawn, with a later created_at.'
+    ? 'Record a signed room memory claim in the private Hive memory store under your own key.' +
+      ' What counts: (1) a reviewed decision with who made it and why, (2) a non-obvious fact or gotcha another agent would otherwise rediscover,' +
+      ' (3) a project status change (started, blocked, shipped, dropped), or (4) who owns what next.' +
+      ' One fact per claim at a stable slug; set topic to the project slug (e.g. nvoy, herd-infra, hive-memory, buzz, r1).' +
+      ' Cite concrete evidence (commit, PR, file path, message id) and an as_of_git (<repo>@<sha>) or as_of_evt (<64-hex>) anchor.' +
+      ' Retention (ttl_sec): 1..2592000 (default 1209600, 14 days; at most 30 days) for a Class A status or handoff claim that expires;' +
+      ' 0 for a Class B durable decision or standing project fact that stays active until withdrawn or superseded.' +
+      ' Check memory_query first to avoid duplicates. When a fact changes, supersede it at the same slug (supersedes: [<prior event id>]); when it stops being true, call memory_withdraw.' +
+      ' Never record chatter, narration, guesses, personal details, secrets, or prose already in git or docs: cite those in evidence instead.'
+    : 'Withdraw your room memory claim at one slug as soon as it stops being true, is resolved, or was wrong.' +
+      ' The broker looks up your current claim at the fact key and submits a replacement marked withdrawn, with a strictly later created_at.'
   return {
     name: TOOLS[op],
     description: `${what} The broker checks the manifest's may_remember block, signs a kind ${REMEMBER_KIND} and submits it to the private Hive memory store, never to a relay. Only room:<uuid> scopes; hive:ops, hive:canon and self are refused.${limits}`,
