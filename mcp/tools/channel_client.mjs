@@ -81,7 +81,14 @@ export function sshChannelEntry({ identity, knownHosts, target }) {
 // A portable harness's whole configuration. It names paths, never values, and it can hold nothing
 // that signs: like a remote-broker manifest, a field that could carry a Nostr key or Bunker
 // credential refuses the file rather than being ignored.
-const CLIENT_FIELDS = new Set(['instance', 'ssh_target', 'identity_file', 'known_hosts_file', 'credential_file', 'home', 'model', 'pubkey', 'channels'])
+const CLIENT_FIELDS = new Set(['instance', 'ssh_target', 'identity_file', 'known_hosts_file', 'credential_file', 'home', 'model', 'pubkey', 'channels', 'remember'])
+// `remember` says the fleet manifest grants this instance memory, so its instructions carry the memory
+// rule. It only adds instructions; the fleet broker alone decides whether a memory write is allowed.
+export function rememberFlag(value) {
+  if (value !== undefined && typeof value !== 'boolean') throw new Error('client config remember must be true or false')
+  return value === true
+}
+
 export function readClientConfig(path, id) {
   const file = fixedPath(path, 'client config', 64 * 1024)
   if ((file.stat.mode & 0o022) !== 0) throw new Error('client config must not be group/world writable')
@@ -108,7 +115,7 @@ export function readClientConfig(path, id) {
   const channels = raw.channels === undefined ? [] : raw.channels
   if (!Array.isArray(channels) || !channels.every(c => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(c))) throw new Error('client config channels must be Buzz channel ids')
   return Object.freeze({
-    id: instanceId(id), target, home: resolve(home), model, pubkey, channels,
+    id: instanceId(id), target, home: resolve(home), model, pubkey, channels, remember: rememberFlag(raw.remember),
     identity: privateFile(String(raw.identity_file || ''), 'SSH identity file'),
     knownHosts: knownHostsFile(String(raw.known_hosts_file || '')),
     credentialFile: privateFile(String(raw.credential_file || ''), 'Claude login credential file'),

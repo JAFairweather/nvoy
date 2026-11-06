@@ -7,7 +7,7 @@ import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, writeFi
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { resolve } from 'node:path'
-import { codexConfigToml, codexTurnText, defaultInstructions, pendingEnvelopes } from './harness_session.mjs'
+import { codexConfigToml, codexTurnText, ensureInstructions, pendingEnvelopes } from './harness_session.mjs'
 import { codexThreadId } from './codex_app_server.mjs'
 
 const sleep = ms => new Promise(done => setTimeout(done, ms))
@@ -104,7 +104,7 @@ export async function runCodexHarness({ manifest, root, home, credential, log, s
   const writePrivate = (path, value) => { writeFileSync(path, value, { mode: 0o600 }); chmodSync(path, 0o600) }
   for (const dir of [codexHome, workdir, privateDir]) mkdirSync(dir, { recursive: true, mode: 0o700 })
   writePrivate(resolve(codexHome, 'config.toml'), codexConfigToml({ manifest, root, model: manifest.harness.model }))
-  if (!existsSync(resolve(workdir, 'AGENTS.md'))) writePrivate(resolve(workdir, 'AGENTS.md'), defaultInstructions(manifest))
+  ensureInstructions(resolve(workdir, 'AGENTS.md'), manifest, writePrivate)
 
   const queueText = () => { try { return readFileSync(queuePath, 'utf8') } catch { return '' } }
   const delivered = () => existsSync(deliveredPath)
