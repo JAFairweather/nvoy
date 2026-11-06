@@ -103,7 +103,7 @@ function viewerActivity(activity, config) {
   return activity.events.map(({ refs, filter, ...e }) => {
     const shown = refs.filter(readable)
     const target = filter ? null : shown[0] || null
-    const filterOk = Boolean(filter) && (!filter.scope || scopeShown(filter.scope))
+    const filterOk = Boolean(filter?.scope) && scopeShown(filter.scope)
     return {
       ...e,
       event_ids: shown.map(r => r.id).filter(Boolean).slice(0, ACTIVITY_IDS_MAX),

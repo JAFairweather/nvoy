@@ -367,6 +367,7 @@ await test('daemon activity ring: only the viewer wake carries it, metadata only
     assert.equal(JSON.stringify(ringed), JSON.stringify(plain))
     assert(!('recent_activity' in payload(ringed)) && !('agent_roster' in payload(ringed)))
     call(biggy, 'memory_query', { topic: 'governance', text: 'SECRET-CLAIM-TEXT' })
+    call(biggy, 'memory_query', { scope: 'hive:canon', topic: 'governance' })
     call(biggy, 'memory_submit', { event: canon, expected_prior_id: null })
 
     const seqBefore = activity.seq
@@ -374,15 +375,16 @@ await test('daemon activity ring: only the viewer wake carries it, metadata only
     assert.equal(activity.seq, seqBefore, 'the viewer records none of its own calls')
     assert.equal(wake.authority, null)
     const seen = wake.recent_activity
-    assert.deepEqual(seen.map(a => a.kind), ['submit', 'submit', 'wake', 'query', 'refused'])
+    assert.deepEqual(seen.map(a => a.kind), ['submit', 'submit', 'wake', 'query', 'query', 'refused'])
     for (const a of seen) {
       assert.deepEqual(Object.keys(a), ['seq', 'at', 'kind', 'actor', 'count', 'accepted', 'code', 'event_ids', 'd', 'topic', 'scope'])
     }
     assert(!/SECRET/.test(JSON.stringify(seen)), 'no claim, because, evidence or query text in the ring')
     assert.deepEqual([seen[0].actor, seen[0].d, seen[0].event_ids], ['owner', 'hive-memory:hive:canon:review-policy', [canon.id]])
     assert.deepEqual([seen[1].actor, seen[1].d, seen[1].scope, seen[1].event_ids], ['neil', null, null, []], 'room key stays outside the keyless viewer ACL')
-    assert.deepEqual([seen[3].topic, seen[3].count], ['governance', 1])
-    assert.deepEqual([seen[4].accepted, seen[4].code], [false, 'HIVE_MEMORY_READ_ONLY_SOCKET'])
+    assert.deepEqual([seen[3].topic, seen[3].scope], [null, null], 'an unscoped query may reach rooms, so its topic stays hidden')
+    assert.deepEqual([seen[4].topic, seen[4].scope, seen[4].count], ['governance', 'hive:canon', 1])
+    assert.deepEqual([seen[5].accepted, seen[5].code], [false, 'HIVE_MEMORY_READ_ONLY_SOCKET'])
 
     const roster = Object.fromEntries(wake.agent_roster.map(a => [a.id, a]))
     assert.deepEqual(Object.keys(roster).sort(), ['biggy', 'neil', 'owner'])
