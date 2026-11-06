@@ -460,12 +460,14 @@ export function renderViewerHtml(initialState) {
       line-height: 1.45;
       -webkit-text-size-adjust: 100%;
     }
-    body[data-view="graph"] { height: 100vh; overflow: hidden; }
+    body[data-view="graph"] { height: 100vh; height: 100dvh; overflow: hidden; overscroll-behavior: none; }
     body[data-view="graph"] .cards-only { display: none; }
     body[data-view="cards"] .graph-only { display: none; }
-    body[data-view="cards"] { padding: 12px; }
+    body[data-view="cards"] {
+      padding: calc(12px + env(safe-area-inset-top, 0px)) calc(12px + env(safe-area-inset-right, 0px)) calc(76px + env(safe-area-inset-bottom, 0px)) calc(12px + env(safe-area-inset-left, 0px));
+    }
     #stage-wrap { position: fixed; inset: 0; }
-    canvas#cortex { width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; }
+    canvas#cortex { width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
     .panel {
       background: var(--panel);
       -webkit-backdrop-filter: blur(14px);
@@ -482,7 +484,13 @@ export function renderViewerHtml(initialState) {
       flex-wrap: wrap;
       z-index: 20;
     }
-    body[data-view="graph"] .hud-top { position: fixed; top: 12px; left: 12px; right: 12px; pointer-events: none; }
+    body[data-view="graph"] .hud-top {
+      position: fixed;
+      top: calc(10px + env(safe-area-inset-top, 0px));
+      left: calc(10px + env(safe-area-inset-left, 0px));
+      right: calc(10px + env(safe-area-inset-right, 0px));
+      pointer-events: none;
+    }
     body[data-view="cards"] .hud-top { max-width: 760px; margin: 0 auto 12px; flex-direction: column; align-items: stretch; }
     .hud-top > * { pointer-events: auto; }
     .brand-card { padding: 10px 14px; display: flex; gap: 12px; align-items: flex-start; max-width: 100%; }
@@ -495,7 +503,7 @@ export function renderViewerHtml(initialState) {
       background: radial-gradient(circle at 35% 35%, #7dd3fc, #6366f1 55%, #1e1b4b 100%);
       box-shadow: 0 0 18px rgba(56, 189, 248, 0.55);
     }
-    .brand-text { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+    .brand-text { display: flex; flex-direction: column; gap: 6px; min-width: 0; flex: 1; }
     h1 { margin: 0; font-size: 16px; font-weight: 700; letter-spacing: -0.01em; }
     .badges { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
     .quarantine-banner {
@@ -506,6 +514,22 @@ export function renderViewerHtml(initialState) {
       background: rgba(0, 0, 0, 0.3);
       border: 1px solid var(--border);
       color: var(--muted);
+    }
+    .mobile-kpi-strip {
+      display: none;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: #cbd5e1;
+      gap: 6px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .mobile-kpi-pill {
+      padding: 2px 7px;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      white-space: nowrap;
     }
     .badge {
       display: inline-flex;
@@ -554,20 +578,33 @@ export function renderViewerHtml(initialState) {
       margin-bottom: 8px;
       display: flex;
       justify-content: space-between;
+      align-items: center;
       gap: 8px;
     }
+    .sheet-close {
+      display: none;
+      font-size: 12px;
+      line-height: 1;
+      padding: 4px 8px;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid var(--border);
+      color: var(--text);
+      cursor: pointer;
+    }
     .mini { font-family: var(--mono); font-size: 10px; color: #7dd3fc; text-transform: none; letter-spacing: 0; }
-    .agent-list { display: flex; flex-direction: column; gap: 4px; max-height: 22vh; overflow-y: auto; }
+    .agent-list { display: flex; flex-direction: column; gap: 4px; max-height: 22vh; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
     .agent-row {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 8px;
-      padding: 5px 8px;
+      padding: 6px 8px;
       border-radius: 8px;
       background: rgba(255, 255, 255, 0.025);
       border: 1px solid transparent;
       cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
     }
     .agent-row:hover, .agent-row.active { background: rgba(56, 189, 248, 0.1); border-color: var(--border-bright); }
     .agent-ident { display: flex; align-items: center; gap: 8px; min-width: 0; }
@@ -583,7 +620,7 @@ export function renderViewerHtml(initialState) {
     .shape.fresh { background: var(--fresh); border-radius: 50%; box-shadow: 0 0 8px var(--fresh); }
     .shape.aging { background: var(--aging); border-radius: 50%; box-shadow: 0 0 8px var(--aging); }
     .feed-box { flex: 1; display: flex; flex-direction: column; }
-    .stream-list { font-family: var(--mono); font-size: 10.5px; display: flex; flex-direction: column; gap: 4px; overflow-y: auto; min-height: 0; }
+    .stream-list { font-family: var(--mono); font-size: 10.5px; display: flex; flex-direction: column; gap: 4px; overflow-y: auto; min-height: 0; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
     .stream-item {
       padding: 4px 7px;
       border-radius: 6px;
@@ -596,8 +633,10 @@ export function renderViewerHtml(initialState) {
     .stream-item.lookup { border-left-color: #a78bfa; }
     .stream-item.refuse { border-left-color: #f87171; }
     .stream-item.sim { border-left-style: dashed; border-left-color: #fbbf24; color: #fde68a; }
-    .inspector { flex: 0 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 9px; }
+    .inspector { flex: 0 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 9px; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
     .inspect-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; border-bottom: 1px solid var(--border); padding-bottom: 7px; }
+    .inspect-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+    .inspect-close { padding: 3px 8px; font-size: 12px; line-height: 1.2; border-radius: 6px; }
     .inspect-kicker { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
     .inspect-title { font-family: var(--mono); font-size: 13px; font-weight: 700; color: #93c5fd; word-break: break-word; }
     .kv-list { display: flex; flex-direction: column; font-family: var(--mono); font-size: 11px; }
@@ -608,9 +647,9 @@ export function renderViewerHtml(initialState) {
     .ttl-bar-fill { height: 100%; border-radius: 999px; }
     .hud-bottom {
       position: fixed;
-      bottom: 12px;
-      left: 12px;
-      right: 12px;
+      bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+      left: calc(12px + env(safe-area-inset-left, 0px));
+      right: calc(12px + env(safe-area-inset-right, 0px));
       display: flex;
       justify-content: space-between;
       gap: 10px;
@@ -632,11 +671,72 @@ export function renderViewerHtml(initialState) {
       border-radius: 8px;
       padding: 6px 10px;
       cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
     }
-    button.btn:hover { background: rgba(56, 189, 248, 0.16); border-color: var(--border-bright); }
+    button.btn:hover, button.btn.active { background: rgba(56, 189, 248, 0.16); border-color: var(--border-bright); }
     button.btn.sim { border-style: dashed; border-color: rgba(251, 191, 36, 0.55); color: #fde68a; }
     input[type="range"] { accent-color: #38bdf8; width: 140px; }
     #time-label { min-width: 96px; color: #7dd3fc; font-weight: 700; }
+    .zoom-fab {
+      display: none;
+      position: fixed;
+      right: calc(12px + env(safe-area-inset-right, 0px));
+      bottom: calc(68px + env(safe-area-inset-bottom, 0px));
+      z-index: 18;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .zoom-fab button.btn {
+      width: 38px;
+      height: 38px;
+      padding: 0;
+      display: grid;
+      place-items: center;
+      font-family: var(--mono);
+      font-size: 16px;
+      font-weight: 700;
+      border-radius: 10px;
+      background: var(--panel);
+      -webkit-backdrop-filter: blur(12px);
+      backdrop-filter: blur(12px);
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+    }
+    .mobile-dock {
+      display: none;
+      position: fixed;
+      left: calc(10px + env(safe-area-inset-left, 0px));
+      right: calc(10px + env(safe-area-inset-right, 0px));
+      bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+      z-index: 25;
+      padding: 5px;
+      gap: 4px;
+      justify-content: space-between;
+      align-items: center;
+      border-radius: 14px;
+    }
+    .mobile-dock button.dock-btn {
+      flex: 1 1 0;
+      min-width: 0;
+      min-height: 38px;
+      padding: 6px 4px;
+      font-family: var(--sans);
+      font-size: 11.5px;
+      font-weight: 600;
+      color: var(--muted);
+      background: transparent;
+      border: 1px solid transparent;
+      border-radius: 10px;
+      cursor: pointer;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .mobile-dock button.dock-btn.active {
+      color: #f8fafc;
+      background: rgba(56, 189, 248, 0.16);
+      border-color: var(--border-bright);
+    }
     .wrap { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }
     .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
     @media (min-width: 560px) {
@@ -681,25 +781,74 @@ export function renderViewerHtml(initialState) {
       border: 1px dashed var(--border);
       border-radius: 8px;
     }
-    .log-list { font-family: var(--mono); font-size: 11px; display: flex; flex-direction: column; gap: 5px; max-height: 240px; overflow-y: auto; }
+    .log-list { font-family: var(--mono); font-size: 11px; display: flex; flex-direction: column; gap: 5px; max-height: 240px; overflow-y: auto; -webkit-overflow-scrolling: touch; }
     .log-row { padding: 5px 8px; border-radius: 6px; background: var(--panel-alt); border: 1px solid var(--border); word-break: break-word; }
     .log-time { color: var(--muted); margin-right: 6px; }
     @media (max-width: 1024px) {
-      .hud-left { display: none; }
-      .hud-right { width: 290px; }
+      .mobile-dock { display: flex; }
+      body[data-view="graph"] .zoom-fab { display: flex; }
+      .sheet-close { display: inline-flex; }
+      .hud-left {
+        top: auto;
+        left: calc(10px + env(safe-area-inset-left, 0px));
+        right: calc(10px + env(safe-area-inset-right, 0px));
+        bottom: calc(64px + env(safe-area-inset-bottom, 0px));
+        width: auto;
+        max-height: 56dvh;
+        z-index: 22;
+        display: none;
+      }
+      body[data-view="graph"][data-drawer="agents"] .hud-left,
+      body[data-view="graph"][data-drawer="pulses"] .hud-left {
+        display: flex;
+      }
+      body[data-view="graph"][data-drawer="agents"] .hud-left .feed-box { display: none; }
+      body[data-view="graph"][data-drawer="pulses"] .hud-left .agents-box,
+      body[data-view="graph"][data-drawer="pulses"] .hud-left .legend-box { display: none; }
+      .agent-list { max-height: 34dvh; }
+      .stream-list { max-height: 44dvh; }
+      .hud-right {
+        top: auto;
+        left: calc(10px + env(safe-area-inset-left, 0px));
+        right: calc(10px + env(safe-area-inset-right, 0px));
+        bottom: calc(64px + env(safe-area-inset-bottom, 0px));
+        width: auto;
+        max-height: 48dvh;
+        z-index: 23;
+      }
+      .inspector.idle { display: none; }
+      .hud-bottom {
+        left: calc(10px + env(safe-area-inset-left, 0px));
+        right: calc(10px + env(safe-area-inset-right, 0px));
+        bottom: calc(64px + env(safe-area-inset-bottom, 0px));
+        flex-direction: column;
+        align-items: stretch;
+        z-index: 21;
+        display: none;
+      }
+      body[data-view="graph"][data-drawer="tools"] .hud-bottom { display: flex; }
     }
     @media (max-width: 680px) {
       body[data-view="graph"] .telemetry-strip { display: none; }
-      .quarantine-banner { font-size: 10px; }
-      .hud-right { top: auto; left: 12px; right: 12px; width: auto; max-height: 32vh; }
-      .inspector.idle { display: none; }
-      .control-bar { padding: 6px 8px; gap: 6px; }
-      button.btn { padding: 5px 8px; font-size: 11px; }
-      input[type="range"] { width: 100px; }
+      body[data-view="graph"] .mobile-kpi-strip { display: flex; }
+      .brand-card { padding: 8px 11px; gap: 9px; }
+      .brain-orb { width: 24px; height: 24px; }
+      h1 { font-size: 14px; }
+      .quarantine-banner {
+        font-size: 9.5px;
+        padding: 3px 6px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .badge { font-size: 10px; padding: 2px 7px; }
+      .control-bar { padding: 8px 10px; gap: 6px; }
+      button.btn { padding: 6px 9px; font-size: 11.5px; }
+      input[type="range"] { flex: 1; min-width: 90px; }
     }
   </style>
 </head>
-<body data-view="graph">
+<body data-view="graph" data-drawer="none">
   <div id="stage-wrap" class="graph-only"><canvas id="cortex" aria-label="Hive memory cortex graph"></canvas></div>
 
   <header class="hud-top">
@@ -711,6 +860,11 @@ export function renderViewerHtml(initialState) {
           <span id="sse-badge" class="badge info">SSE: connecting</span>
           <span id="sync-badge" class="badge">${syncState}</span>
           <button id="view-toggle" class="btn" type="button">Raw cards</button>
+        </div>
+        <div class="mobile-kpi-strip" id="mobile-kpi-strip">
+          <span class="mobile-kpi-pill" id="m-kpi-seq">seq: -</span>
+          <span class="mobile-kpi-pill" id="m-kpi-claims">claims: -</span>
+          <span class="mobile-kpi-pill" id="m-kpi-tiers">-</span>
         </div>
         <div class="quarantine-banner">
           reader: <span id="reader-name">${readerName}</span> (<span id="server-name">${serverName}</span>) |
@@ -748,11 +902,14 @@ export function renderViewerHtml(initialState) {
   </header>
 
   <aside class="hud-left graph-only">
-    <div class="glass-box panel">
-      <div class="box-title"><span>Agent Ganglia</span><span id="roster-count" class="mini">0 agents</span></div>
+    <div class="glass-box panel agents-box">
+      <div class="box-title">
+        <span>Agent Ganglia</span>
+        <span><span id="roster-count" class="mini">0 agents</span> <button class="sheet-close" type="button" data-close-drawer="1" aria-label="Close panel">✕</button></span>
+      </div>
       <div id="agent-list" class="agent-list"></div>
     </div>
-    <div class="glass-box panel">
+    <div class="glass-box panel legend-box">
       <div class="box-title">Engram Morphology &amp; Decay</div>
       <div class="legend-grid">
         <div class="legend-item"><span class="shape canon"></span><span>Rank 2 canon (owner)</span></div>
@@ -762,14 +919,23 @@ export function renderViewerHtml(initialState) {
       </div>
     </div>
     <div class="glass-box panel feed-box">
-      <div class="box-title"><span>Synaptic Activity</span><span id="pulse-counter" class="mini">0 pulses</span></div>
+      <div class="box-title">
+        <span>Synaptic Activity</span>
+        <span><span id="pulse-counter" class="mini">0 pulses</span> <button class="sheet-close" type="button" data-close-drawer="1" aria-label="Close panel">✕</button></span>
+      </div>
       <div id="stream-list" class="stream-list"></div>
     </div>
   </aside>
 
   <aside class="hud-right graph-only">
-    <div id="inspector-box" class="glass-box panel inspector"></div>
+    <div id="inspector-box" class="glass-box panel inspector idle"></div>
   </aside>
+
+  <div class="zoom-fab graph-only">
+    <button class="btn" id="btn-zoom-in" type="button" aria-label="Zoom in">+</button>
+    <button class="btn" id="btn-zoom-out" type="button" aria-label="Zoom out">−</button>
+    <button class="btn" id="btn-zoom-reset" type="button" aria-label="Reset camera">⟲</button>
+  </div>
 
   <div class="hud-bottom graph-only">
     <div class="control-bar sim-bar panel">
@@ -784,8 +950,17 @@ export function renderViewerHtml(initialState) {
       <input type="range" id="time-slider" min="0" max="30" step="0.5" value="0">
       <span id="time-label">NOW (+0.0d)</span>
       <button class="btn" id="btn-reset-view" type="button">Reset camera</button>
+      <button class="sheet-close" type="button" data-close-drawer="1" aria-label="Close tools">✕</button>
     </div>
   </div>
+
+  <nav class="mobile-dock panel" id="mobile-dock" aria-label="Mobile view navigation">
+    <button class="dock-btn active" id="dock-graph" type="button">Cortex</button>
+    <button class="dock-btn" id="dock-agents" type="button">Agents</button>
+    <button class="dock-btn" id="dock-pulses" type="button">Pulses</button>
+    <button class="dock-btn" id="dock-tools" type="button">Sim / Time</button>
+    <button class="dock-btn" id="dock-cards" type="button">Cards</button>
+  </nav>
 
   <main class="wrap cards-only">
     <div class="grid grid-4">
@@ -1069,13 +1244,13 @@ export function renderViewerHtml(initialState) {
           a.angle = -Math.PI / 2 + (i / Math.max(1, agents.length)) * Math.PI * 2;
           a.x = Math.cos(a.angle) * rim;
           a.y = Math.sin(a.angle) * rim;
-          a.radius = a.is_owner ? 21 : 17;
+          a.radius = width < 680 ? (a.is_owner ? 18 : 14) : (a.is_owner ? 21 : 17);
         });
         var even = topics.length > TOPIC_ANCHORS.length;
         topics.forEach(function (t, i) {
           var angle = even ? -Math.PI / 2 + (i / topics.length) * Math.PI * 2 : t.anchorAngle;
-          t.x = Math.cos(angle) * minDim * 0.26;
-          t.y = Math.sin(angle) * minDim * 0.26;
+          t.x = Math.cos(angle) * minDim * 0.25;
+          t.y = Math.sin(angle) * minDim * 0.25;
           t.radius = minDim * 0.12;
         });
       }
@@ -1329,6 +1504,7 @@ export function renderViewerHtml(initialState) {
           row.appendChild(stats);
           row.addEventListener('click', function () {
             selected = { type: 'agent', data: a };
+            if (width <= 1024) setDrawer('none');
             renderAgentRoster();
             renderInspector();
           });
@@ -1351,6 +1527,7 @@ export function renderViewerHtml(initialState) {
         });
         el('hud-tiers').textContent = canon + ' canon · ' + decision + ' B · ' + status + ' A';
         el('hud-forecast').textContent = futureDays === 0 ? 'at now' : 'forecast +' + futureDays.toFixed(1) + 'd: ' + expired + ' expired';
+        if (el('m-kpi-tiers')) el('m-kpi-tiers').textContent = canon + 'C · ' + decision + 'B · ' + status + 'A';
       }
 
       function kvRow(key, value, color) {
@@ -1370,7 +1547,22 @@ export function renderViewerHtml(initialState) {
         if (color) t.style.color = color;
         left.appendChild(t);
         head.appendChild(left);
-        head.appendChild(makeBadge(pillText, pillCls));
+        var actions = makeDiv('inspect-actions');
+        actions.appendChild(makeBadge(pillText, pillCls));
+        var closeBtn = document.createElement('button');
+        closeBtn.type = 'button';
+        closeBtn.className = 'btn inspect-close';
+        closeBtn.textContent = '✕';
+        closeBtn.setAttribute('aria-label', 'Close inspector');
+        closeBtn.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          selected = null;
+          hovered = null;
+          renderAgentRoster();
+          renderInspector();
+        });
+        actions.appendChild(closeBtn);
+        head.appendChild(actions);
         return head;
       }
 
@@ -1441,17 +1633,36 @@ export function renderViewerHtml(initialState) {
 
       // --- Canvas: camera, physics and drawing ---
 
+      var drawer = 'none';
+      function setDrawer(next) {
+        drawer = next || 'none';
+        document.body.setAttribute('data-drawer', drawer);
+        if (el('dock-graph')) el('dock-graph').className = 'dock-btn' + (view === 'graph' && drawer === 'none' ? ' active' : '');
+        if (el('dock-agents')) el('dock-agents').className = 'dock-btn' + (view === 'graph' && drawer === 'agents' ? ' active' : '');
+        if (el('dock-pulses')) el('dock-pulses').className = 'dock-btn' + (view === 'graph' && drawer === 'pulses' ? ' active' : '');
+        if (el('dock-tools')) el('dock-tools').className = 'dock-btn' + (view === 'graph' && drawer === 'tools' ? ' active' : '');
+        if (el('dock-cards')) el('dock-cards').className = 'dock-btn' + (view === 'cards' ? ' active' : '');
+      }
+
       function measureHud() {
         if (view !== 'graph') return;
-        hudTop = Math.ceil(document.querySelector('.hud-top').getBoundingClientRect().bottom) + 10;
-        hudBottom = Math.ceil(height - document.querySelector('.hud-bottom').getBoundingClientRect().top) + 10;
+        var topEl = document.querySelector('.hud-top');
+        hudTop = topEl ? Math.ceil(topEl.getBoundingClientRect().bottom) + 8 : 110;
+        if (width <= 1024) {
+          var dockEl = el('mobile-dock');
+          var dockTop = dockEl ? dockEl.getBoundingClientRect().top : 0;
+          hudBottom = dockTop > 0 ? Math.max(58, Math.ceil(height - dockTop) + 8) : 64;
+        } else {
+          var botEl = document.querySelector('.hud-bottom');
+          hudBottom = botEl ? Math.ceil(height - botEl.getBoundingClientRect().top) + 10 : 120;
+        }
         document.documentElement.style.setProperty('--hud-top', hudTop + 'px');
         document.documentElement.style.setProperty('--hud-bottom', hudBottom + 'px');
       }
 
       function centerY() { return height / 2 + (hudTop - hudBottom) / 2; }
-      function stageDim() { return Math.max(260, Math.min(width, height - hudTop - hudBottom + 20)); }
-      function rimR() { return stageDim() * (width < 680 ? 0.36 : 0.41); }
+      function stageDim() { return Math.max(240, Math.min(width, height - hudTop - hudBottom + 20)); }
+      function rimR() { return width < 680 ? Math.min(width * 0.33, stageDim() * 0.35) : stageDim() * 0.41; }
 
       function resize() {
         width = window.innerWidth;
@@ -1467,25 +1678,83 @@ export function renderViewerHtml(initialState) {
         return { x: (sx - width / 2 - cam.x) / cam.zoom, y: (sy - centerY() - cam.y) / cam.zoom };
       }
 
-      function hitTest(sx, sy) {
+      function hitTest(sx, sy, isTouch) {
         var pt = screenToWorld(sx, sy);
+        var hitR = (isTouch ? 24 : 16) / Math.max(0.7, cam.zoom);
+        var best = null;
+        var bestDist = Infinity;
         for (var i = 0; i < nodes.length; i++) {
-          if (Math.hypot(pt.x - nodes[i].x, pt.y - nodes[i].y) < 16) return { type: 'memory', data: nodes[i] };
+          var nd = Math.hypot(pt.x - nodes[i].x, pt.y - nodes[i].y);
+          if (nd < hitR && nd < bestDist) {
+            bestDist = nd;
+            best = { type: 'memory', data: nodes[i] };
+          }
         }
+        if (best) return best;
+        var agentPad = (isTouch ? 14 : 8) / Math.max(0.7, cam.zoom);
         for (var j = 0; j < agents.length; j++) {
-          if (Math.hypot(pt.x - agents[j].x, pt.y - agents[j].y) < agents[j].radius + 8) return { type: 'agent', data: agents[j] };
+          var ad = Math.hypot(pt.x - agents[j].x, pt.y - agents[j].y);
+          if (ad < agents[j].radius + agentPad && ad < bestDist) {
+            bestDist = ad;
+            best = { type: 'agent', data: agents[j] };
+          }
         }
-        return null;
+        return best;
       }
 
+      var pointers = {};
       var drag = null;
+      var pinch = null;
+      var lastTapAt = 0;
+
+      function pointerList() {
+        var arr = [];
+        for (var k in pointers) if (Object.prototype.hasOwnProperty.call(pointers, k)) arr.push(pointers[k]);
+        return arr;
+      }
+
       canvas.addEventListener('pointerdown', function (e) {
-        drag = { x: e.clientX, y: e.clientY, camX: cam.x, camY: cam.y, moved: false };
-        if (canvas.setPointerCapture) canvas.setPointerCapture(e.pointerId);
+        pointers[e.pointerId] = { id: e.pointerId, x: e.clientX, y: e.clientY, type: e.pointerType };
+        if (canvas.setPointerCapture) {
+          try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+        }
+        var pts = pointerList();
+        if (pts.length === 2) {
+          var d0 = Math.max(10, Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y));
+          pinch = {
+            dist: d0,
+            zoom: cam.targetZoom,
+            midX: (pts[0].x + pts[1].x) / 2,
+            midY: (pts[0].y + pts[1].y) / 2,
+            camX: cam.x,
+            camY: cam.y
+          };
+          if (drag) drag.moved = true;
+        } else if (pts.length === 1) {
+          pinch = null;
+          drag = { x: e.clientX, y: e.clientY, camX: cam.x, camY: cam.y, moved: false, isTouch: e.pointerType !== 'mouse' };
+        }
       });
       canvas.addEventListener('pointermove', function (e) {
-        if (drag) {
-          if (Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) > 5) drag.moved = true;
+        if (pointers[e.pointerId]) {
+          pointers[e.pointerId].x = e.clientX;
+          pointers[e.pointerId].y = e.clientY;
+        }
+        var pts = pointerList();
+        if (pts.length === 2 && pinch) {
+          var dist = Math.max(10, Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y));
+          var nextZoom = Math.max(0.45, Math.min(2.8, pinch.zoom * (dist / pinch.dist)));
+          var midX = (pts[0].x + pts[1].x) / 2;
+          var midY = (pts[0].y + pts[1].y) / 2;
+          cam.targetZoom = nextZoom;
+          cam.zoom = nextZoom;
+          cam.x = pinch.camX + (midX - pinch.midX);
+          cam.y = pinch.camY + (midY - pinch.midY);
+          return;
+        }
+        if (drag && pts.length === 1) {
+          var threshold = drag.isTouch ? 8 : 5;
+          if (Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) > threshold) drag.moved = true;
           if (drag.moved) {
             cam.x = drag.camX + e.clientX - drag.x;
             cam.y = drag.camY + e.clientY - drag.y;
@@ -1493,28 +1762,55 @@ export function renderViewerHtml(initialState) {
           return;
         }
         if (e.pointerType !== 'mouse') return;
-        var found = hitTest(e.clientX, e.clientY);
+        var found = hitTest(e.clientX, e.clientY, false);
         if ((found && found.data) !== (hovered && hovered.data)) {
           hovered = found;
           canvas.style.cursor = found ? 'pointer' : 'grab';
           renderInspector();
         }
       });
-      canvas.addEventListener('pointerup', function (e) {
+      function releasePointer(e) {
+        delete pointers[e.pointerId];
+        var pts = pointerList();
+        if (pts.length < 2) pinch = null;
+        if (pts.length === 1) {
+          drag = { x: pts[0].x, y: pts[0].y, camX: cam.x, camY: cam.y, moved: true, isTouch: pts[0].type !== 'mouse' };
+          return;
+        }
         if (drag && !drag.moved) {
-          selected = hitTest(e.clientX, e.clientY);
-          renderAgentRoster();
-          renderInspector();
+          var isTouch = e.pointerType !== 'mouse';
+          var hit = hitTest(e.clientX, e.clientY, isTouch);
+          if (isTouch && drawer !== 'none' && !hit) {
+            setDrawer('none');
+          } else {
+            var nowMs = Date.now();
+            if (isTouch && !hit && nowMs - lastTapAt < 300) {
+              cam.x = 0;
+              cam.y = 0;
+              cam.targetZoom = 1;
+              lastTapAt = 0;
+            } else {
+              if (isTouch && !hit) lastTapAt = nowMs;
+              selected = hit;
+              if (isTouch && hit && drawer !== 'none') setDrawer('none');
+              renderAgentRoster();
+              renderInspector();
+            }
+          }
         }
         drag = null;
+      }
+      canvas.addEventListener('pointerup', releasePointer);
+      canvas.addEventListener('pointercancel', function (e) {
+        delete pointers[e.pointerId];
+        if (!pointerList().length) { drag = null; pinch = null; }
       });
-      canvas.addEventListener('pointercancel', function () { drag = null; });
-      canvas.addEventListener('pointerleave', function () {
-        if (hovered) { hovered = null; renderInspector(); }
+      canvas.addEventListener('pointerleave', function (e) {
+        if (e.pointerType === 'mouse' && hovered) { hovered = null; renderInspector(); }
       });
       canvas.addEventListener('wheel', function (e) {
         e.preventDefault();
-        cam.targetZoom = Math.max(0.55, Math.min(2.4, cam.targetZoom * (e.deltaY < 0 ? 1.1 : 0.9)));
+        cam.targetZoom = Math.max(0.45, Math.min(2.8, cam.targetZoom * (e.deltaY < 0 ? 1.1 : 0.9)));
       }, { passive: false });
       window.addEventListener('resize', resize);
 
@@ -1807,12 +2103,20 @@ export function renderViewerHtml(initialState) {
             ctx.stroke();
           }
           ctx.textBaseline = 'middle';
-          ctx.font = '700 10.5px -apple-system, BlinkMacSystemFont, sans-serif';
+          ctx.font = (width < 680 ? '700 9.5px' : '700 10.5px') + ' -apple-system, BlinkMacSystemFont, sans-serif';
           ctx.fillStyle = '#f8fafc';
           ctx.fillText(a.is_owner ? '\\u2605' : a.name.slice(0, 2).toUpperCase(), a.x, a.y);
-          ctx.font = '600 11.5px -apple-system, BlinkMacSystemFont, sans-serif';
+          ctx.font = (width < 680 ? '600 10.5px' : '600 11.5px') + ' -apple-system, BlinkMacSystemFont, sans-serif';
           ctx.fillStyle = isSel ? '#ffffff' : '#cbd5e1';
-          ctx.fillText(a.name, a.x + Math.cos(a.angle) * (a.radius + 17), a.y + Math.sin(a.angle) * (a.radius + 17));
+          var labelDist = a.radius + (width < 680 ? 13 : 17);
+          var lx = a.x + Math.cos(a.angle) * labelDist;
+          var ly = a.y + Math.sin(a.angle) * labelDist;
+          if (width < 680) {
+            var tw = ctx.measureText(a.name).width;
+            var maxX = Math.max(70, (width / 2 - tw / 2 - 10) / Math.max(0.7, cam.zoom));
+            lx = Math.max(-maxX, Math.min(maxX, lx));
+          }
+          ctx.fillText(a.name, lx, ly);
           ctx.textBaseline = 'alphabetic';
         });
       }
@@ -1827,11 +2131,50 @@ export function renderViewerHtml(initialState) {
 
       // --- Controls ---
 
-      el('view-toggle').addEventListener('click', function () {
-        view = view === 'graph' ? 'cards' : 'graph';
+      function switchView(nextView) {
+        view = nextView;
         document.body.setAttribute('data-view', view);
         el('view-toggle').textContent = view === 'graph' ? 'Raw cards' : 'Cortex graph';
+        setDrawer('none');
         if (view === 'graph') resize();
+      }
+
+      el('view-toggle').addEventListener('click', function () {
+        switchView(view === 'graph' ? 'cards' : 'graph');
+      });
+      if (el('dock-graph')) el('dock-graph').addEventListener('click', function () {
+        if (view !== 'graph') switchView('graph');
+        else setDrawer('none');
+      });
+      if (el('dock-agents')) el('dock-agents').addEventListener('click', function () {
+        if (view !== 'graph') switchView('graph');
+        setDrawer(drawer === 'agents' ? 'none' : 'agents');
+      });
+      if (el('dock-pulses')) el('dock-pulses').addEventListener('click', function () {
+        if (view !== 'graph') switchView('graph');
+        setDrawer(drawer === 'pulses' ? 'none' : 'pulses');
+      });
+      if (el('dock-tools')) el('dock-tools').addEventListener('click', function () {
+        if (view !== 'graph') switchView('graph');
+        setDrawer(drawer === 'tools' ? 'none' : 'tools');
+      });
+      if (el('dock-cards')) el('dock-cards').addEventListener('click', function () {
+        switchView(view === 'cards' ? 'graph' : 'cards');
+      });
+      var closeButtons = document.querySelectorAll('[data-close-drawer]');
+      for (var cb = 0; cb < closeButtons.length; cb++) {
+        closeButtons[cb].addEventListener('click', function () { setDrawer('none'); });
+      }
+      if (el('btn-zoom-in')) el('btn-zoom-in').addEventListener('click', function () {
+        cam.targetZoom = Math.min(2.8, cam.targetZoom * 1.22);
+      });
+      if (el('btn-zoom-out')) el('btn-zoom-out').addEventListener('click', function () {
+        cam.targetZoom = Math.max(0.45, cam.targetZoom / 1.22);
+      });
+      if (el('btn-zoom-reset')) el('btn-zoom-reset').addEventListener('click', function () {
+        cam.x = 0;
+        cam.y = 0;
+        cam.targetZoom = 1;
       });
       el('btn-sim-write').addEventListener('click', simWrite);
       el('btn-sim-recall').addEventListener('click', simRecall);
@@ -1871,6 +2214,8 @@ export function renderViewerHtml(initialState) {
 
         el('seq-val').textContent = st.write_seq == null ? '-' : String(st.write_seq);
         el('seq-sub').textContent = 'current claims: ' + (st.current_claims == null ? '-' : String(st.current_claims));
+        if (el('m-kpi-seq')) el('m-kpi-seq').textContent = 'seq: ' + (st.write_seq == null ? '-' : String(st.write_seq));
+        if (el('m-kpi-claims')) el('m-kpi-claims').textContent = 'claims: ' + (st.current_claims == null ? '-' : String(st.current_claims));
 
         el('backup-val').textContent = st.last_backup_age_sec == null ? 'none' : (String(st.last_backup_age_sec) + 's ago');
         el('backup-sub').textContent = 'unbacked writes: ' + (st.unbacked_writes == null ? '-' : String(st.unbacked_writes));
@@ -2134,6 +2479,8 @@ export async function startMemoryViewer({
       }
       sseClients.clear()
       client.close()
+      httpServer.closeIdleConnections?.()
+      httpServer.closeAllConnections?.()
       await new Promise(resolveClose => httpServer.close(() => resolveClose()))
     },
   }

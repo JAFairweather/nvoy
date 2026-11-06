@@ -210,6 +210,14 @@ await test('live integration: memory-viewer polls memory-daemon viewer socket, s
     assert(String(htmlRes.headers['content-security-policy']).includes("default-src 'none'"))
     assert(htmlRes.body.includes('Hive Shared Memory'))
     assert(htmlRes.body.includes('READY'))
+    assert(htmlRes.body.includes('viewport-fit=cover'))
+    assert(htmlRes.body.includes('100dvh'))
+    assert(htmlRes.body.includes('id="mobile-dock"'))
+    assert(htmlRes.body.includes('id="dock-agents"'))
+    assert(htmlRes.body.includes('id="dock-pulses"'))
+    assert(htmlRes.body.includes('id="dock-tools"'))
+    assert(htmlRes.body.includes('id="btn-zoom-in"'))
+    assert(htmlRes.body.includes('inspect-close'))
     assert(!/relay|SYNCED/i.test(htmlRes.body.replace('never synced to a relay', '')))
 
     const stateRes1 = await httpGet(viewer.port, '/api/state')
@@ -303,6 +311,23 @@ await test('live integration: memory-viewer polls memory-daemon viewer socket, s
     assert.equal(notReady.query_answer, 'unknown')
     assert.equal(notReady.records.length, 0)
     assert.notEqual(notReady.store_state.state, 'READY')
+
+    // Verify viewer.stop() closes keep-alive sockets immediately (< 500ms) instead of hanging on SIGTERM.
+    const keepAliveReq = httpRequest({
+      host: '127.0.0.1',
+      port: viewer.port,
+      path: '/api/state',
+      method: 'GET',
+      headers: { Connection: 'keep-alive' },
+    })
+    keepAliveReq.end()
+    await new Promise(resolveResp => keepAliveReq.on('response', res => {
+      res.resume()
+      res.on('end', resolveResp)
+    }))
+    const stopStart = Date.now()
+    await viewer.stop()
+    assert(Date.now() - stopStart < 500, 'viewer.stop() should terminate keep-alive connections quickly')
   } finally {
     await viewer.stop()
     await daemon.close()
