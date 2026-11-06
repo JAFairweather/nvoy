@@ -1458,7 +1458,7 @@ export function renderViewerHtml(initialState) {
 
       function fmtAge(sec, nowSec) {
         if (!sec || typeof sec !== 'number') return 'none';
-        var diff = Math.max(0, (nowSec || Math.floor(Date.now() / 1000)) - sec);
+        var diff = Math.floor(Math.max(0, (nowSec || Math.floor(Date.now() / 1000)) - sec));
         if (diff < 60) return diff + 's ago';
         if (diff < 3600) return Math.floor(diff / 60) + 'm ' + (diff % 60) + 's ago';
         return Math.floor(diff / 3600) + 'h ' + Math.floor((diff % 3600) / 60) + 'm ago';
@@ -1466,7 +1466,7 @@ export function renderViewerHtml(initialState) {
 
       function fmtShortAge(sec, nowSec) {
         if (!sec || typeof sec !== 'number') return 'silent';
-        var diff = Math.max(0, (nowSec || Math.floor(Date.now() / 1000)) - sec);
+        var diff = Math.floor(Math.max(0, (nowSec || Math.floor(Date.now() / 1000)) - sec));
         if (diff < 60) return diff + 's';
         if (diff < 3600) return Math.floor(diff / 60) + 'm';
         if (diff < 86400) return Math.floor(diff / 3600) + 'h';
