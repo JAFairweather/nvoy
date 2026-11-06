@@ -28,6 +28,7 @@ export const SOCKET_NAME = /^[a-z][a-z0-9-]{0,31}$/
 const EVENT_KEYS = ['content', 'created_at', 'id', 'kind', 'pubkey', 'sig', 'tags']
 const LEDGER_OPS = new Set(['init', 'cutover', 'submit', 'purge', 'restore-gap-ack'])
 const CONFIG_KEYS = ['memoryGlobalChannelId', 'ownerPubkey', 'maxUnbackedSec', 'globalWriters', 'readers', 'writers', 'rooms']
+const OPTIONAL_CONFIG_KEYS = ['canonWriters']
 const RECEIPT_SKEW_SEC = 300
 
 const SCHEMA = `
@@ -94,7 +95,7 @@ const prefix = id => `${String(id).slice(0, 12)}…`
 export function validateAndResolveConfig(cfg) {
   const fail = m => { throw new Error(`invalid hive-memory config: ${m}`) }
   if (!isObj(cfg)) fail('not a JSON object')
-  const unknown = Object.keys(cfg).filter(k => !CONFIG_KEYS.includes(k))
+  const unknown = Object.keys(cfg).filter(k => !CONFIG_KEYS.includes(k) && !OPTIONAL_CONFIG_KEYS.includes(k))
   if (unknown.length) fail(`unknown keys ${unknown.join(', ')}`)
   const missing = CONFIG_KEYS.filter(k => !Object.hasOwn(cfg, k))
   if (missing.length) fail(`missing keys ${missing.join(', ')}`)
@@ -105,6 +106,8 @@ export function validateAndResolveConfig(cfg) {
   if (!Number.isSafeInteger(cfg.maxUnbackedSec) || cfg.maxUnbackedSec <= 0) fail('maxUnbackedSec must be an explicit positive integer')
   if (!Array.isArray(cfg.globalWriters)) fail('globalWriters must be an array')
   const globalWriters = new Set(cfg.globalWriters.map((p, i) => hex(p, `globalWriters[${i}]`)))
+  if (cfg.canonWriters !== undefined && !Array.isArray(cfg.canonWriters)) fail('canonWriters must be an array')
+  const canonWriters = new Set((cfg.canonWriters ?? []).map((p, i) => hex(p, `canonWriters[${i}]`)))
   const readers = new Map(names(cfg.readers, 'readers').map(([n, p]) => [n, p === null ? '' : hex(p, `readers.${n}`)]))
   const writers = new Map(names(cfg.writers, 'writers').map(([n, w]) => {
     if (!isObj(w) || Object.keys(w).some(k => !['pubkey', 'perHour', 'allowSelf'].includes(k))) fail(`writers.${n} takes only pubkey, perHour and allowSelf`)
@@ -124,7 +127,7 @@ export function validateAndResolveConfig(cfg) {
     for (const w of roomWriters) if (!members.has(w)) fail(`rooms.${id}.writers is not a subset of its members`)
     return [id, Object.freeze({ members, writers: roomWriters })]
   }))
-  return Object.freeze({ memoryGlobalChannelId: cfg.memoryGlobalChannelId, ownerPubkey, maxUnbackedSec: cfg.maxUnbackedSec, globalWriters, readers, writers, rooms })
+  return Object.freeze({ memoryGlobalChannelId: cfg.memoryGlobalChannelId, ownerPubkey, maxUnbackedSec: cfg.maxUnbackedSec, globalWriters, canonWriters, readers, writers, rooms })
 }
 
 export function loadConfigFile(path) {
@@ -139,7 +142,7 @@ export function loadConfigFile(path) {
 // The read predicate, applied to every row, every link end and every count.
 export function canRead(readerPubkey, row, config) {
   if (!config || !row) return false
-  if (row.scope_type === 'hive:canon') return row.pubkey === config.ownerPubkey
+  if (row.scope_type === 'hive:canon') return row.pubkey === config.ownerPubkey || config.canonWriters.has(row.pubkey)
   if (row.scope_type === 'hive:ops') return row.pubkey === config.ownerPubkey || config.globalWriters.has(row.pubkey)
   if (row.scope_type === 'room') {
     const room = config.rooms.get(row.room_id)
@@ -150,7 +153,9 @@ export function canRead(readerPubkey, row, config) {
 
 // Whether `pubkey` may write `scope` (a parseFactKey result); `writer` is null for migration.
 export function writeRefusal(config, writer, pubkey, parsed) {
-  if (parsed.scope === 'hive:canon') return pubkey === config.ownerPubkey ? null : 'hive:canon is written by the owner only'
+  if (parsed.scope === 'hive:canon') {
+    return pubkey === config.ownerPubkey || config.canonWriters.has(pubkey) ? null : 'hive:canon is written by the owner and canonWriters only'
+  }
   if (parsed.scope === 'hive:ops') {
     return pubkey === config.ownerPubkey || config.globalWriters.has(pubkey) ? null : 'hive:ops is written by the owner and globalWriters only'
   }
