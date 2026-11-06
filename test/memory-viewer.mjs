@@ -12,6 +12,7 @@ import { initEmptyStore, recordVerifiedBackup } from '../mcp/tools/hive_memory_s
 import {
   computeAgentHealth,
   computeCoherence,
+  computeDreamingTelemetry,
   diffViewerSnapshots,
   escapeHtml,
   parseListenTarget,
@@ -422,6 +423,62 @@ await test('computeAgentHealth: classifies 5m active, 5-20m warm, >20m stale, er
   assert.equal(byId2.get('mydude').health, 'active')
   assert.equal(byId2.get('mydude').last_read_at, nowSec - 120)
   assert.equal(byId2.get('crusty').health, 'warm')
+})
+
+await test('computeDreamingTelemetry: groups Gate 8 Class A by scope+topic, restricts shortTtlCount to workflow slugs, and marks estimates', () => {
+  const recs = [
+    ...Array.from({ length: 5 }, (_, i) => ({
+      scope: 'room:1',
+      d: `hive-memory:room:1:item-${i}`,
+      topic: 'ops',
+      claim: `Room 1 ops claim ${i}`,
+      created_at: 1000,
+      expires_at: 1000 + 86400, // 24h TTL, but NOT a workflow checkpoint slug
+    })),
+    ...Array.from({ length: 5 }, (_, i) => ({
+      scope: 'room:2',
+      d: `hive-memory:room:2:item-${i}`,
+      topic: 'ops',
+      claim: `Room 2 ops claim ${i}`,
+      created_at: 1000,
+      expires_at: 1000 + 86400,
+    })),
+    {
+      scope: 'room:1',
+      d: 'hive-memory:room:1:pr336-status',
+      topic: 'nvoy',
+      claim: 'PR 336 status checkpoint on 24h TTL',
+      created_at: 1000,
+      expires_at: 1000 + 86400,
+    },
+    {
+      scope: 'room:1',
+      d: 'hive-memory:room:1:pr336-review',
+      topic: 'nvoy',
+      claim: 'PR 336 review checkpoint on 7d TTL',
+      created_at: 1000,
+      expires_at: 1000 + 7 * 86400,
+    },
+    {
+      scope: 'room:1',
+      d: 'hive-memory:room:1:decision-1',
+      topic: 'decisions',
+      claim: 'Permanent Class B decision',
+      created_at: 1000,
+      expires_at: null,
+    },
+  ]
+  const dt = computeDreamingTelemetry(recs)
+  assert.equal(dt.estimated_from_visible, true)
+  assert.equal(dt.wfCount, 2, 'only -status and -review slugs are workflow checkpoints')
+  assert.equal(dt.shortTtlCount, 1, 'shortTtlCount must only count workflow checkpoints with <=48h TTL')
+  assert.equal(dt.classBCount, 1)
+  const room1Ops = dt.topicList.find(x => x.scope === 'room:1' && x.topic === 'ops')
+  const room2Ops = dt.topicList.find(x => x.scope === 'room:2' && x.topic === 'ops')
+  assert.equal(room1Ops?.count, 5)
+  assert.equal(room1Ops?.ready, false, '5 claims in room:1 must not trigger >8 curation ready')
+  assert.equal(room2Ops?.count, 5)
+  assert.equal(room2Ops?.ready, false, '5 claims in room:2 must not trigger >8 curation ready')
 })
 
 await test('live integration: memory-viewer polls memory-daemon viewer socket, streams SSE, and refuses non-GET', async () => {

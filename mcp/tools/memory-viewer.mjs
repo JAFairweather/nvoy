@@ -659,6 +659,60 @@ export function diffViewerSnapshots(prev, next, nowSec = Math.floor(Date.now() /
   return events
 }
 
+export function computeDreamingTelemetry(records = []) {
+  const recs = Array.isArray(records) ? records : []
+  const fullBytes = JSON.stringify(recs).length
+  let indexBytes = 0
+  let canonBytes = 0
+  let wfCount = 0
+  let shortTtlCount = 0
+  let classBCount = 0
+  const byScopeTopic = new Map()
+  for (const r of recs) {
+    if (!r || typeof r !== 'object') continue
+    const slug = String(r.d || '').split(':').pop() || String(r.d || '')
+    const isWf = /-(?:review|status|owner|wip|handoff)$/.test(slug)
+    indexBytes += 140 + Math.min(120, String(r.claim || '').length) + String(r.d || '').length
+    if (r.scope === 'hive:canon') {
+      canonBytes += JSON.stringify(r).length
+    } else if (r.expires_at === null || r.expires_at === undefined) {
+      classBCount += 1
+    } else {
+      const scope = String(r.scope || 'unknown')
+      const top = String(r.topic || 'general')
+      const key = `${scope} · #${top}`
+      const prev = byScopeTopic.get(key) || { scope, topic: top, label: key, count: 0 }
+      prev.count += 1
+      byScopeTopic.set(key, prev)
+    }
+    if (isWf) {
+      wfCount += 1
+      if (r.expires_at !== null && r.expires_at !== undefined && r.created_at && (r.expires_at - r.created_at) <= 172800) {
+        shortTtlCount += 1
+      }
+    }
+  }
+  const wakeBytes = canonBytes + Math.min(4000, indexBytes)
+  const indexSavings = fullBytes > 0 ? Math.round((1 - indexBytes / fullBytes) * 1000) / 10 : 0
+  const wakeSavings = fullBytes > 0 ? Math.round((1 - wakeBytes / fullBytes) * 1000) / 10 : 0
+  const topicList = [...byScopeTopic.values()]
+    .map(item => ({ ...item, ready: item.count > 8 }))
+    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label))
+  return {
+    estimated_from_visible: true,
+    total: recs.length,
+    fullBytes,
+    indexBytes,
+    wakeBytes,
+    indexSavings,
+    wakeSavings,
+    wfCount,
+    shortTtlCount,
+    classBCount,
+    topicList,
+  }
+}
+
 // Single-socket MCP client over the viewer's Unix domain socket.
 export function createSingleSocketMcpClient(socketPath) {
   let socket = null
@@ -1940,24 +1994,35 @@ export function renderViewerHtml(initialState) {
         var wfCount = 0;
         var shortTtlCount = 0;
         var classBCount = 0;
-        var byTopic = {};
+        var byScopeTopic = {};
         recs.forEach(function (r) {
+          var isWf = isWorkflowCheckpoint(r);
           indexBytes += 140 + Math.min(120, String(r.claim || '').length) + String(r.d || '').length;
           if (isCanon(r)) canonBytes += JSON.stringify(r).length;
           else if (r.expires_at === null || r.expires_at === undefined) classBCount += 1;
           else {
+            var sc = String(r.scope || 'unknown');
             var top = topicOf(r);
-            byTopic[top] = (byTopic[top] || 0) + 1;
-            if (r.created_at && (r.expires_at - r.created_at) <= 172800) shortTtlCount += 1;
+            var key = sc + ' · #' + top;
+            if (!byScopeTopic[key]) byScopeTopic[key] = { scope: sc, topic: top, label: key, count: 0 };
+            byScopeTopic[key].count += 1;
           }
-          if (isWorkflowCheckpoint(r)) wfCount += 1;
+          if (isWf) {
+            wfCount += 1;
+            if (r.expires_at !== null && r.expires_at !== undefined && r.created_at && (r.expires_at - r.created_at) <= 172800) {
+              shortTtlCount += 1;
+            }
+          }
         });
         var wakeBytes = canonBytes + Math.min(4000, indexBytes);
         var indexSavings = fullBytes > 0 ? Math.round((1 - indexBytes / fullBytes) * 1000) / 10 : 0;
         var wakeSavings = fullBytes > 0 ? Math.round((1 - wakeBytes / fullBytes) * 1000) / 10 : 0;
-        var topicList = Object.keys(byTopic).map(function (k) { return { topic: k, count: byTopic[k] }; })
-          .sort(function (a, b) { return b.count - a.count; });
+        var topicList = Object.keys(byScopeTopic).map(function (k) {
+          var item = byScopeTopic[k];
+          return { scope: item.scope, topic: item.topic, label: item.label, count: item.count, ready: item.count > 8 };
+        }).sort(function (a, b) { return b.count - a.count; });
         return {
+          estimated_from_visible: true,
           total: recs.length,
           fullBytes: fullBytes,
           indexBytes: indexBytes,
@@ -1974,12 +2039,24 @@ export function renderViewerHtml(initialState) {
       function simConsolidate() {
         var best = null;
         var bestNodes = [];
+        var bestScope = null;
         topics.forEach(function (t) {
-          var cands = nodes.filter(function (n) {
+          var byScope = {};
+          nodes.forEach(function (n) {
             var st = evalRecord(n.rec, simNow()).state;
-            return !isCanon(n.rec) && topicOf(n.rec) === t.id && (st === 'fresh' || st === 'aging');
+            if (!isCanon(n.rec) && topicOf(n.rec) === t.id && (st === 'fresh' || st === 'aging')) {
+              var sc = String(n.rec.scope || 'unknown');
+              if (!byScope[sc]) byScope[sc] = [];
+              byScope[sc].push(n);
+            }
           });
-          if (cands.length > bestNodes.length) { best = t; bestNodes = cands; }
+          Object.keys(byScope).forEach(function (sc) {
+            if (byScope[sc].length > bestNodes.length) {
+              best = t;
+              bestScope = sc;
+              bestNodes = byScope[sc];
+            }
+          });
         });
         selected = { type: 'dreaming', data: computeDreamingTelemetry() };
         hovered = null;
@@ -1988,7 +2065,7 @@ export function renderViewerHtml(initialState) {
         renderInspector();
         if (!consolidator && best && bestNodes.length >= 2) {
           consolidator = { topic: best, targets: bestNodes.slice(0, 5), x: best.x, y: best.y, progress: 0 };
-          logStream('sim', 'MERKLE DREAMING curation in #' + best.id + ': folding ' + consolidator.targets.length + ' Class A claims (nothing written)');
+          logStream('sim', 'MERKLE DREAMING curation in ' + bestScope + ' #' + best.id + ': folding ' + consolidator.targets.length + ' Class A claims (nothing written)');
         }
       }
 
@@ -2296,26 +2373,26 @@ export function renderViewerHtml(initialState) {
           var dr = computeDreamingTelemetry();
           box.appendChild(inspectHeader(
             'Merkle Dreaming & Curation (Phase 2)',
-            '-' + dr.wakeSavings.toFixed(1) + '% Wake Bytes',
-            'GATES 6-8 LIVE',
-            'ok',
+            '-' + dr.wakeSavings.toFixed(1) + '% Est. Wake Bytes',
+            'EST. FROM VISIBLE',
+            'info',
             '#a78bfa'
           ));
           var dkv = makeDiv('kv-list');
-          dkv.appendChild(kvRow('Full store payload', Math.round(dr.fullBytes / 1024) + ' KB (~' + Math.round(dr.fullBytes / 4) + ' tok)', '#94a3b8'));
-          dkv.appendChild(kvRow('Gate 6 · Index cards', Math.round(dr.indexBytes / 1024) + ' KB (-' + dr.indexSavings.toFixed(1) + '%)', '#38bdf8'));
-          dkv.appendChild(kvRow('Gate 6 · Wake digest', Math.round(dr.wakeBytes / 1024) + ' KB (-' + dr.wakeSavings.toFixed(1) + '% vs dump)', '#34d399'));
+          dkv.appendChild(kvRow('Est. visible full JSON', Math.round(dr.fullBytes / 1024) + ' KB (~' + Math.round(dr.fullBytes / 4) + ' tok)', '#94a3b8'));
+          dkv.appendChild(kvRow('Est. visible index cards', Math.round(dr.indexBytes / 1024) + ' KB (-' + dr.indexSavings.toFixed(1) + '%)', '#38bdf8'));
+          dkv.appendChild(kvRow('Est. visible wake digest', Math.round(dr.wakeBytes / 1024) + ' KB (-' + dr.wakeSavings.toFixed(1) + '% vs dump)', '#34d399'));
           dkv.appendChild(kvRow('Gate 7 · Workflow slugs', dr.wfCount + ' active (' + dr.shortTtlCount + ' on <=48h TTL)', '#fbbf24'));
           dkv.appendChild(kvRow('Gate 7 · Class B curated', dr.classBCount + ' permanent decisions', '#a78bfa'));
           box.appendChild(dkv);
           if (dr.topicList.length > 0) {
-            var qTitle = makeDiv('inspect-kicker', 'Gate 8 · Topic Curation Pressure (>8 Class A = curate)');
+            var qTitle = makeDiv('inspect-kicker', 'Gate 8 · Scope+Topic Curation Pressure (>8 Class A = curate)');
             qTitle.style.marginTop = '6px';
             box.appendChild(qTitle);
             var tWrap = makeDiv('kv-list');
             dr.topicList.slice(0, 6).forEach(function (item) {
-              var over = item.count > 8;
-              tWrap.appendChild(kvRow('#' + item.topic, item.count + ' Class A' + (over ? ' · READY TO CURATE' : ''), over ? '#fbbf24' : '#cbd5e1'));
+              var over = item.ready;
+              tWrap.appendChild(kvRow(item.label, item.count + ' Class A' + (over ? ' · READY TO CURATE' : ''), over ? '#fbbf24' : '#cbd5e1'));
             });
             box.appendChild(tWrap);
           }
