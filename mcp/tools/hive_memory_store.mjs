@@ -882,9 +882,11 @@ export class HiveMemoryStore {
       if (list.length - shown > 0) lines.push(`+${list.length - shown} ${scopeHint} claims not shown; memory_query scope=${scopeHint}`)
       return { text: lines.join('\n'), shown, omitted: list.length - shown }
     }
+    // Canon is James's handful of standing decisions, so it goes first and may use up to 60% of the budget; room and
+    // ops claims take what it leaves. A fixed 35% share dropped the oldest of five canon claims (2026-11-06).
     const rest = budget - header.length - 8
-    const canonSec = fitSection('Rank 2: hive:canon', canon, Math.floor(rest * 0.35), 'hive:canon')
-    const opsSec = fitSection('Rank 3: room & hive:ops', ops, rest - Math.floor(rest * 0.35), 'hive:ops')
+    const canonSec = fitSection('Rank 2: hive:canon', canon, Math.floor(rest * 0.6), 'hive:canon')
+    const opsSec = fitSection('Rank 3: room & hive:ops', ops, rest - canonSec.text.length - 1, 'hive:ops')
     const digest = [header, canonSec.text, opsSec.text].join('\n')
     return {
       ...base,
