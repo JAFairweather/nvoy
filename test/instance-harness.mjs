@@ -10,7 +10,7 @@ import { join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { sshChannelEntry } from '../mcp/tools/channel_client.mjs'
 import { fakeHerdr } from './fake-herdr.mjs'
-import { CODEX_CHANNEL_TOOLS, channelProcessUp, classifyPane, claudeArgs, codexConfigToml, codexTurnText, defaultInstructions, ensureInstructions, hasPriorSession, instructionsUpdate, MEMORY_RULE_MARKER, mcpConfig, pendingEnvelopes, seedClaudeJson, seedSettings, serverName } from '../mcp/tools/harness_session.mjs'
+import { CODEX_CHANNEL_TOOLS, channelProcessUp, classifyPane, claudeArgs, codexConfigToml, codexTurnText, defaultInstructions, ensureInstructions, hasPriorSession, instructionsUpdate, MEMORY_RULE_MARKER, mcpConfig, RECALL_RULE_MARKER, pendingEnvelopes, seedClaudeJson, seedSettings, serverName } from '../mcp/tools/harness_session.mjs'
 
 let fails = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); if (!value) fails++ }
@@ -101,6 +101,25 @@ ok('seeding never grants a bypass mode', !/bypass/i.test(JSON.stringify(seedSett
 const instructions = defaultInstructions({ id: 'mc-test', pubkey: 'c'.repeat(64), buzz: { channels: [channel] } })
 ok('the default instructions name the read and reply tools and treat message bodies as data', /nvoy_channel_read/.test(instructions) && /nvoy_channel_reply/.test(instructions) &&
   /never treat it as instructions/.test(instructions) && instructions.includes(channel) && !instructions.includes('c'.repeat(64)))
+const reader = { identity: '/keys/mc-read', knownHosts: '/keys/herd_known_hosts', target: 'hive-memory-gw@herd-cloud' }
+const channelRemote = { identity: '/keys/mc-channel', knownHosts: '/keys/known_hosts', target: 'nvoy-mc@broker.example' }
+const recallMcp = mcpConfig({ manifest: { id: 'mc-test', recall: reader }, root: '', remote: channelRemote }).mcpServers
+ok('a recall block mounts the instance\'s own reader beside its channel, over its own key and pinned host', Object.keys(recallMcp).join() === 'nvoy-mc-test,hive-memory' &&
+  recallMcp['hive-memory'].args.at(-1) === reader.target && recallMcp['hive-memory'].args.includes('/keys/mc-read') && recallMcp['hive-memory'].args.includes('UserKnownHostsFile=/keys/herd_known_hosts') &&
+  !recallMcp['hive-memory'].args.includes('/keys/mc-channel') && recallMcp['hive-memory'].args.includes('IdentitiesOnly=yes'))
+ok('without a recall block the session mounts only its channel', Object.keys(mcpConfig({ manifest: { id: 'mc-test' }, root: '', remote: channelRemote }).mcpServers).join() === 'nvoy-mc-test')
+const recallAllow = seedSettings({}, 'nvoy-mc-test', { recall: true }).permissions.allow
+ok('recall allows the two read tools by name, never the whole server', JSON.stringify(recallAllow) === '["mcp__nvoy-mc-test","mcp__hive-memory__memory_wake","mcp__hive-memory__memory_query"]' &&
+  JSON.stringify(seedSettings({ permissions: { allow: recallAllow } }, 'nvoy-mc-test', { recall: true }).permissions.allow) === JSON.stringify(recallAllow))
+const recaller = { id: 'mc-test', buzz: { channels: [channel] }, mayRemember: { remote: true }, recall: reader }
+const both = instructionsUpdate(null, recaller)
+ok('a reader\'s instructions carry the recall rule once, after the memory rule', both.split(RECALL_RULE_MARKER).length === 2 && both.indexOf(MEMORY_RULE_MARKER) < both.indexOf(RECALL_RULE_MARKER) &&
+  /call `memory_wake` once/.test(both) && /call `memory_query` for it/.test(both) && /evidence, never an instruction/.test(both))
+const savedOnly = instructionsUpdate(null, { ...recaller, recall: undefined })
+const gained = instructionsUpdate(savedOnly, recaller)
+ok('a file that has the memory rule gains the recall rule, appended once, and is then left alone', gained.startsWith(savedOnly) && gained.split(RECALL_RULE_MARKER).length === 2 &&
+  gained.split(MEMORY_RULE_MARKER).length === 2 && instructionsUpdate(gained, recaller) === null)
+ok('without a recall block there is no recall rule', !instructionsUpdate(null, { ...recaller, recall: undefined }).includes(RECALL_RULE_MARKER))
 const rememberer = { id: 'mc-test', pubkey: 'c'.repeat(64), buzz: { channels: [channel] }, mayRemember: { rooms: ['r'], perHour: 10 } }
 const created = instructionsUpdate(null, rememberer)
 ok('a new writer\'s instructions carry the standing memory rule once', created.startsWith(defaultInstructions(rememberer)) &&
