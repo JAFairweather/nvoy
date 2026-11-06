@@ -159,7 +159,7 @@ export function diffViewerSnapshots(prev, next, nowSec = Math.floor(Date.now() /
   if (!prev) {
     push(
       'init',
-      `Initial poll: global_sync=${next.global_sync?.state || 'UNKNOWN'}, relays=${next.relays_answered || '0/0'}, records=${next.records.length}`
+      `Initial poll: store_state=${next.store_state?.state || 'UNKNOWN'}, write_seq=${next.store_state?.write_seq ?? '-'}, records=${next.records.length}`
     )
     return events
   }
@@ -168,32 +168,16 @@ export function diffViewerSnapshots(prev, next, nowSec = Math.floor(Date.now() /
     push('socket', next.connected ? 'Reader socket connected' : `Reader socket disconnected: ${next.error || 'closed'}`)
   }
 
-  const prevSync = prev.global_sync?.state || null
-  const nextSync = next.global_sync?.state || null
-  if (prevSync !== nextSync && nextSync) {
-    push('sync', `global_sync state: ${prevSync || 'NONE'} -> ${nextSync}`)
-  } else if (
-    prev.global_sync?.lastEoseAt !== next.global_sync?.lastEoseAt &&
-    next.global_sync?.lastEoseAt
-  ) {
-    push('eose', `global_sync EOSE updated (${next.global_sync.lastEoseAt})`)
+  const prevState = prev.store_state?.state || null
+  const nextState = next.store_state?.state || null
+  if (prevState !== nextState && nextState) {
+    push('store', `store_state: ${prevState || 'NONE'} -> ${nextState}`)
   }
-
-  if (prev.relays_answered !== next.relays_answered && next.relays_answered) {
-    push('relays', `relays_answered: ${prev.relays_answered || '0/0'} -> ${next.relays_answered}`)
+  if (prev.store_state?.write_seq !== next.store_state?.write_seq && Number.isSafeInteger(next.store_state?.write_seq)) {
+    push('write', `write_seq: ${prev.store_state?.write_seq ?? '-'} -> ${next.store_state.write_seq}`)
   }
-
-  const prevDisagree = (prev.disagreeing_relays || []).join(',')
-  const nextDisagree = (next.disagreeing_relays || []).join(',')
-  if (prevDisagree !== nextDisagree) {
-    push(
-      'relays',
-      nextDisagree ? `disagreeing_relays: ${nextDisagree}` : 'disagreeing_relays cleared (all relays agree)'
-    )
-  }
-
-  if (prev.grants_checked_at !== next.grants_checked_at && next.grants_checked_at) {
-    push('grants', `grants_checked_at advanced to ${next.grants_checked_at}`)
+  if (prev.store_state?.unbacked_writes !== next.store_state?.unbacked_writes && Number.isSafeInteger(next.store_state?.unbacked_writes)) {
+    push('backup', `unbacked writes: ${prev.store_state?.unbacked_writes ?? '-'} -> ${next.store_state.unbacked_writes}`)
   }
 
   if ((prev.scope_counts?.unverified_total || 0) !== (next.scope_counts?.unverified_total || 0)) {
@@ -375,7 +359,7 @@ export function createSingleSocketMcpClient(socketPath) {
 
 export function renderViewerHtml(initialState) {
   const escapedInitial = safeJsonForScript(initialState)
-  const syncState = escapeHtml(initialState.global_sync?.state || 'CONNECTING')
+  const syncState = escapeHtml(initialState.store_state?.state || 'CONNECTING')
   const readerName = escapeHtml(initialState.reader || 'viewer')
   const serverName = escapeHtml(initialState.server_name || 'hive-memory-viewer')
 
@@ -618,19 +602,19 @@ export function renderViewerHtml(initialState) {
 
     <div class="grid">
       <div class="card">
-        <div class="card-label">Global Sync</div>
+        <div class="card-label">Store State</div>
         <div id="sync-state" class="card-val">${syncState}</div>
         <div id="sync-sub" class="card-sub">waiting for poll…</div>
       </div>
       <div class="card">
-        <div class="card-label">Grant Relays</div>
-        <div id="relays-val" class="card-val">-</div>
-        <div id="relays-sub" class="card-sub">disagreeing: none</div>
+        <div class="card-label">Write Seq</div>
+        <div id="seq-val" class="card-val">-</div>
+        <div id="seq-sub" class="card-sub">current claims: -</div>
       </div>
       <div class="card">
-        <div class="card-label">Grants Checked At</div>
-        <div id="grants-val" class="card-val">-</div>
-        <div id="grants-sub" class="card-sub">-</div>
+        <div class="card-label">Last Verified Backup</div>
+        <div id="backup-val" class="card-val">-</div>
+        <div id="backup-sub" class="card-sub">unbacked writes: -</div>
       </div>
       <div class="card">
         <div class="card-label">Last Poll</div>
@@ -700,8 +684,7 @@ export function renderViewerHtml(initialState) {
       }
 
       function syncBadgeClass(state) {
-        if (state === 'SYNCED_OK' || state === 'SYNCED_EMPTY') return 'badge ok';
-        if (state === 'RELAY_EVICTED_WARNING' || state === 'RELAY_UNREACHABLE_SERVING_LOCAL') return 'badge warn';
+        if (state === 'READY') return 'badge ok';
         return 'badge err';
       }
 
@@ -802,8 +785,8 @@ export function renderViewerHtml(initialState) {
       function renderState(s) {
         if (!s || typeof s !== 'object') return;
         var nowSec = s.polled_at || Math.floor(Date.now() / 1000);
-        var gs = s.global_sync || {};
-        var syncState = s.connected === false ? 'SOCKET_ERROR' : (gs.state || 'UNKNOWN');
+        var st = s.store_state || {};
+        var syncState = s.connected === false ? 'SOCKET_ERROR' : (st.state || 'UNKNOWN');
 
         el('reader-name').textContent = s.reader || 'viewer';
         el('server-name').textContent = s.server_name || 'hive-memory-viewer';
@@ -815,16 +798,13 @@ export function renderViewerHtml(initialState) {
         el('sync-state').textContent = syncState;
         el('sync-sub').textContent = s.connected === false
           ? ('error: ' + (s.error || 'disconnected'))
-          : ('local=' + (gs.localCount ?? '-') + ' remote=' + (gs.remoteCount ?? '-') + ' missing=' + (gs.missingCount ?? 0) + ' | EOSE: ' + fmtAge(gs.lastEoseAt, nowSec));
+          : (st.state === 'READY' ? 'private store ready; never synced to a relay' : 'store not ready; claims withheld until verified restore');
 
-        el('relays-val').textContent = s.relays_answered || '0/0';
-        var disagree = Array.isArray(s.disagreeing_relays) && s.disagreeing_relays.length
-          ? s.disagreeing_relays.join(', ')
-          : 'none';
-        el('relays-sub').textContent = 'disagreeing: ' + disagree;
+        el('seq-val').textContent = st.write_seq == null ? '-' : String(st.write_seq);
+        el('seq-sub').textContent = 'current claims: ' + (st.current_claims == null ? '-' : String(st.current_claims));
 
-        el('grants-val').textContent = fmtAge(s.grants_checked_at, nowSec);
-        el('grants-sub').textContent = fmtTime(s.grants_checked_at) + (s.grants_checked_at ? ' (' + s.grants_checked_at + ')' : '');
+        el('backup-val').textContent = st.last_backup_age_sec == null ? 'none' : (String(st.last_backup_age_sec) + 's ago');
+        el('backup-sub').textContent = 'unbacked writes: ' + (st.unbacked_writes == null ? '-' : String(st.unbacked_writes));
 
         el('poll-val').textContent = fmtTime(s.polled_at);
         el('poll-sub').textContent = 'query answer: ' + (s.query_answer || '-') + ' (poll #' + (s.poll_seq || 0) + ')';
@@ -895,11 +875,7 @@ export async function startMemoryViewer({
     trustedInstruction: false,
     polled_at: null,
     poll_seq: 0,
-    global_sync: { state: 'CONNECTING', lastEoseAt: null, localCount: 0, remoteCount: null, missingCount: 0 },
-    room_sync: null,
-    grants_checked_at: null,
-    relays_answered: '0/0',
-    disagreeing_relays: [],
+    store_state: { state: 'CONNECTING', write_seq: null, current_claims: null, last_backup_age_sec: null, unbacked_writes: null },
     scope_counts: { canon: 0, ops: 0, rooms: 0, self: 0, canon_unverified: 0, unverified_total: 0 },
     query_answer: null,
     records: [],
@@ -924,7 +900,7 @@ export async function startMemoryViewer({
     let nextSnapshot
     try {
       const wake = await client.callReadTool('memory_wake', {})
-      const query = await client.callReadTool('memory_query', { limit: 200 })
+      const query = await client.callReadTool('memory_query', { limit: 100 })
 
       const byKey = new Map()
       for (const r of Array.isArray(query?.records) ? query.records : []) {
@@ -952,13 +928,9 @@ export async function startMemoryViewer({
         trustedInstruction: false,
         polled_at: nowSec,
         poll_seq: pollSeq,
-        global_sync: wake?.global_sync || { state: 'UNKNOWN', lastEoseAt: null, localCount: 0, remoteCount: null, missingCount: 0 },
-        room_sync: wake?.room_sync || null,
-        grants_checked_at: wake?.grants_checked_at ?? null,
-        relays_answered: String(wake?.relays_answered || '0/0'),
-        disagreeing_relays: Array.isArray(wake?.disagreeing_relays) ? wake.disagreeing_relays.map(String) : [],
+        store_state: wake?.store_state || query?.store_state || { state: 'UNKNOWN', write_seq: null, current_claims: null, last_backup_age_sec: null, unbacked_writes: null },
         scope_counts: scopeCounts,
-        query_answer: String(query?.answer || 'none'),
+        query_answer: String(query?.answer || 'unknown'),
         records,
       }
     } catch (err) {
