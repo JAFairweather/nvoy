@@ -208,13 +208,26 @@ ok('a live PID running this instance\'s feed, or one /proc cannot describe, stil
   /already runs as pid/.test(noProgram))
 rmSync(strangerLock, { force: true })
 // A recreated container can hand the old PID to another user's process, where the liveness probe
-// answers EPERM rather than ESRCH (2026-11-06, Biggy's channel). /proc decides it as for any stranger.
-mkdirSync(join(proc, '1'), { recursive: true }); writeFileSync(join(proc, '1', 'cmdline'), '/sbin/init\0')
-writeFileSync(strangerLock, JSON.stringify({ version: 1, instance: 'cx-test', pid: 1, started_at: 1 }))
-let foreignUser
-try { claimPidLock(strangerLock, 'cx-test', 'Claude channel', { program: 'claude-channel.mjs', procRoot: proc })(); foreignUser = 'claimed' } catch (error) { foreignUser = error.message }
-ok('a lock whose PID now belongs to another user\'s unrelated process is reclaimed', foreignUser === 'claimed')
-rmSync(strangerLock, { force: true })
+// answers EPERM rather than ESRCH (2026-11-06, Biggy's channel). The probe is forced to EPERM so the
+// case cannot pass through the self-PID exception; /proc then decides it as for any stranger.
+const foreignPid = process.pid + 100000
+mkdirSync(join(proc, String(foreignPid)), { recursive: true })
+const epermOver = (...argv) => {
+  writeFileSync(join(proc, String(foreignPid), 'cmdline'), argv.join('\0') + '\0')
+  writeFileSync(strangerLock, JSON.stringify({ version: 1, instance: 'cx-test', pid: foreignPid, started_at: 1 }))
+  const probed = []
+  const probe = pid => { probed.push(pid); throw Object.assign(new Error(`kill EPERM ${pid}`), { code: 'EPERM' }) }
+  let outcome
+  try { claimPidLock(strangerLock, 'cx-test', 'Claude channel', { program: 'claude-channel.mjs', procRoot: proc, probe })(); outcome = 'claimed' } catch (error) { outcome = error.message }
+  rmSync(strangerLock, { force: true })
+  return { outcome, probed }
+}
+const foreignUser = epermOver('node', '/srv/nvoy/mcp/tools/instance-adapter.mjs', '--instance', 'cx-test')
+const foreignChannel = epermOver('node', '/srv/nvoy/mcp/tools/claude-channel.mjs', '--instance', 'cx-test')
+ok('a lock whose PID answers EPERM and /proc shows running another program is reclaimed',
+  foreignUser.outcome === 'claimed' && foreignUser.probed.includes(foreignPid))
+ok('a lock whose PID answers EPERM but /proc shows this instance\'s channel still holds',
+  /EPERM/.test(foreignChannel.outcome) && foreignChannel.probed.includes(foreignPid))
 const quiet = spawn(process.execPath, ['mcp/tools/codex-channel-feed.mjs', '--instance', 'cx-test', '--client-timeout-ms', '600'], { cwd: resolve('.'), env: { ...process.env, NVOY_INSTANCE_ROOT: fleet } })
 let quietErr = ''
 quiet.stdin.on('error', () => {})

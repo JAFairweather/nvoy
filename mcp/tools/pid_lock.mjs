@@ -20,7 +20,8 @@ function mayHold(pid, instance, program, procRoot) {
   return argv.some(arg => basename(arg) === program) && at >= 0 && argv[at + 1] === instance
 }
 
-export function claimPidLock(path, instance, holder, { program = '', procRoot = '/proc' } = {}) {
+// `probe` is the liveness check, process.kill(pid, 0) by default; tests pass one to force an errno.
+export function claimPidLock(path, instance, holder, { program = '', procRoot = '/proc', probe = pid => process.kill(pid, 0) } = {}) {
   try {
     const fd = openSync(path, 'wx', 0o600)
     writeFileSync(fd, JSON.stringify({ version: 1, instance, pid: process.pid, started_at: Date.now() }))
@@ -34,8 +35,8 @@ export function claimPidLock(path, instance, holder, { program = '', procRoot = 
     prior = JSON.parse(readFileSync(path, 'utf8'))
   } catch (error) { throw new Error(`cannot validate existing ${holder} lock: ${error.message}`) }
   if (prior?.version !== 1 || prior?.instance !== instance || !Number.isInteger(prior?.pid) || prior.pid < 1) throw new Error(`${holder} lock does not bind this instance`)
-  if (prior.pid !== process.pid) try { process.kill(prior.pid, 0); if (mayHold(prior.pid, instance, program, procRoot)) throw new Error(`${holder} already runs as pid ${prior.pid}`) }
+  if (prior.pid !== process.pid) try { probe(prior.pid); if (mayHold(prior.pid, instance, program, procRoot)) throw new Error(`${holder} already runs as pid ${prior.pid}`) }
   catch (error) { if (error.code !== 'ESRCH' && !(error.code === 'EPERM' && !mayHold(prior.pid, instance, program, procRoot))) throw error }
   unlinkSync(path)
-  return claimPidLock(path, instance, holder, { program, procRoot })
+  return claimPidLock(path, instance, holder, { program, procRoot, probe })
 }
