@@ -77,7 +77,7 @@ export function bindingSignature(config, { kind, name }) {
   const w = config.writers.get(name)
   if (!w) return 'absent'
   const rooms = [...config.rooms].filter(([, r]) => r.writers.has(w.pubkey) && r.members.has(w.pubkey)).map(([id]) => id).sort()
-  return JSON.stringify(['writer', w.pubkey, w.perHour, w.allowSelf, rooms, config.ownerPubkey === w.pubkey, config.globalWriters.has(w.pubkey)])
+  return JSON.stringify(['writer', w.pubkey, w.perHour, w.allowSelf, rooms, config.ownerPubkey === w.pubkey, config.globalWriters.has(w.pubkey), config.canonWriters.has(w.pubkey)])
 }
 
 const isViewer = binding => binding.kind === 'reader' && binding.name === VIEWER_READER
@@ -126,7 +126,7 @@ function agentRoster(store, nowSec) {
   for (const [name, w] of config.writers) {
     Object.assign(entry(name), { pubkey: w.pubkey, is_writer: true, per_hour: w.perHour, used_last_hour: store.writerRateCount(w.pubkey, nowSec) })
   }
-  for (const a of roster.values()) a.is_owner = a.pubkey === config.ownerPubkey
+  for (const a of roster.values()) Object.assign(a, { is_owner: a.pubkey === config.ownerPubkey, is_canon_writer: config.canonWriters.has(a.pubkey) })
   return [...roster.values()]
 }
 

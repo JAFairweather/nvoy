@@ -16,7 +16,7 @@ import {
 } from '../mcp/tools/memory.mjs'
 import {
   HiveMemoryStore, RETENTION_PURGE_AFTER_SEC, acquireStoreLock, initEmptyStore, migrateStoreJson, readLedger, recordVerifiedBackup,
-  restoreSnapshot, snapshotStore, validateAndResolveConfig,
+  canRead, restoreSnapshot, snapshotStore, validateAndResolveConfig, writeRefusal,
 } from '../mcp/tools/hive_memory_store.mjs'
 import { startMemoryDaemon } from '../mcp/tools/memory-daemon.mjs'
 
@@ -963,6 +963,17 @@ const loseHost = p => { for (const f of [p.db, `${p.db}-wal`, `${p.db}-shm`, p.l
   bad({ relayUrl: 'wss://x' }, 'a leftover relay key')
   bad({ writers: { a: { pubkey: biggy.pk, perHour: 1 }, b: { pubkey: biggy.pk, perHour: 1 } } }, 'two writers sharing a pubkey')
   bad({ rooms: { 'not-a-uuid': { members: [], writers: [] } } }, 'a non-UUID room id')
+  bad({ canonWriters: 'abc' }, 'a canonWriters that is not an array')
+  bad({ canonWriters: [crusty.pk.toUpperCase()] }, 'an uppercase canonWriters pubkey')
+  const plain = validateAndResolveConfig(rawConfig())
+  const named = validateAndResolveConfig(rawConfig({ canonWriters: [crusty.pk] }))
+  const canonRow = pk => ({ scope_type: 'hive:canon', pubkey: pk })
+  ok('canonWriters is optional and grants nothing when absent',
+    plain.canonWriters.size === 0 && writeRefusal(plain, null, crusty.pk, { scope: 'hive:canon' }) !== null && !canRead(null, canonRow(crusty.pk), plain))
+  ok('a canonWriter writes and is read in hive:canon; other keys still cannot, and hive:ops is unchanged',
+    writeRefusal(named, null, crusty.pk, { scope: 'hive:canon' }) === null && canRead(null, canonRow(crusty.pk), named) &&
+    writeRefusal(named, null, biggy.pk, { scope: 'hive:canon' }) !== null && !canRead(null, canonRow(biggy.pk), named) &&
+    writeRefusal(named, null, james.pk, { scope: 'hive:canon' }) === null && writeRefusal(named, null, crusty.pk, { scope: 'hive:ops' }) !== null)
 }
 {
   const p = setup('acl')
