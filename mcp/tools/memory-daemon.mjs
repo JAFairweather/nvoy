@@ -19,6 +19,8 @@
 //      accepted-write ledger; until the two reconcile, every read answers 'unknown' and every write is refused.
 //   4. SIGHUP reloads /etc/hive-memory/config.json. An invalid file fails closed (CONFIG_INVALID); a valid one
 //      drops every connection whose binding changed.
+//   5. The daemon never purges. The daily 90-day pass is `bin/hive-memory-purge.mjs --retention`, run with the
+//      service stopped and followed at once by a verified backup, like a hard delete (§4.5).
 
 import { chmodSync, existsSync, mkdirSync, rmSync } from 'node:fs'
 import { createServer } from 'node:net'
@@ -31,7 +33,6 @@ import {
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const SD_LISTEN_FDS_START = 3
 export const MAX_LINE_BYTES = 1024 * 1024
-export const RETENTION_INTERVAL_MS = 24 * 3600 * 1000
 const WRITER_FD_PREFIX = 'writer.'
 
 const withStaleFiles = t => ({
@@ -200,7 +201,6 @@ export async function startMemoryDaemon({
   hooks = {},
   log = msg => console.error(msg),
   now = () => Math.floor(Date.now() / 1000),
-  retentionIntervalMs = RETENTION_INTERVAL_MS,
 } = {}) {
   if (!dbPath || !ledgerPath || !receiptPath) throw new Error('--db, --ledger and --backup-receipt are required')
   const loadConfig = () => (rawConfig ? validateAndResolveConfig(rawConfig) : loadConfigFile(configPath))
@@ -306,12 +306,6 @@ export async function startMemoryDaemon({
     return store.isReady()
   }
 
-  const retentionTimer = setInterval(() => {
-    if (!store.isReady().ready) return
-    try { store.purgeRetention({ nowSec: now() }) } catch (e) { log(`hive-memory: retention purge failed: ${e.code || e.message}`) }
-  }, retentionIntervalMs)
-  retentionTimer.unref?.()
-
   return {
     store,
     bindings,
@@ -319,7 +313,6 @@ export async function startMemoryDaemon({
     connections,
     reload,
     async close() {
-      clearInterval(retentionTimer)
       for (const entry of connections) entry.conn.destroy()
       await Promise.all(servers.map(({ srv }) => new Promise(res => srv.close(() => res()))))
       store.close()

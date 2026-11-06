@@ -99,6 +99,12 @@ const unknownAnswer = (s, label) => {
   const q = s.query({ readerPubkey: james.pk, scope: 'hive:ops', nowSec: T0 + 200 })
   return q.answer === 'unknown' && q.answer_reason === `store-not-ready:${label}` && q.records.length === 0
 }
+const runBin = (script, args) => new Promise(res => {
+  const child = spawn(process.execPath, [`bin/${script}`, ...args], { stdio: ['ignore', 'pipe', 'pipe'] })
+  let stdout = '', stderr = ''
+  child.stdout.on('data', c => { stdout += c }); child.stderr.on('data', c => { stderr += c })
+  child.on('close', status => res({ status, stdout, stderr }))
+})
 const withDb = (path, fn) => { const db = new DatabaseSync(path); try { return fn(db) } finally { db.close() } }
 
 // --- 0. Library: secret guard, retention-class builders and NIP-01 ordering ---
@@ -278,12 +284,7 @@ for (const maxUnbackedSec of [3600, 7200]) {
 }
 {
   // The receipt carries the snapshot's time, so a backup verified late still fences from when it was taken.
-  const backupCli = args => new Promise(res => {
-    const child = spawn(process.execPath, ['bin/hive-memory-backup.mjs', ...args], { stdio: ['ignore', 'pipe', 'pipe'] })
-    let stdout = '', stderr = ''
-    child.stdout.on('data', c => { stdout += c }); child.stderr.on('data', c => { stderr += c })
-    child.on('exit', status => res({ status, stdout, stderr }))
-  })
+  const backupCli = args => runBin('hive-memory-backup.mjs', args)
   const p = setup('receipt-at')
   const now = Math.floor(Date.now() / 1000)
   const snap = await backupCli(['snapshot', '--db', p.db, '--ledger', p.ledger, '--out-db', join(p.dir, 'snap.sqlite'), '--out-ledger', join(p.dir, 'snap.ledger')])
@@ -669,6 +670,10 @@ for (const [label, mutate, state] of [
     out.purged.length === 4 && [old.id, tomb.id, shortLived.id, gone.id].every(id => out.purged.includes(id)) &&
     left.join() === [succ.id, keeper.id].sort().join() && readLedger(p.ledger).lines.at(-1).rec.reason === 'retention')
   ok('retention also prunes writer_rate_log rows older than a day', rate === 0)
+  const fenced = s.submit({ writer: 'james', event: claim(james, 'hive:ops', 'after-retention', { nowSec: now }), expectedPriorId: null, nowSec: now + 1 })
+  ok('the retention purge fences every write until a verified backup covers it (HIVE_MEMORY_PURGE_BACKUP_INCOMPLETE)',
+    fenced.code === 'HIVE_MEMORY_PURGE_BACKUP_INCOMPLETE' && s.db.prepare('SELECT last_purge_seq FROM store_meta').get().last_purge_seq === out.seq)
+  recordVerifiedBackup({ receiptPath: p.receipt, snapshotId: SNAP_ID, writeSeq: out.seq, at: now + 1, nowSec: now + 1 })
   const purgedAgain = s.submit({ writer: 'james', event: old, expectedPriorId: null, nowSec: now + 1 })
   ok('a purged event is never stored again (HIVE_MEMORY_PURGED_EVENT)', purgedAgain.code === 'HIVE_MEMORY_PURGED_EVENT')
   const hd = s.hardDelete({ d: `hive-memory:hive:canon:keeper`, nowSec: now + 2 })
@@ -680,6 +685,57 @@ for (const [label, mutate, state] of [
   const s2 = open(p)
   ok('the store reconciles READY after retention and hard-delete purges', s2.state === 'READY')
   s2.close()
+}
+
+{
+  // One completion barrier for every op purge (§4.5): the 90-day pass whose immediate backup fails, then a hard delete.
+  const p = setup('purge-barrier')
+  const cfgPath = join(p.dir, 'config.json')
+  writeFileSync(cfgPath, JSON.stringify(rawConfig()))
+  const s = open(p)
+  const old = claim(james, 'hive:ops', 'rolling', { ttlSec: 0 })
+  const succ = claim(james, 'hive:ops', 'rolling', { ttlSec: 0, priorCreatedAt: old.created_at })
+  s.submit({ writer: 'james', event: old, expectedPriorId: null, nowSec: T0 + 50 })
+  s.submit({ writer: 'james', event: succ, expectedPriorId: old.id, nowSec: T0 + 51 })
+  const now = succ.created_at + RETENTION_PURGE_AFTER_SEC + 1
+  recordVerifiedBackup({ receiptPath: p.receipt, snapshotId: SNAP_ID, writeSeq: seqOf(s), at: now, nowSec: now })
+  const gateArgs = ['gate', '--ledger', p.ledger, '--backup-receipt', p.receipt]
+  const open0 = await runBin('hive-memory-backup.mjs', gateArgs)
+  ok('the gate opens when a valid receipt covers the ledger head', open0.status === 0 && JSON.parse(open0.stdout).snapshot_id === SNAP_ID)
+  const nothing = s.purgeRetention({ nowSec: now - RETENTION_PURGE_AFTER_SEC })
+  ok('a retention pass with nothing past the window writes no op purge', nothing.purged.length === 0 && seqOf(s) === 3)
+  const out = s.purgeRetention({ nowSec: now })
+  const incomplete = await runBin('hive-memory-backup.mjs', gateArgs)
+  ok('after the 90-day purge, with its backup not verified, the gate exits 1 with the design\'s HIVE_MEMORY_PURGE_BACKUP_INCOMPLETE report',
+    out.seq === 4 && incomplete.status === 1 && incomplete.stderr.includes('HIVE_MEMORY_PURGE_BACKUP_INCOMPLETE: local SQLite and ledger purged at write_seq 4, but off-host B2 backup failed; writers remain FENCED and full-host loss before a verified backup would lack the purge in B2'))
+  const refused = s.submit({ writer: 'james', event: claim(james, 'hive:ops', 'during-incomplete', { nowSec: now }), expectedPriorId: null, nowSec: now + 1 })
+  ok('memory_submit refuses with HIVE_MEMORY_PURGE_BACKUP_INCOMPLETE while lastVerifiedBackup.write_seq < lastPurgeSeq, though the receipt is fresh',
+    refused.code === 'HIVE_MEMORY_PURGE_BACKUP_INCOMPLETE')
+  const snapArgs = n => ['snapshot', '--db', p.db, '--ledger', p.ledger, '--out-db', join(p.dir, `s${n}.sqlite`), '--out-ledger', join(p.dir, `s${n}.ledger`), '--backup-receipt', p.receipt]
+  const snapPurge = JSON.parse((await runBin('hive-memory-backup.mjs', snapArgs(1))).stdout || '{}')
+  ok('the next snapshot reports the uncovered purge, so restic tags it hive-memory-purge', snapPurge.purge === true && snapPurge.last_purge_seq === 4 && snapPurge.write_seq === 4)
+  recordVerifiedBackup({ receiptPath: p.receipt, snapshotId: SNAP_ID, writeSeq: 4, at: now + 1, nowSec: now + 1 })
+  const reopened = await runBin('hive-memory-backup.mjs', gateArgs)
+  const accepted = s.submit({ writer: 'james', event: claim(james, 'hive:ops', 'after-verified', { nowSec: now + 2 }), expectedPriorId: null, nowSec: now + 2 })
+  ok('a verified backup at the purge write_seq completes it: the gate opens and writes resume', reopened.status === 0 && accepted.accepted === true)
+  const behind = await runBin('hive-memory-backup.mjs', gateArgs)
+  ok('the gate stays closed while the receipt is behind the ledger head (HIVE_MEMORY_BACKUP_GATE_CLOSED)', behind.status === 1 && /HIVE_MEMORY_BACKUP_GATE_CLOSED/.test(behind.stderr))
+  const snapClean = JSON.parse((await runBin('hive-memory-backup.mjs', snapArgs(2))).stdout || '{}')
+  ok('a snapshot once the purge is covered no longer asks for the purge tag', snapClean.purge === false && snapClean.last_purge_seq === 4)
+  s.close()
+  const hd = await runBin('hive-memory-purge.mjs', ['--db', p.db, '--ledger', p.ledger, '--backup-receipt', p.receipt, '--config', cfgPath, '--id', succ.id])
+  const hdSeq = JSON.parse(hd.stdout || '{}').write_seq
+  const hdGate = await runBin('hive-memory-backup.mjs', gateArgs)
+  ok('a hard delete through bin/hive-memory-purge goes through the same barrier',
+    hd.status === 0 && hdSeq === 6 && hdGate.status === 1 && hdGate.stderr.includes(`HIVE_MEMORY_PURGE_BACKUP_INCOMPLETE: local SQLite and ledger purged at write_seq ${hdSeq},`))
+  const s2 = open(p)
+  ok('a restarted daemon keeps the barrier: last_purge_seq is in store_meta and the ledger',
+    s2.state === 'READY' && s2.submit({ writer: 'james', event: claim(james, 'hive:ops', 'after-restart', { nowSec: now + 3 }), expectedPriorId: null, nowSec: now + 3 }).code === 'HIVE_MEMORY_PURGE_BACKUP_INCOMPLETE')
+  s2.close()
+  withDb(p.db, d => d.prepare('UPDATE store_meta SET last_purge_seq = 0').run())
+  const s3 = open(p)
+  ok('a store_meta.last_purge_seq that disagrees with the ledger fails closed (PURGE_SEQ_MISMATCH)', s3.state === 'PURGE_SEQ_MISMATCH' && unknownAnswer(s3, 'PURGE_SEQ_MISMATCH'))
+  s3.close()
 }
 
 // --- 5. Read ACL, graph traversal, SIGHUP revocation, and the 5,000-claim fixture (§5 test 5) ---

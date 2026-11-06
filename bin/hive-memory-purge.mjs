@@ -4,10 +4,12 @@
 //   node bin/hive-memory-purge.mjs --db … --ledger … --backup-receipt … --config … (--d <fact key> | --id <event id>)
 //   node bin/hive-memory-purge.mjs --db … --ledger … --backup-receipt … --config … --retention
 //
+// --retention is the daily 90-day pass; with nothing past the window it writes no op purge.
 // Stop hive-memory.service first; the purge takes the store lock and refuses while the daemon holds it.
 // The store must reconcile to READY. A hard delete removes every version at that fact key (or the one
-// event), then VACUUMs and checkpoints so the rows leave the SQLite pages. Take a fresh backup afterwards
-// and remove pre-purge snapshots; a restore of one is refused unless --reapply-purges.
+// event); every purge then checkpoints and VACUUMs so the rows leave the SQLite pages.
+// No purge is complete until a verified backup covers its write_seq: until then `hive-memory-backup.mjs
+// gate` exits with HIVE_MEMORY_PURGE_BACKUP_INCOMPLETE and memory_submit refuses with the same code.
 
 import { HiveMemoryStore, loadConfigFile } from '../mcp/tools/hive_memory_store.mjs'
 

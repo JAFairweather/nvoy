@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS store_meta (
   write_seq INTEGER NOT NULL,
   last_event_id TEXT,
   pending_ledger_json TEXT NOT NULL,
-  initialized_at INTEGER NOT NULL
+  initialized_at INTEGER NOT NULL,
+  last_purge_seq INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS events (
   id TEXT PRIMARY KEY,
@@ -225,13 +226,16 @@ export function applyLedgerRecord(fold, rec) {
   fold.maxSeq = rec.seq
   if (rec.op === 'cutover') for (const id of rec.event_ids) fold.expected.add(id)
   if (rec.op === 'submit') fold.expected.add(rec.id)
-  if (rec.op === 'purge') for (const id of rec.purged_ids) { fold.expected.delete(id); fold.purged.add(id) }
+  if (rec.op === 'purge') {
+    for (const id of rec.purged_ids) { fold.expected.delete(id); fold.purged.add(id) }
+    fold.lastPurgeSeq = rec.seq
+  }
   if (rec.op === 'restore-gap-ack') for (const id of rec.acked_ids) fold.expected.delete(id)
   return fold
 }
 
 export function foldLedger(lines) {
-  const fold = { storeId: null, maxSeq: 0, expected: new Set(), purged: new Set(), lastRaw: null }
+  const fold = { storeId: null, maxSeq: 0, expected: new Set(), purged: new Set(), lastPurgeSeq: 0, lastRaw: null }
   for (const { raw, rec } of lines) { applyLedgerRecord(fold, rec); fold.lastRaw = raw }
   return fold
 }
@@ -293,7 +297,7 @@ function inTransaction(db, fn, hooks = {}, op = '') {
   }
 }
 
-const readMeta = db => db.prepare('SELECT store_id, write_seq, last_event_id, pending_ledger_json FROM store_meta WHERE singleton = 1').get()
+const readMeta = db => db.prepare('SELECT store_id, write_seq, last_event_id, pending_ledger_json, last_purge_seq FROM store_meta WHERE singleton = 1').get()
 const dbEventIds = db => new Set(db.prepare('SELECT id FROM events').all().map(r => r.id))
 const setsEqual = (a, b) => a.size === b.size && [...a].every(x => b.has(x))
 const difference = (a, b) => new Set([...a].filter(x => !b.has(x)))
@@ -498,6 +502,7 @@ export class HiveMemoryStore {
     if (missing.size) return this.#fail('DB_BEHIND_LEDGER', `${missing.size} accepted event(s) missing`)
     const extra = difference(ids, fold.expected)
     if (extra.size) return this.#fail('DB_HAS_UNEXPECTED_OR_PURGED_EVENTS', `${extra.size} unrecorded event(s) present`)
+    if (meta.last_purge_seq !== fold.lastPurgeSeq) return this.#fail('PURGE_SEQ_MISMATCH', `last_purge_seq ${meta.last_purge_seq}, ledger ${fold.lastPurgeSeq}`)
     this.ledgerMaxSeq = fold.maxSeq
     this.purgedIds = fold.purged
     this.state = 'READY'
@@ -537,6 +542,13 @@ export class HiveMemoryStore {
   }
 
   readReceipt() { return readReceiptFile(this.receiptPath) }
+
+  // The unbacked-purge barrier (§4.5): no write until a verified backup covers the last op purge.
+  purgeFence() {
+    const why = purgeBackupIncomplete(readMeta(this.db).last_purge_seq, this.readReceipt())
+    if (why) this.log(`hive-memory: HIVE_MEMORY_PURGE_BACKUP_INCOMPLETE ${why}`)
+    return why
+  }
 
   // The stale-backup admission gate: refuses every new write, even the first after an idle outage.
   backupFence(nowSec) {
@@ -589,6 +601,8 @@ export class HiveMemoryStore {
 
   submit({ writer: writerName, event, expectedPriorId = null, nowSec = nowSecDefault() } = {}) {
     if (!this.isReady().ready) return refusal('HIVE_MEMORY_STORE_NOT_READY', `store not ready: ${this.state}`)
+    const unbacked = this.purgeFence()
+    if (unbacked) return refusal('HIVE_MEMORY_PURGE_BACKUP_INCOMPLETE', unbacked)
     const stale = this.backupFence(nowSec)
     if (stale) return refusal('HIVE_MEMORY_BACKUP_STALE_WRITES_FENCED', stale)
     const writer = this.config.writers.get(writerName)
@@ -638,7 +652,8 @@ export class HiveMemoryStore {
 
   // --- purge (retention and owner hard delete) ---
 
-  #purge(ids, reason, nowSec, { vacuum }) {
+  // Every op purge, retention or hard delete, goes through here and so through the same completion barrier.
+  #purge(ids, reason, nowSec) {
     if (!this.isReady().ready) throw new HiveMemoryError('HIVE_MEMORY_STORE_NOT_READY', `store not ready: ${this.state}`)
     if (!ids.length) return { purged: [] }
     const db = this.db
@@ -647,14 +662,17 @@ export class HiveMemoryStore {
       db.prepare('DELETE FROM events WHERE id IN (SELECT value FROM json_each(?))').run(list)
       db.prepare('DELETE FROM writer_rate_log WHERE event_id IN (SELECT value FROM json_each(?)) OR accepted_at < ?').run(list, nowSec - 86400)
       const last = db.prepare('SELECT id FROM events ORDER BY ingested_at DESC, rowid DESC LIMIT 1').get()?.id ?? null
-      return this.#stage(readMeta(db), 'purge', { purged_ids: [...ids].sort(), reason }, nowSec, last)
+      const staged = this.#stage(readMeta(db), 'purge', { purged_ids: [...ids].sort(), reason }, nowSec, last)
+      db.prepare('UPDATE store_meta SET last_purge_seq = ? WHERE singleton = 1').run(staged.seq)
+      return staged
     }, this.hooks, 'purge')
     this.hooks.afterCommit?.('purge')
     if (!this.#phase2(staged.line, staged.seq)) throw new HiveMemoryError('HIVE_MEMORY_LEDGER_IO_ERROR', 'the accepted-write ledger could not be appended')
     for (const id of ids) this.purgedIds.add(id)
-    if (vacuum) db.exec('VACUUM')
     db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
-    this.log(`hive-memory: purged ${ids.length} event(s) (${reason}, seq ${staged.seq})`)
+    db.exec('VACUUM')
+    db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+    this.log(`hive-memory: purged ${ids.length} event(s) (${reason}, seq ${staged.seq}); writes stay fenced until a verified backup covers it`)
     return { purged: ids, seq: staged.seq }
   }
 
@@ -669,7 +687,7 @@ export class HiveMemoryStore {
 
   purgeRetention({ nowSec = nowSecDefault() } = {}) {
     if (!this.isReady().ready) throw new HiveMemoryError('HIVE_MEMORY_STORE_NOT_READY', `store not ready: ${this.state}`)
-    return this.#purge(this.retentionCandidates(nowSec), 'retention', nowSec, { vacuum: false })
+    return this.#purge(this.retentionCandidates(nowSec), 'retention', nowSec)
   }
 
   hardDelete({ d = null, id = null, nowSec = nowSecDefault() } = {}) {
@@ -679,7 +697,7 @@ export class HiveMemoryStore {
       ? this.db.prepare('SELECT id FROM events WHERE d = ?').all(String(d)).map(r => r.id)
       : this.db.prepare('SELECT id FROM events WHERE id = ?').all(String(id)).map(r => r.id)
     if (!ids.length) throw new HiveMemoryError('HIVE_MEMORY_PURGE_NO_MATCH', 'no stored event matches')
-    return this.#purge(ids, 'hard-delete', nowSec, { vacuum: true })
+    return this.#purge(ids, 'hard-delete', nowSec)
   }
 
   // --- reads ---
@@ -907,8 +925,27 @@ export async function snapshotStore({ dbPath, ledgerPath, snapshotPath, ledgerCu
     rmSync(snapshotPath, { force: true })
     throw new HiveMemoryError('HIVE_MEMORY_BACKUP_REFUSED', `the ledger (${lines.length}) is behind the snapshot (${snapshotSeq}); retry`)
   }
-  writeFileSync(ledgerCutPath, lines.slice(0, snapshotSeq).map(l => `${l.raw}\n`).join(''), { mode: 0o600 })
-  return { snapshotSeq, snapshotAt, snapshotPath, ledgerCutPath }
+  const cut = lines.slice(0, snapshotSeq)
+  writeFileSync(ledgerCutPath, cut.map(l => `${l.raw}\n`).join(''), { mode: 0o600 })
+  return { snapshotSeq, snapshotAt, snapshotPath, ledgerCutPath, lastPurgeSeq: foldLedger(cut).lastPurgeSeq }
+}
+
+export function purgeBackupIncomplete(lastPurgeSeq, receipt) {
+  if (!lastPurgeSeq || (receipt && receipt.write_seq >= lastPurgeSeq)) return null
+  return `local SQLite and ledger purged at write_seq ${lastPurgeSeq}, but off-host B2 backup failed; writers remain FENCED and full-host loss before a verified backup would lack the purge in B2`
+}
+
+// `writers on` opens the sockets only when a verified receipt covers exactly the ledger head.
+export function backupGate({ ledgerPath, receiptPath }) {
+  const { lines } = readLedger(ledgerPath)
+  if (!lines.length) throw new HiveMemoryError('HIVE_MEMORY_BACKUP_GATE_CLOSED', 'the ledger is missing or empty')
+  const fold = foldLedger(lines)
+  const receipt = readReceiptFile(receiptPath)
+  const unbacked = purgeBackupIncomplete(fold.lastPurgeSeq, receipt)
+  if (unbacked) throw Object.assign(new HiveMemoryError('HIVE_MEMORY_PURGE_BACKUP_INCOMPLETE', unbacked), { purgeSeq: fold.lastPurgeSeq })
+  if (!receipt) throw new HiveMemoryError('HIVE_MEMORY_BACKUP_GATE_CLOSED', 'no valid verified backup receipt with a 64-hex snapshot_id')
+  if (receipt.write_seq !== fold.maxSeq) throw new HiveMemoryError('HIVE_MEMORY_BACKUP_GATE_CLOSED', `receipt write_seq ${receipt.write_seq} does not match the ledger head ${fold.maxSeq}`)
+  return { write_seq: fold.maxSeq, snapshot_id: receipt.snapshot_id, last_purge_seq: fold.lastPurgeSeq }
 }
 
 // A receipt counts only with a positive at and write_seq and the restic snapshot's exact 64-hex id.
@@ -979,6 +1016,7 @@ export function restoreSnapshot({
         db.prepare('DELETE FROM writer_rate_log WHERE event_id IN (SELECT value FROM json_each(?))').run(JSON.stringify([...fold.purged]))
         const last = db.prepare('SELECT id FROM events ORDER BY ingested_at DESC, rowid DESC LIMIT 1').get()?.id ?? null
         db.prepare('UPDATE store_meta SET last_event_id = ? WHERE singleton = 1').run(last)
+        db.prepare('UPDATE store_meta SET last_purge_seq = ? WHERE singleton = 1').run(fold.lastPurgeSeq)
         if (!missing.size) db.prepare('UPDATE store_meta SET write_seq = ?, pending_ledger_json = ? WHERE singleton = 1').run(fold.maxSeq, fold.lastRaw)
       })
       db.exec('VACUUM')
@@ -998,7 +1036,7 @@ export function restoreSnapshot({
       gapLine = inTransaction(db, () => {
         const seq = fold.maxSeq + 1
         const line = JSON.stringify({ seq, op: 'restore-gap-ack', store_id: fold.storeId, acked_ids: [...missing].sort(), at: nowSec })
-        db.prepare('UPDATE store_meta SET write_seq = ?, pending_ledger_json = ? WHERE singleton = 1').run(seq, line)
+        db.prepare('UPDATE store_meta SET write_seq = ?, pending_ledger_json = ?, last_purge_seq = ? WHERE singleton = 1').run(seq, line, fold.lastPurgeSeq)
         return { seq, line }
       }, hooks, 'restore-gap-ack')
     }
