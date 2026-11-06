@@ -513,6 +513,24 @@ for (const [label, mutate, state] of [
   if (!existsSync(p.db)) ok(`${label}: startup never creates a database implicitly`, !existsSync(p.db))
 }
 
+// 3.4b Canon is a handful of standing decisions; the wake digest shows all of it before room notes take the rest.
+// With a fixed 35% canon share, five canon claims of the real length lost the oldest, James's priorities (2026-11-06).
+{
+  const p = setup('wake-canon')
+  const s = open(p)
+  const long = n => `${'standing decision '.repeat(18)}${n}`
+  const canonEvents = [1, 2, 3, 4, 5].map(n => claim(james, 'hive:canon', `canon-${n}`, { ttlSec: 0, claim: long(n) }))
+  for (const ev of canonEvents) s.submit({ writer: 'james', event: ev, expectedPriorId: null, nowSec: T0 + 200 })
+  for (let n = 0; n < 40; n++) s.submit({ writer: 'ops', event: claim(opsBot, 'hive:ops', `ops-${n}`, { claim: `${'room note '.repeat(25)}${n}` }), expectedPriorId: null, nowSec: T0 + 200 })
+  const wake = s.wake({ readerPubkey: james.pk, nowSec: T0 + 300 })
+  ok('the wake digest shows every canon claim, the oldest included, and fills the rest with ops within budget',
+    wake.counts.canon_shown === 5 && wake.counts.canon_omitted === 0 && wake.digest.includes('canon-1]') &&
+    wake.counts.ops_shown > 0 && wake.counts.ops_omitted > 0 && wake.char_length <= wake.max_chars)
+  const tight = s.wake({ readerPubkey: james.pk, maxChars: 1000, nowSec: T0 + 300 })
+  ok('a tight budget still keeps room for ops and stays within it', tight.char_length <= 1000 && tight.counts.canon_shown >= 1 && tight.digest.includes('Rank 3'))
+  s.close()
+}
+
 // 3.5 A failed Phase 2 append moves the store to LEDGER_IO_ERROR and never returns accepted.
 {
   const p = setup('ledger-io')
