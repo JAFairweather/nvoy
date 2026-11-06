@@ -231,6 +231,28 @@ await test('computeCoherence calculates 5-axis HCI score and retroactive incepti
   assert.equal(coh.history.length, 2)
   assert.equal(coh.history[0].claims, 1)
   assert.equal(coh.history[1].claims, 3)
+
+  // Verify history_records folds supersessions and withdrawals at their chronological epoch
+  const historyWithWithdrawal = [
+    ...records,
+    {
+      ...records[0],
+      event_id: 'w'.repeat(64),
+      status: 'withdrawn',
+      verification: 'withdrawn',
+      is_current: true,
+      created_at: 1300,
+    },
+  ]
+  const coh2 = computeCoherence({
+    records: records.slice(1),
+    history_records: historyWithWithdrawal,
+    agent_roster: roster,
+    store_state: { write_seq: 7 },
+  })
+  assert.equal(coh2.total_events, 4)
+  assert.equal(coh2.history.at(-1).events, 4)
+  assert.equal(coh2.history.at(-1).claims, 2)
 })
 
 await test('live integration: memory-viewer polls memory-daemon viewer socket, streams SSE, and refuses non-GET', async () => {

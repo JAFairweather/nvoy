@@ -118,6 +118,8 @@ export function sanitizeMemoryRecord(rec) {
     scope: String(rec.scope || ''),
     d: String(rec.d || ''),
     topic: String(rec.topic || ''),
+    status: rec.status ? String(rec.status) : 'active',
+    is_current: rec.is_current === undefined ? true : Boolean(rec.is_current),
     claim: String(rec.claim || ''),
     because: String(rec.because || ''),
     evidence: Array.isArray(rec.evidence) ? rec.evidence.map(e => String(e)) : [],
@@ -287,13 +289,17 @@ function evaluateCoherenceSlice(slice, rosterByPk, expectedRosterSize, writeSeqE
 
 export function computeCoherence({
   records = [],
+  history_records = null,
   agent_roster = [],
   recent_activity = [],
   store_state = {},
 } = {}) {
-  const chronological = [...(Array.isArray(records) ? records : [])]
+  const sourceEvents = Array.isArray(history_records) && history_records.length > 0
+    ? history_records
+    : (Array.isArray(records) ? records : [])
+  const chronological = [...sourceEvents]
     .filter(Boolean)
-    .sort((a, b) => (a.created_at || 0) - (b.created_at || 0))
+    .sort((a, b) => (a.created_at || 0) - (b.created_at || 0) || (String(a.event_id || '') < String(b.event_id || '') ? -1 : 1))
   const rosterByPk = new Map()
   let writerCount = 0
   for (const a of Array.isArray(agent_roster) ? agent_roster : []) {
@@ -308,6 +314,7 @@ export function computeCoherence({
       inception_at: null,
       inception_score: 0,
       delta_since_inception: 0,
+      total_events: 0,
       shared_artifacts: 0,
       axes: { alignment: 0, grounding: 0, convergence: 0, coupling: 0, consolidation: 0 },
       history: [],
@@ -315,17 +322,40 @@ export function computeCoherence({
   }
 
   const total = chronological.length
-  const rawSteps = [1, 5, 10, 20, 30, 40, 50, 65, 80, total]
+  const rawSteps = [1, 5, 10, 20, 30, 40, 50, 65, 80, 100, 125, 150, total]
   const uniqueSteps = [...new Set(rawSteps.filter(k => k >= 1 && k <= total))].sort((a, b) => a - b)
+  while (uniqueSteps.length > 10) {
+    uniqueSteps.splice(1, 1)
+  }
   if (uniqueSteps[uniqueSteps.length - 1] !== total) uniqueSteps.push(total)
 
-  const history = uniqueSteps.map(k => {
-    const sub = chronological.slice(0, k)
-    const writeEst = k === total && Number.isSafeInteger(store_state?.write_seq)
-      ? store_state.write_seq
-      : Math.round(k * 1.3)
-    return evaluateCoherenceSlice(sub, rosterByPk, expectedRosterSize, writeEst)
-  })
+  // Replay historical events (including supersessions and withdrawals) chronologically from inception.
+  const stepSet = new Set(uniqueSteps)
+  const activeHeads = new Map()
+  const history = []
+  for (let i = 0; i < total; i++) {
+    const ev = chronological[i]
+    const headKey = `${ev.author_pubkey || ''}:${ev.d || ''}`
+    if (ev.status === 'withdrawn' || ev.verification === 'withdrawn') {
+      activeHeads.delete(headKey)
+    } else {
+      activeHeads.set(headKey, ev)
+    }
+    const stepNum = i + 1
+    if (stepSet.has(stepNum)) {
+      const epochAt = ev.created_at || 0
+      const activeAtEpoch = [...activeHeads.values()].filter(
+        r => r.expires_at === null || r.expires_at === undefined || r.expires_at > epochAt
+      )
+      const writeSeqAtEpoch = stepNum === total && Number.isSafeInteger(store_state?.write_seq)
+        ? Math.max(stepNum, store_state.write_seq)
+        : stepNum
+      const snap = evaluateCoherenceSlice(activeAtEpoch, rosterByPk, expectedRosterSize, writeSeqAtEpoch)
+      snap.at = epochAt || snap.at
+      snap.events = stepNum
+      history.push(snap)
+    }
+  }
 
   const current = history[history.length - 1]
   const inception = history[0]
@@ -348,6 +378,7 @@ export function computeCoherence({
     inception_at: chronological[0]?.created_at || null,
     inception_score: inception.score,
     delta_since_inception: Math.round((current.score - inception.score) * 10) / 10,
+    total_events: total,
     shared_artifacts: current.shared_refs,
     axes: current.axes,
     history,
@@ -2607,40 +2638,63 @@ export async function startMemoryViewer({
     let nextSnapshot
     try {
       const wake = await client.callReadTool('memory_wake', {})
-      const query = await client.callReadTool('memory_query', { limit: 100, format: 'full' })
-
       const byKey = new Map()
-      for (const r of Array.isArray(query?.records) ? query.records : []) {
-        const clean = sanitizeMemoryRecord(r)
-        if (clean) byKey.set(`${clean.author_pubkey}:${clean.d}`, clean)
+      const byEventId = new Map()
+      let firstQuery = null
+      let cursor = '0'
+      let pages = 0
+      while (cursor !== null && pages < 50) {
+        const page = await client.callReadTool('memory_query', {
+          limit: 100,
+          format: 'full',
+          include_history: true,
+          ...(cursor !== '0' ? { cursor } : {}),
+        })
+        if (!firstQuery) firstQuery = page
+        for (const r of Array.isArray(page?.records) ? page.records : []) {
+          const clean = sanitizeMemoryRecord(r)
+          if (!clean) continue
+          if (clean.event_id) byEventId.set(clean.event_id, clean)
+          if (clean.is_current && clean.status !== 'withdrawn' && clean.verification === 'accepted') {
+            byKey.set(`${clean.author_pubkey}:${clean.d}`, clean)
+          }
+        }
+        cursor = typeof page?.next_cursor === 'string' && page.next_cursor ? page.next_cursor : null
+        pages += 1
       }
       // Since Phase 2 wake records are bare references (no claim); only full records are shown.
       for (const r of Array.isArray(wake?.records) ? wake.records.filter(x => typeof x?.claim === 'string') : []) {
         const clean = sanitizeMemoryRecord(r)
         if (clean && !byKey.has(`${clean.author_pubkey}:${clean.d}`)) {
           byKey.set(`${clean.author_pubkey}:${clean.d}`, clean)
+          if (clean.event_id && !byEventId.has(clean.event_id)) byEventId.set(clean.event_id, clean)
         }
       }
       const records = [...byKey.values()].sort(
         (a, b) => (a.computed_rank || 99) - (b.computed_rank || 99) || (b.created_at || 0) - (a.created_at || 0)
       )
+      const historyRecords = [...byEventId.values()]
       const scopeCounts = computeScopeCounts(wake?.counts, records)
       const agentRoster = (Array.isArray(wake?.agent_roster) ? wake.agent_roster : []).map(sanitizeRosterEntry).filter(Boolean)
       const recentActivity = (Array.isArray(wake?.recent_activity) ? wake.recent_activity : []).map(sanitizeActivity).filter(Boolean)
-      const storeState = wake?.store_state || query?.store_state || { state: 'UNKNOWN', write_seq: null, current_claims: null, last_backup_age_sec: null, unbacked_writes: null }
+      const storeState = wake?.store_state || firstQuery?.store_state || { state: 'UNKNOWN', write_seq: null, current_claims: null, last_backup_age_sec: null, unbacked_writes: null }
       const coherence = computeCoherence({
         records,
+        history_records: historyRecords,
         agent_roster: agentRoster,
         recent_activity: recentActivity,
         store_state: storeState,
       })
+      const queryAnswer = firstQuery?.answer === 'unknown'
+        ? 'unknown'
+        : (records.length > 0 ? 'found' : String(firstQuery?.answer || 'unknown'))
 
       nextSnapshot = {
         connected: true,
         error: null,
         server_name: client.getServerName() || 'hive-memory-viewer',
-        reader: String(wake?.reader || query?.reader || 'viewer'),
-        reader_pubkey: wake?.reader_pubkey || query?.reader_pubkey || null,
+        reader: String(wake?.reader || firstQuery?.reader || 'viewer'),
+        reader_pubkey: wake?.reader_pubkey || firstQuery?.reader_pubkey || null,
         authority: null,
         trustedInstruction: false,
         polled_at: nowSec,
@@ -2648,7 +2702,7 @@ export async function startMemoryViewer({
         store_state: storeState,
         scope_counts: scopeCounts,
         coherence,
-        query_answer: String(query?.answer || 'unknown'),
+        query_answer: queryAnswer,
         records,
         agent_roster: agentRoster,
         recent_activity: recentActivity,
