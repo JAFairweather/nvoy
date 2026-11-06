@@ -48,6 +48,12 @@ Add one manifest field: `may_post.mention_rooms: true`, default false.
 An explicit field, rather than a default, keeps the widening visible in the manifest. It also keeps
 an identity's scope from growing silently on upgrade.
 
+The flag needs a second field: `buzz.relay_signer`, the hex pubkey the Buzz relay signs its room
+lists with. Both fields come from trusted instance configuration, set at rollout and by onboarding.
+If `mention_rooms` is true and `buzz.relay_signer` is missing or invalid, `readManifest` refuses the
+manifest, so the feature fails closed. The key is never learned from the relay itself: NIP-11 served
+by the same relay is not an independent pin.
+
 ### 2. The roster: who is in each room
 
 The broker reads it, because it holds the NIP-42 login (`openBuzzSession` plus `brokerSigner`, as
@@ -58,8 +64,14 @@ For each room R in `may_post.channels`, the read is:
 This is the same read `onboard_join.mjs` `inRoom` makes. Factor it into one shared function and use
 it in both places.
 
-Trust: the same as for 44100/44101 today. The relay makes 39002 and refuses a client-submitted one.
-Verify the event signature. The open question (Q1) is whether to also pin the relay's own pubkey.
+Trust: the room list counts only when all of these hold.
+- The event's `pubkey` is the pinned `buzz.relay_signer`.
+- Its signature verifies.
+- It has exactly one `d` tag, equal to R, and any `h` tag equals R.
+
+Any other event is ignored. If no event passes, the room has no roster: an empty roster, never the
+last one carried over. The shared read takes the pinned key as an argument. `onboard_join` passes the
+signer from the configuration it writes the new manifest from.
 
 The broker drops itself from the roster. A member with no usable key is skipped.
 
@@ -87,11 +99,13 @@ It is written with the same rules as `mention-grants.json`:
 
 The broker refreshes the file:
 - at start, then every 5 minutes, on a daemon timer;
-- in the post and reply paths, whenever a requested key is on no list (the same hook the grants
-  check uses, `instance-broker-post.mjs:51`);
+- in the post and reply paths, with each pre-signing read of a room-derived key (§4; the same hook
+  the grants check uses, `instance-broker-post.mjs:51`);
 - in the hourly card run.
 
-A failed read keeps the last good file, and logs it.
+A failed read keeps the last good file, and logs it. That file is for **discovery** only: what the
+channel MCPs show and resolve `@name` against. The broker never signs a room-derived mention on the
+strength of the file (see §4).
 
 ### 4. One merged view, per room
 
@@ -107,13 +121,18 @@ Who uses it:
 - **Channel MCPs:** `mentionView` reads both files on every call. `resolvePost` and
   `resolveReplyMention` resolve against the target channel. A reply resolves against the
   envelope's own channel.
-- **Broker, post path:**
-  - If a key is off the manifest list, check the grants, then the roster for the request's channel.
-  - If the key is on neither, refresh the roster once and check again.
-  - Only then refuse, with the existing `NVOY_POST_MENTION_REFUSED`.
-  - If the roster can't be read, hold the post for retry, as the grants path does today
-    (`instance-broker-post.mjs:56`). Don't refuse it.
-- **Broker, reply path:** the same check (`instance-broker-reply.mjs:151-155`).
+- **Broker, post path.** A key on the manifest list, or on a live mention grant, goes ahead as
+  today. Any other key can only be **room-derived**. For a room-derived key, the broker re-reads the
+  authoritative roster (§2) for the request's channel **immediately before it signs**, on every
+  attempt, retries included:
+  - the key is in the fresh roster: sign and publish;
+  - the key is not in it: refuse, with the existing `NVOY_POST_MENTION_REFUSED`;
+  - the roster can't be read, or no event passes the checks: hold the post for retry, as the grants
+    path does today (`instance-broker-post.mjs:56`). Don't refuse it, and don't fall back to the file.
+
+  The fresh read also rewrites `mention-rooms.json`, so the discovery view catches up.
+- **Broker, reply path:** the same check, with the same pre-signing read
+  (`instance-broker-reply.mjs:151-155`).
 
 ### 5. What the agent is told
 
@@ -130,9 +149,10 @@ Who uses it:
 
 ### 6. Leaving a room
 
-A member who leaves drops out at the next refresh, within 5 minutes. A post already queued with that
-mention is re-checked by the broker and refused if the member has gone. A manifest entry or a grant
-for the same key still works.
+A member who leaves drops out of the discovery view at the next refresh, within 5 minutes. It can't
+be tagged in the meantime: the broker's pre-signing read (§4) refuses a room-derived mention of a
+member who has gone, including one queued while they were still in the room. A manifest entry or a
+grant for the same key still works.
 
 ### 7. The givers step (#324)
 
@@ -151,12 +171,17 @@ flag.
   - the broker drops itself.
 - **Roster read:**
   - the newest 39002 wins;
-  - a bad signature is ignored;
-  - a failed read keeps the last good file.
-- **Broker post path:**
-  - an unknown key triggers one refresh, then a refusal;
-  - an unreadable roster holds the post;
-  - a member who has left is refused at drain.
+  - each of these is ignored: a bad signature, an author other than the pinned signer, a `d` that
+    is not the room, two `d` tags, and an `h` that is not the room;
+  - with no event passing, the roster is empty;
+  - a failed read keeps the last good discovery file.
+- **Manifest:** `mention_rooms: true` without a valid `buzz.relay_signer` is refused.
+- **Broker post and reply paths:**
+  - a room-derived key is read fresh before signing, and refused when absent;
+  - an unreadable roster holds the post, even when the discovery file still lists the member;
+  - **leave between queue and send:** the member is in the roster when the post is queued and
+    gone at drain, so the post is refused;
+  - a retry reads the roster again, never reusing an earlier attempt's read.
 - **Channel MCP end to end**, in the style of `test/mention-grants.mjs`: a member added to the
   fixture roster file becomes mentionable on the next call, with no restart.
 - **Onboarding:**
@@ -170,10 +195,12 @@ flag.
 3. Within 5 minutes, all three can mention each other. Read back each tagged kind 9 cold from the
    relay. Then check, from the container's start time, that no identity restarted.
 
-## Open questions for review
+## Settled in review (mydude, 2026-11-06)
 
-- **Q1.** Is the Buzz relay's refusal of client-made 39002 enough, or should the roster read also
-  pin the relay pubkey (NIP-11)? `inRoom` checks neither today.
-- **Q2.** Opt-in field, or default-on for `may_post.channels`? This spec says opt-in (see §1).
-- **Q3.** Is a 5-minute refresh right? The on-demand refresh covers the key path. A `@name` written
-  in the text for a brand-new member can still miss it for up to 5 minutes.
+- **Q1. Pin the relay signer.** Take it from trusted instance configuration and check each
+  39002's author, signature and exact room tags. NIP-11 from the same relay doesn't count as a pin.
+- **Q2. Explicit opt-in.** `mention_rooms` is false by default.
+- **Q3. 5 minutes is fine for discovery,** including when a new member's `@name` becomes visible.
+- **Required change, made here:** any room-derived mention re-reads the authoritative roster
+  immediately before signing, retries included. A failed read holds the post, and a member who
+  has left is refused. The cached file is never authority (§3, §4, §6, and the leave-between test).
