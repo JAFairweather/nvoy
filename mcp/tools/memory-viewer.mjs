@@ -199,6 +199,161 @@ export function computeScopeCounts(wakeCounts = {}, records = []) {
   }
 }
 
+const CANON_PRIORITY_TOPICS = new Set([
+  'r1',
+  'primer',
+  'illustrated-primer',
+  'hive-memory',
+  'nvoy',
+  'herd-infra',
+  'hive',
+  'buzz',
+  'waggle',
+])
+const KEBAB_TOPIC_RE = /^[a-z0-9][a-z0-9-]{0,31}$/
+const ARTIFACT_REF_RE = /\b(?:PR\s*#?\d+|#\d{2,4}|(?:nvoy|rabidrabbit|herd-infra|waggle)@[0-9a-f]{7})/gi
+
+function evaluateCoherenceSlice(slice, rosterByPk, expectedRosterSize, writeSeqEst) {
+  if (!Array.isArray(slice) || slice.length === 0) {
+    return {
+      at: null,
+      claims: 0,
+      authors: 0,
+      shared_refs: 0,
+      score: 0,
+      axes: { alignment: 0, grounding: 0, convergence: 0, coupling: 0, consolidation: 0 },
+    }
+  }
+  const nonCanon = slice.filter(r => r.scope !== 'hive:canon')
+  const canonCount = slice.length - nonCanon.length
+  const canonFactor = Math.min(1, canonCount / 5)
+  const alignedCount = nonCanon.filter(r => CANON_PRIORITY_TOPICS.has(String(r.topic || ''))).length
+  const alignedRatio = nonCanon.length > 0 ? alignedCount / nonCanon.length : 1
+  const kebabCount = slice.filter(r => KEBAB_TOPIC_RE.test(String(r.topic || ''))).length
+  const kebabRatio = kebabCount / slice.length
+  const alignment = Math.round((0.35 * canonFactor + 0.35 * alignedRatio + 0.3 * kebabRatio) * 1000) / 10
+
+  const anchoredCount = nonCanon.filter(r => Boolean(r.as_of_git || r.as_of_evt)).length
+  const anchoredRatio = nonCanon.length > 0 ? anchoredCount / nonCanon.length : 1
+  const cleanCount = slice.filter(r => !r.conflict && !r.stale_warning).length
+  const cleanRatio = cleanCount / slice.length
+  const grounding = Math.round((0.5 * anchoredRatio + 0.5 * cleanRatio) * 1000) / 10
+
+  const artifactAuthors = new Map()
+  const authors = new Set()
+  for (const r of slice) {
+    const pk = String(r.author_pubkey || '')
+    const actor = rosterByPk.get(pk) || pk.slice(0, 8) || 'unknown'
+    authors.add(actor)
+    const blob = [r.as_of_git || '', r.claim || '', ...(Array.isArray(r.evidence) ? r.evidence : [])].join(' ')
+    const matches = blob.match(ARTIFACT_REF_RE) || []
+    for (const raw of matches) {
+      const norm = raw.replace(/\s+/g, '').toUpperCase()
+      let set = artifactAuthors.get(norm)
+      if (!set) {
+        set = new Set()
+        artifactAuthors.set(norm, set)
+      }
+      set.add(actor)
+    }
+  }
+  let sharedRefs = 0
+  for (const set of artifactAuthors.values()) {
+    if (set.size >= 2) sharedRefs += 1
+  }
+  const convergence = Math.round(Math.min(100, sharedRefs * 8.5) * 10) / 10
+
+  const denomAuthors = Math.max(1, Math.min(14, expectedRosterSize || 14))
+  const coupling = Math.round(Math.min(100, (authors.size / denomAuthors) * 100) * 10) / 10
+
+  const durableCount = slice.filter(r => r.scope === 'hive:canon' || r.expires_at === null || r.expires_at === undefined).length
+  const durableRatio = durableCount / slice.length
+  let reuseBonus = 1
+  if (Number.isSafeInteger(writeSeqEst) && writeSeqEst > slice.length) {
+    reuseBonus = Math.min(1, 0.7 + 0.3 * ((writeSeqEst - slice.length) / Math.max(1, writeSeqEst)))
+  }
+  const consolidation = Math.round(Math.min(100, (0.6 * Math.min(1, durableRatio / 0.35) + 0.4 * reuseBonus) * 100) * 10) / 10
+
+  const score = Math.round((0.25 * alignment + 0.2 * grounding + 0.25 * convergence + 0.15 * coupling + 0.15 * consolidation) * 10) / 10
+  return {
+    at: slice[slice.length - 1]?.created_at || null,
+    claims: slice.length,
+    authors: authors.size,
+    shared_refs: sharedRefs,
+    score,
+    axes: { alignment, grounding, convergence, coupling, consolidation },
+  }
+}
+
+export function computeCoherence({
+  records = [],
+  agent_roster = [],
+  recent_activity = [],
+  store_state = {},
+} = {}) {
+  const chronological = [...(Array.isArray(records) ? records : [])]
+    .filter(Boolean)
+    .sort((a, b) => (a.created_at || 0) - (b.created_at || 0))
+  const rosterByPk = new Map()
+  let writerCount = 0
+  for (const a of Array.isArray(agent_roster) ? agent_roster : []) {
+    if (a?.pubkey) rosterByPk.set(a.pubkey, a.id)
+    if (a?.is_writer) writerCount += 1
+  }
+  const expectedRosterSize = writerCount > 0 ? Math.min(14, writerCount) : 14
+
+  if (chronological.length === 0) {
+    return {
+      score: 0,
+      inception_at: null,
+      inception_score: 0,
+      delta_since_inception: 0,
+      shared_artifacts: 0,
+      axes: { alignment: 0, grounding: 0, convergence: 0, coupling: 0, consolidation: 0 },
+      history: [],
+    }
+  }
+
+  const total = chronological.length
+  const rawSteps = [1, 5, 10, 20, 30, 40, 50, 65, 80, total]
+  const uniqueSteps = [...new Set(rawSteps.filter(k => k >= 1 && k <= total))].sort((a, b) => a - b)
+  if (uniqueSteps[uniqueSteps.length - 1] !== total) uniqueSteps.push(total)
+
+  const history = uniqueSteps.map(k => {
+    const sub = chronological.slice(0, k)
+    const writeEst = k === total && Number.isSafeInteger(store_state?.write_seq)
+      ? store_state.write_seq
+      : Math.round(k * 1.3)
+    return evaluateCoherenceSlice(sub, rosterByPk, expectedRosterSize, writeEst)
+  })
+
+  const current = history[history.length - 1]
+  const inception = history[0]
+  const activityList = Array.isArray(recent_activity) ? recent_activity : []
+  if (activityList.length > 0) {
+    const refusals = activityList.filter(a => a?.kind === 'refused').length
+    const gateHygiene = Math.max(0, 1 - refusals / activityList.length)
+    current.axes.coupling = Math.round((0.7 * current.axes.coupling + 0.3 * (gateHygiene * 100)) * 10) / 10
+    current.score = Math.round((
+      0.25 * current.axes.alignment +
+      0.2 * current.axes.grounding +
+      0.25 * current.axes.convergence +
+      0.15 * current.axes.coupling +
+      0.15 * current.axes.consolidation
+    ) * 10) / 10
+  }
+
+  return {
+    score: current.score,
+    inception_at: chronological[0]?.created_at || null,
+    inception_score: inception.score,
+    delta_since_inception: Math.round((current.score - inception.score) * 10) / 10,
+    shared_artifacts: current.shared_refs,
+    axes: current.axes,
+    history,
+  }
+}
+
 export function diffViewerSnapshots(prev, next, nowSec = Math.floor(Date.now() / 1000)) {
   const events = []
   const push = (kind, summary) => events.push({ at: nowSec, kind, summary: String(summary) })
@@ -865,6 +1020,7 @@ export function renderViewerHtml(initialState) {
           <span class="mobile-kpi-pill" id="m-kpi-seq">seq: -</span>
           <span class="mobile-kpi-pill" id="m-kpi-claims">claims: -</span>
           <span class="mobile-kpi-pill" id="m-kpi-tiers">-</span>
+          <button class="mobile-kpi-pill" id="m-kpi-coherence" type="button" style="cursor:pointer;color:#6ee7b7;border-color:rgba(52,211,153,0.4);">coh: -</button>
         </div>
         <div class="quarantine-banner">
           reader: <span id="reader-name">${readerName}</span> (<span id="server-name">${serverName}</span>) |
@@ -897,6 +1053,11 @@ export function renderViewerHtml(initialState) {
         <span class="metric-label">Memory Tiers</span>
         <span id="hud-tiers" class="metric-val">-</span>
         <span id="hud-forecast" class="metric-sub">at now</span>
+      </div>
+      <div class="metric" id="coherence-card" style="cursor:pointer;" title="Tap to inspect 5-axis Hive Coherence Index and retroactive inception timeline">
+        <span class="metric-label" style="color:#6ee7b7;">Hive Coherence</span>
+        <span id="coherence-val" class="metric-val" style="color:#6ee7b7;">-</span>
+        <span id="coherence-sub" class="metric-sub">tap for timeline</span>
       </div>
     </div>
   </header>
@@ -1013,15 +1174,19 @@ export function renderViewerHtml(initialState) {
         james: { name: 'James', model: 'Sovereign Key', color: '#fbbf24' },
         biggy: { name: 'Biggy', model: 'Gemini / Antigravity', color: '#818cf8' },
         rabidrabbit: { name: 'RabidRabbit', model: 'Claude Opus 4.6', color: '#f59e0b' },
+        'dead-rabbit': { name: 'Dead Rabbit', model: 'Claude Opus 4.6', color: '#f59e0b' },
         mydude: { name: 'My Dude', model: 'OpenAI Codex', color: '#10b981' },
         neil: { name: 'Neil', model: 'OpenAI Codex', color: '#38bdf8' },
         'waggle-dev': { name: 'Waggle-Dev', model: 'Claude Sonnet 4.6', color: '#fb923c' },
         crystalclaude: { name: 'CrystalClaude', model: 'Claude Opus 4.6', color: '#f472b6' },
         'dj-codex': { name: 'DJ-Codex', model: 'OpenAI Codex', color: '#34d399' },
+        djcodex: { name: 'DJ Codex', model: 'OpenAI Codex', color: '#34d399' },
+        dennis: { name: 'Dennis', model: 'Claude Opus 4.6', color: '#60a5fa' },
+        kerouac: { name: 'Kerouac', model: 'Claude Opus 4.6', color: '#c084fc' },
         grokdoggydog: { name: 'GrokDoggyDog', model: 'xAI Grok 4', color: '#f87171' },
         'pi-dog': { name: 'Pi-Dog', model: 'Pi Harness Agent', color: '#2dd4bf' },
         lukedog: { name: 'LukeDog', model: '', color: '#a3e635' },
-        'mc-claude': { name: 'MC-Claude', model: '', color: '#e879f9' }
+        'mc-claude': { name: 'MC-Claude', model: 'Claude Opus 4.6', color: '#e879f9' }
       };
       var SPARE_COLORS = ['#60a5fa', '#c084fc', '#fda4af', '#5eead4', '#fde047', '#93c5fd', '#86efac', '#fdba74'];
       var TOPIC_ANCHORS = [
@@ -1628,6 +1793,102 @@ export function renderViewerHtml(initialState) {
           akv.appendChild(kvRow('Writes this hour', a.is_writer ? (a.used_last_hour === null ? '?' : a.used_last_hour) + ' / ' + a.per_hour : 'read-only'));
           akv.appendChild(kvRow('Visible claims', authored.length + ' (' + authored.filter(function (n) { return evalRecord(n.rec, simNow()).state === 'decision'; }).length + ' Class B)'));
           box.appendChild(akv);
+        } else if (target.type === 'coherence') {
+          var coh = target.data;
+          var delta = Number(coh.delta_since_inception || 0);
+          var deltaSign = delta >= 0 ? '+' : '';
+          box.appendChild(inspectHeader(
+            'Hive Coherence Index (Retroactive)',
+            coh.score.toFixed(1) + ' / 100',
+            deltaSign + delta.toFixed(1) + ' SINCE INCEPTION',
+            coh.score >= 80 ? 'ok' : 'warn',
+            '#6ee7b7'
+          ));
+          var axes = coh.axes || {};
+          var axisRows = [
+            ['Priority & Topic Alignment (25%)', axes.alignment || 0, '#38bdf8'],
+            ['Shared-Reality Grounding (20%)', axes.grounding || 0, '#34d399'],
+            ['Cross-Agent Convergence (25%)', axes.convergence || 0, '#a78bfa'],
+            ['Synaptic Coupling & Hygiene (15%)', axes.coupling || 0, '#fbbf24'],
+            ['Consolidation & Durability (15%)', axes.consolidation || 0, '#f472b6']
+          ];
+          var axesWrap = makeDiv('kv-list');
+          axisRows.forEach(function (item) {
+            var wrap = makeDiv('');
+            var rHead = makeDiv('kv-row');
+            rHead.appendChild(makeDiv('kv-key', item[0]));
+            var rVal = makeDiv('kv-val', Number(item[1]).toFixed(1) + '%');
+            rVal.style.color = item[2];
+            rHead.appendChild(rVal);
+            wrap.appendChild(rHead);
+            var bWrap = makeDiv('ttl-bar-wrap');
+            var bFill = makeDiv('ttl-bar-fill');
+            bFill.style.width = Math.max(0, Math.min(100, Number(item[1]))) + '%';
+            bFill.style.background = item[2];
+            bWrap.appendChild(bFill);
+            wrap.appendChild(bWrap);
+            axesWrap.appendChild(wrap);
+          });
+          box.appendChild(axesWrap);
+
+          var hist = Array.isArray(coh.history) ? coh.history : [];
+          if (hist.length > 0) {
+            var sparkTitle = makeDiv('inspect-kicker', 'Retroactive Trajectory (Inception -> Now)');
+            sparkTitle.style.marginTop = '6px';
+            box.appendChild(sparkTitle);
+            var sparkCanvas = document.createElement('canvas');
+            sparkCanvas.width = 560;
+            sparkCanvas.height = 120;
+            sparkCanvas.style.width = '100%';
+            sparkCanvas.style.height = '64px';
+            sparkCanvas.style.borderRadius = '8px';
+            sparkCanvas.style.background = 'rgba(2, 6, 23, 0.55)';
+            sparkCanvas.style.border = '1px solid rgba(148, 163, 184, 0.16)';
+            box.appendChild(sparkCanvas);
+            var sctx = sparkCanvas.getContext('2d');
+            if (sctx) {
+              var sw = sparkCanvas.width;
+              var sh = sparkCanvas.height;
+              var padX = 24;
+              var padY = 18;
+              sctx.strokeStyle = 'rgba(148, 163, 184, 0.15)';
+              sctx.lineWidth = 1;
+              [50, 75, 100].forEach(function (lvl) {
+                var gy = sh - padY - ((lvl - 40) / 60) * (sh - padY * 2);
+                sctx.beginPath();
+                sctx.moveTo(padX, gy);
+                sctx.lineTo(sw - padX, gy);
+                sctx.stroke();
+              });
+              sctx.beginPath();
+              hist.forEach(function (pt, idx) {
+                var px = padX + (hist.length === 1 ? (sw - padX * 2) / 2 : (idx / (hist.length - 1)) * (sw - padX * 2));
+                var clamped = Math.max(40, Math.min(100, Number(pt.score || 0)));
+                var py = sh - padY - ((clamped - 40) / 60) * (sh - padY * 2);
+                if (idx === 0) sctx.moveTo(px, py);
+                else sctx.lineTo(px, py);
+              });
+              sctx.strokeStyle = '#34d399';
+              sctx.lineWidth = 3;
+              sctx.stroke();
+              hist.forEach(function (pt, idx) {
+                var px = padX + (hist.length === 1 ? (sw - padX * 2) / 2 : (idx / (hist.length - 1)) * (sw - padX * 2));
+                var clamped = Math.max(40, Math.min(100, Number(pt.score || 0)));
+                var py = sh - padY - ((clamped - 40) / 60) * (sh - padY * 2);
+                sctx.beginPath();
+                sctx.arc(px, py, 4, 0, Math.PI * 2);
+                sctx.fillStyle = idx === hist.length - 1 ? '#fbbf24' : '#38bdf8';
+                sctx.fill();
+              });
+            }
+            var hList = makeDiv('kv-list');
+            hist.forEach(function (pt, idx) {
+              var label = (idx === 0 ? 'Inception' : '#' + pt.claims) + ' (' + fmtTime(pt.at).slice(11, 16) + 'Z)';
+              var detail = pt.score.toFixed(1) + ' · ' + pt.authors + 'a · ' + pt.shared_refs + ' shared';
+              hList.appendChild(kvRow(label, detail, idx === hist.length - 1 ? '#6ee7b7' : null));
+            });
+            box.appendChild(hList);
+          }
         }
       }
 
@@ -2193,6 +2454,19 @@ export function renderViewerHtml(initialState) {
         cam.targetZoom = 1;
       });
 
+      var latestCoherence = null;
+      function openCoherenceInspector() {
+        if (!latestCoherence) return;
+        if (view !== 'graph') switchView('graph');
+        setDrawer('none');
+        selected = { type: 'coherence', data: latestCoherence };
+        hovered = null;
+        renderAgentRoster();
+        renderInspector();
+      }
+      if (el('coherence-card')) el('coherence-card').addEventListener('click', openCoherenceInspector);
+      if (el('m-kpi-coherence')) el('m-kpi-coherence').addEventListener('click', openCoherenceInspector);
+
       var graphReady = false;
       function renderState(s) {
         if (!s || typeof s !== 'object') return;
@@ -2222,6 +2496,17 @@ export function renderViewerHtml(initialState) {
 
         el('poll-val').textContent = fmtTime(s.polled_at);
         el('poll-sub').textContent = 'query answer: ' + (s.query_answer || '-') + ' (poll #' + (s.poll_seq || 0) + ')';
+
+        if (s.coherence && typeof s.coherence === 'object') {
+          latestCoherence = s.coherence;
+          if (selected && selected.type === 'coherence') selected.data = latestCoherence;
+          var cScore = Number(s.coherence.score || 0).toFixed(1);
+          var cDelta = Number(s.coherence.delta_since_inception || 0);
+          var cSign = cDelta >= 0 ? '+' : '';
+          if (el('coherence-val')) el('coherence-val').textContent = cScore + '%';
+          if (el('coherence-sub')) el('coherence-sub').textContent = cSign + cDelta.toFixed(1) + ' since inception · tap';
+          if (el('m-kpi-coherence')) el('m-kpi-coherence').textContent = 'coh: ' + cScore + '% (' + cSign + cDelta.toFixed(1) + ')';
+        }
 
         var sc = s.scope_counts || {};
         el('count-canon').textContent = String(sc.canon ?? 0);
@@ -2296,6 +2581,7 @@ export async function startMemoryViewer({
     poll_seq: 0,
     store_state: { state: 'CONNECTING', write_seq: null, current_claims: null, last_backup_age_sec: null, unbacked_writes: null },
     scope_counts: { canon: 0, ops: 0, rooms: 0, self: 0, canon_unverified: 0, unverified_total: 0 },
+    coherence: computeCoherence(),
     query_answer: null,
     records: [],
     agent_roster: [],
@@ -2339,6 +2625,15 @@ export async function startMemoryViewer({
         (a, b) => (a.computed_rank || 99) - (b.computed_rank || 99) || (b.created_at || 0) - (a.created_at || 0)
       )
       const scopeCounts = computeScopeCounts(wake?.counts, records)
+      const agentRoster = (Array.isArray(wake?.agent_roster) ? wake.agent_roster : []).map(sanitizeRosterEntry).filter(Boolean)
+      const recentActivity = (Array.isArray(wake?.recent_activity) ? wake.recent_activity : []).map(sanitizeActivity).filter(Boolean)
+      const storeState = wake?.store_state || query?.store_state || { state: 'UNKNOWN', write_seq: null, current_claims: null, last_backup_age_sec: null, unbacked_writes: null }
+      const coherence = computeCoherence({
+        records,
+        agent_roster: agentRoster,
+        recent_activity: recentActivity,
+        store_state: storeState,
+      })
 
       nextSnapshot = {
         connected: true,
@@ -2350,12 +2645,13 @@ export async function startMemoryViewer({
         trustedInstruction: false,
         polled_at: nowSec,
         poll_seq: pollSeq,
-        store_state: wake?.store_state || query?.store_state || { state: 'UNKNOWN', write_seq: null, current_claims: null, last_backup_age_sec: null, unbacked_writes: null },
+        store_state: storeState,
         scope_counts: scopeCounts,
+        coherence,
         query_answer: String(query?.answer || 'unknown'),
         records,
-        agent_roster: (Array.isArray(wake?.agent_roster) ? wake.agent_roster : []).map(sanitizeRosterEntry).filter(Boolean),
-        recent_activity: (Array.isArray(wake?.recent_activity) ? wake.recent_activity : []).map(sanitizeActivity).filter(Boolean),
+        agent_roster: agentRoster,
+        recent_activity: recentActivity,
       }
     } catch (err) {
       nextSnapshot = {

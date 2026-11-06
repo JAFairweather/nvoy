@@ -10,6 +10,7 @@ import { buildClaimTemplate } from '../mcp/tools/memory.mjs'
 import { ACTIVITY_MAX, handleSocketJsonRpc, startMemoryDaemon } from '../mcp/tools/memory-daemon.mjs'
 import { initEmptyStore, recordVerifiedBackup } from '../mcp/tools/hive_memory_store.mjs'
 import {
+  computeCoherence,
   diffViewerSnapshots,
   escapeHtml,
   parseListenTarget,
@@ -163,6 +164,73 @@ await test('diffViewerSnapshots logs store state, write_seq, backup and record a
   assert(kinds.includes('unverified'))
   assert(kinds.includes('claim-added'))
   assert(!diffs.some(d => /relay|sync/i.test(d.summary)))
+})
+
+await test('computeCoherence calculates 5-axis HCI score and retroactive inception-to-now trajectory', () => {
+  const empty = computeCoherence()
+  assert.equal(empty.score, 0)
+  assert.deepEqual(empty.history, [])
+
+  const roster = [
+    { id: 'james', pubkey: '1'.repeat(64), is_writer: true },
+    { id: 'mydude', pubkey: '2'.repeat(64), is_writer: true },
+    { id: 'neil', pubkey: '3'.repeat(64), is_writer: true },
+  ]
+  const records = [
+    {
+      scope: 'room:a8186b53-537d-46ad-a7e7-b6486c58970e',
+      d: 'hive-memory:room:a8186b53-537d-46ad-a7e7-b6486c58970e:init-spec',
+      topic: 'hive-memory',
+      claim: 'Initial spec for PR #335',
+      author_pubkey: '2'.repeat(64),
+      as_of_git: 'nvoy@9c995af',
+      evidence: ['nvoy@9c995af:mcp/tools/memory-daemon.mjs'],
+      created_at: 1000,
+      expires_at: 2000,
+      conflict: false,
+      stale_warning: null,
+    },
+    {
+      scope: 'hive:canon',
+      d: 'hive-memory:hive:canon:priorities',
+      topic: 'hive',
+      claim: 'Active Hive priorities',
+      author_pubkey: '1'.repeat(64),
+      as_of_git: 'nvoy@9c995af',
+      evidence: ['nvoy@9c995af:README.md'],
+      created_at: 1100,
+      expires_at: null,
+      conflict: false,
+      stale_warning: null,
+    },
+    {
+      scope: 'room:a8186b53-537d-46ad-a7e7-b6486c58970e',
+      d: 'hive-memory:room:a8186b53-537d-46ad-a7e7-b6486c58970e:deploy-status',
+      topic: 'herd-infra',
+      claim: 'Holding PR #335 deploy at nvoy@9c995af',
+      author_pubkey: '3'.repeat(64),
+      as_of_git: 'nvoy@9c995af',
+      evidence: ['nvoy@9c995af:mcp/tools/memory-viewer.mjs'],
+      created_at: 1200,
+      expires_at: null,
+      conflict: false,
+      stale_warning: null,
+    },
+  ]
+  const coh = computeCoherence({
+    records,
+    agent_roster: roster,
+    recent_activity: [{ kind: 'wake', actor: 'neil' }, { kind: 'submit', actor: 'neil' }],
+    store_state: { write_seq: 6 },
+  })
+  assert.equal(coh.inception_at, 1000)
+  assert(coh.score > coh.inception_score, 'coherence should improve as canon and shared PR/commit refs converge')
+  assert(coh.delta_since_inception > 0)
+  assert(coh.shared_artifacts >= 2)
+  assert.equal(coh.axes.grounding, 100)
+  assert.equal(coh.history.length, 2)
+  assert.equal(coh.history[0].claims, 1)
+  assert.equal(coh.history[1].claims, 3)
 })
 
 await test('live integration: memory-viewer polls memory-daemon viewer socket, streams SSE, and refuses non-GET', async () => {
