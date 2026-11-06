@@ -1332,7 +1332,7 @@ export function renderViewerHtml(initialState) {
       <span class="sim-label">Simulation · local animation only, nothing is sent</span>
       <button class="btn sim" id="btn-sim-write" type="button">Sim write</button>
       <button class="btn sim" id="btn-sim-recall" type="button">Sim recall</button>
-      <button class="btn sim" id="btn-sim-consolidate" type="button">Sim consolidator preview</button>
+      <button class="btn sim" id="btn-sim-consolidate" type="button">Merkle Dreaming · Curation</button>
       <button class="btn sim" id="btn-sim-refuse" type="button">Sim refusal</button>
     </div>
     <div class="control-bar panel">
@@ -1415,7 +1415,8 @@ export function renderViewerHtml(initialState) {
         grokdoggydog: { name: 'GrokDoggyDog', model: 'xAI Grok 4', color: '#f87171' },
         'pi-dog': { name: 'Pi-Dog', model: 'Pi Harness Agent', color: '#2dd4bf' },
         lukedog: { name: 'LukeDog', model: '', color: '#a3e635' },
-        'mc-claude': { name: 'MC-Claude', model: 'Claude Opus 4.6', color: '#e879f9' }
+        'mc-claude': { name: 'MC-Claude', model: 'Claude Opus 4.6', color: '#e879f9' },
+        curator: { name: 'Curator', model: 'Merkle Dreamer', color: '#a78bfa' }
       };
       var SPARE_COLORS = ['#60a5fa', '#c084fc', '#fda4af', '#5eead4', '#fde047', '#93c5fd', '#86efac', '#fdba74'];
       var TOPIC_ANCHORS = [
@@ -1987,7 +1988,7 @@ export function renderViewerHtml(initialState) {
         renderInspector();
         if (!consolidator && best && bestNodes.length >= 2) {
           consolidator = { topic: best, targets: bestNodes.slice(0, 5), x: best.x, y: best.y, progress: 0 };
-          logStream('sim', 'SIM consolidator preview in #' + best.id + ': folding ' + consolidator.targets.length + ' Class A claims (nothing written)');
+          logStream('sim', 'MERKLE DREAMING curation in #' + best.id + ': folding ' + consolidator.targets.length + ' Class A claims (nothing written)');
         }
       }
 
@@ -2211,7 +2212,7 @@ export function renderViewerHtml(initialState) {
             ['Shared-Reality Grounding (20%)', axes.grounding || 0, '#34d399'],
             ['Cross-Agent Convergence (25%)', axes.convergence || 0, '#a78bfa'],
             ['Synaptic Coupling & Hygiene (15%)', axes.coupling || 0, '#fbbf24'],
-            ['Consolidation & Durability (15%)', axes.consolidation || 0, '#f472b6']
+            ['Curation & Durability (15%)', axes.consolidation || 0, '#f472b6']
           ];
           var axesWrap = makeDiv('kv-list');
           axisRows.forEach(function (item) {
@@ -2294,7 +2295,7 @@ export function renderViewerHtml(initialState) {
         } else if (target.type === 'dreaming') {
           var dr = computeDreamingTelemetry();
           box.appendChild(inspectHeader(
-            'Phase 2 Cortex Dreaming & Consolidation',
+            'Merkle Dreaming & Curation (Phase 2)',
             '-' + dr.wakeSavings.toFixed(1) + '% Wake Bytes',
             'GATES 6-8 LIVE',
             'ok',
@@ -2305,16 +2306,16 @@ export function renderViewerHtml(initialState) {
           dkv.appendChild(kvRow('Gate 6 · Index cards', Math.round(dr.indexBytes / 1024) + ' KB (-' + dr.indexSavings.toFixed(1) + '%)', '#38bdf8'));
           dkv.appendChild(kvRow('Gate 6 · Wake digest', Math.round(dr.wakeBytes / 1024) + ' KB (-' + dr.wakeSavings.toFixed(1) + '% vs dump)', '#34d399'));
           dkv.appendChild(kvRow('Gate 7 · Workflow slugs', dr.wfCount + ' active (' + dr.shortTtlCount + ' on <=48h TTL)', '#fbbf24'));
-          dkv.appendChild(kvRow('Gate 7 · Class B durable', dr.classBCount + ' permanent decisions', '#a78bfa'));
+          dkv.appendChild(kvRow('Gate 7 · Class B curated', dr.classBCount + ' permanent decisions', '#a78bfa'));
           box.appendChild(dkv);
           if (dr.topicList.length > 0) {
-            var qTitle = makeDiv('inspect-kicker', 'Gate 8 · Topic Grooming Pressure (>8 Class A = consolidate)');
+            var qTitle = makeDiv('inspect-kicker', 'Gate 8 · Topic Curation Pressure (>8 Class A = curate)');
             qTitle.style.marginTop = '6px';
             box.appendChild(qTitle);
             var tWrap = makeDiv('kv-list');
             dr.topicList.slice(0, 6).forEach(function (item) {
               var over = item.count > 8;
-              tWrap.appendChild(kvRow('#' + item.topic, item.count + ' Class A' + (over ? ' · READY TO FOLD' : ''), over ? '#fbbf24' : '#cbd5e1'));
+              tWrap.appendChild(kvRow('#' + item.topic, item.count + ' Class A' + (over ? ' · READY TO CURATE' : ''), over ? '#fbbf24' : '#cbd5e1'));
             });
             box.appendChild(tWrap);
           }
@@ -2559,7 +2560,7 @@ export function renderViewerHtml(initialState) {
           consolidator.progress += 0.012;
           if (consolidator.progress >= 1) {
             shockwaves.push({ x: consolidator.x, y: consolidator.y, r: 8, maxR: 130, color: '#fbbf24', alpha: 1 });
-            logStream('sim', 'SIM consolidator preview done: a real pass would supersede ' + consolidator.targets.length + ' claims with one Class B decision');
+            logStream('sim', 'MERKLE DREAMING curation done: a real pass curates ' + consolidator.targets.length + ' claims into one Class B decision');
             consolidator = null;
           }
         }
@@ -2701,7 +2702,7 @@ export function renderViewerHtml(initialState) {
           ctx.fill();
           ctx.font = '700 10px ui-monospace, monospace';
           ctx.fillStyle = '#fde68a';
-          ctx.fillText('SIM CONSOLIDATOR ' + Math.round(c.progress * 100) + '%', c.x, c.y - 22);
+          ctx.fillText('MERKLE DREAMING · CURATION ' + Math.round(c.progress * 100) + '%', c.x, c.y - 22);
         }
 
         nodes.forEach(function (n) {
