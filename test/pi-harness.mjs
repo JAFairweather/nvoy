@@ -119,9 +119,9 @@ ok('pi runs on the ChatGPT login, gpt-5.6-luna by default, resuming its one sess
 ok('discovered extensions are off and only this extension loads, by absolute path', args.includes('--no-extensions') && argAfter('-e') === resolve('mcp/tools/pi_harness_extension.mjs') &&
   args.filter(arg => arg === '-e').length === 1 && args.includes('--no-approve'))
 ok('the session carries the identity\'s name, for Moshi', argAfter('--name') === 'pdtest')
-ok('the channel tools are pi\'s only tools', argAfter('--tools') === 'nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply,nvoy_channel_post,nvoy_profile_set,nvoy_profile_status')
+ok('the channel tools are pi\'s only tools', argAfter('--tools') === 'nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply,nvoy_channel_post,nvoy_profile_set,nvoy_profile_status,memory_claim,memory_withdraw')
 ok('work_tools adds pi\'s own read, shell and edit tools before the channel\'s, and must be a boolean',
-  piTools({ workTools: true }) === 'read,bash,edit,write,grep,find,ls,nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply,nvoy_channel_post,nvoy_profile_set,nvoy_profile_status' &&
+  piTools({ workTools: true }) === 'read,bash,edit,write,grep,find,ls,nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply,nvoy_channel_post,nvoy_profile_set,nvoy_profile_status,memory_claim,memory_withdraw' &&
   piTools({}) === argAfter('--tools') && refused({ ...client, work_tools: 'yes' }, /work_tools must be true or false/))
 ok('pi gets a built environment: its own agent dir and home, the config, and no API key', sessions()[0].env.join() ===
   'HOME,LANG,NVOY_PI_HARNESS_CONFIG,NVOY_PI_HARNESS_INSTANCE,PATH,PI_CODING_AGENT_DIR,PI_SKIP_VERSION_CHECK,TERM' && sessions()[0].agentDir === piHome &&
@@ -225,7 +225,7 @@ ok('outside the launcher, the extension refuses to load rather than run unconfig
 Object.assign(process.env, { NVOY_PI_HARNESS_CONFIG: configPath, NVOY_PI_HARNESS_INSTANCE: 'pd-test', NVOY_HARNESS_SSH: fakeSsh })
 const pi1 = fakePi()
 const harness1 = await nvoyPiHarness(pi1)
-ok('loading registers the fleet channel\'s tools and starts nothing', [...pi1.tools.keys()].join() === 'nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply,nvoy_channel_post,nvoy_profile_set,nvoy_profile_status' &&
+ok('loading registers the fleet channel\'s tools and starts nothing', [...pi1.tools.keys()].join() === 'nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply,nvoy_channel_post,nvoy_profile_set,nvoy_profile_status,memory_claim,memory_withdraw' &&
   !existsSync(join(root, 'ssh-args.log')) && !existsSync(lockPath))
 const mcp = new Client({ name: 'pi-harness-test', version: '1' })
 await mcp.connect(new StdioClientTransport({ command: process.execPath, args: [resolve('mcp/tools/codex-channel-mcp.mjs'), '--instance', 'pd-test'], env: { ...process.env, NVOY_INSTANCE_ROOT: fleet } }))
@@ -233,7 +233,7 @@ const fleetTools = (await mcp.listTools()).tools
 await mcp.close()
 ok('each tool\'s name, description and schema are the fleet channel\'s own', fleetTools.length === PI_CHANNEL_TOOLS.length && fleetTools.every(tool => {
   const mine = PI_CHANNEL_TOOLS.find(t => t.name === tool.name), registered = pi1.tools.get(tool.name)
-  return mine && registered && mine.description === tool.description && JSON.stringify(mine.parameters) === JSON.stringify(tool.inputSchema) && typeof registered.execute === 'function' && registered.label
+  return mine && registered && (tool.name.startsWith('memory_') ? tool.description.startsWith(mine.description) : mine.description === tool.description) && JSON.stringify(mine.parameters) === JSON.stringify(tool.inputSchema) && typeof registered.execute === 'function' && registered.label
 }))
 
 const privateDir = join(stateDir, 'nvoy'), harnessLog = join(privateDir, 'harness.log')

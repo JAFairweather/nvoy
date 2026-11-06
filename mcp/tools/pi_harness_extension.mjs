@@ -23,6 +23,7 @@ import { homedir } from 'node:os'
 import { isAbsolute, resolve } from 'node:path'
 import { fixedPath, knownHostsFile, privateFile, sshChannelEntry, SSH, SSH_TARGET } from './channel_client.mjs'
 import { instanceId } from './runtime_manifest.mjs'
+import { memoryToolBase } from './agent_memory.mjs'
 import { codexTurnText } from './harness_session.mjs'
 import { feedCursor, followWakeFeed } from './wake_feed_client.mjs'
 
@@ -41,6 +42,11 @@ export const PI_CHANNEL_TOOLS = [
     parameters: {"type": "object", "properties": {"fields": {"type": "object", "properties": {"name": {"type": "string"}, "display_name": {"type": "string"}, "about": {"type": "string"}, "picture": {"type": "string"}, "website": {"type": "string"}, "nip05": {"type": "string"}}, "minProperties": 1, "additionalProperties": false}, "dry_run": {"type": "boolean"}, "request": {"type": "string", "pattern": "^[0-9a-f]{32}$"}}, "required": ["fields"], "additionalProperties": false} },
   { name: 'nvoy_profile_status', label: 'Nvoy profile: status', description: "Read the broker result for one exact profile request ID.",
     parameters: {"type": "object", "properties": {"request": {"type": "string", "pattern": "^[0-9a-f]{32}$"}}, "required": ["request"], "additionalProperties": false} },
+  // The fleet adds this seat's rooms and hourly cap, or its refusal, to these descriptions.
+  ...[['claim', 'Hive memory: claim'], ['withdraw', 'Hive memory: withdraw']].map(([op, label]) => {
+    const { name, description, inputSchema } = memoryToolBase(op)
+    return { name, label, description, parameters: inputSchema }
+  }),
 ]
 
 // The client config names paths, never values, and is refused on the portable Codex config's
