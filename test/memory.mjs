@@ -105,6 +105,16 @@ const runBin = (script, args) => new Promise(res => {
   child.stdout.on('data', c => { stdout += c }); child.stderr.on('data', c => { stderr += c })
   child.on('close', status => res({ status, stdout, stderr }))
 })
+// A verified backup as herd-infra dumps it from restic: memory.sqlite, accepted-ledger.jsonl and SHA256SUMS.
+const backupDir = async (p, name) => {
+  const dir = join(p.dir, name)
+  mkdirSync(dir)
+  const snap = join(dir, 'memory.sqlite')
+  const out = await snapshotStore({ dbPath: p.db, ledgerPath: p.ledger, snapshotPath: snap, ledgerCutPath: join(dir, 'accepted-ledger.jsonl') })
+  const sum = f => `${createHash('sha256').update(readFileSync(join(dir, f))).digest('hex')}  ${f}\n`
+  writeFileSync(join(dir, 'SHA256SUMS'), sum('memory.sqlite') + sum('accepted-ledger.jsonl'))
+  return { dir, snap, out, authority: { headDir: dir } }
+}
 const withDb = (path, fn) => { const db = new DatabaseSync(path); try { return fn(db) } finally { db.close() } }
 
 // --- 0. Library: secret guard, retention-class builders and NIP-01 ordering ---
@@ -536,15 +546,14 @@ for (const [label, mutate, state] of [
 {
   const p = setup('restore-gap')
   const s = open(p)
-  const snap = join(p.dir, 'snap1.sqlite')
-  const snapOut = await snapshotStore({ dbPath: p.db, ledgerPath: p.ledger, snapshotPath: snap, ledgerCutPath: join(p.dir, 'snap1.ledger') })
+  const { snap, out: snapOut, authority: auth } = await backupDir(p, 'snap1')
   const priv = claim(crusty, roomB, 'private-note')
   s.submit({ writer: 'crusty', event: priv, expectedPriorId: null, nowSec: T0 + 5 })
   ok('a running daemon holds the store lock, so restore refuses (HIVE_MEMORY_STORE_LOCKED)',
-    throwsCode(() => restoreSnapshot({ snapshotPath: snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG }), 'HIVE_MEMORY_STORE_LOCKED'))
+    throwsCode(() => restoreSnapshot({ authority: auth, snapshotPath: snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG, nowSec: T0 + 20 }), 'HIVE_MEMORY_STORE_LOCKED'))
   s.close()
   let gapErr = null
-  try { restoreSnapshot({ snapshotPath: snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG }) } catch (e) { gapErr = e }
+  try { restoreSnapshot({ authority: auth, snapshotPath: snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG, nowSec: T0 + 20 }) } catch (e) { gapErr = e }
   ok('restoring the write_seq 1 snapshot after a write_seq 2 claim fails with HIVE_MEMORY_RESTORE_GAP_DETECTED and reports the gap',
     snapOut.snapshotSeq === 1 && gapErr?.code === 'HIVE_MEMORY_RESTORE_GAP_DETECTED' && gapErr.gap[0].id === priv.id && gapErr.ledgerMaxSeq === 2 && !gapErr.message.includes(JSON.parse(priv.content).claim))
   const live = join(p.dir, 'live.sqlite')
@@ -554,8 +563,8 @@ for (const [label, mutate, state] of [
   ok('the same snapshot opened directly by the daemon fails closed with DB_BEHIND_LEDGER', sd.state === 'DB_BEHIND_LEDGER' && unknownAnswer(sd, 'DB_BEHIND_LEDGER'))
   sd.close()
   copyFileSync(live, p.db)
-  ok('--acknowledge-gap must name the ledger max seq', throwsCode(() => restoreSnapshot({ snapshotPath: snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG, acknowledgeGap: 1 }), 'HIVE_MEMORY_RESTORE_GAP_DETECTED'))
-  const restored = restoreSnapshot({ snapshotPath: snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG, acknowledgeGap: 2, nowSec: T0 + 9 })
+  ok('--acknowledge-gap must name the ledger max seq', throwsCode(() => restoreSnapshot({ authority: auth, snapshotPath: snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG, acknowledgeGap: 1, nowSec: T0 + 20 }), 'HIVE_MEMORY_RESTORE_GAP_DETECTED'))
+  const restored = restoreSnapshot({ authority: auth, snapshotPath: snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG, acknowledgeGap: 2, nowSec: T0 + 9 })
   const s2 = open(p)
   const last = readLedger(p.ledger).lines.at(-1).rec
   ok('--acknowledge-gap 2 installs the snapshot, records restore-gap-ack, and reaches READY',
@@ -569,13 +578,12 @@ for (const [label, mutate, state] of [
   const s = open(p)
   const e2 = claim(crusty, roomB, 'to-be-purged')
   s.submit({ writer: 'crusty', event: e2, expectedPriorId: null, nowSec: T0 + 5 })
-  const snap = join(p.dir, 'snap2.sqlite')
-  await snapshotStore({ dbPath: p.db, ledgerPath: p.ledger, snapshotPath: snap, ledgerCutPath: join(p.dir, 'snap2.ledger') })
+  const { snap, authority: auth } = await backupDir(p, 'snap2')
   const purged = s.hardDelete({ id: e2.id, nowSec: T0 + 6 })
   s.close()
   ok('hive-memory-purge records op purge at write_seq 3', purged.seq === 3 && readLedger(p.ledger).lines.at(-1).rec.op === 'purge')
   let err = null
-  try { restoreSnapshot({ snapshotPath: snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG }) } catch (e) { err = e }
+  try { restoreSnapshot({ authority: auth, snapshotPath: snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG, nowSec: T0 + 20 }) } catch (e) { err = e }
   ok('restoring the pre-purge write_seq 2 snapshot is refused (HIVE_MEMORY_RESTORE_PRE_PURGE_SNAPSHOT)', err?.code === 'HIVE_MEMORY_RESTORE_PRE_PURGE_SNAPSHOT')
   const live = join(p.dir, 'live.sqlite')
   copyFileSync(p.db, live)
@@ -584,7 +592,7 @@ for (const [label, mutate, state] of [
   ok('the pre-purge snapshot placed on disk fails closed with DB_HAS_UNEXPECTED_OR_PURGED_EVENTS instead of resurrecting E2',
     sd.state === 'DB_HAS_UNEXPECTED_OR_PURGED_EVENTS' && unknownAnswer(sd, 'DB_HAS_UNEXPECTED_OR_PURGED_EVENTS'))
   sd.close()
-  const out = restoreSnapshot({ snapshotPath: snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG, reapplyPurges: true })
+  const out = restoreSnapshot({ authority: auth, snapshotPath: snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG, reapplyPurges: true, nowSec: T0 + 20 })
   const s2 = open(p)
   ok('--reapply-purges deletes E2, advances write_seq to 3, and reaches READY',
     out.writeSeq === 3 && s2.state === 'READY' && seqOf(s2) === 3 && !s2.db.prepare('SELECT 1 FROM events WHERE id = ?').get(e2.id))
@@ -597,8 +605,7 @@ for (const [label, mutate, state] of [
   const p = setup('restore-refusals')
   const s = open(p)
   s.submit({ writer: 'james', event: claim(james, 'hive:ops', 'r1'), expectedPriorId: null, nowSec: T0 + 5 })
-  const snap = join(p.dir, 'snap.sqlite')
-  await snapshotStore({ dbPath: p.db, ledgerPath: p.ledger, snapshotPath: snap, ledgerCutPath: join(p.dir, 'snap.ledger') })
+  const { snap, authority: auth } = await backupDir(p, 'snap')
   s.close()
   const extra = join(p.dir, 'extra.sqlite')
   copyFileSync(snap, extra)
@@ -607,42 +614,144 @@ for (const [label, mutate, state] of [
     VALUES (?, ?, ?, ?, ?, 'hive:ops', 'hive:ops', NULL, 'never-ledgered', 'active', 'ephemeral', 'abc1234', NULL, NULL, ?, ?, 1)`)
     .run(rogue.id, james.pk, rogue.kind, rogue.created_at, rogue.tags[0][1], JSON.stringify(rogue), T0))
   ok('a snapshot with an event the ledger never recorded is refused (HIVE_MEMORY_RESTORE_UNKNOWN_EVENT)',
-    throwsCode(() => restoreSnapshot({ snapshotPath: extra, dbPath: p.db, ledgerPath: p.ledger, config: CFG, reapplyPurges: true }), 'HIVE_MEMORY_RESTORE_UNKNOWN_EVENT'))
+    throwsCode(() => restoreSnapshot({ authority: auth, snapshotPath: extra, dbPath: p.db, ledgerPath: p.ledger, config: CFG, reapplyPurges: true, nowSec: T0 + 20 }), 'HIVE_MEMORY_RESTORE_UNKNOWN_EVENT'))
   const ahead = join(p.dir, 'ahead.sqlite')
   copyFileSync(snap, ahead)
   withDb(ahead, d => d.prepare('UPDATE store_meta SET write_seq = 9').run())
-  ok('a snapshot ahead of the ledger is refused', throwsCode(() => restoreSnapshot({ snapshotPath: ahead, dbPath: p.db, ledgerPath: p.ledger, config: CFG }), 'HIVE_MEMORY_RESTORE_SNAPSHOT_AHEAD'))
+  ok('a snapshot ahead of the ledger is refused', throwsCode(() => restoreSnapshot({ authority: auth, snapshotPath: ahead, dbPath: p.db, ledgerPath: p.ledger, config: CFG, nowSec: T0 + 20 }), 'HIVE_MEMORY_RESTORE_SNAPSHOT_AHEAD'))
   const foreign = join(p.dir, 'foreign.sqlite')
   copyFileSync(snap, foreign)
   withDb(foreign, d => d.prepare("UPDATE store_meta SET store_id = 'other'").run())
-  ok('a snapshot from another store is refused', throwsCode(() => restoreSnapshot({ snapshotPath: foreign, dbPath: p.db, ledgerPath: p.ledger, config: CFG }), 'HIVE_MEMORY_RESTORE_STORE_ID_MISMATCH'))
+  ok('a snapshot from another store is refused', throwsCode(() => restoreSnapshot({ authority: auth, snapshotPath: foreign, dbPath: p.db, ledgerPath: p.ledger, config: CFG, nowSec: T0 + 20 }), 'HIVE_MEMORY_RESTORE_STORE_ID_MISMATCH'))
   const forged = join(p.dir, 'forged.sqlite')
   copyFileSync(snap, forged)
   withDb(forged, d => d.prepare("UPDATE events SET raw_json = json_set(raw_json, '$.content', '{}')").run())
-  ok('a snapshot with an event that no longer verifies is refused', throwsCode(() => restoreSnapshot({ snapshotPath: forged, dbPath: p.db, ledgerPath: p.ledger, config: CFG }), 'HIVE_MEMORY_RESTORE_INVALID_EVENT'))
-  const same = restoreSnapshot({ snapshotPath: snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG })
+  ok('a snapshot with an event that no longer verifies is refused', throwsCode(() => restoreSnapshot({ authority: auth, snapshotPath: forged, dbPath: p.db, ledgerPath: p.ledger, config: CFG, nowSec: T0 + 20 }), 'HIVE_MEMORY_RESTORE_INVALID_EVENT'))
+  const same = restoreSnapshot({ authority: auth, snapshotPath: snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG, nowSec: T0 + 20 })
   ok('a snapshot that matches the ledger exactly installs cleanly', same.installed && same.writeSeq === 2)
 }
 {
   // The restore-gap-ack op at each crash boundary.
   const p = setup('restore-crash')
   const s = open(p)
-  const snap = join(p.dir, 'snap.sqlite')
-  await snapshotStore({ dbPath: p.db, ledgerPath: p.ledger, snapshotPath: snap, ledgerCutPath: join(p.dir, 'snap.ledger') })
+  const { snap, authority: auth } = await backupDir(p, 'snap')
   const lost = claim(james, 'hive:ops', 'lost')
   s.submit({ writer: 'james', event: lost, expectedPriorId: null, nowSec: T0 + 5 })
   s.close()
   ok('[restore-gap-ack] crash before COMMIT throws',
-    throwsCode(() => restoreSnapshot({ snapshotPath: snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG, acknowledgeGap: 2, hooks: { beforeCommit: crash } }), 'SIMULATED_CRASH'))
+    throwsCode(() => restoreSnapshot({ authority: auth, snapshotPath: snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG, acknowledgeGap: 2, nowSec: T0 + 20, hooks: { beforeCommit: crash } }), 'SIMULATED_CRASH'))
   const s1 = open(p)
   ok('[restore-gap-ack] after a pre-COMMIT crash the live store is untouched',
     s1.state === 'READY' && seqOf(s1) === 2 && Boolean(s1.db.prepare('SELECT 1 FROM events WHERE id = ?').get(lost.id)))
   s1.close()
   ok('[restore-gap-ack] crash after COMMIT and install, before the ledger append, throws',
-    throwsCode(() => restoreSnapshot({ snapshotPath: snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG, acknowledgeGap: 2, hooks: { afterCommit: crash } }), 'SIMULATED_CRASH'))
+    throwsCode(() => restoreSnapshot({ authority: auth, snapshotPath: snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG, acknowledgeGap: 2, nowSec: T0 + 20, hooks: { afterCommit: crash } }), 'SIMULATED_CRASH'))
   const s2 = open(p)
   ok('[restore-gap-ack] startup flushes the pending restore-gap-ack and reaches READY at N+1',
     s2.state === 'READY' && seqOf(s2) === 3 && readLedger(p.ledger).lines.at(-1).rec.op === 'restore-gap-ack')
+  s2.close()
+}
+
+const loseHost = p => { for (const f of [p.db, `${p.db}-wal`, `${p.db}-shm`, p.ledger, p.receipt]) rmSync(f, { force: true }) }
+{
+  // Full-host --with-ledger restore of pre-purge snapshot S2 after a verified post-purge snapshot S3 (§5 test 4).
+  const p = setup('restore-fullhost')
+  const s = open(p)
+  const e2 = claim(crusty, roomB, 'to-be-purged')
+  s.submit({ writer: 'crusty', event: e2, expectedPriorId: null, nowSec: T0 + 5 })
+  const S2 = await backupDir(p, 'S2')
+  s.hardDelete({ id: e2.id, nowSec: T0 + 6 })
+  const S3 = await backupDir(p, 'S3')
+  recordVerifiedBackup({ receiptPath: p.receipt, snapshotId: SNAP_ID, writeSeq: S3.out.snapshotSeq, at: T0 + 7, nowSec: T0 + 7 })
+  const staleLocal = join(p.dir, 'local-ledger-at-2.jsonl')
+  writeFileSync(staleLocal, readFileSync(join(S2.dir, 'accepted-ledger.jsonl')))
+  s.close()
+  loseHost(p)
+  const full = (extra = {}) => restoreSnapshot({ snapshotPath: S2.snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG, withLedger: true, nowSec: T0 + 20, ...extra })
+  ok('a full-host restore with no authority fails closed (HIVE_MEMORY_RESTORE_AUTHORITY_UNAVAILABLE) and installs nothing',
+    throwsCode(() => full(), 'HIVE_MEMORY_RESTORE_AUTHORITY_UNAVAILABLE') && !existsSync(p.ledger) && !existsSync(p.db))
+  const forged = join(p.dir, 'S3-forged')
+  mkdirSync(forged)
+  copyFileSync(join(S3.dir, 'SHA256SUMS'), join(forged, 'SHA256SUMS'))
+  writeFileSync(join(forged, 'accepted-ledger.jsonl'), readFileSync(join(S2.dir, 'accepted-ledger.jsonl')))
+  const unsummed = join(p.dir, 'S3-unsummed')
+  mkdirSync(unsummed)
+  copyFileSync(join(S3.dir, 'accepted-ledger.jsonl'), join(unsummed, 'accepted-ledger.jsonl'))
+  ok('an authority whose ledger fails its SHA256SUMS, or has none, fails closed (HIVE_MEMORY_RESTORE_AUTHORITY_UNAVAILABLE)',
+    [forged, unsummed].every(headDir => throwsCode(() => full({ authority: { headDir } }), 'HIVE_MEMORY_RESTORE_AUTHORITY_UNAVAILABLE')) && !existsSync(p.ledger))
+  ok('a hive-memory-purge ledger ahead of the head fails closed (HIVE_MEMORY_RESTORE_AUTHORITY_MISMATCH)',
+    throwsCode(() => full({ authority: { headDir: S2.dir, purgeDirs: [S3.dir] } }), 'HIVE_MEMORY_RESTORE_AUTHORITY_MISMATCH') && !existsSync(p.ledger))
+  const authority = { headDir: S3.dir, purgeDirs: [S3.dir] }
+  let err = null
+  try { full({ authority }) } catch (e) { err = e }
+  const installed = readLedger(p.ledger).lines
+  ok('restoring S2 with --with-ledger is refused (HIVE_MEMORY_RESTORE_PRE_PURGE_SNAPSHOT) against the write_seq 3 ledger installed from S3, not S2\'s own',
+    err?.code === 'HIVE_MEMORY_RESTORE_PRE_PURGE_SNAPSHOT' && installed.length === 3 && installed.at(-1).rec.op === 'purge' &&
+    installed.at(-1).rec.purged_ids[0] === e2.id && !existsSync(p.db) && (statSync(p.ledger).mode & 0o777) === 0o600)
+  copyFileSync(S2.snap, p.db)
+  const sd = open(p)
+  ok('S2 placed beside the installed S3 ledger fails closed (DB_HAS_UNEXPECTED_OR_PURGED_EVENTS) instead of resurrecting E2',
+    sd.state === 'DB_HAS_UNEXPECTED_OR_PURGED_EVENTS' && unknownAnswer(sd, 'DB_HAS_UNEXPECTED_OR_PURGED_EVENTS'))
+  sd.close()
+  rmSync(p.db)
+  ok('rerunning --with-ledger over the identical ledger it installed is allowed, and refuses S2 again',
+    throwsCode(() => full({ authority }), 'HIVE_MEMORY_RESTORE_PRE_PURGE_SNAPSHOT'))
+  writeFileSync(p.ledger, readFileSync(staleLocal), { mode: 0o600 })
+  ok('--with-ledger never overwrites a different local ledger (HIVE_MEMORY_RESTORE_LEDGER_EXISTS)',
+    throwsCode(() => full({ authority, reapplyPurges: true }), 'HIVE_MEMORY_RESTORE_LEDGER_EXISTS'))
+  ok('a same-host restore whose local ledger is behind the newest verified backup is refused (HIVE_MEMORY_RESTORE_AUTHORITY_STALE)',
+    throwsCode(() => full({ authority, withLedger: false, reapplyPurges: true }), 'HIVE_MEMORY_RESTORE_AUTHORITY_STALE'))
+  rmSync(p.ledger)
+  const out = full({ authority, reapplyPurges: true })
+  const s2 = open(p)
+  ok('--with-ledger --reapply-purges deletes E2, advances write_seq to 3, and reaches READY with E2 absent',
+    out.writeSeq === 3 && s2.state === 'READY' && seqOf(s2) === 3 && !s2.db.prepare('SELECT 1 FROM events WHERE id = ?').get(e2.id))
+  ok('the restored store keeps writers fenced until a verified backup covers the purge (HIVE_MEMORY_PURGE_BACKUP_INCOMPLETE)',
+    s2.submit({ writer: 'crusty', event: claim(crusty, roomB, 'after-restore'), expectedPriorId: null, nowSec: T0 + 21 }).code === 'HIVE_MEMORY_PURGE_BACKUP_INCOMPLETE')
+  s2.close()
+  loseHost(p)
+  const cfgPath = join(p.dir, 'config.json')
+  writeFileSync(cfgPath, JSON.stringify(rawConfig()))
+  const base = ['--snapshot', S2.snap, '--db', p.db, '--ledger', p.ledger, '--config', cfgPath]
+  const none = await runBin('hive-memory-restore.mjs', base)
+  const both = await runBin('hive-memory-restore.mjs', [...base, '--with-ledger', S3.dir, '--authority', S3.dir])
+  const refused = await runBin('hive-memory-restore.mjs', [...base, '--with-ledger', S3.dir, '--purge-authority', S3.dir])
+  const done = await runBin('hive-memory-restore.mjs', [...base, '--with-ledger', S3.dir, '--purge-authority', S3.dir, '--reapply-purges'])
+  ok('bin/hive-memory-restore: no authority exits 1 (AUTHORITY_UNAVAILABLE), both head flags exit 2, S2 is refused, then installs with --reapply-purges',
+    none.status === 1 && /HIVE_MEMORY_RESTORE_AUTHORITY_UNAVAILABLE/.test(none.stderr) && both.status === 2 &&
+    refused.status === 1 && /HIVE_MEMORY_RESTORE_PRE_PURGE_SNAPSHOT/.test(refused.stderr) && done.status === 0 && JSON.parse(done.stdout).write_seq === 3)
+}
+{
+  // A 90-day maintenance purge of E after snapshot S2, then the host is lost before the next scheduled backup.
+  const p = setup('restore-maintenance')
+  const s = open(p)
+  const old = claim(james, 'hive:ops', 'rolling', { ttlSec: 0 })
+  const succ = claim(james, 'hive:ops', 'rolling', { ttlSec: 0, priorCreatedAt: old.created_at })
+  s.submit({ writer: 'james', event: old, expectedPriorId: null, nowSec: T0 + 50 })
+  s.submit({ writer: 'james', event: succ, expectedPriorId: old.id, nowSec: T0 + 51 })
+  const now = succ.created_at + RETENTION_PURGE_AFTER_SEC + 1
+  const S2 = await backupDir(p, 'S2')
+  const purged = s.purgeRetention({ nowSec: now })
+  const S3 = await backupDir(p, 'S3')
+  s.close()
+  loseHost(p)
+  const full = (headDir, extra = {}) => restoreSnapshot({ snapshotPath: S2.snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG, authority: { headDir, purgeDirs: [S3.dir] }, withLedger: true, nowSec: now + 10, ...extra })
+  ok('[maintenance, S3 verified] --with-ledger restore of S2 is refused against S3\'s ledger (HIVE_MEMORY_RESTORE_PRE_PURGE_SNAPSHOT)',
+    purged.seq === 4 && throwsCode(() => full(S3.dir), 'HIVE_MEMORY_RESTORE_PRE_PURGE_SNAPSHOT') && readLedger(p.ledger).lines.length === 4 && !existsSync(p.db))
+  loseHost(p)
+  const noS3 = (extra = {}) => restoreSnapshot({ snapshotPath: S2.snap, dbPath: p.db, ledgerPath: p.ledger, config: CFG, authority: { headDir: S2.dir }, nowSec: now + 10, ...extra })
+  let err = null
+  try { noS3({ withLedger: true }) } catch (e) { err = e }
+  ok('[maintenance, backup lost with the host] restore of S2, the newest backup, still refuses E past the retention window (HIVE_MEMORY_RESTORE_PRE_PURGE_SNAPSHOT)',
+    err?.code === 'HIVE_MEMORY_RESTORE_PRE_PURGE_SNAPSHOT' && /90-day retention/.test(err.message) && !existsSync(p.db))
+  const out = noS3({ reapplyPurges: true })
+  const last = readLedger(p.ledger).lines.at(-1).rec
+  const s2 = open(p)
+  ok('[maintenance, backup lost with the host] --reapply-purges re-runs the 90-day purge: E is gone and op purge is recorded at write_seq 4',
+    out.writeSeq === 4 && out.retentionPurged[0] === old.id && last.op === 'purge' && last.reason === 'retention' && last.purged_ids[0] === old.id &&
+    s2.state === 'READY' && !s2.db.prepare('SELECT 1 FROM events WHERE id = ?').get(old.id))
+  ok('[maintenance, backup lost with the host] writers stay fenced until a verified backup covers that purge',
+    s2.submit({ writer: 'james', event: claim(james, 'hive:ops', 'after', { nowSec: now + 11 }), expectedPriorId: null, nowSec: now + 11 }).code === 'HIVE_MEMORY_PURGE_BACKUP_INCOMPLETE')
   s2.close()
 }
 

@@ -7,11 +7,11 @@
 // Nothing here opens a network connection.
 
 import { DatabaseSync, backup as sqliteBackup } from 'node:sqlite'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import {
-  closeSync, copyFileSync, existsSync, fsyncSync, ftruncateSync, lstatSync, openSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync,
+  closeSync, copyFileSync, existsSync, fsyncSync, ftruncateSync, linkSync, lstatSync, openSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync,
 } from 'node:fs'
-import { dirname } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { verifyEvent } from 'nostr-tools/pure'
 import {
   DEFAULT_QUERY_LIMIT, DEFAULT_WAKE_MAX_CHARS, FALLBACK_MEMORY_KIND, MAX_LINK_HOPS, MAX_QUERY_LIMIT, MEMORY_KIND, nip01Newer, parseFactKey,
@@ -250,6 +250,15 @@ export function appendLedgerLine(path, line, hooks = {}) {
     fsyncSync(fd)
   } finally { closeSync(fd) }
   if (created) fsyncDir(dirname(path))
+}
+
+// Superseded, withdrawn and expired rows whose end of life is more than 90 days past.
+function retentionDue(db, nowSec) {
+  const cutoff = nowSec - RETENTION_PURGE_AFTER_SEC
+  return db.prepare(`SELECT e.id FROM events e WHERE
+    (e.is_current = 0 AND COALESCE((SELECT MIN(n.created_at) FROM events n WHERE n.pubkey = e.pubkey AND n.d = e.d AND n.id <> e.id AND n.created_at >= e.created_at), e.created_at) <= ?)
+    OR (e.is_current = 1 AND e.status = 'withdrawn' AND e.created_at <= ?)
+    OR (e.is_current = 1 AND e.status = 'active' AND e.exp IS NOT NULL AND e.exp <= ?)`).all(cutoff, cutoff, cutoff).map(r => r.id)
 }
 
 // --- the exclusive store lock (daemon and maintenance tools never write at once) ---
@@ -676,14 +685,7 @@ export class HiveMemoryStore {
     return { purged: ids, seq: staged.seq }
   }
 
-  // Superseded, withdrawn and expired rows whose end of life is more than 90 days past.
-  retentionCandidates(nowSec = nowSecDefault()) {
-    const cutoff = nowSec - RETENTION_PURGE_AFTER_SEC
-    return this.db.prepare(`SELECT e.id FROM events e WHERE
-      (e.is_current = 0 AND COALESCE((SELECT MIN(n.created_at) FROM events n WHERE n.pubkey = e.pubkey AND n.d = e.d AND n.id <> e.id AND n.created_at >= e.created_at), e.created_at) <= ?)
-      OR (e.is_current = 1 AND e.status = 'withdrawn' AND e.created_at <= ?)
-      OR (e.is_current = 1 AND e.status = 'active' AND e.exp IS NOT NULL AND e.exp <= ?)`).all(cutoff, cutoff, cutoff).map(r => r.id)
-  }
+  retentionCandidates(nowSec = nowSecDefault()) { return retentionDue(this.db, nowSec) }
 
   purgeRetention({ nowSec = nowSecDefault() } = {}) {
     if (!this.isReady().ready) throw new HiveMemoryError('HIVE_MEMORY_STORE_NOT_READY', `store not ready: ${this.state}`)
@@ -975,14 +977,70 @@ export function recordVerifiedBackup({ receiptPath, writeSeq, snapshotId, at = n
 
 // --- restore: bidirectional reconciliation of a decrypted snapshot against the ledger ---
 
+// The restore authority is restic snapshot content that herd-infra has dumped to local directories, each
+// holding accepted-ledger.jsonl and the SHA256SUMS staged beside it (sha256sum format). The head is the
+// newest verified hive-memory snapshot; purgeDirs are hive-memory-purge snapshots, each of which must be a
+// prefix of the head. A candidate snapshot's own ledger is never the authority.
+const AUTHORITY_LEDGER = 'accepted-ledger.jsonl'
+
+function readAuthorityDir(dir) {
+  const unavailable = why => new HiveMemoryError('HIVE_MEMORY_RESTORE_AUTHORITY_UNAVAILABLE', why)
+  let sums, buf
+  try {
+    sums = readFileSync(join(dir, 'SHA256SUMS'), 'utf8')
+    buf = readFileSync(join(dir, AUTHORITY_LEDGER))
+  } catch (e) { throw unavailable(`cannot read ${dir}: ${e.code || e.message}`) }
+  const named = sums.split('\n').map(l => /^([0-9a-f]{64}) [ *](.+)$/.exec(l)).filter(m => m && basename(m[2]) === AUTHORITY_LEDGER)
+  if (named.length !== 1) throw unavailable(`SHA256SUMS in ${dir} does not name ${AUTHORITY_LEDGER} exactly once`)
+  if (createHash('sha256').update(buf).digest('hex') !== named[0][1]) throw unavailable(`${AUTHORITY_LEDGER} in ${dir} does not match its SHA256SUMS`)
+  let ledger
+  try { ledger = readLedger(join(dir, AUTHORITY_LEDGER)) } catch (e) { throw unavailable(`${dir}: ${e.message}`) }
+  if (!ledger.lines.length || ledger.truncated) throw unavailable(`${dir} holds no complete ledger`)
+  return { lines: ledger.lines, bytes: buf }
+}
+
+export function loadRestoreAuthority({ headDir, purgeDirs = [] } = {}) {
+  if (!headDir) throw new HiveMemoryError('HIVE_MEMORY_RESTORE_AUTHORITY_UNAVAILABLE', 'no verified hive-memory snapshot was given as the restore authority')
+  const head = readAuthorityDir(headDir)
+  const fold = foldLedger(head.lines)
+  for (const dir of purgeDirs) {
+    const { lines } = readAuthorityDir(dir)
+    if (lines.length > head.lines.length || lines.some((l, i) => l.raw !== head.lines[i].raw)) {
+      throw new HiveMemoryError('HIVE_MEMORY_RESTORE_AUTHORITY_MISMATCH', `the hive-memory-purge ledger in ${dir} is not a prefix of the head ledger`)
+    }
+  }
+  return { ...head, fold }
+}
+
+const pathExists = p => { try { lstatSync(p); return true } catch { return false } }
+
+// Full-host: the head ledger goes in place before the candidate is judged, and an existing ledger is never
+// overwritten (an identical one, from an earlier refused attempt, is left as it is).
+function installAuthorityLedger(ledgerPath, auth) {
+  if (pathExists(ledgerPath)) {
+    let same = false
+    try { same = readFileSync(ledgerPath).equals(auth.bytes) } catch { /* unreadable: refuse below */ }
+    if (!same) throw new HiveMemoryError('HIVE_MEMORY_RESTORE_LEDGER_EXISTS', 'the local ledger exists and is never overwritten; restore without --with-ledger')
+    return
+  }
+  const tmp = `${ledgerPath}.${process.pid}.tmp`
+  const fd = openSync(tmp, 'wx', 0o600)
+  try { writeAll(fd, auth.bytes); fsyncSync(fd) } finally { closeSync(fd) }
+  try { linkSync(tmp, ledgerPath) } finally { rmSync(tmp, { force: true }) }
+  fsyncDir(dirname(ledgerPath))
+}
+
 export function restoreSnapshot({
-  snapshotPath, dbPath, ledgerPath, config, reapplyPurges = false, acknowledgeGap = null, nowSec = nowSecDefault(), hooks = {},
+  snapshotPath, dbPath, ledgerPath, config, authority = null, withLedger = false, reapplyPurges = false, acknowledgeGap = null,
+  nowSec = nowSecDefault(), hooks = {},
 }) {
   const fail = (code, message, extra = {}) => { throw Object.assign(new HiveMemoryError(code, message), extra) }
   const lock = acquireStoreLock(dbPath)
   const work = `${dbPath}.restore-${process.pid}`
   let db = null
   try {
+    const auth = loadRestoreAuthority(authority ?? {})
+    if (withLedger) installAuthorityLedger(ledgerPath, auth)
     for (const p of [work, `${work}-wal`, `${work}-shm`]) rmSync(p, { force: true })
     copyFileSync(snapshotPath, work)
     db = openDb(work)
@@ -991,10 +1049,13 @@ export function restoreSnapshot({
     if (!hasStoreMeta(db)) fail('HIVE_MEMORY_RESTORE_INTEGRITY', 'snapshot has no store_meta')
     const { lines } = readLedger(ledgerPath, { repair: true })
     if (!lines.length) fail('HIVE_MEMORY_RESTORE_LEDGER_MISSING', 'the ledger is missing or empty')
+    if (lines.length < auth.lines.length || auth.lines.some((l, i) => l.raw !== lines[i].raw)) {
+      fail('HIVE_MEMORY_RESTORE_AUTHORITY_STALE', `the local ledger (${lines.length}) is behind or diverges from the newest verified backup (${auth.lines.length})`)
+    }
     const fold = foldLedger(lines)
     let meta = readMeta(db)
-    if (meta.store_id !== fold.storeId) fail('HIVE_MEMORY_RESTORE_STORE_ID_MISMATCH', 'snapshot store_id does not match the ledger')
-    if (meta.write_seq > fold.maxSeq) fail('HIVE_MEMORY_RESTORE_SNAPSHOT_AHEAD', `snapshot write_seq ${meta.write_seq} is ahead of the ledger (${fold.maxSeq})`)
+    if (meta.store_id !== fold.storeId) fail(withLedger ? 'HIVE_MEMORY_RESTORE_AUTHORITY_MISMATCH' : 'HIVE_MEMORY_RESTORE_STORE_ID_MISMATCH', 'snapshot store_id does not match the ledger')
+    if (meta.write_seq > fold.maxSeq) fail(withLedger ? 'HIVE_MEMORY_RESTORE_AUTHORITY_MISMATCH' : 'HIVE_MEMORY_RESTORE_SNAPSHOT_AHEAD', `snapshot write_seq ${meta.write_seq} is ahead of the ledger (${fold.maxSeq})`)
     for (const row of db.prepare('SELECT id, raw_json FROM events').all()) {
       const v = checkEvent(JSON.parse(row.raw_json), config)
       if (!v.ok || v.ev.id !== row.id) fail('HIVE_MEMORY_RESTORE_INVALID_EVENT', `event ${prefix(row.id)}: ${v.reason || 'stored under the wrong id'}`)
@@ -1019,13 +1080,14 @@ export function restoreSnapshot({
         db.prepare('UPDATE store_meta SET last_purge_seq = ? WHERE singleton = 1').run(fold.lastPurgeSeq)
         if (!missing.size) db.prepare('UPDATE store_meta SET write_seq = ?, pending_ledger_json = ? WHERE singleton = 1').run(fold.maxSeq, fold.lastRaw)
       })
+      db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
       db.exec('VACUUM')
       db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
       ids = dbEventIds(db)
       if (difference(ids, fold.expected).size) fail('HIVE_MEMORY_RESTORE_UNKNOWN_EVENT', 'events beyond the ledger remain after reapplying purges')
       missing = difference(fold.expected, ids)
     }
-    let gapLine = null
+    let acked = []
     if (missing.size) {
       const report = lines.filter(l => l.rec.op === 'submit' && missing.has(l.rec.id))
         .map(({ rec }) => ({ seq: rec.seq, id: rec.id, pubkey: rec.pubkey, d: rec.d, scope: rec.scope, status: rec.status, at: rec.at }))
@@ -1033,26 +1095,46 @@ export function restoreSnapshot({
       if (acknowledgeGap !== fold.maxSeq) {
         fail('HIVE_MEMORY_RESTORE_GAP_DETECTED', `missing ${missing.size} accepted writes: ${JSON.stringify([...report, ...cutoverOnly])}`, { gap: [...report, ...cutoverOnly], ledgerMaxSeq: fold.maxSeq })
       }
-      gapLine = inTransaction(db, () => {
-        const seq = fold.maxSeq + 1
-        const line = JSON.stringify({ seq, op: 'restore-gap-ack', store_id: fold.storeId, acked_ids: [...missing].sort(), at: nowSec })
-        db.prepare('UPDATE store_meta SET write_seq = ?, pending_ledger_json = ?, last_purge_seq = ? WHERE singleton = 1').run(seq, line, fold.lastPurgeSeq)
-        return { seq, line }
-      }, hooks, 'restore-gap-ack')
+      acked = [...missing].sort()
     }
+    // A 90-day purge whose backup never landed is not in any ledger restore can see; its rows are still due.
+    const due = retentionDue(db, nowSec).sort()
+    if (due.length && !reapplyPurges) {
+      fail('HIVE_MEMORY_RESTORE_PRE_PURGE_SNAPSHOT', `snapshot holds ${due.length} events past the 90-day retention window: [${due.map(prefix).join(', ')}]; rerun with --reapply-purges`)
+    }
+    const staged = []
+    if (acked.length || due.length) {
+      inTransaction(db, () => {
+        let seq = fold.maxSeq
+        if (acked.length) staged.push(JSON.stringify({ seq: ++seq, op: 'restore-gap-ack', store_id: fold.storeId, acked_ids: acked, at: nowSec }))
+        if (due.length) {
+          db.prepare('DELETE FROM events WHERE id IN (SELECT value FROM json_each(?))').run(JSON.stringify(due))
+          db.prepare('DELETE FROM writer_rate_log WHERE event_id IN (SELECT value FROM json_each(?))').run(JSON.stringify(due))
+          const last = db.prepare('SELECT id FROM events ORDER BY ingested_at DESC, rowid DESC LIMIT 1').get()?.id ?? null
+          db.prepare('UPDATE store_meta SET last_event_id = ? WHERE singleton = 1').run(last)
+          staged.push(JSON.stringify({ seq: ++seq, op: 'purge', store_id: fold.storeId, purged_ids: due, reason: 'retention', at: nowSec }))
+        }
+        db.prepare('UPDATE store_meta SET write_seq = ?, pending_ledger_json = ?, last_purge_seq = ? WHERE singleton = 1').run(seq, staged.at(-1), due.length ? seq : fold.lastPurgeSeq)
+      }, hooks, acked.length ? 'restore-gap-ack' : 'purge')
+      if (due.length) {
+        db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+        db.exec('VACUUM')
+      }
+    }
+    const writeSeq = fold.maxSeq + staged.length
     meta = readMeta(db)
-    if (meta.write_seq !== (gapLine ? fold.maxSeq + 1 : fold.maxSeq)) fail('HIVE_MEMORY_RESTORE_GAP_DETECTED', `snapshot write_seq ${meta.write_seq} does not match the ledger (${fold.maxSeq})`)
+    if (meta.write_seq !== writeSeq) fail('HIVE_MEMORY_RESTORE_GAP_DETECTED', `snapshot write_seq ${meta.write_seq} does not match the ledger (${fold.maxSeq})`)
     db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
     db.close()
     db = null
     for (const p of [`${dbPath}-wal`, `${dbPath}-shm`, `${work}-wal`, `${work}-shm`]) rmSync(p, { force: true })
     renameSync(work, dbPath)
     fsyncDir(dirname(dbPath))
-    if (gapLine) {
-      hooks.afterCommit?.('restore-gap-ack')
-      appendLedgerLine(ledgerPath, gapLine.line, hooks)
+    if (staged.length) {
+      hooks.afterCommit?.(acked.length ? 'restore-gap-ack' : 'purge')
+      appendLedgerLine(ledgerPath, staged.join('\n'), hooks)
     }
-    return { installed: true, writeSeq: gapLine ? gapLine.seq : fold.maxSeq, reappliedPurges: reapplyPurges, acknowledgedGap: gapLine ? [...missing] : [] }
+    return { installed: true, writeSeq, reappliedPurges: reapplyPurges, acknowledgedGap: acked, retentionPurged: due }
   } finally {
     try { db?.close() } catch { /* closed */ }
     for (const p of [work, `${work}-wal`, `${work}-shm`]) rmSync(p, { force: true })
