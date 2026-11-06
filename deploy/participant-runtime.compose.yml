@@ -344,6 +344,41 @@ services:
         condition: service_started
     restart: unless-stopped
   # @door-end
+  # @recall-begin
+  # The memory recall forwarder: memory_wake and memory_query from the keyless channel, over the
+  # private socket <runtime>/memory-recall/socket, to the store's reader transport that the manifest's
+  # may_recall.read names (agent_recall.mjs). It runs as the broker UID and forwards those two tools
+  # only, failing closed after 20 s. It holds no Bunker credential and no model login; the read key
+  # stays with whatever serves may_recall.read, reached through the broker state, never mounted into
+  # a channel role.
+  recall:
+    image: ${NVOY_IMAGE:?set NVOY_IMAGE}
+    user: "${BROKER_UID:?}:${BROKER_ADAPTER_GID:?}"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp:mode=1777]
+    environment:
+      NVOY_INSTANCE_ROOT: /etc/nvoy/instances
+    command: ["node", "mcp/tools/instance-broker-recall.mjs", "--instance", "${INSTANCE_ID:?}"]
+    volumes:
+      - type: bind
+        source: ${MANIFEST_DIR:?}
+        target: /etc/nvoy/instances
+        read_only: true
+      - type: volume
+        source: broker_state
+        target: ${STATE_DIR:?}
+        read_only: true
+      - type: volume
+        source: adapter_runtime
+        target: ${RUNTIME_DIR:?}
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+  # @recall-end
 
 secrets:
   nvoy_bunker_uri:

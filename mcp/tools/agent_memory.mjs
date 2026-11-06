@@ -45,7 +45,7 @@ export function memoryToolSpec(manifest, op) {
       ' Cite concrete evidence (commit, PR, file path, message id) and an as_of_git (<repo>@<sha>) or as_of_evt (<64-hex>) anchor.' +
       ' Retention (ttl_sec): 1..2592000 (default 1209600, 14 days; at most 30 days) for a Class A status or handoff claim that expires;' +
       ' 0 for a Class B durable decision or standing project fact that stays active until withdrawn or superseded.' +
-      ' Check memory_query first to avoid duplicates. When a fact changes, supersede it at the same slug (supersedes: [<prior event id>]); when it stops being true, call memory_withdraw.' +
+      (manifest.mayRecall ? ' Check memory_query first to avoid duplicates.' : '') + ' When a fact changes, supersede it at the same slug (supersedes: [<prior event id>]); when it stops being true, call memory_withdraw.' +
       ' Never record chatter, narration, guesses, personal details, secrets, or prose already in git or docs: cite those in evidence instead.'
     : 'Withdraw your room memory claim at one slug as soon as it stops being true, is resolved, or was wrong.' +
       ' The broker looks up your current claim at the fact key and submits a replacement marked withdrawn, with a strictly later created_at.'

@@ -182,7 +182,8 @@ def instances() -> list[dict]:
         if not isinstance(enabled, bool):
             raise RuntimeError(f"{path.name}: worker_enabled must be boolean")
         result.append({"id": raw["id"], "worker": enabled, "harness": raw.get("harness") is not None,
-                       "notifier": raw.get("wake_webhook") is not None, "door": raw.get("channel_door") is not None})
+                       "notifier": raw.get("wake_webhook") is not None, "door": raw.get("channel_door") is not None,
+                       "recall": raw.get("may_recall") is not None})
     if not result:
         raise RuntimeError(f"no instance manifests in {ROOT}")
     return result
@@ -205,7 +206,7 @@ def verify_running(path: Path, instance: dict) -> None:
     running = set(compose(path, ["ps", "--status", "running", "--services"], True).split())
     expected = (["watcher", "broker", "adapter"] + (["worker"] if instance["worker"] else [])
                 + (["harness"] if instance["harness"] else []) + (["notifier"] if instance.get("notifier") else [])
-                + (["door"] if instance.get("door") else []))
+                + (["door"] if instance.get("door") else []) + (["recall"] if instance.get("recall") else []))
     missing = [service for service in expected if service not in running]
     if missing:
         raise RuntimeError(f"{instance['id']}: services not running: {', '.join(missing)}")

@@ -32,6 +32,8 @@ if (!m.wakeWebhook) out = out.replace(/^\s*# @webhook-begin\n[\s\S]*?^\s*# @webh
 else out = out.replace(/^\s*# @webhook-(?:begin|end)\n?/gm, '')
 if (!m.channelDoor) out = out.replace(/^\s*# @door-begin\n[\s\S]*?^\s*# @door-end\n?/gm, '')
 else out = out.replace(/^\s*# @door-(?:begin|end)\n?/gm, '')
+if (!m.mayRecall) out = out.replace(/^\s*# @recall-begin\n[\s\S]*?^\s*# @recall-end\n?/gm, '')
+else out = out.replace(/^\s*# @recall-(?:begin|end)\n?/gm, '')
 const replacements = {
   '${NVOY_IMAGE:?set NVOY_IMAGE}': JSON.stringify(image), '${WATCHER_UID:?}': String(m.watcherUid),
   '${BROKER_UID:?}': String(m.brokerUid), '${ADAPTER_UID:?}': String(m.adapterUid), '${WORKER_UID:?}': String(m.workerUid), '${BROKER_ADAPTER_GID:?}': String(m.brokerAdapterGid), '${WORKER_HANDOFF_GID:?}': String(m.workerHandoffGid),
