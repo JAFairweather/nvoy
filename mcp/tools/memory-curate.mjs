@@ -294,6 +294,16 @@ export function evaluateDreamTriggers({
     a => a && a.kind === 'refused' && typeof a.at === 'number' && Math.max(0, nowSec - a.at) <= NIGHTMARE_REFUSAL_WINDOW_SEC
   ).length
 
+  const zeroHitQueries15m = (Array.isArray(recentActivity) ? recentActivity : []).filter(
+    a =>
+      a &&
+      a.kind === 'query' &&
+      a.count === 0 &&
+      (typeof a.at !== 'number' || Math.max(0, nowSec - a.at) <= NIGHTMARE_REFUSAL_WINDOW_SEC)
+  ).length
+  const epistemicBlindSpot =
+    zeroHitQueries15m >= 2 || coherence?.epistemic_drift?.status === 'blind_spot'
+
   const coherenceScore =
     typeof coherence === 'number'
       ? coherence
@@ -304,6 +314,7 @@ export function evaluateDreamTriggers({
     coherence &&
     typeof coherence === 'object' &&
     coherence.axes &&
+    !epistemicBlindSpot &&
     Number(coherence.delta_since_inception || 0) >= 0 &&
     Number(coherence.axes.grounding || 0) >= 80 &&
     Number(coherence.axes.alignment || 0) >= 60
@@ -313,6 +324,7 @@ export function evaluateDreamTriggers({
     conflictedKeys.size > 0 ||
     staleRecords.length > 0 ||
     refusalCount15m >= NIGHTMARE_REFUSAL_THRESHOLD ||
+    epistemicBlindSpot ||
     coherenceAlert
 
   const reasons = []
@@ -324,6 +336,11 @@ export function evaluateDreamTriggers({
   if (conflictedKeys.size > 0) reasons.push(`nightmare_conflict: ${conflictedKeys.size} conflicted fact key(s)`)
   if (staleRecords.length > 0) reasons.push(`nightmare_stale_git: ${staleRecords.length} stale git anchor(s)`)
   if (refusalCount15m >= NIGHTMARE_REFUSAL_THRESHOLD) reasons.push(`nightmare_refusal_spike: ${refusalCount15m} gate refusals in 15m`)
+  if (epistemicBlindSpot) {
+    reasons.push(
+      `nightmare_epistemic_drift: ${zeroHitQueries15m} zero-hit memory queries in 15m (status=${coherence?.epistemic_drift?.status || 'blind_spot'})`
+    )
+  }
   if (coherenceAlert) reasons.push(`nightmare_coherence_drop: score ${coherenceScore}% (< 70%)`)
 
   return {
@@ -340,6 +357,7 @@ export function evaluateDreamTriggers({
     conflicted_keys: [...conflictedKeys],
     stale_count: staleRecords.length,
     refusal_count_15m: refusalCount15m,
+    zero_hit_queries_15m: zeroHitQueries15m,
     coherence_score: coherenceScore,
   }
 }
