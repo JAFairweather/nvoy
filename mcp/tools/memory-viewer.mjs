@@ -585,15 +585,18 @@ export function computeCoherence({
       }
     }
   }
-  const reportedFailureRegex = /timed out during banner exchange|memory store did not answer in time|permission denied \(publickey\)|hive-memory.*fail|ssh-timeout-diagnosis|cli-ssh-handshake/i
+  const reportedFailureRegex = /timed out during banner exchange|memory store did not answer in time|permission denied \(publickey\)|ssh-timeout-diagnosis|cli-ssh-handshake/i
+  const seenFailureSlugs = new Set()
   for (const r of allNonCanon) {
     if (!r || typeof r !== 'object') continue
     const age = Math.max(0, now_sec - (r.created_at || 0))
-    if (age > 21600) continue
-    const text = `${r.d || ''} ${r.claim || ''}`
-    if (reportedFailureRegex.test(text)) {
+    if (age > 3600) continue
+    const slug = String(r.d || '').split(':').pop() || r.d || 'incident'
+    if (seenFailureSlugs.has(slug)) continue
+    const text = `${slug} ${r.claim || ''}`
+    if (reportedFailureRegex.test(text) && !/\b(?:fixed|resolved|verified)\b/i.test(slug)) {
+      seenFailureSlugs.add(slug)
       const actor = rosterByPk.get(String(r.author_pubkey || '')) || String(r.author_pubkey || '').slice(0, 8)
-      const slug = String(r.d || '').split(':').pop() || r.d || 'incident'
       toolFailureAlerts.push({
         agent: actor,
         category: 'tool_failure',
