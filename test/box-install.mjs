@@ -6,7 +6,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
-import { readClientConfig } from '../mcp/tools/channel_client.mjs'
+import { readClientConfig, recallEntry } from '../mcp/tools/channel_client.mjs'
 import { parseHostKey, publicHalf } from '../mcp/tools/box-install.mjs'
 
 const root = mkdtempSync(join(tmpdir(), 'nvoy-box-'))
@@ -98,6 +98,13 @@ writeFileSync(clientPath, JSON.stringify({ ...client, recall: { ...recall, comma
 assert.throws(() => readClientConfig(clientPath, id), /recall takes exactly/, 'a recall block holds only the three paths')
 writeFileSync(clientPath, JSON.stringify({ ...client, recall: { ...recall, ssh_target: 'gw@herd-cloud -oProxyCommand=x' } }))
 assert.throws(() => readClientConfig(clientPath, id), /recall ssh_target/)
+assert.deepEqual({ ...recallEntry({ local: true }, 'crystalclaude', 'agent-crystalclaude') }, { local: true }, 'on the store\'s box the instance\'s own login reads with no key')
+assert.throws(() => recallEntry({ local: true }, 'crystalclaude', 'agent-crusty'), /reads only as agent-crystalclaude/, 'another agent\'s login never reads as this instance')
+assert.throws(() => recallEntry({ local: true }, 'crystalclaude', 'root'), /reads only as agent-crystalclaude/)
+assert.throws(() => recallEntry({ local: 'yes' }, 'crystalclaude', 'agent-crystalclaude'), /local must be true/)
+assert.throws(() => recallEntry({ local: true, ssh_target: 'hive-memory-gw@herd-cloud' }, 'crystalclaude', 'agent-crystalclaude'), /recall takes exactly/, 'local recall is exactly { local: true }')
+writeFileSync(clientPath, JSON.stringify({ ...client, recall: { local: true } }))
+assert.throws(() => readClientConfig(clientPath, id), new RegExp(`reads only as agent-${id}`), 'the client config checks the process user')
 writeFileSync(clientPath, JSON.stringify(client))
 assert.ok(!(r.stdout + r.stderr).includes('not-a-real-token'), 'the login is never printed')
 

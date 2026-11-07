@@ -5,7 +5,7 @@
 // Every check throws; the caller owns how it dies. No function here reads a private key.
 
 import { lstatSync, readFileSync, realpathSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { homedir, userInfo } from 'node:os'
 import { dirname, isAbsolute, parse, resolve } from 'node:path'
 import { instanceId } from './runtime_manifest.mjs'
 
@@ -92,19 +92,28 @@ export function rememberFlag(value) {
 // `recall` names the instance's own Hive memory read key: { identity_file, known_hosts_file, ssh_target }. The
 // session then mounts that reader as the hive-memory MCP server and its instructions carry the recall rule. The
 // gateway's forced command binds the key to one reader socket, which serves only memory_wake and memory_query.
+// On the store's own box an `agent-<instance>` login needs no key: { local: true } mounts herd-infra's bridge to
+// /run/hive-memory/<instance>.sock, which only that user may open and the bridge refuses to any other reader.
 const RECALL_FIELDS = ['identity_file', 'known_hosts_file', 'ssh_target']
-export function recallEntry(value) {
+export const HIVE_CONNECT = '/usr/local/lib/hive-memory/connect'
+export function recallEntry(value, id, user = userInfo().username) {
   if (value === undefined) return null
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('client config recall must be an object')
   const keys = Object.keys(value)
+  if (keys.length === 1 && keys[0] === 'local') {
+    if (value.local !== true) throw new Error('client config recall local must be true')
+    if (user !== `agent-${id}`) throw new Error(`client config recall local reads only as agent-${id} on the store's box`)
+    return Object.freeze({ local: true })
+  }
   if (keys.length !== RECALL_FIELDS.length || !RECALL_FIELDS.every(k => keys.includes(k))) {
-    throw new Error(`client config recall takes exactly ${RECALL_FIELDS.join(', ')}`)
+    throw new Error(`client config recall takes exactly ${RECALL_FIELDS.join(', ')}, or local: true`)
   }
   const target = String(value.ssh_target)
   if (!SSH_TARGET.test(target)) throw new Error('client config recall ssh_target must be a fixed user@host')
   return Object.freeze({ identity: privateFile(String(value.identity_file), 'Hive memory read key'),
     knownHosts: knownHostsFile(String(value.known_hosts_file)), target })
 }
+export const recallServerEntry = recall => recall.local ? { command: HIVE_CONNECT, args: [] } : sshChannelEntry(recall)
 
 export function readClientConfig(path, id) {
   const file = fixedPath(path, 'client config', 64 * 1024)
@@ -133,7 +142,7 @@ export function readClientConfig(path, id) {
   if (!Array.isArray(channels) || !channels.every(c => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(c))) throw new Error('client config channels must be Buzz channel ids')
   const config = Object.freeze({
     id: instanceId(id), target, home: resolve(home), model, pubkey, channels, remember: rememberFlag(raw.remember),
-    recall: recallEntry(raw.recall),
+    recall: recallEntry(raw.recall, id),
     identity: privateFile(String(raw.identity_file || ''), 'SSH identity file'),
     knownHosts: knownHostsFile(String(raw.known_hosts_file || '')),
     credentialFile: privateFile(String(raw.credential_file || ''), 'Claude login credential file'),

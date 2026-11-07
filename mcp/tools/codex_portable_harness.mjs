@@ -125,11 +125,11 @@ export function readCodexClientConfig(path, id, own = homedir()) {
   const identity = privateFile(String(raw.identity_file || ''), 'SSH channel identity file')
   const feedIdentity = privateFile(String(raw.feed_identity_file || ''), 'SSH feed identity file')
   if (identity === feedIdentity) throw new Error('the channel and feed keys must be two keys: each forced command admits exactly one')
-  const recall = recallEntry(raw.recall)
+  const recall = recallEntry(raw.recall, id)
   if (recall && [identity, feedIdentity].includes(recall.identity)) throw new Error('the Hive memory read key must be a key of its own: each forced command admits exactly one')
   const socket = resolve(codexHome, 'ctl', 'as.sock')
   if (Buffer.byteLength(socket) >= 104) throw new Error('codex_home is too deep for its control socket; choose a shorter path')
-  const grants = codexGrants(raw.grants, { own, codexHome, keys: [identity, feedIdentity, ...(recall ? [recall.identity] : [])] })
+  const grants = codexGrants(raw.grants, { own, codexHome, keys: [identity, feedIdentity, ...(recall?.identity ? [recall.identity] : [])] })
   const approvals = raw.approvals === undefined ? null : codexApprovals(raw.approvals)
   return Object.freeze({ id: instanceId(id), target, model, pubkey, channels, codexHome, socket, identity, feedIdentity, grants, approvals, remember: rememberFlag(raw.remember), recall,
     knownHosts: knownHostsFile(String(raw.known_hosts_file || '')) })
