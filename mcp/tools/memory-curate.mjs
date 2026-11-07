@@ -294,13 +294,20 @@ export function evaluateDreamTriggers({
     a => a && a.kind === 'refused' && typeof a.at === 'number' && Math.max(0, nowSec - a.at) <= NIGHTMARE_REFUSAL_WINDOW_SEC
   ).length
 
-  const zeroHitQueries15m = (Array.isArray(recentActivity) ? recentActivity : []).filter(
-    a =>
-      a &&
-      a.kind === 'query' &&
-      a.count === 0 &&
-      (typeof a.at !== 'number' || Math.max(0, nowSec - a.at) <= NIGHTMARE_REFUSAL_WINDOW_SEC)
-  ).length
+  const actArr = Array.isArray(recentActivity) ? recentActivity : []
+  const zeroHitQueries15m = actArr.filter((a, idx) => {
+    if (!a || a.kind !== 'query' || a.count !== 0 || !a.topic) return false
+    if (a.actor === 'curator' || a.actor === 'viewer') return false
+    if (typeof a.at === 'number' && Math.max(0, nowSec - a.at) > NIGHTMARE_REFUSAL_WINDOW_SEC) return false
+    const resolvedSoon = actArr.slice(idx + 1, idx + 12).some(
+      next =>
+        next &&
+        next.actor === a.actor &&
+        ((next.kind === 'query' && Number(next.count) > 0) ||
+          (next.kind === 'submit' && next.accepted !== false))
+    )
+    return !resolvedSoon
+  }).length
   const epistemicBlindSpot =
     zeroHitQueries15m >= 2 || coherence?.epistemic_drift?.status === 'blind_spot'
 
