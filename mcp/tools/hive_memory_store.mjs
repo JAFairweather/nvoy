@@ -8,7 +8,7 @@
 // Nothing here opens a network connection.
 
 import { DatabaseSync, backup as sqliteBackup } from 'node:sqlite'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import {
   closeSync, copyFileSync, existsSync, fsyncSync, ftruncateSync, linkSync, lstatSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, writeSync,
 } from 'node:fs'
@@ -28,7 +28,7 @@ export const SOCKET_NAME = /^[a-z][a-z0-9-]{0,31}$/
 const EVENT_KEYS = ['content', 'created_at', 'id', 'kind', 'pubkey', 'sig', 'tags']
 const LEDGER_OPS = new Set(['init', 'cutover', 'submit', 'purge', 'restore-gap-ack'])
 const CONFIG_KEYS = ['memoryGlobalChannelId', 'ownerPubkey', 'maxUnbackedSec', 'globalWriters', 'readers', 'writers', 'rooms']
-const OPTIONAL_CONFIG_KEYS = ['canonWriters']
+const OPTIONAL_CONFIG_KEYS = ['canonWriters', 'curators']
 const RECEIPT_SKEW_SEC = 300
 
 const SCHEMA = `
@@ -127,7 +127,14 @@ export function validateAndResolveConfig(cfg) {
     for (const w of roomWriters) if (!members.has(w)) fail(`rooms.${id}.writers is not a subset of its members`)
     return [id, Object.freeze({ members, writers: roomWriters })]
   }))
-  return Object.freeze({ memoryGlobalChannelId: cfg.memoryGlobalChannelId, ownerPubkey, maxUnbackedSec: cfg.maxUnbackedSec, globalWriters, canonWriters, readers, writers, rooms })
+  if (cfg.curators !== undefined && !Array.isArray(cfg.curators)) fail('curators must be an array')
+  const writerPubkeys = new Set([...writers.values()].map(w => w.pubkey))
+  const curators = new Set((cfg.curators ?? []).map((p, i) => {
+    const pk = hex(p, `curators[${i}]`)
+    if (!writerPubkeys.has(pk)) fail(`curators[${i}] (${prefix(pk)}) is not a configured writer`)
+    return pk
+  }))
+  return Object.freeze({ memoryGlobalChannelId: cfg.memoryGlobalChannelId, ownerPubkey, maxUnbackedSec: cfg.maxUnbackedSec, globalWriters, canonWriters, curators, readers, writers, rooms })
 }
 
 export function loadConfigFile(path) {
@@ -258,13 +265,46 @@ export function appendLedgerLine(path, line, hooks = {}) {
   if (created) fsyncDir(dirname(path))
 }
 
+const sha256Hex = str => createHash('sha256').update(String(str), 'utf8').digest('hex')
+
+// Canonical Whole-Store Merkle Root (Phase 2, Gate 3): proves at any point in time that the events table
+// and its current-head flags have not been altered or truncated.
+export function computeStoreMerkleRoot(db) {
+  const meta = db.prepare('SELECT store_id FROM store_meta WHERE singleton = 1').get()
+  const storeId = meta?.store_id || 'uninitialized'
+  const rows = db.prepare('SELECT id, is_current, raw_json FROM events ORDER BY id ASC').all()
+  if (!rows.length) return sha256Hex(`hive-memory-store-empty-v1:${storeId}`)
+  let level = rows.map(r => sha256Hex(`hive-memory-store-leaf-v1:${r.id}:${r.is_current}:${sha256Hex(r.raw_json)}`))
+  while (level.length > 1) {
+    const next = []
+    for (let i = 0; i < level.length; i += 2) {
+      if (i + 1 < level.length) {
+        next.push(sha256Hex(`hive-memory-store-node-v1:${level[i]}:${level[i + 1]}`))
+      } else {
+        next.push(level[i])
+      }
+    }
+    level = next
+  }
+  return level[0]
+}
+
 // Superseded, withdrawn and expired rows whose end of life is more than 90 days past.
+// Phase 2 Gate 2 (90-Day Source Hold): any event referenced in `supersedes` by an active, current claim
+// created within the last 90 days is held from purge so its curation summary remains verifiable.
 function retentionDue(db, nowSec) {
   const cutoff = nowSec - RETENTION_PURGE_AFTER_SEC
   return db.prepare(`SELECT e.id FROM events e WHERE
-    (e.is_current = 0 AND COALESCE((SELECT MIN(n.created_at) FROM events n WHERE n.pubkey = e.pubkey AND n.d = e.d AND n.id <> e.id AND n.created_at >= e.created_at), e.created_at) <= ?)
-    OR (e.is_current = 1 AND e.status = 'withdrawn' AND e.created_at <= ?)
-    OR (e.is_current = 1 AND e.status = 'active' AND e.exp IS NOT NULL AND e.exp <= ?)`).all(cutoff, cutoff, cutoff).map(r => r.id)
+    NOT EXISTS (
+      SELECT 1 FROM links l JOIN events c ON c.id = l.from_id
+      WHERE l.relation = 'supersedes' AND l.target = e.id
+        AND c.is_current = 1 AND c.status = 'active' AND (c.exp IS NULL OR c.exp > ?)
+        AND c.created_at > ?
+    ) AND (
+      (e.is_current = 0 AND COALESCE((SELECT MIN(n.created_at) FROM events n WHERE n.pubkey = e.pubkey AND n.d = e.d AND n.id <> e.id AND n.created_at >= e.created_at), e.created_at) <= ?)
+      OR (e.is_current = 1 AND e.status = 'withdrawn' AND e.created_at <= ?)
+      OR (e.is_current = 1 AND e.status = 'active' AND e.exp IS NOT NULL AND e.exp <= ?)
+    )`).all(nowSec, cutoff, cutoff, cutoff, cutoff).map(r => r.id)
 }
 
 // --- the exclusive store lock (daemon and maintenance tools never write at once) ---
@@ -651,12 +691,23 @@ export class HiveMemoryStore {
       return refusal('HIVE_MEMORY_PRIOR_MISMATCH', 'expected_prior_id must be a 64-hex event id or null')
     }
     if (this.purgedIds.has(v.ev.id)) return refusal('HIVE_MEMORY_PURGED_EVENT', 'this event was purged and is never stored again')
+    if (this.config.curators?.has(v.pubkey) && v.status === 'active' && v.supersedes.length > 0 && !v.merkleSources) {
+      return refusal('HIVE_MEMORY_CURATOR_MISSING_MERKLE', 'curator consolidation claims with supersedes must carry a valid merkle_sources tag')
+    }
     const db = this.db
     let staged
     try {
       staged = inTransaction(db, () => {
         const existing = db.prepare('SELECT id, status FROM events WHERE id = ?').get(v.ev.id)
         if (existing) return { abort: true, replay: { accepted: true, id: existing.id, status: existing.status, replay: true } }
+        if (v.merkleSources) {
+          for (const supId of v.supersedes) {
+            const srcRow = db.prepare('SELECT id, scope FROM events WHERE id = ?').get(String(supId))
+            if (!srcRow || srcRow.scope !== v.scope) {
+              return { abort: true, refused: refusal('HIVE_MEMORY_CURATOR_SOURCE_MISSING', `supersedes source ${prefix(supId)} does not exist in scope ${v.scope}`) }
+            }
+          }
+        }
         const current = db.prepare('SELECT id, created_at, status FROM events WHERE pubkey = ? AND d = ? AND is_current = 1').get(v.pubkey, v.d)
         if ((current?.id ?? null) !== expectedPriorId) return { abort: true, refused: refusal('HIVE_MEMORY_PRIOR_MISMATCH', `the current event at this fact key is ${current ? prefix(current.id) : 'none'}`) }
         if (current && !nip01Newer(v.ev, current)) return { abort: true, refused: refusal('HIVE_MEMORY_NOT_NEWER', 'the event is not newer than the current event at this fact key') }
@@ -741,6 +792,11 @@ export class HiveMemoryStore {
     }
   }
 
+  storeMerkleRoot() {
+    if (!this.isReady().ready || !this.db) return null
+    return computeStoreMerkleRoot(this.db)
+  }
+
   // Accepted writes by `pubkey` in the last hour, as the submit cap counts them; null when not READY.
   writerRateCount(pubkey, nowSec = nowSecDefault()) {
     if (!this.isReady().ready) return null
@@ -777,17 +833,23 @@ export class HiveMemoryStore {
     return found
   }
 
-  // Gate 7 peer supersession: a workflow checkpoint (see isWorkflowSlug) named in `supersedes` by a live, newer claim in
-  // the same scope leaves the default view as 'consolidated'. Canon is never hidden this way. Withdrawing or expiring
-  // the superseding claim brings the checkpoint back, since this is computed at read time and nothing is rewritten.
+  // Gate 1 Curator Curation + Gate 7 peer workflow supersession:
+  // A stored claim `s` named in `supersedes` by a live, newer claim `c` in the same scope leaves the default view
+  // as 'consolidated' when `s` is a workflow checkpoint (isWorkflowSlug) OR `c` is signed by a configured Curator
+  // (`config.curators`). Canon is never hidden this way. Withdrawing or expiring `c` brings `s` back immediately.
   #consolidatedBy(nowSec) {
     const out = new Map()
-    const rows = this.db.prepare(`SELECT s.id AS sid, s.d AS sd, c.id AS cid FROM links l
+    const curators = this.config?.curators || new Set()
+    const rows = this.db.prepare(`SELECT s.id AS sid, s.d AS sd, c.id AS cid, c.pubkey AS cpubkey FROM links l
       JOIN events c ON c.id = l.from_id JOIN events s ON s.id = l.target
       WHERE l.relation = 'supersedes' AND c.is_current = 1 AND c.status = 'active' AND (c.exp IS NULL OR c.exp > ?)
         AND c.scope = s.scope AND c.created_at >= s.created_at AND c.id <> s.id AND s.scope_type <> 'hive:canon'
       ORDER BY c.created_at DESC, c.id`).all(nowSec)
-    for (const r of rows) if (!out.has(r.sid) && isWorkflowSlug(parseFactKey(r.sd)?.slug)) out.set(r.sid, r.cid)
+    for (const r of rows) {
+      if (!out.has(r.sid) && (curators.has(r.cpubkey) || isWorkflowSlug(parseFactKey(r.sd)?.slug))) {
+        out.set(r.sid, r.cid)
+      }
+    }
     return out
   }
 
@@ -975,6 +1037,8 @@ function verdictOf(row, nowSec, staleFiles, consolidated = new Map()) {
 
 // Gate 6 discovery card: enough to choose what to open, without because, evidence or as_of. Still data only.
 function indexCard({ row, verdict, body }, names, conflict) {
+  const tags = JSON.parse(row.raw_json).tags || []
+  const merkleSources = tags.find(t => Array.isArray(t) && t[0] === 'merkle_sources' && typeof t[1] === 'string')?.[1] || null
   return {
     record_type: 'memory-index-card',
     authority: null,
@@ -990,6 +1054,7 @@ function indexCard({ row, verdict, body }, names, conflict) {
     retention: row.retention,
     verification: verdict.verification,
     ...(verdict.consolidatedBy ? { consolidated_by: verdict.consolidatedBy } : {}),
+    ...(merkleSources ? { merkle_sources: merkleSources } : {}),
     conflict,
     claim_preview: preview(body.claim, 120),
   }
@@ -999,6 +1064,7 @@ function indexCard({ row, verdict, body }, names, conflict) {
 function envelope({ row, verdict, body }) {
   const tags = JSON.parse(row.raw_json).tags || []
   const supersedes = tags.filter(t => Array.isArray(t) && t[0] === 'supersedes' && typeof t[1] === 'string').map(t => t[1])
+  const merkleSources = tags.find(t => Array.isArray(t) && t[0] === 'merkle_sources' && typeof t[1] === 'string')?.[1] || null
   return {
     record_type: 'memory-claim',
     authority: null,
@@ -1023,6 +1089,7 @@ function envelope({ row, verdict, body }) {
     expires_at: row.exp,
     stale_warning: verdict.staleWarning,
     ...(supersedes.length ? { supersedes } : {}),
+    ...(merkleSources ? { merkle_sources: merkleSources } : {}),
     ...(verdict.consolidatedBy ? { consolidated_by: verdict.consolidatedBy } : {}),
   }
 }

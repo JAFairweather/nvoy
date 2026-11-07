@@ -130,6 +130,7 @@ export function sanitizeMemoryRecord(rec) {
     expires_at: Number.isFinite(rec.expires_at) ? Number(rec.expires_at) : null,
     stale_warning: rec.stale_warning ? String(rec.stale_warning) : null,
     consolidated_by: rec.consolidated_by ? String(rec.consolidated_by) : null,
+    merkle_sources: rec.merkle_sources ? String(rec.merkle_sources) : null,
     supersedes: Array.isArray(rec.supersedes) ? rec.supersedes.map(s => String(s)) : [],
     conflict: Boolean(rec.conflict),
   }
