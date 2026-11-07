@@ -1907,10 +1907,13 @@ export function renderViewerHtml(initialState) {
         <span id="hud-tiers" class="metric-val">-</span>
         <span id="hud-forecast" class="metric-sub">at now</span>
       </div>
-      <div class="metric" id="coherence-card" style="cursor:pointer;" title="Tap to inspect 5-axis Hive Coherence 2.0 Index, Epistemic Drift telemetry, and retroactive inception timeline">
-        <span class="metric-label" style="color:#6ee7b7;">Coherence 2.0</span>
-        <span id="coherence-val" class="metric-val" style="color:#6ee7b7;">-</span>
-        <span id="coherence-sub" class="metric-sub">tap for timeline</span>
+      <div class="metric" id="coherence-card" style="cursor:pointer;display:flex;flex-direction:row;align-items:center;gap:10px;" title="Tap to inspect 5-axis Hive Coherence 2.0 Index, Epistemic Drift telemetry, and retroactive inception timeline">
+        <div style="display:flex;flex-direction:column;gap:1px;">
+          <span class="metric-label" style="color:#6ee7b7;">Coherence 2.0</span>
+          <span id="coherence-val" class="metric-val" style="color:#6ee7b7;">-</span>
+          <span id="coherence-sub" class="metric-sub">tap for timeline</span>
+        </div>
+        <canvas id="hud-coherence-spark" width="144" height="38" style="width:120px;height:32px;border-radius:6px;background:rgba(2,6,23,0.75);border:1px solid rgba(52,211,153,0.35);flex-shrink:0;"></canvas>
       </div>
       <div class="metric" id="dreaming-card" style="cursor:pointer;" title="Tap to inspect Merkle Dreaming, 3-Trigger Curation State, and Stage 0 Spectral Topic Eigenvectors">
         <span class="metric-label" style="color:#c4b5fd;">Merkle Dreaming</span>
@@ -1950,6 +1953,14 @@ export function renderViewerHtml(initialState) {
   </aside>
 
   <aside class="hud-right graph-only">
+    <div id="coherence-graphs-box" class="glass-box panel" style="display:flex;flex-direction:column;gap:6px;flex-shrink:0;">
+      <div class="box-title" style="margin-bottom:2px;">
+        <span style="color:#6ee7b7;">Coherence &amp; Consolidation Graphs</span>
+        <span id="coh-graph-pill" class="mini" style="color:#f472b6;">live trajectory</span>
+      </div>
+      <canvas id="coherence-trajectory-canvas" width="560" height="148" style="width:100%;height:92px;border-radius:8px;background:rgba(2,6,23,0.78);border:1px solid rgba(52,211,153,0.32);cursor:pointer;" title="Click to open full Coherence 2.0 & Consolidation Ledger details"></canvas>
+      <div id="coherence-axes-mini" class="kv-list" style="gap:3px;"></div>
+    </div>
     <div id="inspector-box" class="glass-box panel inspector idle"></div>
   </aside>
 
@@ -1986,6 +1997,15 @@ export function renderViewerHtml(initialState) {
   </nav>
 
   <main class="wrap cards-only">
+    <section id="cards-coherence-section" style="border-color:rgba(52,211,153,0.35);">
+      <h2>
+        <span style="color:#6ee7b7;">Hive Coherence 2.0 &amp; Consolidation Trajectory Graphs</span>
+        <span id="cards-coherence-badge" class="badge ok">-</span>
+      </h2>
+      <canvas id="cards-coherence-canvas" width="720" height="176" style="width:100%;height:132px;border-radius:8px;background:rgba(2,6,23,0.82);border:1px solid rgba(52,211,153,0.32);margin-bottom:8px;"></canvas>
+      <div id="cards-coherence-bars" class="kv-list" style="gap:4px;"></div>
+    </section>
+
     <div class="grid grid-4">
       <div class="card">
         <div class="card-label">Rank 2: Canon</div>
@@ -4391,10 +4411,59 @@ export function renderViewerHtml(initialState) {
           ctx.fillStyle = dreamRecorder ? '#f87171' : '#fde68a';
           ctx.fillText((dreamRecorder ? '● REC .WEBM · ' : '') + Math.round(bp * 100) + '%', bx + bw - 16, by + 22);
 
-          ctx.fillStyle = 'rgba(51, 65, 85, 0.65)';
+           ctx.fillStyle = 'rgba(51, 65, 85, 0.65)';
           ctx.fillRect(bx + 16, by + 48, bw - 32, 5);
           ctx.fillStyle = actCol;
           ctx.fillRect(bx + 16, by + 48, (bw - 32) * Math.min(1, bp), 5);
+        } else if (width <= 1024 && latestCoherence && Array.isArray(latestCoherence.history) && latestCoherence.history.length > 0) {
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          var cw = Math.min(width - 24, 340);
+          var ch = 76;
+          var cx = width - cw - 12;
+          var cy = Math.max(10, hudTop + 4);
+          ctx.fillStyle = 'rgba(6, 11, 25, 0.88)';
+          ctx.strokeStyle = 'rgba(52, 211, 153, 0.42)';
+          ctx.lineWidth = 1.2;
+          ctx.beginPath();
+          ctx.roundRect ? ctx.roundRect(cx, cy, cw, ch, 10) : ctx.rect(cx, cy, cw, ch);
+          ctx.fill();
+          ctx.stroke();
+          ctx.textAlign = 'left';
+          ctx.textBaseline = 'alphabetic';
+          ctx.font = '700 10px ui-monospace, SFMono-Regular, Menlo, monospace';
+          ctx.fillStyle = '#6ee7b7';
+          var pCons = latestCoherence.axes && typeof latestCoherence.axes.consolidation === 'number' ? latestCoherence.axes.consolidation.toFixed(0) : '-';
+          ctx.fillText('COHERENCE ' + Number(latestCoherence.score || 0).toFixed(1) + '% · CONSOLIDATION ' + pCons + '%', cx + 10, cy + 15);
+          var chist = latestCoherence.history;
+          var cproj = latestCoherence.projected_after_dream || null;
+          var ctot = cproj ? chist.length + 1 : chist.length;
+          var gx0 = cx + 10;
+          var gx1 = cx + cw - 10;
+          var gy0 = cy + 22;
+          var gy1 = cy + ch - 8;
+          var cxOf = function (idx) { return gx0 + (ctot <= 1 ? (gx1 - gx0) / 2 : (idx / (ctot - 1)) * (gx1 - gx0)); };
+          var cyOf = function (v) { var cl = Math.max(20, Math.min(100, Number(v || 0))); return gy1 - ((cl - 20) / 80) * (gy1 - gy0); };
+          ctx.save();
+          ctx.setLineDash([4, 3]);
+          ctx.beginPath();
+          chist.forEach(function (pt, idx) {
+            var cv = pt.axes && typeof pt.axes.consolidation === 'number' ? pt.axes.consolidation : pt.score;
+            if (idx === 0) ctx.moveTo(cxOf(idx), cyOf(cv));
+            else ctx.lineTo(cxOf(idx), cyOf(cv));
+          });
+          if (cproj && typeof cproj.consolidation === 'number') ctx.lineTo(cxOf(chist.length), cyOf(cproj.consolidation));
+          ctx.strokeStyle = '#f472b6';
+          ctx.lineWidth = 1.6;
+          ctx.stroke();
+          ctx.restore();
+          ctx.beginPath();
+          chist.forEach(function (pt, idx) {
+            if (idx === 0) ctx.moveTo(cxOf(idx), cyOf(pt.score));
+            else ctx.lineTo(cxOf(idx), cyOf(pt.score));
+          });
+          ctx.strokeStyle = '#34d399';
+          ctx.lineWidth = 2.2;
+          ctx.stroke();
         }
       }
 
@@ -4472,6 +4541,7 @@ export function renderViewerHtml(initialState) {
       });
 
       var latestCoherence = null;
+      var VIEWER_VERSION = '2026-11-07-v4';
       function openCoherenceInspector() {
         if (!latestCoherence) return;
         if (view !== 'graph') switchView('graph');
@@ -4482,13 +4552,162 @@ export function renderViewerHtml(initialState) {
         renderInspector();
       }
       if (el('coherence-card')) el('coherence-card').addEventListener('click', openCoherenceInspector);
+      if (el('coherence-trajectory-canvas')) el('coherence-trajectory-canvas').addEventListener('click', openCoherenceInspector);
       if (el('m-kpi-coherence')) el('m-kpi-coherence').addEventListener('click', openCoherenceInspector);
       if (el('dreaming-card')) el('dreaming-card').addEventListener('click', openDreamingInspector);
       if (el('m-kpi-dreaming')) el('m-kpi-dreaming').addEventListener('click', openDreamingInspector);
 
+      function drawCoherenceGraphCanvas(cv, coh, isMini) {
+        if (!cv || !coh) return;
+        var hist = Array.isArray(coh.history) ? coh.history : [];
+        if (!hist.length) return;
+        var sctx = cv.getContext('2d');
+        if (!sctx) return;
+        var sw = cv.width;
+        var sh = cv.height;
+        sctx.clearRect(0, 0, sw, sh);
+        var padX = isMini ? 6 : 30;
+        var padY = isMini ? 5 : 18;
+        var proj = coh.projected_after_dream || null;
+        var totalPts = proj ? hist.length + 1 : hist.length;
+        var xOf = function (idx) {
+          return padX + (totalPts <= 1 ? (sw - padX * 2) / 2 : (idx / (totalPts - 1)) * (sw - padX * 2));
+        };
+        var yOf = function (val) {
+          var clamped = Math.max(20, Math.min(100, Number(val || 0)));
+          return sh - padY - ((clamped - 20) / 80) * (sh - padY * 2);
+        };
+        if (!isMini) {
+          sctx.strokeStyle = 'rgba(148, 163, 184, 0.16)';
+          sctx.lineWidth = 1;
+          sctx.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace';
+          sctx.fillStyle = 'rgba(148, 163, 184, 0.72)';
+          [25, 50, 75, 100].forEach(function (lvl) {
+            var gy = yOf(lvl);
+            sctx.beginPath();
+            sctx.moveTo(padX, gy);
+            sctx.lineTo(sw - padX, gy);
+            sctx.stroke();
+            sctx.fillText(lvl + '%', 2, gy + 3);
+          });
+        }
+        // Pink dashed curve: Consolidation Axis over time
+        sctx.save();
+        sctx.setLineDash(isMini ? [3, 2] : [5, 4]);
+        sctx.beginPath();
+        hist.forEach(function (pt, idx) {
+          var px = xOf(idx);
+          var consVal = pt.axes && typeof pt.axes.consolidation === 'number' ? pt.axes.consolidation : pt.score;
+          var py = yOf(consVal);
+          if (idx === 0) sctx.moveTo(px, py);
+          else sctx.lineTo(px, py);
+        });
+        if (proj && typeof proj.consolidation === 'number') {
+          sctx.lineTo(xOf(hist.length), yOf(proj.consolidation));
+        }
+        sctx.strokeStyle = '#f472b6';
+        sctx.lineWidth = isMini ? 1.5 : 2.2;
+        sctx.stroke();
+        sctx.restore();
+        // Solid Emerald curve: Overall Hive Coherence over time
+        sctx.beginPath();
+        hist.forEach(function (pt, idx) {
+          var px = xOf(idx);
+          var py = yOf(pt.score);
+          if (idx === 0) sctx.moveTo(px, py);
+          else sctx.lineTo(px, py);
+        });
+        sctx.strokeStyle = '#34d399';
+        sctx.lineWidth = isMini ? 2 : 3;
+        sctx.stroke();
+        if (proj && typeof proj.score === 'number') {
+          sctx.save();
+          sctx.setLineDash([4, 3]);
+          sctx.beginPath();
+          sctx.moveTo(xOf(hist.length - 1), yOf(hist[hist.length - 1].score));
+          sctx.lineTo(xOf(hist.length), yOf(proj.score));
+          sctx.strokeStyle = '#a78bfa';
+          sctx.lineWidth = isMini ? 1.5 : 2.5;
+          sctx.stroke();
+          sctx.restore();
+        }
+        if (!isMini) {
+          hist.forEach(function (pt, idx) {
+            var px = xOf(idx);
+            var py = yOf(pt.score);
+            sctx.beginPath();
+            sctx.arc(px, py, 3.5, 0, Math.PI * 2);
+            sctx.fillStyle = idx === hist.length - 1 ? '#fbbf24' : '#38bdf8';
+            sctx.fill();
+          });
+          if (proj && typeof proj.score === 'number') {
+            sctx.beginPath();
+            sctx.arc(xOf(hist.length), yOf(proj.score), 4.8, 0, Math.PI * 2);
+            sctx.fillStyle = '#a78bfa';
+            sctx.fill();
+          }
+          sctx.font = '700 10px ui-monospace, SFMono-Regular, Menlo, monospace';
+          sctx.fillStyle = '#34d399';
+          sctx.fillText('● Coherence ' + Number(coh.score || 0).toFixed(1) + '%', padX + 4, 13);
+          var consNow = coh.axes && typeof coh.axes.consolidation === 'number' ? coh.axes.consolidation.toFixed(1) : '-';
+          sctx.fillStyle = '#f472b6';
+          sctx.fillText('--- Consolidation ' + consNow + '%', padX + 145, 13);
+          if (proj && typeof proj.consolidation === 'number') {
+            sctx.fillStyle = '#c4b5fd';
+            sctx.fillText('-> @curator ' + proj.score.toFixed(1) + '% (' + proj.consolidation.toFixed(0) + '% cons)', padX + 305, 13);
+          }
+        }
+      }
+
+      function renderCoherencePanels(coh) {
+        if (!coh || typeof coh !== 'object') return;
+        drawCoherenceGraphCanvas(el('hud-coherence-spark'), coh, true);
+        drawCoherenceGraphCanvas(el('coherence-trajectory-canvas'), coh, false);
+        drawCoherenceGraphCanvas(el('cards-coherence-canvas'), coh, false);
+        var axes = coh.axes || {};
+        var consNow = typeof axes.consolidation === 'number' ? axes.consolidation.toFixed(1) : '-';
+        if (el('coh-graph-pill')) {
+          el('coh-graph-pill').textContent = Number(coh.score || 0).toFixed(1) + '% coh · ' + consNow + '% cons';
+        }
+        if (el('cards-coherence-badge')) {
+          el('cards-coherence-badge').textContent = Number(coh.score || 0).toFixed(1) + '% Coherence · ' + consNow + '% Consolidation';
+        }
+        var miniWrap = el('coherence-axes-mini');
+        if (miniWrap) {
+          miniWrap.textContent = '';
+          var coreVal = typeof coh.core_memory_score === 'number' ? coh.core_memory_score : coh.score;
+          var periphVal = typeof coh.periphery_coherence_score === 'number' ? coh.periphery_coherence_score : coh.score;
+          miniWrap.appendChild(kvRow('Core Memory (Eyeball) vs Periphery (Ring)', Number(coreVal).toFixed(1) + '% core · ' + Number(periphVal).toFixed(1) + '% ring', '#6ee7b7'));
+          miniWrap.appendChild(kvRow('Curation & Durability Axis (74.8% Class A)', consNow + '%', '#f472b6'));
+          if (coh.projected_after_dream) {
+            var pr = coh.projected_after_dream;
+            miniWrap.appendChild(kvRow('Projected Post-@curator (' + (pr.staged_actions || 0) + ' Merkle clusters)', pr.score.toFixed(1) + '% coh · ' + pr.consolidation.toFixed(1) + '% cons', '#c4b5fd'));
+          }
+        }
+        var cardsBars = el('cards-coherence-bars');
+        if (cardsBars) {
+          cardsBars.textContent = '';
+          var rows = [
+            ['Overall Hive Coherence 2.0', coh.score || 0, '#34d399'],
+            ['Core Memory State (Eyeball / Elbow)', coh.core_memory_score || coh.score || 0, '#6ee7b7'],
+            ['Fleet Periphery Coherence (Outer Ring)', coh.periphery_coherence_score || 0, '#fbbf24'],
+            ['Curation & Durability Axis (Consolidation)', axes.consolidation || 0, '#f472b6'],
+            ['Cross-Agent Convergence (25%)', axes.convergence || 0, '#a78bfa'],
+            ['Synaptic Coupling & Hygiene (15%)', axes.coupling || 0, '#38bdf8']
+          ];
+          rows.forEach(function (item) {
+            cardsBars.appendChild(kvRow(item[0], Number(item[1]).toFixed(1) + '%', item[2]));
+          });
+        }
+      }
+
       var graphReady = false;
       function renderState(s) {
         if (!s || typeof s !== 'object') return;
+        if (s.viewer_version && s.viewer_version !== VIEWER_VERSION && typeof window !== 'undefined' && window.location) {
+          window.location.reload();
+          return;
+        }
         var nowSec = s.polled_at || Math.floor(Date.now() / 1000);
         var st = s.store_state || {};
         latestStoreState = st;
@@ -4537,6 +4756,7 @@ export function renderViewerHtml(initialState) {
           if (el('coherence-val')) el('coherence-val').textContent = cScore + '%';
           if (el('coherence-sub')) el('coherence-sub').textContent = cSign + cDelta.toFixed(1) + ' · ' + edSt + ' · tap';
           if (el('m-kpi-coherence')) el('m-kpi-coherence').textContent = 'coh 2.0: ' + cScore + '% (' + edSt + ')';
+          renderCoherencePanels(s.coherence);
         }
         if (s.curator_state && typeof s.curator_state === 'object') {
           var eigCount = Array.isArray(s.curator_state.topic_eigenvectors) ? s.curator_state.topic_eigenvectors.length : 0;
@@ -4793,6 +5013,7 @@ export async function startMemoryViewer({
         : (records.length > 0 ? 'found' : String(firstQuery?.answer || 'unknown'))
 
       nextSnapshot = {
+        viewer_version: '2026-11-07-v4',
         connected: true,
         error: null,
         server_name: client.getServerName() || 'hive-memory-viewer',
