@@ -1496,7 +1496,7 @@ export function renderViewerHtml(initialState) {
     }
     body[data-view="cards"] .hud-top { max-width: 760px; margin: 0 auto 12px; flex-direction: column; align-items: stretch; }
     .hud-top > * { pointer-events: auto; }
-    .brand-card { padding: 10px 14px; display: flex; gap: 12px; align-items: flex-start; max-width: 100%; }
+    .brand-card { padding: 10px 14px; display: flex; gap: 12px; align-items: flex-start; max-width: 100%; flex: 0 1 460px; min-width: 0; }
     .brain-orb {
       width: 30px;
       height: 30px;
@@ -1517,6 +1517,9 @@ export function renderViewerHtml(initialState) {
       background: rgba(0, 0, 0, 0.3);
       border: 1px solid var(--border);
       color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     .mobile-kpi-strip {
       display: none;
@@ -1573,7 +1576,7 @@ export function renderViewerHtml(initialState) {
       pointer-events: none;
     }
     .hud-left { left: 12px; width: 268px; }
-    .hud-right { right: 12px; width: 330px; }
+    .hud-right { right: 12px; width: 356px; }
     .hud-left > *, .hud-right > * { pointer-events: auto; }
     .glass-box { padding: 10px 12px; min-height: 0; }
     .box-title {
@@ -1648,9 +1651,9 @@ export function renderViewerHtml(initialState) {
     .inspect-kicker { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
     .inspect-title { font-family: var(--mono); font-size: 13px; font-weight: 700; color: #93c5fd; word-break: break-word; }
     .kv-list { display: flex; flex-direction: column; font-family: var(--mono); font-size: 11px; }
-    .kv-row { display: flex; justify-content: space-between; gap: 8px; padding: 4px 0; border-bottom: 1px dashed rgba(255, 255, 255, 0.06); }
-    .kv-key { color: var(--muted); flex-shrink: 0; }
-    .kv-val { text-align: right; word-break: break-all; }
+    .kv-row { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; padding: 4px 0; border-bottom: 1px dashed rgba(255, 255, 255, 0.06); }
+    .kv-key { color: var(--muted); flex: 1 1 auto; min-width: 0; word-break: break-word; }
+    .kv-val { text-align: right; flex-shrink: 0; white-space: nowrap; font-weight: 600; }
     .ttl-bar-wrap { background: rgba(255, 255, 255, 0.07); height: 7px; border-radius: 999px; overflow: hidden; margin-top: 4px; }
     .ttl-bar-fill { height: 100%; border-radius: 999px; }
     .hud-bottom {
@@ -1908,13 +1911,10 @@ export function renderViewerHtml(initialState) {
         <span id="hud-tiers" class="metric-val">-</span>
         <span id="hud-forecast" class="metric-sub">at now</span>
       </div>
-      <div class="metric" id="coherence-card" style="cursor:pointer;display:flex;flex-direction:row;align-items:center;gap:10px;" title="Tap to inspect 5-axis Hive Coherence 2.0 Index, Epistemic Drift telemetry, and retroactive inception timeline">
-        <div style="display:flex;flex-direction:column;gap:1px;">
-          <span class="metric-label" style="color:#6ee7b7;">Coherence 2.0</span>
-          <span id="coherence-val" class="metric-val" style="color:#6ee7b7;">-</span>
-          <span id="coherence-sub" class="metric-sub">tap for timeline</span>
-        </div>
-        <canvas id="hud-coherence-spark" width="144" height="38" style="width:120px;height:32px;border-radius:6px;background:rgba(2,6,23,0.75);border:1px solid rgba(52,211,153,0.35);flex-shrink:0;"></canvas>
+      <div class="metric" id="coherence-card" style="cursor:pointer;" title="Tap to inspect 5-axis Hive Coherence 2.0 Index, Epistemic Drift telemetry, and retroactive inception timeline">
+        <span class="metric-label" style="color:#6ee7b7;">Coherence 2.0</span>
+        <span id="coherence-val" class="metric-val" style="color:#6ee7b7;">-</span>
+        <span id="coherence-sub" class="metric-sub">tap for timeline</span>
       </div>
       <div class="metric" id="dreaming-card" style="cursor:pointer;" title="Tap to inspect Merkle Dreaming, 3-Trigger Curation State, and Stage 0 Spectral Topic Eigenvectors">
         <span class="metric-label" style="color:#c4b5fd;">Merkle Dreaming</span>
@@ -1954,14 +1954,6 @@ export function renderViewerHtml(initialState) {
   </aside>
 
   <aside class="hud-right graph-only">
-    <div id="coherence-graphs-box" class="glass-box panel" style="display:flex;flex-direction:column;gap:6px;flex-shrink:0;">
-      <div class="box-title" style="margin-bottom:2px;">
-        <span style="color:#6ee7b7;">Coherence &amp; Consolidation Graphs</span>
-        <span id="coh-graph-pill" class="mini" style="color:#f472b6;">live trajectory</span>
-      </div>
-      <canvas id="coherence-trajectory-canvas" width="560" height="148" style="width:100%;height:92px;border-radius:8px;background:rgba(2,6,23,0.78);border:1px solid rgba(52,211,153,0.32);cursor:pointer;" title="Click to open full Coherence 2.0 & Consolidation Ledger details"></canvas>
-      <div id="coherence-axes-mini" class="kv-list" style="gap:3px;"></div>
-    </div>
     <div id="inspector-box" class="glass-box panel inspector idle"></div>
   </aside>
 
@@ -3240,107 +3232,24 @@ export function renderViewerHtml(initialState) {
             sparkTitle.style.marginTop = '4px';
             box.appendChild(sparkTitle);
             var sparkCanvas = document.createElement('canvas');
-            sparkCanvas.width = 560;
-            sparkCanvas.height = 156;
+            sparkCanvas.width = 640;
+            sparkCanvas.height = 220;
             sparkCanvas.style.width = '100%';
-            sparkCanvas.style.height = '104px';
-            sparkCanvas.style.minHeight = '104px';
+            sparkCanvas.style.height = '136px';
+            sparkCanvas.style.minHeight = '136px';
             sparkCanvas.style.flexShrink = '0';
             sparkCanvas.style.display = 'block';
             sparkCanvas.style.borderRadius = '8px';
-            sparkCanvas.style.background = 'rgba(2, 6, 23, 0.72)';
-            sparkCanvas.style.border = '1px solid rgba(52, 211, 153, 0.28)';
+            sparkCanvas.style.background = 'rgba(2, 6, 23, 0.78)';
+            sparkCanvas.style.border = '1px solid rgba(52, 211, 153, 0.32)';
             box.appendChild(sparkCanvas);
-            var sctx = sparkCanvas.getContext('2d');
-            if (sctx) {
-              var sw = sparkCanvas.width;
-              var sh = sparkCanvas.height;
-              var padX = 28;
-              var padY = 20;
-              var proj = coh.projected_after_dream || null;
-              var totalPts = proj ? hist.length + 1 : hist.length;
-              var xOf = function (idx) {
-                return padX + (totalPts <= 1 ? (sw - padX * 2) / 2 : (idx / (totalPts - 1)) * (sw - padX * 2));
-              };
-              var yOf = function (val) {
-                var clamped = Math.max(20, Math.min(100, Number(val || 0)));
-                return sh - padY - ((clamped - 20) / 80) * (sh - padY * 2);
-              };
-              sctx.strokeStyle = 'rgba(148, 163, 184, 0.16)';
-              sctx.lineWidth = 1;
-              sctx.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace';
-              sctx.fillStyle = 'rgba(148, 163, 184, 0.65)';
-              [25, 50, 75, 100].forEach(function (lvl) {
-                var gy = yOf(lvl);
-                sctx.beginPath();
-                sctx.moveTo(padX, gy);
-                sctx.lineTo(sw - padX, gy);
-                sctx.stroke();
-                sctx.fillText(lvl + '%', 2, gy + 3);
-              });
-              // Pink dashed curve: Consolidation Axis over time
-              sctx.save();
-              sctx.setLineDash([5, 4]);
-              sctx.beginPath();
-              hist.forEach(function (pt, idx) {
-                var px = xOf(idx);
-                var consVal = pt.axes && typeof pt.axes.consolidation === 'number' ? pt.axes.consolidation : pt.score;
-                var py = yOf(consVal);
-                if (idx === 0) sctx.moveTo(px, py);
-                else sctx.lineTo(px, py);
-              });
-              if (proj && typeof proj.consolidation === 'number') {
-                sctx.lineTo(xOf(hist.length), yOf(proj.consolidation));
-              }
-              sctx.strokeStyle = '#f472b6';
-              sctx.lineWidth = 2;
-              sctx.stroke();
-              sctx.restore();
-              // Solid Emerald curve: Overall Hive Coherence over time
-              sctx.beginPath();
-              hist.forEach(function (pt, idx) {
-                var px = xOf(idx);
-                var py = yOf(pt.score);
-                if (idx === 0) sctx.moveTo(px, py);
-                else sctx.lineTo(px, py);
-              });
-              sctx.strokeStyle = '#34d399';
-              sctx.lineWidth = 3;
-              sctx.stroke();
-              if (proj && typeof proj.score === 'number') {
-                sctx.save();
-                sctx.setLineDash([4, 3]);
-                sctx.beginPath();
-                sctx.moveTo(xOf(hist.length - 1), yOf(hist[hist.length - 1].score));
-                sctx.lineTo(xOf(hist.length), yOf(proj.score));
-                sctx.strokeStyle = '#a78bfa';
-                sctx.lineWidth = 2.5;
-                sctx.stroke();
-                sctx.restore();
-              }
-              hist.forEach(function (pt, idx) {
-                var px = xOf(idx);
-                var py = yOf(pt.score);
-                sctx.beginPath();
-                sctx.arc(px, py, 3.8, 0, Math.PI * 2);
-                sctx.fillStyle = idx === hist.length - 1 ? '#fbbf24' : '#38bdf8';
-                sctx.fill();
-              });
-              if (proj && typeof proj.score === 'number') {
-                var ppx = xOf(hist.length);
-                var ppy = yOf(proj.score);
-                sctx.beginPath();
-                sctx.arc(ppx, ppy, 5, 0, Math.PI * 2);
-                sctx.fillStyle = '#a78bfa';
-                sctx.fill();
-              }
-            }
+            drawCoherenceGraphCanvas(sparkCanvas, coh, false);
             if (coh.projected_after_dream) {
               var pr = coh.projected_after_dream;
               var prRow = makeDiv('kv-list');
               prRow.appendChild(kvRow(
-                'Projected After @curator Pass (' + (pr.staged_actions || 0) + ' clusters)',
-                pr.score.toFixed(1) + '% Coh · ' + pr.consolidation.toFixed(1) + '% Consolidation',
+                'Post-@curator (' + (pr.staged_actions || 0) + ' clusters)',
+                pr.score.toFixed(1) + '% Coh · ' + pr.consolidation.toFixed(1) + '% Cons',
                 '#c4b5fd'
               ));
               box.appendChild(prRow);
@@ -4415,83 +4324,10 @@ export function renderViewerHtml(initialState) {
           ctx.fillStyle = dreamRecorder ? '#f87171' : '#fde68a';
           ctx.fillText((dreamRecorder ? '● REC .WEBM · ' : '') + Math.round(bp * 100) + '%', bx + bw - 16, by + 22);
 
-           ctx.fillStyle = 'rgba(51, 65, 85, 0.65)';
+          ctx.fillStyle = 'rgba(51, 65, 85, 0.65)';
           ctx.fillRect(bx + 16, by + 48, bw - 32, 5);
           ctx.fillStyle = actCol;
           ctx.fillRect(bx + 16, by + 48, (bw - 32) * Math.min(1, bp), 5);
-        } else if (latestCoherence && Array.isArray(latestCoherence.history) && latestCoherence.history.length > 0) {
-          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-          var cw = Math.min(width - 24, 330);
-          var ch = 92;
-          var cx = width > 1024 ? 292 : (width - cw - 12);
-          var cy = Math.max(10, hudTop + 4);
-          ctx.fillStyle = 'rgba(6, 11, 25, 0.90)';
-          ctx.strokeStyle = 'rgba(52, 211, 153, 0.48)';
-          ctx.lineWidth = 1.4;
-          ctx.beginPath();
-          ctx.roundRect ? ctx.roundRect(cx, cy, cw, ch, 10) : ctx.rect(cx, cy, cw, ch);
-          ctx.fill();
-          ctx.stroke();
-          ctx.textAlign = 'left';
-          ctx.textBaseline = 'alphabetic';
-          ctx.font = '700 10.5px ui-monospace, SFMono-Regular, Menlo, monospace';
-          ctx.fillStyle = '#6ee7b7';
-          var pCons = latestCoherence.axes && typeof latestCoherence.axes.consolidation === 'number' ? latestCoherence.axes.consolidation.toFixed(1) : '-';
-          ctx.fillText('● COHERENCE ' + Number(latestCoherence.score || 0).toFixed(1) + '%   --- CONSOLIDATION ' + pCons + '%', cx + 10, cy + 16);
-          var chist = latestCoherence.history;
-          var cproj = latestCoherence.projected_after_dream || null;
-          var ctot = cproj ? chist.length + 1 : chist.length;
-          var gx0 = cx + 28;
-          var gx1 = cx + cw - 12;
-          var gy0 = cy + 24;
-          var gy1 = cy + ch - 10;
-          var cxOf = function (idx) { return gx0 + (ctot <= 1 ? (gx1 - gx0) / 2 : (idx / (ctot - 1)) * (gx1 - gx0)); };
-          var cyOf = function (v) { var cl = Math.max(20, Math.min(100, Number(v || 0))); return gy1 - ((cl - 20) / 80) * (gy1 - gy0); };
-          ctx.strokeStyle = 'rgba(148, 163, 184, 0.16)';
-          ctx.lineWidth = 1;
-          ctx.font = '9px ui-monospace, SFMono-Regular, Menlo, monospace';
-          ctx.fillStyle = 'rgba(148, 163, 184, 0.65)';
-          [40, 70, 100].forEach(function (lvl) {
-            var gy = cyOf(lvl);
-            ctx.beginPath();
-            ctx.moveTo(gx0, gy);
-            ctx.lineTo(gx1, gy);
-            ctx.stroke();
-            ctx.fillText(lvl + '%', cx + 4, gy + 3);
-          });
-          ctx.save();
-          ctx.setLineDash([4, 3]);
-          ctx.beginPath();
-          chist.forEach(function (pt, idx) {
-            var cv = pt.axes && typeof pt.axes.consolidation === 'number' ? pt.axes.consolidation : pt.score;
-            if (idx === 0) ctx.moveTo(cxOf(idx), cyOf(cv));
-            else ctx.lineTo(cxOf(idx), cyOf(cv));
-          });
-          if (cproj && typeof cproj.consolidation === 'number') ctx.lineTo(cxOf(chist.length), cyOf(cproj.consolidation));
-          ctx.strokeStyle = '#f472b6';
-          ctx.lineWidth = 2;
-          ctx.stroke();
-          ctx.restore();
-          ctx.beginPath();
-          chist.forEach(function (pt, idx) {
-            if (idx === 0) ctx.moveTo(cxOf(idx), cyOf(pt.score));
-            else ctx.lineTo(cxOf(idx), cyOf(pt.score));
-          });
-          ctx.strokeStyle = '#34d399';
-          ctx.lineWidth = 2.6;
-          ctx.stroke();
-          chist.forEach(function (pt, idx) {
-            ctx.beginPath();
-            ctx.arc(cxOf(idx), cyOf(pt.score), 3, 0, Math.PI * 2);
-            ctx.fillStyle = idx === chist.length - 1 ? '#fbbf24' : '#38bdf8';
-            ctx.fill();
-          });
-          if (cproj && typeof cproj.score === 'number') {
-            ctx.beginPath();
-            ctx.arc(cxOf(chist.length), cyOf(cproj.score), 4, 0, Math.PI * 2);
-            ctx.fillStyle = '#a78bfa';
-            ctx.fill();
-          }
         }
       }
 
@@ -4569,7 +4405,7 @@ export function renderViewerHtml(initialState) {
       });
 
       var latestCoherence = null;
-      var VIEWER_VERSION = '2026-11-07-v4';
+      var VIEWER_VERSION = '2026-11-07-v5';
       function openCoherenceInspector() {
         if (!latestCoherence) return;
         if (view !== 'graph') switchView('graph');
@@ -4580,7 +4416,6 @@ export function renderViewerHtml(initialState) {
         renderInspector();
       }
       if (el('coherence-card')) el('coherence-card').addEventListener('click', openCoherenceInspector);
-      if (el('coherence-trajectory-canvas')) el('coherence-trajectory-canvas').addEventListener('click', openCoherenceInspector);
       if (el('m-kpi-coherence')) el('m-kpi-coherence').addEventListener('click', openCoherenceInspector);
       if (el('dreaming-card')) el('dreaming-card').addEventListener('click', openDreamingInspector);
       if (el('m-kpi-dreaming')) el('m-kpi-dreaming').addEventListener('click', openDreamingInspector);
@@ -4594,34 +4429,36 @@ export function renderViewerHtml(initialState) {
         var sw = cv.width;
         var sh = cv.height;
         sctx.clearRect(0, 0, sw, sh);
-        var padX = isMini ? 6 : 30;
-        var padY = isMini ? 5 : 18;
+        var padX = isMini ? 6 : 42;
+        var padTop = isMini ? 5 : 40;
+        var padBot = isMini ? 5 : 26;
         var proj = coh.projected_after_dream || null;
         var totalPts = proj ? hist.length + 1 : hist.length;
         var xOf = function (idx) {
-          return padX + (totalPts <= 1 ? (sw - padX * 2) / 2 : (idx / (totalPts - 1)) * (sw - padX * 2));
+          return padX + (totalPts <= 1 ? (sw - padX - 20) / 2 : (idx / (totalPts - 1)) * (sw - padX - 24));
         };
         var yOf = function (val) {
           var clamped = Math.max(20, Math.min(100, Number(val || 0)));
-          return sh - padY - ((clamped - 20) / 80) * (sh - padY * 2);
+          return sh - padBot - ((clamped - 20) / 80) * (sh - padTop - padBot);
         };
         if (!isMini) {
-          sctx.strokeStyle = 'rgba(148, 163, 184, 0.16)';
+          sctx.strokeStyle = 'rgba(148, 163, 184, 0.18)';
           sctx.lineWidth = 1;
-          sctx.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace';
-          sctx.fillStyle = 'rgba(148, 163, 184, 0.72)';
+          sctx.font = '600 11px ui-monospace, SFMono-Regular, Menlo, monospace';
+          sctx.fillStyle = 'rgba(148, 163, 184, 0.85)';
+          sctx.textAlign = 'left';
           [25, 50, 75, 100].forEach(function (lvl) {
             var gy = yOf(lvl);
             sctx.beginPath();
             sctx.moveTo(padX, gy);
-            sctx.lineTo(sw - padX, gy);
+            sctx.lineTo(sw - 16, gy);
             sctx.stroke();
-            sctx.fillText(lvl + '%', 2, gy + 3);
+            sctx.fillText(lvl + '%', 4, gy + 4);
           });
         }
         // Pink dashed curve: Consolidation Axis over time
         sctx.save();
-        sctx.setLineDash(isMini ? [3, 2] : [5, 4]);
+        sctx.setLineDash(isMini ? [3, 2] : [6, 4]);
         sctx.beginPath();
         hist.forEach(function (pt, idx) {
           var px = xOf(idx);
@@ -4634,7 +4471,7 @@ export function renderViewerHtml(initialState) {
           sctx.lineTo(xOf(hist.length), yOf(proj.consolidation));
         }
         sctx.strokeStyle = '#f472b6';
-        sctx.lineWidth = isMini ? 1.5 : 2.2;
+        sctx.lineWidth = isMini ? 1.5 : 2.5;
         sctx.stroke();
         sctx.restore();
         // Solid Emerald curve: Overall Hive Coherence over time
@@ -4646,16 +4483,16 @@ export function renderViewerHtml(initialState) {
           else sctx.lineTo(px, py);
         });
         sctx.strokeStyle = '#34d399';
-        sctx.lineWidth = isMini ? 2 : 3;
+        sctx.lineWidth = isMini ? 2 : 3.2;
         sctx.stroke();
         if (proj && typeof proj.score === 'number') {
           sctx.save();
-          sctx.setLineDash([4, 3]);
+          sctx.setLineDash([5, 3]);
           sctx.beginPath();
           sctx.moveTo(xOf(hist.length - 1), yOf(hist[hist.length - 1].score));
           sctx.lineTo(xOf(hist.length), yOf(proj.score));
           sctx.strokeStyle = '#a78bfa';
-          sctx.lineWidth = isMini ? 1.5 : 2.5;
+          sctx.lineWidth = isMini ? 1.5 : 2.8;
           sctx.stroke();
           sctx.restore();
         }
@@ -4664,25 +4501,58 @@ export function renderViewerHtml(initialState) {
             var px = xOf(idx);
             var py = yOf(pt.score);
             sctx.beginPath();
-            sctx.arc(px, py, 3.5, 0, Math.PI * 2);
+            sctx.arc(px, py, 3.8, 0, Math.PI * 2);
             sctx.fillStyle = idx === hist.length - 1 ? '#fbbf24' : '#38bdf8';
             sctx.fill();
+            var consVal = pt.axes && typeof pt.axes.consolidation === 'number' ? pt.axes.consolidation : null;
+            if (consVal !== null && (idx === 0 || idx === hist.length - 1 || idx % 3 === 0)) {
+              sctx.beginPath();
+              sctx.arc(px, yOf(consVal), 2.8, 0, Math.PI * 2);
+              sctx.fillStyle = '#f472b6';
+              sctx.fill();
+            }
           });
           if (proj && typeof proj.score === 'number') {
             sctx.beginPath();
-            sctx.arc(xOf(hist.length), yOf(proj.score), 4.8, 0, Math.PI * 2);
+            sctx.arc(xOf(hist.length), yOf(proj.score), 5, 0, Math.PI * 2);
             sctx.fillStyle = '#a78bfa';
             sctx.fill();
+            if (typeof proj.consolidation === 'number') {
+              sctx.beginPath();
+              sctx.arc(xOf(hist.length), yOf(proj.consolidation), 4.5, 0, Math.PI * 2);
+              sctx.fillStyle = '#f472b6';
+              sctx.fill();
+            }
           }
-          sctx.font = '700 10px ui-monospace, SFMono-Regular, Menlo, monospace';
+          // X-axis labels
+          sctx.font = '600 10.5px ui-monospace, SFMono-Regular, Menlo, monospace';
+          sctx.fillStyle = '#94a3b8';
+          sctx.textAlign = 'left';
+          sctx.fillText('Inception', padX, sh - 7);
+          if (hist.length > 2) {
+            var midIdx = Math.floor((hist.length - 1) / 2);
+            sctx.textAlign = 'center';
+            sctx.fillText('#' + hist[midIdx].claims, xOf(midIdx), sh - 7);
+          }
+          sctx.textAlign = 'center';
+          sctx.fillStyle = '#fbbf24';
+          sctx.fillText('Now #' + hist[hist.length - 1].claims, xOf(hist.length - 1), sh - 7);
+          if (proj) {
+            sctx.textAlign = 'right';
+            sctx.fillStyle = '#c4b5fd';
+            sctx.fillText('+Curator', sw - 8, sh - 7);
+          }
+          // 2-line clear legend at top
+          sctx.textAlign = 'left';
+          sctx.font = '700 11.5px ui-monospace, SFMono-Regular, Menlo, monospace';
           sctx.fillStyle = '#34d399';
-          sctx.fillText('● Coherence ' + Number(coh.score || 0).toFixed(1) + '%', padX + 4, 13);
+          sctx.fillText('● Coherence: ' + Number(coh.score || 0).toFixed(1) + '%', 8, 15);
           var consNow = coh.axes && typeof coh.axes.consolidation === 'number' ? coh.axes.consolidation.toFixed(1) : '-';
           sctx.fillStyle = '#f472b6';
-          sctx.fillText('--- Consolidation ' + consNow + '%', padX + 145, 13);
+          sctx.fillText('--- Consolidation: ' + consNow + '%', 230, 15);
           if (proj && typeof proj.consolidation === 'number') {
             sctx.fillStyle = '#c4b5fd';
-            sctx.fillText('-> @curator ' + proj.score.toFixed(1) + '% (' + proj.consolidation.toFixed(0) + '% cons)', padX + 305, 13);
+            sctx.fillText('◆ Post-@curator Projection: ' + proj.score.toFixed(1) + '% Coh · ' + proj.consolidation.toFixed(1) + '% Cons', 8, 30);
           }
         }
       }
@@ -5041,7 +4911,7 @@ export async function startMemoryViewer({
         : (records.length > 0 ? 'found' : String(firstQuery?.answer || 'unknown'))
 
       nextSnapshot = {
-        viewer_version: '2026-11-07-v4',
+        viewer_version: '2026-11-07-v5',
         connected: true,
         error: null,
         server_name: client.getServerName() || 'hive-memory-viewer',
