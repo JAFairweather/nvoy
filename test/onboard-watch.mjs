@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import { finalizeEvent, generateSecretKey, getPublicKey, verifyEvent } from 'nostr-tools/pure'
 import { v2 as nip44 } from 'nostr-tools/nip44'
 import { SETUP_KIND } from '../mcp/tools/onboard_request.mjs'
-import { WRITERS_D, WRITERS_KIND, writerVerdict } from '../mcp/tools/onboard_run.mjs'
+import { WRITERS_D, WRITERS_KIND, onboard, writerVerdict } from '../mcp/tools/onboard_run.mjs'
 import { pendingRequests, readPages, watchTick, HEARTBEAT_MS } from '../mcp/tools/onboard_watch.mjs'
 import { RECEIPT_KIND, receiptD } from '../mcp/tools/onboard_receipt.mjs'
 
@@ -229,9 +229,18 @@ const ids = read => read.events.map(e => e.id).sort()
 assert.deepEqual(ids(await readPages(relayOf(held), 'wss://x', {}, { page: 50 })), held.map(e => e.id).sort(), 'every event, past any one page')
 assert.deepEqual(ids(await readPages(relayOf(held), 'wss://x', { since: 1040 }, { page: 50 })), held.filter(e => e.created_at >= 1040).map(e => e.id).sort())
 const sameSecond = Array.from({ length: 30 }, (_, n) => ({ id: `s${n}`, created_at: 5 }))
-assert.equal((await readPages(relayOf(sameSecond), 'wss://x', {}, { page: 10 })).events.length, 10, 'a full second past the page size ends the walk, not a loop')
+assert.equal((await readPages(relayOf(held), 'wss://x', {}, { page: 50 })).complete, true, 'a read to the end says it is complete')
+const crowded = await readPages(relayOf(sameSecond), 'wss://x', {}, { page: 10 })
+assert.equal(crowded.events.length, 10, 'a full second past the page size ends the walk, not a loop')
+assert.equal(crowded.complete, false, 'and says it did not reach everything')
+// Events older than a crowded second are still read, and the read is still marked incomplete.
+const crowdedThenOlder = [...sameSecond, { id: 'old', created_at: 1 }]
+const past = await readPages(relayOf(crowdedThenOlder), 'wss://x', {}, { page: 10 })
+assert.ok(past.events.some(e => e.id === 'old') && past.complete === false)
 const partial = await readPages(relayOf(held, Infinity, 2), 'wss://x', {}, { page: 50 })
 assert.equal(partial.answered, true); assert.ok(partial.events.length >= 50 && partial.events.length < held.length, 'a relay that stops answering keeps what it gave')
+assert.equal(partial.complete, false, 'and the read is marked incomplete')
+assert.equal((await readPages(relayOf(held), 'wss://x', {}, { page: 50, pages: 2 })).complete, false, 'so is one cut short by the page cap')
 assert.equal((await readPages(relayOf(held, Infinity, 0), 'wss://x', {})).answered, false)
 
 // The operator's run reads the same writer list as watch, so its relay writer step can be done too.
@@ -240,6 +249,35 @@ const runCall = cli.slice(cli.lastIndexOf('await onboard({'))
 assert.match(runCall.slice(0, runCall.indexOf('})')), /readWriters: writersFrom\(/, 'run reads the owner\'s writer list')
 assert.match(runCall.slice(0, runCall.indexOf('})')), /\bverify\b/, 'and verifies it')
 assert.doesNotMatch(cli, /limit: 500/, 'no fixed window of owner events')
+
+// A tick whose read was incomplete says so, and still runs what it did find.
+lines = []
+const gapped = await tick({ stateDir: join(tmp, 'state-gap'), fetchAll: async () => ({ events: [], incomplete: ['wss://relay.example'] }) })
+assert.deepEqual(gapped.incomplete, ['wss://relay.example'])
+assert.ok(lines.some(line => /wss:\/\/relay\.example gave an incomplete read/.test(line)), 'the gap is logged')
+assert.deepEqual((await tick({ stateDir: join(tmp, 'state-gap2') })).incomplete, [], 'a plain array of events is complete')
+
+// The operator's run has no runner key to report with: it never marks a request finished, so the watch
+// tick still sends the owner the receipt that says it is finished.
+const operator = getPublicKey(generateSecretKey()); keys.operator = operator
+const opAdd = signAs(owner, [['d', 'nvoy-onboard/operator/add_agent'], ['op', 'add_agent'], ['p', operator], ['harness', 'claude-code'], ['like', 'crystalclaude']], at + 60)
+const opBind = signAs(owner, [['d', 'nvoy-onboard/operator/bind_runtime'], ['op', 'bind_runtime'], ['p', operator], ['harness', 'claude-code'],
+  ['like', 'crystalclaude'], ['channel_key', KEY]], at + 61)
+const opState = join(tmp, 'state-operator')
+writers = { answered: true, events: [list(owner, [operator], at + 62)] }
+lines = []
+const opRun = await onboard({ command: 'run', name: 'operator', root, out, stateDir: opState, keysPath: runner.authorizedKeys, giversRedeploy: false,
+  fetchEvents: async () => [opAdd, opBind], runTool, joinWith: member.joinWith, now: () => clock, log: line => lines.push(line), pair,
+  readWriters: async () => writers, verify })
+assert.ok(opRun.receipts.every(row => row.state === 'done'), 'the operator run gets every step done')
+const opFinished = () => existsSync(join(opState, 'requests.jsonl')) ? readFileSync(join(opState, 'requests.jsonl'), 'utf8').split('\n').filter(Boolean).map(JSON.parse).filter(row => row.finished) : []
+assert.deepEqual(opFinished(), [], 'and still does not mark it finished')
+assert.ok(lines.some(line => /left open, so the next watch tick sends the owner the finished receipt/.test(line)))
+count = published.length; events = [opAdd, opBind]
+const opTick = await tick({ ...member, stateDir: opState })
+assert.deepEqual(opTick.ran.map(r => r.name), ['operator'], 'the watch tick takes it up')
+assert.ok(published.length > count && allDone(published.at(-1)), 'and sends the owner the finished receipt')
+assert.deepEqual(opFinished().map(row => row.id), [opAdd.id], 'only then is it finished')
 
 // No trusted owner yet: nothing is read.
 const empty = join(tmp, 'empty'); mkdirSync(empty)

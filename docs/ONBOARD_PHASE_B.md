@@ -20,7 +20,10 @@ makes each one done, stay as `onboard_run.mjs` has them.
   For each name whose newest request is not finished in the ledger, it runs the same steps as
   `run`, in watch mode. Requests are processed one at a time, oldest first. The read pages back
   through every owner event of the last 7 days (the age past which a request is refused anyway), so
-  newer owner events never push an unfinished request out of a fixed window.
+  newer owner events never push an unfinished request out of a fixed window. A relay cannot be asked
+  for the rest of one second, so if more events share a second than a page holds, or a relay stops
+  answering part way, or the page cap ends the walk, that relay's read is reported incomplete: the tick
+  logs a warning naming the relay and exits 1. A request on it may be missing from that tick's queue.
 - When the service is down, nothing happens. Nothing else does the steps instead, and the page shows
   the last receipt with its age.
 
@@ -113,6 +116,9 @@ relay.nave.pub or `--writer-relay`.
 - A request id is run once to completion. The ledger's `finished` row stops every later tick. It is
   written only once the receipt that shows every step done has been taken by a relay; if that last
   receipt is refused, the request stays open and the next tick runs it again and resends it.
+- An operator's `run` has no runner key, so it publishes no receipt and never writes `finished`. When
+  every step is done it logs that the request is left open; the next watch tick, which finds each step
+  done, sends the owner the finished receipt and then finishes it.
 - An unchanged receipt is not sent again each tick. It goes out when a step's state or reason
   changes, or every 10 minutes as a heartbeat, so the page can tell a live runner from a stopped one.
 - A tick and an operator's `run` never overlap: the wrapper holds `/var/lib/nvoy-onboard/.lock`, and
@@ -136,7 +142,10 @@ relay.nave.pub or `--writer-relay`.
   - a finished request is skipped;
   - a request whose finished receipt is refused stays open, and the next tick sends it and finishes;
   - owner events are read page by page, past any one page, and a relay that stops part way keeps
-    what it gave;
+    what it gave; a read that did not reach the end (a crowded second, a relay that stops, the page
+    cap) is marked incomplete, and the tick logs it and reports it;
+  - an operator's `run` that gets every step done leaves the request open, and the watch tick then
+    sends the finished receipt and finishes it;
   - `run` reads and verifies the writer list as watch does;
   - a giver outside a shared room stays pending, with no rewrite;
   - the relay-writer step follows the stored list;

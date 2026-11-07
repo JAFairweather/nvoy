@@ -56,8 +56,13 @@ const fetchEvents = ({ relays, owners, name }) =>
 // Every request kind from the trusted owners, paged back over the window a request stays valid, so
 // newer owner events never push an unfinished add out of a fixed window; watch keeps the add_agent
 // ones by their d tag.
-const fetchAll = ({ relays, owners }) => readAll(readUrls(relays),
-  { kinds: [SETUP_KIND], authors: owners, since: Math.floor(Date.now() / 1000) - MAX_AGE_S - 600 }, (url, filter) => readPages(queryRelay, url, filter))
+const fetchAll = async ({ relays, owners }) => {
+  const incomplete = []
+  const events = await readAll(readUrls(relays),
+    { kinds: [SETUP_KIND], authors: owners, since: Math.floor(Date.now() / 1000) - MAX_AGE_S - 600 },
+    async (url, filter) => { const read = await readPages(queryRelay, url, filter); if (read.answered && !read.complete) incomplete.push(url); return read })
+  return { events, incomplete }
+}
 const verify = event => { try { return verifyEvent(JSON.parse(JSON.stringify(event))) } catch { return false } }
 // The owner's newest writer lists on the server's relay, for the relay writer step in run and watch.
 const writersFrom = relay => async ({ owners }) => queryRelay(relay, { kinds: [WRITERS_KIND], authors: owners, '#d': [WRITERS_D] })
@@ -104,10 +109,11 @@ async function watch(runner) {
       const urls = [...new Set([...runner.relays, ...readUrls([])])]
       return Promise.all(urls.map(url => publishRelay(url, event)))
     }
-    const { ran } = await watchTick({ root, out, stateDir, runner, fetchAll, fetchEvents, runTool, joinWith, pair, readWriters: writersFrom(runner.writerRelay),
+    const tick = await watchTick({ root, out, stateDir, runner, fetchAll, fetchEvents, runTool, joinWith, pair, readWriters: writersFrom(runner.writerRelay),
       publish, signer, verify,
       installFor: name => readInstallDetails({ instance: name, sshTarget: runner.sshTarget }) })
-    return ran.some(entry => entry.error) ? 1 : 0
+    const { ran, incomplete } = tick
+    return ran.some(entry => entry.error) || incomplete.length ? 1 : 0
   } finally { signer.close?.() }
 }
 

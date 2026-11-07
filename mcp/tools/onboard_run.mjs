@@ -100,7 +100,7 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
   // Phase B: every row so far, this run's and earlier runs', goes to the owner after each step.
   // A receipt that no relay takes is logged; it never changes a step's state, but the request is not
   // marked finished until the receipt that shows it finished is out.
-  let reported = !report
+  let reported = false
   const publish = async (extra = {}) => {
     if (!report) return
     try { await report({ request: add, rows: lines(receiptPath), ...extra }); reported = true }
@@ -254,7 +254,11 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
     }
   } finally { session?.close?.(); agentLink?.close?.() }
   if (receipts.every(row => row.state === 'done')) {
-    if (reported) appendFileSync(ledger, JSON.stringify({ id: add.id, name, op: 'add_agent', at: now(), finished: true }) + '\n')
+    // Only a run that reports marks the request finished, after the receipt that says so is out. An
+    // operator's `run` has no runner key to seal one, so it leaves the request open for the next watch
+    // tick to send the finished receipt; the steps are done, so that tick only reports.
+    if (!report) log('pending  finished: every step is done; left open, so the next watch tick sends the owner the finished receipt')
+    else if (reported) appendFileSync(ledger, JSON.stringify({ id: add.id, name, op: 'add_agent', at: now(), finished: true }) + '\n')
     else log('pending  finished: every step is done, but the owner has not been told; the next run sends the receipt again')
   }
   return { request: add, bind, receipts }

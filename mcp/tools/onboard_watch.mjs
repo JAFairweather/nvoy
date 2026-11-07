@@ -18,10 +18,14 @@ export const HEARTBEAT_MS = 10 * 60 * 1000
 
 // Every event one relay holds for a filter, newest page first, walking `until` back until a short page.
 // A relay that stops answering part way keeps what it gave; the caller sees answered as on the first page.
+// `complete` says whether the walk reached the end of what the relay holds. It is false when the relay
+// stopped answering part way, when more events share one second than a page holds (a relay cannot be
+// asked for the rest of a second), and when the page cap ended the walk, so a caller never mistakes a
+// partial read for the whole window.
 export const PAGE = 100
 export async function readPages(query, url, filter, { page = PAGE, pages = 1000 } = {}) {
   const seen = new Map()
-  let until = filter.until, answered = false
+  let until = filter.until, answered = false, complete = false, skipped = false
   for (let n = 0; n < pages; n++) {
     const read = await query(url, { ...filter, limit: page, ...(until === undefined ? {} : { until }) })
     if (!read.answered) break
@@ -31,12 +35,14 @@ export async function readPages(query, url, filter, { page = PAGE, pages = 1000 
       if (!seen.has(event?.id)) { seen.set(event?.id, event); fresh++ }
       if (Number.isInteger(event?.created_at)) oldest = Math.min(oldest, event.created_at)
     }
-    if (read.events.length < page || oldest === Infinity) break
+    if (read.events.length < page || oldest === Infinity) { complete = true; break }
     // `until` is inclusive, so siblings in the oldest second come back; once a page brings nothing
-    // new, step past that second, so the walk always moves back.
-    until = fresh ? oldest : oldest - 1
+    // new, step past that second, so the walk always moves back. Events left in that second are out of
+    // reach, so the read is no longer complete.
+    if (fresh) until = oldest
+    else { until = oldest - 1; skipped = true }
   }
-  return { answered, events: [...seen.values()] }
+  return { answered, complete: complete && !skipped, events: [...seen.values()] }
 }
 
 const rows = path => existsSync(path) ? readFileSync(path, 'utf8').split('\n').filter(Boolean).flatMap(line => {
@@ -72,10 +78,15 @@ export async function watchTick({ root, out, stateDir, runner, fetchAll, fetchEv
   const manifests = installed(root)
   const owners = [...new Set([...manifests.values()].flatMap(manifest => manifest.grantors))]
   const relays = [...new Set([...manifests.values()].flatMap(manifest => manifest.relays))]
-  if (!owners.length) { log('no installed agent names a grantor, so no owner is trusted yet'); return { ran: [] } }
+  if (!owners.length) { log('no installed agent names a grantor, so no owner is trusted yet'); return { ran: [], incomplete: [] } }
   const finished = new Set(rows(join(stateDir, 'requests.jsonl')).filter(row => row.finished).map(row => row.id))
-  const queue = pendingRequests(await fetchAll({ relays, owners }), { verify, finished, refused: refusedIds(stateDir) })
-  if (!queue.length) return { ran: [] }
+  // fetchAll hands back the events, or { events, incomplete } naming the relays whose read did not reach
+  // the end of the window. Say so: a request on such a relay may be missing from the queue.
+  const read = await fetchAll({ relays, owners })
+  const incomplete = Array.isArray(read) ? [] : read.incomplete || []
+  for (const url of incomplete) log(`warning  ${url} gave an incomplete read of the owner's events (more in one second than a page, or it stopped answering); an unfinished request may not be listed`)
+  const queue = pendingRequests(Array.isArray(read) ? read : read.events, { verify, finished, refused: refusedIds(stateDir) })
+  if (!queue.length) return { ran: [], incomplete }
 
   const seal = makeSealer(signer, { now: () => Math.floor(now() / 1000) })
   const ran = []
@@ -118,5 +129,5 @@ export async function watchTick({ root, out, stateDir, runner, fetchAll, fetchEv
       ran.push({ name, id, refused: error.code || 'ERROR' })
     }
   }
-  return { ran }
+  return { ran, incomplete }
 }
