@@ -645,6 +645,29 @@ await test('live integration: memory-viewer polls memory-daemon viewer socket, s
     assert(!htmlRes2.body.includes('<script>alert(1)</script>'))
     assert(htmlRes2.body.includes('\\u003cscript\\u003ealert(1)\\u003c/script\\u003e'))
 
+    // Verify viewer honors HIVE_MEMORY_CURATOR_STATE_FILE / stateFile override and fails closed on corrupt state file
+    const overrideStatePath = join(tmp, 'custom-curator-state.json')
+    process.env.HIVE_MEMORY_CURATOR_STATE_FILE = overrideStatePath
+    try {
+      const parsedFlags = parseViewerFlags(['--socket', join(sockDir, 'viewer.sock'), '--state-file', overrideStatePath, '--listen', '127.0.0.1:0'])
+      assert.equal(parsedFlags.stateFile, overrideStatePath)
+
+      const { writeCuratorStateFile } = await import('../mcp/tools/memory-curate.mjs')
+      writeCuratorStateFile(overrideStatePath, {
+        last_curated_at: nowSec - 120,
+        last_curated_write_seq: 2,
+        last_ran_at: nowSec - 120,
+        last_submitted_count: 1,
+      })
+      const polledWithOverride = await viewer.pollOnce()
+      assert.equal(polledWithOverride.curator_state.state_file, overrideStatePath)
+      assert.equal(polledWithOverride.curator_state.state_file_present, true)
+      assert.equal(polledWithOverride.curator_state.last_curated_write_seq, 2)
+      assert.equal(polledWithOverride.curator_state.write_delta, 0)
+    } finally {
+      delete process.env.HIVE_MEMORY_CURATOR_STATE_FILE
+    }
+
     sseReq.destroy()
 
     // A store that stops being ready answers unknown, never none, and the viewer shows it.
@@ -728,9 +751,9 @@ await test('daemon activity ring: only the viewer wake carries it, metadata only
     const roomed = claim(neilSk, neilPk, `room:${room}`, 'secret-room-plan')
     assert.equal(payload(call({ kind: 'writer', name: 'neil' }, 'memory_submit', { event: roomed, expected_prior_id: null })).accepted, true)
 
-    // Another reader's wake is byte-for-byte what it was without the ring.
+    // Another reader's wake is byte-for-byte what it was without the ring, even if include_telemetry: true is passed.
     const plain = call(biggy, 'memory_wake', {}, null)
-    const ringed = call(biggy, 'memory_wake', {})
+    const ringed = call(biggy, 'memory_wake', { include_telemetry: true })
     assert.equal(JSON.stringify(ringed), JSON.stringify(plain))
     assert(!('recent_activity' in payload(ringed)) && !('agent_roster' in payload(ringed)))
     call(biggy, 'memory_query', { topic: 'governance', text: 'SECRET-CLAIM-TEXT' })

@@ -69,6 +69,7 @@ async function main() {
     ...(opts.nowSec !== null && Number.isFinite(opts.nowSec) ? { nowSec: opts.nowSec } : {}),
   })
   console.log(JSON.stringify(result, null, 2))
+  if (!result.ok) process.exit(1)
 }
 
 main().catch(err => {

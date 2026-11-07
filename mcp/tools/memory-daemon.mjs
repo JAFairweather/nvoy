@@ -46,7 +46,6 @@ const withStaleFiles = t => ({
     properties: {
       ...t.inputSchema.properties,
       stale_files: { type: 'array', items: { type: 'string', maxLength: 300 }, maxItems: 200 },
-      ...(t.name === 'memory_wake' ? { include_telemetry: { type: 'boolean' } } : {}),
     },
   },
 })
@@ -225,7 +224,7 @@ export function handleSocketJsonRpc({ store, binding, message, nowSec, activity 
       frame: o => mcpToolResult({ ...who, ...o }).content[0].text,
     })
     note({ kind: 'wake', count: Array.isArray(out.records) ? out.records.length : 0, refs: recordRefs(out.records) })
-    const includeTelemetry = isViewer(binding) || isCuratorReader(binding, store.config) || args.include_telemetry === true
+    const includeTelemetry = isViewer(binding) || isCuratorReader(binding, store.config)
     const telemetry = activity && includeTelemetry
       ? { recent_activity: viewerActivity(activity, store.config, binding.name), agent_roster: agentRoster(store, nowSec) }
       : {}

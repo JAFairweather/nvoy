@@ -26,6 +26,7 @@ import {
   defaultCuratorStatePath,
   evaluateDreamTriggers,
   readCuratorStateFile,
+  resolveCuratorStatePath,
 } from './memory-curate.mjs'
 
 const DEFAULT_POLL_MS = 3000
@@ -85,6 +86,7 @@ export function parseViewerFlags(argv) {
   const args = Array.isArray(argv) ? argv : []
   const countFlag = name => args.filter(a => a === name).length
   if (countFlag('--socket') > 1) throw new Error('only one --socket may be specified')
+  if (countFlag('--state-file') > 1) throw new Error('only one --state-file may be specified')
   const getFlag = name => {
     const idx = args.indexOf(name)
     return idx < 0 ? '' : String(args[idx + 1] ?? '')
@@ -93,6 +95,10 @@ export function parseViewerFlags(argv) {
   const socketRaw = getFlag('--socket')
   if (!socketRaw || !isAbsolute(socketRaw)) {
     throw new Error('--socket <absolute-path> is required')
+  }
+  const stateFileRaw = getFlag('--state-file')
+  if (stateFileRaw && !isAbsolute(stateFileRaw)) {
+    throw new Error('--state-file <absolute-path> must be an absolute path')
   }
   const { host, port } = parseListenTarget({
     listen: getFlag('--listen'),
@@ -106,6 +112,7 @@ export function parseViewerFlags(argv) {
   }
   return {
     socketPath: resolve(socketRaw),
+    ...(stateFileRaw ? { stateFile: resolve(stateFileRaw) } : {}),
     host,
     port,
     pollMs,
@@ -3391,6 +3398,7 @@ export function renderViewerHtml(initialState) {
 
 export async function startMemoryViewer({
   socketPath,
+  stateFile = undefined,
   host,
   port,
   pollMs = DEFAULT_POLL_MS,
@@ -3398,6 +3406,7 @@ export async function startMemoryViewer({
   if (!socketPath || !isAbsolute(socketPath)) {
     throw new Error('--socket <absolute-path> is required')
   }
+  const resolvedStateFile = resolveCuratorStatePath({ stateFile, socketPath })
   const target = parseListenTarget({ host, port })
   const client = createSingleSocketMcpClient(socketPath)
   const sseClients = new Set()
@@ -3525,7 +3534,8 @@ export async function startMemoryViewer({
         now_sec: nowSec,
         history_complete: historyComplete,
       })
-      const persistedCurator = readCuratorStateFile(defaultCuratorStatePath(socketPath))
+      const activeStateFile = resolveCuratorStatePath({ stateFile, socketPath })
+      const persistedCurator = readCuratorStateFile(activeStateFile)
       const lastCuratedAt = Number(persistedCurator?.last_curated_at || 0)
       const lastCuratedWriteSeq = Number(persistedCurator?.last_curated_write_seq || 0)
       const dreamIntervalSec = Number(persistedCurator?.dream_interval_sec || DEFAULT_DREAM_INTERVAL_SEC)
@@ -3544,6 +3554,7 @@ export async function startMemoryViewer({
         topicPressureThreshold,
       })
       const curatorState = {
+        state_file: activeStateFile,
         state_file_present: Boolean(persistedCurator),
         last_curated_at: lastCuratedAt || null,
         last_curated_write_seq: lastCuratedWriteSeq,
