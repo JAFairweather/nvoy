@@ -199,6 +199,8 @@ function createCuratorWriteClient(socketPath) {
   return { callWriteTool, close: disconnect }
 }
 
+export const DEFAULT_CURATOR_NPUB = 'npub1u6y6esjdnlh4h3nnnjuwqfgc3f5xcnhurfn2vw54w3zml6d92dsshr78l7'
+export const DEFAULT_CURATOR_PUBKEY = 'e689acc24d9fef5bc6739cb8e025188a686c4efc1a66a63a957445bfe9a55361'
 export const DEFAULT_DREAM_INTERVAL_SEC = 6 * 3600
 export const DEFAULT_WRITE_DELTA_THRESHOLD = 20
 export const DEFAULT_TOPIC_PRESSURE_THRESHOLD = 8
