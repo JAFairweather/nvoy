@@ -511,6 +511,24 @@ await test('runCuratorCycle: live end-to-end Distillation, Promotion, Solidifica
       assert.equal(daemon.store.submit({ writer: 'alice', event: c1, nowSec: nowSec + 10 }).accepted, true)
       assert.equal(daemon.store.submit({ writer: 'bob', event: c2, nowSec: nowSec + 11 }).accepted, true)
 
+      // Verify incomplete-history gate: two-page fixture with maxPages: 1 and pageSize: 3 makes zero writer calls and never advances cursor!
+      const preWriteSeq = daemon.store.storeState(curatorPk, nowSec + 19).write_seq
+      const incompleteCycle = await runCuratorCycle({
+        readerSocket: join(sockDir, 'curator.sock'),
+        writerSocket: join(sockDir, 'writers', 'curator.sock'),
+        curatorSecretKey: curatorSk,
+        memoryGlobalChannelId: GLOBAL_CH,
+        maxPages: 1,
+        pageSize: 3,
+        nowSec: nowSec + 19,
+      })
+      assert.equal(incompleteCycle.ok, false)
+      assert.equal(incompleteCycle.history_complete, false)
+      assert.equal(incompleteCycle.cycle_status, 'history_incomplete')
+      assert.equal(incompleteCycle.cursor_advanced, false)
+      assert.equal(incompleteCycle.submitted.length, 0)
+      assert.equal(daemon.store.storeState(curatorPk, nowSec + 19).write_seq, preWriteSeq, 'incomplete pagination must make zero store writes')
+
       // Run the Curator cycle!
       const cycle = await runCuratorCycle({
         readerSocket: join(sockDir, 'curator.sock'),
@@ -938,6 +956,14 @@ await test('readCuratorStateFile fails closed on malformed cursors and runCurato
       () => readCuratorStateFile(badSeqPath),
       (err) => err && err.code === 'HIVE_MEMORY_CURATOR_STATE_READ_FAILED',
       'negative last_curated_write_seq must fail closed'
+    )
+
+    const nullCursorPath = join(tmp, 'null-cursor.json')
+    writeFileSync(nullCursorPath, JSON.stringify({ last_curated_at: null, last_curated_write_seq: null }))
+    assert.throws(
+      () => readCuratorStateFile(nullCursorPath),
+      (err) => err && err.code === 'HIVE_MEMORY_CURATOR_STATE_READ_FAILED',
+      'explicit null cursors must fail closed'
     )
 
     // Initial temporal trigger when lastCuratedAt === 0 and earliest record is older than dreamIntervalSec

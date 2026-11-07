@@ -814,6 +814,10 @@ await test('daemon activity ring: only the viewer wake carries it, metadata only
     const logged = diffViewerSnapshots(prev, next, nowSec).filter(e => e.kind.startsWith('activity-'))
     assert.deepEqual(logged.map(e => e.kind), ['activity-wake', 'activity-wake'])
     assert(!logged.some(e => /relay|sync/i.test(e.summary)))
+
+    const renderedHtml = renderViewerHtml(next)
+    assert(renderedHtml.includes('[REPLAY · READ-ONLY]'), '4-act animation logs must be explicitly read-only replay')
+    assert(!renderedHtml.includes('92.4%'), '4-act animation must not contain invented coherence uplift fallback')
   } finally {
     await daemon.close()
     rmSync(tmp, { recursive: true, force: true })

@@ -81,7 +81,7 @@ export function readCuratorStateFile(stateFilePath) {
   }
   const parseCursorField = (fieldName) => {
     const val = raw[fieldName]
-    if (val === undefined || val === null) return 0
+    if (val === undefined) return 0
     if (typeof val !== 'number' || !Number.isFinite(val) || val < 0) {
       const wrapped = new Error(`curator state file invalid ${fieldName} (${stateFilePath}): must be a non-negative finite number`)
       wrapped.code = 'HIVE_MEMORY_CURATOR_STATE_READ_FAILED'
@@ -1093,6 +1093,7 @@ export async function runCuratorCycle({
   topicPressureThreshold = DEFAULT_TOPIC_PRESSURE_THRESHOLD,
   gitAncestryCheck = null,
   maxPages = 500,
+  pageSize = 100,
   nowSec = Math.floor(Date.now() / 1000),
 } = {}) {
   const resolvedStateFile = resolveCuratorStatePath({ stateFile, socketPath: readerSocket })
@@ -1114,9 +1115,10 @@ export async function runCuratorCycle({
     let cursor = '0'
     let pages = 0
     const pageLimit = Math.max(1, Number(maxPages) || 500)
+    const effectivePageSize = Math.max(1, Math.min(200, Number(pageSize) || 100))
     while (cursor !== null && pages < pageLimit) {
       const page = await reader.callReadTool('memory_query', {
-        limit: 100,
+        limit: effectivePageSize,
         format: 'full',
         include_history: true,
         ...(cursor !== '0' ? { cursor } : {}),

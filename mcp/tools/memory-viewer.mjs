@@ -3301,11 +3301,11 @@ export function renderViewerHtml(initialState) {
           if (!ds.actLogged[1] && p >= 0.01) {
             ds.actLogged[1] = true;
             shockwaves.push({ x: 0, y: 0, r: 12, maxR: stageDim() * 0.38, color: '#a78bfa', alpha: 0.9, hex: true });
-            logStream('lookup', 'ACT I · STAGE 0 SPECTRAL TOPIC EIGENVECTORS (PCA): Aligning ' + ds.eigens.length + ' Eigen-Axes & ' + ds.reorgArcs.length + ' Topic Reorganizations');
+            logStream('lookup', '[REPLAY · READ-ONLY] ACT I · STAGE 0 SPECTRAL TOPIC EIGENVECTORS (PCA): Visualizing ' + ds.eigens.length + ' Eigen-Axes & ' + ds.reorgArcs.length + ' Topic Reorganizations');
           }
           if (!ds.actLogged[2] && p >= 0.25) {
             ds.actLogged[2] = true;
-            logStream('write', 'ACT II · STAGE 1 SYNAPTIC DISTILLATION: Folding ' + ds.totalSources + ' superseded checkpoints into ' + ds.totalMerkle + ' merkle_sources claims');
+            logStream('lookup', '[REPLAY · READ-ONLY] ACT II · STAGE 1 SYNAPTIC DISTILLATION: Visualizing ' + ds.totalSources + ' superseded checkpoints across ' + ds.totalMerkle + ' merkle_sources claims');
           }
           if (!ds.actLogged[3] && p >= 0.62) {
             ds.actLogged[3] = true;
@@ -3316,15 +3316,15 @@ export function renderViewerHtml(initialState) {
                 pulses.push({ kind: 'recall', fromNode: cn, fromX: cn.x, fromY: cn.y, toX: ag.x, toY: ag.y, agent: ag, color: '#a78bfa', t: 0, speed: 0.024 });
               }
             });
-            logStream('write', 'ACT III · STAGE 2 CLASS B PROMOTION: Igniting ' + ds.classBNodes.length + ' permanent Class B crystals across multi-agent ganglia');
+            logStream('lookup', '[REPLAY · READ-ONLY] ACT III · STAGE 2 CLASS B PROMOTION: Highlighting ' + ds.classBNodes.length + ' existing Class B crystals across multi-agent ganglia');
           }
           if (!ds.actLogged[4] && p >= 0.85) {
             ds.actLogged[4] = true;
             shockwaves.push({ x: 0, y: 0, r: 16, maxR: stageDim() * 0.44, color: '#34d399', alpha: 1 });
             ds.classBNodes.slice(0, 10).forEach(function (cn) {
-              pulses.push({ kind: 'write', fromNode: cn, fromX: cn.x, fromY: cn.y, toX: 0, toY: 0, color: '#fbbf24', t: 0, speed: 0.028 });
+              pulses.push({ kind: 'recall', fromNode: cn, fromX: cn.x, fromY: cn.y, toX: 0, toY: 0, color: '#fbbf24', t: 0, speed: 0.028 });
             });
-            logStream('write', 'ACT IV · STAGE 3 CANON SOLIDIFICATION & COHERENCE 2.0 SURGE: Hive Coherence lifted to ' + (latestCoherence ? Number(latestCoherence.score).toFixed(1) + '%' : '92.4%'));
+            logStream('lookup', '[REPLAY · READ-ONLY] ACT IV · STAGE 3 CANON SOLIDIFICATION: Observed Hive Coherence ' + (latestCoherence && typeof latestCoherence.score === 'number' ? Number(latestCoherence.score).toFixed(1) + '%' : 'N/A'));
           }
           if (p >= 0.22 && p <= 0.68) {
             var act2P = Math.max(0, Math.min(1, (p - 0.22) / 0.40));
@@ -3633,8 +3633,8 @@ export function renderViewerHtml(initialState) {
             });
             ctx.font = '800 12px ui-monospace, monospace';
             ctx.fillStyle = '#6ee7b7';
-            var cohScoreTxt = latestCoherence ? Number(latestCoherence.score).toFixed(1) + '%' : '92.4%';
-            ctx.fillText('COHERENCE 2.0: ' + cohScoreTxt + ' · ALIGNED', 0, -coreR - 12);
+            var cohScoreTxt = latestCoherence && typeof latestCoherence.score === 'number' ? Number(latestCoherence.score).toFixed(1) + '%' : 'N/A';
+            ctx.fillText('OBSERVED COHERENCE 2.0: ' + cohScoreTxt, 0, -coreR - 12);
             ctx.restore();
           }
         }
@@ -3825,9 +3825,9 @@ export function renderViewerHtml(initialState) {
             actSub = 'Promoting ' + dsBanner.classBNodes.length + ' Multi-Agent Corroborated Claims to Permanent Class B Decisions';
             actCol = '#c084fc';
           } else {
-            var cohTxt = latestCoherence ? Number(latestCoherence.score).toFixed(1) + '%' : '92.4%';
-            actTitle = 'ACT IV / IV · STAGE 3: CANON SOLIDIFICATION & COHERENCE 2.0 SURGE';
-            actSub = 'Constitutional Core Aligned · Hive Coherence 2.0: ' + cohTxt + ' · All 3 Triggers GREEN';
+            var cohTxt = latestCoherence && typeof latestCoherence.score === 'number' ? Number(latestCoherence.score).toFixed(1) + '%' : 'N/A';
+            actTitle = 'ACT IV / IV · STAGE 3: CANON SOLIDIFICATION (READ-ONLY REPLAY)';
+            actSub = 'Constitutional Core Visualization · Observed Hive Coherence 2.0: ' + cohTxt;
             actCol = '#34d399';
           }
           ctx.textAlign = 'left';
