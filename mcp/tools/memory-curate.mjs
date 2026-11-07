@@ -79,14 +79,24 @@ export function readCuratorStateFile(stateFilePath) {
     wrapped.code = 'HIVE_MEMORY_CURATOR_STATE_READ_FAILED'
     throw wrapped
   }
+  const parseCursorField = (fieldName) => {
+    const val = raw[fieldName]
+    if (val === undefined || val === null) return 0
+    if (typeof val !== 'number' || !Number.isFinite(val) || val < 0) {
+      const wrapped = new Error(`curator state file invalid ${fieldName} (${stateFilePath}): must be a non-negative finite number`)
+      wrapped.code = 'HIVE_MEMORY_CURATOR_STATE_READ_FAILED'
+      throw wrapped
+    }
+    return val
+  }
   return {
-    last_curated_at: Number.isFinite(Number(raw.last_curated_at)) ? Number(raw.last_curated_at) : 0,
-    last_curated_write_seq: Number.isFinite(Number(raw.last_curated_write_seq)) ? Number(raw.last_curated_write_seq) : 0,
-    last_ran_at: Number.isFinite(Number(raw.last_ran_at)) ? Number(raw.last_ran_at) : null,
-    last_submitted_count: Number.isFinite(Number(raw.last_submitted_count)) ? Number(raw.last_submitted_count) : 0,
-    dream_interval_sec: Number.isFinite(Number(raw.dream_interval_sec)) ? Number(raw.dream_interval_sec) : DEFAULT_DREAM_INTERVAL_SEC,
-    write_delta_threshold: Number.isFinite(Number(raw.write_delta_threshold)) ? Number(raw.write_delta_threshold) : DEFAULT_WRITE_DELTA_THRESHOLD,
-    topic_pressure_threshold: Number.isFinite(Number(raw.topic_pressure_threshold)) ? Number(raw.topic_pressure_threshold) : DEFAULT_TOPIC_PRESSURE_THRESHOLD,
+    last_curated_at: parseCursorField('last_curated_at'),
+    last_curated_write_seq: parseCursorField('last_curated_write_seq'),
+    last_ran_at: typeof raw.last_ran_at === 'number' && Number.isFinite(raw.last_ran_at) ? raw.last_ran_at : null,
+    last_submitted_count: typeof raw.last_submitted_count === 'number' && Number.isFinite(raw.last_submitted_count) ? raw.last_submitted_count : 0,
+    dream_interval_sec: typeof raw.dream_interval_sec === 'number' && Number.isFinite(raw.dream_interval_sec) ? raw.dream_interval_sec : DEFAULT_DREAM_INTERVAL_SEC,
+    write_delta_threshold: typeof raw.write_delta_threshold === 'number' && Number.isFinite(raw.write_delta_threshold) ? raw.write_delta_threshold : DEFAULT_WRITE_DELTA_THRESHOLD,
+    topic_pressure_threshold: typeof raw.topic_pressure_threshold === 'number' && Number.isFinite(raw.topic_pressure_threshold) ? raw.topic_pressure_threshold : DEFAULT_TOPIC_PRESSURE_THRESHOLD,
     triggers: raw.triggers && typeof raw.triggers === 'object' ? raw.triggers : null,
     coherence_score: typeof raw.coherence_score === 'number' ? raw.coherence_score : null,
   }
@@ -490,9 +500,9 @@ export function computeTopicEigenvectors(records = [], { maxComponents = 7 } = {
       topicMap[rawTop] = rawTop
       continue
     }
-    // Check cosine similarity against all core topic centroids
-    let bestCoreTopic = aliasNorm && CORE_EIGEN_TOPICS.has(aliasNorm) ? aliasNorm : null
-    let bestCosine = -1
+    // Check cosine similarity against all core topic centroids (require strictly positive affinity)
+    let bestCoreTopic = null
+    let bestCosine = 0
     let sharedBasis = []
 
     for (const ci of coreIndices) {
@@ -513,13 +523,15 @@ export function computeTopicEigenvectors(records = [], { maxComponents = 7 } = {
       }
     }
 
-    const targetTopic =
-      aliasNorm && aliasNorm !== rawTop && CORE_EIGEN_TOPICS.has(aliasNorm)
-        ? aliasNorm
-        : bestCoreTopic || aliasNorm || 'hive-memory'
+    const isKnownCoreAlias = Boolean(aliasNorm && aliasNorm !== rawTop && CORE_EIGEN_TOPICS.has(aliasNorm))
+    const targetTopic = isKnownCoreAlias
+      ? aliasNorm
+      : bestCosine > 0 && bestCoreTopic
+        ? bestCoreTopic
+        : rawTop
 
     topicMap[rawTop] = targetTopic
-    if (targetTopic !== rawTop) {
+    if (targetTopic !== rawTop && (isKnownCoreAlias || bestCosine > 0)) {
       const group = rawTopicGroups.get(rawTop) || []
       reorganizations.push({
         from_topic: rawTop,
@@ -560,13 +572,14 @@ export function evaluateDreamTriggers({
     (min, r) => (typeof r.created_at === 'number' && r.created_at > 0 && r.created_at < min ? r.created_at : min),
     Infinity
   )
+  const hasCuratedBaseline = Number(lastCuratedAt || 0) > 0 || Number.isFinite(earliestCreated)
   const baselineTime = Number(lastCuratedAt || 0) > 0
     ? Number(lastCuratedAt)
     : Number.isFinite(earliestCreated)
       ? earliestCreated
       : nowSec
   const elapsedSec = Math.max(0, nowSec - baselineTime)
-  const circadianDream = lastCuratedAt > 0 ? elapsedSec >= dreamIntervalSec : false
+  const circadianDream = hasCuratedBaseline ? elapsedSec >= dreamIntervalSec : false
 
   const writeSeq = Number(storeState?.write_seq || 0)
   const writeDelta = Math.max(0, writeSeq - Number(lastCuratedWriteSeq || 0))
@@ -1079,6 +1092,7 @@ export async function runCuratorCycle({
   writeDeltaThreshold = DEFAULT_WRITE_DELTA_THRESHOLD,
   topicPressureThreshold = DEFAULT_TOPIC_PRESSURE_THRESHOLD,
   gitAncestryCheck = null,
+  maxPages = 500,
   nowSec = Math.floor(Date.now() / 1000),
 } = {}) {
   const resolvedStateFile = resolveCuratorStatePath({ stateFile, socketPath: readerSocket })
@@ -1099,7 +1113,8 @@ export async function runCuratorCycle({
     const historyRecords = []
     let cursor = '0'
     let pages = 0
-    while (cursor !== null && pages < 50) {
+    const pageLimit = Math.max(1, Number(maxPages) || 500)
+    while (cursor !== null && pages < pageLimit) {
       const page = await reader.callReadTool('memory_query', {
         limit: 100,
         format: 'full',
@@ -1116,6 +1131,7 @@ export async function runCuratorCycle({
       pages += 1
     }
 
+    const historyComplete = cursor === null
     const storeState = wake?.store_state || {}
     const resolvedRecentActivity = Array.isArray(recentActivity)
       ? recentActivity
@@ -1130,7 +1146,7 @@ export async function runCuratorCycle({
             recent_activity: resolvedRecentActivity,
             store_state: storeState,
             now_sec: nowSec,
-            history_complete: cursor === null,
+            history_complete: historyComplete,
           })
 
     const triggerEval = evaluateDreamTriggers({
@@ -1171,7 +1187,7 @@ export async function runCuratorCycle({
     const triggerFired = Boolean(force || triggerEval.shouldRun)
     const hasWriteCapability = Boolean(!dryRun && writerSocket && (curatorSecretKey || curatorSigner))
 
-    if (triggerFired && hasWriteCapability && plannedActions.length > 0) {
+    if (triggerFired && hasWriteCapability && historyComplete && plannedActions.length > 0) {
       const writer = createCuratorWriteClient(writerSocket)
       try {
         for (const item of plannedActions.filter(a => a.template)) {
@@ -1212,7 +1228,10 @@ export async function runCuratorCycle({
     // Read-only passes (no writerSocket/curatorSecretKey or dryRun) and refused write passes NEVER advance the cursor.
     let cycleStatus = 'idle'
     let cursorAdvanced = false
-    if (!hasWriteCapability) {
+    if (!historyComplete) {
+      cycleStatus = 'history_incomplete'
+      cursorAdvanced = false
+    } else if (!hasWriteCapability) {
       cycleStatus = triggerFired ? 'read_only_pending' : 'read_only_idle'
       cursorAdvanced = false
     } else if (!triggerFired) {
@@ -1252,7 +1271,7 @@ export async function runCuratorCycle({
       })
     }
 
-    const cycleOk = cycleStatus !== 'write_refused'
+    const cycleOk = cycleStatus !== 'write_refused' && cycleStatus !== 'history_incomplete'
     const briefing = formatCuratorBriefing({
       cycleStatus,
       triggers: triggerEval,
@@ -1265,6 +1284,7 @@ export async function runCuratorCycle({
     })
     return {
       ok: cycleOk,
+      history_complete: historyComplete,
       cycle_status: cycleStatus,
       cursor_advanced: cursorAdvanced,
       ran_at: nowSec,
