@@ -16,6 +16,29 @@ const ADD = new RegExp(`^${SETUP_PREFIX.replace(/[/]/g, '\\/')}([a-z0-9][a-z0-9.
 // that stopped.
 export const HEARTBEAT_MS = 10 * 60 * 1000
 
+// Every event one relay holds for a filter, newest page first, walking `until` back until a short page.
+// A relay that stops answering part way keeps what it gave; the caller sees answered as on the first page.
+export const PAGE = 100
+export async function readPages(query, url, filter, { page = PAGE, pages = 1000 } = {}) {
+  const seen = new Map()
+  let until = filter.until, answered = false
+  for (let n = 0; n < pages; n++) {
+    const read = await query(url, { ...filter, limit: page, ...(until === undefined ? {} : { until }) })
+    if (!read.answered) break
+    answered = true
+    let fresh = 0, oldest = Infinity
+    for (const event of read.events) {
+      if (!seen.has(event?.id)) { seen.set(event?.id, event); fresh++ }
+      if (Number.isInteger(event?.created_at)) oldest = Math.min(oldest, event.created_at)
+    }
+    if (read.events.length < page || oldest === Infinity) break
+    // `until` is inclusive, so siblings in the oldest second come back; once a page brings nothing
+    // new, step past that second, so the walk always moves back.
+    until = fresh ? oldest : oldest - 1
+  }
+  return { answered, events: [...seen.values()] }
+}
+
 const rows = path => existsSync(path) ? readFileSync(path, 'utf8').split('\n').filter(Boolean).flatMap(line => {
   try { return [JSON.parse(line)] } catch { return [] }
 }) : []

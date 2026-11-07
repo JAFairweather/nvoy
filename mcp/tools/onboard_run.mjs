@@ -98,10 +98,13 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
     return state === 'done'
   }
   // Phase B: every row so far, this run's and earlier runs', goes to the owner after each step.
-  // A receipt that no relay takes is logged; it never changes a step's state.
+  // A receipt that no relay takes is logged; it never changes a step's state, but the request is not
+  // marked finished until the receipt that shows it finished is out.
+  let reported = !report
   const publish = async (extra = {}) => {
     if (!report) return
-    try { await report({ request: add, rows: lines(receiptPath), ...extra }) } catch (error) { log(`warning  receipt not published: ${error.message}`) }
+    try { await report({ request: add, rows: lines(receiptPath), ...extra }); reported = true }
+    catch (error) { reported = false; log(`warning  receipt not published: ${error.message}`) }
   }
   const isInstalled = () => manifests.has(name)
   const stagedPath = join(out, `${name}.json`), stagedFor = join(out, `${name}.request`)
@@ -250,6 +253,9 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
       if (!done && index < 4) break
     }
   } finally { session?.close?.(); agentLink?.close?.() }
-  if (receipts.every(row => row.state === 'done')) appendFileSync(ledger, JSON.stringify({ id: add.id, name, op: 'add_agent', at: now(), finished: true }) + '\n')
+  if (receipts.every(row => row.state === 'done')) {
+    if (reported) appendFileSync(ledger, JSON.stringify({ id: add.id, name, op: 'add_agent', at: now(), finished: true }) + '\n')
+    else log('pending  finished: every step is done, but the owner has not been told; the next run sends the receipt again')
+  }
   return { request: add, bind, receipts }
 }

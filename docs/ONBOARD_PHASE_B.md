@@ -18,7 +18,9 @@ makes each one done, stay as `onboard_run.mjs` has them.
 - **`watch`** (#323) reads every owner's setup requests from the grant relays and every installed
   agent's relays: kind 30078 by an installed agent's grantor, `d` = `nvoy-onboard/<name>/add_agent`.
   For each name whose newest request is not finished in the ledger, it runs the same steps as
-  `run`, in watch mode. Requests are processed one at a time, oldest first.
+  `run`, in watch mode. Requests are processed one at a time, oldest first. The read pages back
+  through every owner event of the last 7 days (the age past which a request is refused anyway), so
+  newer owner events never push an unfinished request out of a fixed window.
 - When the service is down, nothing happens. Nothing else does the steps instead, and the page shows
   the last receipt with its age.
 
@@ -103,11 +105,14 @@ Today the step is a fixed pending line. With nave.pub #157 it is:
   its `owners`, so a list it stores is one it acts on;
 - **pending** otherwise, with "sign the writer list on the page (step 3)".
 
-The page signs that list; the runner only reads it.
+The page signs that list; the runner only reads it. An operator's `run` reads it the same way, from
+relay.nave.pub or `--writer-relay`.
 
 ## Failure and replay
 
-- A request id is run once to completion. The ledger's `finished` row stops every later tick.
+- A request id is run once to completion. The ledger's `finished` row stops every later tick. It is
+  written only once the receipt that shows every step done has been taken by a relay; if that last
+  receipt is refused, the request stays open and the next tick runs it again and resends it.
 - An unchanged receipt is not sent again each tick. It goes out when a step's state or reason
   changes, or every 10 minutes as a heartbeat, so the page can tell a live runner from a stopped one.
 - A tick and an operator's `run` never overlap: the wrapper holds `/var/lib/nvoy-onboard/.lock`, and
@@ -129,6 +134,10 @@ The page signs that list; the runner only reads it.
   - one tick finds a new request and runs it to the pairing;
   - the receipt is sealed to the owner, opens with the owner's key, and carries the link;
   - a finished request is skipped;
+  - a request whose finished receipt is refused stays open, and the next tick sends it and finishes;
+  - owner events are read page by page, past any one page, and a relay that stops part way keeps
+    what it gave;
+  - `run` reads and verifies the writer list as watch does;
   - a giver outside a shared room stays pending, with no rewrite;
   - the relay-writer step follows the stored list;
   - a receipt is never published in the clear, and the link is never logged;

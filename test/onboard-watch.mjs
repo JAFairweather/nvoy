@@ -8,7 +8,7 @@ import { finalizeEvent, generateSecretKey, getPublicKey, verifyEvent } from 'nos
 import { v2 as nip44 } from 'nostr-tools/nip44'
 import { SETUP_KIND } from '../mcp/tools/onboard_request.mjs'
 import { WRITERS_D, WRITERS_KIND, writerVerdict } from '../mcp/tools/onboard_run.mjs'
-import { pendingRequests, watchTick, HEARTBEAT_MS } from '../mcp/tools/onboard_watch.mjs'
+import { pendingRequests, readPages, watchTick, HEARTBEAT_MS } from '../mcp/tools/onboard_watch.mjs'
 import { RECEIPT_KIND, receiptD } from '../mcp/tools/onboard_receipt.mjs'
 
 const tmp = mkdtempSync(join(tmpdir(), 'nvoy-onboard-watch-'))
@@ -43,11 +43,11 @@ const bind = signAs(owner, [['d', 'nvoy-onboard/curator/bind_runtime'], ['op', '
   ['like', 'crystalclaude'], ['channel_key', KEY]])
 
 // Fake tools that make the state each real tool makes.
-const calls = []
+const calls = [], keys = { curator: agent }
 const runTool = (tool, args) => {
   const op = args[0], id = args[args.indexOf('--id') + 1]
   calls.push(`${op} ${id}`)
-  if (op === 'allocate') { writeFileSync(join(out, `${id}.json`), JSON.stringify(raw(id, id === 'curator' ? agent : agent2))); return 0 }
+  if (op === 'allocate') { writeFileSync(join(out, `${id}.json`), JSON.stringify(raw(id, keys[id] || agent2))); return 0 }
   if (op === 'check') return 0
   if (op === 'apply') { copyFileSync(join(out, `${id}.json`), join(root, `${id}.json`)); return 0 }
   throw new Error(`unexpected tool ${tool} ${op}`)
@@ -185,6 +185,61 @@ approved = false
 await tick({ stateDir: freshState, signer: runnerSigner(stranger) })
 assert.equal(published.length, count)
 assert.ok(lines.some(line => /signs as another key/.test(line)))
+
+// A request that ends with every step done is marked finished only once the receipt saying so is out.
+// Here the last publish is refused; the next tick sends it and only then finishes the request.
+const keeper = getPublicKey(generateSecretKey()); keys.keeper = keeper
+const keeperAdd = signAs(owner, [['d', 'nvoy-onboard/keeper/add_agent'], ['op', 'add_agent'], ['p', keeper], ['harness', 'claude-code'], ['like', 'crystalclaude']], at + 40)
+const keeperBind = signAs(owner, [['d', 'nvoy-onboard/keeper/bind_runtime'], ['op', 'bind_runtime'], ['p', keeper], ['harness', 'claude-code'],
+  ['like', 'crystalclaude'], ['channel_key', KEY]], at + 41)
+const keeperState = join(tmp, 'state3'), member = { joinWith: () => ({ signer: {}, open: async () => ({ close() {} }), close() {} }) }
+events = [keeperAdd, keeperBind]; writers = { answered: true, events: [list(owner, [keeper], at + 42)] }; approved = true
+const allDone = event => { const all = Object.values(steps(event)); return all.length === 9 && all.every(state => state === 'done') }
+let refuseFinal = true
+const flakyPublish = async event => {
+  if (refuseFinal && allDone(event)) return [{ relay: 'wss://relay.nave.pub', accepted: false, message: 'blocked: try later' }]
+  published.push(event); return [{ relay: 'wss://relay.nave.pub', accepted: true }]
+}
+const finishedIds = () => readFileSync(join(keeperState, 'requests.jsonl'), 'utf8').split('\n').filter(Boolean).map(JSON.parse).filter(row => row.finished).map(row => row.id)
+lines = []
+await tick({ ...member, stateDir: keeperState, publish: flakyPublish })
+assert.deepEqual(finishedIds(), [], 'not finished while the owner has not seen it finished')
+assert.ok(lines.some(line => /next run sends the receipt again/.test(line)))
+assert.equal(allDone(published.at(-1)), false, 'the last accepted receipt is not the finished one')
+refuseFinal = false; count = published.length
+clock += 30_000
+const again = await tick({ ...member, stateDir: keeperState, publish: flakyPublish })
+assert.deepEqual(again.ran.map(r => r.name), ['keeper'], 'the next tick takes it up again')
+assert.ok(published.length > count)
+assert.ok(allDone(published.at(-1)), 'the owner now has the finished receipt')
+assert.deepEqual(finishedIds(), [keeperAdd.id])
+count = published.length; clock += HEARTBEAT_MS * 2
+assert.deepEqual((await tick({ ...member, stateDir: keeperState, publish: flakyPublish })).ran, [], 'and then it is skipped')
+assert.equal(published.length, count)
+
+// Owner events are read page by page, so newer ones never push an unfinished add out of a window.
+const held = Array.from({ length: 357 }, (_, n) => ({ id: `e${n}`, created_at: 1000 + Math.floor(n / 7) }))
+const relayOf = (all, cap = Infinity, failAfter = Infinity) => { let asked = 0; return async (url, filter) => {
+  if (++asked > failAfter) return { answered: false, events: [] }
+  const hit = all.filter(e => (filter.until === undefined || e.created_at <= filter.until) && (filter.since === undefined || e.created_at >= filter.since))
+    .sort((a, b) => b.created_at - a.created_at)
+  return { answered: true, events: hit.slice(0, Math.min(filter.limit ?? Infinity, cap)) }
+} }
+const ids = read => read.events.map(e => e.id).sort()
+assert.deepEqual(ids(await readPages(relayOf(held), 'wss://x', {}, { page: 50 })), held.map(e => e.id).sort(), 'every event, past any one page')
+assert.deepEqual(ids(await readPages(relayOf(held), 'wss://x', { since: 1040 }, { page: 50 })), held.filter(e => e.created_at >= 1040).map(e => e.id).sort())
+const sameSecond = Array.from({ length: 30 }, (_, n) => ({ id: `s${n}`, created_at: 5 }))
+assert.equal((await readPages(relayOf(sameSecond), 'wss://x', {}, { page: 10 })).events.length, 10, 'a full second past the page size ends the walk, not a loop')
+const partial = await readPages(relayOf(held, Infinity, 2), 'wss://x', {}, { page: 50 })
+assert.equal(partial.answered, true); assert.ok(partial.events.length >= 50 && partial.events.length < held.length, 'a relay that stops answering keeps what it gave')
+assert.equal((await readPages(relayOf(held, Infinity, 0), 'wss://x', {})).answered, false)
+
+// The operator's run reads the same writer list as watch, so its relay writer step can be done too.
+const cli = readFileSync(new URL('../mcp/tools/nvoy-onboard.mjs', import.meta.url), 'utf8')
+const runCall = cli.slice(cli.lastIndexOf('await onboard({'))
+assert.match(runCall.slice(0, runCall.indexOf('})')), /readWriters: writersFrom\(/, 'run reads the owner\'s writer list')
+assert.match(runCall.slice(0, runCall.indexOf('})')), /\bverify\b/, 'and verifies it')
+assert.doesNotMatch(cli, /limit: 500/, 'no fixed window of owner events')
 
 // No trusted owner yet: nothing is read.
 const empty = join(tmp, 'empty'); mkdirSync(empty)

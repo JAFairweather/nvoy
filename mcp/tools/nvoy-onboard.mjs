@@ -3,7 +3,7 @@
 //
 //   nvoy-onboard.mjs show <name> [--instance-root <dir>] [--relay wss://…]…
 //   nvoy-onboard.mjs run <name> [--authorized-keys <path>] [--givers-redeploy] [--out <dir>]
-//                            [--instance-root <dir>] [--state-dir <dir>] [--relay wss://…]…
+//                            [--instance-root <dir>] [--state-dir <dir>] [--relay wss://…]… [--writer-relay wss://…]
 //   nvoy-onboard.mjs watch [--runner <runner.json>] [--out <dir>] [--instance-root <dir>] [--state-dir <dir>]
 //   nvoy-onboard.mjs runner-pair [--runner <runner.json>]
 //
@@ -24,10 +24,10 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { grantReadRelays } from './grant_relays.mjs'
 import { publishRelay, queryRelay } from './public_relays.mjs'
-import { requestD, SETUP_KIND, OnboardRefusal } from './onboard_request.mjs'
+import { MAX_AGE_S, requestD, SETUP_KIND, OnboardRefusal } from './onboard_request.mjs'
 import { onboard, WRITERS_D, WRITERS_KIND } from './onboard_run.mjs'
-import { readInstallDetails, readRunnerConfig } from './onboard_receipt.mjs'
-import { watchTick } from './onboard_watch.mjs'
+import { readInstallDetails, readRunnerConfig, WRITER_RELAY } from './onboard_receipt.mjs'
+import { readPages, watchTick } from './onboard_watch.mjs'
 import { pairInstance } from './instance-pair.mjs'
 import { readManifest } from './runtime_manifest.mjs'
 import { makeBunkerSigner } from './nip46-signer.mjs'
@@ -46,15 +46,21 @@ if (!(named || ['watch', 'runner-pair'].includes(command)) || (named && (!name |
 const here = dirname(fileURLToPath(import.meta.url))
 
 const readUrls = relays => grantReadRelays([...relays, ...all('--relay')], process.env.NVOY_GRANT_RELAYS || '')
-async function readAll(urls, filter) {
-  const reads = await Promise.all(urls.map(url => queryRelay(url, filter)))
+async function readAll(urls, filter, read = queryRelay) {
+  const reads = await Promise.all(urls.map(url => read(url, filter)))
   if (!reads.some(read => read.answered)) throw new OnboardRefusal('ONBOARD_NO_RELAY', 'no relay answered')
   return [...new Map(reads.flatMap(read => read.events).map(event => [event.id, event])).values()]
 }
 const fetchEvents = ({ relays, owners, name }) =>
   readAll(readUrls(relays), { kinds: [SETUP_KIND], authors: owners, '#d': [requestD(name, 'add_agent'), requestD(name, 'bind_runtime')] })
-// Every request kind from the trusted owners; watch keeps the add_agent ones by their d tag.
-const fetchAll = ({ relays, owners }) => readAll(readUrls(relays), { kinds: [SETUP_KIND], authors: owners, limit: 500 })
+// Every request kind from the trusted owners, paged back over the window a request stays valid, so
+// newer owner events never push an unfinished add out of a fixed window; watch keeps the add_agent
+// ones by their d tag.
+const fetchAll = ({ relays, owners }) => readAll(readUrls(relays),
+  { kinds: [SETUP_KIND], authors: owners, since: Math.floor(Date.now() / 1000) - MAX_AGE_S - 600 }, (url, filter) => readPages(queryRelay, url, filter))
+const verify = event => { try { return verifyEvent(JSON.parse(JSON.stringify(event))) } catch { return false } }
+// The owner's newest writer lists on the server's relay, for the relay writer step in run and watch.
+const writersFrom = relay => async ({ owners }) => queryRelay(relay, { kinds: [WRITERS_KIND], authors: owners, '#d': [WRITERS_D] })
 
 // The agent's own connection, from its seated credential files, for the hive claim and room joins.
 function joinWith(manifest) {
@@ -94,13 +100,12 @@ async function watch(runner) {
         return 0
       } catch (error) { console.error(`pairing ${name}: ${error.message}`); return 1 }
     }
-    const readWriters = async ({ owners }) => queryRelay(runner.writerRelay, { kinds: [WRITERS_KIND], authors: owners, '#d': [WRITERS_D] })
     const publish = async event => {
       const urls = [...new Set([...runner.relays, ...readUrls([])])]
       return Promise.all(urls.map(url => publishRelay(url, event)))
     }
-    const { ran } = await watchTick({ root, out, stateDir, runner, fetchAll, fetchEvents, runTool, joinWith, pair, readWriters, publish, signer,
-      verify: event => { try { return verifyEvent(event) } catch { return false } },
+    const { ran } = await watchTick({ root, out, stateDir, runner, fetchAll, fetchEvents, runTool, joinWith, pair, readWriters: writersFrom(runner.writerRelay),
+      publish, signer, verify,
       installFor: name => readInstallDetails({ instance: name, sshTarget: runner.sshTarget }) })
     return ran.some(entry => entry.error) ? 1 : 0
   } finally { signer.close?.() }
@@ -117,7 +122,7 @@ if (!named) {
 }
 
 try {
-  const { receipts } = await onboard({ command, name, fetchEvents, runTool, joinWith,
+  const { receipts } = await onboard({ command, name, fetchEvents, runTool, joinWith, verify, readWriters: writersFrom(flag('--writer-relay') || WRITER_RELAY),
     root, out, stateDir, keysPath: flag('--authorized-keys'), giversRedeploy: argv.includes('--givers-redeploy') })
   process.exit(receipts.some(row => row.state === 'refused') ? 1 : receipts.every(row => row.state === 'done') ? 0 : command === 'show' ? 0 : 4)
 } catch (error) {
