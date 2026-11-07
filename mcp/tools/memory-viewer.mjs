@@ -339,11 +339,24 @@ function evaluateCoherenceSlice(slice, rosterByPk, expectedRosterSize, writeSeqE
 
   const durableCount = slice.filter(r => r.scope === 'hive:canon' || r.expires_at === null || r.expires_at === undefined).length
   const durableRatio = durableCount / slice.length
+  const curatedOrSuperseded = slice.filter(
+    r => Boolean(r.merkle_sources) || (Array.isArray(r.supersedes) && r.supersedes.length > 0)
+  ).length
+  const uncuratedClassACount = nonCanon.filter(
+    r => r.expires_at !== null && r.expires_at !== undefined && !r.merkle_sources
+  ).length
   let reuseBonus = 1
   if (Number.isSafeInteger(writeSeqEst) && writeSeqEst > slice.length) {
     reuseBonus = Math.min(1, 0.7 + 0.3 * ((writeSeqEst - slice.length) / Math.max(1, writeSeqEst)))
   }
-  const consolidation = Math.round(Math.min(100, (0.6 * Math.min(1, durableRatio / 0.35) + 0.4 * reuseBonus) * 100) * 10) / 10
+  let rawConsolidation = (0.6 * Math.min(1, durableRatio / 0.35) + 0.4 * reuseBonus) * 100
+  if (slice.length > 15 && uncuratedClassACount > durableCount) {
+    const backlogRatio = uncuratedClassACount / slice.length
+    const merkleCoverage = Math.min(1, curatedOrSuperseded / Math.max(1, nonCanon.length * 0.16))
+    const backlogPenalty = Math.max(0, (backlogRatio - 0.35) * 95 * (1 - 0.7 * merkleCoverage))
+    rawConsolidation = Math.max(18, rawConsolidation - backlogPenalty)
+  }
+  const consolidation = Math.round(Math.min(100, rawConsolidation) * 10) / 10
 
   const score = Math.round((0.25 * alignment + 0.2 * grounding + 0.25 * convergence + 0.15 * coupling + 0.15 * consolidation) * 10) / 10
   return {
@@ -632,26 +645,34 @@ export function computeCoherence({
         at: a.last_refused_at,
       })
     }
-    const hasRecall =
-      recallByActor.has(id) ||
-      a.last_recall_kind === 'wake' ||
-      a.last_recall_kind === 'query' ||
-      a.last_read_kind === 'wake' ||
-      a.last_read_kind === 'query'
+    const isLiveClock = Number.isSafeInteger(now_sec) && now_sec > 100000
+    const recallAtForSeat = a.last_recall_at || ((a.last_read_kind === 'wake' || a.last_read_kind === 'query') ? a.last_read_at : null)
+    const seatRecallAge = recallAtForSeat ? Math.max(0, now_sec - recallAtForSeat) : null
+    const hasRecall = isLiveClock
+      ? (recallByActor.has(id) || (seatRecallAge !== null && seatRecallAge <= 3600 && a.last_read_kind !== 'lookup'))
+      : (
+          recallByActor.has(id) ||
+          a.last_recall_kind === 'wake' ||
+          a.last_recall_kind === 'query' ||
+          a.last_read_kind === 'wake' ||
+          a.last_read_kind === 'query'
+        )
     const hasAnyRead = readsByActor.has(id) || Boolean(a.last_read_at)
     if (hasRecall) {
       verifiedRecallAgents.push(id)
     } else if (hasAnyRead || writesByActor.has(id) || recentWriterIds.has(id)) {
-      lookupOnlyWriters.push(id)
-      behavioralAlerts.push({
-        agent: id,
-        category: 'behavioral_noncompliance',
-        kind: 'write_without_recall',
-        severity: 'warning',
-        code: 'WRITE_WITHOUT_RECALL',
-        detail: 'Wrote claims (lookup/submit) without calling memory_wake or memory_query',
-        at: a.last_write_at || a.last_read_at || now_sec,
-      })
+      if (a.last_read_kind === 'lookup' || !recallAtForSeat) {
+        lookupOnlyWriters.push(id)
+        behavioralAlerts.push({
+          agent: id,
+          category: 'behavioral_noncompliance',
+          kind: 'write_without_recall',
+          severity: 'warning',
+          code: 'WRITE_WITHOUT_RECALL',
+          detail: 'Wrote claims (lookup/submit) without calling memory_wake or memory_query',
+          at: a.last_write_at || a.last_read_at || now_sec,
+        })
+      }
     } else {
       blindRosterAgents.push(id)
       behavioralAlerts.push({
@@ -688,10 +709,11 @@ export function computeCoherence({
 
   const missedTopics = [...missedTopicsSet]
   // Per-agent periphery coherence score (0-100): measures how synchronized each individual agent on the periphery
-  // is with the Hive's memory state (Recall Sync 50% + Write/Tool Hygiene 30% + Shared Resonance 20%).
+  // is with the Hive's memory state (Recall Sync 50% + Write/Tool Hygiene 30% + Shared Resonance 20%), with recency decay.
+  const isLiveClockForPeriphery = Number.isSafeInteger(now_sec) && now_sec > 100000
   const peripheryAgents = peerReaders.map(a => {
     const id = a.id
-    const hasRecall =
+    const hasEverRecalled =
       recallByActor.has(id) ||
       a.last_recall_kind === 'wake' ||
       a.last_recall_kind === 'query' ||
@@ -700,28 +722,61 @@ export function computeCoherence({
     const hasAnyRead = readsByActor.has(id) || Boolean(a.last_read_at)
     const hasWrite = writesByActor.has(id) || recentWriterIds.has(id) || Boolean(a.last_write_at)
     const hasRefusal = recentRefusalByActor.has(id) || (a.last_refused_at && Math.max(0, now_sec - a.last_refused_at) <= 900)
-    const recallAt = a.last_recall_at || (hasRecall ? (a.last_read_at || now_sec) : null)
+    const recallAt = a.last_recall_at || (hasEverRecalled ? (a.last_read_at || now_sec) : null)
     const recallAge = recallAt ? Math.max(0, now_sec - recallAt) : null
-    const recallSync = hasRecall
-      ? (recallAge !== null && recallAge <= 900 ? 50 : (recallAge !== null && recallAge <= 3600 ? 44 : 36))
-      : 0
+    const writeAge = a.last_write_at ? Math.max(0, now_sec - a.last_write_at) : (writesByActor.has(id) ? 0 : null)
+    let recallSync = 0
     let writeHygiene = 0
-    if (hasWrite) {
-      writeHygiene = hasRecall ? 30 : 18
-    } else if (hasRecall) {
-      writeHygiene = 24
-    } else if (hasAnyRead) {
-      writeHygiene = 10
+    let sharedResonance = 0
+    if (isLiveClockForPeriphery) {
+      recallSync = hasEverRecalled && recallAge !== null
+        ? (recallAge <= 900 ? 50 : (recallAge <= 3600 ? 34 : (recallAge <= 7200 ? 18 : (recallAge <= 21600 ? 10 : 0))))
+        : 0
+      const recalledRecently = hasEverRecalled && recallAge !== null && recallAge <= 3600 && a.last_read_kind !== 'lookup'
+      if (writeAge !== null && writeAge <= 3600) {
+        writeHygiene = recalledRecently ? 30 : 12
+      } else if (writeAge !== null && writeAge <= 21600) {
+        writeHygiene = (hasEverRecalled && recallAge !== null && recallAge <= 7200) ? 20 : 10
+      } else if (writeAge !== null) {
+        writeHygiene = 6
+      } else if (recalledRecently) {
+        writeHygiene = 20
+      } else if (hasEverRecalled && recallAge !== null && recallAge <= 21600) {
+        writeHygiene = 8
+      }
+      if (hasRefusal) writeHygiene = Math.max(0, writeHygiene - 15)
+      if (recalledRecently && writeAge !== null && writeAge <= 21600) {
+        sharedResonance = 20
+      } else if (recalledRecently || (writeAge !== null && writeAge <= 3600)) {
+        sharedResonance = 10
+      } else if ((recallAge !== null && recallAge <= 21600) || (writeAge !== null && writeAge <= 21600)) {
+        sharedResonance = 4
+      }
+    } else {
+      recallSync = hasEverRecalled
+        ? (recallAge !== null && recallAge <= 900 ? 50 : (recallAge !== null && recallAge <= 3600 ? 44 : 36))
+        : 0
+      if (hasWrite) {
+        writeHygiene = hasEverRecalled ? 30 : 18
+      } else if (hasEverRecalled) {
+        writeHygiene = 24
+      } else if (hasAnyRead) {
+        writeHygiene = 10
+      }
+      if (hasRefusal) writeHygiene = Math.max(0, writeHygiene - 15)
+      sharedResonance = (hasEverRecalled && hasWrite) ? 20 : ((hasEverRecalled || hasWrite) ? 14 : (hasAnyRead ? 6 : 0))
     }
-    if (hasRefusal) writeHygiene = Math.max(0, writeHygiene - 15)
-    const sharedResonance = (hasRecall && hasWrite) ? 20 : ((hasRecall || hasWrite) ? 14 : (hasAnyRead ? 6 : 0))
-    const agentScore = typeof a.coherence_score === 'number'
+    const computedScore = Math.max(0, Math.min(100, Math.round(recallSync + writeHygiene + sharedResonance)))
+    const agentScore = typeof a.coherence_score === 'number' && !isLiveClockForPeriphery
       ? a.coherence_score
-      : Math.max(0, Math.min(100, Math.round(recallSync + writeHygiene + sharedResonance)))
+      : computedScore
+    const isSynced = isLiveClockForPeriphery
+      ? (hasEverRecalled && recallAge !== null && recallAge <= 3600 && a.last_read_kind !== 'lookup')
+      : hasEverRecalled
     return {
       id,
       coherence_score: agentScore,
-      status: hasRefusal ? 'tool_failure' : (hasRecall ? 'synced' : (hasWrite || hasAnyRead ? 'write_without_recall' : 'blind_seat')),
+      status: hasRefusal ? 'tool_failure' : (isSynced ? 'synced' : (hasWrite || hasAnyRead ? 'write_without_recall' : 'blind_seat')),
     }
   })
   const peripheryCoherenceScore = peripheryAgents.length > 0
@@ -980,11 +1035,21 @@ export function computeAgentHealth({
       health = 'stale'
       summary.stale += 1
     }
+    const isLiveClock = Number.isSafeInteger(now_sec) && now_sec > 100000
+    const recallAge = e.last_recall_at !== null ? Math.max(0, now_sec - e.last_recall_at) : null
+    const writeAge = e.last_write_at !== null ? Math.max(0, now_sec - e.last_write_at) : null
     let complianceStatus = 'compliant'
     if (health === 'error') {
       complianceStatus = 'tool_failure'
     } else if (agent.is_reader && agent.id !== 'curator' && agent.id !== 'viewer') {
-      if (e.last_recall_at !== null) {
+      const wroteWithoutFreshRecall = isLiveClock
+        && writeAge !== null
+        && writeAge <= 3600
+        && (e.last_read_kind === 'lookup' || recallAge === null || recallAge > 3600)
+      if (wroteWithoutFreshRecall) {
+        complianceStatus = 'write_without_recall'
+        summary.write_without_recall += 1
+      } else if (e.last_recall_at !== null) {
         complianceStatus = 'compliant'
         summary.compliant_recall += 1
       } else if (e.last_write_at !== null || e.last_read_at !== null) {
@@ -995,22 +1060,49 @@ export function computeAgentHealth({
         summary.blind_seats += 1
       }
     }
-    const recallAge = e.last_recall_at !== null ? Math.max(0, now_sec - e.last_recall_at) : null
-    const recallSync = e.last_recall_at !== null
-      ? (recallAge <= 900 ? 50 : (recallAge <= 3600 ? 44 : 36))
-      : (agent.is_owner ? 50 : 0)
+    let recallSync = 0
     let writeHygiene = 0
-    if (e.last_write_at !== null) {
-      writeHygiene = e.last_recall_at !== null || agent.is_owner ? 30 : 18
-    } else if (e.last_recall_at !== null || agent.is_owner) {
-      writeHygiene = 24
-    } else if (e.last_read_at !== null) {
-      writeHygiene = 10
+    let sharedResonance = 0
+    if (isLiveClock && !agent.is_owner) {
+      recallSync = e.last_recall_at !== null && recallAge !== null
+        ? (recallAge <= 900 ? 50 : (recallAge <= 3600 ? 34 : (recallAge <= 7200 ? 18 : (recallAge <= 21600 ? 10 : 0))))
+        : 0
+      const recalledRecently = e.last_recall_at !== null && recallAge !== null && recallAge <= 3600 && e.last_read_kind !== 'lookup'
+      if (writeAge !== null && writeAge <= 3600) {
+        writeHygiene = recalledRecently ? 30 : 12
+      } else if (writeAge !== null && writeAge <= 21600) {
+        writeHygiene = (e.last_recall_at !== null && recallAge !== null && recallAge <= 7200) ? 20 : 10
+      } else if (writeAge !== null) {
+        writeHygiene = 6
+      } else if (recalledRecently) {
+        writeHygiene = 20
+      } else if (e.last_recall_at !== null && recallAge !== null && recallAge <= 21600) {
+        writeHygiene = 8
+      }
+      if (health === 'error') writeHygiene = Math.max(0, writeHygiene - 15)
+      if (recalledRecently && writeAge !== null && writeAge <= 21600) {
+        sharedResonance = 20
+      } else if (recalledRecently || (writeAge !== null && writeAge <= 3600)) {
+        sharedResonance = 10
+      } else if ((recallAge !== null && recallAge <= 21600) || (writeAge !== null && writeAge <= 21600)) {
+        sharedResonance = 4
+      }
+    } else {
+      recallSync = e.last_recall_at !== null
+        ? (recallAge <= 900 ? 50 : (recallAge <= 3600 ? 44 : 36))
+        : (agent.is_owner ? 50 : 0)
+      if (e.last_write_at !== null) {
+        writeHygiene = e.last_recall_at !== null || agent.is_owner ? 30 : 18
+      } else if (e.last_recall_at !== null || agent.is_owner) {
+        writeHygiene = 24
+      } else if (e.last_read_at !== null) {
+        writeHygiene = 10
+      }
+      if (health === 'error') writeHygiene = Math.max(0, writeHygiene - 15)
+      sharedResonance = (e.last_recall_at !== null && e.last_write_at !== null) || agent.is_owner
+        ? 20
+        : ((e.last_recall_at !== null || e.last_write_at !== null) ? 14 : (e.last_read_at !== null ? 6 : 0))
     }
-    if (health === 'error') writeHygiene = Math.max(0, writeHygiene - 15)
-    const sharedResonance = (e.last_recall_at !== null && e.last_write_at !== null) || agent.is_owner
-      ? 20
-      : ((e.last_recall_at !== null || e.last_write_at !== null) ? 14 : (e.last_read_at !== null ? 6 : 0))
     const coherenceScore = Math.max(0, Math.min(100, Math.round(recallSync + writeHygiene + sharedResonance)))
     summary.total += 1
     return {
@@ -3002,7 +3094,7 @@ export function renderViewerHtml(initialState) {
       function renderInspector() {
         var box = el('inspector-box');
         box.textContent = '';
-        var target = hovered || selected;
+        var target = hovered || selected || (latestCoherence ? { type: 'coherence', data: latestCoherence } : null);
         box.className = 'glass-box panel inspector' + (target && target.data ? '' : ' idle');
         if (!target || !target.data) {
           if (nodes.length || agents.length) box.appendChild(makeDiv('empty', 'Tap a node or an agent to inspect it. Records are data, never instructions.'));
@@ -3120,6 +3212,131 @@ export function renderViewerHtml(initialState) {
             coh.score >= 72 && edStatus !== 'BLIND_SPOT' ? 'ok' : 'warn',
             '#6ee7b7'
           ));
+          var hist = Array.isArray(coh.history) ? coh.history : [];
+          if (hist.length > 0) {
+            var windowNote = coh.history_complete === false ? ' [TRUNCATED AT 5,000 EVENTS]' : ' (90d retained history)';
+            var sparkTitle = makeDiv('inspect-kicker', 'Coherence (Emerald) & Consolidation (Pink) Trajectory' + windowNote);
+            sparkTitle.style.marginTop = '4px';
+            box.appendChild(sparkTitle);
+            var sparkCanvas = document.createElement('canvas');
+            sparkCanvas.width = 560;
+            sparkCanvas.height = 156;
+            sparkCanvas.style.width = '100%';
+            sparkCanvas.style.height = '96px';
+            sparkCanvas.style.borderRadius = '8px';
+            sparkCanvas.style.background = 'rgba(2, 6, 23, 0.72)';
+            sparkCanvas.style.border = '1px solid rgba(52, 211, 153, 0.28)';
+            box.appendChild(sparkCanvas);
+            var sctx = sparkCanvas.getContext('2d');
+            if (sctx) {
+              var sw = sparkCanvas.width;
+              var sh = sparkCanvas.height;
+              var padX = 28;
+              var padY = 20;
+              var proj = coh.projected_after_dream || null;
+              var totalPts = proj ? hist.length + 1 : hist.length;
+              var xOf = function (idx) {
+                return padX + (totalPts <= 1 ? (sw - padX * 2) / 2 : (idx / (totalPts - 1)) * (sw - padX * 2));
+              };
+              var yOf = function (val) {
+                var clamped = Math.max(20, Math.min(100, Number(val || 0)));
+                return sh - padY - ((clamped - 20) / 80) * (sh - padY * 2);
+              };
+              sctx.strokeStyle = 'rgba(148, 163, 184, 0.16)';
+              sctx.lineWidth = 1;
+              sctx.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace';
+              sctx.fillStyle = 'rgba(148, 163, 184, 0.65)';
+              [25, 50, 75, 100].forEach(function (lvl) {
+                var gy = yOf(lvl);
+                sctx.beginPath();
+                sctx.moveTo(padX, gy);
+                sctx.lineTo(sw - padX, gy);
+                sctx.stroke();
+                sctx.fillText(lvl + '%', 2, gy + 3);
+              });
+              // Pink dashed curve: Consolidation Axis over time
+              sctx.save();
+              sctx.setLineDash([5, 4]);
+              sctx.beginPath();
+              hist.forEach(function (pt, idx) {
+                var px = xOf(idx);
+                var consVal = pt.axes && typeof pt.axes.consolidation === 'number' ? pt.axes.consolidation : pt.score;
+                var py = yOf(consVal);
+                if (idx === 0) sctx.moveTo(px, py);
+                else sctx.lineTo(px, py);
+              });
+              if (proj && typeof proj.consolidation === 'number') {
+                sctx.lineTo(xOf(hist.length), yOf(proj.consolidation));
+              }
+              sctx.strokeStyle = '#f472b6';
+              sctx.lineWidth = 2;
+              sctx.stroke();
+              sctx.restore();
+              // Solid Emerald curve: Overall Hive Coherence over time
+              sctx.beginPath();
+              hist.forEach(function (pt, idx) {
+                var px = xOf(idx);
+                var py = yOf(pt.score);
+                if (idx === 0) sctx.moveTo(px, py);
+                else sctx.lineTo(px, py);
+              });
+              sctx.strokeStyle = '#34d399';
+              sctx.lineWidth = 3;
+              sctx.stroke();
+              if (proj && typeof proj.score === 'number') {
+                sctx.save();
+                sctx.setLineDash([4, 3]);
+                sctx.beginPath();
+                sctx.moveTo(xOf(hist.length - 1), yOf(hist[hist.length - 1].score));
+                sctx.lineTo(xOf(hist.length), yOf(proj.score));
+                sctx.strokeStyle = '#a78bfa';
+                sctx.lineWidth = 2.5;
+                sctx.stroke();
+                sctx.restore();
+              }
+              hist.forEach(function (pt, idx) {
+                var px = xOf(idx);
+                var py = yOf(pt.score);
+                sctx.beginPath();
+                sctx.arc(px, py, 3.8, 0, Math.PI * 2);
+                sctx.fillStyle = idx === hist.length - 1 ? '#fbbf24' : '#38bdf8';
+                sctx.fill();
+              });
+              if (proj && typeof proj.score === 'number') {
+                var ppx = xOf(hist.length);
+                var ppy = yOf(proj.score);
+                sctx.beginPath();
+                sctx.arc(ppx, ppy, 5, 0, Math.PI * 2);
+                sctx.fillStyle = '#a78bfa';
+                sctx.fill();
+              }
+            }
+            if (coh.projected_after_dream) {
+              var pr = coh.projected_after_dream;
+              var prRow = makeDiv('kv-list');
+              prRow.appendChild(kvRow(
+                'Projected After @curator Pass (' + (pr.staged_actions || 0) + ' clusters)',
+                pr.score.toFixed(1) + '% Coh · ' + pr.consolidation.toFixed(1) + '% Consolidation',
+                '#c4b5fd'
+              ));
+              box.appendChild(prRow);
+            }
+          }
+          if (latestCuratorState && Array.isArray(latestCuratorState.consolidation_ledger) && latestCuratorState.consolidation_ledger.length > 0) {
+            var ledg = latestCuratorState.consolidation_ledger;
+            var ledgTitle = makeDiv('inspect-kicker', 'Recorded Consolidation Process Ledger (' + ledg.length + ' entries)');
+            ledgTitle.style.marginTop = '6px';
+            box.appendChild(ledgTitle);
+            var ledgWrap = makeDiv('kv-list');
+            ledg.slice(-5).reverse().forEach(function (entry) {
+              var stTag = String(entry.cycle_status || 'staged').toUpperCase();
+              var col = stTag.indexOf('CURATED') >= 0 ? '#34d399' : '#c4b5fd';
+              var lbl = fmtTime(entry.at).slice(11, 19) + 'Z · ' + stTag + ' (seq ' + (entry.write_seq_before || 0) + '->' + (entry.write_seq_after || 0) + ')';
+              var subTxt = (entry.submitted_count || 0) + ' Merkle clusters (' + (entry.superseded_raw_claims || 0) + ' raw claims folded)';
+              ledgWrap.appendChild(kvRow(lbl, subTxt, col));
+            });
+            box.appendChild(ledgWrap);
+          }
           var axes = coh.axes || {};
           var axisRows = [
             ['Priority & Topic Alignment (25%)', axes.alignment || 0, '#38bdf8'],
@@ -3198,62 +3415,12 @@ export function renderViewerHtml(initialState) {
               box.appendChild(alWrap);
             }
           }
-
-          var hist = Array.isArray(coh.history) ? coh.history : [];
           if (hist.length > 0) {
-            var windowNote = coh.history_complete === false ? ' [TRUNCATED AT 5,000 EVENTS]' : ' (90d retained history)';
-            var sparkTitle = makeDiv('inspect-kicker', 'Retroactive Trajectory (Inception -> Now)' + windowNote);
-            sparkTitle.style.marginTop = '6px';
-            box.appendChild(sparkTitle);
-            var sparkCanvas = document.createElement('canvas');
-            sparkCanvas.width = 560;
-            sparkCanvas.height = 120;
-            sparkCanvas.style.width = '100%';
-            sparkCanvas.style.height = '64px';
-            sparkCanvas.style.borderRadius = '8px';
-            sparkCanvas.style.background = 'rgba(2, 6, 23, 0.55)';
-            sparkCanvas.style.border = '1px solid rgba(148, 163, 184, 0.16)';
-            box.appendChild(sparkCanvas);
-            var sctx = sparkCanvas.getContext('2d');
-            if (sctx) {
-              var sw = sparkCanvas.width;
-              var sh = sparkCanvas.height;
-              var padX = 24;
-              var padY = 18;
-              sctx.strokeStyle = 'rgba(148, 163, 184, 0.15)';
-              sctx.lineWidth = 1;
-              [50, 75, 100].forEach(function (lvl) {
-                var gy = sh - padY - ((lvl - 40) / 60) * (sh - padY * 2);
-                sctx.beginPath();
-                sctx.moveTo(padX, gy);
-                sctx.lineTo(sw - padX, gy);
-                sctx.stroke();
-              });
-              sctx.beginPath();
-              hist.forEach(function (pt, idx) {
-                var px = padX + (hist.length === 1 ? (sw - padX * 2) / 2 : (idx / (hist.length - 1)) * (sw - padX * 2));
-                var clamped = Math.max(40, Math.min(100, Number(pt.score || 0)));
-                var py = sh - padY - ((clamped - 40) / 60) * (sh - padY * 2);
-                if (idx === 0) sctx.moveTo(px, py);
-                else sctx.lineTo(px, py);
-              });
-              sctx.strokeStyle = '#34d399';
-              sctx.lineWidth = 3;
-              sctx.stroke();
-              hist.forEach(function (pt, idx) {
-                var px = padX + (hist.length === 1 ? (sw - padX * 2) / 2 : (idx / (hist.length - 1)) * (sw - padX * 2));
-                var clamped = Math.max(40, Math.min(100, Number(pt.score || 0)));
-                var py = sh - padY - ((clamped - 40) / 60) * (sh - padY * 2);
-                sctx.beginPath();
-                sctx.arc(px, py, 4, 0, Math.PI * 2);
-                sctx.fillStyle = idx === hist.length - 1 ? '#fbbf24' : '#38bdf8';
-                sctx.fill();
-              });
-            }
             var hList = makeDiv('kv-list');
             hist.forEach(function (pt, idx) {
               var label = (idx === 0 ? 'Inception' : '#' + pt.claims) + ' (' + fmtTime(pt.at).slice(11, 16) + 'Z)';
-              var detail = pt.score.toFixed(1) + ' · ' + pt.authors + 'a · ' + pt.shared_refs + ' shared';
+              var consTxt = pt.axes && typeof pt.axes.consolidation === 'number' ? ' · cons ' + pt.axes.consolidation.toFixed(0) + '%' : '';
+              var detail = pt.score.toFixed(1) + '% coh' + consTxt + ' · ' + pt.authors + 'a · ' + pt.shared_refs + ' shared';
               hList.appendChild(kvRow(label, detail, idx === hist.length - 1 ? '#6ee7b7' : null));
             });
             box.appendChild(hList);

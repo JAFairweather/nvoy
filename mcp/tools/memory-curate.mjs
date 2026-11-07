@@ -17,7 +17,7 @@
 //        caller-verified git ancestry) orders one claim after the other.
 //      - Escalates ambiguous conflicts to `@james` and `@mydude` without guessing.
 
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { createConnection } from 'node:net'
 import { dirname, join, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
@@ -89,6 +89,7 @@ export function readCuratorStateFile(stateFilePath) {
     }
     return val
   }
+  const ledgerPath = resolveConsolidationLedgerPath({ stateFile: stateFilePath })
   return {
     last_curated_at: parseCursorField('last_curated_at'),
     last_curated_write_seq: parseCursorField('last_curated_write_seq'),
@@ -99,6 +100,50 @@ export function readCuratorStateFile(stateFilePath) {
     topic_pressure_threshold: typeof raw.topic_pressure_threshold === 'number' && Number.isFinite(raw.topic_pressure_threshold) ? raw.topic_pressure_threshold : DEFAULT_TOPIC_PRESSURE_THRESHOLD,
     triggers: raw.triggers && typeof raw.triggers === 'object' ? raw.triggers : null,
     coherence_score: typeof raw.coherence_score === 'number' ? raw.coherence_score : null,
+    consolidation_ledger: readConsolidationLedger(ledgerPath),
+  }
+}
+
+export function resolveConsolidationLedgerPath({ ledgerFile = undefined, stateFile = undefined, socketPath = null } = {}) {
+  if (ledgerFile === null || ledgerFile === '') return null
+  if (typeof ledgerFile === 'string' && ledgerFile.trim()) return resolve(ledgerFile.trim())
+  if (typeof process.env.HIVE_MEMORY_CONSOLIDATION_LEDGER === 'string' && process.env.HIVE_MEMORY_CONSOLIDATION_LEDGER.trim()) {
+    return resolve(process.env.HIVE_MEMORY_CONSOLIDATION_LEDGER.trim())
+  }
+  const stPath = resolveCuratorStatePath({ stateFile, socketPath })
+  if (!stPath) return null
+  return join(dirname(stPath), 'consolidation-ledger.jsonl')
+}
+
+export function readConsolidationLedger(ledgerFilePath, { limit = 40 } = {}) {
+  if (!ledgerFilePath || typeof ledgerFilePath !== 'string' || !existsSync(ledgerFilePath)) return []
+  try {
+    const lines = readFileSync(ledgerFilePath, 'utf8')
+      .split('\n')
+      .map(l => l.trim())
+      .filter(Boolean)
+    const entries = []
+    for (const line of lines.slice(-Math.max(1, limit))) {
+      try {
+        const obj = JSON.parse(line)
+        if (obj && typeof obj === 'object') entries.push(obj)
+      } catch {}
+    }
+    return entries
+  } catch {
+    return []
+  }
+}
+
+export function appendConsolidationLedger(ledgerFilePath, entry) {
+  if (!ledgerFilePath || typeof ledgerFilePath !== 'string' || !entry || typeof entry !== 'object') return false
+  try {
+    const resolved = resolve(ledgerFilePath)
+    mkdirSync(dirname(resolved), { recursive: true, mode: 0o755 })
+    appendFileSync(resolved, JSON.stringify(entry) + '\n', { encoding: 'utf8', mode: 0o644 })
+    return true
+  } catch {
+    return false
   }
 }
 
@@ -1300,6 +1345,26 @@ export async function runCuratorCycle({
         triggers: triggerEval,
         coherence_score: triggerEval.coherence_score,
       })
+      const ledgerPath = resolveConsolidationLedgerPath({ stateFile: resolvedStateFile, socketPath: readerSocket })
+      if (ledgerPath) {
+        appendConsolidationLedger(ledgerPath, {
+          at: nowSec,
+          cycle_status: cycleStatus,
+          write_seq_before: Number(storeState.write_seq || 0),
+          write_seq_after: nextCuratedWriteSeq,
+          claims_before: records.length,
+          submitted_count: submitted.length,
+          coherence_score: triggerEval.coherence_score,
+          reasons: triggerEval.reasons || [],
+          plan_summary: plan.summary || {},
+          submitted: submitted.map(s => ({
+            id: s.id,
+            d: s.d,
+            stage: s.stage,
+            merkle_sources: s.merkle_sources,
+          })),
+        })
+      }
     }
 
     const cycleOk = cycleStatus !== 'write_refused' && cycleStatus !== 'history_incomplete'
