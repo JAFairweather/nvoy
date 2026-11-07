@@ -2698,7 +2698,8 @@ export function renderViewerHtml(initialState) {
             box.appendChild(edTitle);
             var edWrap = makeDiv('kv-list');
             var stColor = ed.status === 'aligned' ? '#34d399' : (ed.status === 'drifting' ? '#fbbf24' : '#fca5a5');
-            edWrap.appendChild(kvRow('Epistemic status', String(ed.status || 'aligned').toUpperCase() + ' (' + Number(ed.epistemic_score ?? 100).toFixed(1) + '%)', stColor));
+            var edScoreVal = ed.score ?? ed.epistemic_score ?? 100;
+            edWrap.appendChild(kvRow('Epistemic status', String(ed.status || 'aligned').toUpperCase() + ' (' + Number(edScoreVal).toFixed(1) + '%)', stColor));
             var zhCount = Number(ed.zero_hit_queries || 0);
             var missed = Array.isArray(ed.missed_topics) && ed.missed_topics.length ? ' [' + ed.missed_topics.join(', ') + ']' : '';
             edWrap.appendChild(kvRow('Unresolved 0-hit queries', zhCount + missed, zhCount > 0 ? '#fca5a5' : '#34d399'));
