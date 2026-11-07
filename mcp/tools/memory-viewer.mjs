@@ -284,12 +284,18 @@ function evaluateCoherenceSlice(slice, rosterByPk, expectedRosterSize, writeSeqE
   for (const set of artifactAuthors.values()) {
     if (set.size >= 2) sharedRefs += 1
   }
+  for (const r of slice) {
+    if (r.merkle_sources && Array.isArray(r.supersedes) && r.supersedes.length >= 2) {
+      sharedRefs += 1
+    }
+  }
   // Coherence 2.0 Convergence: blends cumulative cross-author artifact density (which scales with store size
   // rather than saturating permanently at 12 refs) with recent-window cross-agent topic corroboration.
   const targetSharedRefs = slice.length <= 15 ? Math.max(1, slice.length * 0.4) : Math.max(6, nonCanon.length * 0.14)
   const refDensityScore = Math.min(100, (sharedRefs / targetSharedRefs) * 100)
 
-  const recentNonCanon = nonCanon.slice(-18)
+  const peerNonCanon = nonCanon.filter(r => !r.merkle_sources && rosterByPk.get(String(r.author_pubkey || '')) !== 'curator')
+  const recentNonCanon = (peerNonCanon.length > 0 ? peerNonCanon : nonCanon).slice(-18)
   const recentTopics = new Map()
   const recentAuthors = new Set()
   for (const r of recentNonCanon) {
@@ -490,7 +496,9 @@ export function computeCoherence({
   // Epistemic Drift & Blind-Spot Detection:
   // Catches when agents query shared memory and get 0 matches (blind spots), when active writers wake/query
   // repeatedly without sharing room claims (silent work drift), or when recent topics are siloed to a single author.
-  const recentNonCanon = chronological.filter(r => r && r.scope !== 'hive:canon' && r.status !== 'withdrawn').slice(-18)
+  const allNonCanon = chronological.filter(r => r && r.scope !== 'hive:canon' && r.status !== 'withdrawn')
+  const peerChrono = allNonCanon.filter(r => !r.merkle_sources && rosterByPk.get(String(r.author_pubkey || '')) !== 'curator')
+  const recentNonCanon = (peerChrono.length > 0 ? peerChrono : allNonCanon).slice(-18)
   const recentTopicAuthors = new Map()
   const recentWriterIds = new Set()
   for (const r of recentNonCanon) {
