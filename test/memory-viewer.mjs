@@ -1,7 +1,7 @@
 // test/memory-viewer.mjs — Unit and integration tests for mcp/tools/memory-viewer.mjs.
 
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { request as httpRequest } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -14,6 +14,9 @@ import {
   computeCoherence,
   computeDreamingTelemetry,
   diffViewerSnapshots,
+  readWatchStatus,
+  watchAlert,
+  WATCH_STALE_SEC,
   escapeHtml,
   parseListenTarget,
   parseViewerFlags,
@@ -744,6 +747,43 @@ await test('daemon activity ring: only the viewer wake carries it, metadata only
     assert(!logged.some(e => /relay|sync/i.test(e.summary)))
   } finally {
     await daemon.close()
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+await test('the health check status shows saving off, partly off, stale or unreadable as an alert', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'viewer-watch-'))
+  try {
+    const now = 1794053720
+    const write = (o) => { const f = join(tmp, `s${Math.random()}.json`); writeFileSync(f, typeof o === 'string' ? o : JSON.stringify(o)); return f }
+    const off = readWatchStatus(write({ at: now, writers: { biggy: 'FENCED', neil: 'FENCED' }, problems: ['saving is OFF'] }), now)
+    assert.equal(off.saving, 'OFF')
+    assert.match(watchAlert(off, now), /^SAVING IS OFF: all 2 writers/)
+    const part = readWatchStatus(write({ at: now, writers: { biggy: 'open', neil: 'FENCED' }, problems: [] }), now)
+    assert.equal(watchAlert(part, now), 'Saving is off for neil: their saves are refused')
+    const open = readWatchStatus(write({ at: now, writers: { biggy: 'open', neil: 'open' }, problems: [] }), now)
+    assert.equal(open.saving, 'open')
+    assert.equal(watchAlert(open, now), null)
+    const stale = readWatchStatus(write({ at: now - WATCH_STALE_SEC - 60, writers: { biggy: 'open' }, problems: [] }), now)
+    assert.match(watchAlert(stale, now), /last reported 16 min ago/)
+    const old = readWatchStatus(write({ at: now, readers: { hr: 'ok' }, problems: [] }), now)
+    assert.match(watchAlert(old, now), /does not report writers/, 'a watch without the writers check is not taken as saving open')
+    assert.match(watchAlert(readWatchStatus(join(tmp, 'missing.json'), now), now), /has not reported/)
+    assert.match(watchAlert(readWatchStatus(write('not json'), now), now), /has not reported/)
+    const odd = readWatchStatus(write({ at: now, writers: { '../x': 'open', biggy: 'yes' }, problems: [7, 'x'.repeat(400)] }), now)
+    assert.deepEqual(odd.writers, { biggy: 'FENCED' }, 'odd names are dropped and anything but "open" is fenced')
+    assert.equal(odd.problems.length, 1)
+    assert.equal(odd.problems[0].length, 300)
+
+    const base = { store_state: { state: 'READY', write_seq: 319 }, records: [], recent_activity: [], connected: true }
+    const toOff = diffViewerSnapshots({ ...base, watch: open }, { ...base, watch: off }, now).filter((e) => e.kind === 'alert')
+    assert.equal(toOff.length, 1)
+    assert.match(toOff[0].summary, /SAVING IS OFF/)
+    const back = diffViewerSnapshots({ ...base, watch: off }, { ...base, watch: open }, now).filter((e) => e.kind === 'alert')
+    assert.equal(back[0].summary, 'Health check clear: saving is open')
+    assert.equal(diffViewerSnapshots({ ...base, watch: open }, { ...base, watch: open }, now).filter((e) => e.kind === 'alert').length, 0)
+    assert.match(renderViewerHtml({ ...base, watch: off }), /id="alert-banner"/)
+  } finally {
     rmSync(tmp, { recursive: true, force: true })
   }
 })
