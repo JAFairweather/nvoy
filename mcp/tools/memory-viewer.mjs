@@ -26,6 +26,7 @@ import {
   computeTopicEigenvectors,
   defaultCuratorStatePath,
   evaluateDreamTriggers,
+  planMerkleDream,
   readCuratorStateFile,
   resolveCuratorStatePath,
 } from './memory-curate.mjs'
@@ -2815,6 +2816,14 @@ export function renderViewerHtml(initialState) {
           dkv.appendChild(kvRow('Gate 7 · Workflow slugs', dr.wfCount + ' active (' + dr.shortTtlCount + ' on <=48h TTL)', '#fbbf24'));
           dkv.appendChild(kvRow('Gate 7 · Class B curated', dr.classBCount + ' permanent decisions', '#a78bfa'));
           dkv.appendChild(kvRow('merkle_sources tags', (dr.merkleCount || 0) + ' merkle_sources digest tags (90d source hold)', '#c4b5fd'));
+          var ps = latestCuratorState && latestCuratorState.planned_summary ? latestCuratorState.planned_summary : null;
+          if (ps) {
+            dkv.appendChild(kvRow(
+              'Queued Dream Plan',
+              ps.promotions + ' Class B Promotions · ' + ps.distillations + ' Class A Distillations · ' + ps.solidifications + ' Canon Nominations',
+              '#34d399'
+            ));
+          }
           box.appendChild(dkv);
           if (dr.topicList.length > 0) {
             var qTitle = makeDiv('inspect-kicker', 'Gate 8 · Scope+Topic Curation Pressure (>' + cs.topic_pressure_threshold + ' Class A = curate)');
@@ -3770,6 +3779,7 @@ export async function startMemoryViewer({
         topicPressureThreshold,
       })
       const spectral = computeTopicEigenvectors(records, { maxComponents: 7 })
+      const previewPlan = planMerkleDream({ records, nowSec })
       const curatorState = {
         state_file: activeStateFile,
         state_file_present: Boolean(persistedCurator),
@@ -3792,6 +3802,12 @@ export async function startMemoryViewer({
         coherence_score: triggerEval.coherence_score,
         topic_eigenvectors: spectral.eigenvectors,
         topic_reorganizations: spectral.reorganizations,
+        planned_summary: {
+          promotions: previewPlan.promotions.length,
+          distillations: previewPlan.distillations.length,
+          solidifications: previewPlan.solidifications.length,
+          nightmares: previewPlan.nightmares.length,
+        },
       }
       const consolidatedSources = {}
       for (const r of records) {
