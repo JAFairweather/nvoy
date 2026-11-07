@@ -687,6 +687,47 @@ export function computeCoherence({
   }))
 
   const missedTopics = [...missedTopicsSet]
+  // Per-agent periphery coherence score (0-100): measures how synchronized each individual agent on the periphery
+  // is with the Hive's memory state (Recall Sync 50% + Write/Tool Hygiene 30% + Shared Resonance 20%).
+  const peripheryAgents = peerReaders.map(a => {
+    const id = a.id
+    const hasRecall =
+      recallByActor.has(id) ||
+      a.last_recall_kind === 'wake' ||
+      a.last_recall_kind === 'query' ||
+      a.last_read_kind === 'wake' ||
+      a.last_read_kind === 'query'
+    const hasAnyRead = readsByActor.has(id) || Boolean(a.last_read_at)
+    const hasWrite = writesByActor.has(id) || recentWriterIds.has(id) || Boolean(a.last_write_at)
+    const hasRefusal = recentRefusalByActor.has(id) || (a.last_refused_at && Math.max(0, now_sec - a.last_refused_at) <= 900)
+    const recallAt = a.last_recall_at || (hasRecall ? (a.last_read_at || now_sec) : null)
+    const recallAge = recallAt ? Math.max(0, now_sec - recallAt) : null
+    const recallSync = hasRecall
+      ? (recallAge !== null && recallAge <= 900 ? 50 : (recallAge !== null && recallAge <= 3600 ? 44 : 36))
+      : 0
+    let writeHygiene = 0
+    if (hasWrite) {
+      writeHygiene = hasRecall ? 30 : 18
+    } else if (hasRecall) {
+      writeHygiene = 24
+    } else if (hasAnyRead) {
+      writeHygiene = 10
+    }
+    if (hasRefusal) writeHygiene = Math.max(0, writeHygiene - 15)
+    const sharedResonance = (hasRecall && hasWrite) ? 20 : ((hasRecall || hasWrite) ? 14 : (hasAnyRead ? 6 : 0))
+    const agentScore = typeof a.coherence_score === 'number'
+      ? a.coherence_score
+      : Math.max(0, Math.min(100, Math.round(recallSync + writeHygiene + sharedResonance)))
+    return {
+      id,
+      coherence_score: agentScore,
+      status: hasRefusal ? 'tool_failure' : (hasRecall ? 'synced' : (hasWrite || hasAnyRead ? 'write_without_recall' : 'blind_seat')),
+    }
+  })
+  const peripheryCoherenceScore = peripheryAgents.length > 0
+    ? Math.round((peripheryAgents.reduce((acc, x) => acc + x.coherence_score, 0) / peripheryAgents.length) * 10) / 10
+    : current.score
+
   const fleetRecallPenalty = hasExplicitReaderFleet
     ? blindRosterAgents.length * 4 + lookupOnlyWriters.length * 3
     : 0
@@ -702,6 +743,7 @@ export function computeCoherence({
         ? 'drifting'
         : 'aligned'
 
+  const baseCurrentScore = current.score
   if (activityList.length > 0 || siloedRecentTopics.length > 0 || hasExplicitReaderFleet) {
     if (activityList.length > 0 || hasExplicitReaderFleet) {
       const refusals = activityList.filter(a => a?.kind === 'refused').length
@@ -737,6 +779,9 @@ export function computeCoherence({
 
   return {
     score: current.score,
+    core_memory_score: baseCurrentScore,
+    periphery_coherence_score: peripheryCoherenceScore,
+    periphery_agents: peripheryAgents,
     inception_at: chronological[0]?.created_at || null,
     inception_score: inception.score,
     delta_since_inception: Math.round((current.score - inception.score) * 10) / 10,
@@ -950,6 +995,23 @@ export function computeAgentHealth({
         summary.blind_seats += 1
       }
     }
+    const recallAge = e.last_recall_at !== null ? Math.max(0, now_sec - e.last_recall_at) : null
+    const recallSync = e.last_recall_at !== null
+      ? (recallAge <= 900 ? 50 : (recallAge <= 3600 ? 44 : 36))
+      : (agent.is_owner ? 50 : 0)
+    let writeHygiene = 0
+    if (e.last_write_at !== null) {
+      writeHygiene = e.last_recall_at !== null || agent.is_owner ? 30 : 18
+    } else if (e.last_recall_at !== null || agent.is_owner) {
+      writeHygiene = 24
+    } else if (e.last_read_at !== null) {
+      writeHygiene = 10
+    }
+    if (health === 'error') writeHygiene = Math.max(0, writeHygiene - 15)
+    const sharedResonance = (e.last_recall_at !== null && e.last_write_at !== null) || agent.is_owner
+      ? 20
+      : ((e.last_recall_at !== null || e.last_write_at !== null) ? 14 : (e.last_read_at !== null ? 6 : 0))
+    const coherenceScore = Math.max(0, Math.min(100, Math.round(recallSync + writeHygiene + sharedResonance)))
     summary.total += 1
     return {
       ...agent,
@@ -968,6 +1030,7 @@ export function computeAgentHealth({
       writes_5m: writes5mByActor.get(agent.id) || 0,
       health,
       compliance_status: complianceStatus,
+      coherence_score: coherenceScore,
     }
   })
 
@@ -2116,6 +2179,7 @@ export function renderViewerHtml(initialState) {
           writes_5m: 0,
           health: 'stale',
           compliance_status: 'compliant',
+          coherence_score: 0,
           listed: true,
           energy: 0,
           x: 0,
@@ -2234,6 +2298,20 @@ export function renderViewerHtml(initialState) {
                 ? (lastRecall ? 'compliant' : ((lastWrite || lastRead) ? 'write_without_recall' : 'blind_seat'))
                 : 'compliant')
           );
+          var recallAge = lastRecall !== null ? Math.max(0, refNow - lastRecall) : null;
+          var recallSync = lastRecall !== null
+            ? (recallAge <= 900 ? 50 : (recallAge <= 3600 ? 44 : 36))
+            : (r.is_owner ? 50 : 0);
+          var writeHygiene = lastWrite !== null
+            ? ((lastRecall !== null || r.is_owner) ? 30 : 18)
+            : ((lastRecall !== null || r.is_owner) ? 24 : (lastRead !== null ? 10 : 0));
+          if (health === 'error') writeHygiene = Math.max(0, writeHygiene - 15);
+          var sharedResonance = ((lastRecall !== null && lastWrite !== null) || r.is_owner)
+            ? 20
+            : ((lastRecall !== null || lastWrite !== null) ? 14 : (lastRead !== null ? 6 : 0));
+          var cohScore = typeof r.coherence_score === 'number'
+            ? r.coherence_score
+            : Math.max(0, Math.min(100, Math.round(recallSync + writeHygiene + sharedResonance)));
           next.push(makeAgent(r.id, {
             pubkey: r.pubkey || null,
             is_reader: Boolean(r.is_reader),
@@ -2255,6 +2333,7 @@ export function renderViewerHtml(initialState) {
             writes_5m: writes5m,
             health: health,
             compliance_status: complianceStatus,
+            coherence_score: cohScore,
             energy: prev ? prev.energy : 0
           }));
         });
@@ -2850,6 +2929,9 @@ export function renderViewerHtml(initialState) {
             statText = '◌ blind';
             statColor = '#f87171';
           }
+          if (typeof a.coherence_score === 'number') {
+            statText += ' · ' + a.coherence_score + '%';
+          }
           var stats = makeDiv('agent-stats', statText);
           stats.style.color = statColor;
           row.appendChild(stats);
@@ -2995,6 +3077,9 @@ export function renderViewerHtml(initialState) {
                 ? 'BLIND SEAT · 0 wake/query recalls observed'
                 : 'COMPLIANT · wake/query recall verified'));
           var compCol = a.compliance_status === 'compliant' ? '#34d399' : (a.compliance_status === 'write_without_recall' ? '#fbbf24' : '#fca5a5');
+          var agCoh = typeof a.coherence_score === 'number' ? a.coherence_score : 0;
+          var agCohCol = agCoh >= 80 ? '#34d399' : (agCoh >= 55 ? '#38bdf8' : (agCoh >= 25 ? '#fbbf24' : '#fca5a5'));
+          akv.appendChild(kvRow('Coherence with Hive (periphery)', agCoh + '%', agCohCol));
           akv.appendChild(kvRow('Recall compliance', compLabel, compCol));
           akv.appendChild(kvRow(
             'Last recall (wake/query)',
@@ -3069,6 +3154,13 @@ export function renderViewerHtml(initialState) {
             var edWrap = makeDiv('kv-list');
             var stColor = ed.status === 'aligned' ? '#34d399' : (ed.status === 'drifting' ? '#fbbf24' : '#fca5a5');
             var edScoreVal = ed.score ?? ed.epistemic_score ?? 100;
+            if (typeof coh.core_memory_score === 'number') {
+              edWrap.appendChild(kvRow('Core Memory State (Eyeball / Elbow)', Number(coh.core_memory_score).toFixed(1) + '%', '#6ee7b7'));
+            }
+            if (typeof coh.periphery_coherence_score === 'number') {
+              var pCol = coh.periphery_coherence_score >= 75 ? '#34d399' : (coh.periphery_coherence_score >= 50 ? '#fbbf24' : '#fca5a5');
+              edWrap.appendChild(kvRow('Fleet Periphery Coherence (Outer Ring)', Number(coh.periphery_coherence_score).toFixed(1) + '%', pCol));
+            }
             edWrap.appendChild(kvRow('Epistemic status', String(ed.status || 'aligned').toUpperCase() + ' (' + Number(edScoreVal).toFixed(1) + '%)', stColor));
             var zhCount = Number(ed.zero_hit_queries || 0);
             var missed = Array.isArray(ed.missed_topics) && ed.missed_topics.length ? ' [' + ed.missed_topics.join(', ') + ']' : '';
@@ -3646,11 +3738,47 @@ export function renderViewerHtml(initialState) {
         var at = simNow();
         var focus = hovered || selected;
 
+        // Outer Periphery Coherence Halo: segmented per-agent coherence arcs around rimR() + 30
+        var periphR = rimR() + 30;
         ctx.lineWidth = 1.5;
-        ctx.strokeStyle = 'rgba(52, 211, 153, 0.16)';
+        ctx.strokeStyle = 'rgba(148, 163, 184, 0.12)';
         ctx.beginPath();
-        ctx.arc(0, 0, rimR() + 30, 0, Math.PI * 2);
+        ctx.arc(0, 0, periphR, 0, Math.PI * 2);
         ctx.stroke();
+        if (agents.length > 0) {
+          var sectorSpan = (Math.PI * 2) / agents.length;
+          var gapPad = Math.min(0.06, sectorSpan * 0.14);
+          agents.forEach(function (ag) {
+            var agScore = typeof ag.coherence_score === 'number' ? ag.coherence_score : 0;
+            var sCol = agScore >= 80 ? '#34d399' : (agScore >= 55 ? '#38bdf8' : (agScore >= 25 ? '#fbbf24' : '#f87171'));
+            var sStart = ag.angle - sectorSpan * 0.5 + gapPad;
+            var sFullEnd = ag.angle + sectorSpan * 0.5 - gapPad;
+            var sSpan = Math.max(0.02, sFullEnd - sStart);
+            // Background sector track
+            ctx.beginPath();
+            ctx.arc(0, 0, periphR, sStart, sFullEnd);
+            ctx.strokeStyle = 'rgba(148, 163, 184, 0.16)';
+            ctx.lineWidth = 3.2;
+            ctx.stroke();
+            // Filled periphery coherence arc proportional to agent's coherence_score (0-100%)
+            var fillSpan = Math.max(0.03, sSpan * Math.max(0.04, agScore / 100));
+            ctx.beginPath();
+            ctx.arc(0, 0, periphR, sStart, sStart + fillSpan);
+            ctx.strokeStyle = sCol;
+            ctx.lineWidth = 3.8;
+            ctx.stroke();
+            // Radial neural sync tether from agent on periphery toward the central Eyeball (0, 0)
+            ctx.save();
+            if (agScore < 55) ctx.setLineDash(agScore >= 25 ? [4, 5] : [2, 6]);
+            ctx.beginPath();
+            ctx.moveTo(ag.x * 0.88, ag.y * 0.88);
+            ctx.lineTo(Math.cos(ag.angle) * 56, Math.sin(ag.angle) * 56);
+            ctx.strokeStyle = agScore >= 80 ? 'rgba(52, 211, 153, 0.18)' : (agScore >= 25 ? 'rgba(251, 191, 36, 0.12)' : 'rgba(248, 113, 113, 0.08)');
+            ctx.lineWidth = agScore >= 80 ? 1.2 : 0.8;
+            ctx.stroke();
+            ctx.restore();
+          });
+        }
         ctx.save();
         ctx.setLineDash([5, 7]);
         ctx.strokeStyle = 'rgba(245, 158, 11, 0.2)';
@@ -3658,9 +3786,21 @@ export function renderViewerHtml(initialState) {
         ctx.arc(0, 0, minDim * 0.34, 0, Math.PI * 2);
         ctx.stroke();
         ctx.restore();
+        // Central Coherence Eyeball at (0, 0) synchronized to the Hive Memory State
+        var coreScore = latestCoherence && typeof latestCoherence.core_memory_score === 'number'
+          ? latestCoherence.core_memory_score
+          : (latestCoherence && typeof latestCoherence.score === 'number' ? latestCoherence.score : 100);
+        var eyePulse = 52 + Math.sin(tick * 0.06) * 1.8;
+        glow(0, 0, 6, eyePulse * 1.35, 'rgba(52, 211, 153, 0.16)');
         ctx.strokeStyle = 'rgba(251, 191, 36, 0.22)';
+        ctx.lineWidth = 1.6;
         ctx.beginPath();
         ctx.arc(0, 0, 52, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(0, 0, 52, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * Math.max(0, Math.min(1, coreScore / 100)));
+        ctx.strokeStyle = coreScore >= 80 ? '#34d399' : (coreScore >= 65 ? '#fbbf24' : '#f87171');
+        ctx.lineWidth = 2.8;
         ctx.stroke();
 
         ctx.textAlign = 'center';
@@ -3980,13 +4120,13 @@ export function renderViewerHtml(initialState) {
           ctx.lineWidth = isSel ? 3 : 2;
           ctx.stroke();
           ctx.restore();
-          if (a.is_writer && a.per_hour > 0 && a.used_last_hour) {
-            ctx.beginPath();
-            ctx.arc(a.x, a.y, a.radius + 4.5, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * Math.min(1, a.used_last_hour / a.per_hour));
-            ctx.strokeStyle = a.color;
-            ctx.lineWidth = 2.2;
-            ctx.stroke();
-          }
+          var agCohVal = typeof a.coherence_score === 'number' ? a.coherence_score : 0;
+          var agCohArcCol = agCohVal >= 80 ? '#34d399' : (agCohVal >= 55 ? '#38bdf8' : (agCohVal >= 25 ? '#fbbf24' : '#f87171'));
+          ctx.beginPath();
+          ctx.arc(a.x, a.y, a.radius + 4.5, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * Math.max(0.05, Math.min(1, agCohVal / 100)));
+          ctx.strokeStyle = agCohArcCol;
+          ctx.lineWidth = 2.2;
+          ctx.stroke();
           // Health beacon dot on top-right rim of ganglion
           var bx = a.x + a.radius * 0.72;
           var by = a.y - a.radius * 0.72;
@@ -4024,8 +4164,11 @@ export function renderViewerHtml(initialState) {
               : (a.health === 'error'
                 ? '\\u2715 err'
                 : (a.last_seen_at ? ('\\u25cb ' + fmtShortAge(a.last_seen_at, drawNow)) : '\\u25cb silent')));
+          if (typeof a.coherence_score === 'number') {
+            subTag += ' · ' + a.coherence_score + '%';
+          }
           ctx.font = (width < 680 ? '600 8.5px' : '600 9.5px') + ' ui-monospace, SFMono-Regular, Menlo, monospace';
-          ctx.fillStyle = a.health === 'active' ? '#34d399' : (a.health === 'warm' ? '#fbbf24' : (a.health === 'error' ? '#f87171' : '#64748b'));
+          ctx.fillStyle = agCohArcCol;
           ctx.fillText(subTag, lx, ly + (width < 680 ? 10.5 : 12));
           ctx.textBaseline = 'alphabetic';
         });
