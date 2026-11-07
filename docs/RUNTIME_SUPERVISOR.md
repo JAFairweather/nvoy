@@ -113,6 +113,14 @@ node mcp/tools/nvoy-onboard.mjs show <name>
 node mcp/tools/nvoy-onboard.mjs run <name> --authorized-keys /home/<channel-account>/.ssh/authorized_keys
 ```
 
+On the fleet host, which has no node, `deploy/nvoy-onboard.sh` runs the same tool in the deployed
+runtime image, with the host paths the steps write mounted at the same paths and the docker CLI and
+socket that apply's baseline needs (#322). On nvoy-fleet the channel account is root:
+
+```bash
+sh /opt/nvoy-hub/deploy/nvoy-onboard.sh run <name> --authorized-keys /root/.ssh/authorized_keys
+```
+
 The request is a kind 30078 event with `d` = `nvoy-onboard/<name>/add_agent`: the agent's key, its
 harness, the live agent to copy (`like`), who may give it work, and its rooms. A second one,
 `nvoy-onboard/<name>/bind_runtime`, carries the public channel key made on the agent's box. Only a
