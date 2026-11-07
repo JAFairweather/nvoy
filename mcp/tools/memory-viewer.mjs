@@ -1385,6 +1385,7 @@ export function renderViewerHtml(initialState) {
   <div class="hud-bottom graph-only">
     <div class="control-bar sim-bar panel">
       <span class="sim-label" id="dream-bar-status">Merkle Dreaming · Live 3-Trigger Curation Engine</span>
+      <button class="btn sim" id="btn-dream-replay" type="button">Replay Last Dream</button>
       <button class="btn sim" id="btn-dream-consolidate" type="button">Merkle Dreaming · Curation</button>
       <button class="btn sim" id="btn-dream-triggers" type="button">3-Trigger Status</button>
       <button class="btn sim" id="btn-dream-coherence" type="button">5-Axis Coherence</button>
@@ -2044,6 +2045,44 @@ export function renderViewerHtml(initialState) {
         } else {
           bar.textContent = 'Circadian 6h · Max cluster ' + maxCluster + '/8 · ' + d.merkleCount + ' Merkle roots · -' + d.wakeSavings + '% wake';
           bar.style.color = '#94a3b8';
+        }
+      }
+
+      function replayLastDream() {
+        var merkleNodes = nodes.filter(function (n) { return n.rec && n.rec.merkle_sources; }).sort(function (a, b) {
+          return (b.rec.created_at || 0) - (a.rec.created_at || 0);
+        });
+        if (merkleNodes.length > 0) {
+          var latest = merkleNodes[0];
+          var top = topicById(topicOf(latest.rec));
+          var ms = latest.rec.merkle_sources;
+          var srcIds = Array.isArray(ms.event_ids) ? ms.event_ids : [];
+          var srcNodes = srcIds.map(function (id) { return nodeByEventId(id); }).filter(Boolean);
+          var author = agentByPubkey(latest.rec.author_pubkey);
+          if (author) writeComet(author, latest);
+          srcNodes.forEach(function (sn) {
+            pulses.push({ kind: 'write', fromNode: sn, fromX: sn.x, fromY: sn.y, toNode: latest, toX: latest.x, toY: latest.y, color: '#fbbf24', t: 0, speed: 0.02 });
+          });
+          if (top) {
+            consolidator = { topic: top, targets: srcNodes.length ? srcNodes : [latest], x: latest.x, y: latest.y, progress: 0 };
+          }
+          selected = { type: 'memory', data: latest };
+          hovered = null;
+          if (width <= 1024) setDrawer('none');
+          renderAgentRoster();
+          renderInspector();
+          logStream('write', 'REPLAY LAST DREAM · ' + String(latest.rec.scope || 'hive') + ' #' + topicOf(latest.rec) + ' -> ' + slugOf(latest.rec) + ' (Merkle root ' + String(ms.root || '').slice(0, 12) + '… · ' + (ms.count || srcIds.length) + ' sources)', latest.rec.created_at);
+          return;
+        }
+        openDreamingInspector();
+        var classBNodes = nodes.filter(function (n) { return !isCanon(n.rec) && (n.rec.expires_at === null || n.rec.expires_at === undefined); }).sort(function (a, b) {
+          return (b.rec.created_at || 0) - (a.rec.created_at || 0);
+        });
+        if (classBNodes.length > 0) {
+          var latestB = classBNodes[0];
+          var authorB = agentByPubkey(latestB.rec.author_pubkey);
+          if (authorB) writeComet(authorB, latestB);
+          logStream('write', 'REPLAY LAST DREAM · latest Class B solidification: ' + slugOf(latestB.rec) + ' in ' + String(latestB.rec.scope || 'hive') + ' #' + topicOf(latestB.rec), latestB.rec.created_at);
         }
       }
 
@@ -3016,6 +3055,7 @@ export function renderViewerHtml(initialState) {
         cam.y = 0;
         cam.targetZoom = 1;
       });
+      if (el('btn-dream-replay')) el('btn-dream-replay').addEventListener('click', replayLastDream);
       if (el('btn-dream-consolidate')) el('btn-dream-consolidate').addEventListener('click', openDreamingInspector);
       if (el('btn-dream-triggers')) el('btn-dream-triggers').addEventListener('click', inspectDreamTriggers);
       if (el('btn-dream-coherence')) el('btn-dream-coherence').addEventListener('click', openCoherenceInspector);

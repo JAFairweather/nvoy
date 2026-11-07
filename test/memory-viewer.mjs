@@ -534,6 +534,8 @@ await test('live integration: memory-viewer polls memory-daemon viewer socket, s
     assert(htmlRes.body.includes('id="dock-tools"'))
     assert(htmlRes.body.includes('Dream / Time'))
     assert(htmlRes.body.includes('id="dream-bar-status"'))
+    assert(htmlRes.body.includes('id="btn-dream-replay"'))
+    assert(htmlRes.body.includes('Replay Last Dream'))
     assert(htmlRes.body.includes('id="btn-dream-consolidate"'))
     assert(htmlRes.body.includes('id="btn-dream-triggers"'))
     assert(htmlRes.body.includes('id="btn-dream-coherence"'))
