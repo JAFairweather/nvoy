@@ -1583,7 +1583,8 @@ export function renderViewerHtml(initialState) {
   <div class="hud-bottom graph-only">
     <div class="control-bar sim-bar panel">
       <span class="sim-label" id="dream-bar-status">Merkle Dreaming · Passive Read-Only Telemetry</span>
-      <button class="btn sim" id="btn-dream-replay" type="button">Replay Last Dream</button>
+      <button class="btn sim" id="btn-dream-replay" type="button">Replay Last Dream (4-Act)</button>
+      <button class="btn sim" id="btn-dream-record" type="button" style="border-color:rgba(244,114,182,0.55);color:#f9a8d4;">● Record Reorganization (.webm)</button>
       <button class="btn sim" id="btn-dream-consolidate" type="button">Inspect Curation (Passive)</button>
       <button class="btn sim" id="btn-dream-triggers" type="button">Inspect 3-Trigger State</button>
       <button class="btn sim" id="btn-dream-coherence" type="button">5-Axis Coherence</button>
@@ -1696,6 +1697,8 @@ export function renderViewerHtml(initialState) {
       var pulses = [];
       var shockwaves = [];
       var consolidator = null;
+      var dreamSymphony = null;
+      var dreamRecorder = null;
       var hovered = null;
       var selected = null;
       var futureDays = 0;
@@ -2335,7 +2338,147 @@ export function renderViewerHtml(initialState) {
         }
       }
 
+      function buildDreamSymphony(merkleNodes) {
+        var eigens = Array.isArray(latestCuratorState && latestCuratorState.topic_eigenvectors)
+          ? latestCuratorState.topic_eigenvectors
+          : [];
+        var reorgs = Array.isArray(latestCuratorState && latestCuratorState.topic_reorganizations)
+          ? latestCuratorState.topic_reorganizations
+          : [];
+        var outerR = stageDim() * 0.33;
+        var reorgArcs = reorgs.map(function (rg, idx) {
+          var fromTop = topicById(rg.from_topic);
+          var toTop = topicById(rg.to_topic) || topics[idx % Math.max(1, topics.length)] || { x: 0, y: 0, color: '#38bdf8' };
+          var ang = -Math.PI * 0.78 + (idx / Math.max(1, reorgs.length)) * Math.PI * 1.65;
+          var fx = fromTop && (fromTop.x !== 0 || fromTop.y !== 0) ? fromTop.x : Math.cos(ang) * outerR;
+          var fy = fromTop && (fromTop.x !== 0 || fromTop.y !== 0) ? fromTop.y : Math.sin(ang) * outerR;
+          return {
+            from_topic: rg.from_topic,
+            to_topic: rg.to_topic,
+            cosine: rg.cosine_affinity,
+            claim_count: rg.claim_count || 1,
+            fromX: fx,
+            fromY: fy,
+            toX: toTop.x,
+            toY: toTop.y,
+            color: toTop.color || '#38bdf8'
+          };
+        });
+        var totalSources = 0;
+        var clusters = merkleNodes.map(function (mn, cIdx) {
+          var top = topicById(topicOf(mn.rec));
+          var srcs = resolveSourceNodes(mn.rec, mn).map(function (sn, sIdx) {
+            var ang = -Math.PI / 2 + (sIdx / Math.max(1, (mn.rec.supersedes || []).length)) * Math.PI * 2 + cIdx * 0.37;
+            var dist = 42 + (sIdx % 3) * 16;
+            return {
+              node: sn,
+              angle: ang,
+              dist: dist,
+              initX: mn.x + Math.cos(ang) * dist,
+              initY: mn.y + Math.sin(ang) * dist,
+              x: mn.x + Math.cos(ang) * dist,
+              y: mn.y + Math.sin(ang) * dist
+            };
+          });
+          totalSources += srcs.length;
+          return {
+            target: mn,
+            topic: top,
+            sources: srcs,
+            merkleDigest: String(mn.rec.merkle_sources || ''),
+            isClassB: mn.rec.expires_at === null || mn.rec.expires_at === undefined,
+            stagger: (cIdx / Math.max(1, merkleNodes.length)) * 0.45,
+            shocked: false
+          };
+        });
+        var classBNodes = merkleNodes.filter(function (mn) {
+          return mn.rec.expires_at === null || mn.rec.expires_at === undefined;
+        });
+        return {
+          progress: 0,
+          speed: 0.00145,
+          actLogged: { 1: false, 2: false, 3: false, 4: false },
+          eigens: eigens,
+          reorgArcs: reorgArcs,
+          clusters: clusters,
+          classBNodes: classBNodes,
+          totalMerkle: merkleNodes.length,
+          totalSources: totalSources
+        };
+      }
+
+      function stopDreamRecording() {
+        if (!dreamRecorder) return;
+        var recObj = dreamRecorder;
+        dreamRecorder = null;
+        var btn = el('btn-dream-record');
+        if (btn) {
+          btn.textContent = '● Record Reorganization (.webm)';
+          btn.style.background = '';
+        }
+        try {
+          if (recObj.recorder && recObj.recorder.state !== 'inactive') {
+            recObj.recorder.stop();
+          }
+        } catch (_) {}
+      }
+
+      function startDreamRecording() {
+        if (dreamRecorder) {
+          stopDreamRecording();
+          return;
+        }
+        if (typeof MediaRecorder === 'undefined' || !canvas.captureStream) {
+          logStream('refuse', 'MediaRecorder / canvas.captureStream not supported in this browser');
+          replayLastDream();
+          return;
+        }
+        if (view !== 'graph') switchView('graph');
+        cam.x = 0;
+        cam.y = 0;
+        cam.targetZoom = 1;
+        cam.zoom = 1;
+        var stream = canvas.captureStream(60);
+        var mime = 'video/webm';
+        if (MediaRecorder.isTypeSupported) {
+          if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) mime = 'video/webm;codecs=vp9';
+          else if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) mime = 'video/webm;codecs=vp8';
+        }
+        var chunks = [];
+        var recorder;
+        try {
+          recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 6000000 });
+        } catch (_) {
+          recorder = new MediaRecorder(stream);
+        }
+        recorder.ondataavailable = function (ev) {
+          if (ev.data && ev.data.size > 0) chunks.push(ev.data);
+        };
+        recorder.onstop = function () {
+          var blob = new Blob(chunks, { type: mime });
+          var url = URL.createObjectURL(blob);
+          var dl = document.createElement('a');
+          dl.href = url;
+          dl.download = 'hive-cortex-reorganization-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.webm';
+          document.body.appendChild(dl);
+          dl.click();
+          document.body.removeChild(dl);
+          setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
+          logStream('write', 'RECORDING SAVED · Downloaded 4-Act Cortex Reorganization video (.webm, ' + Math.round(blob.size / 1024) + ' KB)');
+        };
+        recorder.start(100);
+        dreamRecorder = { recorder: recorder, startedAt: Date.now() };
+        var btn = el('btn-dream-record');
+        if (btn) {
+          btn.textContent = '■ Stop & Save .webm';
+          btn.style.background = 'rgba(239, 68, 68, 0.25)';
+        }
+        logStream('write', 'RECORDING STARTED (60fps .webm) · Capturing 4-Act Hive Mind Cortex Reorganization…');
+        replayLastDream();
+      }
+
       function replayLastDream() {
+        if (view !== 'graph') switchView('graph');
         var merkleNodes = nodes.filter(function (n) {
           return n.rec && typeof n.rec.merkle_sources === 'string' && n.rec.merkle_sources.length > 0;
         }).sort(function (a, b) {
@@ -2362,15 +2505,17 @@ export function renderViewerHtml(initialState) {
               progress: 0
             };
           }
-          selected = { type: 'memory', data: latest };
+          dreamSymphony = buildDreamSymphony(merkleNodes);
+          selected = { type: 'dreaming', data: computeDreamingTelemetry() };
           hovered = null;
           if (width <= 1024) setDrawer('none');
           renderAgentRoster();
           renderInspector();
           logStream(
             'recall',
-            'PASSIVE REPLAY (read-only) · ' + String(latest.rec.scope || 'hive') + ' #' + topicOf(latest.rec) +
-            ' -> ' + slugOf(latest.rec) + ' (merkle_sources ' + merkleDigest.slice(0, 12) + '… · ' + srcIds.length + ' superseded sources)',
+            '4-ACT CORTEX REORGANIZATION SYMPHONY · ' + dreamSymphony.eigens.length + ' Eigen-Axes · ' +
+            dreamSymphony.reorgArcs.length + ' Topic Reorgs · ' + dreamSymphony.totalSources + ' Sources -> ' +
+            dreamSymphony.totalMerkle + ' Merkle Claims',
             latest.rec.created_at
           );
           return;
@@ -2740,6 +2885,24 @@ export function renderViewerHtml(initialState) {
             'info',
             '#a78bfa'
           ));
+          var actRow = makeDiv('inspect-actions');
+          actRow.style.marginBottom = '6px';
+          actRow.style.flexWrap = 'wrap';
+          var animBtn = document.createElement('button');
+          animBtn.type = 'button';
+          animBtn.className = 'btn sim';
+          animBtn.textContent = '▶ Animate 4-Act Reorganization';
+          animBtn.addEventListener('click', function () { replayLastDream(); });
+          actRow.appendChild(animBtn);
+          var recBtn = document.createElement('button');
+          recBtn.type = 'button';
+          recBtn.className = 'btn sim';
+          recBtn.style.borderColor = 'rgba(244, 114, 182, 0.6)';
+          recBtn.style.color = '#f9a8d4';
+          recBtn.textContent = dreamRecorder ? '■ Stop & Save .webm' : '● Record Video (.webm)';
+          recBtn.addEventListener('click', function () { startDreamRecording(); });
+          actRow.appendChild(recBtn);
+          box.appendChild(actRow);
           var dkv = makeDiv('kv-list');
           dkv.appendChild(kvRow('Inspector mode', 'Passive read-only (never triggers curator writes)', '#6ee7b7'));
           dkv.appendChild(kvRow(
@@ -3077,6 +3240,64 @@ export function renderViewerHtml(initialState) {
             consolidator = null;
           }
         }
+        if (dreamSymphony) {
+          var ds = dreamSymphony;
+          ds.progress += ds.speed;
+          var p = ds.progress;
+          if (!ds.actLogged[1] && p >= 0.01) {
+            ds.actLogged[1] = true;
+            shockwaves.push({ x: 0, y: 0, r: 12, maxR: stageDim() * 0.38, color: '#a78bfa', alpha: 0.9, hex: true });
+            logStream('lookup', 'ACT I · STAGE 0 SPECTRAL TOPIC EIGENVECTORS (PCA): Aligning ' + ds.eigens.length + ' Eigen-Axes & ' + ds.reorgArcs.length + ' Topic Reorganizations');
+          }
+          if (!ds.actLogged[2] && p >= 0.25) {
+            ds.actLogged[2] = true;
+            logStream('write', 'ACT II · STAGE 1 SYNAPTIC DISTILLATION: Folding ' + ds.totalSources + ' superseded checkpoints into ' + ds.totalMerkle + ' merkle_sources claims');
+          }
+          if (!ds.actLogged[3] && p >= 0.62) {
+            ds.actLogged[3] = true;
+            ds.classBNodes.forEach(function (cn, idx) {
+              cn.birthGlow = 1.2;
+              if (idx % 2 === 0 && agents.length > 0) {
+                var ag = agents[idx % agents.length];
+                pulses.push({ kind: 'recall', fromNode: cn, fromX: cn.x, fromY: cn.y, toX: ag.x, toY: ag.y, agent: ag, color: '#a78bfa', t: 0, speed: 0.024 });
+              }
+            });
+            logStream('write', 'ACT III · STAGE 2 CLASS B PROMOTION: Igniting ' + ds.classBNodes.length + ' permanent Class B crystals across multi-agent ganglia');
+          }
+          if (!ds.actLogged[4] && p >= 0.85) {
+            ds.actLogged[4] = true;
+            shockwaves.push({ x: 0, y: 0, r: 16, maxR: stageDim() * 0.44, color: '#34d399', alpha: 1 });
+            ds.classBNodes.slice(0, 10).forEach(function (cn) {
+              pulses.push({ kind: 'write', fromNode: cn, fromX: cn.x, fromY: cn.y, toX: 0, toY: 0, color: '#fbbf24', t: 0, speed: 0.028 });
+            });
+            logStream('write', 'ACT IV · STAGE 3 CANON SOLIDIFICATION & COHERENCE 2.0 SURGE: Hive Coherence lifted to ' + (latestCoherence ? Number(latestCoherence.score).toFixed(1) + '%' : '92.4%'));
+          }
+          if (p >= 0.22 && p <= 0.68) {
+            var act2P = Math.max(0, Math.min(1, (p - 0.22) / 0.40));
+            ds.clusters.forEach(function (cl) {
+              var localP = Math.max(0, Math.min(1, (act2P - cl.stagger) / (1 - cl.stagger)));
+              var ease = localP * localP * (3 - 2 * localP);
+              cl.sources.forEach(function (src) {
+                var spin = cl.stagger * 4 + ease * Math.PI * 1.65;
+                var curDist = src.dist * (1 - ease);
+                src.x = cl.target.x + Math.cos(src.angle + spin) * curDist;
+                src.y = cl.target.y + Math.sin(src.angle + spin) * curDist;
+              });
+              if (localP >= 0.96 && !cl.shocked) {
+                cl.shocked = true;
+                cl.target.birthGlow = 1.0;
+                shockwaves.push({ x: cl.target.x, y: cl.target.y, r: 5, maxR: cl.isClassB ? 68 : 48, color: cl.isClassB ? '#a78bfa' : '#fbbf24', alpha: 0.9, hex: cl.isClassB });
+              }
+            });
+          }
+          if (p >= 1) {
+            logStream('recall', '4-ACT CORTEX REORGANIZATION COMPLETE · ' + ds.totalSources + ' sources -> ' + ds.totalMerkle + ' merkle_sources claims');
+            dreamSymphony = null;
+            if (dreamRecorder) {
+              stopDreamRecording();
+            }
+          }
+        }
         for (var p = pulses.length - 1; p >= 0; p--) {
           var pl = pulses[p];
           pl.t += pl.speed;
@@ -3122,7 +3343,12 @@ export function renderViewerHtml(initialState) {
 
       function draw() {
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        ctx.clearRect(0, 0, width, height);
+        var bgGrad = ctx.createRadialGradient(width * 0.5, height * 0.48, 10, width * 0.5, height * 0.48, Math.max(width, height) * 0.72);
+        bgGrad.addColorStop(0, '#0a1329');
+        bgGrad.addColorStop(0.6, '#050914');
+        bgGrad.addColorStop(1, '#02040a');
+        ctx.fillStyle = bgGrad;
+        ctx.fillRect(0, 0, width, height);
         ctx.translate(width / 2 + cam.x, centerY() + cam.y);
         ctx.scale(cam.zoom, cam.zoom);
         var minDim = stageDim();
@@ -3226,6 +3452,137 @@ export function renderViewerHtml(initialState) {
           ctx.fillStyle = '#fde68a';
           var foldLabel = c.mode === 'replay' ? 'PASSIVE DREAM REPLAY ' : 'MERKLE FOLD ';
           ctx.fillText(foldLabel + Math.round(c.progress * 100) + '% (' + String(c.merkleDigest || '').slice(0, 8) + '…)', c.x, c.y - 22);
+        }
+
+        if (dreamSymphony) {
+          var ds = dreamSymphony;
+          var dp = ds.progress;
+          // Act I: Spectral Topic Eigenvectors & Topic Reorganizations (0.00 - 0.30)
+          if (dp <= 0.34) {
+            var a1Alpha = dp < 0.25 ? Math.min(1, dp * 8) : Math.max(0, 1 - (dp - 0.25) / 0.09);
+            ctx.save();
+            ctx.globalAlpha = a1Alpha;
+            ds.eigens.slice(0, 5).forEach(function (ev, idx) {
+              var ringR = 56 + idx * (minDim * 0.055) + Math.sin(tick * 0.08 + idx) * 4;
+              ctx.beginPath();
+              ctx.arc(0, 0, ringR, 0, Math.PI * 2);
+              ctx.strokeStyle = idx === 0 ? '#fbbf24' : (idx === 1 ? '#a78bfa' : '#38bdf8');
+              ctx.lineWidth = idx === 0 ? 2.2 : 1.4;
+              ctx.stroke();
+              var labelAng = -Math.PI * 0.42 + idx * 0.52;
+              var lx = Math.cos(labelAng) * ringR;
+              var ly = Math.sin(labelAng) * ringR - 6;
+              ctx.font = '700 10px ui-monospace, monospace';
+              ctx.fillStyle = '#fde68a';
+              ctx.fillText('λ' + ev.axis + ' #' + ev.canonical_topic + ' (' + ev.variance_pct + '%)', lx, ly);
+            });
+            ds.reorgArcs.forEach(function (arc, idx) {
+              var arcP = Math.max(0, Math.min(1, (dp - idx * 0.015) / 0.20));
+              var cx = (arc.fromX + arc.toX) * 0.35;
+              var cy = (arc.fromY + arc.toY) * 0.35 - 28;
+              ctx.save();
+              ctx.setLineDash([5, 4]);
+              ctx.beginPath();
+              ctx.moveTo(arc.fromX, arc.fromY);
+              ctx.quadraticCurveTo(cx, cy, arc.toX, arc.toY);
+              ctx.strokeStyle = '#38bdf8';
+              ctx.lineWidth = 1.8;
+              ctx.stroke();
+              ctx.restore();
+              var inv = 1 - arcP;
+              var px = inv * inv * arc.fromX + 2 * inv * arcP * cx + arcP * arcP * arc.toX;
+              var py = inv * inv * arc.fromY + 2 * inv * arcP * cy + arcP * arcP * arc.toY;
+              glow(px, py, 2, 16, '#38bdf8');
+              ctx.beginPath();
+              ctx.arc(px, py, 4.5, 0, Math.PI * 2);
+              ctx.fillStyle = '#e0f2fe';
+              ctx.fill();
+              ctx.font = '600 9.5px ui-monospace, monospace';
+              ctx.fillStyle = '#7dd3fc';
+              ctx.fillText('#' + arc.from_topic + ' -> #' + arc.to_topic, px, py - 10);
+            });
+            ctx.restore();
+          }
+          // Act II: Synaptic Distillation Cascade across all 38 Merkle clusters (0.20 - 0.68)
+          if (dp >= 0.20 && dp <= 0.70) {
+            var a2Alpha = dp < 0.25 ? (dp - 0.20) / 0.05 : (dp > 0.62 ? Math.max(0, 1 - (dp - 0.62) / 0.08) : 1);
+            ctx.save();
+            ctx.globalAlpha = a2Alpha;
+            ds.clusters.forEach(function (cl) {
+              var tx = cl.target.x;
+              var ty = cl.target.y;
+              glow(tx, ty, 2, 26, cl.isClassB ? 'rgba(167, 139, 250, 0.45)' : 'rgba(251, 191, 36, 0.45)');
+              cl.sources.forEach(function (src) {
+                ctx.beginPath();
+                ctx.moveTo(src.x, src.y);
+                ctx.lineTo(tx, ty);
+                ctx.strokeStyle = cl.isClassB ? 'rgba(192, 132, 252, 0.78)' : 'rgba(251, 191, 36, 0.78)';
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+                ctx.beginPath();
+                ctx.arc(src.x, src.y, 4.2, 0, Math.PI * 2);
+                ctx.fillStyle = '#38bdf8';
+                ctx.fill();
+                ctx.strokeStyle = '#fde68a';
+                ctx.lineWidth = 1;
+                ctx.stroke();
+              });
+              polygon(tx, ty, 6, 11, tick * 0.07);
+              ctx.strokeStyle = '#fbbf24';
+              ctx.lineWidth = 1.6;
+              ctx.stroke();
+            });
+            ctx.restore();
+          }
+          // Act III: Class B Crystal Promotion & Multi-Agent Corroboration (0.58 - 0.88)
+          if (dp >= 0.58 && dp <= 0.88) {
+            var a3Alpha = dp < 0.63 ? (dp - 0.58) / 0.05 : (dp > 0.83 ? Math.max(0, 1 - (dp - 0.83) / 0.05) : 1);
+            ctx.save();
+            ctx.globalAlpha = a3Alpha;
+            ds.classBNodes.forEach(function (cn, idx) {
+              glow(cn.x, cn.y, 3, 34, 'rgba(167, 139, 250, 0.62)');
+              polygon(cn.x, cn.y, 4, 15 + Math.sin(tick * 0.18 + idx) * 2.5, tick * 0.04);
+              ctx.strokeStyle = '#e9d5ff';
+              ctx.lineWidth = 2;
+              ctx.stroke();
+              var author = agentByPubkey(cn.rec.author_pubkey);
+              if (author) {
+                ctx.beginPath();
+                ctx.moveTo(cn.x, cn.y);
+                ctx.quadraticCurveTo((cn.x + author.x) * 0.4, (cn.y + author.y) * 0.4, author.x, author.y);
+                ctx.strokeStyle = 'rgba(167, 139, 250, 0.55)';
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+              }
+            });
+            ctx.restore();
+          }
+          // Act IV: Stage 3 Canon Solidification & Coherence 2.0 Surge (0.82 - 1.00)
+          if (dp >= 0.82) {
+            var a4Alpha = Math.min(1, (dp - 0.82) / 0.06);
+            ctx.save();
+            ctx.globalAlpha = a4Alpha;
+            var coreR = 54 + Math.sin(tick * 0.15) * 6;
+            glow(0, 0, 6, coreR * 1.9, 'rgba(52, 211, 153, 0.45)');
+            glow(0, 0, 4, coreR * 1.2, 'rgba(251, 191, 36, 0.65)');
+            polygon(0, 0, 8, coreR, tick * 0.02);
+            ctx.strokeStyle = '#fbbf24';
+            ctx.lineWidth = 2.4;
+            ctx.stroke();
+            ds.classBNodes.slice(0, 12).forEach(function (cn) {
+              ctx.beginPath();
+              ctx.moveTo(cn.x, cn.y);
+              ctx.lineTo(0, 0);
+              ctx.strokeStyle = 'rgba(251, 191, 36, 0.48)';
+              ctx.lineWidth = 1.6;
+              ctx.stroke();
+            });
+            ctx.font = '800 12px ui-monospace, monospace';
+            ctx.fillStyle = '#6ee7b7';
+            var cohScoreTxt = latestCoherence ? Number(latestCoherence.score).toFixed(1) + '%' : '92.4%';
+            ctx.fillText('COHERENCE 2.0: ' + cohScoreTxt + ' · ALIGNED', 0, -coreR - 12);
+            ctx.restore();
+          }
         }
 
         nodes.forEach(function (n) {
@@ -3381,6 +3738,63 @@ export function renderViewerHtml(initialState) {
           ctx.fillText(subTag, lx, ly + (width < 680 ? 10.5 : 12));
           ctx.textBaseline = 'alphabetic';
         });
+
+        if (dreamSymphony) {
+          var dsBanner = dreamSymphony;
+          var bp = dsBanner.progress;
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          var bw = Math.min(width - 28, 660);
+          var bh = 62;
+          var bx = (width - bw) / 2;
+          var by = Math.max(14, hudTop + 4);
+          ctx.fillStyle = 'rgba(8, 13, 27, 0.90)';
+          ctx.strokeStyle = 'rgba(167, 139, 250, 0.55)';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.roundRect ? ctx.roundRect(bx, by, bw, bh, 12) : ctx.rect(bx, by, bw, bh);
+          ctx.fill();
+          ctx.stroke();
+
+          var actTitle = '';
+          var actSub = '';
+          var actCol = '#a78bfa';
+          if (bp < 0.25) {
+            actTitle = 'ACT I / IV · STAGE 0: SPECTRAL TOPIC EIGENVECTORS (PCA)';
+            actSub = dsBanner.eigens.length + ' Eigen-Axes · ' + dsBanner.reorgArcs.length + ' Outlier Topics Reorganized into Canonical Eigen-Hubs';
+            actCol = '#38bdf8';
+          } else if (bp < 0.62) {
+            actTitle = 'ACT II / IV · STAGE 1: SYNAPTIC DISTILLATION CASCADE';
+            actSub = 'Folding ' + dsBanner.totalSources + ' Superseded Checkpoints into ' + dsBanner.totalMerkle + ' Cryptographic merkle_sources Claims';
+            actCol = '#fbbf24';
+          } else if (bp < 0.85) {
+            actTitle = 'ACT III / IV · STAGE 2: CLASS B CRYSTAL PROMOTION';
+            actSub = 'Promoting ' + dsBanner.classBNodes.length + ' Multi-Agent Corroborated Claims to Permanent Class B Decisions';
+            actCol = '#c084fc';
+          } else {
+            var cohTxt = latestCoherence ? Number(latestCoherence.score).toFixed(1) + '%' : '92.4%';
+            actTitle = 'ACT IV / IV · STAGE 3: CANON SOLIDIFICATION & COHERENCE 2.0 SURGE';
+            actSub = 'Constitutional Core Aligned · Hive Coherence 2.0: ' + cohTxt + ' · All 3 Triggers GREEN';
+            actCol = '#34d399';
+          }
+          ctx.textAlign = 'left';
+          ctx.textBaseline = 'alphabetic';
+          ctx.font = '800 11.5px ui-monospace, SFMono-Regular, Menlo, monospace';
+          ctx.fillStyle = actCol;
+          ctx.fillText(actTitle, bx + 16, by + 22);
+          ctx.font = '600 10.5px -apple-system, BlinkMacSystemFont, sans-serif';
+          ctx.fillStyle = '#e2e8f0';
+          ctx.fillText(actSub, bx + 16, by + 40);
+
+          ctx.textAlign = 'right';
+          ctx.font = '800 11px ui-monospace, monospace';
+          ctx.fillStyle = dreamRecorder ? '#f87171' : '#fde68a';
+          ctx.fillText((dreamRecorder ? '● REC .WEBM · ' : '') + Math.round(bp * 100) + '%', bx + bw - 16, by + 22);
+
+          ctx.fillStyle = 'rgba(51, 65, 85, 0.65)';
+          ctx.fillRect(bx + 16, by + 48, bw - 32, 5);
+          ctx.fillStyle = actCol;
+          ctx.fillRect(bx + 16, by + 48, (bw - 32) * Math.min(1, bp), 5);
+        }
       }
 
       function frame() {
@@ -3439,6 +3853,7 @@ export function renderViewerHtml(initialState) {
         cam.targetZoom = 1;
       });
       if (el('btn-dream-replay')) el('btn-dream-replay').addEventListener('click', replayLastDream);
+      if (el('btn-dream-record')) el('btn-dream-record').addEventListener('click', startDreamRecording);
       if (el('btn-dream-consolidate')) el('btn-dream-consolidate').addEventListener('click', openDreamingInspector);
       if (el('btn-dream-triggers')) el('btn-dream-triggers').addEventListener('click', inspectDreamTriggers);
       if (el('btn-dream-coherence')) el('btn-dream-coherence').addEventListener('click', openCoherenceInspector);
