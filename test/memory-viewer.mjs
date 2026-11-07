@@ -419,6 +419,7 @@ await test('computeCoherence calculates 5-axis HCI score and retroactive incepti
       { kind: 'submit', actor: 'mydude' },
       { kind: 'lookup', actor: 'waggle-dev' },
       { kind: 'submit', actor: 'waggle-dev' },
+      { kind: 'refused', actor: 'djcodex', code: 'HIVE_MEMORY_INVALID_EVENT' },
     ],
     store_state: { write_seq: 8 },
   })
@@ -426,6 +427,10 @@ await test('computeCoherence calculates 5-axis HCI score and retroactive incepti
   assert.deepEqual(cohBlindFleet.epistemic_drift.lookup_only_writers, ['neil', 'waggle-dev'])
   assert.deepEqual(cohBlindFleet.epistemic_drift.blind_roster_agents, ['djcodex', 'dennis', 'kerouac'])
   assert.equal(cohBlindFleet.epistemic_drift.status, 'blind_spot')
+  assert(Array.isArray(cohBlindFleet.epistemic_drift.alerts) && cohBlindFleet.epistemic_drift.alerts.length >= 6)
+  assert(cohBlindFleet.epistemic_drift.alerts.some(a => a.category === 'tool_failure' && a.code === 'HIVE_MEMORY_INVALID_EVENT' && a.actor === 'djcodex'))
+  assert(cohBlindFleet.epistemic_drift.alerts.some(a => a.category === 'behavioral_noncompliance' && a.code === 'WRITE_WITHOUT_RECALL' && a.actor === 'waggle-dev'))
+  assert(cohBlindFleet.epistemic_drift.alerts.some(a => a.category === 'behavioral_noncompliance' && a.code === 'BLIND_ROSTER_SEAT' && a.actor === 'dennis'))
   assert(cohBlindFleet.score < coh.score - 15, `fleet amnesia must significantly lower coherence (${cohBlindFleet.score} vs ${coh.score})`)
 })
 

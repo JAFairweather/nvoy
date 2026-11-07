@@ -647,6 +647,12 @@ export function evaluateDreamTriggers({
     Number(coherence.axes.alignment || 0) >= 50
   const coherenceAlert = coherenceScore !== null && coherenceScore < 70 && !isHealthyComputedBaseline
 
+  const complianceAlerts = Array.isArray(coherence?.epistemic_drift?.alerts)
+    ? coherence.epistemic_drift.alerts
+    : []
+  const toolFailureCount = complianceAlerts.filter(a => a && a.category === 'tool_failure').length
+  const writeWithoutRecallCount = complianceAlerts.filter(a => a && a.code === 'WRITE_WITHOUT_RECALL').length
+
   const nightmareInterrupt =
     conflictedKeys.size > 0 ||
     staleRecords.length > 0 ||
@@ -669,6 +675,8 @@ export function evaluateDreamTriggers({
     )
   }
   if (coherenceAlert) reasons.push(`nightmare_coherence_drop: score ${coherenceScore}% (< 70%)`)
+  if (toolFailureCount > 0) reasons.push(`compliance_alert: ${toolFailureCount} agent memory tool failure(s) sensed`)
+  if (writeWithoutRecallCount > 0) reasons.push(`compliance_warning: ${writeWithoutRecallCount} agent(s) writing without recall`)
 
   return {
     shouldRun: circadianDream || synapticVolume || nightmareInterrupt,
@@ -686,6 +694,7 @@ export function evaluateDreamTriggers({
     refusal_count_15m: refusalCount15m,
     zero_hit_queries_15m: zeroHitQueries15m,
     coherence_score: coherenceScore,
+    compliance_alerts: complianceAlerts,
   }
 }
 
@@ -1067,6 +1076,24 @@ export function formatCuratorBriefing({
   if (escalations.length > 0) {
     for (const esc of escalations) {
       lines.push(`- 🚨 **NIGHTMARE ESCALATION:** ${esc.message}`)
+    }
+  }
+
+  const alerts = Array.isArray(coherence?.epistemic_drift?.alerts)
+    ? coherence.epistemic_drift.alerts
+    : (Array.isArray(triggers?.compliance_alerts) ? triggers.compliance_alerts : [])
+  if (alerts.length > 0) {
+    const toolFails = alerts.filter(a => a && a.category === 'tool_failure')
+    const writeOnly = alerts.filter(a => a && a.code === 'WRITE_WITHOUT_RECALL')
+    const readOnly = alerts.filter(a => a && a.code === 'READ_WITHOUT_WRITE')
+    const blindSeats = alerts.filter(a => a && a.code === 'BLIND_ROSTER_SEAT')
+    const parts = []
+    if (toolFails.length > 0) parts.push(`${toolFails.length} tool failure(s) (${toolFails.map(a => `@${a.actor}: ${a.code}`).join(', ')})`)
+    if (writeOnly.length > 0) parts.push(`${writeOnly.length} write-without-recall (${writeOnly.map(a => `@${a.actor}`).join(', ')})`)
+    if (readOnly.length > 0) parts.push(`${readOnly.length} read-without-write (${readOnly.map(a => `@${a.actor}`).join(', ')})`)
+    if (blindSeats.length > 0) parts.push(`${blindSeats.length} blind seat(s) (${blindSeats.map(a => `@${a.actor}`).join(', ')})`)
+    if (parts.length > 0) {
+      lines.push(`- ⚠️ **Agent Tool & Recall Compliance Alerts:** ${parts.join(' | ')}`)
     }
   }
 

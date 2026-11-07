@@ -574,8 +574,61 @@ export function computeCoherence({
   const blindRosterAgents = []
   const lookupOnlyWriters = []
   const verifiedRecallAgents = []
+  const toolFailureAlerts = []
+  const behavioralAlerts = []
+  const recentRefusalByActor = new Map()
+  for (const a of activityList) {
+    if (a && a.kind === 'refused' && a.actor) {
+      const prev = recentRefusalByActor.get(a.actor)
+      if (!prev || (a.at || 0) >= (prev.at || 0)) {
+        recentRefusalByActor.set(a.actor, { code: a.code || 'STORE_REFUSED', at: a.at || now_sec, d: a.d || null })
+      }
+    }
+  }
+  const reportedFailureRegex = /timed out during banner exchange|memory store did not answer in time|permission denied \(publickey\)|hive-memory.*fail|ssh-timeout-diagnosis|cli-ssh-handshake/i
+  for (const r of allNonCanon) {
+    if (!r || typeof r !== 'object') continue
+    const age = Math.max(0, now_sec - (r.created_at || 0))
+    if (age > 21600) continue
+    const text = `${r.d || ''} ${r.claim || ''}`
+    if (reportedFailureRegex.test(text)) {
+      const actor = rosterByPk.get(String(r.author_pubkey || '')) || String(r.author_pubkey || '').slice(0, 8)
+      const slug = String(r.d || '').split(':').pop() || r.d || 'incident'
+      toolFailureAlerts.push({
+        agent: actor,
+        category: 'tool_failure',
+        kind: 'reported_tool_or_transport_failure',
+        severity: 'error',
+        code: 'TRANSPORT_OR_CLI_FAILURE',
+        detail: `${slug}: ${String(r.claim || '').slice(0, 120)}`,
+        at: r.created_at || now_sec,
+      })
+    }
+  }
+  for (const [actor, ref] of recentRefusalByActor.entries()) {
+    toolFailureAlerts.push({
+      agent: actor,
+      category: 'tool_failure',
+      kind: 'store_refusal',
+      severity: 'error',
+      code: ref.code,
+      detail: `Store refused write/read (${ref.code})${ref.d ? ` on ${String(ref.d).split(':').pop()}` : ''}`,
+      at: ref.at,
+    })
+  }
   for (const a of peerReaders) {
     const id = a.id
+    if (a.last_refused_at && Math.max(0, now_sec - a.last_refused_at) <= 3600 && !recentRefusalByActor.has(id)) {
+      toolFailureAlerts.push({
+        agent: id,
+        category: 'tool_failure',
+        kind: 'store_refusal',
+        severity: 'error',
+        code: a.last_refused_code || 'STORE_REFUSED',
+        detail: `Store refused operation (${a.last_refused_code || 'STORE_REFUSED'})`,
+        at: a.last_refused_at,
+      })
+    }
     const hasRecall =
       recallByActor.has(id) ||
       a.last_recall_kind === 'wake' ||
@@ -587,14 +640,48 @@ export function computeCoherence({
       verifiedRecallAgents.push(id)
     } else if (hasAnyRead || writesByActor.has(id) || recentWriterIds.has(id)) {
       lookupOnlyWriters.push(id)
+      behavioralAlerts.push({
+        agent: id,
+        category: 'behavioral_noncompliance',
+        kind: 'write_without_recall',
+        severity: 'warning',
+        code: 'WRITE_WITHOUT_RECALL',
+        detail: 'Wrote claims (lookup/submit) without calling memory_wake or memory_query',
+        at: a.last_write_at || a.last_read_at || now_sec,
+      })
     } else {
       blindRosterAgents.push(id)
+      behavioralAlerts.push({
+        agent: id,
+        category: 'behavioral_noncompliance',
+        kind: 'blind_roster_seat',
+        severity: 'warning',
+        code: 'BLIND_ROSTER_SEAT',
+        detail: 'Provisioned reader seat has 0 observed memory_wake / memory_query calls',
+        at: now_sec,
+      })
     }
+  }
+  for (const actor of silentActiveWriters) {
+    behavioralAlerts.push({
+      agent: actor,
+      category: 'behavioral_noncompliance',
+      kind: 'read_without_write',
+      severity: 'warning',
+      code: 'READ_WITHOUT_WRITE',
+      detail: 'Executed >=4 memory reads without recording any claim in window',
+      at: now_sec,
+    })
   }
   const hasExplicitReaderFleet = peerReaders.length >= 4 && (activityList.length > 0 || peerReaders.some(a => a.last_read_at || a.last_write_at))
   const recallCoveragePct = hasExplicitReaderFleet
     ? Math.round((verifiedRecallAgents.length / peerReaders.length) * 1000) / 10
     : 100
+  const alerts = [...toolFailureAlerts, ...(hasExplicitReaderFleet ? behavioralAlerts : [])].map(a => ({
+    ...a,
+    actor: a.actor || a.agent,
+    summary: a.summary || a.detail,
+  }))
 
   const missedTopics = [...missedTopicsSet]
   const fleetRecallPenalty = hasExplicitReaderFleet
@@ -665,6 +752,9 @@ export function computeCoherence({
       recall_coverage_pct: recallCoveragePct,
       blind_roster_agents: blindRosterAgents,
       lookup_only_writers: lookupOnlyWriters,
+      tool_failures: toolFailureAlerts.length,
+      behavioral_gaps: hasExplicitReaderFleet ? behavioralAlerts.length : 0,
+      alerts,
     },
     history,
   }
@@ -803,6 +893,9 @@ export function computeAgentHealth({
     warm_20m: 0,
     stale: 0,
     error: 0,
+    compliant_recall: 0,
+    write_without_recall: 0,
+    blind_seats: 0,
     total: 0,
     window_sec: ACTIVE_WINDOW_SEC,
   }
@@ -839,6 +932,21 @@ export function computeAgentHealth({
       health = 'stale'
       summary.stale += 1
     }
+    let complianceStatus = 'compliant'
+    if (health === 'error') {
+      complianceStatus = 'tool_failure'
+    } else if (agent.is_reader && agent.id !== 'curator' && agent.id !== 'viewer') {
+      if (e.last_recall_at !== null) {
+        complianceStatus = 'compliant'
+        summary.compliant_recall += 1
+      } else if (e.last_write_at !== null || e.last_read_at !== null) {
+        complianceStatus = 'write_without_recall'
+        summary.write_without_recall += 1
+      } else {
+        complianceStatus = 'blind_seat'
+        summary.blind_seats += 1
+      }
+    }
     summary.total += 1
     return {
       ...agent,
@@ -856,6 +964,7 @@ export function computeAgentHealth({
       reads_5m: reads5mByActor.get(agent.id) || 0,
       writes_5m: writes5mByActor.get(agent.id) || 0,
       health,
+      compliance_status: complianceStatus,
     }
   })
 
@@ -1992,6 +2101,8 @@ export function renderViewerHtml(initialState) {
           used_last_hour: null,
           last_read_at: null,
           last_read_kind: null,
+          last_recall_at: null,
+          last_recall_kind: null,
           last_write_at: null,
           last_write_d: null,
           last_refused_at: null,
@@ -2001,6 +2112,7 @@ export function renderViewerHtml(initialState) {
           reads_5m: 0,
           writes_5m: 0,
           health: 'stale',
+          compliance_status: 'compliant',
           listed: true,
           energy: 0,
           x: 0,
@@ -2072,6 +2184,8 @@ export function renderViewerHtml(initialState) {
           var prev = agentById(r.id);
           var lastRead = typeof r.last_read_at === 'number' ? r.last_read_at : (prev ? prev.last_read_at : null);
           var lastReadKind = r.last_read_kind || (prev ? prev.last_read_kind : null);
+          var lastRecall = typeof r.last_recall_at === 'number' ? r.last_recall_at : (prev ? prev.last_recall_at : null);
+          var lastRecallKind = r.last_recall_kind || (prev ? prev.last_recall_kind : null);
           var lastWrite = typeof r.last_write_at === 'number' ? r.last_write_at : (prev ? prev.last_write_at : null);
           var lastWriteD = r.last_write_d || (prev ? prev.last_write_d : null);
           var lastRefused = typeof r.last_refused_at === 'number' ? r.last_refused_at : (prev ? prev.last_refused_at : null);
@@ -2089,6 +2203,10 @@ export function renderViewerHtml(initialState) {
               var in5 = Math.max(0, refNow - act.at) <= 300;
               if (act.kind === 'wake' || act.kind === 'query' || act.kind === 'lookup') {
                 if (!lastRead || act.at >= lastRead) { lastRead = act.at; lastReadKind = act.kind; }
+                if ((act.kind === 'wake' || act.kind === 'query') && (!lastRecall || act.at >= lastRecall)) {
+                  lastRecall = act.at;
+                  lastRecallKind = act.kind;
+                }
                 if (in5) reads5m += 1;
               } else if (act.kind === 'submit') {
                 if (!lastWrite || act.at >= lastWrite) { lastWrite = act.at; lastWriteD = act.d || lastWriteD; }
@@ -2106,6 +2224,13 @@ export function renderViewerHtml(initialState) {
               ? 'error'
               : (active5m ? 'active' : (ageSec !== null && ageSec <= 1200 ? 'warm' : 'stale'))
           );
+          var complianceStatus = r.compliance_status || (
+            health === 'error'
+              ? 'tool_failure'
+              : (r.is_reader && r.id !== 'curator' && r.id !== 'viewer'
+                ? (lastRecall ? 'compliant' : ((lastWrite || lastRead) ? 'write_without_recall' : 'blind_seat'))
+                : 'compliant')
+          );
           next.push(makeAgent(r.id, {
             pubkey: r.pubkey || null,
             is_reader: Boolean(r.is_reader),
@@ -2115,6 +2240,8 @@ export function renderViewerHtml(initialState) {
             used_last_hour: typeof r.used_last_hour === 'number' ? r.used_last_hour : null,
             last_read_at: lastRead,
             last_read_kind: lastReadKind,
+            last_recall_at: lastRecall,
+            last_recall_kind: lastRecallKind,
             last_write_at: lastWrite,
             last_write_d: lastWriteD,
             last_refused_at: lastRefused,
@@ -2124,6 +2251,7 @@ export function renderViewerHtml(initialState) {
             reads_5m: reads5m,
             writes_5m: writes5m,
             health: health,
+            compliance_status: complianceStatus,
             energy: prev ? prev.energy : 0
           }));
         });
@@ -2712,6 +2840,13 @@ export function renderViewerHtml(initialState) {
           } else if (a.last_seen_at) {
             statText = '○ ' + fmtShortAge(a.last_seen_at, curNow);
           }
+          if (a.compliance_status === 'write_without_recall' && a.health !== 'error') {
+            statText += ' ⚠W-only';
+            statColor = '#fbbf24';
+          } else if (a.compliance_status === 'blind_seat' && !a.last_seen_at) {
+            statText = '◌ blind';
+            statColor = '#f87171';
+          }
           var stats = makeDiv('agent-stats', statText);
           stats.style.color = statColor;
           row.appendChild(stats);
@@ -2849,6 +2984,20 @@ export function renderViewerHtml(initialState) {
                 ? 'ERROR · last call refused (' + (a.last_refused_code || 'REFUSED') + ')'
                 : 'SILENT (>20m) · no recent reads/writes (check MCP bridge)'));
           akv.appendChild(kvRow('Tool health (5m)', hText, healthColor(a.health)));
+          var compLabel = a.compliance_status === 'tool_failure'
+            ? 'TOOL FAILURE · refused or timed out'
+            : (a.compliance_status === 'write_without_recall'
+              ? 'NON-COMPLIANT · writing without recall (lookup only)'
+              : (a.compliance_status === 'blind_seat'
+                ? 'BLIND SEAT · 0 wake/query recalls observed'
+                : 'COMPLIANT · wake/query recall verified'));
+          var compCol = a.compliance_status === 'compliant' ? '#34d399' : (a.compliance_status === 'write_without_recall' ? '#fbbf24' : '#fca5a5');
+          akv.appendChild(kvRow('Recall compliance', compLabel, compCol));
+          akv.appendChild(kvRow(
+            'Last recall (wake/query)',
+            a.last_recall_at ? fmtAge(a.last_recall_at, curNow) + ' (' + (a.last_recall_kind || 'recall') + ')' : 'none observed',
+            a.last_recall_at ? '#34d399' : '#fca5a5'
+          ));
           akv.appendChild(kvRow(
             'Last read',
             a.last_read_at ? fmtAge(a.last_read_at, curNow) + ' (' + (a.last_read_kind || 'read') + ')' : 'none observed',
@@ -2938,6 +3087,21 @@ export function renderViewerHtml(initialState) {
               edWrap.appendChild(kvRow('Write-without-reading (lookup-only)', lookupArr.length + ' [' + lookupArr.join(', ') + ']', '#fbbf24'));
             }
             box.appendChild(edWrap);
+
+            var alertArr = Array.isArray(ed.alerts) ? ed.alerts : [];
+            if (alertArr.length > 0) {
+              var alTitle = makeDiv('inspect-kicker', 'Agent Tool Failure & Recall Compliance Alerts (' + alertArr.length + ')');
+              alTitle.style.marginTop = '8px';
+              box.appendChild(alTitle);
+              var alWrap = makeDiv('kv-list');
+              alertArr.slice(0, 12).forEach(function (al) {
+                var alCol = al.severity === 'critical' ? '#fca5a5' : (al.severity === 'warning' ? '#fbbf24' : '#94a3b8');
+                var catBadge = al.category === 'tool_failure' ? '🔴 TOOL FAIL' : '⚠ NON-COMPLIANCE';
+                var label = catBadge + ' · @' + (al.actor || 'unknown') + ' [' + (al.code || '') + ']';
+                alWrap.appendChild(kvRow(label, String(al.summary || ''), alCol));
+              });
+              box.appendChild(alWrap);
+            }
           }
 
           var hist = Array.isArray(coh.history) ? coh.history : [];
