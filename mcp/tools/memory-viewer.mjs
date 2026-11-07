@@ -1486,6 +1486,7 @@ export function renderViewerHtml(initialState) {
           <span class="mobile-kpi-pill" id="m-kpi-claims">claims: -</span>
           <span class="mobile-kpi-pill" id="m-kpi-tiers">-</span>
           <button class="mobile-kpi-pill" id="m-kpi-coherence" type="button" style="cursor:pointer;color:#6ee7b7;border-color:rgba(52,211,153,0.4);">coh: -</button>
+          <button class="mobile-kpi-pill" id="m-kpi-dreaming" type="button" style="cursor:pointer;color:#c4b5fd;border-color:rgba(167,139,250,0.45);">dream: eigenvectors</button>
         </div>
         <div class="quarantine-banner">
           reader: <span id="reader-name">${readerName}</span> (<span id="server-name">${serverName}</span>) |
@@ -1523,6 +1524,11 @@ export function renderViewerHtml(initialState) {
         <span class="metric-label" style="color:#6ee7b7;">Coherence 2.0</span>
         <span id="coherence-val" class="metric-val" style="color:#6ee7b7;">-</span>
         <span id="coherence-sub" class="metric-sub">tap for timeline</span>
+      </div>
+      <div class="metric" id="dreaming-card" style="cursor:pointer;" title="Tap to inspect Merkle Dreaming, 3-Trigger Curation State, and Stage 0 Spectral Topic Eigenvectors">
+        <span class="metric-label" style="color:#c4b5fd;">Merkle Dreaming</span>
+        <span id="dreaming-val" class="metric-val" style="color:#c4b5fd;">Stage 0–3</span>
+        <span id="dreaming-sub" class="metric-sub">eigenvectors · tap</span>
       </div>
     </div>
   </header>
@@ -3444,6 +3450,8 @@ export function renderViewerHtml(initialState) {
       }
       if (el('coherence-card')) el('coherence-card').addEventListener('click', openCoherenceInspector);
       if (el('m-kpi-coherence')) el('m-kpi-coherence').addEventListener('click', openCoherenceInspector);
+      if (el('dreaming-card')) el('dreaming-card').addEventListener('click', openDreamingInspector);
+      if (el('m-kpi-dreaming')) el('m-kpi-dreaming').addEventListener('click', openDreamingInspector);
 
       var graphReady = false;
       function renderState(s) {
@@ -3489,6 +3497,13 @@ export function renderViewerHtml(initialState) {
           if (el('coherence-val')) el('coherence-val').textContent = cScore + '%';
           if (el('coherence-sub')) el('coherence-sub').textContent = cSign + cDelta.toFixed(1) + ' · ' + edSt + ' · tap';
           if (el('m-kpi-coherence')) el('m-kpi-coherence').textContent = 'coh 2.0: ' + cScore + '% (' + edSt + ')';
+        }
+        if (s.curator_state && typeof s.curator_state === 'object') {
+          var eigCount = Array.isArray(s.curator_state.topic_eigenvectors) ? s.curator_state.topic_eigenvectors.length : 0;
+          var reorgCount = Array.isArray(s.curator_state.topic_reorganizations) ? s.curator_state.topic_reorganizations.length : 0;
+          if (el('dreaming-val')) el('dreaming-val').textContent = eigCount ? (eigCount + ' Eigen-Axes') : 'Stage 0–3';
+          if (el('dreaming-sub')) el('dreaming-sub').textContent = reorgCount + ' topic reorgs · tap';
+          if (el('m-kpi-dreaming')) el('m-kpi-dreaming').textContent = 'dream: ' + eigCount + ' axes · ' + reorgCount + ' reorgs';
         }
 
         var sc = s.scope_counts || {};
