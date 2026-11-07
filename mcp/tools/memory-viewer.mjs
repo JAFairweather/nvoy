@@ -527,6 +527,7 @@ export function computeCoherence({
   let zeroHitQueries = 0
   const missedTopicsSet = new Set()
   const readsByActor = new Map()
+  const recallByActor = new Map()
   const writesByActor = new Map()
   for (let idx = 0; idx < activityList.length; idx++) {
     const a = activityList[idx]
@@ -534,6 +535,9 @@ export function computeCoherence({
     const actor = String(a.actor || '')
     if (a.kind === 'query' || a.kind === 'wake' || a.kind === 'lookup') {
       if (actor) readsByActor.set(actor, (readsByActor.get(actor) || 0) + 1)
+      if ((a.kind === 'query' || a.kind === 'wake') && actor) {
+        recallByActor.set(actor, (recallByActor.get(actor) || 0) + 1)
+      }
       if (a.kind === 'query' && a.count === 0 && actor !== 'curator' && actor !== 'viewer' && a.topic) {
         missedTopicsSet.add(String(a.topic))
         const resolvedSoon = activityList.slice(idx + 1, idx + 12).some(
@@ -552,8 +556,9 @@ export function computeCoherence({
     }
   }
 
+  const rosterArr = Array.isArray(agent_roster) ? agent_roster : []
   const writerIdSet = new Set(
-    (Array.isArray(agent_roster) ? agent_roster : []).filter(a => a?.is_writer && a?.id).map(a => a.id)
+    rosterArr.filter(a => a?.is_writer && a?.id).map(a => a.id)
   )
   const silentActiveWriters = []
   for (const [actor, readCount] of readsByActor.entries()) {
@@ -562,26 +567,61 @@ export function computeCoherence({
     }
   }
 
+  // Bilateral Fleet Recall & Participation Audit:
+  // If agents on the roster are not reading (0 wake/query) or are writing blind (lookup-only without wake/query),
+  // the Hive cannot be fully coherent even if the few active writers produce well-formatted records.
+  const peerReaders = rosterArr.filter(a => a && a.is_reader === true && a.id && a.id !== 'curator' && a.id !== 'viewer')
+  const blindRosterAgents = []
+  const lookupOnlyWriters = []
+  const verifiedRecallAgents = []
+  for (const a of peerReaders) {
+    const id = a.id
+    const hasRecall =
+      recallByActor.has(id) ||
+      a.last_recall_kind === 'wake' ||
+      a.last_recall_kind === 'query' ||
+      a.last_read_kind === 'wake' ||
+      a.last_read_kind === 'query'
+    const hasAnyRead = readsByActor.has(id) || Boolean(a.last_read_at)
+    if (hasRecall) {
+      verifiedRecallAgents.push(id)
+    } else if (hasAnyRead || writesByActor.has(id) || recentWriterIds.has(id)) {
+      lookupOnlyWriters.push(id)
+    } else {
+      blindRosterAgents.push(id)
+    }
+  }
+  const hasExplicitReaderFleet = peerReaders.length >= 4 && (activityList.length > 0 || peerReaders.some(a => a.last_read_at || a.last_write_at))
+  const recallCoveragePct = hasExplicitReaderFleet
+    ? Math.round((verifiedRecallAgents.length / peerReaders.length) * 1000) / 10
+    : 100
+
   const missedTopics = [...missedTopicsSet]
+  const fleetRecallPenalty = hasExplicitReaderFleet
+    ? blindRosterAgents.length * 4 + lookupOnlyWriters.length * 3
+    : 0
   const epistemicPenalty = Math.min(
-    65,
-    zeroHitQueries * 16 + silentActiveWriters.length * 12 + siloedRecentTopics.length * 8
+    75,
+    zeroHitQueries * 16 + silentActiveWriters.length * 12 + siloedRecentTopics.length * 8 + fleetRecallPenalty
   )
   const epistemicScore = Math.max(0, Math.round((100 - epistemicPenalty) * 10) / 10)
   const epistemicStatus =
-    zeroHitQueries >= 2 || epistemicPenalty >= 28
+    zeroHitQueries >= 2 || epistemicPenalty >= 28 || (hasExplicitReaderFleet && recallCoveragePct < 50)
       ? 'blind_spot'
       : epistemicPenalty > 0
         ? 'drifting'
         : 'aligned'
 
-  if (activityList.length > 0 || siloedRecentTopics.length > 0) {
-    if (activityList.length > 0) {
+  if (activityList.length > 0 || siloedRecentTopics.length > 0 || hasExplicitReaderFleet) {
+    if (activityList.length > 0 || hasExplicitReaderFleet) {
       const refusals = activityList.filter(a => a?.kind === 'refused').length
-      const gateHygiene = Math.max(0, 1 - refusals / activityList.length)
+      const gateHygiene = activityList.length > 0 ? Math.max(0, 1 - refusals / activityList.length) : 1
       const silencePenalty = silentActiveWriters.length * 12 + zeroHitQueries * 6
-      const liveCoupling = Math.max(0, gateHygiene * 100 - silencePenalty)
-      current.axes.coupling = Math.round((0.7 * current.axes.coupling + 0.3 * liveCoupling) * 10) / 10
+      const hygieneScore = Math.max(0, gateHygiene * 100 - silencePenalty)
+      const liveCoupling = hasExplicitReaderFleet
+        ? Math.round((0.45 * hygieneScore + 0.55 * recallCoveragePct) * 10) / 10
+        : hygieneScore
+      current.axes.coupling = Math.round(((hasExplicitReaderFleet ? 0.35 : 0.7) * current.axes.coupling + (hasExplicitReaderFleet ? 0.65 : 0.3) * liveCoupling) * 10) / 10
     }
     if (zeroHitQueries > 0 || siloedRecentTopics.length > 0) {
       const convPenalty = Math.min(45, zeroHitQueries * 14 + siloedRecentTopics.length * 8)
@@ -591,13 +631,18 @@ export function computeCoherence({
       const alignPenalty = Math.min(30, missedTopics.length * 10)
       current.axes.alignment = Math.max(0, Math.round((current.axes.alignment - alignPenalty) * 10) / 10)
     }
-    current.score = Math.round((
+    const fleetBlindnessPenalty =
+      hasExplicitReaderFleet && recallCoveragePct < 75
+        ? Math.min(26, Math.round((75 - recallCoveragePct) * 0.42 * 10) / 10)
+        : 0
+    current.score = Math.max(0, Math.round((
       0.25 * current.axes.alignment +
       0.2 * current.axes.grounding +
       0.25 * current.axes.convergence +
       0.15 * current.axes.coupling +
-      0.15 * current.axes.consolidation
-    ) * 10) / 10
+      0.15 * current.axes.consolidation -
+      fleetBlindnessPenalty
+    ) * 10) / 10)
   }
 
   return {
@@ -617,6 +662,9 @@ export function computeCoherence({
       missed_topics: missedTopics,
       silent_active_writers: silentActiveWriters,
       siloed_recent_topics: siloedRecentTopics,
+      recall_coverage_pct: recallCoveragePct,
+      blind_roster_agents: blindRosterAgents,
+      lookup_only_writers: lookupOnlyWriters,
     },
     history,
   }
@@ -689,6 +737,8 @@ export function computeAgentHealth({
       e = {
         last_read_at: null,
         last_read_kind: null,
+        last_recall_at: null,
+        last_recall_kind: null,
         last_write_at: null,
         last_write_d: null,
         last_refused_at: null,
@@ -729,6 +779,10 @@ export function computeAgentHealth({
         e.last_read_at = at
         e.last_read_kind = a.kind
       }
+      if ((a.kind === 'wake' || a.kind === 'query') && (e.last_recall_at === null || at >= e.last_recall_at)) {
+        e.last_recall_at = at
+        e.last_recall_kind = a.kind
+      }
       if (in5m) reads5mByActor.set(actor, (reads5mByActor.get(actor) || 0) + 1)
     } else if (a.kind === 'submit') {
       if (e.last_write_at === null || at >= e.last_write_at) {
@@ -757,6 +811,8 @@ export function computeAgentHealth({
     const e = telemetry.get(agent.id) || {
       last_read_at: null,
       last_read_kind: null,
+      last_recall_at: null,
+      last_recall_kind: null,
       last_write_at: null,
       last_write_d: null,
       last_refused_at: null,
@@ -788,6 +844,8 @@ export function computeAgentHealth({
       ...agent,
       last_read_at: e.last_read_at,
       last_read_kind: e.last_read_kind,
+      last_recall_at: e.last_recall_at,
+      last_recall_kind: e.last_recall_kind,
       last_write_at: e.last_write_at,
       last_write_d: e.last_write_d,
       last_refused_at: e.last_refused_at,
@@ -2867,6 +2925,18 @@ export function renderViewerHtml(initialState) {
             edWrap.appendChild(kvRow('Silent active writers', silentArr.length ? silentArr.join(', ') : '0 (all active readers sharing)', silentArr.length ? '#fbbf24' : '#34d399'));
             var siloArr = Array.isArray(ed.siloed_recent_topics) ? ed.siloed_recent_topics : [];
             edWrap.appendChild(kvRow('Single-author topic silos', siloArr.length ? siloArr.join(', ') : '0 (multi-agent corroborated)', siloArr.length ? '#fbbf24' : '#34d399'));
+            if (typeof ed.recall_coverage_pct === 'number') {
+              var covCol = ed.recall_coverage_pct >= 75 ? '#34d399' : (ed.recall_coverage_pct >= 50 ? '#fbbf24' : '#fca5a5');
+              edWrap.appendChild(kvRow('Fleet recall coverage (wake/query)', Number(ed.recall_coverage_pct).toFixed(1) + '%', covCol));
+            }
+            var blindArr = Array.isArray(ed.blind_roster_agents) ? ed.blind_roster_agents : [];
+            if (blindArr.length > 0) {
+              edWrap.appendChild(kvRow('Blind roster agents (0 reads)', blindArr.length + ' [' + blindArr.join(', ') + ']', '#fca5a5'));
+            }
+            var lookupArr = Array.isArray(ed.lookup_only_writers) ? ed.lookup_only_writers : [];
+            if (lookupArr.length > 0) {
+              edWrap.appendChild(kvRow('Write-without-reading (lookup-only)', lookupArr.length + ' [' + lookupArr.join(', ') + ']', '#fbbf24'));
+            }
             box.appendChild(edWrap);
           }
 
@@ -3813,16 +3883,16 @@ export function renderViewerHtml(initialState) {
           var actSub = '';
           var actCol = '#a78bfa';
           if (bp < 0.25) {
-            actTitle = 'ACT I / IV · STAGE 0: SPECTRAL TOPIC EIGENVECTORS (PCA)';
-            actSub = dsBanner.eigens.length + ' Eigen-Axes · ' + dsBanner.reorgArcs.length + ' Outlier Topics Reorganized into Canonical Eigen-Hubs';
+            actTitle = 'ACT I / IV · STAGE 0: SPECTRAL TOPIC EIGENVECTORS (READ-ONLY REPLAY)';
+            actSub = 'Observed ' + dsBanner.eigens.length + ' Eigen-Axes · ' + dsBanner.reorgArcs.length + ' Topic Affinity Links';
             actCol = '#38bdf8';
           } else if (bp < 0.62) {
-            actTitle = 'ACT II / IV · STAGE 1: SYNAPTIC DISTILLATION CASCADE';
-            actSub = 'Folding ' + dsBanner.totalSources + ' Superseded Checkpoints into ' + dsBanner.totalMerkle + ' Cryptographic merkle_sources Claims';
+            actTitle = 'ACT II / IV · STAGE 1: SYNAPTIC DISTILLATION (READ-ONLY REPLAY)';
+            actSub = 'Observed ' + dsBanner.totalSources + ' Superseded Checkpoints across ' + dsBanner.totalMerkle + ' merkle_sources Claims';
             actCol = '#fbbf24';
           } else if (bp < 0.85) {
-            actTitle = 'ACT III / IV · STAGE 2: CLASS B CRYSTAL PROMOTION';
-            actSub = 'Promoting ' + dsBanner.classBNodes.length + ' Multi-Agent Corroborated Claims to Permanent Class B Decisions';
+            actTitle = 'ACT III / IV · STAGE 2: CLASS B CRYSTALS (READ-ONLY REPLAY)';
+            actSub = 'Observed ' + dsBanner.classBNodes.length + ' Multi-Agent Corroborated Class B Decisions';
             actCol = '#c084fc';
           } else {
             var cohTxt = latestCoherence && typeof latestCoherence.score === 'number' ? Number(latestCoherence.score).toFixed(1) + '%' : 'N/A';

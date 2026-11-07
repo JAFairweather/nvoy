@@ -402,6 +402,31 @@ await test('computeCoherence calculates 5-axis HCI score and retroactive incepti
   assert.deepEqual(cohDrift.epistemic_drift.missed_topics, ['wonder-lab'])
   assert.deepEqual(cohDrift.epistemic_drift.silent_active_writers, ['biggy'])
   assert(cohDrift.score < coh.score, `coherence must dip on epistemic blind spots (${cohDrift.score} < ${coh.score})`)
+
+  // Verify fleet recall blindness: when a multi-agent reader roster has blind (0 reads) or lookup-only agents, coherence drops
+  const cohBlindFleet = computeCoherence({
+    records,
+    agent_roster: [
+      { id: 'mydude', pubkey: '1'.repeat(64), is_reader: true, is_writer: true },
+      { id: 'neil', pubkey: '2'.repeat(64), is_reader: true, is_writer: true },
+      { id: 'waggle-dev', pubkey: '3'.repeat(64), is_reader: true, is_writer: true },
+      { id: 'djcodex', pubkey: '4'.repeat(64), is_reader: true, is_writer: true },
+      { id: 'dennis', pubkey: '5'.repeat(64), is_reader: true, is_writer: true },
+      { id: 'kerouac', pubkey: '6'.repeat(64), is_reader: true, is_writer: true },
+    ],
+    recent_activity: [
+      { kind: 'wake', actor: 'mydude' },
+      { kind: 'submit', actor: 'mydude' },
+      { kind: 'lookup', actor: 'waggle-dev' },
+      { kind: 'submit', actor: 'waggle-dev' },
+    ],
+    store_state: { write_seq: 8 },
+  })
+  assert.equal(cohBlindFleet.epistemic_drift.recall_coverage_pct, 16.7)
+  assert.deepEqual(cohBlindFleet.epistemic_drift.lookup_only_writers, ['neil', 'waggle-dev'])
+  assert.deepEqual(cohBlindFleet.epistemic_drift.blind_roster_agents, ['djcodex', 'dennis', 'kerouac'])
+  assert.equal(cohBlindFleet.epistemic_drift.status, 'blind_spot')
+  assert(cohBlindFleet.score < coh.score - 15, `fleet amnesia must significantly lower coherence (${cohBlindFleet.score} vs ${coh.score})`)
 })
 
 await test('computeAgentHealth: classifies 5m active, 5-20m warm, >20m stale, error, and preserves telemetry across rollover', () => {
