@@ -1007,11 +1007,66 @@ export function planMerkleDream({
   }
 }
 
+// Formats a concise, structured Curatorial Dream Briefing for @curator to post on Nvoy channels (#waggle-test / #hive-ops).
+export function formatCuratorBriefing({
+  cycleStatus = 'idle',
+  triggers = null,
+  plan = null,
+  submitted = [],
+  refused = [],
+  coherence = null,
+  lastCuratedWriteSeq = 0,
+  nextCuratedWriteSeq = 0,
+} = {}) {
+  const lines = []
+  const cohScore = coherence && typeof coherence.score === 'number' ? `${coherence.score.toFixed(1)}%` : 'n/a'
+  const edStatus = coherence?.epistemic_drift?.status ? String(coherence.epistemic_drift.status).toUpperCase() : 'ALIGNED'
+  const reasons = Array.isArray(triggers?.reasons) && triggers.reasons.length ? triggers.reasons.join(', ') : 'manual/scheduled inspection'
+
+  lines.push(`🧠 **MERKLE DREAMING CURATOR BRIEFING** · status=\`${cycleStatus}\` · seq \`${lastCuratedWriteSeq} -> ${nextCuratedWriteSeq}\` · Coherence 2.0: **${cohScore}** (\`${edStatus}\`)`)
+  lines.push(`- **Triggers Evaluated:** ${reasons}`)
+
+  const eigens = Array.isArray(plan?.topic_eigenvectors) ? plan.topic_eigenvectors : []
+  const reorgs = Array.isArray(plan?.topic_reorganizations) ? plan.topic_reorganizations : []
+  if (eigens.length > 0) {
+    const topAxes = eigens.slice(0, 4).map(e => `λ${e.axis} \`#${e.canonical_topic}\` (${e.variance_pct}%)`).join(', ')
+    const reorgStr = reorgs.length > 0
+      ? ` | Reorganized ${reorgs.length} outlier topic(s): ${reorgs.slice(0, 5).map(r => `\`#${r.from_topic} -> #${r.to_topic}\``).join(', ')}`
+      : ''
+    lines.push(`- **Stage 0 (Spectral Topic PCA):** ${topAxes}${reorgStr}`)
+  }
+
+  const proms = Array.isArray(plan?.promotions) ? plan.promotions : []
+  const dists = Array.isArray(plan?.distillations) ? plan.distillations : []
+  const totalSources = [...proms, ...dists].reduce((acc, x) => acc + (Array.isArray(x.source_event_ids) ? x.source_event_ids.length : 0), 0)
+  lines.push(
+    `- **Stage 1 & 2 (Distillation & Promotion):** ${proms.length} Class B Decision Promotion(s) + ${dists.length} Class A Distillation(s) across ${totalSources} source claims (${submitted.length} submitted${refused.length ? `, ${refused.length} refused` : ''})`
+  )
+
+  const solids = Array.isArray(plan?.solidifications) ? plan.solidifications : []
+  if (solids.length > 0) {
+    lines.push(
+      `- **Stage 3 (Canon Nominations for @james):** ${solids.length} converged Class B topic(s) ready for \`hive:canon\`: ${solids.slice(0, 4).map(s => `\`${s.d}\` (merkle \`${String(s.merkle_sources || '').slice(0, 10)}…\`)`).join(', ')}`
+    )
+  }
+
+  const escalations = (Array.isArray(plan?.nightmares) ? plan.nightmares : []).filter(n => n.action === 'escalate_to_owner')
+  if (escalations.length > 0) {
+    for (const esc of escalations) {
+      lines.push(`- 🚨 **NIGHTMARE ESCALATION:** ${esc.message}`)
+    }
+  }
+
+  return lines.join('\n')
+}
+
 // Executes a full Curator Dream & Nightmare cycle over the daemon's reader and writer sockets.
 export async function runCuratorCycle({
   readerSocket,
   writerSocket = null,
   curatorSecretKey = null,
+  curatorSigner = null,
+  curatorPubkey: explicitCuratorPubkey = null,
   memoryGlobalChannelId = '',
   force = false,
   dryRun = false,
@@ -1091,7 +1146,13 @@ export async function runCuratorCycle({
       topicPressureThreshold,
     })
 
-    const curatorPubkey = curatorSecretKey ? getPublicKey(curatorSecretKey) : null
+    const curatorPubkey = explicitCuratorPubkey
+      ? String(explicitCuratorPubkey).toLowerCase()
+      : curatorSecretKey
+        ? getPublicKey(curatorSecretKey)
+        : curatorSigner
+          ? (curatorSigner.pubkey || (typeof curatorSigner.getPublicKey === 'function' ? await curatorSigner.getPublicKey() : null))
+          : null
     const plan = planMerkleDream({
       records,
       curatorPubkey,
@@ -1108,7 +1169,7 @@ export async function runCuratorCycle({
     const submitted = []
     const refused = []
     const triggerFired = Boolean(force || triggerEval.shouldRun)
-    const hasWriteCapability = Boolean(!dryRun && writerSocket && curatorSecretKey)
+    const hasWriteCapability = Boolean(!dryRun && writerSocket && (curatorSecretKey || curatorSigner))
 
     if (triggerFired && hasWriteCapability && plannedActions.length > 0) {
       const writer = createCuratorWriteClient(writerSocket)
@@ -1127,7 +1188,9 @@ export async function runCuratorCycle({
           if (expIdx >= 0) {
             adjustedTemplate.tags[expIdx] = ['exp', String(adjustedTemplate.created_at + DEFAULT_TTL_SEC)]
           }
-          const signed = finalizeEvent(adjustedTemplate, curatorSecretKey)
+          const signed = curatorSigner
+            ? await curatorSigner.signEvent(adjustedTemplate)
+            : finalizeEvent(adjustedTemplate, curatorSecretKey)
           const res = await writer.callWriteTool('memory_submit', {
             event: signed,
             expected_prior_id: expectedPriorId,
@@ -1190,6 +1253,16 @@ export async function runCuratorCycle({
     }
 
     const cycleOk = cycleStatus !== 'write_refused'
+    const briefing = formatCuratorBriefing({
+      cycleStatus,
+      triggers: triggerEval,
+      plan,
+      submitted,
+      refused,
+      coherence: resolvedCoherence,
+      lastCuratedWriteSeq: effectiveLastCuratedWriteSeq,
+      nextCuratedWriteSeq,
+    })
     return {
       ok: cycleOk,
       cycle_status: cycleStatus,
@@ -1208,6 +1281,7 @@ export async function runCuratorCycle({
       plan,
       submitted,
       refused,
+      briefing,
     }
   } finally {
     reader.close()
