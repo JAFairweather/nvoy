@@ -503,10 +503,13 @@ export function computeCoherence({
     entry.count += 1
     if (actor) entry.authors.add(actor)
   }
+  const nonCuratorRecentWriters = [...recentWriterIds].filter(w => w !== 'curator')
   const siloedRecentTopics = []
-  for (const [top, info] of recentTopicAuthors.entries()) {
-    if (info.count >= 3 && info.authors.size === 1) {
-      siloedRecentTopics.push(top)
+  if (nonCuratorRecentWriters.length >= 2) {
+    for (const [top, info] of recentTopicAuthors.entries()) {
+      if (info.count >= 3 && info.authors.size === 1) {
+        siloedRecentTopics.push(top)
+      }
     }
   }
 

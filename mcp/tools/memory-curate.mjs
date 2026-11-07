@@ -245,6 +245,301 @@ function sanitizeSlugPart(str) {
     .slice(0, 48) || 'cluster'
 }
 
+const CORE_EIGEN_TOPICS = new Set([
+  'herd-infra',
+  'hive-memory',
+  'r1',
+  'illustrated-primer',
+  'nvoy',
+  'waggle',
+  'buzz',
+  'hive',
+])
+
+function extractClaimFeatures(rec) {
+  const weights = new Map()
+  const add = (feat, w) => {
+    if (!feat) return
+    weights.set(feat, (weights.get(feat) || 0) + w)
+  }
+  const tokens = tokenize(`${rec.claim || ''} ${rec.because || ''}`)
+  for (const tok of tokens) {
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(tok) || /^[0-9a-f]{12,}$/i.test(tok)) continue
+    add(tok, 1.0)
+  }
+
+  const gitStr = `${rec.as_of_git || ''} ${(Array.isArray(rec.evidence) ? rec.evidence : []).join(' ')}`
+  const repoMatches = gitStr.match(/\b(nvoy|rabidrabbit|herd-infra|waggle)(?=@)/gi) || []
+  for (const rm of repoMatches) add(`repo:${rm.toLowerCase()}`, 2.4)
+
+  const pathMatches = gitStr.match(/\b(?:tools\/[a-z0-9_-]+|mcp\/tools|WONDER_LAB|r1-primer|illustrated-primer|xochitl)\b/gi) || []
+  for (const pm of pathMatches) add(`path:${pm.toLowerCase()}`, 2.0)
+
+  const subj = extractWorkSubject(rec)
+  if (subj && subj !== 'cluster' && subj !== 'item') add(`subj:${subj}`, 1.8)
+  return weights
+}
+
+// Computes the spectral principal components (eigenvectors + eigenvalues) of the active memory store's
+// topic-by-feature space via Power Iteration with Hotelling Deflation, and identifies fragmented or
+// mis-tagged topics that should reorganize into canonical eigen-topics during Dreaming.
+export function computeTopicEigenvectors(records = [], { maxComponents = 7 } = {}) {
+  const active = (Array.isArray(records) ? records : []).filter(
+    r => r && r.verification !== 'withdrawn' && r.status !== 'withdrawn' && r.scope !== 'hive:canon'
+  )
+  if (active.length === 0) {
+    return { eigenvectors: [], topic_map: {}, reorganizations: [], total_variance: 0 }
+  }
+
+  // 1. Build document frequency for IDF weighting and group claims by raw topic
+  const docFreq = new Map()
+  const claimFeatures = new Map()
+  const rawTopicGroups = new Map()
+
+  for (const r of active) {
+    const feats = extractClaimFeatures(r)
+    claimFeatures.set(r.event_id || r.d, feats)
+    for (const f of feats.keys()) {
+      docFreq.set(f, (docFreq.get(f) || 0) + 1)
+    }
+    const rawTop = String(r.topic || 'untagged').trim()
+    if (!rawTopicGroups.has(rawTop)) rawTopicGroups.set(rawTop, [])
+    rawTopicGroups.get(rawTop).push(r)
+  }
+
+  const N = active.length
+  const vocab = [...docFreq.entries()]
+    .filter(([f, df]) => df >= 2 || f.startsWith('repo:') || f.startsWith('path:'))
+    .map(([f]) => f)
+    .sort()
+  const vocabIndex = new Map(vocab.map((f, i) => [f, i]))
+  const F = vocab.length
+
+  const rawTopics = [...rawTopicGroups.keys()].sort((a, b) => {
+    const diff = rawTopicGroups.get(b).length - rawTopicGroups.get(a).length
+    return diff !== 0 ? diff : a.localeCompare(b)
+  })
+  const T = rawTopics.length
+
+  if (F === 0 || T === 0) {
+    return { eigenvectors: [], topic_map: {}, reorganizations: [], total_variance: 0 }
+  }
+
+  // 2. Build L2-normalized TF-IDF centroid vectors per topic: V[t][f]
+  const V = Array.from({ length: T }, () => new Float64Array(F))
+  const topicCounts = new Float64Array(T)
+
+  for (let ti = 0; ti < T; ti++) {
+    const top = rawTopics[ti]
+    const group = rawTopicGroups.get(top)
+    topicCounts[ti] = group.length
+    const vec = V[ti]
+    for (const r of group) {
+      const feats = claimFeatures.get(r.event_id || r.d)
+      if (!feats) continue
+      for (const [f, w] of feats.entries()) {
+        const fi = vocabIndex.get(f)
+        if (fi === undefined) continue
+        const idf = Math.log(1 + N / Math.max(1, docFreq.get(f) || 1))
+        vec[fi] += w * idf
+      }
+    }
+    let norm = 0
+    for (let fi = 0; fi < F; fi++) norm += vec[fi] * vec[fi]
+    norm = Math.sqrt(norm) || 1
+    for (let fi = 0; fi < F; fi++) vec[fi] /= norm
+  }
+
+  // 3. Build mass-weighted symmetric Topic Covariance Matrix C[i][j] = sqrt(n_i * n_j) * <V[i], V[j]>
+  const C = Array.from({ length: T }, () => new Float64Array(T))
+  let totalTrace = 0
+  for (let i = 0; i < T; i++) {
+    for (let j = i; j < T; j++) {
+      let dot = 0
+      for (let fi = 0; fi < F; fi++) dot += V[i][fi] * V[j][fi]
+      const val = Math.sqrt(topicCounts[i] * topicCounts[j]) * dot
+      C[i][j] = val
+      C[j][i] = val
+      if (i === j) totalTrace += val
+    }
+  }
+
+  // 4. Power Iteration + Hotelling Deflation to extract top K eigenvectors of C
+  const K = Math.min(maxComponents, T)
+  const W = C.map(row => Float64Array.from(row))
+  const eigenvectors = []
+  const usedCanonical = new Set()
+
+  for (let k = 0; k < K; k++) {
+    // Seed with row having largest remaining diagonal mass
+    let bestSeed = 0
+    let bestDiag = -1
+    for (let i = 0; i < T; i++) {
+      if (W[i][i] > bestDiag) {
+        bestDiag = W[i][i]
+        bestSeed = i
+      }
+    }
+    if (bestDiag <= 1e-6) break
+
+    let u = new Float64Array(T)
+    u[bestSeed] = 1
+    let lambda = 0
+
+    for (let iter = 0; iter < 45; iter++) {
+      const next = new Float64Array(T)
+      for (let i = 0; i < T; i++) {
+        let s = 0
+        for (let j = 0; j < T; j++) s += W[i][j] * u[j]
+        next[i] = s
+      }
+      let norm = 0
+      for (let i = 0; i < T; i++) norm += next[i] * next[i]
+      norm = Math.sqrt(norm)
+      if (norm <= 1e-9) break
+      lambda = norm
+      for (let i = 0; i < T; i++) u[i] = next[i] / norm
+    }
+
+    if (lambda <= 1e-5) break
+    // Orient sign convention so the highest-magnitude unused core topic (or overall max) is positive
+    let anchorIdx = -1
+    for (let i = 0; i < T; i++) {
+      const normTop = normalizeMemoryTopic(rawTopics[i])
+      if (normTop && CORE_EIGEN_TOPICS.has(normTop) && !usedCanonical.has(normTop)) {
+        if (anchorIdx < 0 || Math.abs(u[i]) > Math.abs(u[anchorIdx])) anchorIdx = i
+      }
+    }
+    if (anchorIdx < 0) {
+      anchorIdx = 0
+      for (let i = 1; i < T; i++) {
+        if (Math.abs(u[i]) > Math.abs(u[anchorIdx])) anchorIdx = i
+      }
+    }
+    if (u[anchorIdx] < 0) {
+      for (let i = 0; i < T; i++) u[i] = -u[i]
+    }
+
+    // Deflate W <- W - lambda * u * u^T
+    for (let i = 0; i < T; i++) {
+      for (let j = 0; j < T; j++) {
+        W[i][j] -= lambda * u[i] * u[j]
+      }
+    }
+
+    // Compute feature-space eigenvector projection: f_vec = sum_t (u[t] * sqrt(n_t) * V[t])
+    const fVec = new Float64Array(F)
+    for (let ti = 0; ti < T; ti++) {
+      if (u[ti] <= 0) continue
+      const scale = u[ti] * Math.sqrt(topicCounts[ti])
+      for (let fi = 0; fi < F; fi++) fVec[fi] += scale * V[ti][fi]
+    }
+    const topFeatures = []
+    for (let fi = 0; fi < F; fi++) {
+      if (fVec[fi] > 0.01) topFeatures.push({ feature: vocab[fi], weight: Math.round(fVec[fi] * 1000) / 1000 })
+    }
+    topFeatures.sort((a, b) => b.weight - a.weight)
+
+    const loadings = []
+    for (let ti = 0; ti < T; ti++) {
+      if (Math.abs(u[ti]) >= 0.04) {
+        loadings.push({
+          topic: rawTopics[ti],
+          count: topicCounts[ti],
+          loading: Math.round(u[ti] * 1000) / 1000,
+        })
+      }
+    }
+    loadings.sort((a, b) => Math.abs(b.loading) - Math.abs(a.loading))
+
+    // Pick the canonical topic name for this eigen-mode
+    const primaryLoading =
+      loadings.find(l => l.loading > 0 && CORE_EIGEN_TOPICS.has(normalizeMemoryTopic(l.topic)) && !usedCanonical.has(normalizeMemoryTopic(l.topic))) ||
+      loadings.find(l => l.loading > 0 && normalizeMemoryTopic(l.topic)) ||
+      loadings[0]
+    const canonicalTopic = normalizeMemoryTopic(primaryLoading?.topic) || primaryLoading?.topic || `eigen-${k + 1}`
+    usedCanonical.add(canonicalTopic)
+
+    eigenvectors.push({
+      axis: k + 1,
+      canonical_topic: canonicalTopic,
+      eigenvalue: Math.round(lambda * 100) / 100,
+      variance_pct: totalTrace > 0 ? Math.round((lambda / totalTrace) * 1000) / 10 : 0,
+      topic_loadings: loadings.slice(0, 6),
+      top_features: topFeatures.slice(0, 8).map(x => x.feature),
+    })
+  }
+
+  // 5. Build Topic Normalization Map & Reorganization Recommendations:
+  // Map fragmented/alias/outlier topics (count <= 3 or non-core) onto their highest-affinity core topic
+  const coreIndices = []
+  for (let ti = 0; ti < T; ti++) {
+    const norm = normalizeMemoryTopic(rawTopics[ti])
+    if (norm && rawTopics[ti] === norm && CORE_EIGEN_TOPICS.has(norm)) {
+      coreIndices.push(ti)
+    }
+  }
+
+  const topicMap = {}
+  const reorganizations = []
+
+  for (let ti = 0; ti < T; ti++) {
+    const rawTop = rawTopics[ti]
+    const aliasNorm = normalizeMemoryTopic(rawTop)
+    if (coreIndices.includes(ti)) {
+      topicMap[rawTop] = rawTop
+      continue
+    }
+    // Check cosine similarity against all core topic centroids
+    let bestCoreTopic = aliasNorm && CORE_EIGEN_TOPICS.has(aliasNorm) ? aliasNorm : null
+    let bestCosine = -1
+    let sharedBasis = []
+
+    for (const ci of coreIndices) {
+      let cos = 0
+      const shared = []
+      for (let fi = 0; fi < F; fi++) {
+        const prod = V[ti][fi] * V[ci][fi]
+        if (prod > 0) {
+          cos += prod
+          shared.push({ feature: vocab[fi], prod })
+        }
+      }
+      if (cos > bestCosine) {
+        bestCosine = cos
+        bestCoreTopic = rawTopics[ci]
+        shared.sort((a, b) => b.prod - a.prod)
+        sharedBasis = shared.slice(0, 5).map(s => s.feature)
+      }
+    }
+
+    const targetTopic =
+      aliasNorm && aliasNorm !== rawTop && CORE_EIGEN_TOPICS.has(aliasNorm)
+        ? aliasNorm
+        : bestCoreTopic || aliasNorm || 'hive-memory'
+
+    topicMap[rawTop] = targetTopic
+    if (targetTopic !== rawTop) {
+      const group = rawTopicGroups.get(rawTop) || []
+      reorganizations.push({
+        from_topic: rawTop,
+        to_topic: targetTopic,
+        claim_count: group.length,
+        cosine_affinity: Math.round(Math.max(0, bestCosine) * 1000) / 1000,
+        shared_features: sharedBasis,
+        event_ids: group.map(r => r.event_id).filter(Boolean),
+      })
+    }
+  }
+
+  return {
+    eigenvectors,
+    topic_map: topicMap,
+    reorganizations,
+    total_variance: Math.round(totalTrace * 100) / 100,
+  }
+}
+
 // Evaluates the 3 Dream & Nightmare triggers against current store state and telemetry.
 export function evaluateDreamTriggers({
   records = [],
@@ -322,9 +617,9 @@ export function evaluateDreamTriggers({
     typeof coherence === 'object' &&
     coherence.axes &&
     !epistemicBlindSpot &&
-    Number(coherence.delta_since_inception || 0) >= 0 &&
+    Number(coherence.delta_since_inception || 0) >= -5 &&
     Number(coherence.axes.grounding || 0) >= 80 &&
-    Number(coherence.axes.alignment || 0) >= 60
+    Number(coherence.axes.alignment || 0) >= 50
   const coherenceAlert = coherenceScore !== null && coherenceScore < 70 && !isHealthyComputedBaseline
 
   const nightmareInterrupt =
@@ -492,7 +787,14 @@ export function planMerkleDream({
     }
   }
 
-  // 2. Group non-conflicted Class A claims by (scope, topic, subject/similarity) for Stage 1 (Distillation) & Stage 2 (Promotion)
+  // 2. Stage 0: Spectral Topic Eigenvector Analysis & Topic Normalization
+  const spectral = computeTopicEigenvectors(active)
+  const resolveEigenTopic = rawTopic => {
+    const trimmed = String(rawTopic || '').trim()
+    return spectral.topic_map[trimmed] || normalizeMemoryTopic(trimmed) || 'hive-memory'
+  }
+
+  // 3. Group non-conflicted Class A claims by (scope, eigen-topic, subject/similarity) for Stage 1 (Distillation) & Stage 2 (Promotion)
   const distillations = []
   const promotions = []
   const classAByScopeTopic = new Map()
@@ -504,7 +806,7 @@ export function planMerkleDream({
     if (cleanCuratorPk && r.author_pubkey === cleanCuratorPk && String(r.d || '').includes(':curated-')) continue
     if (r.expires_at !== null && r.expires_at !== undefined) {
       const sc = String(r.scope || '')
-      const top = normalizeMemoryTopic(r.topic) || 'hive-memory'
+      const top = resolveEigenTopic(r.topic)
       const key = `${sc}::${top}`
       if (!classAByScopeTopic.has(key)) classAByScopeTopic.set(key, { scope: sc, topic: top, items: [] })
       classAByScopeTopic.get(key).items.push(r)
@@ -540,6 +842,9 @@ export function planMerkleDream({
       const nonWorkflowCount = sorted.filter(r => !isWorkflowSlug(parseFactKey(r.d)?.slug)).length
       const maxCreated = Math.max(...sorted.map(r => r.created_at || 0))
       const cleanSubj = sanitizeSlugPart(cl.subject)
+      const reorganizedFromTopics = [
+        ...new Set(sorted.map(r => String(r.topic || '').trim()).filter(t => t && t !== topic)),
+      ]
 
       // Stage 2 Promotion criterion: >=2 distinct authors (or >=3 non-workflow claims with >=3 evidence citations)
       // and at least one non-workflow claim with zero stale warnings -> Promote to Class B Durable Decision!
@@ -573,6 +878,7 @@ export function planMerkleDream({
           stage: 'promotion',
           scope,
           topic,
+          reorganized_from_topics: reorganizedFromTopics,
           slug,
           subject: cl.subject,
           source_event_ids: sourceIds,
@@ -610,6 +916,7 @@ export function planMerkleDream({
           stage: 'distillation',
           scope,
           topic,
+          reorganized_from_topics: reorganizedFromTopics,
           slug,
           subject: cl.subject,
           source_event_ids: sourceIds,
@@ -622,13 +929,13 @@ export function planMerkleDream({
     }
   }
 
-  // 3. Stage 3: Solidification — Nominate high-convergence Class B decisions for `hive:canon`
+  // 4. Stage 3: Solidification — Nominate high-convergence Class B decisions for `hive:canon`
   const solidifications = []
   const classBByTopic = new Map()
   for (const r of active) {
     if (r.scope === 'hive:canon' || conflictedFactKeys.has(r.d) || r.stale_warning) continue
     if (r.expires_at === null || r.expires_at === undefined || r.retention === 'decision') {
-      const top = normalizeMemoryTopic(r.topic) || 'hive-memory'
+      const top = resolveEigenTopic(r.topic)
       if (!classBByTopic.has(top)) classBByTopic.set(top, [])
       classBByTopic.get(top).push(r)
     }
@@ -665,11 +972,15 @@ export function planMerkleDream({
 
   return {
     planned_at: nowSec,
+    topic_eigenvectors: spectral.eigenvectors,
+    topic_reorganizations: spectral.reorganizations,
     distillations,
     promotions,
     solidifications,
     nightmares,
     summary: {
+      topic_eigenvectors: spectral.eigenvectors.length,
+      topic_reorganizations: spectral.reorganizations.length,
       distillations: distillations.length,
       promotions: promotions.length,
       solidifications: solidifications.length,

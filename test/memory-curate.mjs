@@ -27,6 +27,7 @@ import {
 } from '../mcp/tools/hive_memory_store.mjs'
 import { startMemoryDaemon } from '../mcp/tools/memory-daemon.mjs'
 import {
+  computeTopicEigenvectors,
   evaluateDreamTriggers,
   planMerkleDream,
   runCuratorCycle,
@@ -798,6 +799,99 @@ await test('CLI bin/hive-memory-curate.mjs requires write capability to advance 
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }
+})
+
+// ── Test 6: Spectral Topic Eigenvector Analysis & Topic Normalization in Dreaming ──
+await test('computeTopicEigenvectors extracts orthonormal eigen-axes and planMerkleDream normalizes fragmented topics', async () => {
+  const now = 1_780_000_000
+  const records = [
+    // Core topic: r1
+    {
+      event_id: 'e1'.padEnd(64, '0'),
+      pubkey: 'a'.repeat(64),
+      created_at: now - 300,
+      expires_at: now + 86400 * 7,
+      scope: `room:${ROOM_ID}`,
+      topic: 'r1',
+      d: `room:${ROOM_ID}:r1:wonder-lab-window24`,
+      claim: 'Rabbit R1 Window 24 displays Wonder-Lab notebook title and wheel hint in tools/r1-primer-ui/r1-primer-ui.c.',
+      evidence: ['git:rabidrabbit@cc85281c:tools/r1-primer-ui/r1-primer-ui.c'],
+      verification: 'accepted',
+      status: 'active',
+    },
+    {
+      event_id: 'e2'.padEnd(64, '0'),
+      pubkey: 'b'.repeat(64),
+      created_at: now - 250,
+      expires_at: now + 86400 * 7,
+      scope: `room:${ROOM_ID}`,
+      topic: 'r1',
+      d: `room:${ROOM_ID}:r1:wonder-lab-window24-review`,
+      claim: 'Rabbit R1 primer feed serves Wonder-Lab notebooks on Window 24 via tools/r1-primer-ui/r1-primer-ui.c.',
+      evidence: ['git:rabidrabbit@cc85281c:tools/r1-primer-ui/r1-primer-ui.c'],
+      verification: 'accepted',
+      status: 'active',
+    },
+    // Fragmented topic: wonder-lab (shares repo:rabidrabbit, tools/r1-primer-ui, Window 24, Wonder-Lab with r1)
+    {
+      event_id: 'e3'.padEnd(64, '0'),
+      pubkey: 'c'.repeat(64),
+      created_at: now - 200,
+      expires_at: now + 86400 * 7,
+      scope: `room:${ROOM_ID}`,
+      topic: 'wonder-lab',
+      d: `room:${ROOM_ID}:wonder-lab:wonder-lab-window24-status`,
+      claim: 'Wonder-Lab Window 24 header and wheel hint active on Rabbit R1 via tools/r1-primer-ui/r1-primer-ui.c.',
+      evidence: ['git:rabidrabbit@cc85281c:tools/r1-primer-ui/r1-primer-ui.c'],
+      verification: 'accepted',
+      status: 'active',
+    },
+    // Core topic: herd-infra
+    {
+      event_id: 'e4'.padEnd(64, '0'),
+      pubkey: 'a'.repeat(64),
+      created_at: now - 180,
+      expires_at: now + 86400 * 7,
+      scope: `room:${ROOM_ID}`,
+      topic: 'herd-infra',
+      d: `room:${ROOM_ID}:herd-infra:fleet-watchdog`,
+      claim: 'Herd-infra fleet watchdog monitors systemd services and tailscale health on herd-cloud.',
+      evidence: ['git:herd-infra@11111111:scripts/watchdog.sh'],
+      verification: 'accepted',
+      status: 'active',
+    },
+    // Fragmented alias topic: ops -> herd-infra
+    {
+      event_id: 'e5'.padEnd(64, '0'),
+      pubkey: 'b'.repeat(64),
+      created_at: now - 120,
+      expires_at: now + 86400 * 7,
+      scope: `room:${ROOM_ID}`,
+      topic: 'ops',
+      d: `room:${ROOM_ID}:ops:fleet-watchdog-status`,
+      claim: 'Ops fleet watchdog systemd check verified on herd-cloud.',
+      evidence: ['git:herd-infra@11111111:scripts/watchdog.sh'],
+      verification: 'accepted',
+      status: 'active',
+    },
+  ]
+
+  const eigen = computeTopicEigenvectors(records, { maxComponents: 4 })
+  assert(eigen.eigenvectors.length >= 2, 'must extract principal eigenvectors')
+  assert(eigen.eigenvectors[0].eigenvalue >= eigen.eigenvectors[1].eigenvalue, 'eigenvalues must be sorted descending')
+  assert.equal(eigen.topic_map['wonder-lab'], 'r1', 'wonder-lab maps to core eigen-topic r1 by spectral cosine affinity')
+  assert.equal(eigen.topic_map['ops'], 'herd-infra', 'ops maps to core eigen-topic herd-infra')
+  assert(eigen.reorganizations.some(r => r.from_topic === 'wonder-lab' && r.to_topic === 'r1'))
+
+  // Verify planMerkleDream uses eigen topic normalization so e1, e2 (topic: r1) and e3 (topic: wonder-lab) cluster together!
+  const plan = planMerkleDream({ records, nowSec: now })
+  assert(Array.isArray(plan.topic_eigenvectors) && plan.topic_eigenvectors.length >= 2)
+  assert(Array.isArray(plan.topic_reorganizations) && plan.topic_reorganizations.length >= 2)
+  assert.equal(plan.distillations.length, 2, 'cross-topic r1+wonder-lab and herd-infra+ops converge into 2 distilled claims')
+  const r1Dist = plan.distillations.find(d => d.topic === 'r1')
+  assert(r1Dist, 'r1 distillation present')
+  assert.equal(r1Dist.source_event_ids.length, 3, 'e1, e2 (r1) and e3 (wonder-lab) distilled together')
+  assert.deepEqual(r1Dist.reorganized_from_topics, ['wonder-lab'])
 })
 
 console.log(`\nResults: ${passed} passed, ${failed} failed`)
