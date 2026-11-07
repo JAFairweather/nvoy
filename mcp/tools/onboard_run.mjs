@@ -13,7 +13,19 @@ import { newestRequest, OnboardRefusal, parseSetupRequest } from './onboard_requ
 import { joinHive, joinRooms } from './onboard_join.mjs'
 import { profileRequestIdsPath, profileResultsPath, profileStatus, queueProfile } from './agent_profile.mjs'
 
-const PENDING_RELAY = 'the relay writer list is nave.pub #157; until it lands, add the key to deploy/relay/allowlist.json by PR'
+export const WRITERS_KIND = 30000, WRITERS_D = 'nave-relay-writers'
+
+// The newest owner writer list (nave.pub #157) decides whether the relay takes the agent's writes: by
+// NIP-01 order, a later created_at, then the lower id. Only a list that verifies counts.
+export function writerVerdict(read, { owners, pubkey, verify }) {
+  if (!read?.answered) return ['pending', 'the relay did not answer; trying again next run']
+  const lists = (read.events || []).filter(event => event?.kind === WRITERS_KIND && owners.includes(event.pubkey) &&
+    (event.tags || []).some(tag => tag[0] === 'd' && tag[1] === WRITERS_D) && verify(event))
+  const newest = lists.sort((a, b) => b.created_at - a.created_at || (a.id < b.id ? -1 : 1))[0]
+  if (newest && newest.tags.some(tag => tag[0] === 'p' && tag[1] === pubkey))
+    return ['done', `on the owner's writer list (${newest.id.slice(0, 12)}), so the relay takes its writes`]
+  return ['pending', newest ? 'not on the owner\'s newest writer list yet: sign it on the page (step 3)' : 'no owner writer list on the relay yet: sign it on the page (step 3)']
+}
 
 export function installed(root) {
   const manifests = new Map()
@@ -50,7 +62,8 @@ export function rewrite(root, id, change, { backupRoot, now }) {
 }
 
 export async function onboard({ command, name, root, out, stateDir, keysPath = '', giversRedeploy = false,
-  backupRoot = '/root', fetchEvents, runTool, joinWith, now = () => Date.now(), log = console.log }) {
+  backupRoot = '/root', fetchEvents, runTool, joinWith, now = () => Date.now(), log = console.log,
+  pair = null, report = null, readWriters = null, verify = () => false }) {
   if (!['show', 'run'].includes(command)) throw new OnboardRefusal('ONBOARD_USAGE', 'command is show or run')
   const ledger = join(stateDir, 'requests.jsonl')
   const rows = lines(ledger), seen = new Set(rows.filter(row => row.finished).map(row => row.id))
@@ -84,6 +97,12 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
     receipts.push(row); appendFileSync(receiptPath, JSON.stringify(row) + '\n'); log(`${state.padEnd(8)} ${step}: ${detail}`)
     return state === 'done'
   }
+  // Phase B: every row so far, this run's and earlier runs', goes to the owner after each step.
+  // A receipt that no relay takes is logged; it never changes a step's state.
+  const publish = async (extra = {}) => {
+    if (!report) return
+    try { await report({ request: add, rows: lines(receiptPath), ...extra }) } catch (error) { log(`warning  receipt not published: ${error.message}`) }
+  }
   const isInstalled = () => manifests.has(name)
   const stagedPath = join(out, `${name}.json`), stagedFor = join(out, `${name}.request`)
 
@@ -110,12 +129,16 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
       try { readManifest(out, name) } catch (error) { return receipt('staged', 'refused', error.message) }
       return receipt('staged', 'done', `staged like ${add.like} with its profile grant, for request ${add.id.slice(0, 12)}`)
     }],
-    ['paired', () => {
+    ['paired', async () => {
       if (isInstalled()) return receipt('paired', 'done', 'installed already')
       const staged = readManifest(out, name), seated = [staged.bunkerUriRef, staged.bunkerClientRef].filter(path => path && existsSync(path))
       if (seated.length === 2) return receipt('paired', 'done', 'both credential files are seated')
       if (seated.length) return receipt('paired', 'refused', 'only one credential file is seated; remove it and run again')
-      const code = runTool('instance-pair.mjs', ['--id', name, '--out', out])
+      // In watch mode the link goes only into a receipt sealed to the owner, while pairing waits.
+      let sent = null
+      const code = pair ? await pair({ name, out, onUri: (uri, expiresAt) => { sent = publish({ pairing: { uri, made_at: Math.floor(now() / 1000), expires_at: expiresAt } }) } })
+        : runTool('instance-pair.mjs', ['--id', name, '--out', out])
+      await sent
       return code === 0 ? receipt('paired', 'done', 'the Bunker signs as this agent') :
         receipt('paired', 'pending', 'not approved in the Bunker yet; run again to make a new link')
     }],
@@ -197,7 +220,11 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
       manifests = installed(root)
       return receipt('givers', outside.length ? 'pending' : 'done', `added ${name} to ${missing.map(giver => giver.seat).join(', ')}${tail}`)
     }],
-    ['relay writer', () => receipt('relay writer', 'pending', PENDING_RELAY)],
+    ['relay writer', async () => {
+      if (!readWriters) return receipt('relay writer', 'pending', 'not read: this run has no relay to read the owner\'s writer list from')
+      const [state, detail] = writerVerdict(await readWriters({ owners: [add.owner] }), { owners: [add.owner], pubkey: add.pubkey, verify })
+      return receipt('relay writer', state, detail)
+    }],
     ['hive', async () => {
       if (!isInstalled()) return receipt('hive', 'pending', 'waiting for the agent to start')
       const manifest = manifests.get(name)
@@ -219,6 +246,7 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
   try {
     for (const [index, [, step]] of steps.entries()) {
       const done = await step()
+      await publish()
       if (!done && index < 4) break
     }
   } finally { session?.close?.(); agentLink?.close?.() }
