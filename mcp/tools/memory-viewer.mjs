@@ -379,6 +379,14 @@ export function computeCoherence({
       history_complete: Boolean(history_complete),
       history_window: history_complete ? '90d-retained' : 'truncated-5000',
       axes: { alignment: 0, grounding: 0, convergence: 0, coupling: 0, consolidation: 0 },
+      epistemic_drift: {
+        score: 0,
+        status: 'empty',
+        zero_hit_queries: 0,
+        missed_topics: [],
+        silent_active_writers: [],
+        siloed_recent_topics: [],
+      },
       history: [],
     }
   }
@@ -429,10 +437,90 @@ export function computeCoherence({
   const current = history[history.length - 1]
   const inception = history[0]
   const activityList = Array.isArray(recent_activity) ? recent_activity : []
-  if (activityList.length > 0) {
-    const refusals = activityList.filter(a => a?.kind === 'refused').length
-    const gateHygiene = Math.max(0, 1 - refusals / activityList.length)
-    current.axes.coupling = Math.round((0.7 * current.axes.coupling + 0.3 * (gateHygiene * 100)) * 10) / 10
+
+  // Epistemic Drift & Blind-Spot Detection:
+  // Catches when agents query shared memory and get 0 matches (blind spots), when active writers wake/query
+  // repeatedly without sharing room claims (silent work drift), or when recent topics are siloed to a single author.
+  const recentNonCanon = chronological.filter(r => r && r.scope !== 'hive:canon' && r.status !== 'withdrawn').slice(-18)
+  const recentTopicAuthors = new Map()
+  const recentWriterIds = new Set()
+  for (const r of recentNonCanon) {
+    const actor = rosterByPk.get(String(r.author_pubkey || '')) || String(r.author_pubkey || '').slice(0, 8)
+    if (actor) recentWriterIds.add(actor)
+    const top = String(r.topic || '').trim()
+    if (!top) continue
+    let entry = recentTopicAuthors.get(top)
+    if (!entry) {
+      entry = { count: 0, authors: new Set() }
+      recentTopicAuthors.set(top, entry)
+    }
+    entry.count += 1
+    if (actor) entry.authors.add(actor)
+  }
+  const siloedRecentTopics = []
+  for (const [top, info] of recentTopicAuthors.entries()) {
+    if (info.count >= 3 && info.authors.size === 1) {
+      siloedRecentTopics.push(top)
+    }
+  }
+
+  let zeroHitQueries = 0
+  const missedTopicsSet = new Set()
+  const readsByActor = new Map()
+  const writesByActor = new Map()
+  for (const a of activityList) {
+    if (!a || typeof a !== 'object') continue
+    const actor = String(a.actor || '')
+    if (a.kind === 'query' || a.kind === 'wake' || a.kind === 'lookup') {
+      if (actor) readsByActor.set(actor, (readsByActor.get(actor) || 0) + 1)
+      if (a.kind === 'query' && a.count === 0) {
+        zeroHitQueries += 1
+        if (a.topic) missedTopicsSet.add(String(a.topic))
+      }
+    } else if (a.kind === 'submit' && a.accepted !== false) {
+      if (actor) writesByActor.set(actor, (writesByActor.get(actor) || 0) + 1)
+    }
+  }
+
+  const writerIdSet = new Set(
+    (Array.isArray(agent_roster) ? agent_roster : []).filter(a => a?.is_writer && a?.id).map(a => a.id)
+  )
+  const silentActiveWriters = []
+  for (const [actor, readCount] of readsByActor.entries()) {
+    if (writerIdSet.has(actor) && readCount >= 4 && !writesByActor.has(actor) && !recentWriterIds.has(actor)) {
+      silentActiveWriters.push(actor)
+    }
+  }
+
+  const missedTopics = [...missedTopicsSet]
+  const epistemicPenalty = Math.min(
+    65,
+    zeroHitQueries * 16 + silentActiveWriters.length * 12 + siloedRecentTopics.length * 8
+  )
+  const epistemicScore = Math.max(0, Math.round((100 - epistemicPenalty) * 10) / 10)
+  const epistemicStatus =
+    zeroHitQueries >= 2 || epistemicPenalty >= 28
+      ? 'blind_spot'
+      : epistemicPenalty > 0
+        ? 'drifting'
+        : 'aligned'
+
+  if (activityList.length > 0 || siloedRecentTopics.length > 0) {
+    if (activityList.length > 0) {
+      const refusals = activityList.filter(a => a?.kind === 'refused').length
+      const gateHygiene = Math.max(0, 1 - refusals / activityList.length)
+      const silencePenalty = silentActiveWriters.length * 12 + zeroHitQueries * 6
+      const liveCoupling = Math.max(0, gateHygiene * 100 - silencePenalty)
+      current.axes.coupling = Math.round((0.7 * current.axes.coupling + 0.3 * liveCoupling) * 10) / 10
+    }
+    if (zeroHitQueries > 0 || siloedRecentTopics.length > 0) {
+      const convPenalty = Math.min(45, zeroHitQueries * 14 + siloedRecentTopics.length * 8)
+      current.axes.convergence = Math.max(0, Math.round((current.axes.convergence - convPenalty) * 10) / 10)
+    }
+    if (missedTopics.length > 0) {
+      const alignPenalty = Math.min(30, missedTopics.length * 10)
+      current.axes.alignment = Math.max(0, Math.round((current.axes.alignment - alignPenalty) * 10) / 10)
+    }
     current.score = Math.round((
       0.25 * current.axes.alignment +
       0.2 * current.axes.grounding +
@@ -452,6 +540,14 @@ export function computeCoherence({
     history_complete: Boolean(history_complete),
     history_window: history_complete ? '90d-retained' : 'truncated-5000',
     axes: current.axes,
+    epistemic_drift: {
+      score: epistemicScore,
+      status: epistemicStatus,
+      zero_hit_queries: zeroHitQueries,
+      missed_topics: missedTopics,
+      silent_active_writers: silentActiveWriters,
+      siloed_recent_topics: siloedRecentTopics,
+    },
     history,
   }
 }

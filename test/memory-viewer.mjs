@@ -379,6 +379,29 @@ await test('computeCoherence calculates 5-axis HCI score and retroactive incepti
   })
   const step5 = coh4.history.find(h => h.events === 5)
   assert.equal(step5.claims, 4, 'at step 5 (t=110), c2 is active and consolidates c1 via supersedes even after c2 later expires')
+
+  // Verify epistemic drift & blind-spot detection: zero-hit queries and silent active writers dip coherence
+  const cohDrift = computeCoherence({
+    records,
+    agent_roster: [
+      ...roster,
+      { id: 'biggy', pubkey: '4'.repeat(64), is_writer: true },
+    ],
+    recent_activity: [
+      { kind: 'wake', actor: 'biggy' },
+      { kind: 'query', actor: 'biggy', count: 2, topic: 'r1' },
+      { kind: 'lookup', actor: 'biggy' },
+      { kind: 'wake', actor: 'biggy' },
+      { kind: 'query', actor: 'mc-claude', count: 0, topic: 'wonder-lab' },
+      { kind: 'query', actor: 'mydude', count: 0, topic: 'wonder-lab' },
+    ],
+    store_state: { write_seq: 6 },
+  })
+  assert.equal(cohDrift.epistemic_drift.status, 'blind_spot')
+  assert.equal(cohDrift.epistemic_drift.zero_hit_queries, 2)
+  assert.deepEqual(cohDrift.epistemic_drift.missed_topics, ['wonder-lab'])
+  assert.deepEqual(cohDrift.epistemic_drift.silent_active_writers, ['biggy'])
+  assert(cohDrift.score < coh.score, `coherence must dip on epistemic blind spots (${cohDrift.score} < ${coh.score})`)
 })
 
 await test('computeAgentHealth: classifies 5m active, 5-20m warm, >20m stale, error, and preserves telemetry across rollover', () => {
