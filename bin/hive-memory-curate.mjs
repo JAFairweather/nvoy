@@ -2,7 +2,6 @@
 // bin/hive-memory-curate.mjs — CLI runner for the Phase 2 Merkle Dreaming & Curation Engine.
 
 import { readFileSync } from 'node:fs'
-import { hexToBytes } from '@noble/hashes/utils'
 import { runCuratorCycle } from '../mcp/tools/memory-curate.mjs'
 
 function parseArgs(argv) {
@@ -10,6 +9,11 @@ function parseArgs(argv) {
     readerSocket: null,
     writerSocket: null,
     keyFile: null,
+    stateFile: undefined,
+    lastCuratedAt: null,
+    lastCuratedWriteSeq: null,
+    coherenceScore: null,
+    nowSec: null,
     globalChannelId: '',
     force: false,
     dryRun: false,
@@ -22,6 +26,11 @@ function parseArgs(argv) {
     if (a === '--reader-socket') out.readerSocket = argv[++i]
     else if (a === '--writer-socket') out.writerSocket = argv[++i]
     else if (a === '--key-file') out.keyFile = argv[++i]
+    else if (a === '--state-file') out.stateFile = argv[++i]
+    else if (a === '--last-curated-at') out.lastCuratedAt = Number(argv[++i])
+    else if (a === '--last-curated-write-seq') out.lastCuratedWriteSeq = Number(argv[++i])
+    else if (a === '--coherence-score') out.coherenceScore = Number(argv[++i])
+    else if (a === '--now-sec') out.nowSec = Number(argv[++i])
     else if (a === '--global-channel-id') out.globalChannelId = argv[++i]
     else if (a === '--force') out.force = true
     else if (a === '--dry-run') out.dryRun = true
@@ -35,13 +44,13 @@ function parseArgs(argv) {
 async function main() {
   const opts = parseArgs(process.argv.slice(2))
   if (!opts.readerSocket) {
-    console.error('Usage: hive-memory-curate --reader-socket <path> [--writer-socket <path>] [--key-file <hex-file>] [--global-channel-id <uuid>] [--force] [--dry-run]')
+    console.error('Usage: hive-memory-curate --reader-socket <path> [--writer-socket <path>] [--key-file <hex-file>] [--state-file <path>] [--global-channel-id <uuid>] [--force] [--dry-run]')
     process.exit(2)
   }
   let sk = null
   if (opts.keyFile) {
     const raw = readFileSync(opts.keyFile, 'utf8').trim()
-    sk = hexToBytes(raw)
+    sk = new Uint8Array(Buffer.from(raw, 'hex'))
   }
   const result = await runCuratorCycle({
     readerSocket: opts.readerSocket,
@@ -50,9 +59,14 @@ async function main() {
     memoryGlobalChannelId: opts.globalChannelId,
     force: opts.force,
     dryRun: opts.dryRun,
+    stateFile: opts.stateFile,
+    lastCuratedAt: opts.lastCuratedAt,
+    lastCuratedWriteSeq: opts.lastCuratedWriteSeq,
+    coherence: opts.coherenceScore !== null ? { score: opts.coherenceScore } : null,
     dreamIntervalSec: opts.dreamIntervalSec,
     writeDeltaThreshold: opts.writeDeltaThreshold,
     topicPressureThreshold: opts.topicPressureThreshold,
+    ...(opts.nowSec !== null && Number.isFinite(opts.nowSec) ? { nowSec: opts.nowSec } : {}),
   })
   console.log(JSON.stringify(result, null, 2))
 }
