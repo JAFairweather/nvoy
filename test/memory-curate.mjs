@@ -30,6 +30,7 @@ import {
   computeTopicEigenvectors,
   evaluateDreamTriggers,
   planMerkleDream,
+  readCuratorStateFile,
   runCuratorCycle,
 } from '../mcp/tools/memory-curate.mjs'
 
@@ -892,6 +893,78 @@ await test('computeTopicEigenvectors extracts orthonormal eigen-axes and planMer
   assert(r1Dist, 'r1 distillation present')
   assert.equal(r1Dist.source_event_ids.length, 3, 'e1, e2 (r1) and e3 (wonder-lab) distilled together')
   assert.deepEqual(r1Dist.reorganized_from_topics, ['wonder-lab'])
+
+  // Zero-overlap regression: an unrelated topic ('astro') with zero cosine affinity must remain intact ('astro')
+  const withUnrelated = [
+    ...records,
+    {
+      event_id: 'e6'.padEnd(64, '0'),
+      pubkey: 'd'.repeat(64),
+      created_at: now - 100,
+      expires_at: now + 86400 * 7,
+      scope: `room:${ROOM_ID}`,
+      topic: 'astro',
+      d: `room:${ROOM_ID}:astro:quasar-redshift`,
+      claim: 'Quasar spectroscopy measures Lyman-alpha forest absorption lines at high redshift.',
+      evidence: ['doi:10.1086/quasar-lyman-alpha'],
+      verification: 'accepted',
+      status: 'active',
+    },
+  ]
+  const eigenUnrelated = computeTopicEigenvectors(withUnrelated, { maxComponents: 4 })
+  assert.equal(eigenUnrelated.topic_map.astro, 'astro', 'zero-overlap topic astro must not be mapped to a core topic')
+  assert.equal(
+    eigenUnrelated.reorganizations.some(r => r.from_topic === 'astro'),
+    false,
+    'zero-overlap topic astro must not appear in reorganizations'
+  )
+})
+
+// ── Test 7: Fail-closed malformed state cursors, initial temporal trigger, and incomplete-history write gate ──
+await test('readCuratorStateFile fails closed on malformed cursors and runCuratorCycle blocks writes on incomplete history', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'hive-curate-safety-'))
+  try {
+    const badStatePath = join(tmp, 'bad-cursor.json')
+    writeFileSync(badStatePath, JSON.stringify({ last_curated_at: 'garbage', last_curated_write_seq: 10 }))
+    assert.throws(
+      () => readCuratorStateFile(badStatePath),
+      (err) => err && err.code === 'HIVE_MEMORY_CURATOR_STATE_READ_FAILED',
+      'malformed last_curated_at must fail closed'
+    )
+
+    const badSeqPath = join(tmp, 'bad-seq.json')
+    writeFileSync(badSeqPath, JSON.stringify({ last_curated_at: 100, last_curated_write_seq: -5 }))
+    assert.throws(
+      () => readCuratorStateFile(badSeqPath),
+      (err) => err && err.code === 'HIVE_MEMORY_CURATOR_STATE_READ_FAILED',
+      'negative last_curated_write_seq must fail closed'
+    )
+
+    // Initial temporal trigger when lastCuratedAt === 0 and earliest record is older than dreamIntervalSec
+    const now = 1_780_000_000
+    const initialTrig = evaluateDreamTriggers({
+      records: [
+        {
+          event_id: 'f1'.padEnd(64, '0'),
+          created_at: now - 30000,
+          expires_at: now + 86400,
+          scope: `room:${ROOM_ID}`,
+          topic: 'nvoy',
+          d: `room:${ROOM_ID}:nvoy:init`,
+          verification: 'accepted',
+          status: 'active',
+        },
+      ],
+      storeState: { write_seq: 5 },
+      lastCuratedAt: 0,
+      lastCuratedWriteSeq: 0,
+      nowSec: now,
+      dreamIntervalSec: 21600,
+    })
+    assert.equal(initialTrig.triggers.circadian_dream, true, 'initial circadian_dream fires when store age >= dreamIntervalSec')
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
 })
 
 console.log(`\nResults: ${passed} passed, ${failed} failed`)
