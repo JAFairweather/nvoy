@@ -16,6 +16,7 @@ import {
   diffViewerSnapshots,
   readWatchStatus,
   watchAlert,
+  watchView,
   WATCH_STALE_SEC,
   escapeHtml,
   parseListenTarget,
@@ -766,6 +767,13 @@ await test('the health check status shows saving off, partly off, stale or unrea
     assert.equal(watchAlert(open, now), null)
     const stale = readWatchStatus(write({ at: now - WATCH_STALE_SEC - 60, writers: { biggy: 'open' }, problems: [] }), now)
     assert.match(watchAlert(stale, now), /last reported 16 min ago/)
+    const staleOff = join(tmp, 'stale-off.json')
+    writeFileSync(staleOff, JSON.stringify({ at: now - WATCH_STALE_SEC - 60, writers: { biggy: 'FENCED', neil: 'FENCED' }, problems: [] }))
+    const so = watchView(now, staleOff)
+    assert.equal(so.alert, 'The health check last reported 16 min ago (it then said saving was OFF): saving cannot be confirmed',
+      'a stale OFF report is not shown as the current state')
+    assert.equal(so.hard, false, 'a stale report is amber, not red')
+    assert.equal(watchView(now, write({ at: now, writers: { biggy: 'FENCED' }, problems: [] })).hard, true, 'a fresh OFF report is red')
     const old = readWatchStatus(write({ at: now, readers: { hr: 'ok' }, problems: [] }), now)
     assert.match(watchAlert(old, now), /does not report writers/, 'a watch without the writers check is not taken as saving open')
     assert.match(watchAlert(readWatchStatus(join(tmp, 'missing.json'), now), now), /has not reported/)

@@ -465,20 +465,22 @@ export function readWatchStatus(path = WATCH_STATUS_PATH, nowSec = Math.floor(Da
   return { at, stale: at === null || nowSec - at > WATCH_STALE_SEC, saving, writers, fenced, problems }
 }
 
-function watchView(nowSec) {
-  const watch = readWatchStatus(undefined, nowSec)
-  return { ...watch, alert: watchAlert(watch, nowSec), hard: watch.saving === 'OFF' || watch.saving === 'partial' }
+export function watchView(nowSec, path = undefined) {
+  const watch = readWatchStatus(path, nowSec)
+  return { ...watch, alert: watchAlert(watch, nowSec), hard: !watch.stale && (watch.saving === 'OFF' || watch.saving === 'partial') }
 }
 
 export function watchAlert(watch, nowSec = Math.floor(Date.now() / 1000)) {
   if (!watch) return null
+  // A stale report says nothing about now: name its age and what it last said, never claim it as the current state.
+  if (watch.stale) {
+    if (watch.at === null) return 'The health check has not reported: saving cannot be confirmed'
+    const last = watch.saving === 'OFF' ? ' (it then said saving was OFF)'
+      : watch.saving === 'partial' ? ` (it then said saving was off for ${watch.fenced.join(', ')})` : ''
+    return `The health check last reported ${Math.round((nowSec - watch.at) / 60)} min ago${last}: saving cannot be confirmed`
+  }
   if (watch.saving === 'OFF') return `SAVING IS OFF: all ${watch.fenced.length} writers are fenced, so every save is refused`
   if (watch.saving === 'partial') return `Saving is off for ${watch.fenced.join(', ')}: their saves are refused`
-  if (watch.stale) {
-    return watch.at === null
-      ? 'The health check has not reported: saving cannot be confirmed'
-      : `The health check last reported ${Math.round((nowSec - watch.at) / 60)} min ago: saving cannot be confirmed`
-  }
   if (watch.saving === 'unknown') return 'The health check does not report writers: saving cannot be confirmed'
   if (watch.problems.length) return `Health check: ${watch.problems[0]}`
   return null
