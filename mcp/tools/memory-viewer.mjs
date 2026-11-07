@@ -281,10 +281,52 @@ function evaluateCoherenceSlice(slice, rosterByPk, expectedRosterSize, writeSeqE
   for (const set of artifactAuthors.values()) {
     if (set.size >= 2) sharedRefs += 1
   }
-  const convergence = Math.round(Math.min(100, sharedRefs * 8.5) * 10) / 10
+  // Coherence 2.0 Convergence: blends cumulative cross-author artifact density (which scales with store size
+  // rather than saturating permanently at 12 refs) with recent-window cross-agent topic corroboration.
+  const targetSharedRefs = slice.length <= 15 ? Math.max(1, slice.length * 0.4) : Math.max(6, nonCanon.length * 0.14)
+  const refDensityScore = Math.min(100, (sharedRefs / targetSharedRefs) * 100)
 
+  const recentNonCanon = nonCanon.slice(-18)
+  const recentTopics = new Map()
+  const recentAuthors = new Set()
+  for (const r of recentNonCanon) {
+    const pk = String(r.author_pubkey || '')
+    const actor = rosterByPk.get(pk) || pk.slice(0, 8) || 'unknown'
+    recentAuthors.add(actor)
+    const top = String(r.topic || 'general')
+    let set = recentTopics.get(top)
+    if (!set) {
+      set = { count: 0, authors: new Set() }
+      recentTopics.set(top, set)
+    }
+    set.count += 1
+    set.authors.add(actor)
+  }
+  let multiClaimTopics = 0
+  let corroboratedTopics = 0
+  let siloedTopics = 0
+  for (const info of recentTopics.values()) {
+    if (info.count >= 2) {
+      multiClaimTopics += 1
+      if (info.authors.size >= 2) corroboratedTopics += 1
+      else if (info.count >= 3) siloedTopics += 1
+    }
+  }
+  const topicCorroboration =
+    multiClaimTopics > 0
+      ? Math.max(0, (corroboratedTopics / multiClaimTopics) * 100 - siloedTopics * 12)
+      : recentNonCanon.length <= 2
+        ? refDensityScore
+        : 65
+  const convergence = Math.round((0.6 * refDensityScore + 0.4 * topicCorroboration) * 10) / 10
+
+  // Coherence 2.0 Coupling: blends cumulative roster breadth (55%) with active-window author participation (45%)
+  // so coupling dips when only 1-2 agents write a burst of claims while the rest of the Hive is silent.
   const denomAuthors = Math.max(1, Math.min(14, expectedRosterSize || 14))
-  const coupling = Math.round(Math.min(100, (authors.size / denomAuthors) * 100) * 10) / 10
+  const cumulativeCoupling = Math.min(100, (authors.size / denomAuthors) * 100)
+  const windowTargetAuthors = Math.max(1, Math.min(denomAuthors, Math.min(6, recentNonCanon.length || 1)))
+  const windowCoupling = Math.min(100, (recentAuthors.size / windowTargetAuthors) * 100)
+  const coupling = Math.round((0.55 * cumulativeCoupling + 0.45 * windowCoupling) * 10) / 10
 
   const durableCount = slice.filter(r => r.scope === 'hive:canon' || r.expires_at === null || r.expires_at === undefined).length
   const durableRatio = durableCount / slice.length
@@ -391,9 +433,14 @@ export function computeCoherence({
   }
 
   const total = chronological.length
-  const rawSteps = [1, 5, 10, 20, 30, 40, 50, 65, 80, 100, 125, 150, total]
+  const extraSteps = []
+  if (total > 150) {
+    for (let s = 170; s < total; s += 15) extraSteps.push(s)
+    if (total > 12) extraSteps.push(total - 8, total - 4)
+  }
+  const rawSteps = [1, 5, 10, 20, 30, 40, 50, 65, 80, 100, 125, 150, ...extraSteps, total]
   const uniqueSteps = [...new Set(rawSteps.filter(k => k >= 1 && k <= total))].sort((a, b) => a - b)
-  while (uniqueSteps.length > 10) {
+  while (uniqueSteps.length > 14) {
     uniqueSteps.splice(1, 1)
   }
   if (uniqueSteps[uniqueSteps.length - 1] !== total) uniqueSteps.push(total)
@@ -467,14 +514,24 @@ export function computeCoherence({
   const missedTopicsSet = new Set()
   const readsByActor = new Map()
   const writesByActor = new Map()
-  for (const a of activityList) {
+  for (let idx = 0; idx < activityList.length; idx++) {
+    const a = activityList[idx]
     if (!a || typeof a !== 'object') continue
     const actor = String(a.actor || '')
     if (a.kind === 'query' || a.kind === 'wake' || a.kind === 'lookup') {
       if (actor) readsByActor.set(actor, (readsByActor.get(actor) || 0) + 1)
-      if (a.kind === 'query' && a.count === 0) {
-        zeroHitQueries += 1
-        if (a.topic) missedTopicsSet.add(String(a.topic))
+      if (a.kind === 'query' && a.count === 0 && actor !== 'curator' && actor !== 'viewer' && a.topic) {
+        missedTopicsSet.add(String(a.topic))
+        const resolvedSoon = activityList.slice(idx + 1, idx + 12).some(
+          next =>
+            next &&
+            next.actor === actor &&
+            ((next.kind === 'query' && Number(next.count) > 0) ||
+              (next.kind === 'submit' && next.accepted !== false))
+        )
+        if (!resolvedSoon) {
+          zeroHitQueries += 1
+        }
       }
     } else if (a.kind === 'submit' && a.accepted !== false) {
       if (actor) writesByActor.set(actor, (writesByActor.get(actor) || 0) + 1)
