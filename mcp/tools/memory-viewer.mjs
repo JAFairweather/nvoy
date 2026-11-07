@@ -11,7 +11,7 @@
 //      and sets a strict Content-Security-Policy (`default-src 'none'`).
 //   4. Listen address and port come from CLI flags (`--host <addr> --port <port>` or `--listen <addr>:<port>`).
 //   5. The viewer's memory_wake also carries the daemon's metadata-only activity ring and agent roster, which
-//      drive the cortex canvas. Its simulation controls animate locally and never call the server.
+//      drive the cortex canvas and live Merkle Dreaming & 3-Trigger Curation telemetry.
 
 import { readFileSync } from 'node:fs'
 import { createServer as createHttpServer } from 'node:http'
@@ -1438,11 +1438,10 @@ export function renderViewerHtml(initialState) {
 
   <div class="hud-bottom graph-only">
     <div class="control-bar sim-bar panel">
-      <span class="sim-label">Simulation · local animation only, nothing is sent</span>
-      <button class="btn sim" id="btn-sim-write" type="button">Sim write</button>
-      <button class="btn sim" id="btn-sim-recall" type="button">Sim recall</button>
-      <button class="btn sim" id="btn-sim-consolidate" type="button">Merkle Dreaming · Curation</button>
-      <button class="btn sim" id="btn-sim-refuse" type="button">Sim refusal</button>
+      <span class="sim-label" id="dream-bar-status">Merkle Dreaming · Live 3-Trigger Curation Engine</span>
+      <button class="btn sim" id="btn-dream-consolidate" type="button">Merkle Dreaming · Curation</button>
+      <button class="btn sim" id="btn-dream-triggers" type="button">3-Trigger Status</button>
+      <button class="btn sim" id="btn-dream-coherence" type="button">5-Axis Coherence</button>
     </div>
     <div class="control-bar panel">
       <label for="time-slider">Time-decay forecast</label>
@@ -1457,7 +1456,7 @@ export function renderViewerHtml(initialState) {
     <button class="dock-btn active" id="dock-graph" type="button">Cortex</button>
     <button class="dock-btn" id="dock-agents" type="button">Agents</button>
     <button class="dock-btn" id="dock-pulses" type="button">Pulses</button>
-    <button class="dock-btn" id="dock-tools" type="button">Sim / Time</button>
+    <button class="dock-btn" id="dock-tools" type="button">Dream / Time</button>
     <button class="dock-btn" id="dock-cards" type="button">Cards</button>
   </nav>
 
@@ -1935,14 +1934,25 @@ export function renderViewerHtml(initialState) {
             if (covered[n.rec.event_id]) return;
             var author = agentByPubkey(n.rec.author_pubkey);
             if (author) writeComet(author, n);
+            if (n.rec.merkle_sources && !consolidator) {
+              var top = topicById(topicOf(n.rec));
+              var srcIds = Array.isArray(n.rec.merkle_sources.event_ids) ? n.rec.merkle_sources.event_ids : [];
+              var srcNodes = srcIds.map(function (id) { return nodeByEventId(id); }).filter(Boolean);
+              if (top) {
+                consolidator = { topic: top, targets: srcNodes.length ? srcNodes : [n], x: top.x, y: top.y, progress: 0 };
+                logStream('write', 'MERKLE DREAMING verified curation in ' + String(n.rec.scope || 'hive') + ' #' + top.id + ' (root ' + String(n.rec.merkle_sources.root || '').slice(0, 12) + '…)', n.rec.created_at);
+              }
+            }
           });
         }
+        updateDreamBarStatus();
+        if (selected && selected.type === 'dreaming') selected.data = computeDreamingTelemetry();
         renderAgentRoster();
         updateTiers();
         renderInspector();
       }
 
-      // --- Pulses: real activity from the ring, or local simulations ---
+      // --- Pulses: real activity from the ring and live Merkle Dreaming curation ---
 
       function writeComet(agent, node) {
         agent.energy = 1;
@@ -2011,32 +2021,6 @@ export function renderViewerHtml(initialState) {
         el('pulse-counter').textContent = pulseTotal + (pulseTotal === 1 ? ' pulse' : ' pulses');
       }
 
-      function pickAgent(filter) {
-        if (selected && selected.type === 'agent' && (!filter || filter(selected.data))) return selected.data;
-        var pool = agents.filter(function (a) { return !filter || filter(a); });
-        if (!pool.length) pool = agents;
-        return pool.length ? pool[Math.floor(Math.random() * pool.length)] : null;
-      }
-
-      function simWrite() {
-        var agent = pickAgent(function (a) { return a.is_writer; });
-        if (!agent) return logStream('sim', 'SIM write: no agents to animate');
-        var pool = nodes.filter(function (n) { return !isCanon(n.rec); });
-        var target = pool.length ? pool[Math.floor(Math.random() * pool.length)] : null;
-        writeComet(agent, target);
-        logStream('sim', 'SIM write comet: ' + agent.name + ' -> ' + (target ? slugOf(target.rec) : 'core') + ' (nothing written)');
-      }
-
-      function simRecall() {
-        var agent = pickAgent(null);
-        if (!agent) return logStream('sim', 'SIM recall: no agents to animate');
-        var focus = topics.length ? topics[Math.floor(Math.random() * topics.length)].id : null;
-        var recalled = nodes.filter(function (n) { return isCanon(n.rec) || topicOf(n.rec) === focus; }).slice(0, 6);
-        if (!recalled.length) recallWave(agent, null);
-        recalled.forEach(function (n) { recallWave(agent, n); });
-        logStream('sim', 'SIM recall wave: ' + agent.name + ' <- ' + recalled.length + ' engrams (nothing queried)');
-      }
-
       function isWorkflowCheckpoint(rec) {
         return /-(?:review|status|owner|wip|handoff)$/.test(slugOf(rec));
       }
@@ -2099,7 +2083,25 @@ export function renderViewerHtml(initialState) {
         };
       }
 
-      function simConsolidate() {
+      function updateDreamBarStatus() {
+        var bar = el('dream-bar-status');
+        if (!bar) return;
+        var d = computeDreamingTelemetry();
+        var readyCount = (d.topicList || []).filter(function (t) { return t.ready; }).length;
+        var maxCluster = (d.topicList && d.topicList.length) ? d.topicList[0].count : 0;
+        if (d.nightmareCount > 0) {
+          bar.textContent = 'NIGHTMARE INTERRUPT (' + d.nightmareCount + ') · ' + d.merkleCount + ' Merkle roots · -' + d.wakeSavings + '% wake';
+          bar.style.color = '#f87171';
+        } else if (readyCount > 0) {
+          bar.textContent = 'READY TO CURATE (' + readyCount + ' cluster' + (readyCount === 1 ? '' : 's') + ' >8) · ' + d.merkleCount + ' Merkle roots · -' + d.wakeSavings + '% wake';
+          bar.style.color = '#fbbf24';
+        } else {
+          bar.textContent = 'Circadian 6h · Max cluster ' + maxCluster + '/8 · ' + d.merkleCount + ' Merkle roots · -' + d.wakeSavings + '% wake';
+          bar.style.color = '#94a3b8';
+        }
+      }
+
+      function openDreamingInspector() {
         var best = null;
         var bestNodes = [];
         var bestScope = null;
@@ -2121,22 +2123,31 @@ export function renderViewerHtml(initialState) {
             }
           });
         });
-        selected = { type: 'dreaming', data: computeDreamingTelemetry() };
+        var d = computeDreamingTelemetry();
+        selected = { type: 'dreaming', data: d };
         hovered = null;
         if (width <= 1024) setDrawer('none');
         renderAgentRoster();
         renderInspector();
         if (!consolidator && best && bestNodes.length >= 2) {
           consolidator = { topic: best, targets: bestNodes.slice(0, 5), x: best.x, y: best.y, progress: 0 };
-          logStream('sim', 'MERKLE DREAMING curation in ' + bestScope + ' #' + best.id + ': folding ' + consolidator.targets.length + ' Class A claims (nothing written)');
+          logStream('lookup', 'MERKLE DREAMING focus: ' + bestScope + ' #' + best.id + ' (' + bestNodes.length + ' active Class A claims · ' + d.merkleCount + ' verified Merkle roots)');
         }
       }
 
-      function simRefuse() {
-        var agent = pickAgent(function (a) { return !a.is_writer; });
-        if (!agent) return logStream('sim', 'SIM refusal: no agents to animate');
-        refusalProbe(agent);
-        logStream('sim', 'SIM refusal shield at ' + agent.name + ' gate (nothing sent)');
+      function inspectDreamTriggers() {
+        var d = computeDreamingTelemetry();
+        var readyClusters = (d.topicList || []).filter(function (t) { return t.ready; });
+        var maxTopic = (d.topicList && d.topicList.length) ? (d.topicList[0].label + ' (' + d.topicList[0].count + '/8)') : 'none';
+        selected = { type: 'dreaming', data: d };
+        hovered = null;
+        if (width <= 1024) setDrawer('none');
+        renderAgentRoster();
+        renderInspector();
+        logStream(
+          d.nightmareCount > 0 ? 'refuse' : 'recall',
+          '3-TRIGGER ENGINE · Circadian: 6h | Volume: ' + readyClusters.length + ' ready (top: ' + maxTopic + ') | Nightmares: ' + d.nightmareCount + ' | Merkle roots: ' + d.merkleCount
+        );
       }
 
       // --- HUD: roster, tiers and inspector (record text only ever via textContent) ---
@@ -2704,7 +2715,7 @@ export function renderViewerHtml(initialState) {
           consolidator.progress += 0.012;
           if (consolidator.progress >= 1) {
             shockwaves.push({ x: consolidator.x, y: consolidator.y, r: 8, maxR: 130, color: '#fbbf24', alpha: 1 });
-            logStream('sim', 'MERKLE DREAMING curation done: a real pass curates ' + consolidator.targets.length + ' claims into one Class B decision');
+            logStream('write', 'MERKLE DREAMING curation focus complete: ' + consolidator.targets.length + ' Class A claims mapped to Class B decision');
             consolidator = null;
           }
         }
@@ -3059,10 +3070,9 @@ export function renderViewerHtml(initialState) {
         cam.y = 0;
         cam.targetZoom = 1;
       });
-      el('btn-sim-write').addEventListener('click', simWrite);
-      el('btn-sim-recall').addEventListener('click', simRecall);
-      el('btn-sim-consolidate').addEventListener('click', simConsolidate);
-      el('btn-sim-refuse').addEventListener('click', simRefuse);
+      if (el('btn-dream-consolidate')) el('btn-dream-consolidate').addEventListener('click', openDreamingInspector);
+      if (el('btn-dream-triggers')) el('btn-dream-triggers').addEventListener('click', inspectDreamTriggers);
+      if (el('btn-dream-coherence')) el('btn-dream-coherence').addEventListener('click', openCoherenceInspector);
       el('time-slider').addEventListener('input', function () {
         futureDays = Number(el('time-slider').value);
         el('time-label').textContent = futureDays === 0 ? 'NOW (+0.0d)' : 'FUTURE (+' + futureDays.toFixed(1) + 'd)';
