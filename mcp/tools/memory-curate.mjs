@@ -588,11 +588,14 @@ export function evaluateDreamTriggers({
     }
   }
 
-  const hotScopeTopics = [...byScopeTopic.values()]
-    .filter(x => x.count > topicPressureThreshold)
-    .sort((a, b) => b.count - a.count)
+  const hasNewWritesSinceCurate = Number(lastCuratedWriteSeq || 0) === 0 || writeDelta > 0
+  const hotScopeTopics = hasNewWritesSinceCurate
+    ? [...byScopeTopic.values()]
+        .filter(x => x.count > topicPressureThreshold)
+        .sort((a, b) => b.count - a.count)
+    : []
 
-  const synapticVolume = writeDelta >= writeDeltaThreshold || hotScopeTopics.length > 0
+  const synapticVolume = hasNewWritesSinceCurate && (writeDelta >= writeDeltaThreshold || hotScopeTopics.length > 0)
 
   const refusalCount15m = (Array.isArray(recentActivity) ? recentActivity : []).filter(
     a => a && a.kind === 'refused' && typeof a.at === 'number' && Math.max(0, nowSec - a.at) <= NIGHTMARE_REFUSAL_WINDOW_SEC
