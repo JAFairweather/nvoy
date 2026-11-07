@@ -23,6 +23,7 @@ import {
   DEFAULT_DREAM_INTERVAL_SEC,
   DEFAULT_TOPIC_PRESSURE_THRESHOLD,
   DEFAULT_WRITE_DELTA_THRESHOLD,
+  computeTopicEigenvectors,
   defaultCuratorStatePath,
   evaluateDreamTriggers,
   readCuratorStateFile,
@@ -1571,8 +1572,8 @@ export function renderViewerHtml(initialState) {
         <span id="hud-tiers" class="metric-val">-</span>
         <span id="hud-forecast" class="metric-sub">at now</span>
       </div>
-      <div class="metric" id="coherence-card" style="cursor:pointer;" title="Tap to inspect 5-axis Hive Coherence Index and retroactive inception timeline">
-        <span class="metric-label" style="color:#6ee7b7;">Hive Coherence</span>
+      <div class="metric" id="coherence-card" style="cursor:pointer;" title="Tap to inspect 5-axis Hive Coherence 2.0 Index, Epistemic Drift telemetry, and retroactive inception timeline">
+        <span class="metric-label" style="color:#6ee7b7;">Coherence 2.0</span>
         <span id="coherence-val" class="metric-val" style="color:#6ee7b7;">-</span>
         <span id="coherence-sub" class="metric-sub">tap for timeline</span>
       </div>
@@ -2655,11 +2656,13 @@ export function renderViewerHtml(initialState) {
           var coh = target.data;
           var delta = Number(coh.delta_since_inception || 0);
           var deltaSign = delta >= 0 ? '+' : '';
+          var ed = coh.epistemic_drift || null;
+          var edStatus = ed && ed.status ? String(ed.status).toUpperCase() : 'ALIGNED';
           box.appendChild(inspectHeader(
-            'Hive Coherence Index (Retroactive)',
+            'Hive Coherence 2.0 (Epistemic + Retroactive)',
             coh.score.toFixed(1) + ' / 100',
-            deltaSign + delta.toFixed(1) + ' SINCE INCEPTION',
-            coh.score >= 80 ? 'ok' : 'warn',
+            deltaSign + delta.toFixed(1) + ' SINCE INCEPTION · ' + edStatus,
+            coh.score >= 72 && edStatus !== 'BLIND_SPOT' ? 'ok' : 'warn',
             '#6ee7b7'
           ));
           var axes = coh.axes || {};
@@ -2688,6 +2691,23 @@ export function renderViewerHtml(initialState) {
             axesWrap.appendChild(wrap);
           });
           box.appendChild(axesWrap);
+
+          if (ed) {
+            var edTitle = makeDiv('inspect-kicker', 'Coherence 2.0 · Epistemic Drift & Blind-Spot Telemetry');
+            edTitle.style.marginTop = '6px';
+            box.appendChild(edTitle);
+            var edWrap = makeDiv('kv-list');
+            var stColor = ed.status === 'aligned' ? '#34d399' : (ed.status === 'drifting' ? '#fbbf24' : '#fca5a5');
+            edWrap.appendChild(kvRow('Epistemic status', String(ed.status || 'aligned').toUpperCase() + ' (' + Number(ed.epistemic_score ?? 100).toFixed(1) + '%)', stColor));
+            var zhCount = Number(ed.zero_hit_queries || 0);
+            var missed = Array.isArray(ed.missed_topics) && ed.missed_topics.length ? ' [' + ed.missed_topics.join(', ') + ']' : '';
+            edWrap.appendChild(kvRow('Unresolved 0-hit queries', zhCount + missed, zhCount > 0 ? '#fca5a5' : '#34d399'));
+            var silentArr = Array.isArray(ed.silent_active_writers) ? ed.silent_active_writers : [];
+            edWrap.appendChild(kvRow('Silent active writers', silentArr.length ? silentArr.join(', ') : '0 (all active readers sharing)', silentArr.length ? '#fbbf24' : '#34d399'));
+            var siloArr = Array.isArray(ed.siloed_recent_topics) ? ed.siloed_recent_topics : [];
+            edWrap.appendChild(kvRow('Single-author topic silos', siloArr.length ? siloArr.join(', ') : '0 (multi-agent corroborated)', siloArr.length ? '#fbbf24' : '#34d399'));
+            box.appendChild(edWrap);
+          }
 
           var hist = Array.isArray(coh.history) ? coh.history : [];
           if (hist.length > 0) {
@@ -2799,6 +2819,29 @@ export function renderViewerHtml(initialState) {
               tWrap.appendChild(kvRow(item.label, item.count + ' Class A' + (over ? ' · READY TO CURATE' : ''), over ? '#fbbf24' : '#cbd5e1'));
             });
             box.appendChild(tWrap);
+          }
+          var eigens = Array.isArray(latestCuratorState && latestCuratorState.topic_eigenvectors) ? latestCuratorState.topic_eigenvectors : [];
+          if (eigens.length > 0) {
+            var eTitle = makeDiv('inspect-kicker', 'Stage 0 · Spectral Topic Eigenvectors (PCA)');
+            eTitle.style.marginTop = '6px';
+            box.appendChild(eTitle);
+            var eWrap = makeDiv('kv-list');
+            eigens.slice(0, 6).forEach(function (ev) {
+              var loads = Array.isArray(ev.topic_loadings) ? ev.topic_loadings.slice(0, 3).map(function (l) { return l.topic + (l.loading >= 0 ? '+' : '') + Number(l.loading).toFixed(2); }).join(', ') : '';
+              eWrap.appendChild(kvRow('Axis ' + ev.axis + ' · #' + ev.canonical_topic, 'λ=' + ev.eigenvalue + ' (' + ev.variance_pct + '%) · ' + loads, '#a78bfa'));
+            });
+            box.appendChild(eWrap);
+          }
+          var reorgs = Array.isArray(latestCuratorState && latestCuratorState.topic_reorganizations) ? latestCuratorState.topic_reorganizations : [];
+          if (reorgs.length > 0) {
+            var rTitle = makeDiv('inspect-kicker', 'Stage 0 · Topic Reorganizations (Outliers -> Eigen-Topics)');
+            rTitle.style.marginTop = '6px';
+            box.appendChild(rTitle);
+            var rWrap = makeDiv('kv-list');
+            reorgs.slice(0, 8).forEach(function (rg) {
+              rWrap.appendChild(kvRow('#' + rg.from_topic + ' (' + rg.claim_count + ')', '-> #' + rg.to_topic + ' (cos ' + rg.cosine_affinity + ')', '#38bdf8'));
+            });
+            box.appendChild(rWrap);
           }
         }
       }
@@ -3502,9 +3545,10 @@ export function renderViewerHtml(initialState) {
           var cScore = Number(s.coherence.score || 0).toFixed(1);
           var cDelta = Number(s.coherence.delta_since_inception || 0);
           var cSign = cDelta >= 0 ? '+' : '';
+          var edSt = s.coherence.epistemic_drift && s.coherence.epistemic_drift.status ? String(s.coherence.epistemic_drift.status).toUpperCase() : '2.0';
           if (el('coherence-val')) el('coherence-val').textContent = cScore + '%';
-          if (el('coherence-sub')) el('coherence-sub').textContent = cSign + cDelta.toFixed(1) + ' since inception · tap';
-          if (el('m-kpi-coherence')) el('m-kpi-coherence').textContent = 'coh: ' + cScore + '% (' + cSign + cDelta.toFixed(1) + ')';
+          if (el('coherence-sub')) el('coherence-sub').textContent = cSign + cDelta.toFixed(1) + ' · ' + edSt + ' · tap';
+          if (el('m-kpi-coherence')) el('m-kpi-coherence').textContent = 'coh 2.0: ' + cScore + '% (' + edSt + ')';
         }
 
         var sc = s.scope_counts || {};
@@ -3709,6 +3753,7 @@ export async function startMemoryViewer({
         writeDeltaThreshold,
         topicPressureThreshold,
       })
+      const spectral = computeTopicEigenvectors(records, { maxComponents: 7 })
       const curatorState = {
         state_file: activeStateFile,
         state_file_present: Boolean(persistedCurator),
@@ -3729,6 +3774,8 @@ export async function startMemoryViewer({
         stale_count: triggerEval.stale_count,
         refusal_count_15m: triggerEval.refusal_count_15m,
         coherence_score: triggerEval.coherence_score,
+        topic_eigenvectors: spectral.eigenvectors,
+        topic_reorganizations: spectral.reorganizations,
       }
       const consolidatedSources = {}
       for (const r of records) {
