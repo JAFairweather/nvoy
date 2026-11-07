@@ -11,7 +11,7 @@
 //      and sets a strict Content-Security-Policy (`default-src 'none'`).
 //   4. Listen address and port come from CLI flags (`--host <addr> --port <port>` or `--listen <addr>:<port>`).
 //   5. The viewer's memory_wake also carries the daemon's metadata-only activity ring and agent roster, which
-//      drive the cortex canvas. Its simulation controls animate locally and never call the server.
+//      drive the cortex canvas and live Merkle Dreaming & 3-Trigger Curation telemetry.
 
 import { readFileSync } from 'node:fs'
 import { createServer as createHttpServer } from 'node:http'
@@ -19,6 +19,17 @@ import { createConnection } from 'node:net'
 import { isAbsolute, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
+import {
+  DEFAULT_DREAM_INTERVAL_SEC,
+  DEFAULT_TOPIC_PRESSURE_THRESHOLD,
+  DEFAULT_WRITE_DELTA_THRESHOLD,
+  computeTopicEigenvectors,
+  defaultCuratorStatePath,
+  evaluateDreamTriggers,
+  planMerkleDream,
+  readCuratorStateFile,
+  resolveCuratorStatePath,
+} from './memory-curate.mjs'
 
 const DEFAULT_POLL_MS = 3000
 const MAX_EVENT_LOG = 60
@@ -77,6 +88,7 @@ export function parseViewerFlags(argv) {
   const args = Array.isArray(argv) ? argv : []
   const countFlag = name => args.filter(a => a === name).length
   if (countFlag('--socket') > 1) throw new Error('only one --socket may be specified')
+  if (countFlag('--state-file') > 1) throw new Error('only one --state-file may be specified')
   const getFlag = name => {
     const idx = args.indexOf(name)
     return idx < 0 ? '' : String(args[idx + 1] ?? '')
@@ -85,6 +97,10 @@ export function parseViewerFlags(argv) {
   const socketRaw = getFlag('--socket')
   if (!socketRaw || !isAbsolute(socketRaw)) {
     throw new Error('--socket <absolute-path> is required')
+  }
+  const stateFileRaw = getFlag('--state-file')
+  if (stateFileRaw && !isAbsolute(stateFileRaw)) {
+    throw new Error('--state-file <absolute-path> must be an absolute path')
   }
   const { host, port } = parseListenTarget({
     listen: getFlag('--listen'),
@@ -98,6 +114,7 @@ export function parseViewerFlags(argv) {
   }
   return {
     socketPath: resolve(socketRaw),
+    ...(stateFileRaw ? { stateFile: resolve(stateFileRaw) } : {}),
     host,
     port,
     pollMs,
@@ -130,6 +147,7 @@ export function sanitizeMemoryRecord(rec) {
     expires_at: Number.isFinite(rec.expires_at) ? Number(rec.expires_at) : null,
     stale_warning: rec.stale_warning ? String(rec.stale_warning) : null,
     consolidated_by: rec.consolidated_by ? String(rec.consolidated_by) : null,
+    merkle_sources: rec.merkle_sources ? String(rec.merkle_sources) : null,
     supersedes: Array.isArray(rec.supersedes) ? rec.supersedes.map(s => String(s)) : [],
     conflict: Boolean(rec.conflict),
   }
@@ -266,10 +284,58 @@ function evaluateCoherenceSlice(slice, rosterByPk, expectedRosterSize, writeSeqE
   for (const set of artifactAuthors.values()) {
     if (set.size >= 2) sharedRefs += 1
   }
-  const convergence = Math.round(Math.min(100, sharedRefs * 8.5) * 10) / 10
+  for (const r of slice) {
+    if (r.merkle_sources && Array.isArray(r.supersedes) && r.supersedes.length >= 2) {
+      sharedRefs += 1
+    }
+  }
+  // Coherence 2.0 Convergence: blends cumulative cross-author artifact density (which scales with store size
+  // rather than saturating permanently at 12 refs) with recent-window cross-agent topic corroboration.
+  const targetSharedRefs = slice.length <= 15 ? Math.max(1, slice.length * 0.4) : Math.max(6, nonCanon.length * 0.14)
+  const refDensityScore = Math.min(100, (sharedRefs / targetSharedRefs) * 100)
 
+  const peerNonCanon = nonCanon.filter(r => !r.merkle_sources && rosterByPk.get(String(r.author_pubkey || '')) !== 'curator')
+  const recentNonCanon = (peerNonCanon.length > 0 ? peerNonCanon : nonCanon).slice(-18)
+  const recentTopics = new Map()
+  const recentAuthors = new Set()
+  for (const r of recentNonCanon) {
+    const pk = String(r.author_pubkey || '')
+    const actor = rosterByPk.get(pk) || pk.slice(0, 8) || 'unknown'
+    recentAuthors.add(actor)
+    const top = String(r.topic || 'general')
+    let set = recentTopics.get(top)
+    if (!set) {
+      set = { count: 0, authors: new Set() }
+      recentTopics.set(top, set)
+    }
+    set.count += 1
+    set.authors.add(actor)
+  }
+  let multiClaimTopics = 0
+  let corroboratedTopics = 0
+  let siloedTopics = 0
+  for (const info of recentTopics.values()) {
+    if (info.count >= 2) {
+      multiClaimTopics += 1
+      if (info.authors.size >= 2) corroboratedTopics += 1
+      else if (info.count >= 3) siloedTopics += 1
+    }
+  }
+  const topicCorroboration =
+    multiClaimTopics > 0
+      ? Math.max(0, (corroboratedTopics / multiClaimTopics) * 100 - siloedTopics * 12)
+      : recentNonCanon.length <= 2
+        ? refDensityScore
+        : 65
+  const convergence = Math.round((0.6 * refDensityScore + 0.4 * topicCorroboration) * 10) / 10
+
+  // Coherence 2.0 Coupling: blends cumulative roster breadth (55%) with active-window author participation (45%)
+  // so coupling dips when only 1-2 agents write a burst of claims while the rest of the Hive is silent.
   const denomAuthors = Math.max(1, Math.min(14, expectedRosterSize || 14))
-  const coupling = Math.round(Math.min(100, (authors.size / denomAuthors) * 100) * 10) / 10
+  const cumulativeCoupling = Math.min(100, (authors.size / denomAuthors) * 100)
+  const windowTargetAuthors = Math.max(1, Math.min(denomAuthors, Math.min(6, recentNonCanon.length || 1)))
+  const windowCoupling = Math.min(100, (recentAuthors.size / windowTargetAuthors) * 100)
+  const coupling = Math.round((0.55 * cumulativeCoupling + 0.45 * windowCoupling) * 10) / 10
 
   const durableCount = slice.filter(r => r.scope === 'hive:canon' || r.expires_at === null || r.expires_at === undefined).length
   const durableRatio = durableCount / slice.length
@@ -363,14 +429,27 @@ export function computeCoherence({
       history_complete: Boolean(history_complete),
       history_window: history_complete ? '90d-retained' : 'truncated-5000',
       axes: { alignment: 0, grounding: 0, convergence: 0, coupling: 0, consolidation: 0 },
+      epistemic_drift: {
+        score: 0,
+        status: 'empty',
+        zero_hit_queries: 0,
+        missed_topics: [],
+        silent_active_writers: [],
+        siloed_recent_topics: [],
+      },
       history: [],
     }
   }
 
   const total = chronological.length
-  const rawSteps = [1, 5, 10, 20, 30, 40, 50, 65, 80, 100, 125, 150, total]
+  const extraSteps = []
+  if (total > 150) {
+    for (let s = 170; s < total; s += 15) extraSteps.push(s)
+    if (total > 12) extraSteps.push(total - 8, total - 4)
+  }
+  const rawSteps = [1, 5, 10, 20, 30, 40, 50, 65, 80, 100, 125, 150, ...extraSteps, total]
   const uniqueSteps = [...new Set(rawSteps.filter(k => k >= 1 && k <= total))].sort((a, b) => a - b)
-  while (uniqueSteps.length > 10) {
+  while (uniqueSteps.length > 14) {
     uniqueSteps.splice(1, 1)
   }
   if (uniqueSteps[uniqueSteps.length - 1] !== total) uniqueSteps.push(total)
@@ -413,10 +492,105 @@ export function computeCoherence({
   const current = history[history.length - 1]
   const inception = history[0]
   const activityList = Array.isArray(recent_activity) ? recent_activity : []
-  if (activityList.length > 0) {
-    const refusals = activityList.filter(a => a?.kind === 'refused').length
-    const gateHygiene = Math.max(0, 1 - refusals / activityList.length)
-    current.axes.coupling = Math.round((0.7 * current.axes.coupling + 0.3 * (gateHygiene * 100)) * 10) / 10
+
+  // Epistemic Drift & Blind-Spot Detection:
+  // Catches when agents query shared memory and get 0 matches (blind spots), when active writers wake/query
+  // repeatedly without sharing room claims (silent work drift), or when recent topics are siloed to a single author.
+  const allNonCanon = chronological.filter(r => r && r.scope !== 'hive:canon' && r.status !== 'withdrawn')
+  const peerChrono = allNonCanon.filter(r => !r.merkle_sources && rosterByPk.get(String(r.author_pubkey || '')) !== 'curator')
+  const recentNonCanon = (peerChrono.length > 0 ? peerChrono : allNonCanon).slice(-18)
+  const recentTopicAuthors = new Map()
+  const recentWriterIds = new Set()
+  for (const r of recentNonCanon) {
+    const actor = rosterByPk.get(String(r.author_pubkey || '')) || String(r.author_pubkey || '').slice(0, 8)
+    if (actor) recentWriterIds.add(actor)
+    const top = String(r.topic || '').trim()
+    if (!top) continue
+    let entry = recentTopicAuthors.get(top)
+    if (!entry) {
+      entry = { count: 0, authors: new Set() }
+      recentTopicAuthors.set(top, entry)
+    }
+    entry.count += 1
+    if (actor) entry.authors.add(actor)
+  }
+  const nonCuratorRecentWriters = [...recentWriterIds].filter(w => w !== 'curator')
+  const siloedRecentTopics = []
+  if (nonCuratorRecentWriters.length >= 2) {
+    for (const [top, info] of recentTopicAuthors.entries()) {
+      if (info.count >= 3 && info.authors.size === 1) {
+        siloedRecentTopics.push(top)
+      }
+    }
+  }
+
+  let zeroHitQueries = 0
+  const missedTopicsSet = new Set()
+  const readsByActor = new Map()
+  const writesByActor = new Map()
+  for (let idx = 0; idx < activityList.length; idx++) {
+    const a = activityList[idx]
+    if (!a || typeof a !== 'object') continue
+    const actor = String(a.actor || '')
+    if (a.kind === 'query' || a.kind === 'wake' || a.kind === 'lookup') {
+      if (actor) readsByActor.set(actor, (readsByActor.get(actor) || 0) + 1)
+      if (a.kind === 'query' && a.count === 0 && actor !== 'curator' && actor !== 'viewer' && a.topic) {
+        missedTopicsSet.add(String(a.topic))
+        const resolvedSoon = activityList.slice(idx + 1, idx + 12).some(
+          next =>
+            next &&
+            next.actor === actor &&
+            ((next.kind === 'query' && Number(next.count) > 0) ||
+              (next.kind === 'submit' && next.accepted !== false))
+        )
+        if (!resolvedSoon) {
+          zeroHitQueries += 1
+        }
+      }
+    } else if (a.kind === 'submit' && a.accepted !== false) {
+      if (actor) writesByActor.set(actor, (writesByActor.get(actor) || 0) + 1)
+    }
+  }
+
+  const writerIdSet = new Set(
+    (Array.isArray(agent_roster) ? agent_roster : []).filter(a => a?.is_writer && a?.id).map(a => a.id)
+  )
+  const silentActiveWriters = []
+  for (const [actor, readCount] of readsByActor.entries()) {
+    if (writerIdSet.has(actor) && readCount >= 4 && !writesByActor.has(actor) && !recentWriterIds.has(actor)) {
+      silentActiveWriters.push(actor)
+    }
+  }
+
+  const missedTopics = [...missedTopicsSet]
+  const epistemicPenalty = Math.min(
+    65,
+    zeroHitQueries * 16 + silentActiveWriters.length * 12 + siloedRecentTopics.length * 8
+  )
+  const epistemicScore = Math.max(0, Math.round((100 - epistemicPenalty) * 10) / 10)
+  const epistemicStatus =
+    zeroHitQueries >= 2 || epistemicPenalty >= 28
+      ? 'blind_spot'
+      : epistemicPenalty > 0
+        ? 'drifting'
+        : 'aligned'
+
+  if (activityList.length > 0 || siloedRecentTopics.length > 0) {
+    if (activityList.length > 0) {
+      const refusals = activityList.filter(a => a?.kind === 'refused').length
+      const gateHygiene = Math.max(0, 1 - refusals / activityList.length)
+      const silencePenalty = silentActiveWriters.length * 12 + zeroHitQueries * 6
+      const liveCoupling = Math.max(0, gateHygiene * 100 - silencePenalty)
+      current.axes.coupling = Math.round((0.7 * current.axes.coupling + 0.3 * liveCoupling) * 10) / 10
+    }
+    if (zeroHitQueries > 0 || siloedRecentTopics.length > 0) {
+      const convPenalty = Math.min(45, zeroHitQueries * 14 + siloedRecentTopics.length * 8)
+      current.axes.convergence = Math.max(0, Math.round((current.axes.convergence - convPenalty) * 10) / 10)
+    }
+    if (missedTopics.length > 0) {
+      const alignPenalty = Math.min(30, missedTopics.length * 10)
+      current.axes.alignment = Math.max(0, Math.round((current.axes.alignment - alignPenalty) * 10) / 10)
+    }
     current.score = Math.round((
       0.25 * current.axes.alignment +
       0.2 * current.axes.grounding +
@@ -436,6 +610,14 @@ export function computeCoherence({
     history_complete: Boolean(history_complete),
     history_window: history_complete ? '90d-retained' : 'truncated-5000',
     axes: current.axes,
+    epistemic_drift: {
+      score: epistemicScore,
+      status: epistemicStatus,
+      zero_hit_queries: zeroHitQueries,
+      missed_topics: missedTopics,
+      silent_active_writers: silentActiveWriters,
+      siloed_recent_topics: siloedRecentTopics,
+    },
     history,
   }
 }
@@ -708,7 +890,7 @@ export function diffViewerSnapshots(prev, next, nowSec = Math.floor(Date.now() /
   return events
 }
 
-export function computeDreamingTelemetry(records = []) {
+export function computeDreamingTelemetry(records = [], curatorState = null) {
   const recs = Array.isArray(records) ? records : []
   const fullBytes = JSON.stringify(recs).length
   let indexBytes = 0
@@ -716,12 +898,18 @@ export function computeDreamingTelemetry(records = []) {
   let wfCount = 0
   let shortTtlCount = 0
   let classBCount = 0
+  let merkleCount = 0
+  let nightmareCount = 0
   const byScopeTopic = new Map()
   for (const r of recs) {
     if (!r || typeof r !== 'object') continue
     const slug = String(r.d || '').split(':').pop() || String(r.d || '')
     const isWf = /-(?:review|status|owner|wip|handoff)$/.test(slug)
     indexBytes += 140 + Math.min(120, String(r.claim || '').length) + String(r.d || '').length
+    if (typeof r.merkle_sources === 'string' && r.merkle_sources.length > 0) merkleCount += 1
+    if (r.conflict || ((r.scope === 'hive:canon' || r.expires_at === null || r.expires_at === undefined) && r.stale_warning)) {
+      nightmareCount += 1
+    }
     if (r.scope === 'hive:canon') {
       canonBytes += JSON.stringify(r).length
     } else if (r.expires_at === null || r.expires_at === undefined) {
@@ -744,11 +932,13 @@ export function computeDreamingTelemetry(records = []) {
   const wakeBytes = canonBytes + Math.min(4000, indexBytes)
   const indexSavings = fullBytes > 0 ? Math.round((1 - indexBytes / fullBytes) * 1000) / 10 : 0
   const wakeSavings = fullBytes > 0 ? Math.round((1 - wakeBytes / fullBytes) * 1000) / 10 : 0
+  const pressureThreshold = Number(curatorState?.topic_pressure_threshold) || DEFAULT_TOPIC_PRESSURE_THRESHOLD
   const topicList = [...byScopeTopic.values()]
-    .map(item => ({ ...item, ready: item.count > 8 }))
+    .map(item => ({ ...item, ready: item.count > pressureThreshold }))
     .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label))
   return {
     estimated_from_visible: true,
+    passive_inspection: true,
     total: recs.length,
     fullBytes,
     indexBytes,
@@ -758,7 +948,10 @@ export function computeDreamingTelemetry(records = []) {
     wfCount,
     shortTtlCount,
     classBCount,
+    merkleCount,
+    nightmareCount,
     topicList,
+    curator_state: curatorState,
   }
 }
 
@@ -1355,6 +1548,7 @@ export function renderViewerHtml(initialState) {
           <span class="mobile-kpi-pill" id="m-kpi-claims">claims: -</span>
           <span class="mobile-kpi-pill" id="m-kpi-tiers">-</span>
           <button class="mobile-kpi-pill" id="m-kpi-coherence" type="button" style="cursor:pointer;color:#6ee7b7;border-color:rgba(52,211,153,0.4);">coh: -</button>
+          <button class="mobile-kpi-pill" id="m-kpi-dreaming" type="button" style="cursor:pointer;color:#c4b5fd;border-color:rgba(167,139,250,0.45);">dream: eigenvectors</button>
         </div>
         <div class="quarantine-banner">
           reader: <span id="reader-name">${readerName}</span> (<span id="server-name">${serverName}</span>) |
@@ -1388,10 +1582,15 @@ export function renderViewerHtml(initialState) {
         <span id="hud-tiers" class="metric-val">-</span>
         <span id="hud-forecast" class="metric-sub">at now</span>
       </div>
-      <div class="metric" id="coherence-card" style="cursor:pointer;" title="Tap to inspect 5-axis Hive Coherence Index and retroactive inception timeline">
-        <span class="metric-label" style="color:#6ee7b7;">Hive Coherence</span>
+      <div class="metric" id="coherence-card" style="cursor:pointer;" title="Tap to inspect 5-axis Hive Coherence 2.0 Index, Epistemic Drift telemetry, and retroactive inception timeline">
+        <span class="metric-label" style="color:#6ee7b7;">Coherence 2.0</span>
         <span id="coherence-val" class="metric-val" style="color:#6ee7b7;">-</span>
         <span id="coherence-sub" class="metric-sub">tap for timeline</span>
+      </div>
+      <div class="metric" id="dreaming-card" style="cursor:pointer;" title="Tap to inspect Merkle Dreaming, 3-Trigger Curation State, and Stage 0 Spectral Topic Eigenvectors">
+        <span class="metric-label" style="color:#c4b5fd;">Merkle Dreaming</span>
+        <span id="dreaming-val" class="metric-val" style="color:#c4b5fd;">Stage 0–3</span>
+        <span id="dreaming-sub" class="metric-sub">eigenvectors · tap</span>
       </div>
     </div>
   </header>
@@ -1437,11 +1636,12 @@ export function renderViewerHtml(initialState) {
 
   <div class="hud-bottom graph-only">
     <div class="control-bar sim-bar panel">
-      <span class="sim-label">Simulation · local animation only, nothing is sent</span>
-      <button class="btn sim" id="btn-sim-write" type="button">Sim write</button>
-      <button class="btn sim" id="btn-sim-recall" type="button">Sim recall</button>
-      <button class="btn sim" id="btn-sim-consolidate" type="button">Merkle Dreaming · Curation</button>
-      <button class="btn sim" id="btn-sim-refuse" type="button">Sim refusal</button>
+      <span class="sim-label" id="dream-bar-status">Merkle Dreaming · Passive Read-Only Telemetry</span>
+      <button class="btn sim" id="btn-dream-replay" type="button">Replay Last Dream (4-Act)</button>
+      <button class="btn sim" id="btn-dream-record" type="button" style="border-color:rgba(244,114,182,0.55);color:#f9a8d4;">● Record Reorganization (.webm)</button>
+      <button class="btn sim" id="btn-dream-consolidate" type="button">Inspect Curation (Passive)</button>
+      <button class="btn sim" id="btn-dream-triggers" type="button">Inspect 3-Trigger State</button>
+      <button class="btn sim" id="btn-dream-coherence" type="button">5-Axis Coherence</button>
     </div>
     <div class="control-bar panel">
       <label for="time-slider">Time-decay forecast</label>
@@ -1456,7 +1656,7 @@ export function renderViewerHtml(initialState) {
     <button class="dock-btn active" id="dock-graph" type="button">Cortex</button>
     <button class="dock-btn" id="dock-agents" type="button">Agents</button>
     <button class="dock-btn" id="dock-pulses" type="button">Pulses</button>
-    <button class="dock-btn" id="dock-tools" type="button">Sim / Time</button>
+    <button class="dock-btn" id="dock-tools" type="button">Dream / Time</button>
     <button class="dock-btn" id="dock-cards" type="button">Cards</button>
   </nav>
 
@@ -1551,12 +1751,19 @@ export function renderViewerHtml(initialState) {
       var pulses = [];
       var shockwaves = [];
       var consolidator = null;
+      var dreamSymphony = null;
+      var dreamRecorder = null;
       var hovered = null;
       var selected = null;
       var futureDays = 0;
       var lastActivitySeq = null;
       var pulseTotal = 0;
       var tick = 0;
+      var latestCuratorState = null;
+      var latestConsolidatedSources = {};
+      var latestStoreState = {};
+      var latestRecentActivity = [];
+      var prevByEventId = {};
 
       function fmtTime(sec) {
         if (!sec || typeof sec !== 'number') return 'never';
@@ -1889,6 +2096,34 @@ export function renderViewerHtml(initialState) {
         });
       }
 
+      function resolveSourceNodes(rec, anchorNode) {
+        var srcIds = Array.isArray(rec && rec.supersedes) ? rec.supersedes : [];
+        var top = topicById(topicOf(rec));
+        var cx = anchorNode ? anchorNode.x : (top ? top.x : 0);
+        var cy = anchorNode ? anchorNode.y : (top ? top.y : 0);
+        return srcIds.map(function (id, idx) {
+          var existing = nodeByEventId(id) || prevByEventId[id];
+          if (existing) return existing;
+          var angle = -Math.PI / 2 + (idx / Math.max(1, srcIds.length)) * Math.PI * 2;
+          var dist = 36 + (idx % 2) * 14;
+          var histRec = (latestConsolidatedSources && latestConsolidatedSources[id]) || {
+            event_id: id,
+            scope: rec.scope,
+            topic: rec.topic,
+            d: id.slice(0, 12)
+          };
+          return {
+            key: 'src:' + id,
+            rec: histRec,
+            x: cx + Math.cos(angle) * dist,
+            y: cy + Math.sin(angle) * dist,
+            vx: 0,
+            vy: 0,
+            isSourceGhost: true
+          };
+        });
+      }
+
       function syncGraph(s, animate) {
         var records = Array.isArray(s.records) ? s.records : [];
         syncAgents(s);
@@ -1896,7 +2131,12 @@ export function renderViewerHtml(initialState) {
         layout();
 
         var byKey = {};
-        nodes.forEach(function (n) { byKey[n.key] = n; });
+        var oldByEventId = {};
+        nodes.forEach(function (n) {
+          byKey[n.key] = n;
+          if (n.rec && n.rec.event_id) oldByEventId[n.rec.event_id] = n;
+        });
+        prevByEventId = oldByEventId;
         var fresh = [];
         var nextNodes = records.map(function (rec, i) {
           var key = rec.author_pubkey + ':' + rec.d;
@@ -1934,14 +2174,39 @@ export function renderViewerHtml(initialState) {
             if (covered[n.rec.event_id]) return;
             var author = agentByPubkey(n.rec.author_pubkey);
             if (author) writeComet(author, n);
+            var merkleDigest = typeof n.rec.merkle_sources === 'string' ? n.rec.merkle_sources : '';
+            if (merkleDigest && !consolidator) {
+              var top = topicById(topicOf(n.rec));
+              var srcNodes = resolveSourceNodes(n.rec, n);
+              if (top && srcNodes.length > 0) {
+                consolidator = {
+                  mode: 'live-write',
+                  topic: top,
+                  targetNode: n,
+                  targets: srcNodes,
+                  merkleDigest: merkleDigest,
+                  x: n.x,
+                  y: n.y,
+                  progress: 0
+                };
+                logStream(
+                  'write',
+                  'MERKLE DREAMING curator write in ' + String(n.rec.scope || 'hive') + ' #' + top.id +
+                  ' (merkle_sources ' + merkleDigest.slice(0, 12) + '… · ' + srcNodes.length + ' superseded sources)',
+                  n.rec.created_at
+                );
+              }
+            }
           });
         }
+        updateDreamBarStatus();
+        if (selected && selected.type === 'dreaming') selected.data = computeDreamingTelemetry();
         renderAgentRoster();
         updateTiers();
         renderInspector();
       }
 
-      // --- Pulses: real activity from the ring, or local simulations ---
+      // --- Pulses: real activity from the ring and live Merkle Dreaming curation ---
 
       function writeComet(agent, node) {
         agent.energy = 1;
@@ -2010,32 +2275,6 @@ export function renderViewerHtml(initialState) {
         el('pulse-counter').textContent = pulseTotal + (pulseTotal === 1 ? ' pulse' : ' pulses');
       }
 
-      function pickAgent(filter) {
-        if (selected && selected.type === 'agent' && (!filter || filter(selected.data))) return selected.data;
-        var pool = agents.filter(function (a) { return !filter || filter(a); });
-        if (!pool.length) pool = agents;
-        return pool.length ? pool[Math.floor(Math.random() * pool.length)] : null;
-      }
-
-      function simWrite() {
-        var agent = pickAgent(function (a) { return a.is_writer; });
-        if (!agent) return logStream('sim', 'SIM write: no agents to animate');
-        var pool = nodes.filter(function (n) { return !isCanon(n.rec); });
-        var target = pool.length ? pool[Math.floor(Math.random() * pool.length)] : null;
-        writeComet(agent, target);
-        logStream('sim', 'SIM write comet: ' + agent.name + ' -> ' + (target ? slugOf(target.rec) : 'core') + ' (nothing written)');
-      }
-
-      function simRecall() {
-        var agent = pickAgent(null);
-        if (!agent) return logStream('sim', 'SIM recall: no agents to animate');
-        var focus = topics.length ? topics[Math.floor(Math.random() * topics.length)].id : null;
-        var recalled = nodes.filter(function (n) { return isCanon(n.rec) || topicOf(n.rec) === focus; }).slice(0, 6);
-        if (!recalled.length) recallWave(agent, null);
-        recalled.forEach(function (n) { recallWave(agent, n); });
-        logStream('sim', 'SIM recall wave: ' + agent.name + ' <- ' + recalled.length + ' engrams (nothing queried)');
-      }
-
       function isWorkflowCheckpoint(rec) {
         return /-(?:review|status|owner|wip|handoff)$/.test(slugOf(rec));
       }
@@ -2048,10 +2287,18 @@ export function renderViewerHtml(initialState) {
         var wfCount = 0;
         var shortTtlCount = 0;
         var classBCount = 0;
+        var merkleCount = 0;
+        var nightmareCount = 0;
         var byScopeTopic = {};
+        var cs = latestCuratorState || {};
+        var pressureThreshold = Number(cs.topic_pressure_threshold) || 8;
         recs.forEach(function (r) {
           var isWf = isWorkflowCheckpoint(r);
           indexBytes += 140 + Math.min(120, String(r.claim || '').length) + String(r.d || '').length;
+          if (typeof r.merkle_sources === 'string' && r.merkle_sources.length > 0) merkleCount += 1;
+          if (r.conflict || ((isCanon(r) || r.expires_at === null || r.expires_at === undefined) && r.stale_warning)) {
+            nightmareCount += 1;
+          }
           if (isCanon(r)) canonBytes += JSON.stringify(r).length;
           else if (r.expires_at === null || r.expires_at === undefined) classBCount += 1;
           else {
@@ -2073,10 +2320,27 @@ export function renderViewerHtml(initialState) {
         var wakeSavings = fullBytes > 0 ? Math.round((1 - wakeBytes / fullBytes) * 1000) / 10 : 0;
         var topicList = Object.keys(byScopeTopic).map(function (k) {
           var item = byScopeTopic[k];
-          return { scope: item.scope, topic: item.topic, label: item.label, count: item.count, ready: item.count > 8 };
+          return { scope: item.scope, topic: item.topic, label: item.label, count: item.count, ready: item.count > pressureThreshold };
         }).sort(function (a, b) { return b.count - a.count; });
+        var writeSeq = Number(latestStoreState && latestStoreState.write_seq) || 0;
+        var lastCuratedSeq = Number(cs.last_curated_write_seq) || 0;
+        var writeDelta = typeof cs.write_delta === 'number' ? cs.write_delta : Math.max(0, writeSeq - lastCuratedSeq);
+        var writeDeltaThreshold = Number(cs.write_delta_threshold) || 20;
+        var dreamIntervalSec = Number(cs.dream_interval_sec) || 21600;
+        var lastCuratedAt = Number(cs.last_curated_at) || 0;
+        var elapsedSec = typeof cs.elapsed_sec === 'number' ? cs.elapsed_sec : (lastCuratedAt > 0 ? Math.max(0, Math.floor(nowSec() - lastCuratedAt)) : 0);
+        var triggers = cs.triggers || {
+          circadian_dream: lastCuratedAt > 0 && elapsedSec >= dreamIntervalSec,
+          synaptic_volume: writeDelta >= writeDeltaThreshold || topicList.some(function (t) { return t.ready; }),
+          nightmare_interrupt: nightmareCount > 0
+        };
+        var shouldRun = typeof cs.should_run === 'boolean'
+          ? cs.should_run
+          : Boolean(triggers.circadian_dream || triggers.synaptic_volume || triggers.nightmare_interrupt);
+        var reasons = Array.isArray(cs.reasons) ? cs.reasons : [];
         return {
           estimated_from_visible: true,
+          passive_inspection: true,
           total: recs.length,
           fullBytes: fullBytes,
           indexBytes: indexBytes,
@@ -2086,48 +2350,268 @@ export function renderViewerHtml(initialState) {
           wfCount: wfCount,
           shortTtlCount: shortTtlCount,
           classBCount: classBCount,
-          topicList: topicList
+          merkleCount: merkleCount,
+          nightmareCount: nightmareCount,
+          topicList: topicList,
+          curatorState: {
+            state_file_present: Boolean(cs.state_file_present),
+            last_curated_at: lastCuratedAt || null,
+            last_curated_write_seq: lastCuratedSeq,
+            last_ran_at: cs.last_ran_at || null,
+            last_submitted_count: cs.last_submitted_count || 0,
+            elapsed_sec: elapsedSec,
+            dream_interval_sec: dreamIntervalSec,
+            write_delta: writeDelta,
+            write_delta_threshold: writeDeltaThreshold,
+            topic_pressure_threshold: pressureThreshold,
+            should_run: shouldRun,
+            triggers: triggers,
+            reasons: reasons,
+            refusal_count_15m: Number(cs.refusal_count_15m) || 0,
+            stale_count: Number(cs.stale_count) || 0
+          }
         };
       }
 
-      function simConsolidate() {
-        var best = null;
-        var bestNodes = [];
-        var bestScope = null;
-        topics.forEach(function (t) {
-          var byScope = {};
-          nodes.forEach(function (n) {
-            var st = evalRecord(n.rec, simNow()).state;
-            if (!isCanon(n.rec) && topicOf(n.rec) === t.id && (st === 'fresh' || st === 'aging')) {
-              var sc = String(n.rec.scope || 'unknown');
-              if (!byScope[sc]) byScope[sc] = [];
-              byScope[sc].push(n);
-            }
-          });
-          Object.keys(byScope).forEach(function (sc) {
-            if (byScope[sc].length > bestNodes.length) {
-              best = t;
-              bestScope = sc;
-              bestNodes = byScope[sc];
-            }
-          });
+      function updateDreamBarStatus() {
+        var bar = el('dream-bar-status');
+        if (!bar) return;
+        var d = computeDreamingTelemetry();
+        var cs = d.curatorState;
+        var lastLabel = cs.last_curated_at ? ('last curated ' + fmtShortAge(cs.last_curated_at, nowSec()) + ' ago (seq ' + cs.last_curated_write_seq + ')') : 'last curated: never (seq 0)';
+        var deltaLabel = '+' + cs.write_delta + '/' + cs.write_delta_threshold + ' writes';
+        if (cs.triggers.nightmare_interrupt || d.nightmareCount > 0) {
+          bar.textContent = 'NIGHTMARE TRIGGER ACTIVE · ' + lastLabel + ' · ' + deltaLabel + ' · ' + d.merkleCount + ' merkle_sources tags';
+          bar.style.color = '#f87171';
+        } else if (cs.should_run) {
+          bar.textContent = 'CURATOR TRIGGER DUE (' + (cs.reasons[0] || deltaLabel) + ') · ' + lastLabel + ' · ' + d.merkleCount + ' merkle_sources tags';
+          bar.style.color = '#fbbf24';
+        } else {
+          bar.textContent = 'Passive Read-Only · ' + lastLabel + ' · ' + deltaLabel + ' · ' + d.merkleCount + ' merkle_sources tags · -' + d.wakeSavings + '% wake';
+          bar.style.color = '#94a3b8';
+        }
+      }
+
+      function buildDreamSymphony(merkleNodes) {
+        var eigens = Array.isArray(latestCuratorState && latestCuratorState.topic_eigenvectors)
+          ? latestCuratorState.topic_eigenvectors
+          : [];
+        var reorgs = Array.isArray(latestCuratorState && latestCuratorState.topic_reorganizations)
+          ? latestCuratorState.topic_reorganizations
+          : [];
+        var outerR = stageDim() * 0.33;
+        var reorgArcs = reorgs.map(function (rg, idx) {
+          var fromTop = topicById(rg.from_topic);
+          var toTop = topicById(rg.to_topic) || topics[idx % Math.max(1, topics.length)] || { x: 0, y: 0, color: '#38bdf8' };
+          var ang = -Math.PI * 0.78 + (idx / Math.max(1, reorgs.length)) * Math.PI * 1.65;
+          var fx = fromTop && (fromTop.x !== 0 || fromTop.y !== 0) ? fromTop.x : Math.cos(ang) * outerR;
+          var fy = fromTop && (fromTop.x !== 0 || fromTop.y !== 0) ? fromTop.y : Math.sin(ang) * outerR;
+          return {
+            from_topic: rg.from_topic,
+            to_topic: rg.to_topic,
+            cosine: rg.cosine_affinity,
+            claim_count: rg.claim_count || 1,
+            fromX: fx,
+            fromY: fy,
+            toX: toTop.x,
+            toY: toTop.y,
+            color: toTop.color || '#38bdf8'
+          };
         });
-        selected = { type: 'dreaming', data: computeDreamingTelemetry() };
+        var totalSources = 0;
+        var clusters = merkleNodes.map(function (mn, cIdx) {
+          var top = topicById(topicOf(mn.rec));
+          var srcs = resolveSourceNodes(mn.rec, mn).map(function (sn, sIdx) {
+            var ang = -Math.PI / 2 + (sIdx / Math.max(1, (mn.rec.supersedes || []).length)) * Math.PI * 2 + cIdx * 0.37;
+            var dist = 42 + (sIdx % 3) * 16;
+            return {
+              node: sn,
+              angle: ang,
+              dist: dist,
+              initX: mn.x + Math.cos(ang) * dist,
+              initY: mn.y + Math.sin(ang) * dist,
+              x: mn.x + Math.cos(ang) * dist,
+              y: mn.y + Math.sin(ang) * dist
+            };
+          });
+          totalSources += srcs.length;
+          return {
+            target: mn,
+            topic: top,
+            sources: srcs,
+            merkleDigest: String(mn.rec.merkle_sources || ''),
+            isClassB: mn.rec.expires_at === null || mn.rec.expires_at === undefined,
+            stagger: (cIdx / Math.max(1, merkleNodes.length)) * 0.45,
+            shocked: false
+          };
+        });
+        var classBNodes = merkleNodes.filter(function (mn) {
+          return mn.rec.expires_at === null || mn.rec.expires_at === undefined;
+        });
+        return {
+          progress: 0,
+          speed: 0.00145,
+          actLogged: { 1: false, 2: false, 3: false, 4: false },
+          eigens: eigens,
+          reorgArcs: reorgArcs,
+          clusters: clusters,
+          classBNodes: classBNodes,
+          totalMerkle: merkleNodes.length,
+          totalSources: totalSources
+        };
+      }
+
+      function stopDreamRecording() {
+        if (!dreamRecorder) return;
+        var recObj = dreamRecorder;
+        dreamRecorder = null;
+        var btn = el('btn-dream-record');
+        if (btn) {
+          btn.textContent = '● Record Reorganization (.webm)';
+          btn.style.background = '';
+        }
+        try {
+          if (recObj.recorder && recObj.recorder.state !== 'inactive') {
+            recObj.recorder.stop();
+          }
+        } catch (_) {}
+      }
+
+      function startDreamRecording() {
+        if (dreamRecorder) {
+          stopDreamRecording();
+          return;
+        }
+        if (typeof MediaRecorder === 'undefined' || !canvas.captureStream) {
+          logStream('refuse', 'MediaRecorder / canvas.captureStream not supported in this browser');
+          replayLastDream();
+          return;
+        }
+        if (view !== 'graph') switchView('graph');
+        cam.x = 0;
+        cam.y = 0;
+        cam.targetZoom = 1;
+        cam.zoom = 1;
+        var stream = canvas.captureStream(60);
+        var mime = 'video/webm';
+        if (MediaRecorder.isTypeSupported) {
+          if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) mime = 'video/webm;codecs=vp9';
+          else if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) mime = 'video/webm;codecs=vp8';
+        }
+        var chunks = [];
+        var recorder;
+        try {
+          recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 6000000 });
+        } catch (_) {
+          recorder = new MediaRecorder(stream);
+        }
+        recorder.ondataavailable = function (ev) {
+          if (ev.data && ev.data.size > 0) chunks.push(ev.data);
+        };
+        recorder.onstop = function () {
+          var blob = new Blob(chunks, { type: mime });
+          var url = URL.createObjectURL(blob);
+          var dl = document.createElement('a');
+          dl.href = url;
+          dl.download = 'hive-cortex-reorganization-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.webm';
+          document.body.appendChild(dl);
+          dl.click();
+          document.body.removeChild(dl);
+          setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
+          logStream('write', 'RECORDING SAVED · Downloaded 4-Act Cortex Reorganization video (.webm, ' + Math.round(blob.size / 1024) + ' KB)');
+        };
+        recorder.start(100);
+        dreamRecorder = { recorder: recorder, startedAt: Date.now() };
+        var btn = el('btn-dream-record');
+        if (btn) {
+          btn.textContent = '■ Stop & Save .webm';
+          btn.style.background = 'rgba(239, 68, 68, 0.25)';
+        }
+        logStream('write', 'RECORDING STARTED (60fps .webm) · Capturing 4-Act Hive Mind Cortex Reorganization…');
+        replayLastDream();
+      }
+
+      function replayLastDream() {
+        if (view !== 'graph') switchView('graph');
+        var merkleNodes = nodes.filter(function (n) {
+          return n.rec && typeof n.rec.merkle_sources === 'string' && n.rec.merkle_sources.length > 0;
+        }).sort(function (a, b) {
+          return (b.rec.created_at || 0) - (a.rec.created_at || 0);
+        });
+        if (merkleNodes.length > 0) {
+          var latest = merkleNodes[0];
+          var top = topicById(topicOf(latest.rec));
+          var merkleDigest = String(latest.rec.merkle_sources || '');
+          var srcIds = Array.isArray(latest.rec.supersedes) ? latest.rec.supersedes : [];
+          var srcNodes = resolveSourceNodes(latest.rec, latest);
+          srcNodes.forEach(function (sn) {
+            pulses.push({ kind: 'recall', fromNode: sn, fromX: sn.x, fromY: sn.y, toNode: latest, toX: latest.x, toY: latest.y, color: '#fbbf24', t: 0, speed: 0.02 });
+          });
+          if (top && srcNodes.length > 0) {
+            consolidator = {
+              mode: 'replay',
+              topic: top,
+              targetNode: latest,
+              targets: srcNodes,
+              merkleDigest: merkleDigest,
+              x: latest.x,
+              y: latest.y,
+              progress: 0
+            };
+          }
+          dreamSymphony = buildDreamSymphony(merkleNodes);
+          selected = { type: 'dreaming', data: computeDreamingTelemetry() };
+          hovered = null;
+          if (width <= 1024) setDrawer('none');
+          renderAgentRoster();
+          renderInspector();
+          logStream(
+            'recall',
+            '4-ACT CORTEX REORGANIZATION SYMPHONY · ' + dreamSymphony.eigens.length + ' Eigen-Axes · ' +
+            dreamSymphony.reorgArcs.length + ' Topic Reorgs · ' + dreamSymphony.totalSources + ' Sources -> ' +
+            dreamSymphony.totalMerkle + ' Merkle Claims',
+            latest.rec.created_at
+          );
+          return;
+        }
+        openDreamingInspector();
+        logStream('recall', 'PASSIVE REPLAY (read-only) · no curated records with merkle_sources in store yet');
+      }
+
+      function openDreamingInspector() {
+        var d = computeDreamingTelemetry();
+        var cs = d.curatorState;
+        selected = { type: 'dreaming', data: d };
         hovered = null;
         if (width <= 1024) setDrawer('none');
         renderAgentRoster();
         renderInspector();
-        if (!consolidator && best && bestNodes.length >= 2) {
-          consolidator = { topic: best, targets: bestNodes.slice(0, 5), x: best.x, y: best.y, progress: 0 };
-          logStream('sim', 'MERKLE DREAMING curation in ' + bestScope + ' #' + best.id + ': folding ' + consolidator.targets.length + ' Class A claims (nothing written)');
-        }
+        logStream(
+          'lookup',
+          'PASSIVE INSPECTION (read-only; no curator write) · ' + d.merkleCount + ' merkle_sources digest tags · +' +
+          cs.write_delta + '/' + cs.write_delta_threshold + ' writes since seq ' + cs.last_curated_write_seq
+        );
       }
 
-      function simRefuse() {
-        var agent = pickAgent(function (a) { return !a.is_writer; });
-        if (!agent) return logStream('sim', 'SIM refusal: no agents to animate');
-        refusalProbe(agent);
-        logStream('sim', 'SIM refusal shield at ' + agent.name + ' gate (nothing sent)');
+      function inspectDreamTriggers() {
+        var d = computeDreamingTelemetry();
+        var cs = d.curatorState;
+        var lastAtStr = cs.last_curated_at ? (fmtTime(cs.last_curated_at) + ' (' + cs.elapsed_sec + 's/' + cs.dream_interval_sec + 's)') : 'never (0s/' + cs.dream_interval_sec + 's)';
+        var volStr = '+' + cs.write_delta + '/' + cs.write_delta_threshold + ' writes (last seq ' + cs.last_curated_write_seq + ')';
+        var reasonStr = cs.reasons.length ? cs.reasons.join('; ') : 'all 3 triggers below threshold';
+        selected = { type: 'dreaming', data: d };
+        hovered = null;
+        if (width <= 1024) setDrawer('none');
+        renderAgentRoster();
+        renderInspector();
+        logStream(
+          cs.triggers.nightmare_interrupt ? 'refuse' : 'lookup',
+          'PASSIVE 3-TRIGGER INSPECTION · shouldRun=' + String(cs.should_run) +
+          ' | Circadian: ' + String(Boolean(cs.triggers.circadian_dream)) + ' [' + lastAtStr + ']' +
+          ' | Volume: ' + String(Boolean(cs.triggers.synaptic_volume)) + ' [' + volStr + ']' +
+          ' | Nightmare: ' + String(Boolean(cs.triggers.nightmare_interrupt)) +
+          ' (' + reasonStr + ')'
+        );
       }
 
       // --- HUD: roster, tiers and inspector (record text only ever via textContent) ---
@@ -2280,6 +2764,8 @@ export function renderViewerHtml(initialState) {
           kv.appendChild(kvRow('Anchor', r.as_of_git || r.as_of_evt || '(none)'));
           kv.appendChild(kvRow('Evidence', Array.isArray(r.evidence) && r.evidence.length ? r.evidence.join(', ') : '(none)'));
           kv.appendChild(kvRow('Event id', String(r.event_id || '').slice(0, 20) + '…'));
+          if (r.merkle_sources) kv.appendChild(kvRow('Merkle sources', String(r.merkle_sources).slice(0, 20) + '…', '#a78bfa'));
+          if (r.consolidated_by) kv.appendChild(kvRow('Curated into', String(r.consolidated_by).slice(0, 20) + '… (90d hold)', '#c4b5fd'));
           kv.appendChild(kvRow('Created', fmtTime(r.created_at)));
           kv.appendChild(kvRow('Expires', fmtTime(r.expires_at)));
           if (r.conflict) kv.appendChild(kvRow('Conflict', 'yes', '#fcd34d'));
@@ -2330,11 +2816,13 @@ export function renderViewerHtml(initialState) {
           var coh = target.data;
           var delta = Number(coh.delta_since_inception || 0);
           var deltaSign = delta >= 0 ? '+' : '';
+          var ed = coh.epistemic_drift || null;
+          var edStatus = ed && ed.status ? String(ed.status).toUpperCase() : 'ALIGNED';
           box.appendChild(inspectHeader(
-            'Hive Coherence Index (Retroactive)',
+            'Hive Coherence 2.0 (Epistemic + Retroactive)',
             coh.score.toFixed(1) + ' / 100',
-            deltaSign + delta.toFixed(1) + ' SINCE INCEPTION',
-            coh.score >= 80 ? 'ok' : 'warn',
+            deltaSign + delta.toFixed(1) + ' SINCE INCEPTION · ' + edStatus,
+            coh.score >= 72 && edStatus !== 'BLIND_SPOT' ? 'ok' : 'warn',
             '#6ee7b7'
           ));
           var axes = coh.axes || {};
@@ -2363,6 +2851,24 @@ export function renderViewerHtml(initialState) {
             axesWrap.appendChild(wrap);
           });
           box.appendChild(axesWrap);
+
+          if (ed) {
+            var edTitle = makeDiv('inspect-kicker', 'Coherence 2.0 · Epistemic Drift & Blind-Spot Telemetry');
+            edTitle.style.marginTop = '6px';
+            box.appendChild(edTitle);
+            var edWrap = makeDiv('kv-list');
+            var stColor = ed.status === 'aligned' ? '#34d399' : (ed.status === 'drifting' ? '#fbbf24' : '#fca5a5');
+            var edScoreVal = ed.score ?? ed.epistemic_score ?? 100;
+            edWrap.appendChild(kvRow('Epistemic status', String(ed.status || 'aligned').toUpperCase() + ' (' + Number(edScoreVal).toFixed(1) + '%)', stColor));
+            var zhCount = Number(ed.zero_hit_queries || 0);
+            var missed = Array.isArray(ed.missed_topics) && ed.missed_topics.length ? ' [' + ed.missed_topics.join(', ') + ']' : '';
+            edWrap.appendChild(kvRow('Unresolved 0-hit queries', zhCount + missed, zhCount > 0 ? '#fca5a5' : '#34d399'));
+            var silentArr = Array.isArray(ed.silent_active_writers) ? ed.silent_active_writers : [];
+            edWrap.appendChild(kvRow('Silent active writers', silentArr.length ? silentArr.join(', ') : '0 (all active readers sharing)', silentArr.length ? '#fbbf24' : '#34d399'));
+            var siloArr = Array.isArray(ed.siloed_recent_topics) ? ed.siloed_recent_topics : [];
+            edWrap.appendChild(kvRow('Single-author topic silos', siloArr.length ? siloArr.join(', ') : '0 (multi-agent corroborated)', siloArr.length ? '#fbbf24' : '#34d399'));
+            box.appendChild(edWrap);
+          }
 
           var hist = Array.isArray(coh.history) ? coh.history : [];
           if (hist.length > 0) {
@@ -2425,22 +2931,73 @@ export function renderViewerHtml(initialState) {
           }
         } else if (target.type === 'dreaming') {
           var dr = computeDreamingTelemetry();
+          var cs = dr.curatorState;
           box.appendChild(inspectHeader(
-            'Merkle Dreaming & Curation (Phase 2)',
+            'Merkle Dreaming & Curation · Passive Inspector',
             '-' + dr.wakeSavings.toFixed(1) + '% Est. Wake Bytes',
-            'EST. FROM VISIBLE',
+            'PASSIVE INSPECTION · READ-ONLY',
             'info',
             '#a78bfa'
           ));
+          var actRow = makeDiv('inspect-actions');
+          actRow.style.marginBottom = '6px';
+          actRow.style.flexWrap = 'wrap';
+          var animBtn = document.createElement('button');
+          animBtn.type = 'button';
+          animBtn.className = 'btn sim';
+          animBtn.textContent = '▶ Animate 4-Act Reorganization';
+          animBtn.addEventListener('click', function () { replayLastDream(); });
+          actRow.appendChild(animBtn);
+          var recBtn = document.createElement('button');
+          recBtn.type = 'button';
+          recBtn.className = 'btn sim';
+          recBtn.style.borderColor = 'rgba(244, 114, 182, 0.6)';
+          recBtn.style.color = '#f9a8d4';
+          recBtn.textContent = dreamRecorder ? '■ Stop & Save .webm' : '● Record Video (.webm)';
+          recBtn.addEventListener('click', function () { startDreamRecording(); });
+          actRow.appendChild(recBtn);
+          box.appendChild(actRow);
           var dkv = makeDiv('kv-list');
+          dkv.appendChild(kvRow('Inspector mode', 'Passive read-only (never triggers curator writes)', '#6ee7b7'));
+          dkv.appendChild(kvRow(
+            'Last curated cycle',
+            cs.last_curated_at ? (fmtTime(cs.last_curated_at) + ' (seq ' + cs.last_curated_write_seq + ')') : 'never persisted (seq 0)',
+            cs.last_curated_at ? '#38bdf8' : '#94a3b8'
+          ));
+          dkv.appendChild(kvRow(
+            'Trigger 1 · Circadian',
+            (cs.triggers.circadian_dream ? 'DUE · ' : 'IDLE · ') + cs.elapsed_sec + 's / ' + cs.dream_interval_sec + 's',
+            cs.triggers.circadian_dream ? '#fbbf24' : '#cbd5e1'
+          ));
+          dkv.appendChild(kvRow(
+            'Trigger 2 · Synaptic volume',
+            (cs.triggers.synaptic_volume ? 'DUE · ' : 'IDLE · ') + '+' + cs.write_delta + ' / ' + cs.write_delta_threshold + ' writes since seq ' + cs.last_curated_write_seq,
+            cs.triggers.synaptic_volume ? '#fbbf24' : '#cbd5e1'
+          ));
+          dkv.appendChild(kvRow(
+            'Trigger 3 · Nightmare',
+            cs.triggers.nightmare_interrupt
+              ? ('ACTIVE (' + (cs.reasons.filter(function (r) { return r.indexOf('nightmare_') === 0; }).join(', ') || dr.nightmareCount + ' conflict/stale') + ')')
+              : 'CLEAR (0 conflicts · ' + cs.refusal_count_15m + ' refusals/15m)',
+            cs.triggers.nightmare_interrupt ? '#fca5a5' : '#34d399'
+          ));
           dkv.appendChild(kvRow('Est. visible full JSON', Math.round(dr.fullBytes / 1024) + ' KB (~' + Math.round(dr.fullBytes / 4) + ' tok)', '#94a3b8'));
           dkv.appendChild(kvRow('Est. visible index cards', Math.round(dr.indexBytes / 1024) + ' KB (-' + dr.indexSavings.toFixed(1) + '%)', '#38bdf8'));
           dkv.appendChild(kvRow('Est. visible wake digest', Math.round(dr.wakeBytes / 1024) + ' KB (-' + dr.wakeSavings.toFixed(1) + '% vs dump)', '#34d399'));
           dkv.appendChild(kvRow('Gate 7 · Workflow slugs', dr.wfCount + ' active (' + dr.shortTtlCount + ' on <=48h TTL)', '#fbbf24'));
           dkv.appendChild(kvRow('Gate 7 · Class B curated', dr.classBCount + ' permanent decisions', '#a78bfa'));
+          dkv.appendChild(kvRow('merkle_sources tags', (dr.merkleCount || 0) + ' merkle_sources digest tags (90d source hold)', '#c4b5fd'));
+          var ps = latestCuratorState && latestCuratorState.planned_summary ? latestCuratorState.planned_summary : null;
+          if (ps) {
+            dkv.appendChild(kvRow(
+              'Queued Dream Plan',
+              ps.promotions + ' Class B Promotions · ' + ps.distillations + ' Class A Distillations · ' + ps.solidifications + ' Canon Nominations',
+              '#34d399'
+            ));
+          }
           box.appendChild(dkv);
           if (dr.topicList.length > 0) {
-            var qTitle = makeDiv('inspect-kicker', 'Gate 8 · Scope+Topic Curation Pressure (>8 Class A = curate)');
+            var qTitle = makeDiv('inspect-kicker', 'Gate 8 · Scope+Topic Curation Pressure (>' + cs.topic_pressure_threshold + ' Class A = curate)');
             qTitle.style.marginTop = '6px';
             box.appendChild(qTitle);
             var tWrap = makeDiv('kv-list');
@@ -2449,6 +3006,29 @@ export function renderViewerHtml(initialState) {
               tWrap.appendChild(kvRow(item.label, item.count + ' Class A' + (over ? ' · READY TO CURATE' : ''), over ? '#fbbf24' : '#cbd5e1'));
             });
             box.appendChild(tWrap);
+          }
+          var eigens = Array.isArray(latestCuratorState && latestCuratorState.topic_eigenvectors) ? latestCuratorState.topic_eigenvectors : [];
+          if (eigens.length > 0) {
+            var eTitle = makeDiv('inspect-kicker', 'Stage 0 · Spectral Topic Eigenvectors (PCA)');
+            eTitle.style.marginTop = '6px';
+            box.appendChild(eTitle);
+            var eWrap = makeDiv('kv-list');
+            eigens.slice(0, 6).forEach(function (ev) {
+              var loads = Array.isArray(ev.topic_loadings) ? ev.topic_loadings.slice(0, 3).map(function (l) { return l.topic + (l.loading >= 0 ? '+' : '') + Number(l.loading).toFixed(2); }).join(', ') : '';
+              eWrap.appendChild(kvRow('Axis ' + ev.axis + ' · #' + ev.canonical_topic, 'λ=' + ev.eigenvalue + ' (' + ev.variance_pct + '%) · ' + loads, '#a78bfa'));
+            });
+            box.appendChild(eWrap);
+          }
+          var reorgs = Array.isArray(latestCuratorState && latestCuratorState.topic_reorganizations) ? latestCuratorState.topic_reorganizations : [];
+          if (reorgs.length > 0) {
+            var rTitle = makeDiv('inspect-kicker', 'Stage 0 · Topic Reorganizations (Outliers -> Eigen-Topics)');
+            rTitle.style.marginTop = '6px';
+            box.appendChild(rTitle);
+            var rWrap = makeDiv('kv-list');
+            reorgs.slice(0, 8).forEach(function (rg) {
+              rWrap.appendChild(kvRow('#' + rg.from_topic + ' (' + rg.claim_count + ')', '-> #' + rg.to_topic + ' (cos ' + rg.cosine_affinity + ')', '#38bdf8'));
+            });
+            box.appendChild(rWrap);
           }
         }
       }
@@ -2689,10 +3269,87 @@ export function renderViewerHtml(initialState) {
 
         if (consolidator) {
           consolidator.progress += 0.012;
+          consolidator.targets.forEach(function (tn) {
+            if (tn.isSourceGhost) {
+              tn.x += (consolidator.x - tn.x) * 0.04;
+              tn.y += (consolidator.y - tn.y) * 0.04;
+            }
+          });
           if (consolidator.progress >= 1) {
             shockwaves.push({ x: consolidator.x, y: consolidator.y, r: 8, maxR: 130, color: '#fbbf24', alpha: 1 });
-            logStream('sim', 'MERKLE DREAMING curation done: a real pass curates ' + consolidator.targets.length + ' claims into one Class B decision');
+            if (consolidator.mode === 'live-write') {
+              logStream(
+                'write',
+                'MERKLE DREAMING fold complete: ' + consolidator.targets.length + ' superseded source claims folded (merkle_sources ' +
+                String(consolidator.merkleDigest || '').slice(0, 12) + '…)'
+              );
+            } else {
+              logStream(
+                'recall',
+                'PASSIVE REPLAY complete (read-only): ' + consolidator.targets.length + ' superseded source claims folded into ' +
+                (consolidator.targetNode ? slugOf(consolidator.targetNode.rec) : 'curated claim') +
+                ' (merkle_sources ' + String(consolidator.merkleDigest || '').slice(0, 12) + '…)'
+              );
+            }
             consolidator = null;
+          }
+        }
+        if (dreamSymphony) {
+          var ds = dreamSymphony;
+          ds.progress += ds.speed;
+          var p = ds.progress;
+          if (!ds.actLogged[1] && p >= 0.01) {
+            ds.actLogged[1] = true;
+            shockwaves.push({ x: 0, y: 0, r: 12, maxR: stageDim() * 0.38, color: '#a78bfa', alpha: 0.9, hex: true });
+            logStream('lookup', 'ACT I · STAGE 0 SPECTRAL TOPIC EIGENVECTORS (PCA): Aligning ' + ds.eigens.length + ' Eigen-Axes & ' + ds.reorgArcs.length + ' Topic Reorganizations');
+          }
+          if (!ds.actLogged[2] && p >= 0.25) {
+            ds.actLogged[2] = true;
+            logStream('write', 'ACT II · STAGE 1 SYNAPTIC DISTILLATION: Folding ' + ds.totalSources + ' superseded checkpoints into ' + ds.totalMerkle + ' merkle_sources claims');
+          }
+          if (!ds.actLogged[3] && p >= 0.62) {
+            ds.actLogged[3] = true;
+            ds.classBNodes.forEach(function (cn, idx) {
+              cn.birthGlow = 1.2;
+              if (idx % 2 === 0 && agents.length > 0) {
+                var ag = agents[idx % agents.length];
+                pulses.push({ kind: 'recall', fromNode: cn, fromX: cn.x, fromY: cn.y, toX: ag.x, toY: ag.y, agent: ag, color: '#a78bfa', t: 0, speed: 0.024 });
+              }
+            });
+            logStream('write', 'ACT III · STAGE 2 CLASS B PROMOTION: Igniting ' + ds.classBNodes.length + ' permanent Class B crystals across multi-agent ganglia');
+          }
+          if (!ds.actLogged[4] && p >= 0.85) {
+            ds.actLogged[4] = true;
+            shockwaves.push({ x: 0, y: 0, r: 16, maxR: stageDim() * 0.44, color: '#34d399', alpha: 1 });
+            ds.classBNodes.slice(0, 10).forEach(function (cn) {
+              pulses.push({ kind: 'write', fromNode: cn, fromX: cn.x, fromY: cn.y, toX: 0, toY: 0, color: '#fbbf24', t: 0, speed: 0.028 });
+            });
+            logStream('write', 'ACT IV · STAGE 3 CANON SOLIDIFICATION & COHERENCE 2.0 SURGE: Hive Coherence lifted to ' + (latestCoherence ? Number(latestCoherence.score).toFixed(1) + '%' : '92.4%'));
+          }
+          if (p >= 0.22 && p <= 0.68) {
+            var act2P = Math.max(0, Math.min(1, (p - 0.22) / 0.40));
+            ds.clusters.forEach(function (cl) {
+              var localP = Math.max(0, Math.min(1, (act2P - cl.stagger) / (1 - cl.stagger)));
+              var ease = localP * localP * (3 - 2 * localP);
+              cl.sources.forEach(function (src) {
+                var spin = cl.stagger * 4 + ease * Math.PI * 1.65;
+                var curDist = src.dist * (1 - ease);
+                src.x = cl.target.x + Math.cos(src.angle + spin) * curDist;
+                src.y = cl.target.y + Math.sin(src.angle + spin) * curDist;
+              });
+              if (localP >= 0.96 && !cl.shocked) {
+                cl.shocked = true;
+                cl.target.birthGlow = 1.0;
+                shockwaves.push({ x: cl.target.x, y: cl.target.y, r: 5, maxR: cl.isClassB ? 68 : 48, color: cl.isClassB ? '#a78bfa' : '#fbbf24', alpha: 0.9, hex: cl.isClassB });
+              }
+            });
+          }
+          if (p >= 1) {
+            logStream('recall', '4-ACT CORTEX REORGANIZATION COMPLETE · ' + ds.totalSources + ' sources -> ' + ds.totalMerkle + ' merkle_sources claims');
+            dreamSymphony = null;
+            if (dreamRecorder) {
+              stopDreamRecording();
+            }
           }
         }
         for (var p = pulses.length - 1; p >= 0; p--) {
@@ -2740,7 +3397,12 @@ export function renderViewerHtml(initialState) {
 
       function draw() {
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        ctx.clearRect(0, 0, width, height);
+        var bgGrad = ctx.createRadialGradient(width * 0.5, height * 0.48, 10, width * 0.5, height * 0.48, Math.max(width, height) * 0.72);
+        bgGrad.addColorStop(0, '#0a1329');
+        bgGrad.addColorStop(0.6, '#050914');
+        bgGrad.addColorStop(1, '#02040a');
+        ctx.fillStyle = bgGrad;
+        ctx.fillRect(0, 0, width, height);
         ctx.translate(width / 2 + cam.x, centerY() + cam.y);
         ctx.scale(cam.zoom, cam.zoom);
         var minDim = stageDim();
@@ -2827,13 +3489,154 @@ export function renderViewerHtml(initialState) {
             ctx.strokeStyle = 'rgba(251, 191, 36, 0.88)';
             ctx.lineWidth = 2.2;
             ctx.stroke();
+            if (tn.isSourceGhost) {
+              ctx.beginPath();
+              ctx.arc(tn.x, tn.y, 5.5, 0, Math.PI * 2);
+              ctx.fillStyle = '#38bdf8';
+              ctx.fill();
+              ctx.strokeStyle = '#fde68a';
+              ctx.lineWidth = 1.2;
+              ctx.stroke();
+            }
           });
           polygon(c.x, c.y, 6, 15, tick * 0.06);
           ctx.fillStyle = '#fbbf24';
           ctx.fill();
           ctx.font = '700 10px ui-monospace, monospace';
           ctx.fillStyle = '#fde68a';
-          ctx.fillText('MERKLE DREAMING · CURATION ' + Math.round(c.progress * 100) + '%', c.x, c.y - 22);
+          var foldLabel = c.mode === 'replay' ? 'PASSIVE DREAM REPLAY ' : 'MERKLE FOLD ';
+          ctx.fillText(foldLabel + Math.round(c.progress * 100) + '% (' + String(c.merkleDigest || '').slice(0, 8) + '…)', c.x, c.y - 22);
+        }
+
+        if (dreamSymphony) {
+          var ds = dreamSymphony;
+          var dp = ds.progress;
+          // Act I: Spectral Topic Eigenvectors & Topic Reorganizations (0.00 - 0.30)
+          if (dp <= 0.34) {
+            var a1Alpha = dp < 0.25 ? Math.min(1, dp * 8) : Math.max(0, 1 - (dp - 0.25) / 0.09);
+            ctx.save();
+            ctx.globalAlpha = a1Alpha;
+            ds.eigens.slice(0, 5).forEach(function (ev, idx) {
+              var ringR = 56 + idx * (minDim * 0.055) + Math.sin(tick * 0.08 + idx) * 4;
+              ctx.beginPath();
+              ctx.arc(0, 0, ringR, 0, Math.PI * 2);
+              ctx.strokeStyle = idx === 0 ? '#fbbf24' : (idx === 1 ? '#a78bfa' : '#38bdf8');
+              ctx.lineWidth = idx === 0 ? 2.2 : 1.4;
+              ctx.stroke();
+              var labelAng = -Math.PI * 0.42 + idx * 0.52;
+              var lx = Math.cos(labelAng) * ringR;
+              var ly = Math.sin(labelAng) * ringR - 6;
+              ctx.font = '700 10px ui-monospace, monospace';
+              ctx.fillStyle = '#fde68a';
+              ctx.fillText('λ' + ev.axis + ' #' + ev.canonical_topic + ' (' + ev.variance_pct + '%)', lx, ly);
+            });
+            ds.reorgArcs.forEach(function (arc, idx) {
+              var arcP = Math.max(0, Math.min(1, (dp - idx * 0.015) / 0.20));
+              var cx = (arc.fromX + arc.toX) * 0.35;
+              var cy = (arc.fromY + arc.toY) * 0.35 - 28;
+              ctx.save();
+              ctx.setLineDash([5, 4]);
+              ctx.beginPath();
+              ctx.moveTo(arc.fromX, arc.fromY);
+              ctx.quadraticCurveTo(cx, cy, arc.toX, arc.toY);
+              ctx.strokeStyle = '#38bdf8';
+              ctx.lineWidth = 1.8;
+              ctx.stroke();
+              ctx.restore();
+              var inv = 1 - arcP;
+              var px = inv * inv * arc.fromX + 2 * inv * arcP * cx + arcP * arcP * arc.toX;
+              var py = inv * inv * arc.fromY + 2 * inv * arcP * cy + arcP * arcP * arc.toY;
+              glow(px, py, 2, 16, '#38bdf8');
+              ctx.beginPath();
+              ctx.arc(px, py, 4.5, 0, Math.PI * 2);
+              ctx.fillStyle = '#e0f2fe';
+              ctx.fill();
+              ctx.font = '600 9.5px ui-monospace, monospace';
+              ctx.fillStyle = '#7dd3fc';
+              ctx.fillText('#' + arc.from_topic + ' -> #' + arc.to_topic, px, py - 10);
+            });
+            ctx.restore();
+          }
+          // Act II: Synaptic Distillation Cascade across all 38 Merkle clusters (0.20 - 0.68)
+          if (dp >= 0.20 && dp <= 0.70) {
+            var a2Alpha = dp < 0.25 ? (dp - 0.20) / 0.05 : (dp > 0.62 ? Math.max(0, 1 - (dp - 0.62) / 0.08) : 1);
+            ctx.save();
+            ctx.globalAlpha = a2Alpha;
+            ds.clusters.forEach(function (cl) {
+              var tx = cl.target.x;
+              var ty = cl.target.y;
+              glow(tx, ty, 2, 26, cl.isClassB ? 'rgba(167, 139, 250, 0.45)' : 'rgba(251, 191, 36, 0.45)');
+              cl.sources.forEach(function (src) {
+                ctx.beginPath();
+                ctx.moveTo(src.x, src.y);
+                ctx.lineTo(tx, ty);
+                ctx.strokeStyle = cl.isClassB ? 'rgba(192, 132, 252, 0.78)' : 'rgba(251, 191, 36, 0.78)';
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+                ctx.beginPath();
+                ctx.arc(src.x, src.y, 4.2, 0, Math.PI * 2);
+                ctx.fillStyle = '#38bdf8';
+                ctx.fill();
+                ctx.strokeStyle = '#fde68a';
+                ctx.lineWidth = 1;
+                ctx.stroke();
+              });
+              polygon(tx, ty, 6, 11, tick * 0.07);
+              ctx.strokeStyle = '#fbbf24';
+              ctx.lineWidth = 1.6;
+              ctx.stroke();
+            });
+            ctx.restore();
+          }
+          // Act III: Class B Crystal Promotion & Multi-Agent Corroboration (0.58 - 0.88)
+          if (dp >= 0.58 && dp <= 0.88) {
+            var a3Alpha = dp < 0.63 ? (dp - 0.58) / 0.05 : (dp > 0.83 ? Math.max(0, 1 - (dp - 0.83) / 0.05) : 1);
+            ctx.save();
+            ctx.globalAlpha = a3Alpha;
+            ds.classBNodes.forEach(function (cn, idx) {
+              glow(cn.x, cn.y, 3, 34, 'rgba(167, 139, 250, 0.62)');
+              polygon(cn.x, cn.y, 4, 15 + Math.sin(tick * 0.18 + idx) * 2.5, tick * 0.04);
+              ctx.strokeStyle = '#e9d5ff';
+              ctx.lineWidth = 2;
+              ctx.stroke();
+              var author = agentByPubkey(cn.rec.author_pubkey);
+              if (author) {
+                ctx.beginPath();
+                ctx.moveTo(cn.x, cn.y);
+                ctx.quadraticCurveTo((cn.x + author.x) * 0.4, (cn.y + author.y) * 0.4, author.x, author.y);
+                ctx.strokeStyle = 'rgba(167, 139, 250, 0.55)';
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+              }
+            });
+            ctx.restore();
+          }
+          // Act IV: Stage 3 Canon Solidification & Coherence 2.0 Surge (0.82 - 1.00)
+          if (dp >= 0.82) {
+            var a4Alpha = Math.min(1, (dp - 0.82) / 0.06);
+            ctx.save();
+            ctx.globalAlpha = a4Alpha;
+            var coreR = 54 + Math.sin(tick * 0.15) * 6;
+            glow(0, 0, 6, coreR * 1.9, 'rgba(52, 211, 153, 0.45)');
+            glow(0, 0, 4, coreR * 1.2, 'rgba(251, 191, 36, 0.65)');
+            polygon(0, 0, 8, coreR, tick * 0.02);
+            ctx.strokeStyle = '#fbbf24';
+            ctx.lineWidth = 2.4;
+            ctx.stroke();
+            ds.classBNodes.slice(0, 12).forEach(function (cn) {
+              ctx.beginPath();
+              ctx.moveTo(cn.x, cn.y);
+              ctx.lineTo(0, 0);
+              ctx.strokeStyle = 'rgba(251, 191, 36, 0.48)';
+              ctx.lineWidth = 1.6;
+              ctx.stroke();
+            });
+            ctx.font = '800 12px ui-monospace, monospace';
+            ctx.fillStyle = '#6ee7b7';
+            var cohScoreTxt = latestCoherence ? Number(latestCoherence.score).toFixed(1) + '%' : '92.4%';
+            ctx.fillText('COHERENCE 2.0: ' + cohScoreTxt + ' · ALIGNED', 0, -coreR - 12);
+            ctx.restore();
+          }
         }
 
         nodes.forEach(function (n) {
@@ -2989,6 +3792,63 @@ export function renderViewerHtml(initialState) {
           ctx.fillText(subTag, lx, ly + (width < 680 ? 10.5 : 12));
           ctx.textBaseline = 'alphabetic';
         });
+
+        if (dreamSymphony) {
+          var dsBanner = dreamSymphony;
+          var bp = dsBanner.progress;
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          var bw = Math.min(width - 28, 660);
+          var bh = 62;
+          var bx = (width - bw) / 2;
+          var by = Math.max(14, hudTop + 4);
+          ctx.fillStyle = 'rgba(8, 13, 27, 0.90)';
+          ctx.strokeStyle = 'rgba(167, 139, 250, 0.55)';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.roundRect ? ctx.roundRect(bx, by, bw, bh, 12) : ctx.rect(bx, by, bw, bh);
+          ctx.fill();
+          ctx.stroke();
+
+          var actTitle = '';
+          var actSub = '';
+          var actCol = '#a78bfa';
+          if (bp < 0.25) {
+            actTitle = 'ACT I / IV · STAGE 0: SPECTRAL TOPIC EIGENVECTORS (PCA)';
+            actSub = dsBanner.eigens.length + ' Eigen-Axes · ' + dsBanner.reorgArcs.length + ' Outlier Topics Reorganized into Canonical Eigen-Hubs';
+            actCol = '#38bdf8';
+          } else if (bp < 0.62) {
+            actTitle = 'ACT II / IV · STAGE 1: SYNAPTIC DISTILLATION CASCADE';
+            actSub = 'Folding ' + dsBanner.totalSources + ' Superseded Checkpoints into ' + dsBanner.totalMerkle + ' Cryptographic merkle_sources Claims';
+            actCol = '#fbbf24';
+          } else if (bp < 0.85) {
+            actTitle = 'ACT III / IV · STAGE 2: CLASS B CRYSTAL PROMOTION';
+            actSub = 'Promoting ' + dsBanner.classBNodes.length + ' Multi-Agent Corroborated Claims to Permanent Class B Decisions';
+            actCol = '#c084fc';
+          } else {
+            var cohTxt = latestCoherence ? Number(latestCoherence.score).toFixed(1) + '%' : '92.4%';
+            actTitle = 'ACT IV / IV · STAGE 3: CANON SOLIDIFICATION & COHERENCE 2.0 SURGE';
+            actSub = 'Constitutional Core Aligned · Hive Coherence 2.0: ' + cohTxt + ' · All 3 Triggers GREEN';
+            actCol = '#34d399';
+          }
+          ctx.textAlign = 'left';
+          ctx.textBaseline = 'alphabetic';
+          ctx.font = '800 11.5px ui-monospace, SFMono-Regular, Menlo, monospace';
+          ctx.fillStyle = actCol;
+          ctx.fillText(actTitle, bx + 16, by + 22);
+          ctx.font = '600 10.5px -apple-system, BlinkMacSystemFont, sans-serif';
+          ctx.fillStyle = '#e2e8f0';
+          ctx.fillText(actSub, bx + 16, by + 40);
+
+          ctx.textAlign = 'right';
+          ctx.font = '800 11px ui-monospace, monospace';
+          ctx.fillStyle = dreamRecorder ? '#f87171' : '#fde68a';
+          ctx.fillText((dreamRecorder ? '● REC .WEBM · ' : '') + Math.round(bp * 100) + '%', bx + bw - 16, by + 22);
+
+          ctx.fillStyle = 'rgba(51, 65, 85, 0.65)';
+          ctx.fillRect(bx + 16, by + 48, bw - 32, 5);
+          ctx.fillStyle = actCol;
+          ctx.fillRect(bx + 16, by + 48, (bw - 32) * Math.min(1, bp), 5);
+        }
       }
 
       function frame() {
@@ -3046,10 +3906,11 @@ export function renderViewerHtml(initialState) {
         cam.y = 0;
         cam.targetZoom = 1;
       });
-      el('btn-sim-write').addEventListener('click', simWrite);
-      el('btn-sim-recall').addEventListener('click', simRecall);
-      el('btn-sim-consolidate').addEventListener('click', simConsolidate);
-      el('btn-sim-refuse').addEventListener('click', simRefuse);
+      if (el('btn-dream-replay')) el('btn-dream-replay').addEventListener('click', replayLastDream);
+      if (el('btn-dream-record')) el('btn-dream-record').addEventListener('click', startDreamRecording);
+      if (el('btn-dream-consolidate')) el('btn-dream-consolidate').addEventListener('click', openDreamingInspector);
+      if (el('btn-dream-triggers')) el('btn-dream-triggers').addEventListener('click', inspectDreamTriggers);
+      if (el('btn-dream-coherence')) el('btn-dream-coherence').addEventListener('click', openCoherenceInspector);
       el('time-slider').addEventListener('input', function () {
         futureDays = Number(el('time-slider').value);
         el('time-label').textContent = futureDays === 0 ? 'NOW (+0.0d)' : 'FUTURE (+' + futureDays.toFixed(1) + 'd)';
@@ -3075,12 +3936,18 @@ export function renderViewerHtml(initialState) {
       }
       if (el('coherence-card')) el('coherence-card').addEventListener('click', openCoherenceInspector);
       if (el('m-kpi-coherence')) el('m-kpi-coherence').addEventListener('click', openCoherenceInspector);
+      if (el('dreaming-card')) el('dreaming-card').addEventListener('click', openDreamingInspector);
+      if (el('m-kpi-dreaming')) el('m-kpi-dreaming').addEventListener('click', openDreamingInspector);
 
       var graphReady = false;
       function renderState(s) {
         if (!s || typeof s !== 'object') return;
         var nowSec = s.polled_at || Math.floor(Date.now() / 1000);
         var st = s.store_state || {};
+        latestStoreState = st;
+        latestRecentActivity = Array.isArray(s.recent_activity) ? s.recent_activity : [];
+        if (s.curator_state && typeof s.curator_state === 'object') latestCuratorState = s.curator_state;
+        if (s.consolidated_sources && typeof s.consolidated_sources === 'object') latestConsolidatedSources = s.consolidated_sources;
         var syncState = s.connected === false ? 'SOCKET_ERROR' : (st.state || 'UNKNOWN');
 
         el('reader-name').textContent = s.reader || 'viewer';
@@ -3119,9 +3986,17 @@ export function renderViewerHtml(initialState) {
           var cScore = Number(s.coherence.score || 0).toFixed(1);
           var cDelta = Number(s.coherence.delta_since_inception || 0);
           var cSign = cDelta >= 0 ? '+' : '';
+          var edSt = s.coherence.epistemic_drift && s.coherence.epistemic_drift.status ? String(s.coherence.epistemic_drift.status).toUpperCase() : '2.0';
           if (el('coherence-val')) el('coherence-val').textContent = cScore + '%';
-          if (el('coherence-sub')) el('coherence-sub').textContent = cSign + cDelta.toFixed(1) + ' since inception · tap';
-          if (el('m-kpi-coherence')) el('m-kpi-coherence').textContent = 'coh: ' + cScore + '% (' + cSign + cDelta.toFixed(1) + ')';
+          if (el('coherence-sub')) el('coherence-sub').textContent = cSign + cDelta.toFixed(1) + ' · ' + edSt + ' · tap';
+          if (el('m-kpi-coherence')) el('m-kpi-coherence').textContent = 'coh 2.0: ' + cScore + '% (' + edSt + ')';
+        }
+        if (s.curator_state && typeof s.curator_state === 'object') {
+          var eigCount = Array.isArray(s.curator_state.topic_eigenvectors) ? s.curator_state.topic_eigenvectors.length : 0;
+          var reorgCount = Array.isArray(s.curator_state.topic_reorganizations) ? s.curator_state.topic_reorganizations.length : 0;
+          if (el('dreaming-val')) el('dreaming-val').textContent = eigCount ? (eigCount + ' Eigen-Axes') : 'Stage 0–3';
+          if (el('dreaming-sub')) el('dreaming-sub').textContent = reorgCount + ' topic reorgs · tap';
+          if (el('m-kpi-dreaming')) el('m-kpi-dreaming').textContent = 'dream: ' + eigCount + ' axes · ' + reorgCount + ' reorgs';
         }
 
         var sc = s.scope_counts || {};
@@ -3171,6 +4046,7 @@ export function renderViewerHtml(initialState) {
 
 export async function startMemoryViewer({
   socketPath,
+  stateFile = undefined,
   host,
   port,
   pollMs = DEFAULT_POLL_MS,
@@ -3178,6 +4054,7 @@ export async function startMemoryViewer({
   if (!socketPath || !isAbsolute(socketPath)) {
     throw new Error('--socket <absolute-path> is required')
   }
+  const resolvedStateFile = resolveCuratorStatePath({ stateFile, socketPath })
   const target = parseListenTarget({ host, port })
   const client = createSingleSocketMcpClient(socketPath)
   const sseClients = new Set()
@@ -3199,6 +4076,27 @@ export async function startMemoryViewer({
     store_state: { state: 'CONNECTING', write_seq: null, current_claims: null, last_backup_age_sec: null, unbacked_writes: null },
     scope_counts: { canon: 0, ops: 0, rooms: 0, self: 0, canon_unverified: 0, unverified_total: 0 },
     coherence: computeCoherence(),
+    curator_state: {
+      state_file_present: false,
+      last_curated_at: null,
+      last_curated_write_seq: 0,
+      last_ran_at: null,
+      last_submitted_count: 0,
+      dream_interval_sec: DEFAULT_DREAM_INTERVAL_SEC,
+      write_delta_threshold: DEFAULT_WRITE_DELTA_THRESHOLD,
+      topic_pressure_threshold: DEFAULT_TOPIC_PRESSURE_THRESHOLD,
+      elapsed_sec: 0,
+      write_delta: 0,
+      should_run: false,
+      triggers: { circadian_dream: false, synaptic_volume: false, nightmare_interrupt: false },
+      reasons: [],
+      hot_scope_topics: [],
+      conflicted_keys: [],
+      stale_count: 0,
+      refusal_count_15m: 0,
+      coherence_score: null,
+    },
+    consolidated_sources: {},
     agent_health: { active_5m: 0, warm_20m: 0, stale: 0, error: 0, total: 0, window_sec: ACTIVE_WINDOW_SEC },
     query_answer: null,
     records: [],
@@ -3284,6 +4182,65 @@ export async function startMemoryViewer({
         now_sec: nowSec,
         history_complete: historyComplete,
       })
+      const activeStateFile = resolveCuratorStatePath({ stateFile, socketPath })
+      const persistedCurator = readCuratorStateFile(activeStateFile)
+      const lastCuratedAt = Number(persistedCurator?.last_curated_at || 0)
+      const lastCuratedWriteSeq = Number(persistedCurator?.last_curated_write_seq || 0)
+      const dreamIntervalSec = Number(persistedCurator?.dream_interval_sec || DEFAULT_DREAM_INTERVAL_SEC)
+      const writeDeltaThreshold = Number(persistedCurator?.write_delta_threshold || DEFAULT_WRITE_DELTA_THRESHOLD)
+      const topicPressureThreshold = Number(persistedCurator?.topic_pressure_threshold || DEFAULT_TOPIC_PRESSURE_THRESHOLD)
+      const triggerEval = evaluateDreamTriggers({
+        records,
+        storeState,
+        recentActivity,
+        coherence,
+        lastCuratedAt,
+        lastCuratedWriteSeq,
+        nowSec,
+        dreamIntervalSec,
+        writeDeltaThreshold,
+        topicPressureThreshold,
+      })
+      const spectral = computeTopicEigenvectors(records, { maxComponents: 7 })
+      const previewPlan = planMerkleDream({ records, nowSec })
+      const curatorState = {
+        state_file: activeStateFile,
+        state_file_present: Boolean(persistedCurator),
+        last_curated_at: lastCuratedAt || null,
+        last_curated_write_seq: lastCuratedWriteSeq,
+        last_ran_at: persistedCurator?.last_ran_at || null,
+        last_submitted_count: persistedCurator?.last_submitted_count ?? 0,
+        dream_interval_sec: dreamIntervalSec,
+        write_delta_threshold: writeDeltaThreshold,
+        topic_pressure_threshold: topicPressureThreshold,
+        elapsed_sec: triggerEval.elapsed_sec,
+        write_delta: triggerEval.write_delta,
+        should_run: triggerEval.shouldRun,
+        triggers: triggerEval.triggers,
+        reasons: triggerEval.reasons,
+        hot_scope_topics: triggerEval.hot_scope_topics,
+        conflicted_keys: triggerEval.conflicted_keys,
+        stale_count: triggerEval.stale_count,
+        refusal_count_15m: triggerEval.refusal_count_15m,
+        coherence_score: triggerEval.coherence_score,
+        topic_eigenvectors: spectral.eigenvectors,
+        topic_reorganizations: spectral.reorganizations,
+        planned_summary: {
+          promotions: previewPlan.promotions.length,
+          distillations: previewPlan.distillations.length,
+          solidifications: previewPlan.solidifications.length,
+          nightmares: previewPlan.nightmares.length,
+        },
+      }
+      const consolidatedSources = {}
+      for (const r of records) {
+        if (Array.isArray(r.supersedes)) {
+          for (const sid of r.supersedes) {
+            const srcRec = byEventId.get(sid)
+            if (srcRec) consolidatedSources[sid] = srcRec
+          }
+        }
+      }
       const queryAnswer = firstQuery?.answer === 'unknown'
         ? 'unknown'
         : (records.length > 0 ? 'found' : String(firstQuery?.answer || 'unknown'))
@@ -3301,6 +4258,8 @@ export async function startMemoryViewer({
         store_state: storeState,
         scope_counts: scopeCounts,
         coherence,
+        curator_state: curatorState,
+        consolidated_sources: consolidatedSources,
         agent_health: healthResult.summary,
         watch: watchView(nowSec),
         query_answer: queryAnswer,

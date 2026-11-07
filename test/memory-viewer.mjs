@@ -379,6 +379,29 @@ await test('computeCoherence calculates 5-axis HCI score and retroactive incepti
   })
   const step5 = coh4.history.find(h => h.events === 5)
   assert.equal(step5.claims, 4, 'at step 5 (t=110), c2 is active and consolidates c1 via supersedes even after c2 later expires')
+
+  // Verify epistemic drift & blind-spot detection: zero-hit queries and silent active writers dip coherence
+  const cohDrift = computeCoherence({
+    records,
+    agent_roster: [
+      ...roster,
+      { id: 'biggy', pubkey: '4'.repeat(64), is_writer: true },
+    ],
+    recent_activity: [
+      { kind: 'wake', actor: 'biggy' },
+      { kind: 'query', actor: 'biggy', count: 2, topic: 'r1' },
+      { kind: 'lookup', actor: 'biggy' },
+      { kind: 'wake', actor: 'biggy' },
+      { kind: 'query', actor: 'mc-claude', count: 0, topic: 'wonder-lab' },
+      { kind: 'query', actor: 'mydude', count: 0, topic: 'wonder-lab' },
+    ],
+    store_state: { write_seq: 6 },
+  })
+  assert.equal(cohDrift.epistemic_drift.status, 'blind_spot')
+  assert.equal(cohDrift.epistemic_drift.zero_hit_queries, 2)
+  assert.deepEqual(cohDrift.epistemic_drift.missed_topics, ['wonder-lab'])
+  assert.deepEqual(cohDrift.epistemic_drift.silent_active_writers, ['biggy'])
+  assert(cohDrift.score < coh.score, `coherence must dip on epistemic blind spots (${cohDrift.score} < ${coh.score})`)
 })
 
 await test('computeAgentHealth: classifies 5m active, 5-20m warm, >20m stale, error, and preserves telemetry across rollover', () => {
@@ -536,6 +559,25 @@ await test('live integration: memory-viewer polls memory-daemon viewer socket, s
     assert(htmlRes.body.includes('id="dock-agents"'))
     assert(htmlRes.body.includes('id="dock-pulses"'))
     assert(htmlRes.body.includes('id="dock-tools"'))
+    assert(htmlRes.body.includes('Dream / Time'))
+    assert(htmlRes.body.includes('id="dream-bar-status"'))
+    assert(htmlRes.body.includes('id="btn-dream-replay"'))
+    assert(htmlRes.body.includes('Replay Last Dream'))
+    assert(htmlRes.body.includes('id="btn-dream-consolidate"'))
+    assert(htmlRes.body.includes('Inspect Curation (Passive)'))
+    assert(htmlRes.body.includes('id="btn-dream-triggers"'))
+    assert(htmlRes.body.includes('Inspect 3-Trigger State'))
+    assert(htmlRes.body.includes('id="btn-dream-coherence"'))
+    assert(htmlRes.body.includes('PASSIVE INSPECTION · READ-ONLY'))
+    assert(htmlRes.body.includes('merkle_sources digest tags'))
+    assert(!htmlRes.body.includes('verified SHA-256 trees'))
+    assert(!htmlRes.body.includes('merkle_sources.event_ids'))
+    assert(!htmlRes.body.includes('merkle_sources.root'))
+    assert(!htmlRes.body.includes('ms.event_ids'))
+    assert(!htmlRes.body.includes('ms.root'))
+    assert(!htmlRes.body.includes('Sim write'))
+    assert(!htmlRes.body.includes('Sim recall'))
+    assert(!htmlRes.body.includes('Sim refusal'))
     assert(htmlRes.body.includes('id="btn-zoom-in"'))
     assert(htmlRes.body.includes('inspect-close'))
     assert(!/relay|SYNCED/i.test(htmlRes.body.replace('never synced to a relay', '')))
@@ -549,6 +591,9 @@ await test('live integration: memory-viewer polls memory-daemon viewer socket, s
     assert.equal(state1.trustedInstruction, false)
     assert.equal(state1.store_state.state, 'READY')
     assert.equal(state1.store_state.write_seq, 1)
+    assert.equal(typeof state1.curator_state, 'object')
+    assert.equal(state1.curator_state.write_delta, 1)
+    assert.equal(state1.curator_state.should_run, false)
     assert.equal(state1.query_answer, 'none')
     assert(!('global_sync' in state1) && !('relays_answered' in state1) && !('grants_checked_at' in state1))
     assert.equal(state1.records.length, 0)
@@ -622,6 +667,29 @@ await test('live integration: memory-viewer polls memory-daemon viewer socket, s
     const htmlRes2 = await httpGet(viewer.port, '/')
     assert(!htmlRes2.body.includes('<script>alert(1)</script>'))
     assert(htmlRes2.body.includes('\\u003cscript\\u003ealert(1)\\u003c/script\\u003e'))
+
+    // Verify viewer honors HIVE_MEMORY_CURATOR_STATE_FILE / stateFile override and fails closed on corrupt state file
+    const overrideStatePath = join(tmp, 'custom-curator-state.json')
+    process.env.HIVE_MEMORY_CURATOR_STATE_FILE = overrideStatePath
+    try {
+      const parsedFlags = parseViewerFlags(['--socket', join(sockDir, 'viewer.sock'), '--state-file', overrideStatePath, '--listen', '127.0.0.1:0'])
+      assert.equal(parsedFlags.stateFile, overrideStatePath)
+
+      const { writeCuratorStateFile } = await import('../mcp/tools/memory-curate.mjs')
+      writeCuratorStateFile(overrideStatePath, {
+        last_curated_at: nowSec - 120,
+        last_curated_write_seq: 2,
+        last_ran_at: nowSec - 120,
+        last_submitted_count: 1,
+      })
+      const polledWithOverride = await viewer.pollOnce()
+      assert.equal(polledWithOverride.curator_state.state_file, overrideStatePath)
+      assert.equal(polledWithOverride.curator_state.state_file_present, true)
+      assert.equal(polledWithOverride.curator_state.last_curated_write_seq, 2)
+      assert.equal(polledWithOverride.curator_state.write_delta, 0)
+    } finally {
+      delete process.env.HIVE_MEMORY_CURATOR_STATE_FILE
+    }
 
     sseReq.destroy()
 
@@ -706,9 +774,9 @@ await test('daemon activity ring: only the viewer wake carries it, metadata only
     const roomed = claim(neilSk, neilPk, `room:${room}`, 'secret-room-plan')
     assert.equal(payload(call({ kind: 'writer', name: 'neil' }, 'memory_submit', { event: roomed, expected_prior_id: null })).accepted, true)
 
-    // Another reader's wake is byte-for-byte what it was without the ring.
+    // Another reader's wake is byte-for-byte what it was without the ring, even if include_telemetry: true is passed.
     const plain = call(biggy, 'memory_wake', {}, null)
-    const ringed = call(biggy, 'memory_wake', {})
+    const ringed = call(biggy, 'memory_wake', { include_telemetry: true })
     assert.equal(JSON.stringify(ringed), JSON.stringify(plain))
     assert(!('recent_activity' in payload(ringed)) && !('agent_roster' in payload(ringed)))
     call(biggy, 'memory_query', { topic: 'governance', text: 'SECRET-CLAIM-TEXT' })
