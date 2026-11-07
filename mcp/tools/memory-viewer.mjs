@@ -2049,10 +2049,16 @@ export function renderViewerHtml(initialState) {
         var wfCount = 0;
         var shortTtlCount = 0;
         var classBCount = 0;
+        var merkleCount = 0;
+        var nightmareCount = 0;
         var byScopeTopic = {};
         recs.forEach(function (r) {
           var isWf = isWorkflowCheckpoint(r);
           indexBytes += 140 + Math.min(120, String(r.claim || '').length) + String(r.d || '').length;
+          if (r.merkle_sources) merkleCount += 1;
+          if (r.conflict || ((isCanon(r) || r.expires_at === null || r.expires_at === undefined) && r.stale_warning)) {
+            nightmareCount += 1;
+          }
           if (isCanon(r)) canonBytes += JSON.stringify(r).length;
           else if (r.expires_at === null || r.expires_at === undefined) classBCount += 1;
           else {
@@ -2087,6 +2093,8 @@ export function renderViewerHtml(initialState) {
           wfCount: wfCount,
           shortTtlCount: shortTtlCount,
           classBCount: classBCount,
+          merkleCount: merkleCount,
+          nightmareCount: nightmareCount,
           topicList: topicList
         };
       }
@@ -2281,6 +2289,8 @@ export function renderViewerHtml(initialState) {
           kv.appendChild(kvRow('Anchor', r.as_of_git || r.as_of_evt || '(none)'));
           kv.appendChild(kvRow('Evidence', Array.isArray(r.evidence) && r.evidence.length ? r.evidence.join(', ') : '(none)'));
           kv.appendChild(kvRow('Event id', String(r.event_id || '').slice(0, 20) + '…'));
+          if (r.merkle_sources) kv.appendChild(kvRow('Merkle sources', String(r.merkle_sources).slice(0, 20) + '…', '#a78bfa'));
+          if (r.consolidated_by) kv.appendChild(kvRow('Curated into', String(r.consolidated_by).slice(0, 20) + '… (90d hold)', '#c4b5fd'));
           kv.appendChild(kvRow('Created', fmtTime(r.created_at)));
           kv.appendChild(kvRow('Expires', fmtTime(r.expires_at)));
           if (r.conflict) kv.appendChild(kvRow('Conflict', 'yes', '#fcd34d'));
@@ -2439,6 +2449,8 @@ export function renderViewerHtml(initialState) {
           dkv.appendChild(kvRow('Est. visible wake digest', Math.round(dr.wakeBytes / 1024) + ' KB (-' + dr.wakeSavings.toFixed(1) + '% vs dump)', '#34d399'));
           dkv.appendChild(kvRow('Gate 7 · Workflow slugs', dr.wfCount + ' active (' + dr.shortTtlCount + ' on <=48h TTL)', '#fbbf24'));
           dkv.appendChild(kvRow('Gate 7 · Class B curated', dr.classBCount + ' permanent decisions', '#a78bfa'));
+          dkv.appendChild(kvRow('Merkle source roots', (dr.merkleCount || 0) + ' verified SHA-256 trees (90d hold)', '#c4b5fd'));
+          dkv.appendChild(kvRow('3-Trigger Dream Engine', (dr.nightmareCount > 0 ? dr.nightmareCount + ' NIGHTMARE INTERRUPTS' : 'Circadian 6h · +20 Vol · Clear'), dr.nightmareCount > 0 ? '#fca5a5' : '#34d399'));
           box.appendChild(dkv);
           if (dr.topicList.length > 0) {
             var qTitle = makeDiv('inspect-kicker', 'Gate 8 · Scope+Topic Curation Pressure (>8 Class A = curate)');
