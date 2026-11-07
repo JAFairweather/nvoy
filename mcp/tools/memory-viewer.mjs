@@ -13,6 +13,7 @@
 //   5. The viewer's memory_wake also carries the daemon's metadata-only activity ring and agent roster, which
 //      drive the cortex canvas. Its simulation controls animate locally and never call the server.
 
+import { readFileSync } from 'node:fs'
 import { createServer as createHttpServer } from 'node:http'
 import { createConnection } from 'node:net'
 import { isAbsolute, resolve } from 'node:path'
@@ -440,6 +441,50 @@ export function computeCoherence({
 }
 
 export const ACTIVE_WINDOW_SEC = 300
+// herd-infra's hive-memory-watch writes this every 5 minutes. Its writers map is the only place saving shows: the daemon's
+// store_state stays READY while every writer is fenced (2026-11-07, 04:15-12:20 UTC, no alert).
+const WATCH_STATUS_PATH = process.env.HIVE_MEMORY_WATCH_STATUS || '/run/hive-memory-watch/status.json'
+export const WATCH_STALE_SEC = 900
+
+export function readWatchStatus(path = WATCH_STATUS_PATH, nowSec = Math.floor(Date.now() / 1000)) {
+  let raw
+  try {
+    raw = JSON.parse(readFileSync(path, 'utf8'))
+  } catch (err) {
+    return { at: null, stale: true, saving: 'unknown', writers: {}, fenced: [], problems: [`no health check status (${err.code || 'unreadable'})`] }
+  }
+  const writers = {}
+  for (const [name, state] of Object.entries(raw?.writers && typeof raw.writers === 'object' ? raw.writers : {})) {
+    if (/^[a-z0-9][a-z0-9-]{0,39}$/.test(name)) writers[name] = state === 'open' ? 'open' : 'FENCED'
+  }
+  const names = Object.keys(writers)
+  const fenced = names.filter((n) => writers[n] !== 'open')
+  const saving = names.length === 0 ? 'unknown' : fenced.length === 0 ? 'open' : fenced.length === names.length ? 'OFF' : 'partial'
+  const problems = (Array.isArray(raw?.problems) ? raw.problems : []).filter((x) => typeof x === 'string').slice(0, 10).map((x) => x.slice(0, 300))
+  const at = Number.isSafeInteger(raw?.at) ? raw.at : null
+  return { at, stale: at === null || nowSec - at > WATCH_STALE_SEC, saving, writers, fenced, problems }
+}
+
+export function watchView(nowSec, path = undefined) {
+  const watch = readWatchStatus(path, nowSec)
+  return { ...watch, alert: watchAlert(watch, nowSec), hard: !watch.stale && (watch.saving === 'OFF' || watch.saving === 'partial') }
+}
+
+export function watchAlert(watch, nowSec = Math.floor(Date.now() / 1000)) {
+  if (!watch) return null
+  // A stale report says nothing about now: name its age and what it last said, never claim it as the current state.
+  if (watch.stale) {
+    if (watch.at === null) return 'The health check has not reported: saving cannot be confirmed'
+    const last = watch.saving === 'OFF' ? ' (it then said saving was OFF)'
+      : watch.saving === 'partial' ? ` (it then said saving was off for ${watch.fenced.join(', ')})` : ''
+    return `The health check last reported ${Math.round((nowSec - watch.at) / 60)} min ago${last}: saving cannot be confirmed`
+  }
+  if (watch.saving === 'OFF') return `SAVING IS OFF: all ${watch.fenced.length} writers are fenced, so every save is refused`
+  if (watch.saving === 'partial') return `Saving is off for ${watch.fenced.join(', ')}: their saves are refused`
+  if (watch.saving === 'unknown') return 'The health check does not report writers: saving cannot be confirmed'
+  if (watch.problems.length) return `Health check: ${watch.problems[0]}`
+  return null
+}
 export const WARM_WINDOW_SEC = 1200
 
 export function computeAgentHealth({
@@ -592,6 +637,10 @@ export function diffViewerSnapshots(prev, next, nowSec = Math.floor(Date.now() /
     )
     return events
   }
+
+  const prevAlert = watchAlert(prev.watch, nowSec)
+  const nextAlert = watchAlert(next.watch, nowSec)
+  if (prevAlert !== nextAlert) push('alert', nextAlert || 'Health check clear: saving is open')
 
   if (prev.connected !== next.connected) {
     push('socket', next.connected ? 'Reader socket connected' : `Reader socket disconnected: ${next.error || 'closed'}`)
@@ -984,6 +1033,10 @@ export function renderViewerHtml(initialState) {
     .badge.ok { color: #86efac; background: var(--ok-bg); border-color: rgba(34, 197, 94, 0.4); }
     .badge.warn { color: #fcd34d; background: var(--warn-bg); border-color: rgba(245, 158, 11, 0.4); }
     .badge.err { color: #fca5a5; background: var(--err-bg); border-color: rgba(239, 68, 68, 0.4); }
+    .alert-banner { position: fixed; top: calc(env(safe-area-inset-top, 0px) + 8px); left: 50%; transform: translateX(-50%);
+      z-index: 50; max-width: min(720px, calc(100vw - 32px)); padding: 10px 16px; border-radius: 10px; font-weight: 700;
+      color: #fff; background: #b91c1c; border: 1px solid #fca5a5; box-shadow: 0 0 24px rgba(239, 68, 68, 0.6); }
+    .alert-banner.warn { background: #92400e; border-color: #fcd34d; box-shadow: 0 0 18px rgba(245, 158, 11, 0.5); }
     .badge.info { color: #7dd3fc; background: var(--info-bg); border-color: rgba(56, 189, 248, 0.4); }
     .badge.sim { color: #fde68a; background: rgba(245, 158, 11, 0.12); border: 1px dashed rgba(251, 191, 36, 0.6); }
     .telemetry-strip { display: flex; gap: 16px; padding: 8px 14px; flex-wrap: wrap; }
@@ -1342,6 +1395,7 @@ export function renderViewerHtml(initialState) {
       </div>
     </div>
   </header>
+  <div id="alert-banner" class="alert-banner" role="alert" hidden></div>
 
   <aside class="hud-left graph-only">
     <div class="glass-box panel agents-box">
@@ -3036,6 +3090,13 @@ export function renderViewerHtml(initialState) {
         syncBadge.textContent = syncState;
         syncBadge.className = syncBadgeClass(syncState);
 
+        var w = s.watch || {}, banner = el('alert-banner'), msg = w.alert || null, hard = !!w.hard;
+        if (banner) {
+          banner.textContent = msg || '';
+          banner.className = 'alert-banner' + (hard ? '' : ' warn');
+          banner.hidden = !msg;
+        }
+
         el('sync-state').textContent = syncState;
         el('sync-sub').textContent = s.connected === false
           ? ('error: ' + (s.error || 'disconnected'))
@@ -3241,6 +3302,7 @@ export async function startMemoryViewer({
         scope_counts: scopeCounts,
         coherence,
         agent_health: healthResult.summary,
+        watch: watchView(nowSec),
         query_answer: queryAnswer,
         records,
         agent_roster: agentRoster,
@@ -3251,6 +3313,7 @@ export async function startMemoryViewer({
         ...currentState,
         connected: false,
         error: String(err.message || err),
+        watch: watchView(nowSec),
         polled_at: nowSec,
         poll_seq: pollSeq,
         authority: null,
