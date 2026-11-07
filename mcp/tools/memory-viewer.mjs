@@ -1640,7 +1640,8 @@ export function renderViewerHtml(initialState) {
     .stream-item.lookup { border-left-color: #a78bfa; }
     .stream-item.refuse { border-left-color: #f87171; }
     .stream-item.sim { border-left-style: dashed; border-left-color: #fbbf24; color: #fde68a; }
-    .inspector { flex: 0 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 9px; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+    .inspector { flex: 1 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 9px; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+    .inspector > *, #coherence-graphs-box > *, .glass-box > canvas { flex-shrink: 0; }
     .inspect-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; border-bottom: 1px solid var(--border); padding-bottom: 7px; }
     .inspect-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
     .inspect-close { padding: 3px 8px; font-size: 12px; line-height: 1.2; border-radius: 6px; }
@@ -3242,7 +3243,10 @@ export function renderViewerHtml(initialState) {
             sparkCanvas.width = 560;
             sparkCanvas.height = 156;
             sparkCanvas.style.width = '100%';
-            sparkCanvas.style.height = '96px';
+            sparkCanvas.style.height = '104px';
+            sparkCanvas.style.minHeight = '104px';
+            sparkCanvas.style.flexShrink = '0';
+            sparkCanvas.style.display = 'block';
             sparkCanvas.style.borderRadius = '8px';
             sparkCanvas.style.background = 'rgba(2, 6, 23, 0.72)';
             sparkCanvas.style.border = '1px solid rgba(52, 211, 153, 0.28)';
@@ -4415,34 +4419,46 @@ export function renderViewerHtml(initialState) {
           ctx.fillRect(bx + 16, by + 48, bw - 32, 5);
           ctx.fillStyle = actCol;
           ctx.fillRect(bx + 16, by + 48, (bw - 32) * Math.min(1, bp), 5);
-        } else if (width <= 1024 && latestCoherence && Array.isArray(latestCoherence.history) && latestCoherence.history.length > 0) {
+        } else if (latestCoherence && Array.isArray(latestCoherence.history) && latestCoherence.history.length > 0) {
           ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-          var cw = Math.min(width - 24, 340);
-          var ch = 76;
-          var cx = width - cw - 12;
+          var cw = Math.min(width - 24, 330);
+          var ch = 92;
+          var cx = width > 1024 ? 292 : (width - cw - 12);
           var cy = Math.max(10, hudTop + 4);
-          ctx.fillStyle = 'rgba(6, 11, 25, 0.88)';
-          ctx.strokeStyle = 'rgba(52, 211, 153, 0.42)';
-          ctx.lineWidth = 1.2;
+          ctx.fillStyle = 'rgba(6, 11, 25, 0.90)';
+          ctx.strokeStyle = 'rgba(52, 211, 153, 0.48)';
+          ctx.lineWidth = 1.4;
           ctx.beginPath();
           ctx.roundRect ? ctx.roundRect(cx, cy, cw, ch, 10) : ctx.rect(cx, cy, cw, ch);
           ctx.fill();
           ctx.stroke();
           ctx.textAlign = 'left';
           ctx.textBaseline = 'alphabetic';
-          ctx.font = '700 10px ui-monospace, SFMono-Regular, Menlo, monospace';
+          ctx.font = '700 10.5px ui-monospace, SFMono-Regular, Menlo, monospace';
           ctx.fillStyle = '#6ee7b7';
-          var pCons = latestCoherence.axes && typeof latestCoherence.axes.consolidation === 'number' ? latestCoherence.axes.consolidation.toFixed(0) : '-';
-          ctx.fillText('COHERENCE ' + Number(latestCoherence.score || 0).toFixed(1) + '% · CONSOLIDATION ' + pCons + '%', cx + 10, cy + 15);
+          var pCons = latestCoherence.axes && typeof latestCoherence.axes.consolidation === 'number' ? latestCoherence.axes.consolidation.toFixed(1) : '-';
+          ctx.fillText('● COHERENCE ' + Number(latestCoherence.score || 0).toFixed(1) + '%   --- CONSOLIDATION ' + pCons + '%', cx + 10, cy + 16);
           var chist = latestCoherence.history;
           var cproj = latestCoherence.projected_after_dream || null;
           var ctot = cproj ? chist.length + 1 : chist.length;
-          var gx0 = cx + 10;
-          var gx1 = cx + cw - 10;
-          var gy0 = cy + 22;
-          var gy1 = cy + ch - 8;
+          var gx0 = cx + 28;
+          var gx1 = cx + cw - 12;
+          var gy0 = cy + 24;
+          var gy1 = cy + ch - 10;
           var cxOf = function (idx) { return gx0 + (ctot <= 1 ? (gx1 - gx0) / 2 : (idx / (ctot - 1)) * (gx1 - gx0)); };
           var cyOf = function (v) { var cl = Math.max(20, Math.min(100, Number(v || 0))); return gy1 - ((cl - 20) / 80) * (gy1 - gy0); };
+          ctx.strokeStyle = 'rgba(148, 163, 184, 0.16)';
+          ctx.lineWidth = 1;
+          ctx.font = '9px ui-monospace, SFMono-Regular, Menlo, monospace';
+          ctx.fillStyle = 'rgba(148, 163, 184, 0.65)';
+          [40, 70, 100].forEach(function (lvl) {
+            var gy = cyOf(lvl);
+            ctx.beginPath();
+            ctx.moveTo(gx0, gy);
+            ctx.lineTo(gx1, gy);
+            ctx.stroke();
+            ctx.fillText(lvl + '%', cx + 4, gy + 3);
+          });
           ctx.save();
           ctx.setLineDash([4, 3]);
           ctx.beginPath();
@@ -4453,7 +4469,7 @@ export function renderViewerHtml(initialState) {
           });
           if (cproj && typeof cproj.consolidation === 'number') ctx.lineTo(cxOf(chist.length), cyOf(cproj.consolidation));
           ctx.strokeStyle = '#f472b6';
-          ctx.lineWidth = 1.6;
+          ctx.lineWidth = 2;
           ctx.stroke();
           ctx.restore();
           ctx.beginPath();
@@ -4462,8 +4478,20 @@ export function renderViewerHtml(initialState) {
             else ctx.lineTo(cxOf(idx), cyOf(pt.score));
           });
           ctx.strokeStyle = '#34d399';
-          ctx.lineWidth = 2.2;
+          ctx.lineWidth = 2.6;
           ctx.stroke();
+          chist.forEach(function (pt, idx) {
+            ctx.beginPath();
+            ctx.arc(cxOf(idx), cyOf(pt.score), 3, 0, Math.PI * 2);
+            ctx.fillStyle = idx === chist.length - 1 ? '#fbbf24' : '#38bdf8';
+            ctx.fill();
+          });
+          if (cproj && typeof cproj.score === 'number') {
+            ctx.beginPath();
+            ctx.arc(cxOf(chist.length), cyOf(cproj.score), 4, 0, Math.PI * 2);
+            ctx.fillStyle = '#a78bfa';
+            ctx.fill();
+          }
         }
       }
 
