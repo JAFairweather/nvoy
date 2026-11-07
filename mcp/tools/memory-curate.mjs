@@ -17,7 +17,7 @@
 //        caller-verified git ancestry) orders one claim after the other.
 //      - Escalates ambiguous conflicts to `@james` and `@mydude` without guessing.
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { createConnection } from 'node:net'
 import { dirname, join, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
@@ -34,40 +34,82 @@ import { computeCoherence, createSingleSocketMcpClient } from './memory-viewer.m
 
 export function defaultCuratorStatePath(readerSocket) {
   if (!readerSocket || typeof readerSocket !== 'string') return null
-  return join(dirname(resolve(readerSocket)), 'curator-state.json')
+  const sockDir = dirname(resolve(readerSocket))
+  if (sockDir === '/run/hive-memory') {
+    if (existsSync('/var/lib/hive-memory-curator')) {
+      return '/var/lib/hive-memory-curator/curator-state.json'
+    }
+    if (existsSync('/run/hive-memory-curator')) {
+      return '/run/hive-memory-curator/curator-state.json'
+    }
+  }
+  return join(sockDir, 'curator-state.json')
+}
+
+export function resolveCuratorStatePath({ stateFile = undefined, socketPath = null } = {}) {
+  if (stateFile === null || stateFile === '') return null
+  if (typeof stateFile === 'string' && stateFile.trim()) return resolve(stateFile.trim())
+  if (typeof process.env.HIVE_MEMORY_CURATOR_STATE_FILE === 'string' && process.env.HIVE_MEMORY_CURATOR_STATE_FILE.trim()) {
+    return resolve(process.env.HIVE_MEMORY_CURATOR_STATE_FILE.trim())
+  }
+  return defaultCuratorStatePath(socketPath)
 }
 
 export function readCuratorStateFile(stateFilePath) {
-  if (!stateFilePath || typeof stateFilePath !== 'string' || !existsSync(stateFilePath)) return null
+  if (!stateFilePath || typeof stateFilePath !== 'string') return null
+  let text
   try {
-    const raw = JSON.parse(readFileSync(stateFilePath, 'utf8'))
-    if (!raw || typeof raw !== 'object') return null
-    return {
-      last_curated_at: Number.isFinite(Number(raw.last_curated_at)) ? Number(raw.last_curated_at) : 0,
-      last_curated_write_seq: Number.isFinite(Number(raw.last_curated_write_seq)) ? Number(raw.last_curated_write_seq) : 0,
-      last_ran_at: Number.isFinite(Number(raw.last_ran_at)) ? Number(raw.last_ran_at) : null,
-      last_submitted_count: Number.isFinite(Number(raw.last_submitted_count)) ? Number(raw.last_submitted_count) : 0,
-      dream_interval_sec: Number.isFinite(Number(raw.dream_interval_sec)) ? Number(raw.dream_interval_sec) : DEFAULT_DREAM_INTERVAL_SEC,
-      write_delta_threshold: Number.isFinite(Number(raw.write_delta_threshold)) ? Number(raw.write_delta_threshold) : DEFAULT_WRITE_DELTA_THRESHOLD,
-      topic_pressure_threshold: Number.isFinite(Number(raw.topic_pressure_threshold)) ? Number(raw.topic_pressure_threshold) : DEFAULT_TOPIC_PRESSURE_THRESHOLD,
-      triggers: raw.triggers && typeof raw.triggers === 'object' ? raw.triggers : null,
-      coherence_score: typeof raw.coherence_score === 'number' ? raw.coherence_score : null,
-    }
-  } catch {
-    return null
+    text = readFileSync(stateFilePath, 'utf8')
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return null
+    const wrapped = new Error(`curator state file read failed (${stateFilePath}): ${err?.message || err}`)
+    wrapped.code = 'HIVE_MEMORY_CURATOR_STATE_READ_FAILED'
+    throw wrapped
+  }
+  let raw
+  try {
+    raw = JSON.parse(text)
+  } catch (err) {
+    const wrapped = new Error(`curator state file corrupt JSON (${stateFilePath}): ${err?.message || err}`)
+    wrapped.code = 'HIVE_MEMORY_CURATOR_STATE_READ_FAILED'
+    throw wrapped
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    const wrapped = new Error(`curator state file must contain a JSON object (${stateFilePath})`)
+    wrapped.code = 'HIVE_MEMORY_CURATOR_STATE_READ_FAILED'
+    throw wrapped
+  }
+  return {
+    last_curated_at: Number.isFinite(Number(raw.last_curated_at)) ? Number(raw.last_curated_at) : 0,
+    last_curated_write_seq: Number.isFinite(Number(raw.last_curated_write_seq)) ? Number(raw.last_curated_write_seq) : 0,
+    last_ran_at: Number.isFinite(Number(raw.last_ran_at)) ? Number(raw.last_ran_at) : null,
+    last_submitted_count: Number.isFinite(Number(raw.last_submitted_count)) ? Number(raw.last_submitted_count) : 0,
+    dream_interval_sec: Number.isFinite(Number(raw.dream_interval_sec)) ? Number(raw.dream_interval_sec) : DEFAULT_DREAM_INTERVAL_SEC,
+    write_delta_threshold: Number.isFinite(Number(raw.write_delta_threshold)) ? Number(raw.write_delta_threshold) : DEFAULT_WRITE_DELTA_THRESHOLD,
+    topic_pressure_threshold: Number.isFinite(Number(raw.topic_pressure_threshold)) ? Number(raw.topic_pressure_threshold) : DEFAULT_TOPIC_PRESSURE_THRESHOLD,
+    triggers: raw.triggers && typeof raw.triggers === 'object' ? raw.triggers : null,
+    coherence_score: typeof raw.coherence_score === 'number' ? raw.coherence_score : null,
   }
 }
 
 export function writeCuratorStateFile(stateFilePath, state) {
-  if (!stateFilePath || typeof stateFilePath !== 'string') return false
+  if (!stateFilePath || typeof stateFilePath !== 'string') {
+    const wrapped = new Error('curator state file path is required')
+    wrapped.code = 'HIVE_MEMORY_CURATOR_STATE_WRITE_FAILED'
+    throw wrapped
+  }
   try {
-    mkdirSync(dirname(resolve(stateFilePath)), { recursive: true })
-    const tmpPath = `${stateFilePath}.tmp.${process.pid}`
-    writeFileSync(tmpPath, JSON.stringify(state, null, 2) + '\n', 'utf8')
-    renameSync(tmpPath, stateFilePath)
+    const resolved = resolve(stateFilePath)
+    mkdirSync(dirname(resolved), { recursive: true, mode: 0o755 })
+    const tmpPath = `${resolved}.tmp.${process.pid}`
+    writeFileSync(tmpPath, JSON.stringify(state, null, 2) + '\n', { encoding: 'utf8', mode: 0o644 })
+    chmodSync(tmpPath, 0o644)
+    renameSync(tmpPath, resolved)
     return true
-  } catch {
-    return false
+  } catch (err) {
+    const wrapped = new Error(`curator state file write failed (${stateFilePath}): ${err?.message || err}`)
+    wrapped.code = 'HIVE_MEMORY_CURATOR_STATE_WRITE_FAILED'
+    throw wrapped
   }
 }
 
@@ -355,7 +397,7 @@ export function planMerkleDream({
       const older = sorted.slice(1)
       const deterministic = older.every(old => causallySupersedes(newest, old, gitAncestryCheck))
 
-      if (deterministic && cleanCuratorPk && sample.scope !== 'hive:canon') {
+      if (deterministic && sample.scope !== 'hive:canon') {
         const sourceIds = sorted.map(r => r.event_id).sort()
         const merkleRoot = computeSourceMerkleRoot(sourceIds)
         const topic = normalizeMemoryTopic(newest.topic) || 'hive-memory'
@@ -363,23 +405,25 @@ export function planMerkleDream({
         const slug = `curated-${topic}-${subj}-resolved`
         const mergedEvidence = [...new Set(sorted.flatMap(r => Array.isArray(r.evidence) ? r.evidence : []))].slice(0, 24)
         const maxCreated = Math.max(...sorted.map(r => r.created_at || 0))
-        const template = buildClaimTemplate({
-          pubkey: cleanCuratorPk,
-          scope: sample.scope,
-          slug,
-          topic,
-          claim: newest.claim,
-          because: `Merkle Dreaming auto-resolved causal conflict at ${sample.d} in favor of ${newest.event_id.slice(0, 12)} (${newest.because || 'causal descendant'}).`,
-          evidence: mergedEvidence.length ? mergedEvidence : [newest.event_id],
-          asOfGit: newest.as_of_git || null,
-          asOfEvt: newest.as_of_git ? null : newest.event_id,
-          ttlSec: newest.expires_at == null ? 0 : DEFAULT_TTL_SEC,
-          supersedes: sourceIds,
-          merkleSources: true,
-          memoryGlobalChannelId,
-          nowSec,
-          priorCreatedAt: maxCreated,
-        })
+        const template = cleanCuratorPk
+          ? buildClaimTemplate({
+              pubkey: cleanCuratorPk,
+              scope: sample.scope,
+              slug,
+              topic,
+              claim: newest.claim,
+              because: `Merkle Dreaming auto-resolved causal conflict at ${sample.d} in favor of ${newest.event_id.slice(0, 12)} (${newest.because || 'causal descendant'}).`,
+              evidence: mergedEvidence.length ? mergedEvidence : [newest.event_id],
+              asOfGit: newest.as_of_git || null,
+              asOfEvt: newest.as_of_git ? null : newest.event_id,
+              ttlSec: newest.expires_at == null ? 0 : DEFAULT_TTL_SEC,
+              supersedes: sourceIds,
+              merkleSources: true,
+              memoryGlobalChannelId,
+              nowSec,
+              priorCreatedAt: maxCreated,
+            })
+          : null
         nightmares.push({
           kind: 'conflict',
           action: 'auto_resolve',
@@ -630,10 +674,7 @@ export async function runCuratorCycle({
   gitAncestryCheck = null,
   nowSec = Math.floor(Date.now() / 1000),
 } = {}) {
-  const resolvedStateFile =
-    stateFile === undefined
-      ? (process.env.HIVE_MEMORY_CURATOR_STATE_FILE || defaultCuratorStatePath(readerSocket))
-      : stateFile
+  const resolvedStateFile = resolveCuratorStatePath({ stateFile, socketPath: readerSocket })
   const persisted = resolvedStateFile ? readCuratorStateFile(resolvedStateFile) : null
   const effectiveLastCuratedAt =
     lastCuratedAt !== null && lastCuratedAt !== undefined
@@ -646,7 +687,7 @@ export async function runCuratorCycle({
 
   const reader = createSingleSocketMcpClient(readerSocket)
   try {
-    const wake = await reader.callReadTool('memory_wake', { include_telemetry: true })
+    const wake = await reader.callReadTool('memory_wake', {})
     const records = []
     const historyRecords = []
     let cursor = '0'
@@ -707,19 +748,20 @@ export async function runCuratorCycle({
       gitAncestryCheck,
     })
 
+    const plannedActions = [
+      ...plan.nightmares.filter(n => n.action === 'auto_resolve'),
+      ...plan.promotions,
+      ...plan.distillations,
+    ]
     const submitted = []
     const refused = []
-    const cycleExecuted = Boolean(force || triggerEval.shouldRun)
+    const triggerFired = Boolean(force || triggerEval.shouldRun)
+    const hasWriteCapability = Boolean(!dryRun && writerSocket && curatorSecretKey)
 
-    if (cycleExecuted && !dryRun && writerSocket && curatorSecretKey) {
+    if (triggerFired && hasWriteCapability && plannedActions.length > 0) {
       const writer = createCuratorWriteClient(writerSocket)
       try {
-        const actions = [
-          ...plan.nightmares.filter(n => n.action === 'auto_resolve' && n.template),
-          ...plan.promotions.filter(p => p.template),
-          ...plan.distillations.filter(d => d.template),
-        ]
-        for (const item of actions) {
+        for (const item of plannedActions.filter(a => a.template)) {
           const dTag = item.template.tags.find(t => t[0] === 'd')?.[1]
           const prior = await writer.callWriteTool('memory_lookup_prior', { d: dTag })
           const priorCreatedAt = prior?.found ? Number(prior.created_at || 0) : 0
@@ -749,15 +791,39 @@ export async function runCuratorCycle({
       }
     }
 
-    const postWriteSeq = Number(storeState.write_seq || 0) + submitted.length
-    const nextCuratedAt = !dryRun
-      ? (cycleExecuted ? nowSec : (effectiveLastCuratedAt > 0 ? effectiveLastCuratedAt : nowSec))
-      : effectiveLastCuratedAt
-    const nextCuratedWriteSeq = !dryRun
-      ? (cycleExecuted ? postWriteSeq : effectiveLastCuratedWriteSeq)
-      : effectiveLastCuratedWriteSeq
+    // Advance the durable curation cursor ONLY when a write-capable pass either:
+    //   (a) submits all planned curations without refusal (`submitted.length === plannedActions.length && refused.length === 0`), or
+    //   (b) executes an explicit, verified no-op curation pass (`plannedActions.length === 0 && !triggerEval.triggers.nightmare_interrupt`).
+    // Read-only passes (no writerSocket/curatorSecretKey or dryRun) and refused write passes NEVER advance the cursor.
+    let cycleStatus = 'idle'
+    let cursorAdvanced = false
+    if (!hasWriteCapability) {
+      cycleStatus = triggerFired ? 'read_only_pending' : 'read_only_idle'
+      cursorAdvanced = false
+    } else if (!triggerFired) {
+      cycleStatus = 'idle'
+      cursorAdvanced = false
+    } else if (plannedActions.length > 0) {
+      if (submitted.length === plannedActions.length && refused.length === 0) {
+        cycleStatus = 'curated'
+        cursorAdvanced = true
+      } else {
+        cycleStatus = 'write_refused'
+        cursorAdvanced = false
+      }
+    } else if (!triggerEval.triggers.nightmare_interrupt) {
+      cycleStatus = 'noop_verified'
+      cursorAdvanced = true
+    } else {
+      cycleStatus = 'nightmare_unresolved'
+      cursorAdvanced = false
+    }
 
-    if (!dryRun && resolvedStateFile) {
+    const postWriteSeq = Number(storeState.write_seq || 0) + submitted.length
+    const nextCuratedAt = cursorAdvanced ? nowSec : effectiveLastCuratedAt
+    const nextCuratedWriteSeq = cursorAdvanced ? postWriteSeq : effectiveLastCuratedWriteSeq
+
+    if (hasWriteCapability && resolvedStateFile && cursorAdvanced) {
       writeCuratorStateFile(resolvedStateFile, {
         last_curated_at: nextCuratedAt,
         last_curated_write_seq: nextCuratedWriteSeq,
@@ -771,8 +837,11 @@ export async function runCuratorCycle({
       })
     }
 
+    const cycleOk = cycleStatus !== 'write_refused'
     return {
-      ok: true,
+      ok: cycleOk,
+      cycle_status: cycleStatus,
+      cursor_advanced: cursorAdvanced,
       ran_at: nowSec,
       forced: Boolean(force),
       dry_run: Boolean(dryRun),

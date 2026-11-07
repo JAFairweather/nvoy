@@ -3,7 +3,7 @@
 
 import assert from 'node:assert/strict'
 import { execFile as execFileCb } from 'node:child_process'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -547,18 +547,23 @@ await test('runCuratorCycle: live end-to-end Distillation, Promotion, Solidifica
   }
 })
 
-await test('CLI bin/hive-memory-curate.mjs persists lastCuratedAt/lastCuratedWriteSeq across seq 20 -> 21, fires 6h circadian, and supplies live coherence/recentActivity', async () => {
+await test('CLI bin/hive-memory-curate.mjs requires write capability to advance cursor, persists across seq 20 -> 21, fails closed on refused writes or state-file errors, and restricts telemetry to curator/viewer bindings', async () => {
   const tmp = mkdtempSync(join(tmpdir(), 'nvoy-curate-cli-'))
   try {
     const sockDir = join(tmp, 'sock')
     const dbPath = join(tmp, 'memory.sqlite')
     const ledgerPath = join(tmp, 'ledger.jsonl')
     const receiptPath = join(tmp, 'receipt.json')
+    const keyFile = join(tmp, 'curator.key')
+    const wrongKeyFile = join(tmp, 'wrong.key')
+    const customStateFile = join(tmp, 'state', 'curator-state.json')
     const cliPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'hive-memory-curate.mjs')
 
     const ownerSk = generateSecretKey(), ownerPk = getPublicKey(ownerSk)
     const aliceSk = generateSecretKey(), alicePk = getPublicKey(aliceSk)
     const curatorSk = generateSecretKey(), curatorPk = getPublicKey(curatorSk)
+    writeFileSync(keyFile, Buffer.from(curatorSk).toString('hex') + '\n', { mode: 0o600 })
+    writeFileSync(wrongKeyFile, Buffer.from(aliceSk).toString('hex') + '\n', { mode: 0o600 })
 
     const nowSec = Math.floor(Date.now() / 1000)
     initEmptyStore({ dbPath, ledgerPath, nowSec })
@@ -574,7 +579,7 @@ await test('CLI bin/hive-memory-curate.mjs persists lastCuratedAt/lastCuratedWri
         maxUnbackedSec: 3600,
         globalWriters: [ownerPk, curatorPk],
         curators: [curatorPk],
-        readers: { curator: curatorPk },
+        readers: { curator: curatorPk, alice: alicePk },
         writers: {
           owner: { pubkey: ownerPk, perHour: 100 },
           alice: { pubkey: alicePk, perHour: 100 },
@@ -587,24 +592,54 @@ await test('CLI bin/hive-memory-curate.mjs persists lastCuratedAt/lastCuratedWri
           },
         },
       },
-      readers: 'curator',
+      readers: 'curator:alice',
       writers: 'alice:curator',
       socketDir: sockDir,
       log: () => {},
     })
 
     try {
-      // Advance store to write_seq = 20 (init_empty is seq 1, so submit 19 claims across distinct topics so topic pressure <= 8)
+      // Advance store to write_seq = 20 with 2 distillable checkpoints on PR #401 plus 17 independent claims
+      const d1 = finalizeEvent(buildClaimTemplate({
+        pubkey: alicePk,
+        scope: `room:${ROOM_ID}`,
+        slug: 'r1-pr401-wip',
+        topic: 'r1',
+        claim: 'PR #401 opened for R1 primer companion',
+        because: 'Started PR 401',
+        evidence: ['rabidrabbit@4010001'],
+        asOfGit: 'rabidrabbit@4010001',
+        nowSec: nowSec + 1,
+      }), aliceSk)
+      const d2 = finalizeEvent(buildClaimTemplate({
+        pubkey: alicePk,
+        scope: `room:${ROOM_ID}`,
+        slug: 'r1-pr401-status',
+        topic: 'r1',
+        claim: 'PR #401 unit tests passing for R1 primer companion',
+        because: 'Verified PR 401',
+        evidence: ['rabidrabbit@4010002'],
+        asOfGit: 'rabidrabbit@4010002',
+        nowSec: nowSec + 2,
+      }), aliceSk)
+      assert.equal(daemon.store.submit({ writer: 'alice', event: d1, nowSec: nowSec + 1 }).accepted, true)
+      assert.equal(daemon.store.submit({ writer: 'alice', event: d2, nowSec: nowSec + 2 }).accepted, true)
+
       const topics = ['nvoy', 'r1', 'buzz', 'herd-infra']
-      for (let i = 1; i <= 19; i++) {
+      const vocab = [
+        'alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel', 'india',
+        'juliet', 'kilo', 'lima', 'mike', 'november', 'oscar', 'papa', 'quebec', 'romeo', 'sierra', 'tango'
+      ]
+      for (let i = 3; i <= 19; i++) {
         const top = topics[i % topics.length]
+        const w = vocab[i - 1]
         const ev = finalizeEvent(buildClaimTemplate({
           pubkey: alicePk,
           scope: `room:${ROOM_ID}`,
-          slug: `seq-item-${i}`,
+          slug: `${w}-metric-${i * 17}`,
           topic: top,
-          claim: `Independent status item ${i} for ${top}`,
-          because: `Test write ${i}`,
+          claim: `${w.toUpperCase()} ${w}1 ${w}2 ${w}3 ${w}4 ${w}5`,
+          because: `${w}reason ${i}`,
           evidence: [`${top}@${String(i).padStart(7, '0')}`],
           asOfGit: `${top}@${String(i).padStart(7, '0')}`,
           nowSec: nowSec + i,
@@ -613,25 +648,69 @@ await test('CLI bin/hive-memory-curate.mjs persists lastCuratedAt/lastCuratedWri
       }
       assert.equal(daemon.store.storeState(ownerPk, nowSec + 20).write_seq, 20)
 
-      const runCli = async args => {
-        const { stdout } = await execFileAsync(process.execPath, [cliPath, ...args], { encoding: 'utf8' })
-        return JSON.parse(stdout)
+      const runCli = async (args, expectFail = false) => {
+        try {
+          const { stdout } = await execFileAsync(process.execPath, [cliPath, ...args], { encoding: 'utf8' })
+          assert.equal(expectFail, false, 'expected CLI to fail but it exited 0')
+          return JSON.parse(stdout)
+        } catch (err) {
+          if (!expectFail) throw err
+          return err.stdout ? JSON.parse(err.stdout) : { ok: false, stderr: String(err.stderr || err.message) }
+        }
       }
 
-      // 1. Direct CLI call with defaults at write_seq = 20: +20 write trigger fires and persists state
+      // 0. Non-curator reader socket (alice.sock) receives 0 telemetry even if calling memory_wake with include_telemetry: true
+      const outAliceRo = await runCli([
+        '--reader-socket', join(sockDir, 'alice.sock'),
+        '--state-file', customStateFile,
+      ])
+      assert.equal(outAliceRo.recent_activity_count, 0, 'ordinary reader socket never receives recent_activity telemetry')
+
+      // 1a. Read-only CLI call without writer socket/key at write_seq = 20 MUST NOT advance cursor or consume the +20 trigger
+      const outRo20 = await runCli([
+        '--reader-socket', join(sockDir, 'curator.sock'),
+        '--state-file', customStateFile,
+      ])
+      assert.equal(outRo20.ok, true)
+      assert.equal(outRo20.cycle_status, 'read_only_pending')
+      assert.equal(outRo20.cursor_advanced, false)
+      assert.equal(outRo20.next_curated_write_seq, 0, 'read-only call leaves last_curated_write_seq at 0')
+
+      // 1b. Write-capable CLI call with wrong key (refused submission) MUST fail closed (exit 1) and retain pending cursor
+      const outRefusedWrite = await runCli([
+        '--reader-socket', join(sockDir, 'curator.sock'),
+        '--writer-socket', join(sockDir, 'writers', 'curator.sock'),
+        '--key-file', wrongKeyFile,
+        '--state-file', customStateFile,
+        '--global-channel-id', GLOBAL_CH,
+      ], true)
+      assert.equal(outRefusedWrite.ok, false)
+      assert.equal(outRefusedWrite.cycle_status, 'write_refused')
+      assert.equal(outRefusedWrite.cursor_advanced, false)
+      assert.equal(outRefusedWrite.refused.length, 1)
+      assert.equal(outRefusedWrite.next_curated_write_seq, 0, 'refused write retains cursor at 0')
+
+      // 1c. Write-capable CLI call with valid curator key at write_seq = 20 submits distillation (seq becomes 21) and advances cursor
       const out20 = await runCli([
         '--reader-socket', join(sockDir, 'curator.sock'),
+        '--writer-socket', join(sockDir, 'writers', 'curator.sock'),
+        '--key-file', keyFile,
+        '--state-file', customStateFile,
+        '--global-channel-id', GLOBAL_CH,
       ])
       assert.equal(out20.ok, true)
+      assert.equal(out20.cycle_status, 'curated')
+      assert.equal(out20.cursor_advanced, true)
+      assert.equal(out20.submitted.length, 1, 'PR #401 distillation submitted on write-capable cycle')
       assert.equal(out20.triggers.write_delta, 20)
       assert.equal(out20.triggers.triggers.synaptic_volume, true)
       assert.equal(out20.triggers.shouldRun, true)
-      assert.equal(out20.next_curated_write_seq, 20)
+      assert.equal(out20.next_curated_write_seq, 21, 'cursor advances to post-submission write_seq = 21')
       assert.equal(typeof out20.coherence?.score, 'number', 'CLI supplies live coherence score')
 
-      // 2. Submit 1 more write to reach write_seq = 21 and run CLI with defaults again:
+      // 2. Submit 1 more write to reach write_seq = 22 and run CLI again:
       //    +20-write trigger MUST NOT repeat (write_delta === 1, shouldRun === false)
-      const ev21 = finalizeEvent(buildClaimTemplate({
+      const ev22 = finalizeEvent(buildClaimTemplate({
         pubkey: alicePk,
         scope: `room:${ROOM_ID}`,
         slug: 'seq-item-20',
@@ -640,32 +719,44 @@ await test('CLI bin/hive-memory-curate.mjs persists lastCuratedAt/lastCuratedWri
         because: 'Test write 20',
         evidence: ['nvoy@0000020'],
         asOfGit: 'nvoy@0000020',
-        nowSec: nowSec + 21,
+        nowSec: nowSec + 25,
       }), aliceSk)
-      assert.equal(daemon.store.submit({ writer: 'alice', event: ev21, nowSec: nowSec + 21 }).accepted, true)
-      assert.equal(daemon.store.storeState(ownerPk, nowSec + 21).write_seq, 21)
+      assert.equal(daemon.store.submit({ writer: 'alice', event: ev22, nowSec: nowSec + 25 }).accepted, true)
+      assert.equal(daemon.store.storeState(ownerPk, nowSec + 25).write_seq, 22)
 
-      const out21 = await runCli([
+      const out22 = await runCli([
         '--reader-socket', join(sockDir, 'curator.sock'),
+        '--writer-socket', join(sockDir, 'writers', 'curator.sock'),
+        '--key-file', keyFile,
+        '--state-file', customStateFile,
+        '--global-channel-id', GLOBAL_CH,
       ])
-      assert.equal(out21.ok, true)
-      assert.equal(out21.last_curated_write_seq, 20)
-      assert.equal(out21.triggers.write_delta, 1, 'write delta at seq 21 must be 1, not 21')
-      assert.equal(out21.triggers.triggers.synaptic_volume, false, '+20 trigger must not repeat at seq 21')
-      assert.equal(out21.triggers.triggers.circadian_dream, false)
-      assert.equal(out21.triggers.shouldRun, false)
+      assert.equal(out22.ok, true)
+      assert.equal(out22.cycle_status, 'idle')
+      assert.equal(out22.last_curated_write_seq, 21)
+      assert.equal(out22.triggers.write_delta, 1, 'write delta at seq 22 must be 1, not 22')
+      assert.equal(out22.triggers.triggers.synaptic_volume, false, '+20 trigger must not repeat after 1 new write')
+      assert.equal(out22.triggers.triggers.circadian_dream, false)
+      assert.equal(out22.triggers.shouldRun, false)
 
-      // 3. Six hours later, the 6-hour circadian trigger fires from persisted lastCuratedAt
+      // 3. Six hours later, the 6-hour circadian trigger fires from persisted lastCuratedAt and records noop_verified
       const out6h = await runCli([
         '--reader-socket', join(sockDir, 'curator.sock'),
+        '--writer-socket', join(sockDir, 'writers', 'curator.sock'),
+        '--key-file', keyFile,
+        '--state-file', customStateFile,
+        '--global-channel-id', GLOBAL_CH,
         '--now-sec', String(out20.next_curated_at + 6 * 3600),
       ])
       assert.equal(out6h.triggers.triggers.circadian_dream, true, '6-hour circadian trigger fires using persisted lastCuratedAt')
       assert.equal(out6h.triggers.shouldRun, true)
+      assert.equal(out6h.cycle_status, 'noop_verified')
+      assert.equal(out6h.cursor_advanced, true)
 
       // 4. Low coherence score supplied via CLI triggers nightmare_interrupt
       const outLowCoh = await runCli([
         '--reader-socket', join(sockDir, 'curator.sock'),
+        '--state-file', customStateFile,
         '--coherence-score', '58',
       ])
       assert.equal(outLowCoh.triggers.triggers.nightmare_interrupt, true)
@@ -685,11 +776,22 @@ await test('CLI bin/hive-memory-curate.mjs persists lastCuratedAt/lastCuratedWri
       }
       const outRefusal = await runCli([
         '--reader-socket', join(sockDir, 'curator.sock'),
+        '--state-file', customStateFile,
       ])
       assert(outRefusal.recent_activity_count >= 3, 'CLI receives recent_activity from daemon')
-      assert.equal(outRefusal.triggers.refusal_count_15m, 3)
+      assert(outRefusal.triggers.refusal_count_15m >= 3)
       assert.equal(outRefusal.triggers.triggers.nightmare_interrupt, true)
       assert(outRefusal.triggers.reasons.some(r => r.includes('nightmare_refusal_spike')))
+
+      // 6. Corrupt state file fails closed instead of silently resetting cursor to 0
+      const corruptStateFile = join(tmp, 'corrupt-state.json')
+      writeFileSync(corruptStateFile, '{not-valid-json', 'utf8')
+      const outCorrupt = await runCli([
+        '--reader-socket', join(sockDir, 'curator.sock'),
+        '--state-file', corruptStateFile,
+      ], true)
+      assert.equal(outCorrupt.ok, false)
+      assert(String(outCorrupt.stderr).includes('curator state file corrupt JSON'))
     } finally {
       await daemon.close()
     }
