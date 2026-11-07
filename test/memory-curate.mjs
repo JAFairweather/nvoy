@@ -2,10 +2,15 @@
 // Curation (Distillation -> Promotion -> Solidification), and Nightmare handling.
 
 import assert from 'node:assert/strict'
+import { execFile as execFileCb } from 'node:child_process'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
+
+const execFileAsync = promisify(execFileCb)
 import {
   buildClaimTemplate,
   buildWithdrawalTemplate,
@@ -534,6 +539,157 @@ await test('runCuratorCycle: live end-to-end Distillation, Promotion, Solidifica
       assert.equal(promotedRec.retention, 'decision')
       assert.equal(promotedRec.expires_at, null)
       assert.equal(promotedRec.merkle_sources, computeSourceMerkleRoot([p1.id, p2.id]))
+    } finally {
+      await daemon.close()
+    }
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+await test('CLI bin/hive-memory-curate.mjs persists lastCuratedAt/lastCuratedWriteSeq across seq 20 -> 21, fires 6h circadian, and supplies live coherence/recentActivity', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'nvoy-curate-cli-'))
+  try {
+    const sockDir = join(tmp, 'sock')
+    const dbPath = join(tmp, 'memory.sqlite')
+    const ledgerPath = join(tmp, 'ledger.jsonl')
+    const receiptPath = join(tmp, 'receipt.json')
+    const cliPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'hive-memory-curate.mjs')
+
+    const ownerSk = generateSecretKey(), ownerPk = getPublicKey(ownerSk)
+    const aliceSk = generateSecretKey(), alicePk = getPublicKey(aliceSk)
+    const curatorSk = generateSecretKey(), curatorPk = getPublicKey(curatorSk)
+
+    const nowSec = Math.floor(Date.now() / 1000)
+    initEmptyStore({ dbPath, ledgerPath, nowSec })
+    recordVerifiedBackup({ receiptPath, snapshotId: SNAP_ID, writeSeq: 1, at: nowSec, nowSec })
+
+    const daemon = await startMemoryDaemon({
+      dbPath,
+      ledgerPath,
+      receiptPath,
+      config: {
+        memoryGlobalChannelId: GLOBAL_CH,
+        ownerPubkey: ownerPk,
+        maxUnbackedSec: 3600,
+        globalWriters: [ownerPk, curatorPk],
+        curators: [curatorPk],
+        readers: { curator: curatorPk },
+        writers: {
+          owner: { pubkey: ownerPk, perHour: 100 },
+          alice: { pubkey: alicePk, perHour: 100 },
+          curator: { pubkey: curatorPk, perHour: 120 },
+        },
+        rooms: {
+          [ROOM_ID]: {
+            members: [ownerPk, alicePk, curatorPk],
+            writers: [ownerPk, alicePk, curatorPk],
+          },
+        },
+      },
+      readers: 'curator',
+      writers: 'alice:curator',
+      socketDir: sockDir,
+      log: () => {},
+    })
+
+    try {
+      // Advance store to write_seq = 20 (init_empty is seq 1, so submit 19 claims across distinct topics so topic pressure <= 8)
+      const topics = ['nvoy', 'r1', 'buzz', 'herd-infra']
+      for (let i = 1; i <= 19; i++) {
+        const top = topics[i % topics.length]
+        const ev = finalizeEvent(buildClaimTemplate({
+          pubkey: alicePk,
+          scope: `room:${ROOM_ID}`,
+          slug: `seq-item-${i}`,
+          topic: top,
+          claim: `Independent status item ${i} for ${top}`,
+          because: `Test write ${i}`,
+          evidence: [`${top}@${String(i).padStart(7, '0')}`],
+          asOfGit: `${top}@${String(i).padStart(7, '0')}`,
+          nowSec: nowSec + i,
+        }), aliceSk)
+        assert.equal(daemon.store.submit({ writer: 'alice', event: ev, nowSec: nowSec + i }).accepted, true)
+      }
+      assert.equal(daemon.store.storeState(ownerPk, nowSec + 20).write_seq, 20)
+
+      const runCli = async args => {
+        const { stdout } = await execFileAsync(process.execPath, [cliPath, ...args], { encoding: 'utf8' })
+        return JSON.parse(stdout)
+      }
+
+      // 1. Direct CLI call with defaults at write_seq = 20: +20 write trigger fires and persists state
+      const out20 = await runCli([
+        '--reader-socket', join(sockDir, 'curator.sock'),
+      ])
+      assert.equal(out20.ok, true)
+      assert.equal(out20.triggers.write_delta, 20)
+      assert.equal(out20.triggers.triggers.synaptic_volume, true)
+      assert.equal(out20.triggers.shouldRun, true)
+      assert.equal(out20.next_curated_write_seq, 20)
+      assert.equal(typeof out20.coherence?.score, 'number', 'CLI supplies live coherence score')
+
+      // 2. Submit 1 more write to reach write_seq = 21 and run CLI with defaults again:
+      //    +20-write trigger MUST NOT repeat (write_delta === 1, shouldRun === false)
+      const ev21 = finalizeEvent(buildClaimTemplate({
+        pubkey: alicePk,
+        scope: `room:${ROOM_ID}`,
+        slug: 'seq-item-20',
+        topic: 'nvoy',
+        claim: 'Independent status item 20 for nvoy',
+        because: 'Test write 20',
+        evidence: ['nvoy@0000020'],
+        asOfGit: 'nvoy@0000020',
+        nowSec: nowSec + 21,
+      }), aliceSk)
+      assert.equal(daemon.store.submit({ writer: 'alice', event: ev21, nowSec: nowSec + 21 }).accepted, true)
+      assert.equal(daemon.store.storeState(ownerPk, nowSec + 21).write_seq, 21)
+
+      const out21 = await runCli([
+        '--reader-socket', join(sockDir, 'curator.sock'),
+      ])
+      assert.equal(out21.ok, true)
+      assert.equal(out21.last_curated_write_seq, 20)
+      assert.equal(out21.triggers.write_delta, 1, 'write delta at seq 21 must be 1, not 21')
+      assert.equal(out21.triggers.triggers.synaptic_volume, false, '+20 trigger must not repeat at seq 21')
+      assert.equal(out21.triggers.triggers.circadian_dream, false)
+      assert.equal(out21.triggers.shouldRun, false)
+
+      // 3. Six hours later, the 6-hour circadian trigger fires from persisted lastCuratedAt
+      const out6h = await runCli([
+        '--reader-socket', join(sockDir, 'curator.sock'),
+        '--now-sec', String(out20.next_curated_at + 6 * 3600),
+      ])
+      assert.equal(out6h.triggers.triggers.circadian_dream, true, '6-hour circadian trigger fires using persisted lastCuratedAt')
+      assert.equal(out6h.triggers.shouldRun, true)
+
+      // 4. Low coherence score supplied via CLI triggers nightmare_interrupt
+      const outLowCoh = await runCli([
+        '--reader-socket', join(sockDir, 'curator.sock'),
+        '--coherence-score', '58',
+      ])
+      assert.equal(outLowCoh.triggers.triggers.nightmare_interrupt, true)
+      assert(outLowCoh.triggers.reasons.some(r => r.includes('nightmare_coherence_drop')))
+
+      // 5. Refusal spike on daemon socket is visible to CLI via wake.recent_activity and triggers nightmare_interrupt
+      const net = await import('node:net')
+      for (let r = 0; r < 3; r++) {
+        await new Promise((resolveCall, rejectCall) => {
+          const s = net.createConnection(join(sockDir, 'curator.sock'))
+          s.once('connect', () => {
+            s.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'memory_submit', arguments: {} } }) + '\n')
+          })
+          s.on('data', () => { s.destroy(); resolveCall() })
+          s.once('error', rejectCall)
+        })
+      }
+      const outRefusal = await runCli([
+        '--reader-socket', join(sockDir, 'curator.sock'),
+      ])
+      assert(outRefusal.recent_activity_count >= 3, 'CLI receives recent_activity from daemon')
+      assert.equal(outRefusal.triggers.refusal_count_15m, 3)
+      assert.equal(outRefusal.triggers.triggers.nightmare_interrupt, true)
+      assert(outRefusal.triggers.reasons.some(r => r.includes('nightmare_refusal_spike')))
     } finally {
       await daemon.close()
     }

@@ -17,7 +17,9 @@
 //        caller-verified git ancestry) orders one claim after the other.
 //      - Escalates ambiguous conflicts to `@james` and `@mydude` without guessing.
 
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { createConnection } from 'node:net'
+import { dirname, join, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 import { finalizeEvent, getPublicKey } from 'nostr-tools/pure'
 import {
@@ -28,7 +30,46 @@ import {
   normalizeMemoryTopic,
   parseFactKey,
 } from './memory.mjs'
-import { createSingleSocketMcpClient } from './memory-viewer.mjs'
+import { computeCoherence, createSingleSocketMcpClient } from './memory-viewer.mjs'
+
+export function defaultCuratorStatePath(readerSocket) {
+  if (!readerSocket || typeof readerSocket !== 'string') return null
+  return join(dirname(resolve(readerSocket)), 'curator-state.json')
+}
+
+export function readCuratorStateFile(stateFilePath) {
+  if (!stateFilePath || typeof stateFilePath !== 'string' || !existsSync(stateFilePath)) return null
+  try {
+    const raw = JSON.parse(readFileSync(stateFilePath, 'utf8'))
+    if (!raw || typeof raw !== 'object') return null
+    return {
+      last_curated_at: Number.isFinite(Number(raw.last_curated_at)) ? Number(raw.last_curated_at) : 0,
+      last_curated_write_seq: Number.isFinite(Number(raw.last_curated_write_seq)) ? Number(raw.last_curated_write_seq) : 0,
+      last_ran_at: Number.isFinite(Number(raw.last_ran_at)) ? Number(raw.last_ran_at) : null,
+      last_submitted_count: Number.isFinite(Number(raw.last_submitted_count)) ? Number(raw.last_submitted_count) : 0,
+      dream_interval_sec: Number.isFinite(Number(raw.dream_interval_sec)) ? Number(raw.dream_interval_sec) : DEFAULT_DREAM_INTERVAL_SEC,
+      write_delta_threshold: Number.isFinite(Number(raw.write_delta_threshold)) ? Number(raw.write_delta_threshold) : DEFAULT_WRITE_DELTA_THRESHOLD,
+      topic_pressure_threshold: Number.isFinite(Number(raw.topic_pressure_threshold)) ? Number(raw.topic_pressure_threshold) : DEFAULT_TOPIC_PRESSURE_THRESHOLD,
+      triggers: raw.triggers && typeof raw.triggers === 'object' ? raw.triggers : null,
+      coherence_score: typeof raw.coherence_score === 'number' ? raw.coherence_score : null,
+    }
+  } catch {
+    return null
+  }
+}
+
+export function writeCuratorStateFile(stateFilePath, state) {
+  if (!stateFilePath || typeof stateFilePath !== 'string') return false
+  try {
+    mkdirSync(dirname(resolve(stateFilePath)), { recursive: true })
+    const tmpPath = `${stateFilePath}.tmp.${process.pid}`
+    writeFileSync(tmpPath, JSON.stringify(state, null, 2) + '\n', 'utf8')
+    renameSync(tmpPath, stateFilePath)
+    return true
+  } catch {
+    return false
+  }
+}
 
 function createCuratorWriteClient(socketPath) {
   let socket = null
@@ -211,8 +252,20 @@ export function evaluateDreamTriggers({
     a => a && a.kind === 'refused' && typeof a.at === 'number' && Math.max(0, nowSec - a.at) <= NIGHTMARE_REFUSAL_WINDOW_SEC
   ).length
 
-  const coherenceScore = typeof coherence?.score === 'number' ? coherence.score : null
-  const coherenceAlert = coherenceScore !== null && coherenceScore < 70
+  const coherenceScore =
+    typeof coherence === 'number'
+      ? coherence
+      : typeof coherence?.score === 'number' && (coherence.total_events === undefined || coherence.total_events > 0)
+        ? coherence.score
+        : null
+  const isHealthyComputedBaseline =
+    coherence &&
+    typeof coherence === 'object' &&
+    coherence.axes &&
+    Number(coherence.delta_since_inception || 0) >= 0 &&
+    Number(coherence.axes.grounding || 0) >= 80 &&
+    Number(coherence.axes.alignment || 0) >= 60
+  const coherenceAlert = coherenceScore !== null && coherenceScore < 70 && !isHealthyComputedBaseline
 
   const nightmareInterrupt =
     conflictedKeys.size > 0 ||
@@ -245,6 +298,7 @@ export function evaluateDreamTriggers({
     conflicted_keys: [...conflictedKeys],
     stale_count: staleRecords.length,
     refusal_count_15m: refusalCount15m,
+    coherence_score: coherenceScore,
   }
 }
 
@@ -565,39 +619,79 @@ export async function runCuratorCycle({
   memoryGlobalChannelId = '',
   force = false,
   dryRun = false,
-  lastCuratedAt = 0,
-  lastCuratedWriteSeq = 0,
+  stateFile = undefined,
+  lastCuratedAt = null,
+  lastCuratedWriteSeq = null,
+  coherence = null,
+  recentActivity = null,
   dreamIntervalSec = DEFAULT_DREAM_INTERVAL_SEC,
   writeDeltaThreshold = DEFAULT_WRITE_DELTA_THRESHOLD,
   topicPressureThreshold = DEFAULT_TOPIC_PRESSURE_THRESHOLD,
   gitAncestryCheck = null,
   nowSec = Math.floor(Date.now() / 1000),
 } = {}) {
+  const resolvedStateFile =
+    stateFile === undefined
+      ? (process.env.HIVE_MEMORY_CURATOR_STATE_FILE || defaultCuratorStatePath(readerSocket))
+      : stateFile
+  const persisted = resolvedStateFile ? readCuratorStateFile(resolvedStateFile) : null
+  const effectiveLastCuratedAt =
+    lastCuratedAt !== null && lastCuratedAt !== undefined
+      ? Number(lastCuratedAt)
+      : Number(persisted?.last_curated_at || 0)
+  const effectiveLastCuratedWriteSeq =
+    lastCuratedWriteSeq !== null && lastCuratedWriteSeq !== undefined
+      ? Number(lastCuratedWriteSeq)
+      : Number(persisted?.last_curated_write_seq || 0)
+
   const reader = createSingleSocketMcpClient(readerSocket)
   try {
-    const wake = await reader.callReadTool('memory_wake', {})
+    const wake = await reader.callReadTool('memory_wake', { include_telemetry: true })
     const records = []
+    const historyRecords = []
     let cursor = '0'
     let pages = 0
     while (cursor !== null && pages < 50) {
       const page = await reader.callReadTool('memory_query', {
         limit: 100,
         format: 'full',
+        include_history: true,
         ...(cursor !== '0' ? { cursor } : {}),
       })
       for (const r of Array.isArray(page?.records) ? page.records : []) {
-        records.push(r)
+        historyRecords.push(r)
+        if ((r.is_current === undefined || r.is_current === true) && r.status !== 'withdrawn' && r.verification === 'accepted') {
+          records.push(r)
+        }
       }
       cursor = typeof page?.next_cursor === 'string' && page.next_cursor ? page.next_cursor : null
       pages += 1
     }
 
+    const storeState = wake?.store_state || {}
+    const resolvedRecentActivity = Array.isArray(recentActivity)
+      ? recentActivity
+      : (Array.isArray(wake?.recent_activity) ? wake.recent_activity : [])
+    const resolvedCoherence =
+      coherence !== null && coherence !== undefined
+        ? (typeof coherence === 'number' ? { score: coherence } : coherence)
+        : computeCoherence({
+            records,
+            history_records: historyRecords,
+            agent_roster: Array.isArray(wake?.agent_roster) ? wake.agent_roster : [],
+            recent_activity: resolvedRecentActivity,
+            store_state: storeState,
+            now_sec: nowSec,
+            history_complete: cursor === null,
+          })
+
     const triggerEval = evaluateDreamTriggers({
       records,
-      storeState: wake?.store_state || {},
-      recentActivity: wake?.recent_activity || [],
-      lastCuratedAt,
-      lastCuratedWriteSeq,
+      storeState,
+      recentActivity: resolvedRecentActivity,
+      coherence: resolvedCoherence,
+      lastCuratedAt: effectiveLastCuratedAt,
+      lastCuratedWriteSeq: effectiveLastCuratedWriteSeq,
       nowSec,
       dreamIntervalSec,
       writeDeltaThreshold,
@@ -615,8 +709,9 @@ export async function runCuratorCycle({
 
     const submitted = []
     const refused = []
+    const cycleExecuted = Boolean(force || triggerEval.shouldRun)
 
-    if ((force || triggerEval.shouldRun) && !dryRun && writerSocket && curatorSecretKey) {
+    if (cycleExecuted && !dryRun && writerSocket && curatorSecretKey) {
       const writer = createCuratorWriteClient(writerSocket)
       try {
         const actions = [
@@ -654,11 +749,40 @@ export async function runCuratorCycle({
       }
     }
 
+    const postWriteSeq = Number(storeState.write_seq || 0) + submitted.length
+    const nextCuratedAt = !dryRun
+      ? (cycleExecuted ? nowSec : (effectiveLastCuratedAt > 0 ? effectiveLastCuratedAt : nowSec))
+      : effectiveLastCuratedAt
+    const nextCuratedWriteSeq = !dryRun
+      ? (cycleExecuted ? postWriteSeq : effectiveLastCuratedWriteSeq)
+      : effectiveLastCuratedWriteSeq
+
+    if (!dryRun && resolvedStateFile) {
+      writeCuratorStateFile(resolvedStateFile, {
+        last_curated_at: nextCuratedAt,
+        last_curated_write_seq: nextCuratedWriteSeq,
+        last_ran_at: nowSec,
+        last_submitted_count: submitted.length,
+        dream_interval_sec: dreamIntervalSec,
+        write_delta_threshold: writeDeltaThreshold,
+        topic_pressure_threshold: topicPressureThreshold,
+        triggers: triggerEval,
+        coherence_score: triggerEval.coherence_score,
+      })
+    }
+
     return {
       ok: true,
       ran_at: nowSec,
       forced: Boolean(force),
       dry_run: Boolean(dryRun),
+      state_file: resolvedStateFile || null,
+      last_curated_at: effectiveLastCuratedAt,
+      last_curated_write_seq: effectiveLastCuratedWriteSeq,
+      next_curated_at: nextCuratedAt,
+      next_curated_write_seq: nextCuratedWriteSeq,
+      coherence: resolvedCoherence,
+      recent_activity_count: resolvedRecentActivity.length,
       triggers: triggerEval,
       plan,
       submitted,

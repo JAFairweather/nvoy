@@ -18,6 +18,14 @@ import { createConnection } from 'node:net'
 import { isAbsolute, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
+import {
+  DEFAULT_DREAM_INTERVAL_SEC,
+  DEFAULT_TOPIC_PRESSURE_THRESHOLD,
+  DEFAULT_WRITE_DELTA_THRESHOLD,
+  defaultCuratorStatePath,
+  evaluateDreamTriggers,
+  readCuratorStateFile,
+} from './memory-curate.mjs'
 
 const DEFAULT_POLL_MS = 3000
 const MAX_EVENT_LOG = 60
@@ -660,7 +668,7 @@ export function diffViewerSnapshots(prev, next, nowSec = Math.floor(Date.now() /
   return events
 }
 
-export function computeDreamingTelemetry(records = []) {
+export function computeDreamingTelemetry(records = [], curatorState = null) {
   const recs = Array.isArray(records) ? records : []
   const fullBytes = JSON.stringify(recs).length
   let indexBytes = 0
@@ -668,12 +676,18 @@ export function computeDreamingTelemetry(records = []) {
   let wfCount = 0
   let shortTtlCount = 0
   let classBCount = 0
+  let merkleCount = 0
+  let nightmareCount = 0
   const byScopeTopic = new Map()
   for (const r of recs) {
     if (!r || typeof r !== 'object') continue
     const slug = String(r.d || '').split(':').pop() || String(r.d || '')
     const isWf = /-(?:review|status|owner|wip|handoff)$/.test(slug)
     indexBytes += 140 + Math.min(120, String(r.claim || '').length) + String(r.d || '').length
+    if (typeof r.merkle_sources === 'string' && r.merkle_sources.length > 0) merkleCount += 1
+    if (r.conflict || ((r.scope === 'hive:canon' || r.expires_at === null || r.expires_at === undefined) && r.stale_warning)) {
+      nightmareCount += 1
+    }
     if (r.scope === 'hive:canon') {
       canonBytes += JSON.stringify(r).length
     } else if (r.expires_at === null || r.expires_at === undefined) {
@@ -696,11 +710,13 @@ export function computeDreamingTelemetry(records = []) {
   const wakeBytes = canonBytes + Math.min(4000, indexBytes)
   const indexSavings = fullBytes > 0 ? Math.round((1 - indexBytes / fullBytes) * 1000) / 10 : 0
   const wakeSavings = fullBytes > 0 ? Math.round((1 - wakeBytes / fullBytes) * 1000) / 10 : 0
+  const pressureThreshold = Number(curatorState?.topic_pressure_threshold) || DEFAULT_TOPIC_PRESSURE_THRESHOLD
   const topicList = [...byScopeTopic.values()]
-    .map(item => ({ ...item, ready: item.count > 8 }))
+    .map(item => ({ ...item, ready: item.count > pressureThreshold }))
     .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label))
   return {
     estimated_from_visible: true,
+    passive_inspection: true,
     total: recs.length,
     fullBytes,
     indexBytes,
@@ -710,7 +726,10 @@ export function computeDreamingTelemetry(records = []) {
     wfCount,
     shortTtlCount,
     classBCount,
+    merkleCount,
+    nightmareCount,
     topicList,
+    curator_state: curatorState,
   }
 }
 
@@ -1384,10 +1403,10 @@ export function renderViewerHtml(initialState) {
 
   <div class="hud-bottom graph-only">
     <div class="control-bar sim-bar panel">
-      <span class="sim-label" id="dream-bar-status">Merkle Dreaming · Live 3-Trigger Curation Engine</span>
+      <span class="sim-label" id="dream-bar-status">Merkle Dreaming · Passive Read-Only Telemetry</span>
       <button class="btn sim" id="btn-dream-replay" type="button">Replay Last Dream</button>
-      <button class="btn sim" id="btn-dream-consolidate" type="button">Merkle Dreaming · Curation</button>
-      <button class="btn sim" id="btn-dream-triggers" type="button">3-Trigger Status</button>
+      <button class="btn sim" id="btn-dream-consolidate" type="button">Inspect Curation (Passive)</button>
+      <button class="btn sim" id="btn-dream-triggers" type="button">Inspect 3-Trigger State</button>
       <button class="btn sim" id="btn-dream-coherence" type="button">5-Axis Coherence</button>
     </div>
     <div class="control-bar panel">
@@ -1504,6 +1523,11 @@ export function renderViewerHtml(initialState) {
       var lastActivitySeq = null;
       var pulseTotal = 0;
       var tick = 0;
+      var latestCuratorState = null;
+      var latestConsolidatedSources = {};
+      var latestStoreState = {};
+      var latestRecentActivity = [];
+      var prevByEventId = {};
 
       function fmtTime(sec) {
         if (!sec || typeof sec !== 'number') return 'never';
@@ -1836,6 +1860,34 @@ export function renderViewerHtml(initialState) {
         });
       }
 
+      function resolveSourceNodes(rec, anchorNode) {
+        var srcIds = Array.isArray(rec && rec.supersedes) ? rec.supersedes : [];
+        var top = topicById(topicOf(rec));
+        var cx = anchorNode ? anchorNode.x : (top ? top.x : 0);
+        var cy = anchorNode ? anchorNode.y : (top ? top.y : 0);
+        return srcIds.map(function (id, idx) {
+          var existing = nodeByEventId(id) || prevByEventId[id];
+          if (existing) return existing;
+          var angle = -Math.PI / 2 + (idx / Math.max(1, srcIds.length)) * Math.PI * 2;
+          var dist = 36 + (idx % 2) * 14;
+          var histRec = (latestConsolidatedSources && latestConsolidatedSources[id]) || {
+            event_id: id,
+            scope: rec.scope,
+            topic: rec.topic,
+            d: id.slice(0, 12)
+          };
+          return {
+            key: 'src:' + id,
+            rec: histRec,
+            x: cx + Math.cos(angle) * dist,
+            y: cy + Math.sin(angle) * dist,
+            vx: 0,
+            vy: 0,
+            isSourceGhost: true
+          };
+        });
+      }
+
       function syncGraph(s, animate) {
         var records = Array.isArray(s.records) ? s.records : [];
         syncAgents(s);
@@ -1843,7 +1895,12 @@ export function renderViewerHtml(initialState) {
         layout();
 
         var byKey = {};
-        nodes.forEach(function (n) { byKey[n.key] = n; });
+        var oldByEventId = {};
+        nodes.forEach(function (n) {
+          byKey[n.key] = n;
+          if (n.rec && n.rec.event_id) oldByEventId[n.rec.event_id] = n;
+        });
+        prevByEventId = oldByEventId;
         var fresh = [];
         var nextNodes = records.map(function (rec, i) {
           var key = rec.author_pubkey + ':' + rec.d;
@@ -1881,13 +1938,27 @@ export function renderViewerHtml(initialState) {
             if (covered[n.rec.event_id]) return;
             var author = agentByPubkey(n.rec.author_pubkey);
             if (author) writeComet(author, n);
-            if (n.rec.merkle_sources && !consolidator) {
+            var merkleDigest = typeof n.rec.merkle_sources === 'string' ? n.rec.merkle_sources : '';
+            if (merkleDigest && !consolidator) {
               var top = topicById(topicOf(n.rec));
-              var srcIds = Array.isArray(n.rec.merkle_sources.event_ids) ? n.rec.merkle_sources.event_ids : [];
-              var srcNodes = srcIds.map(function (id) { return nodeByEventId(id); }).filter(Boolean);
-              if (top) {
-                consolidator = { topic: top, targets: srcNodes.length ? srcNodes : [n], x: top.x, y: top.y, progress: 0 };
-                logStream('write', 'MERKLE DREAMING verified curation in ' + String(n.rec.scope || 'hive') + ' #' + top.id + ' (root ' + String(n.rec.merkle_sources.root || '').slice(0, 12) + '…)', n.rec.created_at);
+              var srcNodes = resolveSourceNodes(n.rec, n);
+              if (top && srcNodes.length > 0) {
+                consolidator = {
+                  mode: 'live-write',
+                  topic: top,
+                  targetNode: n,
+                  targets: srcNodes,
+                  merkleDigest: merkleDigest,
+                  x: n.x,
+                  y: n.y,
+                  progress: 0
+                };
+                logStream(
+                  'write',
+                  'MERKLE DREAMING curator write in ' + String(n.rec.scope || 'hive') + ' #' + top.id +
+                  ' (merkle_sources ' + merkleDigest.slice(0, 12) + '… · ' + srcNodes.length + ' superseded sources)',
+                  n.rec.created_at
+                );
               }
             }
           });
@@ -1983,10 +2054,12 @@ export function renderViewerHtml(initialState) {
         var merkleCount = 0;
         var nightmareCount = 0;
         var byScopeTopic = {};
+        var cs = latestCuratorState || {};
+        var pressureThreshold = Number(cs.topic_pressure_threshold) || 8;
         recs.forEach(function (r) {
           var isWf = isWorkflowCheckpoint(r);
           indexBytes += 140 + Math.min(120, String(r.claim || '').length) + String(r.d || '').length;
-          if (r.merkle_sources) merkleCount += 1;
+          if (typeof r.merkle_sources === 'string' && r.merkle_sources.length > 0) merkleCount += 1;
           if (r.conflict || ((isCanon(r) || r.expires_at === null || r.expires_at === undefined) && r.stale_warning)) {
             nightmareCount += 1;
           }
@@ -2011,10 +2084,27 @@ export function renderViewerHtml(initialState) {
         var wakeSavings = fullBytes > 0 ? Math.round((1 - wakeBytes / fullBytes) * 1000) / 10 : 0;
         var topicList = Object.keys(byScopeTopic).map(function (k) {
           var item = byScopeTopic[k];
-          return { scope: item.scope, topic: item.topic, label: item.label, count: item.count, ready: item.count > 8 };
+          return { scope: item.scope, topic: item.topic, label: item.label, count: item.count, ready: item.count > pressureThreshold };
         }).sort(function (a, b) { return b.count - a.count; });
+        var writeSeq = Number(latestStoreState && latestStoreState.write_seq) || 0;
+        var lastCuratedSeq = Number(cs.last_curated_write_seq) || 0;
+        var writeDelta = typeof cs.write_delta === 'number' ? cs.write_delta : Math.max(0, writeSeq - lastCuratedSeq);
+        var writeDeltaThreshold = Number(cs.write_delta_threshold) || 20;
+        var dreamIntervalSec = Number(cs.dream_interval_sec) || 21600;
+        var lastCuratedAt = Number(cs.last_curated_at) || 0;
+        var elapsedSec = typeof cs.elapsed_sec === 'number' ? cs.elapsed_sec : (lastCuratedAt > 0 ? Math.max(0, Math.floor(nowSec() - lastCuratedAt)) : 0);
+        var triggers = cs.triggers || {
+          circadian_dream: lastCuratedAt > 0 && elapsedSec >= dreamIntervalSec,
+          synaptic_volume: writeDelta >= writeDeltaThreshold || topicList.some(function (t) { return t.ready; }),
+          nightmare_interrupt: nightmareCount > 0
+        };
+        var shouldRun = typeof cs.should_run === 'boolean'
+          ? cs.should_run
+          : Boolean(triggers.circadian_dream || triggers.synaptic_volume || triggers.nightmare_interrupt);
+        var reasons = Array.isArray(cs.reasons) ? cs.reasons : [];
         return {
           estimated_from_visible: true,
+          passive_inspection: true,
           total: recs.length,
           fullBytes: fullBytes,
           indexBytes: indexBytes,
@@ -2026,7 +2116,24 @@ export function renderViewerHtml(initialState) {
           classBCount: classBCount,
           merkleCount: merkleCount,
           nightmareCount: nightmareCount,
-          topicList: topicList
+          topicList: topicList,
+          curatorState: {
+            state_file_present: Boolean(cs.state_file_present),
+            last_curated_at: lastCuratedAt || null,
+            last_curated_write_seq: lastCuratedSeq,
+            last_ran_at: cs.last_ran_at || null,
+            last_submitted_count: cs.last_submitted_count || 0,
+            elapsed_sec: elapsedSec,
+            dream_interval_sec: dreamIntervalSec,
+            write_delta: writeDelta,
+            write_delta_threshold: writeDeltaThreshold,
+            topic_pressure_threshold: pressureThreshold,
+            should_run: shouldRun,
+            triggers: triggers,
+            reasons: reasons,
+            refusal_count_15m: Number(cs.refusal_count_15m) || 0,
+            stale_count: Number(cs.stale_count) || 0
+          }
         };
       }
 
@@ -2034,104 +2141,98 @@ export function renderViewerHtml(initialState) {
         var bar = el('dream-bar-status');
         if (!bar) return;
         var d = computeDreamingTelemetry();
-        var readyCount = (d.topicList || []).filter(function (t) { return t.ready; }).length;
-        var maxCluster = (d.topicList && d.topicList.length) ? d.topicList[0].count : 0;
-        if (d.nightmareCount > 0) {
-          bar.textContent = 'NIGHTMARE INTERRUPT (' + d.nightmareCount + ') · ' + d.merkleCount + ' Merkle roots · -' + d.wakeSavings + '% wake';
+        var cs = d.curatorState;
+        var lastLabel = cs.last_curated_at ? ('last curated ' + fmtShortAge(cs.last_curated_at, nowSec()) + ' ago (seq ' + cs.last_curated_write_seq + ')') : 'last curated: never (seq 0)';
+        var deltaLabel = '+' + cs.write_delta + '/' + cs.write_delta_threshold + ' writes';
+        if (cs.triggers.nightmare_interrupt || d.nightmareCount > 0) {
+          bar.textContent = 'NIGHTMARE TRIGGER ACTIVE · ' + lastLabel + ' · ' + deltaLabel + ' · ' + d.merkleCount + ' merkle_sources tags';
           bar.style.color = '#f87171';
-        } else if (readyCount > 0) {
-          bar.textContent = 'READY TO CURATE (' + readyCount + ' cluster' + (readyCount === 1 ? '' : 's') + ' >8) · ' + d.merkleCount + ' Merkle roots · -' + d.wakeSavings + '% wake';
+        } else if (cs.should_run) {
+          bar.textContent = 'CURATOR TRIGGER DUE (' + (cs.reasons[0] || deltaLabel) + ') · ' + lastLabel + ' · ' + d.merkleCount + ' merkle_sources tags';
           bar.style.color = '#fbbf24';
         } else {
-          bar.textContent = 'Circadian 6h · Max cluster ' + maxCluster + '/8 · ' + d.merkleCount + ' Merkle roots · -' + d.wakeSavings + '% wake';
+          bar.textContent = 'Passive Read-Only · ' + lastLabel + ' · ' + deltaLabel + ' · ' + d.merkleCount + ' merkle_sources tags · -' + d.wakeSavings + '% wake';
           bar.style.color = '#94a3b8';
         }
       }
 
       function replayLastDream() {
-        var merkleNodes = nodes.filter(function (n) { return n.rec && n.rec.merkle_sources; }).sort(function (a, b) {
+        var merkleNodes = nodes.filter(function (n) {
+          return n.rec && typeof n.rec.merkle_sources === 'string' && n.rec.merkle_sources.length > 0;
+        }).sort(function (a, b) {
           return (b.rec.created_at || 0) - (a.rec.created_at || 0);
         });
         if (merkleNodes.length > 0) {
           var latest = merkleNodes[0];
           var top = topicById(topicOf(latest.rec));
-          var ms = latest.rec.merkle_sources;
-          var srcIds = Array.isArray(ms.event_ids) ? ms.event_ids : [];
-          var srcNodes = srcIds.map(function (id) { return nodeByEventId(id); }).filter(Boolean);
-          var author = agentByPubkey(latest.rec.author_pubkey);
-          if (author) writeComet(author, latest);
+          var merkleDigest = String(latest.rec.merkle_sources || '');
+          var srcIds = Array.isArray(latest.rec.supersedes) ? latest.rec.supersedes : [];
+          var srcNodes = resolveSourceNodes(latest.rec, latest);
           srcNodes.forEach(function (sn) {
-            pulses.push({ kind: 'write', fromNode: sn, fromX: sn.x, fromY: sn.y, toNode: latest, toX: latest.x, toY: latest.y, color: '#fbbf24', t: 0, speed: 0.02 });
+            pulses.push({ kind: 'recall', fromNode: sn, fromX: sn.x, fromY: sn.y, toNode: latest, toX: latest.x, toY: latest.y, color: '#fbbf24', t: 0, speed: 0.02 });
           });
-          if (top) {
-            consolidator = { topic: top, targets: srcNodes.length ? srcNodes : [latest], x: latest.x, y: latest.y, progress: 0 };
+          if (top && srcNodes.length > 0) {
+            consolidator = {
+              mode: 'replay',
+              topic: top,
+              targetNode: latest,
+              targets: srcNodes,
+              merkleDigest: merkleDigest,
+              x: latest.x,
+              y: latest.y,
+              progress: 0
+            };
           }
           selected = { type: 'memory', data: latest };
           hovered = null;
           if (width <= 1024) setDrawer('none');
           renderAgentRoster();
           renderInspector();
-          logStream('write', 'REPLAY LAST DREAM · ' + String(latest.rec.scope || 'hive') + ' #' + topicOf(latest.rec) + ' -> ' + slugOf(latest.rec) + ' (Merkle root ' + String(ms.root || '').slice(0, 12) + '… · ' + (ms.count || srcIds.length) + ' sources)', latest.rec.created_at);
+          logStream(
+            'recall',
+            'PASSIVE REPLAY (read-only) · ' + String(latest.rec.scope || 'hive') + ' #' + topicOf(latest.rec) +
+            ' -> ' + slugOf(latest.rec) + ' (merkle_sources ' + merkleDigest.slice(0, 12) + '… · ' + srcIds.length + ' superseded sources)',
+            latest.rec.created_at
+          );
           return;
         }
         openDreamingInspector();
-        var classBNodes = nodes.filter(function (n) { return !isCanon(n.rec) && (n.rec.expires_at === null || n.rec.expires_at === undefined); }).sort(function (a, b) {
-          return (b.rec.created_at || 0) - (a.rec.created_at || 0);
-        });
-        if (classBNodes.length > 0) {
-          var latestB = classBNodes[0];
-          var authorB = agentByPubkey(latestB.rec.author_pubkey);
-          if (authorB) writeComet(authorB, latestB);
-          logStream('write', 'REPLAY LAST DREAM · latest Class B solidification: ' + slugOf(latestB.rec) + ' in ' + String(latestB.rec.scope || 'hive') + ' #' + topicOf(latestB.rec), latestB.rec.created_at);
-        }
+        logStream('recall', 'PASSIVE REPLAY (read-only) · no curated records with merkle_sources in store yet');
       }
 
       function openDreamingInspector() {
-        var best = null;
-        var bestNodes = [];
-        var bestScope = null;
-        topics.forEach(function (t) {
-          var byScope = {};
-          nodes.forEach(function (n) {
-            var st = evalRecord(n.rec, simNow()).state;
-            if (!isCanon(n.rec) && topicOf(n.rec) === t.id && (st === 'fresh' || st === 'aging')) {
-              var sc = String(n.rec.scope || 'unknown');
-              if (!byScope[sc]) byScope[sc] = [];
-              byScope[sc].push(n);
-            }
-          });
-          Object.keys(byScope).forEach(function (sc) {
-            if (byScope[sc].length > bestNodes.length) {
-              best = t;
-              bestScope = sc;
-              bestNodes = byScope[sc];
-            }
-          });
-        });
         var d = computeDreamingTelemetry();
-        selected = { type: 'dreaming', data: d };
-        hovered = null;
-        if (width <= 1024) setDrawer('none');
-        renderAgentRoster();
-        renderInspector();
-        if (!consolidator && best && bestNodes.length >= 2) {
-          consolidator = { topic: best, targets: bestNodes.slice(0, 5), x: best.x, y: best.y, progress: 0 };
-          logStream('lookup', 'MERKLE DREAMING focus: ' + bestScope + ' #' + best.id + ' (' + bestNodes.length + ' active Class A claims · ' + d.merkleCount + ' verified Merkle roots)');
-        }
-      }
-
-      function inspectDreamTriggers() {
-        var d = computeDreamingTelemetry();
-        var readyClusters = (d.topicList || []).filter(function (t) { return t.ready; });
-        var maxTopic = (d.topicList && d.topicList.length) ? (d.topicList[0].label + ' (' + d.topicList[0].count + '/8)') : 'none';
+        var cs = d.curatorState;
         selected = { type: 'dreaming', data: d };
         hovered = null;
         if (width <= 1024) setDrawer('none');
         renderAgentRoster();
         renderInspector();
         logStream(
-          d.nightmareCount > 0 ? 'refuse' : 'recall',
-          '3-TRIGGER ENGINE · Circadian: 6h | Volume: ' + readyClusters.length + ' ready (top: ' + maxTopic + ') | Nightmares: ' + d.nightmareCount + ' | Merkle roots: ' + d.merkleCount
+          'lookup',
+          'PASSIVE INSPECTION (read-only; no curator write) · ' + d.merkleCount + ' merkle_sources digest tags · +' +
+          cs.write_delta + '/' + cs.write_delta_threshold + ' writes since seq ' + cs.last_curated_write_seq
+        );
+      }
+
+      function inspectDreamTriggers() {
+        var d = computeDreamingTelemetry();
+        var cs = d.curatorState;
+        var lastAtStr = cs.last_curated_at ? (fmtTime(cs.last_curated_at) + ' (' + cs.elapsed_sec + 's/' + cs.dream_interval_sec + 's)') : 'never (0s/' + cs.dream_interval_sec + 's)';
+        var volStr = '+' + cs.write_delta + '/' + cs.write_delta_threshold + ' writes (last seq ' + cs.last_curated_write_seq + ')';
+        var reasonStr = cs.reasons.length ? cs.reasons.join('; ') : 'all 3 triggers below threshold';
+        selected = { type: 'dreaming', data: d };
+        hovered = null;
+        if (width <= 1024) setDrawer('none');
+        renderAgentRoster();
+        renderInspector();
+        logStream(
+          cs.triggers.nightmare_interrupt ? 'refuse' : 'lookup',
+          'PASSIVE 3-TRIGGER INSPECTION · shouldRun=' + String(cs.should_run) +
+          ' | Circadian: ' + String(Boolean(cs.triggers.circadian_dream)) + ' [' + lastAtStr + ']' +
+          ' | Volume: ' + String(Boolean(cs.triggers.synaptic_volume)) + ' [' + volStr + ']' +
+          ' | Nightmare: ' + String(Boolean(cs.triggers.nightmare_interrupt)) +
+          ' (' + reasonStr + ')'
         );
       }
 
@@ -2432,24 +2533,47 @@ export function renderViewerHtml(initialState) {
           }
         } else if (target.type === 'dreaming') {
           var dr = computeDreamingTelemetry();
+          var cs = dr.curatorState;
           box.appendChild(inspectHeader(
-            'Merkle Dreaming & Curation (Phase 2)',
+            'Merkle Dreaming & Curation · Passive Inspector',
             '-' + dr.wakeSavings.toFixed(1) + '% Est. Wake Bytes',
-            'EST. FROM VISIBLE',
+            'PASSIVE INSPECTION · READ-ONLY',
             'info',
             '#a78bfa'
           ));
           var dkv = makeDiv('kv-list');
+          dkv.appendChild(kvRow('Inspector mode', 'Passive read-only (never triggers curator writes)', '#6ee7b7'));
+          dkv.appendChild(kvRow(
+            'Last curated cycle',
+            cs.last_curated_at ? (fmtTime(cs.last_curated_at) + ' (seq ' + cs.last_curated_write_seq + ')') : 'never persisted (seq 0)',
+            cs.last_curated_at ? '#38bdf8' : '#94a3b8'
+          ));
+          dkv.appendChild(kvRow(
+            'Trigger 1 · Circadian',
+            (cs.triggers.circadian_dream ? 'DUE · ' : 'IDLE · ') + cs.elapsed_sec + 's / ' + cs.dream_interval_sec + 's',
+            cs.triggers.circadian_dream ? '#fbbf24' : '#cbd5e1'
+          ));
+          dkv.appendChild(kvRow(
+            'Trigger 2 · Synaptic volume',
+            (cs.triggers.synaptic_volume ? 'DUE · ' : 'IDLE · ') + '+' + cs.write_delta + ' / ' + cs.write_delta_threshold + ' writes since seq ' + cs.last_curated_write_seq,
+            cs.triggers.synaptic_volume ? '#fbbf24' : '#cbd5e1'
+          ));
+          dkv.appendChild(kvRow(
+            'Trigger 3 · Nightmare',
+            cs.triggers.nightmare_interrupt
+              ? ('ACTIVE (' + (cs.reasons.filter(function (r) { return r.indexOf('nightmare_') === 0; }).join(', ') || dr.nightmareCount + ' conflict/stale') + ')')
+              : 'CLEAR (0 conflicts · ' + cs.refusal_count_15m + ' refusals/15m)',
+            cs.triggers.nightmare_interrupt ? '#fca5a5' : '#34d399'
+          ));
           dkv.appendChild(kvRow('Est. visible full JSON', Math.round(dr.fullBytes / 1024) + ' KB (~' + Math.round(dr.fullBytes / 4) + ' tok)', '#94a3b8'));
           dkv.appendChild(kvRow('Est. visible index cards', Math.round(dr.indexBytes / 1024) + ' KB (-' + dr.indexSavings.toFixed(1) + '%)', '#38bdf8'));
           dkv.appendChild(kvRow('Est. visible wake digest', Math.round(dr.wakeBytes / 1024) + ' KB (-' + dr.wakeSavings.toFixed(1) + '% vs dump)', '#34d399'));
           dkv.appendChild(kvRow('Gate 7 · Workflow slugs', dr.wfCount + ' active (' + dr.shortTtlCount + ' on <=48h TTL)', '#fbbf24'));
           dkv.appendChild(kvRow('Gate 7 · Class B curated', dr.classBCount + ' permanent decisions', '#a78bfa'));
-          dkv.appendChild(kvRow('Merkle source roots', (dr.merkleCount || 0) + ' verified SHA-256 trees (90d hold)', '#c4b5fd'));
-          dkv.appendChild(kvRow('3-Trigger Dream Engine', (dr.nightmareCount > 0 ? dr.nightmareCount + ' NIGHTMARE INTERRUPTS' : 'Circadian 6h · +20 Vol · Clear'), dr.nightmareCount > 0 ? '#fca5a5' : '#34d399'));
+          dkv.appendChild(kvRow('merkle_sources tags', (dr.merkleCount || 0) + ' merkle_sources digest tags (90d source hold)', '#c4b5fd'));
           box.appendChild(dkv);
           if (dr.topicList.length > 0) {
-            var qTitle = makeDiv('inspect-kicker', 'Gate 8 · Scope+Topic Curation Pressure (>8 Class A = curate)');
+            var qTitle = makeDiv('inspect-kicker', 'Gate 8 · Scope+Topic Curation Pressure (>' + cs.topic_pressure_threshold + ' Class A = curate)');
             qTitle.style.marginTop = '6px';
             box.appendChild(qTitle);
             var tWrap = makeDiv('kv-list');
@@ -2698,9 +2822,28 @@ export function renderViewerHtml(initialState) {
 
         if (consolidator) {
           consolidator.progress += 0.012;
+          consolidator.targets.forEach(function (tn) {
+            if (tn.isSourceGhost) {
+              tn.x += (consolidator.x - tn.x) * 0.04;
+              tn.y += (consolidator.y - tn.y) * 0.04;
+            }
+          });
           if (consolidator.progress >= 1) {
             shockwaves.push({ x: consolidator.x, y: consolidator.y, r: 8, maxR: 130, color: '#fbbf24', alpha: 1 });
-            logStream('write', 'MERKLE DREAMING curation focus complete: ' + consolidator.targets.length + ' Class A claims mapped to Class B decision');
+            if (consolidator.mode === 'live-write') {
+              logStream(
+                'write',
+                'MERKLE DREAMING fold complete: ' + consolidator.targets.length + ' superseded source claims folded (merkle_sources ' +
+                String(consolidator.merkleDigest || '').slice(0, 12) + '…)'
+              );
+            } else {
+              logStream(
+                'recall',
+                'PASSIVE REPLAY complete (read-only): ' + consolidator.targets.length + ' superseded source claims folded into ' +
+                (consolidator.targetNode ? slugOf(consolidator.targetNode.rec) : 'curated claim') +
+                ' (merkle_sources ' + String(consolidator.merkleDigest || '').slice(0, 12) + '…)'
+              );
+            }
             consolidator = null;
           }
         }
@@ -2836,13 +2979,23 @@ export function renderViewerHtml(initialState) {
             ctx.strokeStyle = 'rgba(251, 191, 36, 0.88)';
             ctx.lineWidth = 2.2;
             ctx.stroke();
+            if (tn.isSourceGhost) {
+              ctx.beginPath();
+              ctx.arc(tn.x, tn.y, 5.5, 0, Math.PI * 2);
+              ctx.fillStyle = '#38bdf8';
+              ctx.fill();
+              ctx.strokeStyle = '#fde68a';
+              ctx.lineWidth = 1.2;
+              ctx.stroke();
+            }
           });
           polygon(c.x, c.y, 6, 15, tick * 0.06);
           ctx.fillStyle = '#fbbf24';
           ctx.fill();
           ctx.font = '700 10px ui-monospace, monospace';
           ctx.fillStyle = '#fde68a';
-          ctx.fillText('MERKLE DREAMING · CURATION ' + Math.round(c.progress * 100) + '%', c.x, c.y - 22);
+          var foldLabel = c.mode === 'replay' ? 'PASSIVE DREAM REPLAY ' : 'MERKLE FOLD ';
+          ctx.fillText(foldLabel + Math.round(c.progress * 100) + '% (' + String(c.merkleDigest || '').slice(0, 8) + '…)', c.x, c.y - 22);
         }
 
         nodes.forEach(function (n) {
@@ -3090,6 +3243,10 @@ export function renderViewerHtml(initialState) {
         if (!s || typeof s !== 'object') return;
         var nowSec = s.polled_at || Math.floor(Date.now() / 1000);
         var st = s.store_state || {};
+        latestStoreState = st;
+        latestRecentActivity = Array.isArray(s.recent_activity) ? s.recent_activity : [];
+        if (s.curator_state && typeof s.curator_state === 'object') latestCuratorState = s.curator_state;
+        if (s.consolidated_sources && typeof s.consolidated_sources === 'object') latestConsolidatedSources = s.consolidated_sources;
         var syncState = s.connected === false ? 'SOCKET_ERROR' : (st.state || 'UNKNOWN');
 
         el('reader-name').textContent = s.reader || 'viewer';
@@ -3201,6 +3358,27 @@ export async function startMemoryViewer({
     store_state: { state: 'CONNECTING', write_seq: null, current_claims: null, last_backup_age_sec: null, unbacked_writes: null },
     scope_counts: { canon: 0, ops: 0, rooms: 0, self: 0, canon_unverified: 0, unverified_total: 0 },
     coherence: computeCoherence(),
+    curator_state: {
+      state_file_present: false,
+      last_curated_at: null,
+      last_curated_write_seq: 0,
+      last_ran_at: null,
+      last_submitted_count: 0,
+      dream_interval_sec: DEFAULT_DREAM_INTERVAL_SEC,
+      write_delta_threshold: DEFAULT_WRITE_DELTA_THRESHOLD,
+      topic_pressure_threshold: DEFAULT_TOPIC_PRESSURE_THRESHOLD,
+      elapsed_sec: 0,
+      write_delta: 0,
+      should_run: false,
+      triggers: { circadian_dream: false, synaptic_volume: false, nightmare_interrupt: false },
+      reasons: [],
+      hot_scope_topics: [],
+      conflicted_keys: [],
+      stale_count: 0,
+      refusal_count_15m: 0,
+      coherence_score: null,
+    },
+    consolidated_sources: {},
     agent_health: { active_5m: 0, warm_20m: 0, stale: 0, error: 0, total: 0, window_sec: ACTIVE_WINDOW_SEC },
     query_answer: null,
     records: [],
@@ -3286,6 +3464,53 @@ export async function startMemoryViewer({
         now_sec: nowSec,
         history_complete: historyComplete,
       })
+      const persistedCurator = readCuratorStateFile(defaultCuratorStatePath(socketPath))
+      const lastCuratedAt = Number(persistedCurator?.last_curated_at || 0)
+      const lastCuratedWriteSeq = Number(persistedCurator?.last_curated_write_seq || 0)
+      const dreamIntervalSec = Number(persistedCurator?.dream_interval_sec || DEFAULT_DREAM_INTERVAL_SEC)
+      const writeDeltaThreshold = Number(persistedCurator?.write_delta_threshold || DEFAULT_WRITE_DELTA_THRESHOLD)
+      const topicPressureThreshold = Number(persistedCurator?.topic_pressure_threshold || DEFAULT_TOPIC_PRESSURE_THRESHOLD)
+      const triggerEval = evaluateDreamTriggers({
+        records,
+        storeState,
+        recentActivity,
+        coherence,
+        lastCuratedAt,
+        lastCuratedWriteSeq,
+        nowSec,
+        dreamIntervalSec,
+        writeDeltaThreshold,
+        topicPressureThreshold,
+      })
+      const curatorState = {
+        state_file_present: Boolean(persistedCurator),
+        last_curated_at: lastCuratedAt || null,
+        last_curated_write_seq: lastCuratedWriteSeq,
+        last_ran_at: persistedCurator?.last_ran_at || null,
+        last_submitted_count: persistedCurator?.last_submitted_count ?? 0,
+        dream_interval_sec: dreamIntervalSec,
+        write_delta_threshold: writeDeltaThreshold,
+        topic_pressure_threshold: topicPressureThreshold,
+        elapsed_sec: triggerEval.elapsed_sec,
+        write_delta: triggerEval.write_delta,
+        should_run: triggerEval.shouldRun,
+        triggers: triggerEval.triggers,
+        reasons: triggerEval.reasons,
+        hot_scope_topics: triggerEval.hot_scope_topics,
+        conflicted_keys: triggerEval.conflicted_keys,
+        stale_count: triggerEval.stale_count,
+        refusal_count_15m: triggerEval.refusal_count_15m,
+        coherence_score: triggerEval.coherence_score,
+      }
+      const consolidatedSources = {}
+      for (const r of records) {
+        if (Array.isArray(r.supersedes)) {
+          for (const sid of r.supersedes) {
+            const srcRec = byEventId.get(sid)
+            if (srcRec) consolidatedSources[sid] = srcRec
+          }
+        }
+      }
       const queryAnswer = firstQuery?.answer === 'unknown'
         ? 'unknown'
         : (records.length > 0 ? 'found' : String(firstQuery?.answer || 'unknown'))
@@ -3303,6 +3528,8 @@ export async function startMemoryViewer({
         store_state: storeState,
         scope_counts: scopeCounts,
         coherence,
+        curator_state: curatorState,
+        consolidated_sources: consolidatedSources,
         agent_health: healthResult.summary,
         query_answer: queryAnswer,
         records,

@@ -37,12 +37,17 @@ const WRITER_FD_PREFIX = 'writer.'
 export const ACTIVITY_MAX = 80
 const ACTIVITY_IDS_MAX = 20
 const VIEWER_READER = 'viewer'
+const CURATOR_READER = 'curator'
 
 const withStaleFiles = t => ({
   ...t,
   inputSchema: {
     ...t.inputSchema,
-    properties: { ...t.inputSchema.properties, stale_files: { type: 'array', items: { type: 'string', maxLength: 300 }, maxItems: 200 } },
+    properties: {
+      ...t.inputSchema.properties,
+      stale_files: { type: 'array', items: { type: 'string', maxLength: 300 }, maxItems: 200 },
+      ...(t.name === 'memory_wake' ? { include_telemetry: { type: 'boolean' } } : {}),
+    },
   },
 })
 const READER_TOOLS = Object.freeze(MEMORY_TOOL_SPECS.filter(t => t.name === 'memory_wake' || t.name === 'memory_query').map(withStaleFiles))
@@ -81,6 +86,9 @@ export function bindingSignature(config, { kind, name }) {
 }
 
 const isViewer = binding => binding.kind === 'reader' && binding.name === VIEWER_READER
+const isCuratorReader = (binding, config) =>
+  binding.kind === 'reader' &&
+  (binding.name === CURATOR_READER || Boolean(config?.curators?.has(config?.readers.get(binding.name) || '')))
 
 // In-memory telemetry for the viewer only: metadata, never claim text, because, evidence or query text, and
 // never the viewer's own calls. Each ref keeps its claim's scope and author so viewerActivity can apply the
@@ -94,8 +102,8 @@ function noteActivity(activity, binding, nowSec, { kind, count = null, refs = []
 
 const recordRefs = records => (Array.isArray(records) ? records : []).map(r => ({ id: r.event_id, d: null, scope: r.scope, pubkey: r.author_pubkey }))
 
-function viewerActivity(activity, config) {
-  const pk = config?.readers.get(VIEWER_READER) || ''
+function viewerActivity(activity, config, readerName = VIEWER_READER) {
+  const pk = config?.readers.get(readerName) || ''
   const readable = ({ scope, pubkey }) => typeof scope === 'string' &&
     canRead(pk, scope.startsWith('room:') ? { scope_type: 'room', room_id: scope.slice(5), pubkey } : { scope_type: scope, pubkey }, config)
   const scopeShown = s => Boolean(config) && (s === 'hive:canon' || s === 'hive:ops' ||
@@ -217,7 +225,10 @@ export function handleSocketJsonRpc({ store, binding, message, nowSec, activity 
       frame: o => mcpToolResult({ ...who, ...o }).content[0].text,
     })
     note({ kind: 'wake', count: Array.isArray(out.records) ? out.records.length : 0, refs: recordRefs(out.records) })
-    const telemetry = activity && isViewer(binding) ? { recent_activity: viewerActivity(activity, store.config), agent_roster: agentRoster(store, nowSec) } : {}
+    const includeTelemetry = isViewer(binding) || isCuratorReader(binding, store.config) || args.include_telemetry === true
+    const telemetry = activity && includeTelemetry
+      ? { recent_activity: viewerActivity(activity, store.config, binding.name), agent_roster: agentRoster(store, nowSec) }
+      : {}
     return reply(mcpToolResult({ ...who, ...out, ...telemetry }))
   }
   const out = store.query({
