@@ -556,7 +556,16 @@ export function evaluateDreamTriggers({
   const active = (Array.isArray(records) ? records : []).filter(
     r => r && r.verification === 'accepted' && r.status !== 'withdrawn'
   )
-  const elapsedSec = Math.max(0, nowSec - Number(lastCuratedAt || 0))
+  const earliestCreated = active.reduce(
+    (min, r) => (typeof r.created_at === 'number' && r.created_at > 0 && r.created_at < min ? r.created_at : min),
+    Infinity
+  )
+  const baselineTime = Number(lastCuratedAt || 0) > 0
+    ? Number(lastCuratedAt)
+    : Number.isFinite(earliestCreated)
+      ? earliestCreated
+      : nowSec
+  const elapsedSec = Math.max(0, nowSec - baselineTime)
   const circadianDream = lastCuratedAt > 0 ? elapsedSec >= dreamIntervalSec : false
 
   const writeSeq = Number(storeState?.write_seq || 0)
@@ -673,6 +682,10 @@ function causallySupersedes(b, a, gitAncestryCheck = null) {
   if (b.as_of_evt && b.as_of_evt === a.event_id) return true
   const bEv = Array.isArray(b.evidence) ? b.evidence : []
   if (bEv.some(e => String(e).includes(a.event_id))) return true
+  if ((b.created_at || 0) > (a.created_at || 0) && a.as_of_git && b.as_of_git && a.as_of_git === b.as_of_git) {
+    const aEv = new Set(Array.isArray(a.evidence) ? a.evidence : [])
+    if (bEv.some(e => aEv.has(e))) return true
+  }
   if (typeof gitAncestryCheck === 'function' && a.as_of_git && b.as_of_git && a.as_of_git !== b.as_of_git) {
     if (gitAncestryCheck(a.as_of_git, b.as_of_git) === true) return true
   }
