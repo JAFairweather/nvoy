@@ -297,7 +297,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async request => {
     return toolResult({ code: 'NVOY_REPLY_REQUIRES_ONE_SENDER' }, true)
   }
   const allowed = view()
-  const { mention, unresolved, ...refused } = resolveReplyMention(allowed, args.mention, content)
+  // A reply resolves against the envelope's own room (#321).
+  const room = task.authority?.reply_channel
+  const { mention, unresolved, ...refused } = resolveReplyMention(allowed, args.mention, content, room)
   if (refused.code) return toolResult(refused, true)
   try {
     const prior = lines(replyPath, 'Desktop reply queue').map(line => { try { return JSON.parse(line) } catch { throw new Error('Desktop reply queue contains malformed JSON') } })
@@ -306,7 +308,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async request => {
       instance: manifest.id, receipt: envelope, content, ...(mention.length ? { mention } : {}) }
     appendFileSync(replyPath, JSON.stringify(record) + '\n', { mode: 0o640 })
     chmodSync(replyPath, 0o640)
-    return toolResult({ queued: true, envelope, request: record.id, ...(mention.length ? { mention } : {}), ...notMentioned(allowed.mayPost, unresolved) })
+    return toolResult({ queued: true, envelope, request: record.id, ...(mention.length ? { mention } : {}), ...notMentioned(allowed.mayPost, unresolved, room) })
   } catch (error) { return toolResult({ code: 'NVOY_REPLY_QUEUE_FAILED', message: error.message }, true) }
 })
 

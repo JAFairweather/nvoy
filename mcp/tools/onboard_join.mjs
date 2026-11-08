@@ -9,9 +9,10 @@
 // version, and are never derived from each other or from what the terms ask for.
 
 import { createHash, randomUUID } from 'node:crypto'
+import { readRoster, rosterFilter } from './room_roster.mjs'
 
 export const JOIN_KIND = 9021
-export const MEMBERS_KIND = 39002
+export { MEMBERS_KIND } from './room_roster.mjs'
 
 const httpBase = relay => relay.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:')
 const refusedLogin = error => /AUTH refused/.test(error?.message || '')
@@ -113,21 +114,23 @@ export async function joinHive({ add, relay, signer, open, fetchImpl = globalThi
   catch (error) { return result('pending', `claimed, but the hive does not let it log in yet: ${error.message}`) }
 }
 
-const inRoom = async (session, room, pubkey) => {
-  const lists = await session.fetch({ kinds: [MEMBERS_KIND], '#d': [room], '#h': [room], limit: 5 })
+// With the relay's signing key pinned in the template (#321), only a list it signed counts.
+const inRoom = async (session, room, pubkey, relaySigner) => {
+  if (relaySigner) return !!(await readRoster(session, room, relaySigner))?.includes(pubkey)
+  const lists = await session.fetch(rosterFilter(room))
   const newest = lists.sort((a, b) => b.created_at - a.created_at)[0]
   return !!newest?.tags?.some(tag => tag[0] === 'p' && tag[1] === pubkey)
 }
 
 // Step "rooms": each room asked for, joined by the agent itself, proven by the room's member list.
-export async function joinRooms({ add, session, now = () => Date.now() }) {
+export async function joinRooms({ add, session, now = () => Date.now(), relaySigner = null }) {
   if (!add.rooms.length) return result('done', 'no rooms asked for')
   const joined = [], waiting = []
   for (const room of add.rooms) {
-    if (await inRoom(session, room, add.pubkey)) { joined.push(room); continue }
+    if (await inRoom(session, room, add.pubkey, relaySigner)) { joined.push(room); continue }
     const sent = await session.publish({ kind: JOIN_KIND, created_at: Math.floor(now() / 1000), tags: [['h', room]], content: '' })
     if (!sent.accepted) { waiting.push(`${room.slice(0, 8)} refused the join (${scrub(sent.message)}); if it is private, the owner adds it from the page`); continue }
-    if (await inRoom(session, room, add.pubkey)) joined.push(room)
+    if (await inRoom(session, room, add.pubkey, relaySigner)) joined.push(room)
     else waiting.push(`${room.slice(0, 8)} took the join but its member list does not show it yet; run again`)
   }
   const head = `${joined.length} of ${add.rooms.length} rooms joined`

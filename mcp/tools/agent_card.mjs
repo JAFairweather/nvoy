@@ -14,7 +14,8 @@
 import { createHash } from 'node:crypto'
 import { generateSecretKey, getPublicKey } from 'nostr-tools/pure'
 import { v2 as nip44 } from 'nostr-tools/nip44'
-import { mergeMentions, releaseSha } from './agent_post.mjs'
+import { mergeMentions, releaseSha, roomEntries } from './agent_post.mjs'
+import { readMentionRooms } from './room_roster.mjs'
 
 export const CARD_KIND = 30078
 export const CARD_D = 'nvoy-agent-card'
@@ -62,13 +63,17 @@ export function agentCard(manifest, { release = releaseSha() } = {}) {
 
 // What each grantor is shown: the merged mention list from the live policy, its refusals, and the
 // post channels. Null without may_post, so a reply-only card carries no owner_view.
-export function ownerView(manifest, mentions, log) {
+// With mention_rooms on, each room's members follow, read from the broker's last snapshot (#321):
+// the card reports that file; the rooms timer, not the card run, refreshes it.
+export function ownerView(manifest, mentions, log, rooms = manifest.mayPost?.mentionRooms ? readMentionRooms(manifest) : null) {
   const m = manifest.mayPost
   if (!m) return null
   const { mention, refused } = mergeMentions(m.mention, mentions, log)
   const listed = new Set(m.mention.map(e => e.pubkey))
+  const merged = { ...m, mention, rooms: rooms || {} }
   return {
-    mention: mention.map(e => ({ name: e.name ?? null, pubkey: e.pubkey, source: listed.has(e.pubkey) ? 'manifest' : 'grant', grants: [...e.grants] })),
+    mention: [...mention.map(e => ({ name: e.name ?? null, pubkey: e.pubkey, source: listed.has(e.pubkey) ? 'manifest' : 'grant', grants: [...e.grants] })),
+      ...m.channels.flatMap(c => roomEntries(merged, c)).map(e => ({ name: e.name, pubkey: e.pubkey, source: 'room', room: e.room, grants: [] }))],
     refused: refused.map(r => ({ grant: r.grant_id, reason: r.reason })),
     channels: m.channels.map(id => ({ id, name: null })),
   }

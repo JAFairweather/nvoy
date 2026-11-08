@@ -28,7 +28,7 @@ import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, readFileSy
 import { spawn, spawnSync } from 'node:child_process'
 import { homedir } from 'node:os'
 import { delimiter, dirname, isAbsolute, relative, resolve } from 'node:path'
-import { fixedPath, knownHostsFile, privateFile, rememberFlag, sshChannelEntry, SSH, SSH_TARGET } from './channel_client.mjs'
+import { fixedPath, knownHostsFile, privateFile, recallEntry, rememberFlag, sshChannelEntry, SSH, SSH_TARGET } from './channel_client.mjs'
 import { instanceId } from './runtime_manifest.mjs'
 import { CHANNEL_PERMISSIONS, codexConfigToml, codexRules, codexTurnText, ensureInstructions, serverName } from './harness_session.mjs'
 import { openThread } from './codex_harness.mjs'
@@ -43,7 +43,7 @@ const gone = pid => { try { process.kill(pid, 0); return false } catch (error) {
 // The client config names paths, never values. Beyond the portable Claude config's refusals, a
 // field or value that could carry an OpenAI API key refuses the file: this harness bills the
 // owner's subscription, and a key anywhere near it is how it would quietly bill an account instead.
-const CODEX_FIELDS = new Set(['instance', 'ssh_target', 'identity_file', 'feed_identity_file', 'known_hosts_file', 'codex_home', 'model', 'pubkey', 'channels', 'grants', 'approvals', 'remember'])
+const CODEX_FIELDS = new Set(['instance', 'ssh_target', 'identity_file', 'feed_identity_file', 'known_hosts_file', 'codex_home', 'model', 'pubkey', 'channels', 'grants', 'approvals', 'remember', 'recall'])
 
 // `grants`: what this one harness's shell commands may reach beyond the channel profile, for an owner
 // who gives it real work (dj-codex, the reMarkable notebooks, 2026-10-26): { "filesystem": { "/abs/path":
@@ -125,11 +125,13 @@ export function readCodexClientConfig(path, id, own = homedir()) {
   const identity = privateFile(String(raw.identity_file || ''), 'SSH channel identity file')
   const feedIdentity = privateFile(String(raw.feed_identity_file || ''), 'SSH feed identity file')
   if (identity === feedIdentity) throw new Error('the channel and feed keys must be two keys: each forced command admits exactly one')
+  const recall = recallEntry(raw.recall)
+  if (recall && [identity, feedIdentity].includes(recall.identity)) throw new Error('the Hive memory read key must be a key of its own: each forced command admits exactly one')
   const socket = resolve(codexHome, 'ctl', 'as.sock')
   if (Buffer.byteLength(socket) >= 104) throw new Error('codex_home is too deep for its control socket; choose a shorter path')
-  const grants = codexGrants(raw.grants, { own, codexHome, keys: [identity, feedIdentity] })
+  const grants = codexGrants(raw.grants, { own, codexHome, keys: [identity, feedIdentity, ...(recall ? [recall.identity] : [])] })
   const approvals = raw.approvals === undefined ? null : codexApprovals(raw.approvals)
-  return Object.freeze({ id: instanceId(id), target, model, pubkey, channels, codexHome, socket, identity, feedIdentity, grants, approvals, remember: rememberFlag(raw.remember),
+  return Object.freeze({ id: instanceId(id), target, model, pubkey, channels, codexHome, socket, identity, feedIdentity, grants, approvals, remember: rememberFlag(raw.remember), recall,
     knownHosts: knownHostsFile(String(raw.known_hosts_file || '')) })
 }
 
@@ -208,7 +210,7 @@ export async function runCodexPortableHarness({ config, log, stopping, ssh = SSH
   process.on('exit', () => { for (const child of children) try { child.kill('SIGTERM') } catch {} viewer?.hide(); release() })
 
   const manifest = { id: config.id, pubkey: config.pubkey, buzz: { channels: config.channels }, harness: { runner: 'codex', model: config.model },
-    ...(config.remember ? { mayRemember: { remote: true } } : {}) }
+    ...(config.remember ? { mayRemember: { remote: true } } : {}), ...(config.recall ? { recall: config.recall } : {}) }
   const codex = codexInstall({ codexHome })
   const approvalPolicy = config.approvals?.policy || 'never', approvalsReviewer = config.approvals?.reviewer || 'user'
   writePrivate(resolve(codexHome, 'config.toml'), codexConfigToml({ manifest, root: '', model: config.model, auth: 'chatgpt', codexRelease: codex.release, grants: config.grants, approvals: config.approvals,

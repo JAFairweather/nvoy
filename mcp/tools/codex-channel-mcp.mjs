@@ -133,14 +133,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async request => {
   const credential = credentialIn(content)
   if (credential) { const { error, log } = withheld({ instance: manifest.id, path: 'nvoy-codex-channel-mcp', name: credential, text: content }); console.error(log); return result(error, true) }
   const allowed = view()
-  const { mention, unresolved, ...refused } = resolveReplyMention(allowed, request.params.arguments?.mention, content)
+  // A reply resolves against the envelope's own room (#321).
+  const room = record.authority?.reply_channel
+  const { mention, unresolved, ...refused } = resolveReplyMention(allowed, request.params.arguments?.mention, content, room)
   if (refused.code) return result(refused, true)
   try {
     const prior = lines(replyPath, 'reply request queue').map(line => { try { return JSON.parse(line) } catch { throw new Error('reply request queue contains malformed JSON') } })
     if (prior.some(row => row?.receipt === envelope)) return result({ code: 'NVOY_ALREADY_REPLIED', envelope }, true)
     const row = { version: 1, type: 'reply-request', id: randomBytes(16).toString('hex'), instance: manifest.id, receipt: envelope, content, ...(mention.length ? { mention } : {}) }
     appendFileSync(replyPath, JSON.stringify(row) + '\n', { mode: 0o640 }); chmodSync(replyPath, 0o640)
-    return result({ queued: true, envelope, request: row.id, ...(mention.length ? { mention } : {}), ...notMentioned(allowed.mayPost, unresolved) })
+    return result({ queued: true, envelope, request: row.id, ...(mention.length ? { mention } : {}), ...notMentioned(allowed.mayPost, unresolved, room) })
   } catch (error) { return result({ code: 'NVOY_REPLY_QUEUE_FAILED', message: error.message }, true) }
 })
 await mcp.connect(new StdioServerTransport())

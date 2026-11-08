@@ -183,9 +183,10 @@ ok('the broker never writes through a symlink', readFileSync(elsewhere, 'utf8') 
 
 // --- 5. the brokers enforce on the live policy (a wss grant relay is out of reach here, so pinned in source) ---
 const replySource = readFileSync('mcp/tools/instance-broker-reply.mjs', 'utf8')
-const merge = replySource.indexOf('validateReplyMention(request.mention, withMentionGrants(manifest, policy.mentions), receipt.reply_channel)')
+const merge = replySource.indexOf('validateReplyMention(request.mention, allowed, receipt.reply_channel)')
 ok('the reply broker checks mention keys on the live merged list, after the live recheck and before the post counter',
   merge > replySource.indexOf("die('admission receipt no longer has a live matching grant chain')") &&
+  merge > replySource.indexOf('const allowed = withMentionGrants(manifest, policy.mentions)') &&
   merge < replySource.indexOf("countInWindow(resolve(manifest.stateDir, 'agent-limits', 'posts.json')") &&
   !/validateReplyMention\(request\.mention, manifest,/.test(replySource))
 const postSource = readFileSync('mcp/tools/instance-broker-post.mjs', 'utf8')

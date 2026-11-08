@@ -2,7 +2,7 @@
 // host key pinned from the line, one public line on stdout, nothing written when a tool is missing.
 // ssh-keygen is real; Claude Code and tmux are fakes, and the harness itself is not started here.
 import assert from 'node:assert/strict'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -86,6 +86,18 @@ writeFileSync(clientPath, JSON.stringify({ ...client, remember: true }))
 assert.equal(readClientConfig(clientPath, id).remember, true, 'remember: true turns the memory rule on')
 writeFileSync(clientPath, JSON.stringify({ ...client, remember: 'yes' }))
 assert.throws(() => readClientConfig(clientPath, id), /remember must be true or false/)
+writeFileSync(clientPath, JSON.stringify(client))
+assert.equal(readClientConfig(clientPath, id).recall, null, 'no recall block, no memory reader')
+const recall = { identity_file: join(root, 'other'), known_hosts_file: client.known_hosts_file, ssh_target: 'hive-memory-gw@herd-cloud' }
+writeFileSync(clientPath, JSON.stringify({ ...client, recall }))
+assert.deepEqual({ ...readClientConfig(clientPath, id).recall }, { identity: realpathSync(join(root, 'other')), knownHosts: realpathSync(client.known_hosts_file), target: 'hive-memory-gw@herd-cloud' },
+  'a recall block names the read key, its pinned host and the gateway')
+writeFileSync(clientPath, JSON.stringify({ ...client, recall: { ...recall, identity_file: client.identity_file } }))
+assert.throws(() => readClientConfig(clientPath, id), /two keys/, 'the read key is never the channel key')
+writeFileSync(clientPath, JSON.stringify({ ...client, recall: { ...recall, command: 'sh' } }))
+assert.throws(() => readClientConfig(clientPath, id), /recall takes exactly/, 'a recall block holds only the three paths')
+writeFileSync(clientPath, JSON.stringify({ ...client, recall: { ...recall, ssh_target: 'gw@herd-cloud -oProxyCommand=x' } }))
+assert.throws(() => readClientConfig(clientPath, id), /recall ssh_target/)
 writeFileSync(clientPath, JSON.stringify(client))
 assert.ok(!(r.stdout + r.stderr).includes('not-a-real-token'), 'the login is never printed')
 

@@ -13,6 +13,7 @@
 //   5. The viewer's memory_wake also carries the daemon's metadata-only activity ring and agent roster, which
 //      drive the cortex canvas. Its simulation controls animate locally and never call the server.
 
+import { readFileSync } from 'node:fs'
 import { createServer as createHttpServer } from 'node:http'
 import { createConnection } from 'node:net'
 import { isAbsolute, resolve } from 'node:path'
@@ -118,6 +119,8 @@ export function sanitizeMemoryRecord(rec) {
     scope: String(rec.scope || ''),
     d: String(rec.d || ''),
     topic: String(rec.topic || ''),
+    status: rec.status ? String(rec.status) : 'active',
+    is_current: rec.is_current === undefined ? true : Boolean(rec.is_current),
     claim: String(rec.claim || ''),
     because: String(rec.because || ''),
     evidence: Array.isArray(rec.evidence) ? rec.evidence.map(e => String(e)) : [],
@@ -126,6 +129,8 @@ export function sanitizeMemoryRecord(rec) {
     created_at: Number.isFinite(rec.created_at) ? Number(rec.created_at) : null,
     expires_at: Number.isFinite(rec.expires_at) ? Number(rec.expires_at) : null,
     stale_warning: rec.stale_warning ? String(rec.stale_warning) : null,
+    consolidated_by: rec.consolidated_by ? String(rec.consolidated_by) : null,
+    supersedes: Array.isArray(rec.supersedes) ? rec.supersedes.map(s => String(s)) : [],
     conflict: Boolean(rec.conflict),
   }
 }
@@ -199,6 +204,428 @@ export function computeScopeCounts(wakeCounts = {}, records = []) {
   }
 }
 
+const CANON_PRIORITY_TOPICS = new Set([
+  'r1',
+  'primer',
+  'illustrated-primer',
+  'hive-memory',
+  'nvoy',
+  'herd-infra',
+  'hive',
+  'buzz',
+  'waggle',
+])
+const KEBAB_TOPIC_RE = /^[a-z0-9][a-z0-9-]{0,31}$/
+const ARTIFACT_REF_RE = /\b(?:PR\s*#?\d+|#\d{2,4}|(?:nvoy|rabidrabbit|herd-infra|waggle)@[0-9a-f]{7})/gi
+
+function evaluateCoherenceSlice(slice, rosterByPk, expectedRosterSize, writeSeqEst) {
+  if (!Array.isArray(slice) || slice.length === 0) {
+    return {
+      at: null,
+      claims: 0,
+      authors: 0,
+      shared_refs: 0,
+      score: 0,
+      axes: { alignment: 0, grounding: 0, convergence: 0, coupling: 0, consolidation: 0 },
+    }
+  }
+  const nonCanon = slice.filter(r => r.scope !== 'hive:canon')
+  const canonCount = slice.length - nonCanon.length
+  const canonFactor = Math.min(1, canonCount / 5)
+  const alignedCount = nonCanon.filter(r => CANON_PRIORITY_TOPICS.has(String(r.topic || ''))).length
+  const alignedRatio = nonCanon.length > 0 ? alignedCount / nonCanon.length : 1
+  const kebabCount = slice.filter(r => KEBAB_TOPIC_RE.test(String(r.topic || ''))).length
+  const kebabRatio = kebabCount / slice.length
+  const alignment = Math.round((0.35 * canonFactor + 0.35 * alignedRatio + 0.3 * kebabRatio) * 1000) / 10
+
+  const anchoredCount = nonCanon.filter(r => Boolean(r.as_of_git || r.as_of_evt)).length
+  const anchoredRatio = nonCanon.length > 0 ? anchoredCount / nonCanon.length : 1
+  const cleanCount = slice.filter(r => !r.conflict && !r.stale_warning).length
+  const cleanRatio = cleanCount / slice.length
+  const grounding = Math.round((0.5 * anchoredRatio + 0.5 * cleanRatio) * 1000) / 10
+
+  const artifactAuthors = new Map()
+  const authors = new Set()
+  for (const r of slice) {
+    const pk = String(r.author_pubkey || '')
+    const actor = rosterByPk.get(pk) || pk.slice(0, 8) || 'unknown'
+    authors.add(actor)
+    const blob = [r.as_of_git || '', r.claim || '', ...(Array.isArray(r.evidence) ? r.evidence : [])].join(' ')
+    const matches = blob.match(ARTIFACT_REF_RE) || []
+    for (const raw of matches) {
+      const norm = raw.replace(/\s+/g, '').toUpperCase()
+      let set = artifactAuthors.get(norm)
+      if (!set) {
+        set = new Set()
+        artifactAuthors.set(norm, set)
+      }
+      set.add(actor)
+    }
+  }
+  let sharedRefs = 0
+  for (const set of artifactAuthors.values()) {
+    if (set.size >= 2) sharedRefs += 1
+  }
+  const convergence = Math.round(Math.min(100, sharedRefs * 8.5) * 10) / 10
+
+  const denomAuthors = Math.max(1, Math.min(14, expectedRosterSize || 14))
+  const coupling = Math.round(Math.min(100, (authors.size / denomAuthors) * 100) * 10) / 10
+
+  const durableCount = slice.filter(r => r.scope === 'hive:canon' || r.expires_at === null || r.expires_at === undefined).length
+  const durableRatio = durableCount / slice.length
+  let reuseBonus = 1
+  if (Number.isSafeInteger(writeSeqEst) && writeSeqEst > slice.length) {
+    reuseBonus = Math.min(1, 0.7 + 0.3 * ((writeSeqEst - slice.length) / Math.max(1, writeSeqEst)))
+  }
+  const consolidation = Math.round(Math.min(100, (0.6 * Math.min(1, durableRatio / 0.35) + 0.4 * reuseBonus) * 100) * 10) / 10
+
+  const score = Math.round((0.25 * alignment + 0.2 * grounding + 0.25 * convergence + 0.15 * coupling + 0.15 * consolidation) * 10) / 10
+  return {
+    at: slice[slice.length - 1]?.created_at || null,
+    claims: slice.length,
+    authors: authors.size,
+    shared_refs: sharedRefs,
+    score,
+    axes: { alignment, grounding, convergence, coupling, consolidation },
+  }
+}
+
+const WORKFLOW_SLUG_RE = /-(?:review|status|owner|wip|handoff)$/
+
+function filterActiveAtEpoch(heads, epochAt, isCurrentFinal = false) {
+  const unexpired = heads.filter(r => {
+    if (!r || r.status === 'withdrawn' || r.verification === 'withdrawn') return false
+    if (isCurrentFinal && (r.verification === 'expired' || r.verification === 'consolidated' || r.verification === 'superseded')) {
+      return false
+    }
+    return r.expires_at === null || r.expires_at === undefined || r.expires_at > epochAt
+  })
+  const byEventId = new Map()
+  for (const r of unexpired) {
+    if (r.event_id) byEventId.set(r.event_id, r)
+  }
+  const supersededByPeer = new Set()
+  for (const c of unexpired) {
+    if (Array.isArray(c.supersedes)) {
+      for (const tid of c.supersedes) {
+        const s = byEventId.get(String(tid))
+        if (
+          s &&
+          c.event_id !== s.event_id &&
+          c.scope === s.scope &&
+          (c.created_at || 0) >= (s.created_at || 0) &&
+          s.scope !== 'hive:canon' &&
+          WORKFLOW_SLUG_RE.test(String(s.d || '').split(':').pop() || '')
+        ) {
+          supersededByPeer.add(s.event_id)
+        }
+      }
+    }
+  }
+  return unexpired.filter(r => {
+    if (r.scope === 'hive:canon') return true
+    if (isCurrentFinal && r.consolidated_by && byEventId.has(r.consolidated_by)) return false
+    if (r.event_id && supersededByPeer.has(r.event_id)) return false
+    return true
+  })
+}
+
+export function computeCoherence({
+  records = [],
+  history_records = null,
+  agent_roster = [],
+  recent_activity = [],
+  store_state = {},
+  now_sec = null,
+  history_complete = true,
+} = {}) {
+  const hasHistory = Array.isArray(history_records) && history_records.length > 0
+  const sourceEvents = hasHistory ? history_records : (Array.isArray(records) ? records : [])
+  const chronological = [...sourceEvents]
+    .filter(Boolean)
+    .sort((a, b) => (a.created_at || 0) - (b.created_at || 0) || (String(a.event_id || '') < String(b.event_id || '') ? -1 : 1))
+  const rosterByPk = new Map()
+  let writerCount = 0
+  for (const a of Array.isArray(agent_roster) ? agent_roster : []) {
+    if (a?.pubkey) rosterByPk.set(a.pubkey, a.id)
+    if (a?.is_writer) writerCount += 1
+  }
+  const expectedRosterSize = writerCount > 0 ? Math.min(14, writerCount) : 14
+
+  if (chronological.length === 0) {
+    return {
+      score: 0,
+      inception_at: null,
+      inception_score: 0,
+      delta_since_inception: 0,
+      total_events: 0,
+      shared_artifacts: 0,
+      history_complete: Boolean(history_complete),
+      history_window: history_complete ? '90d-retained' : 'truncated-5000',
+      axes: { alignment: 0, grounding: 0, convergence: 0, coupling: 0, consolidation: 0 },
+      history: [],
+    }
+  }
+
+  const total = chronological.length
+  const rawSteps = [1, 5, 10, 20, 30, 40, 50, 65, 80, 100, 125, 150, total]
+  const uniqueSteps = [...new Set(rawSteps.filter(k => k >= 1 && k <= total))].sort((a, b) => a - b)
+  while (uniqueSteps.length > 10) {
+    uniqueSteps.splice(1, 1)
+  }
+  if (uniqueSteps[uniqueSteps.length - 1] !== total) uniqueSteps.push(total)
+
+  // Replay retained historical events (including supersessions, cross-author checkpoints, and withdrawals).
+  const stepSet = new Set(uniqueSteps)
+  const activeHeads = new Map()
+  const history = []
+  for (let i = 0; i < total; i++) {
+    const ev = chronological[i]
+    const headKey = `${ev.author_pubkey || ''}:${ev.d || ''}`
+    if (ev.status === 'withdrawn' || ev.verification === 'withdrawn') {
+      activeHeads.delete(headKey)
+    } else {
+      activeHeads.set(headKey, ev)
+    }
+    const stepNum = i + 1
+    if (stepSet.has(stepNum)) {
+      const isFinalStep = stepNum === total
+      const epochAt = isFinalStep && Number.isSafeInteger(now_sec)
+        ? Math.max(ev.created_at || 0, now_sec)
+        : (ev.created_at || 0)
+      let activeAtEpoch = filterActiveAtEpoch([...activeHeads.values()], epochAt, isFinalStep)
+      if (isFinalStep && hasHistory && Array.isArray(records)) {
+        const reconciled = filterActiveAtEpoch(records, epochAt, true)
+        if (reconciled.length > 0 || records.length === 0) {
+          activeAtEpoch = reconciled
+        }
+      }
+      const writeSeqAtEpoch = isFinalStep && Number.isSafeInteger(store_state?.write_seq)
+        ? Math.max(stepNum, store_state.write_seq)
+        : stepNum
+      const snap = evaluateCoherenceSlice(activeAtEpoch, rosterByPk, expectedRosterSize, writeSeqAtEpoch)
+      snap.at = epochAt || snap.at
+      snap.events = stepNum
+      history.push(snap)
+    }
+  }
+
+  const current = history[history.length - 1]
+  const inception = history[0]
+  const activityList = Array.isArray(recent_activity) ? recent_activity : []
+  if (activityList.length > 0) {
+    const refusals = activityList.filter(a => a?.kind === 'refused').length
+    const gateHygiene = Math.max(0, 1 - refusals / activityList.length)
+    current.axes.coupling = Math.round((0.7 * current.axes.coupling + 0.3 * (gateHygiene * 100)) * 10) / 10
+    current.score = Math.round((
+      0.25 * current.axes.alignment +
+      0.2 * current.axes.grounding +
+      0.25 * current.axes.convergence +
+      0.15 * current.axes.coupling +
+      0.15 * current.axes.consolidation
+    ) * 10) / 10
+  }
+
+  return {
+    score: current.score,
+    inception_at: chronological[0]?.created_at || null,
+    inception_score: inception.score,
+    delta_since_inception: Math.round((current.score - inception.score) * 10) / 10,
+    total_events: total,
+    shared_artifacts: current.shared_refs,
+    history_complete: Boolean(history_complete),
+    history_window: history_complete ? '90d-retained' : 'truncated-5000',
+    axes: current.axes,
+    history,
+  }
+}
+
+export const ACTIVE_WINDOW_SEC = 300
+// herd-infra's hive-memory-watch writes this every 5 minutes. Its writers map is the only place saving shows: the daemon's
+// store_state stays READY while every writer is fenced (2026-11-07, 04:15-12:20 UTC, no alert).
+const WATCH_STATUS_PATH = process.env.HIVE_MEMORY_WATCH_STATUS || '/run/hive-memory-watch/status.json'
+export const WATCH_STALE_SEC = 900
+
+export function readWatchStatus(path = WATCH_STATUS_PATH, nowSec = Math.floor(Date.now() / 1000)) {
+  let raw
+  try {
+    raw = JSON.parse(readFileSync(path, 'utf8'))
+  } catch (err) {
+    return { at: null, stale: true, saving: 'unknown', writers: {}, fenced: [], problems: [`no health check status (${err.code || 'unreadable'})`] }
+  }
+  const writers = {}
+  for (const [name, state] of Object.entries(raw?.writers && typeof raw.writers === 'object' ? raw.writers : {})) {
+    if (/^[a-z0-9][a-z0-9-]{0,39}$/.test(name)) writers[name] = state === 'open' ? 'open' : 'FENCED'
+  }
+  const names = Object.keys(writers)
+  const fenced = names.filter((n) => writers[n] !== 'open')
+  const saving = names.length === 0 ? 'unknown' : fenced.length === 0 ? 'open' : fenced.length === names.length ? 'OFF' : 'partial'
+  const problems = (Array.isArray(raw?.problems) ? raw.problems : []).filter((x) => typeof x === 'string').slice(0, 10).map((x) => x.slice(0, 300))
+  const at = Number.isSafeInteger(raw?.at) ? raw.at : null
+  return { at, stale: at === null || nowSec - at > WATCH_STALE_SEC, saving, writers, fenced, problems }
+}
+
+export function watchView(nowSec, path = undefined) {
+  const watch = readWatchStatus(path, nowSec)
+  return { ...watch, alert: watchAlert(watch, nowSec), hard: !watch.stale && (watch.saving === 'OFF' || watch.saving === 'partial') }
+}
+
+export function watchAlert(watch, nowSec = Math.floor(Date.now() / 1000)) {
+  if (!watch) return null
+  // A stale report says nothing about now: name its age and what it last said, never claim it as the current state.
+  if (watch.stale) {
+    if (watch.at === null) return 'The health check has not reported: saving cannot be confirmed'
+    const last = watch.saving === 'OFF' ? ' (it then said saving was OFF)'
+      : watch.saving === 'partial' ? ` (it then said saving was off for ${watch.fenced.join(', ')})` : ''
+    return `The health check last reported ${Math.round((nowSec - watch.at) / 60)} min ago${last}: saving cannot be confirmed`
+  }
+  if (watch.saving === 'OFF') return `SAVING IS OFF: all ${watch.fenced.length} writers are fenced, so every save is refused`
+  if (watch.saving === 'partial') return `Saving is off for ${watch.fenced.join(', ')}: their saves are refused`
+  if (watch.saving === 'unknown') return 'The health check does not report writers: saving cannot be confirmed'
+  if (watch.problems.length) return `Health check: ${watch.problems[0]}`
+  return null
+}
+export const WARM_WINDOW_SEC = 1200
+
+export function computeAgentHealth({
+  agent_roster = [],
+  recent_activity = [],
+  records = [],
+  history_records = [],
+  prior_telemetry = null,
+  now_sec = Math.floor(Date.now() / 1000),
+} = {}) {
+  const telemetry = prior_telemetry instanceof Map ? prior_telemetry : new Map()
+  const rosterByPk = new Map()
+  for (const a of Array.isArray(agent_roster) ? agent_roster : []) {
+    if (a?.pubkey && a?.id) rosterByPk.set(a.pubkey, a.id)
+  }
+
+  const getEntry = id => {
+    let e = telemetry.get(id)
+    if (!e) {
+      e = {
+        last_read_at: null,
+        last_read_kind: null,
+        last_write_at: null,
+        last_write_d: null,
+        last_refused_at: null,
+        last_refused_code: null,
+      }
+      telemetry.set(id, e)
+    }
+    return e
+  }
+
+  const allRecords = [
+    ...(Array.isArray(records) ? records : []),
+    ...(Array.isArray(history_records) ? history_records : []),
+  ]
+  for (const r of allRecords) {
+    if (!r || typeof r !== 'object') continue
+    const actor = rosterByPk.get(String(r.author_pubkey || ''))
+    const at = Number.isSafeInteger(r.created_at) ? r.created_at : null
+    if (!actor || !at) continue
+    const e = getEntry(actor)
+    if (e.last_write_at === null || at >= e.last_write_at) {
+      e.last_write_at = at
+      if (r.d) e.last_write_d = String(r.d)
+    }
+  }
+
+  const reads5mByActor = new Map()
+  const writes5mByActor = new Map()
+  for (const a of Array.isArray(recent_activity) ? recent_activity : []) {
+    if (!a || typeof a !== 'object' || !a.actor) continue
+    const actor = String(a.actor)
+    const at = Number.isSafeInteger(a.at) ? a.at : null
+    if (!at) continue
+    const e = getEntry(actor)
+    const in5m = Math.max(0, now_sec - at) <= ACTIVE_WINDOW_SEC
+    if (a.kind === 'wake' || a.kind === 'query' || a.kind === 'lookup') {
+      if (e.last_read_at === null || at >= e.last_read_at) {
+        e.last_read_at = at
+        e.last_read_kind = a.kind
+      }
+      if (in5m) reads5mByActor.set(actor, (reads5mByActor.get(actor) || 0) + 1)
+    } else if (a.kind === 'submit') {
+      if (e.last_write_at === null || at >= e.last_write_at) {
+        e.last_write_at = at
+        if (a.d) e.last_write_d = String(a.d)
+      }
+      if (in5m) writes5mByActor.set(actor, (writes5mByActor.get(actor) || 0) + 1)
+    } else if (a.kind === 'refused') {
+      if (e.last_refused_at === null || at >= e.last_refused_at) {
+        e.last_refused_at = at
+        e.last_refused_code = a.code || 'REFUSED'
+      }
+    }
+  }
+
+  const summary = {
+    active_5m: 0,
+    warm_20m: 0,
+    stale: 0,
+    error: 0,
+    total: 0,
+    window_sec: ACTIVE_WINDOW_SEC,
+  }
+
+  const enrichedRoster = (Array.isArray(agent_roster) ? agent_roster : []).map(agent => {
+    const e = telemetry.get(agent.id) || {
+      last_read_at: null,
+      last_read_kind: null,
+      last_write_at: null,
+      last_write_d: null,
+      last_refused_at: null,
+      last_refused_code: null,
+    }
+    const lastSeen = Math.max(e.last_read_at || 0, e.last_write_at || 0) || null
+    const ageSec = lastSeen !== null ? Math.max(0, now_sec - lastSeen) : null
+    const active5m = ageSec !== null && ageSec <= ACTIVE_WINDOW_SEC
+    let health = 'stale'
+    if (
+      e.last_refused_at !== null &&
+      (lastSeen === null || e.last_refused_at > lastSeen) &&
+      Math.max(0, now_sec - e.last_refused_at) <= 900
+    ) {
+      health = 'error'
+      summary.error += 1
+    } else if (active5m) {
+      health = 'active'
+      summary.active_5m += 1
+    } else if (ageSec !== null && ageSec <= WARM_WINDOW_SEC) {
+      health = 'warm'
+      summary.warm_20m += 1
+    } else {
+      health = 'stale'
+      summary.stale += 1
+    }
+    summary.total += 1
+    return {
+      ...agent,
+      last_read_at: e.last_read_at,
+      last_read_kind: e.last_read_kind,
+      last_write_at: e.last_write_at,
+      last_write_d: e.last_write_d,
+      last_refused_at: e.last_refused_at,
+      last_refused_code: e.last_refused_code,
+      last_seen_at: lastSeen,
+      age_sec: ageSec,
+      active_5m: active5m,
+      reads_5m: reads5mByActor.get(agent.id) || 0,
+      writes_5m: writes5mByActor.get(agent.id) || 0,
+      health,
+    }
+  })
+
+  return {
+    roster: enrichedRoster,
+    summary,
+    telemetry,
+  }
+}
+
 export function diffViewerSnapshots(prev, next, nowSec = Math.floor(Date.now() / 1000)) {
   const events = []
   const push = (kind, summary) => events.push({ at: nowSec, kind, summary: String(summary) })
@@ -210,6 +637,10 @@ export function diffViewerSnapshots(prev, next, nowSec = Math.floor(Date.now() /
     )
     return events
   }
+
+  const prevAlert = watchAlert(prev.watch, nowSec)
+  const nextAlert = watchAlert(next.watch, nowSec)
+  if (prevAlert !== nextAlert) push('alert', nextAlert || 'Health check clear: saving is open')
 
   if (prev.connected !== next.connected) {
     push('socket', next.connected ? 'Reader socket connected' : `Reader socket disconnected: ${next.error || 'closed'}`)
@@ -275,6 +706,60 @@ export function diffViewerSnapshots(prev, next, nowSec = Math.floor(Date.now() /
   }
 
   return events
+}
+
+export function computeDreamingTelemetry(records = []) {
+  const recs = Array.isArray(records) ? records : []
+  const fullBytes = JSON.stringify(recs).length
+  let indexBytes = 0
+  let canonBytes = 0
+  let wfCount = 0
+  let shortTtlCount = 0
+  let classBCount = 0
+  const byScopeTopic = new Map()
+  for (const r of recs) {
+    if (!r || typeof r !== 'object') continue
+    const slug = String(r.d || '').split(':').pop() || String(r.d || '')
+    const isWf = /-(?:review|status|owner|wip|handoff)$/.test(slug)
+    indexBytes += 140 + Math.min(120, String(r.claim || '').length) + String(r.d || '').length
+    if (r.scope === 'hive:canon') {
+      canonBytes += JSON.stringify(r).length
+    } else if (r.expires_at === null || r.expires_at === undefined) {
+      classBCount += 1
+    } else {
+      const scope = String(r.scope || 'unknown')
+      const top = String(r.topic || 'general')
+      const key = `${scope} · #${top}`
+      const prev = byScopeTopic.get(key) || { scope, topic: top, label: key, count: 0 }
+      prev.count += 1
+      byScopeTopic.set(key, prev)
+    }
+    if (isWf) {
+      wfCount += 1
+      if (r.expires_at !== null && r.expires_at !== undefined && r.created_at && (r.expires_at - r.created_at) <= 172800) {
+        shortTtlCount += 1
+      }
+    }
+  }
+  const wakeBytes = canonBytes + Math.min(4000, indexBytes)
+  const indexSavings = fullBytes > 0 ? Math.round((1 - indexBytes / fullBytes) * 1000) / 10 : 0
+  const wakeSavings = fullBytes > 0 ? Math.round((1 - wakeBytes / fullBytes) * 1000) / 10 : 0
+  const topicList = [...byScopeTopic.values()]
+    .map(item => ({ ...item, ready: item.count > 8 }))
+    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label))
+  return {
+    estimated_from_visible: true,
+    total: recs.length,
+    fullBytes,
+    indexBytes,
+    wakeBytes,
+    indexSavings,
+    wakeSavings,
+    wfCount,
+    shortTtlCount,
+    classBCount,
+    topicList,
+  }
 }
 
 // Single-socket MCP client over the viewer's Unix domain socket.
@@ -460,12 +945,14 @@ export function renderViewerHtml(initialState) {
       line-height: 1.45;
       -webkit-text-size-adjust: 100%;
     }
-    body[data-view="graph"] { height: 100vh; overflow: hidden; }
+    body[data-view="graph"] { height: 100vh; height: 100dvh; overflow: hidden; overscroll-behavior: none; }
     body[data-view="graph"] .cards-only { display: none; }
     body[data-view="cards"] .graph-only { display: none; }
-    body[data-view="cards"] { padding: 12px; }
+    body[data-view="cards"] {
+      padding: calc(12px + env(safe-area-inset-top, 0px)) calc(12px + env(safe-area-inset-right, 0px)) calc(76px + env(safe-area-inset-bottom, 0px)) calc(12px + env(safe-area-inset-left, 0px));
+    }
     #stage-wrap { position: fixed; inset: 0; }
-    canvas#cortex { width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; }
+    canvas#cortex { width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
     .panel {
       background: var(--panel);
       -webkit-backdrop-filter: blur(14px);
@@ -482,7 +969,13 @@ export function renderViewerHtml(initialState) {
       flex-wrap: wrap;
       z-index: 20;
     }
-    body[data-view="graph"] .hud-top { position: fixed; top: 12px; left: 12px; right: 12px; pointer-events: none; }
+    body[data-view="graph"] .hud-top {
+      position: fixed;
+      top: calc(10px + env(safe-area-inset-top, 0px));
+      left: calc(10px + env(safe-area-inset-left, 0px));
+      right: calc(10px + env(safe-area-inset-right, 0px));
+      pointer-events: none;
+    }
     body[data-view="cards"] .hud-top { max-width: 760px; margin: 0 auto 12px; flex-direction: column; align-items: stretch; }
     .hud-top > * { pointer-events: auto; }
     .brand-card { padding: 10px 14px; display: flex; gap: 12px; align-items: flex-start; max-width: 100%; }
@@ -495,7 +988,7 @@ export function renderViewerHtml(initialState) {
       background: radial-gradient(circle at 35% 35%, #7dd3fc, #6366f1 55%, #1e1b4b 100%);
       box-shadow: 0 0 18px rgba(56, 189, 248, 0.55);
     }
-    .brand-text { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+    .brand-text { display: flex; flex-direction: column; gap: 6px; min-width: 0; flex: 1; }
     h1 { margin: 0; font-size: 16px; font-weight: 700; letter-spacing: -0.01em; }
     .badges { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
     .quarantine-banner {
@@ -506,6 +999,22 @@ export function renderViewerHtml(initialState) {
       background: rgba(0, 0, 0, 0.3);
       border: 1px solid var(--border);
       color: var(--muted);
+    }
+    .mobile-kpi-strip {
+      display: none;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: #cbd5e1;
+      gap: 6px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .mobile-kpi-pill {
+      padding: 2px 7px;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      white-space: nowrap;
     }
     .badge {
       display: inline-flex;
@@ -524,6 +1033,10 @@ export function renderViewerHtml(initialState) {
     .badge.ok { color: #86efac; background: var(--ok-bg); border-color: rgba(34, 197, 94, 0.4); }
     .badge.warn { color: #fcd34d; background: var(--warn-bg); border-color: rgba(245, 158, 11, 0.4); }
     .badge.err { color: #fca5a5; background: var(--err-bg); border-color: rgba(239, 68, 68, 0.4); }
+    .alert-banner { position: fixed; top: calc(env(safe-area-inset-top, 0px) + 8px); left: 50%; transform: translateX(-50%);
+      z-index: 50; max-width: min(720px, calc(100vw - 32px)); padding: 10px 16px; border-radius: 10px; font-weight: 700;
+      color: #fff; background: #b91c1c; border: 1px solid #fca5a5; box-shadow: 0 0 24px rgba(239, 68, 68, 0.6); }
+    .alert-banner.warn { background: #92400e; border-color: #fcd34d; box-shadow: 0 0 18px rgba(245, 158, 11, 0.5); }
     .badge.info { color: #7dd3fc; background: var(--info-bg); border-color: rgba(56, 189, 248, 0.4); }
     .badge.sim { color: #fde68a; background: rgba(245, 158, 11, 0.12); border: 1px dashed rgba(251, 191, 36, 0.6); }
     .telemetry-strip { display: flex; gap: 16px; padding: 8px 14px; flex-wrap: wrap; }
@@ -554,20 +1067,33 @@ export function renderViewerHtml(initialState) {
       margin-bottom: 8px;
       display: flex;
       justify-content: space-between;
+      align-items: center;
       gap: 8px;
     }
+    .sheet-close {
+      display: none;
+      font-size: 12px;
+      line-height: 1;
+      padding: 4px 8px;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid var(--border);
+      color: var(--text);
+      cursor: pointer;
+    }
     .mini { font-family: var(--mono); font-size: 10px; color: #7dd3fc; text-transform: none; letter-spacing: 0; }
-    .agent-list { display: flex; flex-direction: column; gap: 4px; max-height: 22vh; overflow-y: auto; }
+    .agent-list { display: flex; flex-direction: column; gap: 4px; max-height: 22vh; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
     .agent-row {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 8px;
-      padding: 5px 8px;
+      padding: 6px 8px;
       border-radius: 8px;
       background: rgba(255, 255, 255, 0.025);
       border: 1px solid transparent;
       cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
     }
     .agent-row:hover, .agent-row.active { background: rgba(56, 189, 248, 0.1); border-color: var(--border-bright); }
     .agent-ident { display: flex; align-items: center; gap: 8px; min-width: 0; }
@@ -583,7 +1109,7 @@ export function renderViewerHtml(initialState) {
     .shape.fresh { background: var(--fresh); border-radius: 50%; box-shadow: 0 0 8px var(--fresh); }
     .shape.aging { background: var(--aging); border-radius: 50%; box-shadow: 0 0 8px var(--aging); }
     .feed-box { flex: 1; display: flex; flex-direction: column; }
-    .stream-list { font-family: var(--mono); font-size: 10.5px; display: flex; flex-direction: column; gap: 4px; overflow-y: auto; min-height: 0; }
+    .stream-list { font-family: var(--mono); font-size: 10.5px; display: flex; flex-direction: column; gap: 4px; overflow-y: auto; min-height: 0; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
     .stream-item {
       padding: 4px 7px;
       border-radius: 6px;
@@ -596,8 +1122,10 @@ export function renderViewerHtml(initialState) {
     .stream-item.lookup { border-left-color: #a78bfa; }
     .stream-item.refuse { border-left-color: #f87171; }
     .stream-item.sim { border-left-style: dashed; border-left-color: #fbbf24; color: #fde68a; }
-    .inspector { flex: 0 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 9px; }
+    .inspector { flex: 0 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 9px; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
     .inspect-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; border-bottom: 1px solid var(--border); padding-bottom: 7px; }
+    .inspect-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+    .inspect-close { padding: 3px 8px; font-size: 12px; line-height: 1.2; border-radius: 6px; }
     .inspect-kicker { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
     .inspect-title { font-family: var(--mono); font-size: 13px; font-weight: 700; color: #93c5fd; word-break: break-word; }
     .kv-list { display: flex; flex-direction: column; font-family: var(--mono); font-size: 11px; }
@@ -608,9 +1136,9 @@ export function renderViewerHtml(initialState) {
     .ttl-bar-fill { height: 100%; border-radius: 999px; }
     .hud-bottom {
       position: fixed;
-      bottom: 12px;
-      left: 12px;
-      right: 12px;
+      bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+      left: calc(12px + env(safe-area-inset-left, 0px));
+      right: calc(12px + env(safe-area-inset-right, 0px));
       display: flex;
       justify-content: space-between;
       gap: 10px;
@@ -632,11 +1160,72 @@ export function renderViewerHtml(initialState) {
       border-radius: 8px;
       padding: 6px 10px;
       cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
     }
-    button.btn:hover { background: rgba(56, 189, 248, 0.16); border-color: var(--border-bright); }
+    button.btn:hover, button.btn.active { background: rgba(56, 189, 248, 0.16); border-color: var(--border-bright); }
     button.btn.sim { border-style: dashed; border-color: rgba(251, 191, 36, 0.55); color: #fde68a; }
     input[type="range"] { accent-color: #38bdf8; width: 140px; }
     #time-label { min-width: 96px; color: #7dd3fc; font-weight: 700; }
+    .zoom-fab {
+      display: none;
+      position: fixed;
+      right: calc(12px + env(safe-area-inset-right, 0px));
+      bottom: calc(68px + env(safe-area-inset-bottom, 0px));
+      z-index: 18;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .zoom-fab button.btn {
+      width: 38px;
+      height: 38px;
+      padding: 0;
+      display: grid;
+      place-items: center;
+      font-family: var(--mono);
+      font-size: 16px;
+      font-weight: 700;
+      border-radius: 10px;
+      background: var(--panel);
+      -webkit-backdrop-filter: blur(12px);
+      backdrop-filter: blur(12px);
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+    }
+    .mobile-dock {
+      display: none;
+      position: fixed;
+      left: calc(10px + env(safe-area-inset-left, 0px));
+      right: calc(10px + env(safe-area-inset-right, 0px));
+      bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+      z-index: 25;
+      padding: 5px;
+      gap: 4px;
+      justify-content: space-between;
+      align-items: center;
+      border-radius: 14px;
+    }
+    .mobile-dock button.dock-btn {
+      flex: 1 1 0;
+      min-width: 0;
+      min-height: 38px;
+      padding: 6px 4px;
+      font-family: var(--sans);
+      font-size: 11.5px;
+      font-weight: 600;
+      color: var(--muted);
+      background: transparent;
+      border: 1px solid transparent;
+      border-radius: 10px;
+      cursor: pointer;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .mobile-dock button.dock-btn.active {
+      color: #f8fafc;
+      background: rgba(56, 189, 248, 0.16);
+      border-color: var(--border-bright);
+    }
     .wrap { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }
     .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
     @media (min-width: 560px) {
@@ -681,25 +1270,74 @@ export function renderViewerHtml(initialState) {
       border: 1px dashed var(--border);
       border-radius: 8px;
     }
-    .log-list { font-family: var(--mono); font-size: 11px; display: flex; flex-direction: column; gap: 5px; max-height: 240px; overflow-y: auto; }
+    .log-list { font-family: var(--mono); font-size: 11px; display: flex; flex-direction: column; gap: 5px; max-height: 240px; overflow-y: auto; -webkit-overflow-scrolling: touch; }
     .log-row { padding: 5px 8px; border-radius: 6px; background: var(--panel-alt); border: 1px solid var(--border); word-break: break-word; }
     .log-time { color: var(--muted); margin-right: 6px; }
     @media (max-width: 1024px) {
-      .hud-left { display: none; }
-      .hud-right { width: 290px; }
+      .mobile-dock { display: flex; }
+      body[data-view="graph"] .zoom-fab { display: flex; }
+      .sheet-close { display: inline-flex; }
+      .hud-left {
+        top: auto;
+        left: calc(10px + env(safe-area-inset-left, 0px));
+        right: calc(10px + env(safe-area-inset-right, 0px));
+        bottom: calc(64px + env(safe-area-inset-bottom, 0px));
+        width: auto;
+        max-height: 56dvh;
+        z-index: 22;
+        display: none;
+      }
+      body[data-view="graph"][data-drawer="agents"] .hud-left,
+      body[data-view="graph"][data-drawer="pulses"] .hud-left {
+        display: flex;
+      }
+      body[data-view="graph"][data-drawer="agents"] .hud-left .feed-box { display: none; }
+      body[data-view="graph"][data-drawer="pulses"] .hud-left .agents-box,
+      body[data-view="graph"][data-drawer="pulses"] .hud-left .legend-box { display: none; }
+      .agent-list { max-height: 34dvh; }
+      .stream-list { max-height: 44dvh; }
+      .hud-right {
+        top: auto;
+        left: calc(10px + env(safe-area-inset-left, 0px));
+        right: calc(10px + env(safe-area-inset-right, 0px));
+        bottom: calc(64px + env(safe-area-inset-bottom, 0px));
+        width: auto;
+        max-height: 48dvh;
+        z-index: 23;
+      }
+      .inspector.idle { display: none; }
+      .hud-bottom {
+        left: calc(10px + env(safe-area-inset-left, 0px));
+        right: calc(10px + env(safe-area-inset-right, 0px));
+        bottom: calc(64px + env(safe-area-inset-bottom, 0px));
+        flex-direction: column;
+        align-items: stretch;
+        z-index: 21;
+        display: none;
+      }
+      body[data-view="graph"][data-drawer="tools"] .hud-bottom { display: flex; }
     }
     @media (max-width: 680px) {
       body[data-view="graph"] .telemetry-strip { display: none; }
-      .quarantine-banner { font-size: 10px; }
-      .hud-right { top: auto; left: 12px; right: 12px; width: auto; max-height: 32vh; }
-      .inspector.idle { display: none; }
-      .control-bar { padding: 6px 8px; gap: 6px; }
-      button.btn { padding: 5px 8px; font-size: 11px; }
-      input[type="range"] { width: 100px; }
+      body[data-view="graph"] .mobile-kpi-strip { display: flex; }
+      .brand-card { padding: 8px 11px; gap: 9px; }
+      .brain-orb { width: 24px; height: 24px; }
+      h1 { font-size: 14px; }
+      .quarantine-banner {
+        font-size: 9.5px;
+        padding: 3px 6px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .badge { font-size: 10px; padding: 2px 7px; }
+      .control-bar { padding: 8px 10px; gap: 6px; }
+      button.btn { padding: 6px 9px; font-size: 11.5px; }
+      input[type="range"] { flex: 1; min-width: 90px; }
     }
   </style>
 </head>
-<body data-view="graph">
+<body data-view="graph" data-drawer="none">
   <div id="stage-wrap" class="graph-only"><canvas id="cortex" aria-label="Hive memory cortex graph"></canvas></div>
 
   <header class="hud-top">
@@ -711,6 +1349,12 @@ export function renderViewerHtml(initialState) {
           <span id="sse-badge" class="badge info">SSE: connecting</span>
           <span id="sync-badge" class="badge">${syncState}</span>
           <button id="view-toggle" class="btn" type="button">Raw cards</button>
+        </div>
+        <div class="mobile-kpi-strip" id="mobile-kpi-strip">
+          <span class="mobile-kpi-pill" id="m-kpi-seq">seq: -</span>
+          <span class="mobile-kpi-pill" id="m-kpi-claims">claims: -</span>
+          <span class="mobile-kpi-pill" id="m-kpi-tiers">-</span>
+          <button class="mobile-kpi-pill" id="m-kpi-coherence" type="button" style="cursor:pointer;color:#6ee7b7;border-color:rgba(52,211,153,0.4);">coh: -</button>
         </div>
         <div class="quarantine-banner">
           reader: <span id="reader-name">${readerName}</span> (<span id="server-name">${serverName}</span>) |
@@ -744,39 +1388,59 @@ export function renderViewerHtml(initialState) {
         <span id="hud-tiers" class="metric-val">-</span>
         <span id="hud-forecast" class="metric-sub">at now</span>
       </div>
+      <div class="metric" id="coherence-card" style="cursor:pointer;" title="Tap to inspect 5-axis Hive Coherence Index and retroactive inception timeline">
+        <span class="metric-label" style="color:#6ee7b7;">Hive Coherence</span>
+        <span id="coherence-val" class="metric-val" style="color:#6ee7b7;">-</span>
+        <span id="coherence-sub" class="metric-sub">tap for timeline</span>
+      </div>
     </div>
   </header>
+  <div id="alert-banner" class="alert-banner" role="alert" hidden></div>
 
   <aside class="hud-left graph-only">
-    <div class="glass-box panel">
-      <div class="box-title"><span>Agent Ganglia</span><span id="roster-count" class="mini">0 agents</span></div>
+    <div class="glass-box panel agents-box">
+      <div class="box-title">
+        <span>Agent Ganglia</span>
+        <span><span id="roster-count" class="mini">0 agents</span> <button class="sheet-close" type="button" data-close-drawer="1" aria-label="Close panel">✕</button></span>
+      </div>
       <div id="agent-list" class="agent-list"></div>
     </div>
-    <div class="glass-box panel">
-      <div class="box-title">Engram Morphology &amp; Decay</div>
+    <div class="glass-box panel legend-box">
+      <div class="box-title">Engram &amp; Ganglion Key</div>
       <div class="legend-grid">
         <div class="legend-item"><span class="shape canon"></span><span>Rank 2 canon (owner)</span></div>
         <div class="legend-item"><span class="shape decision"></span><span>Class B decision (no expiry)</span></div>
         <div class="legend-item"><span class="shape fresh"></span><span>Class A status, fresh</span></div>
         <div class="legend-item"><span class="shape aging"></span><span>Class A status, near expiry</span></div>
+        <div class="legend-item"><span class="shape" style="background:#10b981;border-radius:999px;box-shadow:0 0 8px #10b981;"></span><span>Ganglion active (&le;5m R/W)</span></div>
+        <div class="legend-item"><span class="shape" style="background:#475569;border-radius:999px;border:1px dashed #94a3b8;"></span><span>Ganglion silent (&gt;20m)</span></div>
       </div>
     </div>
     <div class="glass-box panel feed-box">
-      <div class="box-title"><span>Synaptic Activity</span><span id="pulse-counter" class="mini">0 pulses</span></div>
+      <div class="box-title">
+        <span>Synaptic Activity</span>
+        <span><span id="pulse-counter" class="mini">0 pulses</span> <button class="sheet-close" type="button" data-close-drawer="1" aria-label="Close panel">✕</button></span>
+      </div>
       <div id="stream-list" class="stream-list"></div>
     </div>
   </aside>
 
   <aside class="hud-right graph-only">
-    <div id="inspector-box" class="glass-box panel inspector"></div>
+    <div id="inspector-box" class="glass-box panel inspector idle"></div>
   </aside>
+
+  <div class="zoom-fab graph-only">
+    <button class="btn" id="btn-zoom-in" type="button" aria-label="Zoom in">+</button>
+    <button class="btn" id="btn-zoom-out" type="button" aria-label="Zoom out">−</button>
+    <button class="btn" id="btn-zoom-reset" type="button" aria-label="Reset camera">⟲</button>
+  </div>
 
   <div class="hud-bottom graph-only">
     <div class="control-bar sim-bar panel">
       <span class="sim-label">Simulation · local animation only, nothing is sent</span>
       <button class="btn sim" id="btn-sim-write" type="button">Sim write</button>
       <button class="btn sim" id="btn-sim-recall" type="button">Sim recall</button>
-      <button class="btn sim" id="btn-sim-consolidate" type="button">Sim consolidator preview</button>
+      <button class="btn sim" id="btn-sim-consolidate" type="button">Merkle Dreaming · Curation</button>
       <button class="btn sim" id="btn-sim-refuse" type="button">Sim refusal</button>
     </div>
     <div class="control-bar panel">
@@ -784,8 +1448,17 @@ export function renderViewerHtml(initialState) {
       <input type="range" id="time-slider" min="0" max="30" step="0.5" value="0">
       <span id="time-label">NOW (+0.0d)</span>
       <button class="btn" id="btn-reset-view" type="button">Reset camera</button>
+      <button class="sheet-close" type="button" data-close-drawer="1" aria-label="Close tools">✕</button>
     </div>
   </div>
+
+  <nav class="mobile-dock panel" id="mobile-dock" aria-label="Mobile view navigation">
+    <button class="dock-btn active" id="dock-graph" type="button">Cortex</button>
+    <button class="dock-btn" id="dock-agents" type="button">Agents</button>
+    <button class="dock-btn" id="dock-pulses" type="button">Pulses</button>
+    <button class="dock-btn" id="dock-tools" type="button">Sim / Time</button>
+    <button class="dock-btn" id="dock-cards" type="button">Cards</button>
+  </nav>
 
   <main class="wrap cards-only">
     <div class="grid grid-4">
@@ -838,15 +1511,20 @@ export function renderViewerHtml(initialState) {
         james: { name: 'James', model: 'Sovereign Key', color: '#fbbf24' },
         biggy: { name: 'Biggy', model: 'Gemini / Antigravity', color: '#818cf8' },
         rabidrabbit: { name: 'RabidRabbit', model: 'Claude Opus 4.6', color: '#f59e0b' },
+        'dead-rabbit': { name: 'Dead Rabbit', model: 'Claude Opus 4.6', color: '#f59e0b' },
         mydude: { name: 'My Dude', model: 'OpenAI Codex', color: '#10b981' },
         neil: { name: 'Neil', model: 'OpenAI Codex', color: '#38bdf8' },
         'waggle-dev': { name: 'Waggle-Dev', model: 'Claude Sonnet 4.6', color: '#fb923c' },
         crystalclaude: { name: 'CrystalClaude', model: 'Claude Opus 4.6', color: '#f472b6' },
         'dj-codex': { name: 'DJ-Codex', model: 'OpenAI Codex', color: '#34d399' },
+        djcodex: { name: 'DJ Codex', model: 'OpenAI Codex', color: '#34d399' },
+        dennis: { name: 'Dennis', model: 'Claude Opus 4.6', color: '#60a5fa' },
+        kerouac: { name: 'Kerouac', model: 'Claude Opus 4.6', color: '#c084fc' },
         grokdoggydog: { name: 'GrokDoggyDog', model: 'xAI Grok 4', color: '#f87171' },
         'pi-dog': { name: 'Pi-Dog', model: 'Pi Harness Agent', color: '#2dd4bf' },
         lukedog: { name: 'LukeDog', model: '', color: '#a3e635' },
-        'mc-claude': { name: 'MC-Claude', model: '', color: '#e879f9' }
+        'mc-claude': { name: 'MC-Claude', model: 'Claude Opus 4.6', color: '#e879f9' },
+        curator: { name: 'Curator', model: 'Merkle Dreamer', color: '#a78bfa' }
       };
       var SPARE_COLORS = ['#60a5fa', '#c084fc', '#fda4af', '#5eead4', '#fde047', '#93c5fd', '#86efac', '#fdba74'];
       var TOPIC_ANCHORS = [
@@ -888,10 +1566,26 @@ export function renderViewerHtml(initialState) {
 
       function fmtAge(sec, nowSec) {
         if (!sec || typeof sec !== 'number') return 'none';
-        var diff = Math.max(0, (nowSec || Math.floor(Date.now() / 1000)) - sec);
+        var diff = Math.floor(Math.max(0, (nowSec || Math.floor(Date.now() / 1000)) - sec));
         if (diff < 60) return diff + 's ago';
         if (diff < 3600) return Math.floor(diff / 60) + 'm ' + (diff % 60) + 's ago';
         return Math.floor(diff / 3600) + 'h ' + Math.floor((diff % 3600) / 60) + 'm ago';
+      }
+
+      function fmtShortAge(sec, nowSec) {
+        if (!sec || typeof sec !== 'number') return 'silent';
+        var diff = Math.floor(Math.max(0, (nowSec || Math.floor(Date.now() / 1000)) - sec));
+        if (diff < 60) return diff + 's';
+        if (diff < 3600) return Math.floor(diff / 60) + 'm';
+        if (diff < 86400) return Math.floor(diff / 3600) + 'h';
+        return Math.floor(diff / 86400) + 'd';
+      }
+
+      function healthColor(h) {
+        if (h === 'active') return '#10b981';
+        if (h === 'warm') return '#f59e0b';
+        if (h === 'error') return '#ef4444';
+        return '#475569';
       }
 
       function syncBadgeClass(state) {
@@ -1031,6 +1725,17 @@ export function renderViewerHtml(initialState) {
           is_owner: false,
           per_hour: 0,
           used_last_hour: null,
+          last_read_at: null,
+          last_read_kind: null,
+          last_write_at: null,
+          last_write_d: null,
+          last_refused_at: null,
+          last_refused_code: null,
+          last_seen_at: null,
+          active_5m: false,
+          reads_5m: 0,
+          writes_5m: 0,
+          health: 'stale',
           listed: true,
           energy: 0,
           x: 0,
@@ -1069,13 +1774,13 @@ export function renderViewerHtml(initialState) {
           a.angle = -Math.PI / 2 + (i / Math.max(1, agents.length)) * Math.PI * 2;
           a.x = Math.cos(a.angle) * rim;
           a.y = Math.sin(a.angle) * rim;
-          a.radius = a.is_owner ? 21 : 17;
+          a.radius = width < 680 ? (a.is_owner ? 18 : 14) : (a.is_owner ? 21 : 17);
         });
         var even = topics.length > TOPIC_ANCHORS.length;
         topics.forEach(function (t, i) {
           var angle = even ? -Math.PI / 2 + (i / topics.length) * Math.PI * 2 : t.anchorAngle;
-          t.x = Math.cos(angle) * minDim * 0.26;
-          t.y = Math.sin(angle) * minDim * 0.26;
+          t.x = Math.cos(angle) * minDim * 0.25;
+          t.y = Math.sin(angle) * minDim * 0.25;
           t.radius = minDim * 0.12;
         });
       }
@@ -1094,9 +1799,48 @@ export function renderViewerHtml(initialState) {
 
       function syncAgents(s) {
         var roster = Array.isArray(s.agent_roster) ? s.agent_roster : [];
+        var activity = Array.isArray(s.recent_activity) ? s.recent_activity : [];
+        var recs = Array.isArray(s.records) ? s.records : [];
+        var refNow = s.polled_at || nowSec();
         var next = [];
         roster.forEach(function (r) {
           var prev = agentById(r.id);
+          var lastRead = typeof r.last_read_at === 'number' ? r.last_read_at : (prev ? prev.last_read_at : null);
+          var lastReadKind = r.last_read_kind || (prev ? prev.last_read_kind : null);
+          var lastWrite = typeof r.last_write_at === 'number' ? r.last_write_at : (prev ? prev.last_write_at : null);
+          var lastWriteD = r.last_write_d || (prev ? prev.last_write_d : null);
+          var lastRefused = typeof r.last_refused_at === 'number' ? r.last_refused_at : (prev ? prev.last_refused_at : null);
+          var lastRefusedCode = r.last_refused_code || (prev ? prev.last_refused_code : null);
+          var reads5m = typeof r.reads_5m === 'number' ? r.reads_5m : 0;
+          var writes5m = typeof r.writes_5m === 'number' ? r.writes_5m : 0;
+          if (!r.health) {
+            recs.forEach(function (rec) {
+              if (r.pubkey && rec.author_pubkey === r.pubkey && typeof rec.created_at === 'number') {
+                if (!lastWrite || rec.created_at >= lastWrite) { lastWrite = rec.created_at; lastWriteD = rec.d || lastWriteD; }
+              }
+            });
+            activity.forEach(function (act) {
+              if (!act || act.actor !== r.id || typeof act.at !== 'number') return;
+              var in5 = Math.max(0, refNow - act.at) <= 300;
+              if (act.kind === 'wake' || act.kind === 'query' || act.kind === 'lookup') {
+                if (!lastRead || act.at >= lastRead) { lastRead = act.at; lastReadKind = act.kind; }
+                if (in5) reads5m += 1;
+              } else if (act.kind === 'submit') {
+                if (!lastWrite || act.at >= lastWrite) { lastWrite = act.at; lastWriteD = act.d || lastWriteD; }
+                if (in5) writes5m += 1;
+              } else if (act.kind === 'refused') {
+                if (!lastRefused || act.at >= lastRefused) { lastRefused = act.at; lastRefusedCode = act.code || 'REFUSED'; }
+              }
+            });
+          }
+          var lastSeen = typeof r.last_seen_at === 'number' ? r.last_seen_at : (Math.max(lastRead || 0, lastWrite || 0) || null);
+          var ageSec = lastSeen !== null ? Math.max(0, refNow - lastSeen) : null;
+          var active5m = typeof r.active_5m === 'boolean' ? r.active_5m : (ageSec !== null && ageSec <= 300);
+          var health = r.health || (
+            lastRefused !== null && (lastSeen === null || lastRefused > lastSeen) && Math.max(0, refNow - lastRefused) <= 900
+              ? 'error'
+              : (active5m ? 'active' : (ageSec !== null && ageSec <= 1200 ? 'warm' : 'stale'))
+          );
           next.push(makeAgent(r.id, {
             pubkey: r.pubkey || null,
             is_reader: Boolean(r.is_reader),
@@ -1104,12 +1848,23 @@ export function renderViewerHtml(initialState) {
             is_owner: Boolean(r.is_owner),
             per_hour: r.per_hour || 0,
             used_last_hour: typeof r.used_last_hour === 'number' ? r.used_last_hour : null,
+            last_read_at: lastRead,
+            last_read_kind: lastReadKind,
+            last_write_at: lastWrite,
+            last_write_d: lastWriteD,
+            last_refused_at: lastRefused,
+            last_refused_code: lastRefusedCode,
+            last_seen_at: lastSeen,
+            active_5m: active5m,
+            reads_5m: reads5m,
+            writes_5m: writes5m,
+            health: health,
             energy: prev ? prev.energy : 0
           }));
         });
         var known = {};
         next.forEach(function (a) { if (a.pubkey) known[a.pubkey] = true; });
-        (Array.isArray(s.records) ? s.records : []).forEach(function (rec) {
+        recs.forEach(function (rec) {
           var pk = rec.author_pubkey;
           if (!pk || known[pk]) return;
           known[pk] = true;
@@ -1281,20 +2036,91 @@ export function renderViewerHtml(initialState) {
         logStream('sim', 'SIM recall wave: ' + agent.name + ' <- ' + recalled.length + ' engrams (nothing queried)');
       }
 
+      function isWorkflowCheckpoint(rec) {
+        return /-(?:review|status|owner|wip|handoff)$/.test(slugOf(rec));
+      }
+
+      function computeDreamingTelemetry() {
+        var recs = nodes.map(function (n) { return n.rec; });
+        var fullBytes = JSON.stringify(recs).length;
+        var indexBytes = 0;
+        var canonBytes = 0;
+        var wfCount = 0;
+        var shortTtlCount = 0;
+        var classBCount = 0;
+        var byScopeTopic = {};
+        recs.forEach(function (r) {
+          var isWf = isWorkflowCheckpoint(r);
+          indexBytes += 140 + Math.min(120, String(r.claim || '').length) + String(r.d || '').length;
+          if (isCanon(r)) canonBytes += JSON.stringify(r).length;
+          else if (r.expires_at === null || r.expires_at === undefined) classBCount += 1;
+          else {
+            var sc = String(r.scope || 'unknown');
+            var top = topicOf(r);
+            var key = sc + ' · #' + top;
+            if (!byScopeTopic[key]) byScopeTopic[key] = { scope: sc, topic: top, label: key, count: 0 };
+            byScopeTopic[key].count += 1;
+          }
+          if (isWf) {
+            wfCount += 1;
+            if (r.expires_at !== null && r.expires_at !== undefined && r.created_at && (r.expires_at - r.created_at) <= 172800) {
+              shortTtlCount += 1;
+            }
+          }
+        });
+        var wakeBytes = canonBytes + Math.min(4000, indexBytes);
+        var indexSavings = fullBytes > 0 ? Math.round((1 - indexBytes / fullBytes) * 1000) / 10 : 0;
+        var wakeSavings = fullBytes > 0 ? Math.round((1 - wakeBytes / fullBytes) * 1000) / 10 : 0;
+        var topicList = Object.keys(byScopeTopic).map(function (k) {
+          var item = byScopeTopic[k];
+          return { scope: item.scope, topic: item.topic, label: item.label, count: item.count, ready: item.count > 8 };
+        }).sort(function (a, b) { return b.count - a.count; });
+        return {
+          estimated_from_visible: true,
+          total: recs.length,
+          fullBytes: fullBytes,
+          indexBytes: indexBytes,
+          wakeBytes: wakeBytes,
+          indexSavings: indexSavings,
+          wakeSavings: wakeSavings,
+          wfCount: wfCount,
+          shortTtlCount: shortTtlCount,
+          classBCount: classBCount,
+          topicList: topicList
+        };
+      }
+
       function simConsolidate() {
-        if (consolidator) return;
         var best = null;
         var bestNodes = [];
+        var bestScope = null;
         topics.forEach(function (t) {
-          var cands = nodes.filter(function (n) {
+          var byScope = {};
+          nodes.forEach(function (n) {
             var st = evalRecord(n.rec, simNow()).state;
-            return !isCanon(n.rec) && topicOf(n.rec) === t.id && (st === 'fresh' || st === 'aging');
+            if (!isCanon(n.rec) && topicOf(n.rec) === t.id && (st === 'fresh' || st === 'aging')) {
+              var sc = String(n.rec.scope || 'unknown');
+              if (!byScope[sc]) byScope[sc] = [];
+              byScope[sc].push(n);
+            }
           });
-          if (cands.length > bestNodes.length) { best = t; bestNodes = cands; }
+          Object.keys(byScope).forEach(function (sc) {
+            if (byScope[sc].length > bestNodes.length) {
+              best = t;
+              bestScope = sc;
+              bestNodes = byScope[sc];
+            }
+          });
         });
-        if (bestNodes.length < 2) return logStream('sim', 'SIM consolidator preview: no topic holds 2+ Class A claims');
-        consolidator = { topic: best, targets: bestNodes.slice(0, 4), x: best.x, y: best.y, progress: 0 };
-        logStream('sim', 'SIM consolidator preview in #' + best.id + ': folding ' + consolidator.targets.length + ' Class A claims (nothing written)');
+        selected = { type: 'dreaming', data: computeDreamingTelemetry() };
+        hovered = null;
+        if (width <= 1024) setDrawer('none');
+        renderAgentRoster();
+        renderInspector();
+        if (!consolidator && best && bestNodes.length >= 2) {
+          consolidator = { topic: best, targets: bestNodes.slice(0, 5), x: best.x, y: best.y, progress: 0 };
+          logStream('sim', 'MERKLE DREAMING curation in ' + bestScope + ' #' + best.id + ': folding ' + consolidator.targets.length + ' Class A claims (nothing written)');
+        }
       }
 
       function simRefuse() {
@@ -1309,26 +2135,47 @@ export function renderViewerHtml(initialState) {
       function renderAgentRoster() {
         var list = el('agent-list');
         list.textContent = '';
-        el('roster-count').textContent = agents.length + (agents.length === 1 ? ' agent' : ' agents');
+        var activeCount = agents.filter(function (a) { return a.listed && a.health === 'active'; }).length;
+        var listedCount = agents.filter(function (a) { return a.listed; }).length || agents.length;
+        el('roster-count').textContent = activeCount + '/' + listedCount + ' active (<=5m)';
+        var curNow = nowSec();
         agents.forEach(function (a) {
           var count = nodes.filter(function (n) { return a.pubkey && n.rec.author_pubkey === a.pubkey; }).length;
           var row = makeDiv('agent-row' + (selected && selected.type === 'agent' && selected.data.id === a.id ? ' active' : ''));
           var ident = makeDiv('agent-ident');
           var dot = document.createElement('span');
           dot.className = 'agent-dot';
+          var hCol = healthColor(a.health);
           dot.style.background = a.color;
-          dot.style.boxShadow = '0 0 8px ' + a.color;
+          dot.style.boxShadow = '0 0 0 2px ' + hCol + ', 0 0 8px ' + hCol;
           ident.appendChild(dot);
           var names = makeDiv('');
           names.appendChild(makeDiv('agent-name', a.name));
-          names.appendChild(makeDiv('agent-model', a.model || (a.listed ? a.id : 'not in roster')));
+          var quotaTxt = a.is_writer ? (a.used_last_hour === null ? '?' : a.used_last_hour) + '/' + a.per_hour : 'RO';
+          names.appendChild(makeDiv('agent-model', (a.model || (a.listed ? a.id : 'unlisted')) + ' · ' + count + 'm · ' + quotaTxt));
           ident.appendChild(names);
           row.appendChild(ident);
-          var stats = makeDiv('agent-stats', count + 'm ' + (a.is_writer ? (a.used_last_hour === null ? '?' : a.used_last_hour) + '/' + a.per_hour : 'RO'));
-          stats.style.color = a.is_writer ? '#6ee7b7' : '#fca5a5';
+          var lastOp = (a.last_write_at && (!a.last_read_at || a.last_write_at >= a.last_read_at)) ? 'W' : 'R';
+          var statText = '○ silent';
+          var statColor = '#64748b';
+          if (a.health === 'active') {
+            statText = '● ' + fmtShortAge(a.last_seen_at, curNow) + ' ' + lastOp;
+            statColor = '#34d399';
+          } else if (a.health === 'warm') {
+            statText = '◐ ' + fmtShortAge(a.last_seen_at, curNow) + ' ' + lastOp;
+            statColor = '#fbbf24';
+          } else if (a.health === 'error') {
+            statText = '✕ ERR ' + fmtShortAge(a.last_refused_at, curNow);
+            statColor = '#f87171';
+          } else if (a.last_seen_at) {
+            statText = '○ ' + fmtShortAge(a.last_seen_at, curNow);
+          }
+          var stats = makeDiv('agent-stats', statText);
+          stats.style.color = statColor;
           row.appendChild(stats);
           row.addEventListener('click', function () {
             selected = { type: 'agent', data: a };
+            if (width <= 1024) setDrawer('none');
             renderAgentRoster();
             renderInspector();
           });
@@ -1351,6 +2198,7 @@ export function renderViewerHtml(initialState) {
         });
         el('hud-tiers').textContent = canon + ' canon · ' + decision + ' B · ' + status + ' A';
         el('hud-forecast').textContent = futureDays === 0 ? 'at now' : 'forecast +' + futureDays.toFixed(1) + 'd: ' + expired + ' expired';
+        if (el('m-kpi-tiers')) el('m-kpi-tiers').textContent = canon + 'C · ' + decision + 'B · ' + status + 'A';
       }
 
       function kvRow(key, value, color) {
@@ -1370,7 +2218,22 @@ export function renderViewerHtml(initialState) {
         if (color) t.style.color = color;
         left.appendChild(t);
         head.appendChild(left);
-        head.appendChild(makeBadge(pillText, pillCls));
+        var actions = makeDiv('inspect-actions');
+        actions.appendChild(makeBadge(pillText, pillCls));
+        var closeBtn = document.createElement('button');
+        closeBtn.type = 'button';
+        closeBtn.className = 'btn inspect-close';
+        closeBtn.textContent = '✕';
+        closeBtn.setAttribute('aria-label', 'Close inspector');
+        closeBtn.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          selected = null;
+          hovered = null;
+          renderAgentRoster();
+          renderInspector();
+        });
+        actions.appendChild(closeBtn);
+        head.appendChild(actions);
         return head;
       }
 
@@ -1426,9 +2289,36 @@ export function renderViewerHtml(initialState) {
         } else if (target.type === 'agent') {
           var a = target.data;
           var authored = nodes.filter(function (n) { return a.pubkey && n.rec.author_pubkey === a.pubkey; });
-          box.appendChild(inspectHeader('Agent ganglion', a.name, !a.listed ? 'NOT IN ROSTER' : (a.is_writer ? 'WRITER SOCKET' : 'READ-ONLY SOCKET'), a.is_writer ? 'ok' : 'warn', a.color));
-          if (a.model) box.appendChild(makeDiv('metric-sub', 'harness: ' + a.model));
+          var curNow = nowSec();
+          var hBadge = a.health === 'active'
+            ? 'ACTIVE <=5M'
+            : (a.health === 'warm' ? 'IDLE 5-20M' : (a.health === 'error' ? 'TOOL ERROR' : 'SILENT >20M'));
+          var hBadgeCls = a.health === 'active' ? 'ok' : (a.health === 'error' ? 'err' : 'warn');
+          box.appendChild(inspectHeader('Agent ganglion', a.name, hBadge, hBadgeCls, a.color));
+          if (a.model) box.appendChild(makeDiv('metric-sub', 'harness: ' + a.model + ' · ' + (!a.listed ? 'NOT IN ROSTER' : (a.is_writer ? 'WRITER SOCKET' : 'READ-ONLY SOCKET'))));
           var akv = makeDiv('kv-list');
+          var hText = a.health === 'active'
+            ? 'ACTIVE (<=5m) · tool link healthy'
+            : (a.health === 'warm'
+              ? 'IDLE (5-20m) · quiet'
+              : (a.health === 'error'
+                ? 'ERROR · last call refused (' + (a.last_refused_code || 'REFUSED') + ')'
+                : 'SILENT (>20m) · no recent reads/writes (check MCP bridge)'));
+          akv.appendChild(kvRow('Tool health (5m)', hText, healthColor(a.health)));
+          akv.appendChild(kvRow(
+            'Last read',
+            a.last_read_at ? fmtAge(a.last_read_at, curNow) + ' (' + (a.last_read_kind || 'read') + ')' : 'none observed',
+            a.last_read_at && (curNow - a.last_read_at) <= 300 ? '#34d399' : null
+          ));
+          akv.appendChild(kvRow(
+            'Last write',
+            a.last_write_at ? fmtAge(a.last_write_at, curNow) + (a.last_write_d ? ' (' + a.last_write_d + ')' : '') : 'none observed',
+            a.last_write_at && (curNow - a.last_write_at) <= 300 ? '#34d399' : null
+          ));
+          akv.appendChild(kvRow('Activity in last 5m', (a.reads_5m || 0) + ' reads · ' + (a.writes_5m || 0) + ' writes'));
+          if (a.last_refused_at) {
+            akv.appendChild(kvRow('Last refusal', fmtAge(a.last_refused_at, curNow) + ' (' + (a.last_refused_code || 'REFUSED') + ')', '#fca5a5'));
+          }
           akv.appendChild(kvRow('Binding', a.id));
           akv.appendChild(kvRow('Pubkey', a.pubkey ? a.pubkey.slice(0, 22) + '…' : '(keyless)'));
           akv.appendChild(kvRow('Owner', a.is_owner ? 'yes' : 'no'));
@@ -1436,22 +2326,165 @@ export function renderViewerHtml(initialState) {
           akv.appendChild(kvRow('Writes this hour', a.is_writer ? (a.used_last_hour === null ? '?' : a.used_last_hour) + ' / ' + a.per_hour : 'read-only'));
           akv.appendChild(kvRow('Visible claims', authored.length + ' (' + authored.filter(function (n) { return evalRecord(n.rec, simNow()).state === 'decision'; }).length + ' Class B)'));
           box.appendChild(akv);
+        } else if (target.type === 'coherence') {
+          var coh = target.data;
+          var delta = Number(coh.delta_since_inception || 0);
+          var deltaSign = delta >= 0 ? '+' : '';
+          box.appendChild(inspectHeader(
+            'Hive Coherence Index (Retroactive)',
+            coh.score.toFixed(1) + ' / 100',
+            deltaSign + delta.toFixed(1) + ' SINCE INCEPTION',
+            coh.score >= 80 ? 'ok' : 'warn',
+            '#6ee7b7'
+          ));
+          var axes = coh.axes || {};
+          var axisRows = [
+            ['Priority & Topic Alignment (25%)', axes.alignment || 0, '#38bdf8'],
+            ['Shared-Reality Grounding (20%)', axes.grounding || 0, '#34d399'],
+            ['Cross-Agent Convergence (25%)', axes.convergence || 0, '#a78bfa'],
+            ['Synaptic Coupling & Hygiene (15%)', axes.coupling || 0, '#fbbf24'],
+            ['Curation & Durability (15%)', axes.consolidation || 0, '#f472b6']
+          ];
+          var axesWrap = makeDiv('kv-list');
+          axisRows.forEach(function (item) {
+            var wrap = makeDiv('');
+            var rHead = makeDiv('kv-row');
+            rHead.appendChild(makeDiv('kv-key', item[0]));
+            var rVal = makeDiv('kv-val', Number(item[1]).toFixed(1) + '%');
+            rVal.style.color = item[2];
+            rHead.appendChild(rVal);
+            wrap.appendChild(rHead);
+            var bWrap = makeDiv('ttl-bar-wrap');
+            var bFill = makeDiv('ttl-bar-fill');
+            bFill.style.width = Math.max(0, Math.min(100, Number(item[1]))) + '%';
+            bFill.style.background = item[2];
+            bWrap.appendChild(bFill);
+            wrap.appendChild(bWrap);
+            axesWrap.appendChild(wrap);
+          });
+          box.appendChild(axesWrap);
+
+          var hist = Array.isArray(coh.history) ? coh.history : [];
+          if (hist.length > 0) {
+            var windowNote = coh.history_complete === false ? ' [TRUNCATED AT 5,000 EVENTS]' : ' (90d retained history)';
+            var sparkTitle = makeDiv('inspect-kicker', 'Retroactive Trajectory (Inception -> Now)' + windowNote);
+            sparkTitle.style.marginTop = '6px';
+            box.appendChild(sparkTitle);
+            var sparkCanvas = document.createElement('canvas');
+            sparkCanvas.width = 560;
+            sparkCanvas.height = 120;
+            sparkCanvas.style.width = '100%';
+            sparkCanvas.style.height = '64px';
+            sparkCanvas.style.borderRadius = '8px';
+            sparkCanvas.style.background = 'rgba(2, 6, 23, 0.55)';
+            sparkCanvas.style.border = '1px solid rgba(148, 163, 184, 0.16)';
+            box.appendChild(sparkCanvas);
+            var sctx = sparkCanvas.getContext('2d');
+            if (sctx) {
+              var sw = sparkCanvas.width;
+              var sh = sparkCanvas.height;
+              var padX = 24;
+              var padY = 18;
+              sctx.strokeStyle = 'rgba(148, 163, 184, 0.15)';
+              sctx.lineWidth = 1;
+              [50, 75, 100].forEach(function (lvl) {
+                var gy = sh - padY - ((lvl - 40) / 60) * (sh - padY * 2);
+                sctx.beginPath();
+                sctx.moveTo(padX, gy);
+                sctx.lineTo(sw - padX, gy);
+                sctx.stroke();
+              });
+              sctx.beginPath();
+              hist.forEach(function (pt, idx) {
+                var px = padX + (hist.length === 1 ? (sw - padX * 2) / 2 : (idx / (hist.length - 1)) * (sw - padX * 2));
+                var clamped = Math.max(40, Math.min(100, Number(pt.score || 0)));
+                var py = sh - padY - ((clamped - 40) / 60) * (sh - padY * 2);
+                if (idx === 0) sctx.moveTo(px, py);
+                else sctx.lineTo(px, py);
+              });
+              sctx.strokeStyle = '#34d399';
+              sctx.lineWidth = 3;
+              sctx.stroke();
+              hist.forEach(function (pt, idx) {
+                var px = padX + (hist.length === 1 ? (sw - padX * 2) / 2 : (idx / (hist.length - 1)) * (sw - padX * 2));
+                var clamped = Math.max(40, Math.min(100, Number(pt.score || 0)));
+                var py = sh - padY - ((clamped - 40) / 60) * (sh - padY * 2);
+                sctx.beginPath();
+                sctx.arc(px, py, 4, 0, Math.PI * 2);
+                sctx.fillStyle = idx === hist.length - 1 ? '#fbbf24' : '#38bdf8';
+                sctx.fill();
+              });
+            }
+            var hList = makeDiv('kv-list');
+            hist.forEach(function (pt, idx) {
+              var label = (idx === 0 ? 'Inception' : '#' + pt.claims) + ' (' + fmtTime(pt.at).slice(11, 16) + 'Z)';
+              var detail = pt.score.toFixed(1) + ' · ' + pt.authors + 'a · ' + pt.shared_refs + ' shared';
+              hList.appendChild(kvRow(label, detail, idx === hist.length - 1 ? '#6ee7b7' : null));
+            });
+            box.appendChild(hList);
+          }
+        } else if (target.type === 'dreaming') {
+          var dr = computeDreamingTelemetry();
+          box.appendChild(inspectHeader(
+            'Merkle Dreaming & Curation (Phase 2)',
+            '-' + dr.wakeSavings.toFixed(1) + '% Est. Wake Bytes',
+            'EST. FROM VISIBLE',
+            'info',
+            '#a78bfa'
+          ));
+          var dkv = makeDiv('kv-list');
+          dkv.appendChild(kvRow('Est. visible full JSON', Math.round(dr.fullBytes / 1024) + ' KB (~' + Math.round(dr.fullBytes / 4) + ' tok)', '#94a3b8'));
+          dkv.appendChild(kvRow('Est. visible index cards', Math.round(dr.indexBytes / 1024) + ' KB (-' + dr.indexSavings.toFixed(1) + '%)', '#38bdf8'));
+          dkv.appendChild(kvRow('Est. visible wake digest', Math.round(dr.wakeBytes / 1024) + ' KB (-' + dr.wakeSavings.toFixed(1) + '% vs dump)', '#34d399'));
+          dkv.appendChild(kvRow('Gate 7 · Workflow slugs', dr.wfCount + ' active (' + dr.shortTtlCount + ' on <=48h TTL)', '#fbbf24'));
+          dkv.appendChild(kvRow('Gate 7 · Class B curated', dr.classBCount + ' permanent decisions', '#a78bfa'));
+          box.appendChild(dkv);
+          if (dr.topicList.length > 0) {
+            var qTitle = makeDiv('inspect-kicker', 'Gate 8 · Scope+Topic Curation Pressure (>8 Class A = curate)');
+            qTitle.style.marginTop = '6px';
+            box.appendChild(qTitle);
+            var tWrap = makeDiv('kv-list');
+            dr.topicList.slice(0, 6).forEach(function (item) {
+              var over = item.ready;
+              tWrap.appendChild(kvRow(item.label, item.count + ' Class A' + (over ? ' · READY TO CURATE' : ''), over ? '#fbbf24' : '#cbd5e1'));
+            });
+            box.appendChild(tWrap);
+          }
         }
       }
 
       // --- Canvas: camera, physics and drawing ---
 
+      var drawer = 'none';
+      function setDrawer(next) {
+        drawer = next || 'none';
+        document.body.setAttribute('data-drawer', drawer);
+        if (el('dock-graph')) el('dock-graph').className = 'dock-btn' + (view === 'graph' && drawer === 'none' ? ' active' : '');
+        if (el('dock-agents')) el('dock-agents').className = 'dock-btn' + (view === 'graph' && drawer === 'agents' ? ' active' : '');
+        if (el('dock-pulses')) el('dock-pulses').className = 'dock-btn' + (view === 'graph' && drawer === 'pulses' ? ' active' : '');
+        if (el('dock-tools')) el('dock-tools').className = 'dock-btn' + (view === 'graph' && drawer === 'tools' ? ' active' : '');
+        if (el('dock-cards')) el('dock-cards').className = 'dock-btn' + (view === 'cards' ? ' active' : '');
+      }
+
       function measureHud() {
         if (view !== 'graph') return;
-        hudTop = Math.ceil(document.querySelector('.hud-top').getBoundingClientRect().bottom) + 10;
-        hudBottom = Math.ceil(height - document.querySelector('.hud-bottom').getBoundingClientRect().top) + 10;
+        var topEl = document.querySelector('.hud-top');
+        hudTop = topEl ? Math.ceil(topEl.getBoundingClientRect().bottom) + 8 : 110;
+        if (width <= 1024) {
+          var dockEl = el('mobile-dock');
+          var dockTop = dockEl ? dockEl.getBoundingClientRect().top : 0;
+          hudBottom = dockTop > 0 ? Math.max(58, Math.ceil(height - dockTop) + 8) : 64;
+        } else {
+          var botEl = document.querySelector('.hud-bottom');
+          hudBottom = botEl ? Math.ceil(height - botEl.getBoundingClientRect().top) + 10 : 120;
+        }
         document.documentElement.style.setProperty('--hud-top', hudTop + 'px');
         document.documentElement.style.setProperty('--hud-bottom', hudBottom + 'px');
       }
 
       function centerY() { return height / 2 + (hudTop - hudBottom) / 2; }
-      function stageDim() { return Math.max(260, Math.min(width, height - hudTop - hudBottom + 20)); }
-      function rimR() { return stageDim() * (width < 680 ? 0.36 : 0.41); }
+      function stageDim() { return Math.max(240, Math.min(width, height - hudTop - hudBottom + 20)); }
+      function rimR() { return width < 680 ? Math.min(width * 0.33, stageDim() * 0.35) : stageDim() * 0.41; }
 
       function resize() {
         width = window.innerWidth;
@@ -1467,25 +2500,83 @@ export function renderViewerHtml(initialState) {
         return { x: (sx - width / 2 - cam.x) / cam.zoom, y: (sy - centerY() - cam.y) / cam.zoom };
       }
 
-      function hitTest(sx, sy) {
+      function hitTest(sx, sy, isTouch) {
         var pt = screenToWorld(sx, sy);
+        var hitR = (isTouch ? 24 : 16) / Math.max(0.7, cam.zoom);
+        var best = null;
+        var bestDist = Infinity;
         for (var i = 0; i < nodes.length; i++) {
-          if (Math.hypot(pt.x - nodes[i].x, pt.y - nodes[i].y) < 16) return { type: 'memory', data: nodes[i] };
+          var nd = Math.hypot(pt.x - nodes[i].x, pt.y - nodes[i].y);
+          if (nd < hitR && nd < bestDist) {
+            bestDist = nd;
+            best = { type: 'memory', data: nodes[i] };
+          }
         }
+        if (best) return best;
+        var agentPad = (isTouch ? 14 : 8) / Math.max(0.7, cam.zoom);
         for (var j = 0; j < agents.length; j++) {
-          if (Math.hypot(pt.x - agents[j].x, pt.y - agents[j].y) < agents[j].radius + 8) return { type: 'agent', data: agents[j] };
+          var ad = Math.hypot(pt.x - agents[j].x, pt.y - agents[j].y);
+          if (ad < agents[j].radius + agentPad && ad < bestDist) {
+            bestDist = ad;
+            best = { type: 'agent', data: agents[j] };
+          }
         }
-        return null;
+        return best;
       }
 
+      var pointers = {};
       var drag = null;
+      var pinch = null;
+      var lastTapAt = 0;
+
+      function pointerList() {
+        var arr = [];
+        for (var k in pointers) if (Object.prototype.hasOwnProperty.call(pointers, k)) arr.push(pointers[k]);
+        return arr;
+      }
+
       canvas.addEventListener('pointerdown', function (e) {
-        drag = { x: e.clientX, y: e.clientY, camX: cam.x, camY: cam.y, moved: false };
-        if (canvas.setPointerCapture) canvas.setPointerCapture(e.pointerId);
+        pointers[e.pointerId] = { id: e.pointerId, x: e.clientX, y: e.clientY, type: e.pointerType };
+        if (canvas.setPointerCapture) {
+          try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+        }
+        var pts = pointerList();
+        if (pts.length === 2) {
+          var d0 = Math.max(10, Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y));
+          pinch = {
+            dist: d0,
+            zoom: cam.targetZoom,
+            midX: (pts[0].x + pts[1].x) / 2,
+            midY: (pts[0].y + pts[1].y) / 2,
+            camX: cam.x,
+            camY: cam.y
+          };
+          if (drag) drag.moved = true;
+        } else if (pts.length === 1) {
+          pinch = null;
+          drag = { x: e.clientX, y: e.clientY, camX: cam.x, camY: cam.y, moved: false, isTouch: e.pointerType !== 'mouse' };
+        }
       });
       canvas.addEventListener('pointermove', function (e) {
-        if (drag) {
-          if (Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) > 5) drag.moved = true;
+        if (pointers[e.pointerId]) {
+          pointers[e.pointerId].x = e.clientX;
+          pointers[e.pointerId].y = e.clientY;
+        }
+        var pts = pointerList();
+        if (pts.length === 2 && pinch) {
+          var dist = Math.max(10, Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y));
+          var nextZoom = Math.max(0.45, Math.min(2.8, pinch.zoom * (dist / pinch.dist)));
+          var midX = (pts[0].x + pts[1].x) / 2;
+          var midY = (pts[0].y + pts[1].y) / 2;
+          cam.targetZoom = nextZoom;
+          cam.zoom = nextZoom;
+          cam.x = pinch.camX + (midX - pinch.midX);
+          cam.y = pinch.camY + (midY - pinch.midY);
+          return;
+        }
+        if (drag && pts.length === 1) {
+          var threshold = drag.isTouch ? 8 : 5;
+          if (Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) > threshold) drag.moved = true;
           if (drag.moved) {
             cam.x = drag.camX + e.clientX - drag.x;
             cam.y = drag.camY + e.clientY - drag.y;
@@ -1493,28 +2584,55 @@ export function renderViewerHtml(initialState) {
           return;
         }
         if (e.pointerType !== 'mouse') return;
-        var found = hitTest(e.clientX, e.clientY);
+        var found = hitTest(e.clientX, e.clientY, false);
         if ((found && found.data) !== (hovered && hovered.data)) {
           hovered = found;
           canvas.style.cursor = found ? 'pointer' : 'grab';
           renderInspector();
         }
       });
-      canvas.addEventListener('pointerup', function (e) {
+      function releasePointer(e) {
+        delete pointers[e.pointerId];
+        var pts = pointerList();
+        if (pts.length < 2) pinch = null;
+        if (pts.length === 1) {
+          drag = { x: pts[0].x, y: pts[0].y, camX: cam.x, camY: cam.y, moved: true, isTouch: pts[0].type !== 'mouse' };
+          return;
+        }
         if (drag && !drag.moved) {
-          selected = hitTest(e.clientX, e.clientY);
-          renderAgentRoster();
-          renderInspector();
+          var isTouch = e.pointerType !== 'mouse';
+          var hit = hitTest(e.clientX, e.clientY, isTouch);
+          if (isTouch && drawer !== 'none' && !hit) {
+            setDrawer('none');
+          } else {
+            var nowMs = Date.now();
+            if (isTouch && !hit && nowMs - lastTapAt < 300) {
+              cam.x = 0;
+              cam.y = 0;
+              cam.targetZoom = 1;
+              lastTapAt = 0;
+            } else {
+              if (isTouch && !hit) lastTapAt = nowMs;
+              selected = hit;
+              if (isTouch && hit && drawer !== 'none') setDrawer('none');
+              renderAgentRoster();
+              renderInspector();
+            }
+          }
         }
         drag = null;
+      }
+      canvas.addEventListener('pointerup', releasePointer);
+      canvas.addEventListener('pointercancel', function (e) {
+        delete pointers[e.pointerId];
+        if (!pointerList().length) { drag = null; pinch = null; }
       });
-      canvas.addEventListener('pointercancel', function () { drag = null; });
-      canvas.addEventListener('pointerleave', function () {
-        if (hovered) { hovered = null; renderInspector(); }
+      canvas.addEventListener('pointerleave', function (e) {
+        if (e.pointerType === 'mouse' && hovered) { hovered = null; renderInspector(); }
       });
       canvas.addEventListener('wheel', function (e) {
         e.preventDefault();
-        cam.targetZoom = Math.max(0.55, Math.min(2.4, cam.targetZoom * (e.deltaY < 0 ? 1.1 : 0.9)));
+        cam.targetZoom = Math.max(0.45, Math.min(2.8, cam.targetZoom * (e.deltaY < 0 ? 1.1 : 0.9)));
       }, { passive: false });
       window.addEventListener('resize', resize);
 
@@ -1568,11 +2686,12 @@ export function renderViewerHtml(initialState) {
           n.y += n.vy;
           if (n.birthGlow > 0) n.birthGlow = Math.max(0, n.birthGlow - 0.015);
         }
+
         if (consolidator) {
           consolidator.progress += 0.012;
           if (consolidator.progress >= 1) {
             shockwaves.push({ x: consolidator.x, y: consolidator.y, r: 8, maxR: 130, color: '#fbbf24', alpha: 1 });
-            logStream('sim', 'SIM consolidator preview done: a real pass would supersede ' + consolidator.targets.length + ' claims with one Class B decision');
+            logStream('sim', 'MERKLE DREAMING curation done: a real pass curates ' + consolidator.targets.length + ' claims into one Class B decision');
             consolidator = null;
           }
         }
@@ -1673,6 +2792,23 @@ export function renderViewerHtml(initialState) {
           ctx.stroke();
         });
 
+        if (selected && selected.type === 'dreaming') {
+          ctx.save();
+          ctx.setLineDash([4, 4]);
+          nodes.forEach(function (n) {
+            if (isCanon(n.rec) || !isWorkflowCheckpoint(n.rec)) return;
+            var tp = topicById(topicOf(n.rec));
+            if (!tp) return;
+            ctx.beginPath();
+            ctx.moveTo(n.x, n.y);
+            ctx.lineTo(tp.x, tp.y);
+            ctx.strokeStyle = 'rgba(167, 139, 250, 0.55)';
+            ctx.lineWidth = 1.4;
+            ctx.stroke();
+          });
+          ctx.restore();
+        }
+
         if (consolidator) {
           var c = consolidator;
           var pr = 24 + Math.sin(tick * 0.25) * 6;
@@ -1697,7 +2833,7 @@ export function renderViewerHtml(initialState) {
           ctx.fill();
           ctx.font = '700 10px ui-monospace, monospace';
           ctx.fillStyle = '#fde68a';
-          ctx.fillText('SIM CONSOLIDATOR ' + Math.round(c.progress * 100) + '%', c.x, c.y - 22);
+          ctx.fillText('MERKLE DREAMING · CURATION ' + Math.round(c.progress * 100) + '%', c.x, c.y - 22);
         }
 
         nodes.forEach(function (n) {
@@ -1786,15 +2922,20 @@ export function renderViewerHtml(initialState) {
           ctx.restore();
         });
 
+        var drawNow = nowSec();
         agents.forEach(function (a) {
           var isSel = (hovered && hovered.data === a) || (selected && selected.data === a);
+          var isStale = a.health === 'stale' && !isSel;
+          var hCol = healthColor(a.health);
           if (a.energy > 0 || isSel) glow(a.x, a.y, a.radius * 0.4, a.radius * (2.1 + a.energy * 1.1), a.color + '77');
+          else if (a.health === 'active') glow(a.x, a.y, a.radius * 0.5, a.radius * 1.65, 'rgba(16, 185, 129, 0.26)');
+          ctx.save();
+          if (isStale) ctx.globalAlpha = 0.52;
           ctx.beginPath();
           ctx.arc(a.x, a.y, a.radius, 0, Math.PI * 2);
           ctx.fillStyle = '#0b1325';
           ctx.fill();
-          ctx.save();
-          if (!a.listed) ctx.setLineDash([3, 3]);
+          if (!a.listed || isStale) ctx.setLineDash([4, 3]);
           ctx.strokeStyle = a.color;
           ctx.lineWidth = isSel ? 3 : 2;
           ctx.stroke();
@@ -1806,13 +2947,46 @@ export function renderViewerHtml(initialState) {
             ctx.lineWidth = 2.2;
             ctx.stroke();
           }
+          // Health beacon dot on top-right rim of ganglion
+          var bx = a.x + a.radius * 0.72;
+          var by = a.y - a.radius * 0.72;
+          var br = width < 680 ? 4.2 : 5.2;
+          if (a.health === 'active' || a.health === 'error') {
+            glow(bx, by, 1, br * 2.4, a.health === 'active' ? 'rgba(16, 185, 129, 0.65)' : 'rgba(239, 68, 68, 0.65)');
+          }
+          ctx.beginPath();
+          ctx.arc(bx, by, br, 0, Math.PI * 2);
+          ctx.fillStyle = hCol;
+          ctx.fill();
+          ctx.strokeStyle = '#040711';
+          ctx.lineWidth = 1.6;
+          ctx.stroke();
+
           ctx.textBaseline = 'middle';
-          ctx.font = '700 10.5px -apple-system, BlinkMacSystemFont, sans-serif';
-          ctx.fillStyle = '#f8fafc';
+          ctx.font = (width < 680 ? '700 9.5px' : '700 10.5px') + ' -apple-system, BlinkMacSystemFont, sans-serif';
+          ctx.fillStyle = isStale ? '#94a3b8' : '#f8fafc';
           ctx.fillText(a.is_owner ? '\\u2605' : a.name.slice(0, 2).toUpperCase(), a.x, a.y);
-          ctx.font = '600 11.5px -apple-system, BlinkMacSystemFont, sans-serif';
-          ctx.fillStyle = isSel ? '#ffffff' : '#cbd5e1';
-          ctx.fillText(a.name, a.x + Math.cos(a.angle) * (a.radius + 17), a.y + Math.sin(a.angle) * (a.radius + 17));
+          ctx.font = (width < 680 ? '600 10.5px' : '600 11.5px') + ' -apple-system, BlinkMacSystemFont, sans-serif';
+          ctx.fillStyle = isSel ? '#ffffff' : (isStale ? '#64748b' : '#cbd5e1');
+          var labelDist = a.radius + (width < 680 ? 13 : 17);
+          var lx = a.x + Math.cos(a.angle) * labelDist;
+          var ly = a.y + Math.sin(a.angle) * labelDist;
+          if (width < 680) {
+            var tw = ctx.measureText(a.name).width;
+            var maxX = Math.max(70, (width / 2 - tw / 2 - 10) / Math.max(0.7, cam.zoom));
+            lx = Math.max(-maxX, Math.min(maxX, lx));
+          }
+          ctx.fillText(a.name, lx, ly);
+          var subTag = a.health === 'active'
+            ? ('\\u25cf ' + fmtShortAge(a.last_seen_at, drawNow))
+            : (a.health === 'warm'
+              ? ('\\u25d0 ' + fmtShortAge(a.last_seen_at, drawNow))
+              : (a.health === 'error'
+                ? '\\u2715 err'
+                : (a.last_seen_at ? ('\\u25cb ' + fmtShortAge(a.last_seen_at, drawNow)) : '\\u25cb silent')));
+          ctx.font = (width < 680 ? '600 8.5px' : '600 9.5px') + ' ui-monospace, SFMono-Regular, Menlo, monospace';
+          ctx.fillStyle = a.health === 'active' ? '#34d399' : (a.health === 'warm' ? '#fbbf24' : (a.health === 'error' ? '#f87171' : '#64748b'));
+          ctx.fillText(subTag, lx, ly + (width < 680 ? 10.5 : 12));
           ctx.textBaseline = 'alphabetic';
         });
       }
@@ -1827,11 +3001,50 @@ export function renderViewerHtml(initialState) {
 
       // --- Controls ---
 
-      el('view-toggle').addEventListener('click', function () {
-        view = view === 'graph' ? 'cards' : 'graph';
+      function switchView(nextView) {
+        view = nextView;
         document.body.setAttribute('data-view', view);
         el('view-toggle').textContent = view === 'graph' ? 'Raw cards' : 'Cortex graph';
+        setDrawer('none');
         if (view === 'graph') resize();
+      }
+
+      el('view-toggle').addEventListener('click', function () {
+        switchView(view === 'graph' ? 'cards' : 'graph');
+      });
+      if (el('dock-graph')) el('dock-graph').addEventListener('click', function () {
+        if (view !== 'graph') switchView('graph');
+        else setDrawer('none');
+      });
+      if (el('dock-agents')) el('dock-agents').addEventListener('click', function () {
+        if (view !== 'graph') switchView('graph');
+        setDrawer(drawer === 'agents' ? 'none' : 'agents');
+      });
+      if (el('dock-pulses')) el('dock-pulses').addEventListener('click', function () {
+        if (view !== 'graph') switchView('graph');
+        setDrawer(drawer === 'pulses' ? 'none' : 'pulses');
+      });
+      if (el('dock-tools')) el('dock-tools').addEventListener('click', function () {
+        if (view !== 'graph') switchView('graph');
+        setDrawer(drawer === 'tools' ? 'none' : 'tools');
+      });
+      if (el('dock-cards')) el('dock-cards').addEventListener('click', function () {
+        switchView(view === 'cards' ? 'graph' : 'cards');
+      });
+      var closeButtons = document.querySelectorAll('[data-close-drawer]');
+      for (var cb = 0; cb < closeButtons.length; cb++) {
+        closeButtons[cb].addEventListener('click', function () { setDrawer('none'); });
+      }
+      if (el('btn-zoom-in')) el('btn-zoom-in').addEventListener('click', function () {
+        cam.targetZoom = Math.min(2.8, cam.targetZoom * 1.22);
+      });
+      if (el('btn-zoom-out')) el('btn-zoom-out').addEventListener('click', function () {
+        cam.targetZoom = Math.max(0.45, cam.targetZoom / 1.22);
+      });
+      if (el('btn-zoom-reset')) el('btn-zoom-reset').addEventListener('click', function () {
+        cam.x = 0;
+        cam.y = 0;
+        cam.targetZoom = 1;
       });
       el('btn-sim-write').addEventListener('click', simWrite);
       el('btn-sim-recall').addEventListener('click', simRecall);
@@ -1850,6 +3063,19 @@ export function renderViewerHtml(initialState) {
         cam.targetZoom = 1;
       });
 
+      var latestCoherence = null;
+      function openCoherenceInspector() {
+        if (!latestCoherence) return;
+        if (view !== 'graph') switchView('graph');
+        setDrawer('none');
+        selected = { type: 'coherence', data: latestCoherence };
+        hovered = null;
+        renderAgentRoster();
+        renderInspector();
+      }
+      if (el('coherence-card')) el('coherence-card').addEventListener('click', openCoherenceInspector);
+      if (el('m-kpi-coherence')) el('m-kpi-coherence').addEventListener('click', openCoherenceInspector);
+
       var graphReady = false;
       function renderState(s) {
         if (!s || typeof s !== 'object') return;
@@ -1864,6 +3090,13 @@ export function renderViewerHtml(initialState) {
         syncBadge.textContent = syncState;
         syncBadge.className = syncBadgeClass(syncState);
 
+        var w = s.watch || {}, banner = el('alert-banner'), msg = w.alert || null, hard = !!w.hard;
+        if (banner) {
+          banner.textContent = msg || '';
+          banner.className = 'alert-banner' + (hard ? '' : ' warn');
+          banner.hidden = !msg;
+        }
+
         el('sync-state').textContent = syncState;
         el('sync-sub').textContent = s.connected === false
           ? ('error: ' + (s.error || 'disconnected'))
@@ -1871,12 +3104,25 @@ export function renderViewerHtml(initialState) {
 
         el('seq-val').textContent = st.write_seq == null ? '-' : String(st.write_seq);
         el('seq-sub').textContent = 'current claims: ' + (st.current_claims == null ? '-' : String(st.current_claims));
+        if (el('m-kpi-seq')) el('m-kpi-seq').textContent = 'seq: ' + (st.write_seq == null ? '-' : String(st.write_seq));
+        if (el('m-kpi-claims')) el('m-kpi-claims').textContent = 'claims: ' + (st.current_claims == null ? '-' : String(st.current_claims));
 
         el('backup-val').textContent = st.last_backup_age_sec == null ? 'none' : (String(st.last_backup_age_sec) + 's ago');
         el('backup-sub').textContent = 'unbacked writes: ' + (st.unbacked_writes == null ? '-' : String(st.unbacked_writes));
 
         el('poll-val').textContent = fmtTime(s.polled_at);
         el('poll-sub').textContent = 'query answer: ' + (s.query_answer || '-') + ' (poll #' + (s.poll_seq || 0) + ')';
+
+        if (s.coherence && typeof s.coherence === 'object') {
+          latestCoherence = s.coherence;
+          if (selected && selected.type === 'coherence') selected.data = latestCoherence;
+          var cScore = Number(s.coherence.score || 0).toFixed(1);
+          var cDelta = Number(s.coherence.delta_since_inception || 0);
+          var cSign = cDelta >= 0 ? '+' : '';
+          if (el('coherence-val')) el('coherence-val').textContent = cScore + '%';
+          if (el('coherence-sub')) el('coherence-sub').textContent = cSign + cDelta.toFixed(1) + ' since inception · tap';
+          if (el('m-kpi-coherence')) el('m-kpi-coherence').textContent = 'coh: ' + cScore + '% (' + cSign + cDelta.toFixed(1) + ')';
+        }
 
         var sc = s.scope_counts || {};
         el('count-canon').textContent = String(sc.canon ?? 0);
@@ -1936,6 +3182,7 @@ export async function startMemoryViewer({
   const client = createSingleSocketMcpClient(socketPath)
   const sseClients = new Set()
   const eventLog = []
+  const agentTelemetry = new Map()
   let pollSeq = 0
   let stopped = false
 
@@ -1951,6 +3198,8 @@ export async function startMemoryViewer({
     poll_seq: 0,
     store_state: { state: 'CONNECTING', write_seq: null, current_claims: null, last_backup_age_sec: null, unbacked_writes: null },
     scope_counts: { canon: 0, ops: 0, rooms: 0, self: 0, canon_unverified: 0, unverified_total: 0 },
+    coherence: computeCoherence(),
+    agent_health: { active_5m: 0, warm_20m: 0, stale: 0, error: 0, total: 0, window_sec: ACTIVE_WINDOW_SEC },
     query_answer: null,
     records: [],
     agent_roster: [],
@@ -1976,46 +3225,95 @@ export async function startMemoryViewer({
     let nextSnapshot
     try {
       const wake = await client.callReadTool('memory_wake', {})
-      const query = await client.callReadTool('memory_query', { limit: 100 })
-
       const byKey = new Map()
-      for (const r of Array.isArray(query?.records) ? query.records : []) {
-        const clean = sanitizeMemoryRecord(r)
-        if (clean) byKey.set(`${clean.author_pubkey}:${clean.d}`, clean)
+      const byEventId = new Map()
+      let firstQuery = null
+      let cursor = '0'
+      let pages = 0
+      while (cursor !== null && pages < 50) {
+        const page = await client.callReadTool('memory_query', {
+          limit: 100,
+          format: 'full',
+          include_history: true,
+          ...(cursor !== '0' ? { cursor } : {}),
+        })
+        if (!firstQuery) firstQuery = page
+        for (const r of Array.isArray(page?.records) ? page.records : []) {
+          const clean = sanitizeMemoryRecord(r)
+          if (!clean) continue
+          if (clean.event_id) byEventId.set(clean.event_id, clean)
+          if (clean.is_current && clean.status !== 'withdrawn' && clean.verification === 'accepted') {
+            byKey.set(`${clean.author_pubkey}:${clean.d}`, clean)
+          }
+        }
+        cursor = typeof page?.next_cursor === 'string' && page.next_cursor ? page.next_cursor : null
+        pages += 1
       }
-      for (const r of Array.isArray(wake?.records) ? wake.records : []) {
+      // Since Phase 2 wake records are bare references (no claim); only full records are shown.
+      for (const r of Array.isArray(wake?.records) ? wake.records.filter(x => typeof x?.claim === 'string') : []) {
         const clean = sanitizeMemoryRecord(r)
         if (clean && !byKey.has(`${clean.author_pubkey}:${clean.d}`)) {
           byKey.set(`${clean.author_pubkey}:${clean.d}`, clean)
+          if (clean.event_id && !byEventId.has(clean.event_id)) byEventId.set(clean.event_id, clean)
         }
       }
       const records = [...byKey.values()].sort(
         (a, b) => (a.computed_rank || 99) - (b.computed_rank || 99) || (b.created_at || 0) - (a.created_at || 0)
       )
+      const historyRecords = [...byEventId.values()]
       const scopeCounts = computeScopeCounts(wake?.counts, records)
+      const rawRoster = (Array.isArray(wake?.agent_roster) ? wake.agent_roster : []).map(sanitizeRosterEntry).filter(Boolean)
+      const recentActivity = (Array.isArray(wake?.recent_activity) ? wake.recent_activity : []).map(sanitizeActivity).filter(Boolean)
+      const healthResult = computeAgentHealth({
+        agent_roster: rawRoster,
+        recent_activity: recentActivity,
+        records,
+        history_records: historyRecords,
+        prior_telemetry: agentTelemetry,
+        now_sec: nowSec,
+      })
+      const agentRoster = healthResult.roster
+      const storeState = wake?.store_state || firstQuery?.store_state || { state: 'UNKNOWN', write_seq: null, current_claims: null, last_backup_age_sec: null, unbacked_writes: null }
+      const historyComplete = cursor === null
+      const coherence = computeCoherence({
+        records,
+        history_records: historyRecords,
+        agent_roster: agentRoster,
+        recent_activity: recentActivity,
+        store_state: storeState,
+        now_sec: nowSec,
+        history_complete: historyComplete,
+      })
+      const queryAnswer = firstQuery?.answer === 'unknown'
+        ? 'unknown'
+        : (records.length > 0 ? 'found' : String(firstQuery?.answer || 'unknown'))
 
       nextSnapshot = {
         connected: true,
         error: null,
         server_name: client.getServerName() || 'hive-memory-viewer',
-        reader: String(wake?.reader || query?.reader || 'viewer'),
-        reader_pubkey: wake?.reader_pubkey || query?.reader_pubkey || null,
+        reader: String(wake?.reader || firstQuery?.reader || 'viewer'),
+        reader_pubkey: wake?.reader_pubkey || firstQuery?.reader_pubkey || null,
         authority: null,
         trustedInstruction: false,
         polled_at: nowSec,
         poll_seq: pollSeq,
-        store_state: wake?.store_state || query?.store_state || { state: 'UNKNOWN', write_seq: null, current_claims: null, last_backup_age_sec: null, unbacked_writes: null },
+        store_state: storeState,
         scope_counts: scopeCounts,
-        query_answer: String(query?.answer || 'unknown'),
+        coherence,
+        agent_health: healthResult.summary,
+        watch: watchView(nowSec),
+        query_answer: queryAnswer,
         records,
-        agent_roster: (Array.isArray(wake?.agent_roster) ? wake.agent_roster : []).map(sanitizeRosterEntry).filter(Boolean),
-        recent_activity: (Array.isArray(wake?.recent_activity) ? wake.recent_activity : []).map(sanitizeActivity).filter(Boolean),
+        agent_roster: agentRoster,
+        recent_activity: recentActivity,
       }
     } catch (err) {
       nextSnapshot = {
         ...currentState,
         connected: false,
         error: String(err.message || err),
+        watch: watchView(nowSec),
         polled_at: nowSec,
         poll_seq: pollSeq,
         authority: null,
@@ -2133,6 +3431,8 @@ export async function startMemoryViewer({
       }
       sseClients.clear()
       client.close()
+      httpServer.closeIdleConnections?.()
+      httpServer.closeAllConnections?.()
       await new Promise(resolveClose => httpServer.close(() => resolveClose()))
     },
   }
