@@ -21,10 +21,11 @@ import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, readFileSy
 import { spawn } from 'node:child_process'
 import { homedir } from 'node:os'
 import { isAbsolute, resolve } from 'node:path'
-import { fixedPath, knownHostsFile, privateFile, sshChannelEntry, SSH, SSH_TARGET } from './channel_client.mjs'
+import { fixedPath, knownHostsFile, privateFile, recallEntry, sshChannelEntry, SSH, SSH_TARGET } from './channel_client.mjs'
 import { instanceId } from './runtime_manifest.mjs'
 import { memoryToolBase } from './agent_memory.mjs'
-import { codexTurnText } from './harness_session.mjs'
+import { MEMORY_TOOL_SPECS } from './memory.mjs'
+import { codexTurnText, RECALL_TOOLS } from './harness_session.mjs'
 import { feedCursor, followWakeFeed } from './wake_feed_client.mjs'
 
 // Mirrors codex-channel-mcp.mjs's tools/list, which is what the fleet enforces. pi validates tool
@@ -49,14 +50,22 @@ export const PI_CHANNEL_TOOLS = [
   }),
 ]
 
+// The two read tools, served by the agent's own Hive memory reader (`recall`), never by the channel.
+export const PI_RECALL_TOOLS = MEMORY_TOOL_SPECS.filter(spec => RECALL_TOOLS.includes(spec.name)).map(({ name, description, inputSchema }) =>
+  ({ name, label: `Hive memory: ${name.slice('memory_'.length)}`, description, parameters: inputSchema }))
+// On a box that runs Hive memory (herd-cloud), the root-owned bridge that maps the calling agent-NAME user to its own
+// reader socket; nothing to configure but `"recall": "local"`.
+export const LOCAL_RECALL = '/usr/local/lib/hive-memory/connect'
+
 // The client config names paths, never values, and is refused on the portable Codex config's
 // grounds: nothing here signs, and nothing may bill an API key instead of the owner's subscription.
-const PI_FIELDS = new Set(['instance', 'ssh_target', 'identity_file', 'feed_identity_file', 'known_hosts_file', 'state_dir', 'pi_home', 'model', 'pubkey', 'channels', 'work_tools'])
+const PI_FIELDS = new Set(['instance', 'ssh_target', 'identity_file', 'feed_identity_file', 'known_hosts_file', 'state_dir', 'pi_home', 'model', 'pubkey', 'channels', 'work_tools', 'recall'])
 // `work_tools: true` gives pi its own read, shell and edit tools beside the channel's, for an agent
 // trusted to work on its own (James, 2026-10-27). Without it the channel tools are pi's only tools.
 export const PI_WORK_TOOLS = ['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls']
-export const piTools = config => [...(config.workTools ? PI_WORK_TOOLS : []), ...PI_CHANNEL_TOOLS.map(tool => tool.name)].join(',')
-export function readPiClientConfig(path, id, own = homedir()) {
+export const piTools = config => [...(config.workTools ? PI_WORK_TOOLS : []), ...PI_CHANNEL_TOOLS.map(tool => tool.name),
+  ...(config.recall ? PI_RECALL_TOOLS.map(tool => tool.name) : [])].join(',')
+export function readPiClientConfig(path, id, own = homedir(), { bridge = LOCAL_RECALL } = {}) {
   const file = fixedPath(path, 'client config', 64 * 1024)
   if ((file.stat.mode & 0o022) !== 0) throw new Error('client config must not be group/world writable')
   let raw
@@ -90,7 +99,14 @@ export function readPiClientConfig(path, id, own = homedir()) {
   const socket = resolve(stateDir, 'tmux.sock')
   if (Buffer.byteLength(socket) >= 104) throw new Error('state_dir is too deep for its tmux socket; choose a shorter path')
   return Object.freeze({ id: instanceId(id), target, model, pubkey, channels, workTools: raw.work_tools === true, stateDir: resolve(stateDir), socket, identity, feedIdentity,
+    recall: piRecall(raw.recall, bridge),
     ...piLogin(String(raw.pi_home || ''), own), knownHosts: knownHostsFile(String(raw.known_hosts_file || '')) })
+}
+
+// `recall`: "local" for the box's own bridge, or the read key object the Claude and Codex harnesses take.
+function piRecall(value, bridge) {
+  if (value !== 'local') return recallEntry(value)
+  return Object.freeze({ local: true, bridge: fixedPath(bridge, 'Hive memory bridge', null).path })
 }
 
 // The harness's own PI_CODING_AGENT_DIR, which its owner has logged in with `/login` (ChatGPT). pi
@@ -119,14 +135,15 @@ function piLogin(path, own) {
 
 // One ssh child speaking newline-delimited JSON-RPC to the fleet's channel MCP. A call that gets no
 // answer within HARNESS_CHANNEL_CALL_MS ends the child, so a dead carrier cannot hang a turn.
-export function channelProxy({ config, ssh = SSH, env, log = () => {} }) {
+// The same carrier serves the Hive memory reader: `entry` and `what` name another server.
+export function channelProxy({ config, ssh = SSH, env, log = () => {}, entry = null, what = 'the channel to the fleet' }) {
   const CALL_MS = Number(process.env.HARNESS_CHANNEL_CALL_MS || 30000)
-  const entry = sshChannelEntry({ identity: config.identity, knownHosts: config.knownHosts, target: config.target })
+  entry ||= { ...sshChannelEntry({ identity: config.identity, knownHosts: config.knownHosts, target: config.target }), command: ssh }
   let current = null, spawned = 0
 
   function connect() {
     // detached: its own process group, off the pane's foreground, so herdr and Moshi see pi, not ssh.
-    const child = spawn(ssh, entry.args, { stdio: ['pipe', 'pipe', 'pipe'], env, detached: true })
+    const child = spawn(entry.command, entry.args, { stdio: ['pipe', 'pipe', 'pipe'], env, detached: true })
     const pending = new Map()
     let out = '', stderr = '', nextId = 1, closed = false
     const conn = { child, closed: () => closed }
@@ -134,10 +151,10 @@ export function channelProxy({ config, ssh = SSH, env, log = () => {} }) {
     // A child that closed, failed to start or went silent is never reused, even before it exits.
     const drop = () => { closed = true; if (current === conn) current = null }
     const fail = error => { for (const { reject, timer } of pending.values()) { clearTimeout(timer); reject(error) } pending.clear() }
-    child.on('error', error => { drop(); fail(new Error(`the channel to the fleet did not start: ${error.code || error.message}`)) })
+    child.on('error', error => { drop(); fail(new Error(`${what} did not start: ${error.code || error.message}`)) })
     child.on('close', code => {
       drop()
-      fail(new Error(`the channel to the fleet closed (${code})${stderr.trim() ? `: ${stderr.trim().split('\n').at(-1).slice(0, 300)}` : ''}`))
+      fail(new Error(`${what} closed (${code})${stderr.trim() ? `: ${stderr.trim().split('\n').at(-1).slice(0, 300)}` : ''}`))
     })
     child.stdin.on('error', () => {})
     child.stderr.on('data', data => { stderr = (stderr + String(data)).slice(-600) })
@@ -151,14 +168,14 @@ export function channelProxy({ config, ssh = SSH, env, log = () => {} }) {
         const waiting = pending.get(message?.id)
         if (!waiting) continue
         pending.delete(message.id); clearTimeout(waiting.timer)
-        if (message.error) waiting.reject(new Error(`the channel refused the call: ${String(message.error.message || message.error.code).slice(0, 300)}`))
+        if (message.error) waiting.reject(new Error(`${what} refused the call: ${String(message.error.message || message.error.code).slice(0, 300)}`))
         else waiting.resolve(message.result)
       }
     })
     conn.request = (method, params, signal) => new Promise((done, reject) => {
-      if (closed) return reject(new Error('the channel to the fleet is closed'))
+      if (closed) return reject(new Error(`${what} is closed`))
       const id = nextId++
-      const timer = setTimeout(() => { pending.delete(id); drop(); reject(new Error(`the channel to the fleet did not answer within ${Math.round(CALL_MS / 1000)}s`)); child.kill('SIGTERM') }, CALL_MS)
+      const timer = setTimeout(() => { pending.delete(id); drop(); reject(new Error(`${what} did not answer within ${Math.round(CALL_MS / 1000)}s`)); child.kill('SIGTERM') }, CALL_MS)
       pending.set(id, { resolve: done, reject, timer })
       signal?.addEventListener?.('abort', () => { if (pending.delete(id)) { clearTimeout(timer); reject(new Error('the tool call was aborted')) } }, { once: true })
       child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n')
@@ -194,6 +211,9 @@ export function createPiHarness({ pi, config, ssh = SSH, log: logLine }) {
   const env = { PATH: process.env.PATH || '/usr/bin:/bin', HOME: config.stateDir }
   const channel = channelProxy({ config, ssh, env, log })
   for (const tool of PI_CHANNEL_TOOLS) pi.registerTool({ ...tool, execute: (_id, params, signal) => channel.call(tool.name, params, signal) })
+  const reader = config.recall ? channelProxy({ config, env, log, what: 'the Hive memory reader',
+    entry: config.recall.local ? { command: config.recall.bridge, args: [] } : { ...sshChannelEntry(config.recall), command: ssh } }) : null
+  for (const tool of reader ? PI_RECALL_TOOLS : []) pi.registerTool({ ...tool, execute: (_id, params, signal) => reader.call(tool.name, params, signal) })
 
   let run = null
   const children = new Set()
@@ -228,6 +248,7 @@ export function createPiHarness({ pi, config, ssh = SSH, log: logLine }) {
       run = null
       for (const child of children) try { child.kill('SIGTERM') } catch {}
       channel.close()
+      reader?.close()
     },
   }
 }

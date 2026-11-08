@@ -17,7 +17,7 @@ import { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { defaultInstructions } from './harness_session.mjs'
+import { ensureInstructions } from './harness_session.mjs'
 import { herdrAgentName, herdrClient, herdrSession } from './harness_herdr.mjs'
 import { claimPidLock } from './pid_lock.mjs'
 import { piTools, readPiClientConfig } from './pi_harness_extension.mjs'
@@ -38,8 +38,8 @@ const STATUS_EXTENSIONS = ['herdr-agent-state.ts', 'moshi-hooks.ts']
 const moshiExtension = piHome => piHome ? STATUS_EXTENSIONS.map(name => resolve(piHome, 'extensions', name))
   .filter(path => existsSync(path)).flatMap(path => ['-e', path]) : []
 // --name: the session's display name, the identity's, which Moshi shows instead of its first prompt.
-const piArgs = ({ id, model, stateDir, workTools, piHome, provider }) => ['--provider', provider, '--model', model || 'gpt-5.6-luna',
-  '--no-extensions', '-e', extension, ...moshiExtension(piHome), '--tools', piTools({ workTools }),
+const piArgs = ({ id, model, stateDir, workTools, recall, piHome, provider }) => ['--provider', provider, '--model', model || 'gpt-5.6-luna',
+  '--no-extensions', '-e', extension, ...moshiExtension(piHome), '--tools', piTools({ workTools, recall }),
   '--no-approve', '--session-dir', resolve(stateDir, 'sessions'), '--name', herdrAgentName(id), '--continue']
 
 const { stateDir, socket } = config
@@ -55,8 +55,9 @@ const writePrivate = (path, value) => { writeFileSync(path, value, { mode: 0o600
 for (const dir of [stateDir, workdir, privateDir, home, resolve(stateDir, 'sessions')]) { mkdirSync(dir, { recursive: true, mode: 0o700 }); chmodSync(dir, 0o700) }
 let release
 try { release = claimPidLock(resolve(privateDir, 'supervisor.lock'), config.id, 'portable Pi harness') } catch (error) { die(error.message) }
-const manifest = { id: config.id, pubkey: config.pubkey, buzz: { channels: config.channels } }
-if (!existsSync(resolve(workdir, 'AGENTS.md'))) writePrivate(resolve(workdir, 'AGENTS.md'), defaultInstructions(manifest))
+const manifest = { id: config.id, pubkey: config.pubkey, buzz: { channels: config.channels }, recall: Boolean(config.recall) }
+// The defaults when missing, and the recall rule once when a reader is mounted; an owner's edits are kept.
+ensureInstructions(resolve(workdir, 'AGENTS.md'), manifest)
 
 // HOME is the harness's own, so pi never reads the owner's dotfiles; the login is in pi_home.
 const sessionEnv = {

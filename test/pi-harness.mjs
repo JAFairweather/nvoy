@@ -9,7 +9,8 @@ import { spawn, spawnSync } from 'node:child_process'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { codexTurnText } from '../mcp/tools/harness_session.mjs'
-import nvoyPiHarness, { PI_CHANNEL_TOOLS, piTools } from '../mcp/tools/pi_harness_extension.mjs'
+import { MEMORY_TOOL_SPECS } from '../mcp/tools/memory.mjs'
+import nvoyPiHarness, { createPiHarness, PI_CHANNEL_TOOLS, PI_RECALL_TOOLS, piTools } from '../mcp/tools/pi_harness_extension.mjs'
 import { readPiClientConfig } from '../mcp/tools/pi_harness_extension.mjs'
 import { fakeHerdr } from './fake-herdr.mjs'
 
@@ -123,11 +124,13 @@ ok('the channel tools are pi\'s only tools', argAfter('--tools') === 'nvoy_chann
 ok('work_tools adds pi\'s own read, shell and edit tools before the channel\'s, and must be a boolean',
   piTools({ workTools: true }) === 'read,bash,edit,write,grep,find,ls,nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply,nvoy_channel_post,nvoy_profile_set,nvoy_profile_status,memory_claim,memory_withdraw' &&
   piTools({}) === argAfter('--tools') && refused({ ...client, work_tools: 'yes' }, /work_tools must be true or false/))
+ok('recall adds the two Hive memory read tools after the channel\'s', piTools({ recall: { local: true } }) === `${argAfter('--tools')},memory_wake,memory_query`)
 ok('pi gets a built environment: its own agent dir and home, the config, and no API key', sessions()[0].env.join() ===
   'HOME,LANG,NVOY_PI_HARNESS_CONFIG,NVOY_PI_HARNESS_INSTANCE,PATH,PI_CODING_AGENT_DIR,PI_SKIP_VERSION_CHECK,TERM' && sessions()[0].agentDir === piHome &&
   sessions()[0].home === join(stateDir, 'home') && sessions()[0].config === configPath && sessions()[0].instance === 'pd-test' && sessions()[0].skip === '1')
 ok('the workspace gets the participant instructions, owner-only, in an owner-only state dir', /You are the participant `pd-test`/.test(readText(join(stateDir, 'workspace', 'AGENTS.md'))) &&
   (statSync(join(stateDir, 'workspace', 'AGENTS.md')).mode & 0o777) === 0o600 && (statSync(stateDir).mode & 0o777) === 0o700)
+ok('without recall the instructions carry no recall rule', !/## Recall from Hive memory/.test(readText(join(stateDir, 'workspace', 'AGENTS.md'))))
 const dup = spawnSync(process.execPath, ['mcp/tools/pi-harness.mjs', '--instance', 'pd-test', '--config', configPath], { cwd: resolve('.'), encoding: 'utf8', env: launcherEnv, timeout: 10000 })
 ok('a second launcher on the same state dir is refused', dup.status === 1 && /portable Pi harness already runs as pid/.test(dup.stderr))
 process.kill(Number(readText(`${socket}.pid`)), 'SIGKILL')
@@ -200,8 +203,19 @@ ok('the pi LaunchAgent runs the supervisor headless, in herdr, logging under the
 // and its own channel MCP on the channel key, each for this fleet root.
 const ctl = join(root, 'ctl')
 mkdirSync(ctl)
+// A stand-in Hive memory reader: answers initialize, and each tool call with how it was reached and what it was asked.
+const readKey = secretFile(join(root, 'read-key'), 'PRIVATE-KEY-MUST-NEVER-PRINT\n')
+const fakeReader = secretFile(join(fakeBin, 'hive-reader'), `#!${process.execPath}
+let buf = ''
+process.stdin.on('data', data => { buf += data; let at; while ((at = buf.indexOf('\\n')) >= 0) { const m = JSON.parse(buf.slice(0, at)); buf = buf.slice(at + 1)
+  if (m.id === undefined) continue
+  const result = m.method === 'initialize' ? { protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'stub', version: '1' } }
+    : { content: [{ type: 'text', text: ['reader', ...process.argv.slice(2), m.params.name, JSON.stringify(m.params.arguments)].join(' ') }] }
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }) + '\\n') } })
+`, 0o700)
 const fakeSsh = secretFile(join(fakeBin, 'ssh'), `#!/bin/sh
 echo "$@" >> ${join(root, 'ssh-args.log')}
+case "$*" in *"-i ${readKey} "*) exec ${fakeReader} via-ssh ;; esac
 case "$*" in *"-i ${feedKey} "*) NVOY_INSTANCE_ROOT=${fleet} exec ${process.execPath} ${resolve('mcp/tools/codex-channel-feed.mjs')} --instance pd-test --heartbeat-ms 150 --poll-ms 40 ;; esac
 [ -e ${ctl}/refuse ] && { echo "Connection closed by broker.example port 22" >&2; exit 255; }
 echo $$ > ${join(root, 'channel.pid')}
@@ -310,6 +324,32 @@ await waitFor(() => !existsSync(lockPath), 5000)
 let notebookRefused = false
 try { readPiClientConfig(clientConfig({ ...client, notebook: { adapter_dir: root } }), 'pd-test', own) } catch (error) { notebookRefused = /unknown field notebook/.test(error.message) }
 ok('a notebook section is refused as an unknown field', notebookRefused)
+
+// Recall: memory_wake and memory_query come from the agent's own Hive memory reader, never the channel.
+const recallObject = { identity_file: readKey, known_hosts_file: knownHosts, ssh_target: 'pd-test@hive.example' }
+const localConfig = readPiClientConfig(clientConfig({ ...client, recall: 'local' }), 'pd-test', own, { bridge: fakeReader })
+const sshConfig = readPiClientConfig(clientConfig({ ...client, recall: recallObject }), 'pd-test', own)
+ok('recall is off unless asked for', readPiClientConfig(configPath, 'pd-test', own).recall === null)
+ok('"local" recall names the box\'s own bridge; a read key recall names its key, known_hosts and target', localConfig.recall.local === true && localConfig.recall.bridge === fakeReader &&
+  sshConfig.recall.identity === readKey && sshConfig.recall.knownHosts === knownHosts && sshConfig.recall.target === 'pd-test@hive.example')
+ok('a missing bridge, a recall that is neither, a partial read key or a loose target is refused',
+  throws(() => readPiClientConfig(clientConfig({ ...client, recall: 'local' }), 'pd-test', own, { bridge: join(root, 'absent') }), /Hive memory bridge is missing/) &&
+  throws(() => readPiClientConfig(clientConfig({ ...client, recall: 'remote' }), 'pd-test', own), /recall must be an object/) &&
+  throws(() => readPiClientConfig(clientConfig({ ...client, recall: { identity_file: readKey } }), 'pd-test', own), /recall takes exactly/) &&
+  throws(() => readPiClientConfig(clientConfig({ ...client, recall: { ...recallObject, ssh_target: '-oProxyCommand=x@h' } }), 'pd-test', own), /fixed user@host/))
+ok('the read tools carry the reader\'s own descriptions and schemas', PI_RECALL_TOOLS.map(tool => tool.name).join() === 'memory_wake,memory_query' &&
+  PI_RECALL_TOOLS.every(tool => { const spec = MEMORY_TOOL_SPECS.find(s => s.name === tool.name); return tool.description === spec.description && tool.parameters === spec.inputSchema && tool.label }))
+for (const [how, config] of [['the local bridge', localConfig], ['ssh with the read key', sshConfig]]) {
+  const pi = fakePi(), harness = createPiHarness({ pi, config, ssh: fakeSsh, log: () => {} })
+  const wake = await pi.tools.get('memory_wake')?.execute('1', { max_chars: 900 })
+  const query = await pi.tools.get('memory_query')?.execute('2', { topic: 'nvoy' })
+  ok(`with recall over ${how}, the read tools register after the channel's and reach the reader, not the channel`,
+    [...pi.tools.keys()].join() === [...PI_CHANNEL_TOOLS, ...PI_RECALL_TOOLS].map(tool => tool.name).join() &&
+    wake?.content[0].text === `reader${how.startsWith('ssh') ? ' via-ssh' : ''} memory_wake {"max_chars":900}` && query?.content[0].text.endsWith('memory_query {"topic":"nvoy"}') &&
+    harness.channel.spawned() === 0)
+  harness.stop()
+}
+ok('the ssh reader is reached with the read key and nothing else', readText(join(root, 'ssh-args.log')).split('\n').some(line => line.includes(`-i ${readKey} pd-test@hive.example`) && line.includes(`UserKnownHostsFile=${knownHosts}`)))
 process.env.NVOY_PI_HARNESS_CONFIG = configPath
 
 rmSync(root, { recursive: true, force: true })
