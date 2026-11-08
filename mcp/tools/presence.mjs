@@ -27,6 +27,17 @@ export const PRESENCE_REFRESH_SEC = 30 * 60        // re-sign an unchanged state
 export const SNAPSHOT_MAX_AGE_SEC = 90             // the collector runs every 30 s
 const FP = /^SHA256:[A-Za-z0-9+/]{43}$/
 
+// The cgroup file's paths (v2: one `0::/path` line; v1: `N:controllers:/path` lines), as component lists.
+const cgroupPaths = text => String(text || '').split('\n').map(l => l.split(':').slice(2).join(':')).filter(Boolean).map(p => p.split('/').filter(Boolean))
+
+// True only when the adapter container's id is a whole Docker cgroup component: systemd's
+// `docker-<id>.scope`, or `<id>` directly under `docker`. A path that merely contains the id as part of
+// another name (`not-docker-<id>-other.scope`) is not the container.
+export function inContainer(cgroup, containerId) {
+  if (!/^[0-9a-f]{64}$/.test(String(containerId || ''))) return false
+  return cgroupPaths(cgroup).some(parts => parts.some((c, i) => c === `docker-${containerId}.scope` || (c === 'docker' && parts[i + 1] === containerId)))
+}
+
 const sameArgv = (a, b) => a.length === b.length && a.every((v, i) => v === b[i])
 
 // null when the argv is not exactly this instance's channel command; otherwise the fingerprint it
@@ -49,7 +60,7 @@ export function countSessions(procs, manifest, containerId) {
   if (!/^[0-9a-f]{64}$/.test(String(containerId || ''))) return { byFp, untagged, counted: 0 }
   for (const p of procs || []) {
     if (p?.uid !== manifest.workerUid) continue
-    if (!String(p.cgroup || '').includes(containerId)) continue
+    if (!inContainer(p.cgroup, containerId)) continue
     const parsed = parseChannelArgv(p.argv, manifest)
     if (!parsed) continue
     if (parsed.fp) byFp[parsed.fp] = (byFp[parsed.fp] || 0) + 1

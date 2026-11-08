@@ -1,7 +1,7 @@
 // Presence (waggle #721 step 4): counting, judging, deciding. The claim must be as strong as its
 // evidence, so every case below that proves "connected" sits beside one that must NOT.
 import { keyFingerprint } from '../mcp/tools/participant_unit.mjs'
-import { parseChannelArgv, countSessions, buildSnapshot, presenceVerdict, nextPresence, presenceTemplate,
+import { inContainer, parseChannelArgv, countSessions, buildSnapshot, presenceVerdict, nextPresence, presenceTemplate,
   PRESENCE_D, PRESENCE_TTL_SEC, PRESENCE_REFRESH_SEC, SNAPSHOT_MAX_AGE_SEC } from '../mcp/tools/presence.mjs'
 
 let fails = 0
@@ -30,6 +30,10 @@ const c = countSessions(good, m, CID)
 ok('parallel sessions are counted per key', c.byFp[FPA] === 2 && c.byFp[FPB] === 1 && c.untagged === 1)
 ok('a process in another container does not count', countSessions([tagged(FPA), proc([...base, '--key-fp', FPA], { cgroup: `0::/docker-${OTHER}.scope` })], m, CID).byFp[FPA] === 1)
 ok('a host process with matching words, outside the container, does not count', countSessions([proc([...base, '--key-fp', FPA], { cgroup: '0::/user.slice/session-3.scope' })], m, CID).counted === 0)
+ok('an impostor cgroup that merely contains the id does not count', countSessions([proc([...base, '--key-fp', FPA], { cgroup: `0::/system.slice/not-docker-${CID}-other.scope\n` })], m, CID).counted === 0)
+ok('the cgroupfs layout (docker/<id>) counts', inContainer(`0::/docker/${CID}\n`, CID))
+ok('a v1 multi-line cgroup counts when one line is the container', inContainer(`12:memory:/docker/${CID}\n1:name=systemd:/docker/${CID}\n`, CID))
+ok('the id as a non-adjacent component does not count', !inContainer(`0::/docker/x/${CID}\n`, CID) && !inContainer(`0::/${CID}\n`, CID))
 ok('a process under another uid does not count', countSessions([proc([...base, '--key-fp', FPA], { uid: 0 })], m, CID).counted === 0)
 ok('no container id counts nothing', countSessions(good, m, '').counted === 0)
 
@@ -98,6 +102,8 @@ const body = Buffer.alloc(51, 5).toString('base64')
 const line = principalLine(man, 'ssh-ed25519', body)
 ok('the installed tagged line yields its own key fingerprint', installedFingerprint(line + '\n', man) === keyFingerprint(body))
 ok('an older line yields no fingerprint, so presence stays unproven', installedFingerprint(line.replace(/ --key-fp [^"]+/, '') + '\n', man) === '')
+ok('a line whose command was swapped but still ends in the fingerprint yields none', installedFingerprint(line.replace(/command="[^"]*(?= --key-fp)/, 'command="/bin/echo') + '\n', man) === '')
+ok('a line with restrict stripped yields none', installedFingerprint(line.replace('restrict,', '') + '\n', man) === '')
 ok('two lines under one comment yield none (ambiguous)', installedFingerprint(line + '\n' + line + '\n', man) === '')
 
 const insts = join(tmp, 'instances'); mkdirSync(insts)

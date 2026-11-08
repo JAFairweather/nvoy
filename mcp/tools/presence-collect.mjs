@@ -14,7 +14,7 @@ import { closeSync, fsyncSync, openSync, readdirSync, readFileSync, renameSync, 
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { readManifest, instanceId } from './runtime_manifest.mjs'
-import { keyFingerprint, parsePrincipal, principalComment } from './participant_unit.mjs'
+import { keyFingerprint, parsePrincipal, principalComment, verifyPrincipal } from './participant_unit.mjs'
 import { buildSnapshot } from './presence.mjs'
 
 // [{ pid, uid, cgroup, argv }] from a /proc tree. A process that vanishes mid-read is skipped.
@@ -37,10 +37,13 @@ export function readProcs(procRoot = '/proc') {
 // fingerprint is not its own key's).
 export function installedFingerprint(keysText, manifest) {
   const comment = principalComment(manifest)
-  const lines = String(keysText || '').split('\n').map(parsePrincipal).filter(p => p && p.comment === comment)
+  const lines = String(keysText || '').split('\n').map(l => l.trim()).filter(l => { const p = parsePrincipal(l); return p && p.comment === comment })
   if (lines.length !== 1) return ''
-  const own = keyFingerprint(lines[0].keyBody)
-  return lines[0].command.endsWith(` --key-fp ${own}`) ? own : ''
+  // The whole line must verify against the manifest: restrict intact, the exact docker exec as the
+  // worker uid:gid into the adapter, this instance, and the line's own key fingerprint. A line whose
+  // command was swapped but still ends in a fingerprint supports no claim.
+  const verified = verifyPrincipal(manifest, lines[0])
+  return verified?.ok && verified.fingerprint === 'bound' ? keyFingerprint(verified.parsed.keyBody) : ''
 }
 
 export function writeAtomic(path, text) {
