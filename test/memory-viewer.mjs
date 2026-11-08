@@ -791,6 +791,7 @@ await test('live integration: memory-viewer polls memory-daemon viewer socket, s
       assert.equal(polledWithOverride.curator_state.state_file_present, true)
       assert.equal(polledWithOverride.curator_state.last_curated_write_seq, 2)
       assert.equal(polledWithOverride.curator_state.write_delta, 0)
+      assert(Array.isArray(polledWithOverride.curator_state.planned_clusters), 'curator_state includes planned_clusters for 4-Act Replay')
     } finally {
       delete process.env.HIVE_MEMORY_CURATOR_STATE_FILE
     }
@@ -921,6 +922,7 @@ await test('daemon activity ring: only the viewer wake carries it, metadata only
 
     const renderedHtml = renderViewerHtml(next)
     assert(renderedHtml.includes('[REPLAY · READ-ONLY]'), '4-act animation logs must be explicitly read-only replay')
+    assert(renderedHtml.includes('buildPreviewDreamClusters'), 'replayLastDream must fall back to buildPreviewDreamClusters when store has 0 merkle_sources records')
     assert(!renderedHtml.includes('92.4%'), '4-act animation must not contain invented coherence uplift fallback')
   } finally {
     await daemon.close()
