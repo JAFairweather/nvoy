@@ -160,6 +160,14 @@ services:
         source: broker_credentials
         target: /run/nvoy-broker-credentials
         read_only: true
+      # The host collector's per-instance presence snapshots (presence-collect.mjs): counts only, no
+      # credential, and the broker can read but not change them.
+      - type: bind
+        source: /var/lib/nvoy/presence
+        target: /run/nvoy-presence
+        read_only: true
+        bind:
+          create_host_path: true
     depends_on:
       init:
         condition: service_completed_successfully

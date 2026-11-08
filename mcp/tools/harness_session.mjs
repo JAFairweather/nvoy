@@ -4,12 +4,12 @@
 
 import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { basename, dirname, resolve } from 'node:path'
-import { sshChannelEntry } from './channel_client.mjs'
+import { recallServerEntry, sshChannelEntry } from './channel_client.mjs'
 
 export const serverName = manifest => `nvoy-${manifest.id}`
 
 // An instance with a recall block reads Hive memory through its own reader: the gateway's forced command binds the
-// key to one reader socket, which serves only these two tools.
+// key to one reader socket (or, on the store's box, the bridge binds the login to it), which serves only these two tools.
 export const RECALL_SERVER = 'hive-memory'
 export const RECALL_TOOLS = ['memory_wake', 'memory_query']
 
@@ -17,7 +17,7 @@ export const RECALL_TOOLS = ['memory_wake', 'memory_query']
 // command would use, so it keeps exactly the queue permissions that path has. Off the fleet it is
 // that SSH forced command, reached with the same entry claude-channel-doctor renders for a client.
 export function mcpConfig({ manifest, root, remote = null }) {
-  const recall = manifest.recall ? { [RECALL_SERVER]: sshChannelEntry(manifest.recall) } : {}
+  const recall = manifest.recall ? { [RECALL_SERVER]: recallServerEntry(manifest.recall) } : {}
   if (remote) return { mcpServers: { [serverName(manifest)]: sshChannelEntry(remote), ...recall } }
   return { mcpServers: { [serverName(manifest)]: {
     command: 'node',
@@ -248,7 +248,7 @@ export const CHANNEL_PERMISSIONS = 'nvoy-channel'
 
 function codexRecall(manifest) {
   if (!manifest.recall) return []
-  const q = value => JSON.stringify(String(value)), entry = sshChannelEntry(manifest.recall)
+  const q = value => JSON.stringify(String(value)), entry = recallServerEntry(manifest.recall)
   return [`[mcp_servers.${RECALL_SERVER}]`, `command = ${q(entry.command)}`, `args = [${entry.args.map(q).join(', ')}]`, '',
     ...RECALL_TOOLS.flatMap(tool => [`[mcp_servers.${RECALL_SERVER}.tools.${tool}]`, 'approval_mode = "approve"', ''])]
 }

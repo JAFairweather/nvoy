@@ -4,7 +4,7 @@
 // crash-left `.inflight` markers are requeued at boot and are harmless because the adapter queue
 // deduplicates on envelope before ACKing.
 
-import { appendFileSync, readdirSync, renameSync, readFileSync, lstatSync, rmSync } from 'node:fs'
+import { appendFileSync, existsSync, readdirSync, renameSync, readFileSync, lstatSync, rmSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
@@ -324,6 +324,21 @@ function publishCard() {
   child.on('error', () => complete(null))
   child.on('exit', complete)
 }
+// Channel presence (waggle #721 step 4): every 30 s, only when the host collector has written this
+// instance's snapshot. The child signs only on a change or a refresh, and never on an unproven read.
+let presenceRunning = false
+function publishPresence() {
+  if (presenceRunning) return
+  const dir = process.env.NVOY_PRESENCE_DIR || '/run/nvoy-presence'
+  if (!existsSync(resolve(dir, `${manifest.id}.json`))) return
+  presenceRunning = true
+  const child = spawn(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-presence.mjs'), '--instance', manifest.id],
+    { env: childEnv, stdio: ['ignore', 'inherit', 'inherit'] })
+  const timeout = setTimeout(() => child.kill('SIGKILL'), 60000)
+  const complete = code => { clearTimeout(timeout); presenceRunning = false; if (code !== 0) console.error(`instance-broker-daemon: presence unconfirmed (${code ?? 'signal'}); retrying the same event in 30 s`) }
+  child.on('error', () => complete(null))
+  child.on('exit', complete)
+}
 // Room members for the channel MCPs' mention lists (#321): at start and every five minutes.
 function refreshRooms() {
   const child = spawn(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-rooms.mjs'), '--instance', manifest.id],
@@ -336,6 +351,7 @@ function refreshRooms() {
 recover()
 if (manifest.mayPost?.mentionRooms) { refreshRooms(); setInterval(refreshRooms, 5 * 60 * 1000) }
 if (manifest.agentCard) { publishCard(); setInterval(publishCard, 60 * 60 * 1000) }
+publishPresence(); setInterval(publishPresence, 30 * 1000)
 if (manifest.buzz) supervise('instance-broker-auth.mjs', 'AUTH oracle')
 if (manifest.buzz?.statusReactions) supervise('instance-broker-status.mjs', 'status keeper')
 drain()
