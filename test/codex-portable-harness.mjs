@@ -93,6 +93,9 @@ ok('a recall block mounts the reader with its own key and host, and approves onl
   /"-i", "\/keys\/cx-read", "hive-memory-gw@herd-cloud"\]/.test(recallToml) && recallToml.includes('UserKnownHostsFile=/keys/herd_known_hosts') &&
   /^\[mcp_servers\.hive-memory\.tools\.memory_wake\]$/m.test(recallToml) && /^\[mcp_servers\.hive-memory\.tools\.memory_query\]$/m.test(recallToml) &&
   (recallToml.match(/^\[mcp_servers\.hive-memory\.tools\./gm) || []).length === 2 && recallToml.startsWith(toml))
+const localToml = codexConfigToml({ manifest: { id: 'cx-test', recall: { local: true, bridge: '/usr/local/lib/hive-memory/connect' } }, root: '', auth: 'chatgpt', remote })
+ok('local recall mounts the box\'s bridge with no arguments and approves only its two read tools', localToml.includes('[mcp_servers.hive-memory]\ncommand = "/usr/local/lib/hive-memory/connect"\nargs = []\n') &&
+  (localToml.match(/^\[mcp_servers\.hive-memory\.tools\./gm) || []).length === 2 && !localToml.includes('hive-memory-gw'))
 ok('without a recall block there is no reader', !toml.includes('hive-memory'))
 ok('a model is set only when chosen', !/^model = /m.test(toml) && /^model = "gpt-5\.5"$/m.test(codexConfigToml({ manifest: { id: 'cx-test' }, root: '', model: 'gpt-5.5', auth: 'chatgpt', remote })))
 ok('a ChatGPT config without the SSH channel, or an unknown auth mode, is refused', (() => { try { codexConfigToml({ manifest: { id: 'x' }, root: '', auth: 'chatgpt' }); return false } catch { return true } })() &&

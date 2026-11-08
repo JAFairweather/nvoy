@@ -21,7 +21,7 @@ import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, readFileSy
 import { spawn } from 'node:child_process'
 import { homedir } from 'node:os'
 import { isAbsolute, resolve } from 'node:path'
-import { fixedPath, knownHostsFile, privateFile, recallEntry, sshChannelEntry, SSH, SSH_TARGET } from './channel_client.mjs'
+import { fixedPath, knownHostsFile, LOCAL_RECALL, privateFile, recallEntry, sshChannelEntry, SSH, SSH_TARGET } from './channel_client.mjs'
 import { instanceId } from './runtime_manifest.mjs'
 import { memoryToolBase } from './agent_memory.mjs'
 import { MEMORY_TOOL_SPECS } from './memory.mjs'
@@ -53,9 +53,7 @@ export const PI_CHANNEL_TOOLS = [
 // The two read tools, served by the agent's own Hive memory reader (`recall`), never by the channel.
 export const PI_RECALL_TOOLS = MEMORY_TOOL_SPECS.filter(spec => RECALL_TOOLS.includes(spec.name)).map(({ name, description, inputSchema }) =>
   ({ name, label: `Hive memory: ${name.slice('memory_'.length)}`, description, parameters: inputSchema }))
-// On a box that runs Hive memory (herd-cloud), the root-owned bridge that maps the calling agent-NAME user to its own
-// reader socket; nothing to configure but `"recall": "local"`.
-export const LOCAL_RECALL = '/usr/local/lib/hive-memory/connect'
+export { LOCAL_RECALL }
 
 // The client config names paths, never values, and is refused on the portable Codex config's
 // grounds: nothing here signs, and nothing may bill an API key instead of the owner's subscription.
@@ -99,14 +97,8 @@ export function readPiClientConfig(path, id, own = homedir(), { bridge = LOCAL_R
   const socket = resolve(stateDir, 'tmux.sock')
   if (Buffer.byteLength(socket) >= 104) throw new Error('state_dir is too deep for its tmux socket; choose a shorter path')
   return Object.freeze({ id: instanceId(id), target, model, pubkey, channels, workTools: raw.work_tools === true, stateDir: resolve(stateDir), socket, identity, feedIdentity,
-    recall: piRecall(raw.recall, bridge),
+    recall: recallEntry(raw.recall, { bridge }),
     ...piLogin(String(raw.pi_home || ''), own), knownHosts: knownHostsFile(String(raw.known_hosts_file || '')) })
-}
-
-// `recall`: "local" for the box's own bridge, or the read key object the Claude and Codex harnesses take.
-function piRecall(value, bridge) {
-  if (value !== 'local') return recallEntry(value)
-  return Object.freeze({ local: true, bridge: fixedPath(bridge, 'Hive memory bridge', null).path })
 }
 
 // The harness's own PI_CODING_AGENT_DIR, which its owner has logged in with `/login` (ChatGPT). pi
