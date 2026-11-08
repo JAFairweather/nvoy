@@ -156,7 +156,7 @@ const claudeManifest = { ...manifest, id: 'claude-channel', pubkey: 'c'.repeat(6
 writeFileSync(join(manifestRoot, 'claude-channel.json'), JSON.stringify(claudeManifest))
 const forcedClaudeKey = spawnSync(process.execPath, ['mcp/tools/instance-claude-channel-authorized-key.mjs', '--instance', 'claude-channel', '--public-key-file', desktopPublicKey, '--container', 'nvoy-claude-channel-adapter-1'], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
 ok('the Claude channel installer fixes a restricted worker-UID/GID MCP command distinct from the adapter', forcedClaudeKey.status === 0 &&
-  forcedClaudeKey.stdout.startsWith(`restrict,command="/usr/bin/docker exec -i --user ${manifest.worker_uid}:${manifest.worker_handoff_gid} nvoy-claude-channel-adapter-1 /usr/local/bin/node /srv/nvoy/mcp/tools/claude-channel.mjs --instance claude-channel" ssh-ed25519 `) &&
+  forcedClaudeKey.stdout.startsWith(`restrict,command="/usr/bin/docker exec -i --user ${manifest.worker_uid}:${manifest.worker_handoff_gid} nvoy-claude-channel-adapter-1 /usr/local/bin/node /srv/nvoy/mcp/tools/claude-channel.mjs --instance claude-channel --key-fp SHA256:`) &&
   !forcedClaudeKey.stdout.includes(`--user ${manifest.adapter_uid}:`) && !/permitopen|environment=|pty/.test(forcedClaudeKey.stdout))
 writeFileSync(join(manifestRoot, 'bad-desktop.json'), JSON.stringify({ ...manifest, id: 'bad-desktop', pubkey: '4'.repeat(64), state_dir: join(root, 'state-bad-desktop'), runtime_dir: join(root, 'run-bad-desktop'), spool_dir: join(root, 'spool-bad-desktop'), worker_image: '', worker_runner: '', worker_credential_ref: '', delivery_mode: 'codex_app_server' }))
 const badDesktop = cli('describe', '--instance', 'bad-desktop')

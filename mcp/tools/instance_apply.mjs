@@ -57,6 +57,11 @@ export function principalPlan(text, manifest, { keyType, keyBody }) {
     .filter(l => { const p = parsePrincipal(l); return p ? p.comment === comment : l.includes(comment) })
   if (!ours.length) return { action: 'append', line: want }
   if (ours.length === 1 && ours[0] === want) return { action: 'present', line: want }
+  // An older seat: the same line without the fingerprint argument. It is left exactly as it is; its
+  // sessions cannot be attributed to a key, so presence reports it unproven until a controlled migration.
+  if (ours.length === 1 && ours[0] === want.replace(/ --key-fp SHA256:[A-Za-z0-9+/]{43}"/, '"')) {
+    return { action: 'present', line: ours[0], unproven: true }
+  }
   return { action: 'refuse', line: want,
     why: `${ours.length} line(s) already carry ${comment} and ${ours.length > 1 ? 'which one authorises is ambiguous' : 'it is not the line this key and manifest produce'}; resolve by hand` }
 }

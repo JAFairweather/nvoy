@@ -3,3 +3,4 @@ CLAUDE.md
 .claude/
 drafts/
 dist/
+__pycache__/

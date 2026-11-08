@@ -102,7 +102,7 @@ const containers = read(join(FACTS, 'containers.txt')).split('\n').filter(Boolea
 }).filter(Boolean)
 const channels = new Map()
 for (const line of read(join(FACTS, 'channels.txt')).split('\n')) {
-  const m = line.match(/^\s*(\d+)\s+\S+\.mjs --instance ([a-z0-9-]+)$/)
+  const m = line.match(/^\s*(\d+)\s+\S+\.mjs --instance ([a-z0-9-]+)(?: --key-fp SHA256:\S+)?$/)
   if (m) channels.set(m[2], (channels.get(m[2]) || 0) + Number(m[1]))
 }
 const logOf = (id, role) => parseLog(read(join(FACTS, 'logs', `nvoy-${id}-${role}-1.log`)))
