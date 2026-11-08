@@ -12,7 +12,7 @@ import { spawnSync } from 'node:child_process'
 import { generateSecretKey, getPublicKey } from 'nostr-tools/pure'
 import * as nip19 from 'nostr-tools/nip19'
 import { readManifest } from '../mcp/tools/runtime_manifest.mjs'
-import { forcedCommand, principalLine, parsePrincipal, verifyPrincipal, volumeLifecycle } from '../mcp/tools/participant_unit.mjs'
+import { forcedCommand, keyFingerprint, principalLine, parsePrincipal, verifyPrincipal, volumeLifecycle } from '../mcp/tools/participant_unit.mjs'
 
 let fails = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); if (!value) fails++ }
@@ -88,7 +88,17 @@ const verify = (...args) => unit('verify', '--instance', 'claude-test', '--autho
 
 writeFileSync(keysFile, `${goodLine}\n`)
 const clean = verify()
-ok('a correctly installed principal verifies', clean.status === 0 && /verified 8\/8/.test(clean.stdout))
+ok('a correctly installed principal verifies', clean.status === 0 && /verified 9\/9/.test(clean.stdout))
+ok('the installed line carries the fingerprint of its own key', goodLine.includes(` --key-fp ${keyFingerprint(keyBody)}"`))
+
+// an older seat has no fingerprint: still verified, reported unproven, never rewritten
+const oldLine = goodLine.replace(/ --key-fp [^"]+/, '')
+writeFileSync(keysFile, `${oldLine}\n`)
+ok('an older line with no fingerprint still verifies, so no seat is broken', verify().status === 0)
+ok('an older line is reported unproven, not bound', verifyPrincipal(m, oldLine).fingerprint === 'unproven' && verifyPrincipal(m, goodLine).fingerprint === 'bound')
+writeFileSync(keysFile, `${goodLine.replace(/SHA256:./, 'SHA256:Z')}\n`)
+ok('a fingerprint naming another key FAILS', verify().status === 1)
+writeFileSync(keysFile, `${goodLine}\n`)
 
 writeFileSync(keysFile, `# a comment\nssh-ed25519 ${keyBody} someone-else@example\n${goodLine}\n`)
 ok('unrelated principals in the same file do not disturb the verdict', verify().status === 0)

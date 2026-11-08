@@ -15,6 +15,8 @@
 // Nothing in this module signs, reads a credential, or talks to Docker. It renders text and
 // compares text.
 
+import { createHash } from 'node:crypto'
+
 const NODE = '/usr/local/bin/node'
 const DOCKER = '/usr/bin/docker'
 const TOOL = '/srv/nvoy/mcp/tools/claude-channel.mjs'
@@ -61,13 +63,27 @@ export function channelArgv(manifest) {
   return [NODE, TOOL, '--instance', manifest.id]
 }
 
-export function forcedArgv(manifest) {
-  return [DOCKER, 'exec', '-i', '--user', `${manifest.workerUid}:${manifest.workerHandoffGid}`,
-    manifest.adapterContainer, ...channelArgv(manifest)]
+// OpenSSH's SHA256 fingerprint of an authorized_keys key body: base64 (unpadded) of the sha256 of the
+// decoded blob. A line that carries it in its forced command lets a running channel process name the
+// key that opened it, which is what the presence proof counts (waggle #721 step 4).
+export function keyFingerprint(keyBody) {
+  const blob = Buffer.from(String(keyBody || ''), 'base64')
+  if (!blob.length) throw new Error('key body is not base64')
+  return `SHA256:${createHash('sha256').update(blob).digest('base64').replace(/=+$/, '')}`
 }
 
-export function forcedCommand(manifest) {
-  return forcedArgv(manifest).join(' ')
+const FP_RE = /^SHA256:[A-Za-z0-9+/]{43}$/
+
+// `keyFp` is SSH-only: the HTTPS door uses channelArgv, which stays unchanged. A line without it is
+// an older seat — present, but its sessions cannot be attributed to a key.
+export function forcedArgv(manifest, keyFp = '') {
+  if (keyFp && !FP_RE.test(keyFp)) throw new Error('key fingerprint must be SHA256:<43 base64 chars>')
+  return [DOCKER, 'exec', '-i', '--user', `${manifest.workerUid}:${manifest.workerHandoffGid}`,
+    manifest.adapterContainer, ...channelArgv(manifest), ...(keyFp ? ['--key-fp', keyFp] : [])]
+}
+
+export function forcedCommand(manifest, keyFp = '') {
+  return forcedArgv(manifest, keyFp).join(' ')
 }
 
 export function principalComment(manifest) {
@@ -77,7 +93,7 @@ export function principalComment(manifest) {
 // `restrict` is the load-bearing prefix: no shell, no agent/port/X11 forwarding, no PTY. It is
 // written first so that a later option cannot be read as part of the command string.
 export function principalLine(manifest, keyType, keyBody) {
-  return `restrict,command="${forcedCommand(manifest)}" ${keyType} ${keyBody} ${principalComment(manifest)}`
+  return `restrict,command="${forcedCommand(manifest, keyFingerprint(keyBody))}" ${keyType} ${keyBody} ${principalComment(manifest)}`
 }
 
 // Pull apart an installed authorized_keys line without trusting its shape. Returns null when the
@@ -97,7 +113,10 @@ export function parsePrincipal(line) {
 export function verifyPrincipal(manifest, line) {
   const parsed = parsePrincipal(line)
   if (!parsed) return null
-  const expected = forcedCommand(manifest)
+  // An older line has no --key-fp: accepted as the manifest's command, but reported as unproven.
+  const fpMatch = / --key-fp (\S+)$/.exec(parsed.command)
+  const ownFp = keyFingerprint(parsed.keyBody)
+  const expected = forcedCommand(manifest, fpMatch ? ownFp : '')
   const findings = []
   const check = (ok, label, detail = '') => findings.push({ ok, label, detail })
 
@@ -110,8 +129,11 @@ export function verifyPrincipal(manifest, line) {
   check(parsed.command === expected, 'forced command matches the manifest', parsed.command === expected ? '' : `installed: ${parsed.command}`)
   check(parsed.command.includes(` --user ${manifest.workerUid}:${manifest.workerHandoffGid} `), 'runs as the manifest worker uid:gid')
   check(parsed.command.includes(` ${manifest.adapterContainer} `), 'targets the manifest adapter container')
-  check(parsed.command.endsWith(` --instance ${manifest.id}`), 'is bound to this instance')
+  check(parsed.command.endsWith(fpMatch ? ` --instance ${manifest.id} --key-fp ${ownFp}` : ` --instance ${manifest.id}`), 'is bound to this instance')
   check(parsed.command.includes(TOOL), 'invokes the channel tool and nothing else')
   check(parsed.comment === principalComment(manifest), 'carries the expected principal comment', parsed.comment)
-  return { parsed, findings, ok: findings.every(f => f.ok) }
+  // Not a failure: an old seat has no fingerprint, so its sessions can never prove a bound key.
+  const fingerprint = fpMatch ? (fpMatch[1] === ownFp ? 'bound' : 'mismatch') : 'unproven'
+  check(fingerprint !== 'mismatch', 'forced-command fingerprint is this line\'s own key', fingerprint === 'mismatch' ? `names ${fpMatch[1]}` : '')
+  return { parsed, findings, fingerprint, ok: findings.every(f => f.ok) }
 }
