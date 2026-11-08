@@ -863,6 +863,417 @@ export function computeCoherence({
   }
 }
 
+const REPO_PR_EXTRACT_RE = /\b(nvoy|nave\.pub|nave-pub|herd-infra|rabidrabbit|illustrated-primer|waggle|buzz)[-\s]*(?:pr[-\s]*)?#?(\d{2,4})\b/gi
+const SLUG_STEP_SUFFIX_RE = /-(?:owner|review|reviewed|approved|approval|deployed|deploy|merged|merge|status|hold|live|fix|fixes|fixed|verified|verify|wip|handoff|ready|done|receipt)(?:-[a-z0-9]+)*$/i
+
+export function computeSynapticEfficacy({
+  records = [],
+  history_records = null,
+  agent_roster = [],
+  recent_activity = [],
+  coherence = null,
+  curator_state = null,
+  now_sec = null,
+} = {}) {
+  const activeRecords = Array.isArray(records) ? records.filter(Boolean) : []
+  const sourceEvents = Array.isArray(history_records) && history_records.length > 0 ? history_records : activeRecords
+  const chronological = [...sourceEvents]
+    .filter(Boolean)
+    .sort((a, b) => (a.created_at || 0) - (b.created_at || 0) || (String(a.event_id || '') < String(b.event_id || '') ? -1 : 1))
+
+  const rosterArr = Array.isArray(agent_roster) ? agent_roster : []
+  const rosterByPk = new Map()
+  for (const a of rosterArr) {
+    if (a?.pubkey && a?.id) rosterByPk.set(a.pubkey, a.id)
+  }
+  rosterByPk.set('4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b287ea84d', 'james')
+
+  if (activeRecords.length === 0 && chronological.length === 0) {
+    return {
+      score: 0,
+      axes: { breadth: 0, precision: 0, velocity: 0, reuse: 0 },
+      distribution: {
+        recall_coverage_pct: 0,
+        read_before_write_pct: 0,
+        active_bus_agents: 0,
+        total_peer_seats: 0,
+        compliant_writers: [],
+        receipt_only_writers: [],
+        blind_seats: [],
+        writer_funnel: [],
+      },
+      retrieval: {
+        query_hit_rate_pct: 0,
+        query_hits: 0,
+        query_total: 0,
+        zero_hit_queries: 0,
+        wake_surface_pct: 0,
+        state_compression_pct: 0,
+        durable_claims: 0,
+        raw_class_a_claims: 0,
+      },
+      velocity: {
+        median_handoff_min: null,
+        p25_handoff_min: null,
+        handoff_count: 0,
+        multi_agent_chains: 0,
+        recent_handoffs: [],
+      },
+      reuse: {
+        corroborated_topic_pct: 0,
+        corroborated_topics: 0,
+        total_multi_claim_topics: 0,
+        reused_or_durable_pct: 0,
+        sprawl_slug_count: 0,
+      },
+      projected: {
+        after_curator_score: 0,
+        after_curator_precision: 0,
+        after_curator_reuse: 0,
+        after_wake_hook_score: 0,
+        after_wake_hook_breadth: 0,
+      },
+      history: [],
+    }
+  }
+
+  // --- 1. Distribution Breadth & Read-Before-Write Funnel ---
+  const activityList = Array.isArray(recent_activity) ? recent_activity : []
+  const actorStats = new Map()
+  const ensureActor = id => {
+    if (!actorStats.has(id)) {
+      actorStats.set(id, { actor: id, wakes: 0, queries: 0, query_hits: 0, lookups: 0, submits: 0 })
+    }
+    return actorStats.get(id)
+  }
+  let queryTotal = 0
+  let queryHits = 0
+  let zeroHitQueries = 0
+  for (const a of activityList) {
+    if (!a || typeof a !== 'object' || !a.actor) continue
+    const id = String(a.actor)
+    if (id === 'viewer' || id === 'curator') continue
+    const st = ensureActor(id)
+    if (a.kind === 'wake') st.wakes += 1
+    else if (a.kind === 'query') {
+      st.queries += 1
+      queryTotal += 1
+      if ((a.count || 0) > 0) {
+        st.query_hits += 1
+        queryHits += 1
+      } else {
+        zeroHitQueries += 1
+      }
+    } else if (a.kind === 'lookup') st.lookups += 1
+    else if (a.kind === 'submit' && a.accepted !== false) st.submits += 1
+  }
+
+  const peerReaders = rosterArr.filter(a => a && a.is_reader === true && a.id && a.id !== 'curator' && a.id !== 'viewer')
+  const compliantWriters = []
+  const receiptOnlyWriters = []
+  const blindSeats = []
+  const writerFunnel = []
+
+  for (const st of actorStats.values()) {
+    const recalled = st.wakes + st.queries > 0
+    const wrote = st.submits > 0 || st.lookups > 0
+    let mode = 'reader'
+    if (wrote && recalled) {
+      mode = 'read_before_write'
+      compliantWriters.push(st.actor)
+    } else if (wrote && !recalled) {
+      mode = 'receipt_only'
+      receiptOnlyWriters.push(st.actor)
+    } else if (recalled) {
+      mode = 'recall_only'
+    }
+    writerFunnel.push({ ...st, mode })
+  }
+  writerFunnel.sort((a, b) => (b.submits + b.queries + b.wakes) - (a.submits + a.queries + a.wakes))
+
+  let recalledSeatCount = 0
+  for (const seat of peerReaders) {
+    const st = actorStats.get(seat.id)
+    const hasRecall =
+      (st && st.wakes + st.queries > 0) ||
+      seat.last_recall_kind === 'wake' ||
+      seat.last_recall_kind === 'query' ||
+      seat.last_read_kind === 'wake' ||
+      seat.last_read_kind === 'query'
+    const hasWrite = (st && (st.submits > 0 || st.lookups > 0)) || Boolean(seat.last_write_at) || seat.last_read_kind === 'lookup'
+    if (hasRecall) {
+      recalledSeatCount += 1
+    } else if (!hasWrite) {
+      blindSeats.push(seat.id)
+    } else if (!receiptOnlyWriters.includes(seat.id)) {
+      receiptOnlyWriters.push(seat.id)
+    }
+  }
+
+  const recallCoveragePct = peerReaders.length > 0
+    ? Math.round((recalledSeatCount / peerReaders.length) * 1000) / 10
+    : (coherence?.epistemic_drift?.recall_coverage_pct ?? 75)
+  const totalActiveWriters = compliantWriters.length + receiptOnlyWriters.length
+  const readBeforeWritePct = totalActiveWriters > 0
+    ? Math.round((compliantWriters.length / totalActiveWriters) * 1000) / 10
+    : recallCoveragePct
+  const breadth = Math.round((0.55 * readBeforeWritePct + 0.45 * recallCoveragePct) * 10) / 10
+
+  // --- 2. Retrieval Precision & Signal-to-Noise ---
+  const queryHitRatePct = queryTotal > 0 ? Math.round((queryHits / queryTotal) * 1000) / 10 : 85
+  const nonCanon = activeRecords.filter(r => r.scope !== 'hive:canon')
+  const durableClaims = activeRecords.filter(
+    r => r.scope === 'hive:canon' || r.expires_at === null || r.expires_at === undefined || Boolean(r.merkle_sources)
+  ).length
+  const rawClassAClaims = Math.max(0, activeRecords.length - durableClaims)
+  const stateCompressionPct = activeRecords.length > 0
+    ? Math.round((durableClaims / activeRecords.length) * 1000) / 10
+    : 100
+  const wakeSurfacePct = activeRecords.length > 0
+    ? Math.min(100, Math.round((Math.min(10, activeRecords.length) / activeRecords.length) * 1000) / 10)
+    : 100
+  const compressionScore = Math.min(100, (stateCompressionPct / 50) * 100)
+  const precision = Math.round((0.60 * queryHitRatePct + 0.40 * compressionScore) * 10) / 10
+
+  // --- 3. Cross-Agent Handoff Velocity (Builder -> Reviewer -> Deployer) ---
+  function computeSliceVelocityAndReuse(slice) {
+    const sliceNonCanon = slice.filter(r => r && r.scope !== 'hive:canon')
+    const chains = new Map()
+    const eventChainMembership = new Set()
+    const addStep = (key, rec, actor, slug) => {
+      let arr = chains.get(key)
+      if (!arr) {
+        arr = []
+        chains.set(key, arr)
+      }
+      if (!arr.some(x => x.event_id === rec.event_id)) {
+        arr.push({
+          event_id: rec.event_id || `${actor}:${slug}:${rec.created_at}`,
+          actor,
+          slug,
+          at: rec.created_at || 0,
+          git: rec.as_of_git || null,
+          key,
+        })
+      }
+    }
+    for (const r of sliceNonCanon) {
+      const actor = rosterByPk.get(String(r.author_pubkey || '')) || String(r.author_pubkey || '').slice(0, 8) || 'unknown'
+      const slug = String(r.d || '').split(':').pop() || ''
+      const stem = slug.replace(SLUG_STEP_SUFFIX_RE, '')
+      if (stem && stem.length >= 3) addStep(`stem:${stem}`, r, actor, slug)
+      const blob = `${slug.replace(/-pr(\d+)/gi, ' #$1')} ${r.claim || ''}`
+      REPO_PR_EXTRACT_RE.lastIndex = 0
+      let m
+      while ((m = REPO_PR_EXTRACT_RE.exec(blob)) !== null) {
+        const repo = m[1].toLowerCase().replace('nave.pub', 'nave-pub').replace('rabidrabbit', 'illustrated-primer')
+        addStep(`pr:${repo}#${m[2]}`, r, actor, slug)
+      }
+    }
+
+    const handoffByPair = new Map()
+    const multiAgentChainKeys = new Set()
+    for (const [k, arr] of chains.entries()) {
+      if (arr.length >= 2) {
+        for (const item of arr) eventChainMembership.add(item.event_id)
+      }
+      arr.sort((a, b) => a.at - b.at)
+      const authors = new Set(arr.map(x => x.actor))
+      if (authors.size >= 2) {
+        const cleanKey = k.replace(/^(?:stem|pr):/, '')
+        multiAgentChainKeys.add(cleanKey)
+        for (let i = 1; i < arr.length; i++) {
+          if (arr[i].actor !== arr[i - 1].actor && arr[i].at >= arr[i - 1].at) {
+            const pairId = `${arr[i - 1].event_id}->${arr[i].event_id}`
+            const dtMin = Math.max(0.1, Math.round(((arr[i].at - arr[i - 1].at) / 60) * 10) / 10)
+            const prev = handoffByPair.get(pairId)
+            // Prefer explicit repo#PR label over generic stem label
+            if (!prev || k.startsWith('pr:')) {
+              handoffByPair.set(pairId, {
+                chain: cleanKey,
+                from: arr[i - 1].actor,
+                to: arr[i].actor,
+                from_slug: arr[i - 1].slug,
+                to_slug: arr[i].slug,
+                latency_min: dtMin,
+                at: arr[i].at,
+                git_ref: arr[i].git || arr[i - 1].git || null,
+              })
+            }
+          }
+        }
+      }
+    }
+    const handoffs = [...handoffByPair.values()].sort((a, b) => b.at - a.at)
+    const dts = handoffs.map(h => h.latency_min).sort((a, b) => a - b)
+    const medianMin = dts.length > 0 ? dts[Math.floor(dts.length / 2)] : null
+    const p25Min = dts.length > 0 ? dts[Math.floor(dts.length * 0.25)] : null
+
+    let latencyScore = 75
+    if (medianMin !== null) {
+      if (medianMin <= 5) latencyScore = 98
+      else if (medianMin <= 15) latencyScore = Math.round(98 - ((medianMin - 5) / 10) * 10)
+      else if (medianMin <= 60) latencyScore = Math.round(88 - ((medianMin - 15) / 45) * 16)
+      else latencyScore = Math.max(40, Math.round(72 - Math.min(32, (medianMin - 60) * 0.08)))
+    }
+    const targetHandoffs = Math.max(2, Math.min(12, Math.ceil(sliceNonCanon.length * 0.04)))
+    const volumeFactor = Math.min(1, handoffs.length / targetHandoffs)
+    const velocityScore = Math.round((0.75 * latencyScore + 0.25 * (volumeFactor * 100)) * 10) / 10
+
+    // --- 4. State Reuse vs. Slug Sprawl ---
+    const topicMap = new Map()
+    for (const r of sliceNonCanon) {
+      const actor = rosterByPk.get(String(r.author_pubkey || '')) || String(r.author_pubkey || '').slice(0, 8)
+      const top = String(r.topic || 'general')
+      let entry = topicMap.get(top)
+      if (!entry) {
+        entry = { count: 0, authors: new Set() }
+        topicMap.set(top, entry)
+      }
+      entry.count += 1
+      entry.authors.add(actor)
+    }
+    let multiClaimTopics = 0
+    let corroboratedTopics = 0
+    for (const info of topicMap.values()) {
+      if (info.count >= 2) {
+        multiClaimTopics += 1
+        if (info.authors.size >= 2) corroboratedTopics += 1
+      }
+    }
+    const corroboratedTopicPct = multiClaimTopics > 0
+      ? Math.round((corroboratedTopics / multiClaimTopics) * 1000) / 10
+      : 100
+
+    let sprawlSlugCount = 0
+    let reusedOrDurableCount = 0
+    for (const r of slice) {
+      const isDurable = r.scope === 'hive:canon' || r.expires_at === null || r.expires_at === undefined || Boolean(r.merkle_sources)
+      const inChain = eventChainMembership.has(r.event_id) || (Array.isArray(r.supersedes) && r.supersedes.length > 0)
+      if (isDurable || inChain) {
+        reusedOrDurableCount += 1
+      } else {
+        sprawlSlugCount += 1
+      }
+    }
+    const reusedOrDurablePct = slice.length > 0
+      ? Math.round((reusedOrDurableCount / slice.length) * 1000) / 10
+      : 100
+    const reuseScore = Math.round((0.45 * corroboratedTopicPct + 0.55 * Math.min(100, (reusedOrDurablePct / 65) * 100)) * 10) / 10
+
+    return {
+      velocityScore,
+      medianMin,
+      p25Min,
+      handoffCount: handoffs.length,
+      multiAgentChains: multiAgentChainKeys.size,
+      recentHandoffs: handoffs.slice(0, 8),
+      reuseScore,
+      corroboratedTopicPct,
+      corroboratedTopics,
+      multiClaimTopics,
+      reusedOrDurablePct,
+      sprawlSlugCount,
+    }
+  }
+
+  const currentVR = computeSliceVelocityAndReuse(activeRecords)
+  const velocity = currentVR.velocityScore
+  const reuse = currentVR.reuseScore
+  const score = Math.round((0.30 * breadth + 0.25 * precision + 0.25 * velocity + 0.20 * reuse) * 10) / 10
+
+  // --- 5. Projected Efficacy After @curator & Turn-Start Wake Hook ---
+  const stagedPromotions = Number(curator_state?.planned_summary?.promotions || 0)
+  const stagedDistillations = Number(curator_state?.planned_summary?.distillations || 0)
+  const stagedClusters = stagedPromotions + stagedDistillations || Number(coherence?.projected_after_dream?.staged_actions || 44)
+  const foldedRaw = Number(coherence?.projected_after_dream?.superseded_raw_claims || Math.min(rawClassAClaims, stagedClusters * 2))
+  const postCuratorTotal = Math.max(1, activeRecords.length - foldedRaw + stagedClusters)
+  const postCuratorDurable = Math.min(postCuratorTotal, durableClaims + stagedClusters)
+  const postCuratorCompressionPct = Math.round((postCuratorDurable / postCuratorTotal) * 1000) / 10
+  const afterCuratorPrecision = Math.round((0.60 * queryHitRatePct + 0.40 * Math.min(100, (postCuratorCompressionPct / 50) * 100)) * 10) / 10
+  const postCuratorReusedPct = Math.min(100, Math.round(((activeRecords.length - currentVR.sprawlSlugCount + Math.round(foldedRaw * 0.65)) / Math.max(1, activeRecords.length)) * 1000) / 10)
+  const afterCuratorReuse = Math.round((0.45 * currentVR.corroboratedTopicPct + 0.55 * Math.min(100, (postCuratorReusedPct / 65) * 100)) * 10) / 10
+  const afterCuratorScore = Math.round((0.30 * breadth + 0.25 * afterCuratorPrecision + 0.25 * velocity + 0.20 * afterCuratorReuse) * 10) / 10
+
+  const afterWakeHookBreadth = Math.round((0.55 * 100 + 0.45 * Math.max(recallCoveragePct, 80)) * 10) / 10
+  const afterWakeHookScore = Math.round((0.30 * afterWakeHookBreadth + 0.25 * afterCuratorPrecision + 0.25 * velocity + 0.20 * afterCuratorReuse) * 10) / 10
+
+  // --- 6. Historical Efficacy Trajectory ---
+  const cohHistory = Array.isArray(coherence?.history) ? coherence.history : []
+  const history = cohHistory.map((pt, idx) => {
+    const isLast = idx === cohHistory.length - 1
+    if (isLast) {
+      return {
+        at: pt.at,
+        claims: pt.claims,
+        score,
+        axes: { breadth, precision, velocity, reuse },
+      }
+    }
+    const sliceLen = Math.max(1, Math.min(chronological.length, pt.events || pt.claims || 1))
+    const slice = chronological.slice(0, sliceLen)
+    const vr = computeSliceVelocityAndReuse(slice)
+    const slDurable = slice.filter(r => r.scope === 'hive:canon' || r.expires_at === null || r.expires_at === undefined || Boolean(r.merkle_sources)).length
+    const slComp = (slDurable / slice.length) * 100
+    const slPrec = Math.round((0.60 * queryHitRatePct + 0.40 * Math.min(100, (slComp / 50) * 100)) * 10) / 10
+    const slBreadth = Math.round((0.5 * breadth + 0.5 * Math.min(100, (pt.axes?.coupling || breadth))) * 10) / 10
+    const slScore = Math.round((0.30 * slBreadth + 0.25 * slPrec + 0.25 * vr.velocityScore + 0.20 * vr.reuseScore) * 10) / 10
+    return {
+      at: pt.at,
+      claims: pt.claims,
+      score: slScore,
+      axes: { breadth: slBreadth, precision: slPrec, velocity: vr.velocityScore, reuse: vr.reuseScore },
+    }
+  })
+
+  return {
+    score,
+    axes: { breadth, precision, velocity, reuse },
+    distribution: {
+      recall_coverage_pct: recallCoveragePct,
+      read_before_write_pct: readBeforeWritePct,
+      active_bus_agents: actorStats.size,
+      total_peer_seats: peerReaders.length,
+      compliant_writers: compliantWriters,
+      receipt_only_writers: receiptOnlyWriters,
+      blind_seats: blindSeats,
+      writer_funnel: writerFunnel,
+    },
+    retrieval: {
+      query_hit_rate_pct: queryHitRatePct,
+      query_hits: queryHits,
+      query_total: queryTotal,
+      zero_hit_queries: zeroHitQueries,
+      wake_surface_pct: wakeSurfacePct,
+      state_compression_pct: stateCompressionPct,
+      durable_claims: durableClaims,
+      raw_class_a_claims: rawClassAClaims,
+    },
+    velocity: {
+      median_handoff_min: currentVR.medianMin,
+      p25_handoff_min: currentVR.p25Min,
+      handoff_count: currentVR.handoffCount,
+      multi_agent_chains: currentVR.multiAgentChains,
+      recent_handoffs: currentVR.recentHandoffs,
+    },
+    reuse: {
+      corroborated_topic_pct: currentVR.corroboratedTopicPct,
+      corroborated_topics: currentVR.corroboratedTopics,
+      total_multi_claim_topics: currentVR.multiClaimTopics,
+      reused_or_durable_pct: currentVR.reusedOrDurablePct,
+      sprawl_slug_count: currentVR.sprawlSlugCount,
+    },
+    projected: {
+      after_curator_score: afterCuratorScore,
+      after_curator_precision: afterCuratorPrecision,
+      after_curator_reuse: afterCuratorReuse,
+      after_wake_hook_score: afterWakeHookScore,
+      after_wake_hook_breadth: afterWakeHookBreadth,
+    },
+    history,
+  }
+}
+
 export const ACTIVE_WINDOW_SEC = 300
 // herd-infra's hive-memory-watch writes this every 5 minutes. Its writers map is the only place saving shows: the daemon's
 // store_state stays READY while every writer is fenced (2026-11-07, 04:15-12:20 UTC, no alert).
@@ -1560,7 +1971,7 @@ export function renderViewerHtml(initialState) {
     .alert-banner.warn { background: #92400e; border-color: #fcd34d; box-shadow: 0 0 18px rgba(245, 158, 11, 0.5); }
     .badge.info { color: #7dd3fc; background: var(--info-bg); border-color: rgba(56, 189, 248, 0.4); }
     .badge.sim { color: #fde68a; background: rgba(245, 158, 11, 0.12); border: 1px dashed rgba(251, 191, 36, 0.6); }
-    .telemetry-strip { display: flex; gap: 16px; padding: 8px 14px; flex-wrap: wrap; }
+    .telemetry-strip { display: flex; gap: 11px; padding: 8px 12px; flex-wrap: wrap; }
     .metric { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
     .metric-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
     .metric-val { font-family: var(--mono); font-size: 14px; font-weight: 700; word-break: break-word; }
@@ -1879,6 +2290,7 @@ export function renderViewerHtml(initialState) {
           <span class="mobile-kpi-pill" id="m-kpi-claims">claims: -</span>
           <span class="mobile-kpi-pill" id="m-kpi-tiers">-</span>
           <button class="mobile-kpi-pill" id="m-kpi-coherence" type="button" style="cursor:pointer;color:#6ee7b7;border-color:rgba(52,211,153,0.4);">coh: -</button>
+          <button class="mobile-kpi-pill" id="m-kpi-efficacy" type="button" style="cursor:pointer;color:#38bdf8;border-color:rgba(56,189,248,0.45);">eff: -</button>
           <button class="mobile-kpi-pill" id="m-kpi-dreaming" type="button" style="cursor:pointer;color:#c4b5fd;border-color:rgba(167,139,250,0.45);">dream: eigenvectors</button>
         </div>
         <div class="quarantine-banner">
@@ -1917,6 +2329,11 @@ export function renderViewerHtml(initialState) {
         <span class="metric-label" style="color:#6ee7b7;">Coherence 2.0</span>
         <span id="coherence-val" class="metric-val" style="color:#6ee7b7;">-</span>
         <span id="coherence-sub" class="metric-sub">tap for timeline</span>
+      </div>
+      <div class="metric" id="efficacy-card" style="cursor:pointer;" title="Tap to inspect 4-axis Synaptic Efficacy: Information Distribution Breadth, Retrieval Precision, Cross-Agent Handoff Velocity, and State Reuse">
+        <span class="metric-label" style="color:#38bdf8;">Synaptic Efficacy</span>
+        <span id="efficacy-val" class="metric-val" style="color:#38bdf8;">-</span>
+        <span id="efficacy-sub" class="metric-sub">handoff &amp; recall · tap</span>
       </div>
       <div class="metric" id="dreaming-card" style="cursor:pointer;" title="Tap to inspect Merkle Dreaming, 3-Trigger Curation State, and Stage 0 Spectral Topic Eigenvectors">
         <span class="metric-label" style="color:#c4b5fd;">Merkle Dreaming</span>
@@ -1973,6 +2390,7 @@ export function renderViewerHtml(initialState) {
       <button class="btn sim" id="btn-dream-consolidate" type="button">Inspect Curation (Passive)</button>
       <button class="btn sim" id="btn-dream-triggers" type="button">Inspect 3-Trigger State</button>
       <button class="btn sim" id="btn-dream-coherence" type="button">5-Axis Coherence</button>
+      <button class="btn sim" id="btn-dream-efficacy" type="button" style="border-color:rgba(56,189,248,0.55);color:#7dd3fc;">4-Axis Synaptic Efficacy</button>
     </div>
     <div class="control-bar panel">
       <label for="time-slider">Time-decay forecast</label>
@@ -3239,6 +3657,21 @@ export function renderViewerHtml(initialState) {
             '#6ee7b7',
             !selected && !hovered
           ));
+          if (latestEfficacy) {
+            var swRow = makeDiv('inspect-actions');
+            swRow.style.marginBottom = '4px';
+            var swBtn = document.createElement('button');
+            swBtn.type = 'button';
+            swBtn.className = 'btn sim';
+            swBtn.style.width = '100%';
+            swBtn.style.borderColor = 'rgba(56, 189, 248, 0.55)';
+            swBtn.style.color = '#7dd3fc';
+            var medH = latestEfficacy.velocity && latestEfficacy.velocity.median_handoff_min != null ? latestEfficacy.velocity.median_handoff_min + 'm handoff' : '4-axis';
+            swBtn.textContent = '⚡ Synaptic Efficacy: ' + Number(latestEfficacy.score || 0).toFixed(1) + '% (' + medH + ' · tap to inspect)';
+            swBtn.addEventListener('click', function () { openEfficacyInspector(); });
+            swRow.appendChild(swBtn);
+            box.appendChild(swRow);
+          }
           var hist = Array.isArray(coh.history) ? coh.history : [];
           if (hist.length > 0) {
             var windowNote = coh.history_complete === false ? ' [TRUNCATED]' : ' (90d history)';
@@ -3330,6 +3763,28 @@ export function renderViewerHtml(initialState) {
             }
             box.appendChild(edWrap);
 
+            if (latestEfficacy) {
+              var efTitle = makeDiv('inspect-kicker', 'Synaptic Efficacy & Operational Distribution');
+              efTitle.style.marginTop = '6px';
+              box.appendChild(efTitle);
+              var efWrap = makeDiv('kv-list');
+              var efScore = Number(latestEfficacy.score || 0);
+              var efAxes = latestEfficacy.axes || {};
+              var efDist = latestEfficacy.distribution || {};
+              var efRet = latestEfficacy.retrieval || {};
+              var efVel = latestEfficacy.velocity || {};
+              var efProj = latestEfficacy.projected || {};
+              efWrap.appendChild(kvRow('Overall Synaptic Efficacy (4-Axis)', efScore.toFixed(1) + '%', '#38bdf8'));
+              efWrap.appendChild(kvRow('1. Distribution Breadth (Read-First)', Number(efAxes.breadth || 0).toFixed(1) + '% (' + Number(efDist.read_before_write_pct || 0).toFixed(0) + '% R->W)', efAxes.breadth >= 70 ? '#34d399' : '#fbbf24'));
+              efWrap.appendChild(kvRow('2. Retrieval Precision (Signal/Noise)', Number(efAxes.precision || 0).toFixed(1) + '% (' + Number(efRet.query_hit_rate_pct || 0).toFixed(0) + '% hit)', '#38bdf8'));
+              efWrap.appendChild(kvRow('3. Cross-Agent Velocity (Handoff)', Number(efAxes.velocity || 0).toFixed(1) + '% (' + (efVel.median_handoff_min != null ? efVel.median_handoff_min + 'm med' : '-') + ')', '#34d399'));
+              efWrap.appendChild(kvRow('4. State Reuse vs. Slug Sprawl', Number(efAxes.reuse || 0).toFixed(1) + '% (' + (efVel.multi_agent_chains || 0) + ' chains)', '#a78bfa'));
+              if (efProj.after_wake_hook_score) {
+                efWrap.appendChild(kvRow('Projected Post-@curator + Wake Hook', Number(efProj.after_curator_score || 0).toFixed(1) + '% -> ' + Number(efProj.after_wake_hook_score).toFixed(1) + '%', '#c4b5fd'));
+              }
+              box.appendChild(efWrap);
+            }
+
             if (latestCuratorState && Array.isArray(latestCuratorState.consolidation_ledger) && latestCuratorState.consolidation_ledger.length > 0) {
               var ledg = latestCuratorState.consolidation_ledger;
               var ledgTitle = makeDiv('inspect-kicker', 'Recorded Consolidation Ledger (' + ledg.length + ' cycles)');
@@ -3394,6 +3849,129 @@ export function renderViewerHtml(initialState) {
               hList.appendChild(kvRow(label, detail, idx === hist.length - 1 ? '#6ee7b7' : null));
             });
             box.appendChild(hList);
+          }
+        } else if (target.type === 'efficacy') {
+          var eff = target.data;
+          var efVel = eff.velocity || {};
+          var efRet = eff.retrieval || {};
+          var efDist = eff.distribution || {};
+          var efReuse = eff.reuse || {};
+          var efProj = eff.projected || {};
+          var medBadge = (efVel.median_handoff_min != null ? efVel.median_handoff_min + 'm HANDOFF' : '4-AXIS') + ' · ' + Number(efRet.query_hit_rate_pct || 0).toFixed(0) + '% HIT';
+          box.appendChild(inspectHeader(
+            'Synaptic Efficacy · Information Distribution',
+            Number(eff.score || 0).toFixed(1) + ' / 100',
+            medBadge,
+            eff.score >= 70 ? 'ok' : 'warn',
+            '#38bdf8'
+          ));
+          var backRow = makeDiv('inspect-actions');
+          backRow.style.marginBottom = '4px';
+          var backBtn = document.createElement('button');
+          backBtn.type = 'button';
+          backBtn.className = 'btn sim';
+          backBtn.style.width = '100%';
+          backBtn.textContent = '⇄ Switch to 5-Axis Hive Coherence 2.0 (' + (latestCoherence ? Number(latestCoherence.score || 0).toFixed(1) + '%' : '-') + ')';
+          backBtn.addEventListener('click', function () { openCoherenceInspector(); });
+          backRow.appendChild(backBtn);
+          box.appendChild(backRow);
+
+          var efHist = Array.isArray(eff.history) ? eff.history : [];
+          if (efHist.length > 0) {
+            var efSparkTitle = makeDiv('inspect-kicker', 'Synaptic Efficacy & Handoff Velocity Trajectory (90d)');
+            efSparkTitle.style.marginTop = '2px';
+            box.appendChild(efSparkTitle);
+            var efCanvas = document.createElement('canvas');
+            efCanvas.width = 640;
+            efCanvas.height = 220;
+            efCanvas.style.width = '100%';
+            efCanvas.style.height = '136px';
+            efCanvas.style.minHeight = '136px';
+            efCanvas.style.flexShrink = '0';
+            efCanvas.style.display = 'block';
+            efCanvas.style.borderRadius = '8px';
+            efCanvas.style.background = 'rgba(2, 6, 23, 0.78)';
+            efCanvas.style.border = '1px solid rgba(56, 189, 248, 0.35)';
+            box.appendChild(efCanvas);
+            drawEfficacyGraphCanvas(efCanvas, eff);
+          }
+
+          var eAxes = eff.axes || {};
+          var eAxisRows = [
+            ['1. Distribution Breadth · Read-First (30%)', eAxes.breadth || 0, '#fbbf24'],
+            ['2. Retrieval Precision · Signal/Noise (25%)', eAxes.precision || 0, '#38bdf8'],
+            ['3. Cross-Agent Handoff Velocity (25%)', eAxes.velocity || 0, '#34d399'],
+            ['4. State Reuse vs. Slug Sprawl (20%)', eAxes.reuse || 0, '#a78bfa']
+          ];
+          var eAxesWrap = makeDiv('kv-list');
+          eAxisRows.forEach(function (item) {
+            var wrap = makeDiv('');
+            var rHead = makeDiv('kv-row');
+            rHead.appendChild(makeDiv('kv-key', item[0]));
+            var rVal = makeDiv('kv-val', Number(item[1]).toFixed(1) + '%');
+            rVal.style.color = item[2];
+            rHead.appendChild(rVal);
+            wrap.appendChild(rHead);
+            var bWrap = makeDiv('ttl-bar-wrap');
+            var bFill = makeDiv('ttl-bar-fill');
+            bFill.style.width = Math.max(0, Math.min(100, Number(item[1]))) + '%';
+            bFill.style.background = item[2];
+            bWrap.appendChild(bFill);
+            wrap.appendChild(bWrap);
+            eAxesWrap.appendChild(wrap);
+          });
+          box.appendChild(eAxesWrap);
+
+          var distTitle = makeDiv('inspect-kicker', 'Information Distribution & Read-Before-Write Funnel');
+          distTitle.style.marginTop = '6px';
+          box.appendChild(distTitle);
+          var distWrap = makeDiv('kv-list');
+          var rbwCol = efDist.read_before_write_pct >= 75 ? '#34d399' : '#fbbf24';
+          distWrap.appendChild(kvRow('Read-before-write ratio', Number(efDist.read_before_write_pct || 0).toFixed(1) + '% (' + (efDist.compliant_writers || []).length + ' read-first / ' + ((efDist.compliant_writers || []).length + (efDist.receipt_only_writers || []).length) + ' writers)', rbwCol, true));
+          distWrap.appendChild(kvRow('Fleet recall coverage (wake/query)', Number(efDist.recall_coverage_pct || 0).toFixed(1) + '% (' + (efDist.active_bus_agents || 0) + ' active on bus / ' + (efDist.total_peer_seats || 0) + ' seats)', efDist.recall_coverage_pct >= 70 ? '#34d399' : '#fbbf24', true));
+          distWrap.appendChild(kvRow('Query hit rate (retrieval precision)', Number(efRet.query_hit_rate_pct || 0).toFixed(1) + '% (' + (efRet.query_hits || 0) + '/' + (efRet.query_total || 0) + ' queries hit)', '#38bdf8', true));
+          distWrap.appendChild(kvRow('Wake digest surface visibility', Number(efRet.wake_surface_pct || 0).toFixed(1) + '% (top 10 of ' + ((efRet.durable_claims || 0) + (efRet.raw_class_a_claims || 0)) + ' claims)', '#94a3b8'));
+          distWrap.appendChild(kvRow('State compression (durable vs Class A)', Number(efRet.state_compression_pct || 0).toFixed(1) + '% (' + (efRet.durable_claims || 0) + ' durable · ' + (efRet.raw_class_a_claims || 0) + ' raw A)', '#c4b5fd', true));
+          distWrap.appendChild(kvRow('Multi-author topic corroboration', Number(efReuse.corroborated_topic_pct || 0).toFixed(1) + '% (' + (efReuse.corroborated_topics || 0) + '/' + (efReuse.total_multi_claim_topics || 0) + ' topics)', '#34d399'));
+          distWrap.appendChild(kvRow('Orphaned 1-step Class A PR slugs', (efReuse.sprawl_slug_count || 0) + ' single-use slugs awaiting fold', '#fbbf24'));
+          if (efProj.after_curator_score) {
+            distWrap.appendChild(kvRow('Projected Post-@curator Consolidation', Number(efProj.after_curator_score).toFixed(1) + '% (' + Number(efProj.after_curator_precision).toFixed(1) + '% precision)', '#c4b5fd'));
+          }
+          if (efProj.after_wake_hook_score) {
+            distWrap.appendChild(kvRow('Projected Post-@curator + Wake-Hook', Number(efProj.after_wake_hook_score).toFixed(1) + '% (' + Number(efProj.after_wake_hook_breadth).toFixed(1) + '% breadth)', '#34d399'));
+          }
+          box.appendChild(distWrap);
+
+          var funnel = Array.isArray(efDist.writer_funnel) ? efDist.writer_funnel : [];
+          if (funnel.length > 0) {
+            var fTitle = makeDiv('inspect-kicker', 'Active Bus Read-vs-Write Behavior (' + funnel.length + ' agents)');
+            fTitle.style.marginTop = '6px';
+            box.appendChild(fTitle);
+            var fWrap = makeDiv('kv-list');
+            funnel.forEach(function (f) {
+              var badge = f.mode === 'read_before_write'
+                ? '✓ READ+WRITE'
+                : (f.mode === 'receipt_only' ? '⚠ RECEIPT-ONLY' : '● RECALL-ONLY');
+              var col = f.mode === 'read_before_write' ? '#34d399' : (f.mode === 'receipt_only' ? '#fbbf24' : '#38bdf8');
+              var detail = f.wakes + ' wakes · ' + f.queries + ' queries (' + f.query_hits + ' hits) -> ' + f.submits + ' submits';
+              fWrap.appendChild(kvRow('@' + f.actor + ' [' + badge + ']', detail, col, true));
+            });
+            box.appendChild(fWrap);
+          }
+
+          var handoffs = Array.isArray(efVel.recent_handoffs) ? efVel.recent_handoffs : [];
+          if (handoffs.length > 0) {
+            var hoTitle = makeDiv('inspect-kicker', 'Autonomous Cross-Agent Handoffs (' + (efVel.handoff_count || handoffs.length) + ' transitions · ' + (efVel.median_handoff_min || '-') + 'm median)');
+            hoTitle.style.marginTop = '6px';
+            box.appendChild(hoTitle);
+            var hoWrap = makeDiv('kv-list');
+            handoffs.slice(0, 6).forEach(function (h) {
+              var hCol = h.latency_min <= 5 ? '#34d399' : (h.latency_min <= 25 ? '#38bdf8' : '#fbbf24');
+              var topLine = h.chain + ' · @' + h.from + ' -> @' + h.to + ' (' + h.latency_min + 'm)';
+              var botLine = h.from_slug + ' -> ' + h.to_slug + (h.git_ref ? ' [' + String(h.git_ref).slice(0, 8) + ']' : '');
+              hoWrap.appendChild(kvRow(topLine, botLine, hCol, true));
+            });
+            box.appendChild(hoWrap);
           }
         } else if (target.type === 'dreaming') {
           var dr = computeDreamingTelemetry();
@@ -4432,6 +5010,7 @@ export function renderViewerHtml(initialState) {
       if (el('btn-dream-consolidate')) el('btn-dream-consolidate').addEventListener('click', openDreamingInspector);
       if (el('btn-dream-triggers')) el('btn-dream-triggers').addEventListener('click', inspectDreamTriggers);
       if (el('btn-dream-coherence')) el('btn-dream-coherence').addEventListener('click', openCoherenceInspector);
+      if (el('btn-dream-efficacy')) el('btn-dream-efficacy').addEventListener('click', openEfficacyInspector);
       el('time-slider').addEventListener('input', function () {
         futureDays = Number(el('time-slider').value);
         el('time-label').textContent = futureDays === 0 ? 'NOW (+0.0d)' : 'FUTURE (+' + futureDays.toFixed(1) + 'd)';
@@ -4446,7 +5025,8 @@ export function renderViewerHtml(initialState) {
       });
 
       var latestCoherence = null;
-      var VIEWER_VERSION = '2026-11-07-v7';
+      var latestEfficacy = null;
+      var VIEWER_VERSION = '2026-11-07-v9';
       function openCoherenceInspector() {
         if (!latestCoherence) return;
         if (view !== 'graph') switchView('graph');
@@ -4456,10 +5036,132 @@ export function renderViewerHtml(initialState) {
         renderAgentRoster();
         renderInspector();
       }
+      function openEfficacyInspector() {
+        if (!latestEfficacy) return;
+        if (view !== 'graph') switchView('graph');
+        setDrawer('none');
+        selected = { type: 'efficacy', data: latestEfficacy };
+        hovered = null;
+        renderAgentRoster();
+        renderInspector();
+      }
       if (el('coherence-card')) el('coherence-card').addEventListener('click', openCoherenceInspector);
       if (el('m-kpi-coherence')) el('m-kpi-coherence').addEventListener('click', openCoherenceInspector);
+      if (el('efficacy-card')) el('efficacy-card').addEventListener('click', openEfficacyInspector);
+      if (el('m-kpi-efficacy')) el('m-kpi-efficacy').addEventListener('click', openEfficacyInspector);
       if (el('dreaming-card')) el('dreaming-card').addEventListener('click', openDreamingInspector);
       if (el('m-kpi-dreaming')) el('m-kpi-dreaming').addEventListener('click', openDreamingInspector);
+
+      function drawEfficacyGraphCanvas(cv, eff) {
+        if (!cv || !eff) return;
+        var hist = Array.isArray(eff.history) ? eff.history : [];
+        if (!hist.length) return;
+        var sctx = cv.getContext('2d');
+        if (!sctx) return;
+        var sw = cv.width;
+        var sh = cv.height;
+        sctx.clearRect(0, 0, sw, sh);
+        var padX = 42;
+        var padTop = 40;
+        var padBot = 26;
+        var proj = eff.projected || null;
+        var totalPts = proj && proj.after_wake_hook_score ? hist.length + 1 : hist.length;
+        var xOf = function (idx) {
+          return padX + (totalPts <= 1 ? (sw - padX - 20) / 2 : (idx / (totalPts - 1)) * (sw - padX - 24));
+        };
+        var yOf = function (val) {
+          var clamped = Math.max(20, Math.min(100, Number(val || 0)));
+          return sh - padBot - ((clamped - 20) / 80) * (sh - padTop - padBot);
+        };
+        sctx.strokeStyle = 'rgba(148, 163, 184, 0.18)';
+        sctx.lineWidth = 1;
+        sctx.font = '600 11px ui-monospace, SFMono-Regular, Menlo, monospace';
+        sctx.fillStyle = 'rgba(148, 163, 184, 0.85)';
+        sctx.textAlign = 'left';
+        [25, 50, 75, 100].forEach(function (lvl) {
+          var gy = yOf(lvl);
+          sctx.beginPath();
+          sctx.moveTo(padX, gy);
+          sctx.lineTo(sw - 16, gy);
+          sctx.stroke();
+          sctx.fillText(lvl + '%', 4, gy + 4);
+        });
+        // Dashed Amber curve: Cross-Agent Handoff Velocity
+        sctx.save();
+        sctx.setLineDash([6, 4]);
+        sctx.beginPath();
+        hist.forEach(function (pt, idx) {
+          var px = xOf(idx);
+          var velVal = pt.axes && typeof pt.axes.velocity === 'number' ? pt.axes.velocity : pt.score;
+          var py = yOf(velVal);
+          if (idx === 0) sctx.moveTo(px, py);
+          else sctx.lineTo(px, py);
+        });
+        sctx.strokeStyle = '#fbbf24';
+        sctx.lineWidth = 2.4;
+        sctx.stroke();
+        sctx.restore();
+        // Solid Cyan curve: Overall Synaptic Efficacy
+        sctx.beginPath();
+        hist.forEach(function (pt, idx) {
+          var px = xOf(idx);
+          var py = yOf(pt.score);
+          if (idx === 0) sctx.moveTo(px, py);
+          else sctx.lineTo(px, py);
+        });
+        sctx.strokeStyle = '#38bdf8';
+        sctx.lineWidth = 3.2;
+        sctx.stroke();
+        if (proj && typeof proj.after_wake_hook_score === 'number') {
+          sctx.save();
+          sctx.setLineDash([5, 3]);
+          sctx.beginPath();
+          sctx.moveTo(xOf(hist.length - 1), yOf(hist[hist.length - 1].score));
+          sctx.lineTo(xOf(hist.length), yOf(proj.after_wake_hook_score));
+          sctx.strokeStyle = '#34d399';
+          sctx.lineWidth = 2.8;
+          sctx.stroke();
+          sctx.restore();
+          sctx.beginPath();
+          sctx.arc(xOf(hist.length), yOf(proj.after_wake_hook_score), 5, 0, Math.PI * 2);
+          sctx.fillStyle = '#34d399';
+          sctx.fill();
+        }
+        hist.forEach(function (pt, idx) {
+          var px = xOf(idx);
+          var py = yOf(pt.score);
+          sctx.beginPath();
+          sctx.arc(px, py, 3.8, 0, Math.PI * 2);
+          sctx.fillStyle = idx === hist.length - 1 ? '#fbbf24' : '#38bdf8';
+          sctx.fill();
+        });
+        sctx.font = '600 10.5px ui-monospace, SFMono-Regular, Menlo, monospace';
+        sctx.fillStyle = '#94a3b8';
+        sctx.textAlign = 'left';
+        sctx.fillText('Inception', padX, sh - 7);
+        if (hist.length > 2) {
+          var midIdx = Math.floor((hist.length - 1) / 2);
+          sctx.textAlign = 'center';
+          sctx.fillText('#' + hist[midIdx].claims, xOf(midIdx), sh - 7);
+        }
+        sctx.textAlign = 'right';
+        sctx.fillStyle = '#fbbf24';
+        sctx.fillText('Now #' + hist[hist.length - 1].claims, Math.min(xOf(hist.length - 1), sw - 78), sh - 7);
+        sctx.fillStyle = '#34d399';
+        sctx.fillText('+WakeHook', sw - 8, sh - 7);
+        // 2-line legend
+        sctx.textAlign = 'left';
+        sctx.font = '700 11.5px ui-monospace, SFMono-Regular, Menlo, monospace';
+        sctx.fillStyle = '#38bdf8';
+        sctx.fillText('● Synaptic Efficacy: ' + Number(eff.score || 0).toFixed(1) + '%', 8, 15);
+        var velNow = eff.axes && typeof eff.axes.velocity === 'number' ? eff.axes.velocity.toFixed(1) : '-';
+        sctx.fillStyle = '#fbbf24';
+        sctx.fillText('--- Handoff Velocity: ' + velNow + '%', 250, 15);
+        if (proj && typeof proj.after_wake_hook_score === 'number') {
+          sctx.fillStyle = '#34d399';
+          sctx.fillText('◆ Post-@curator (' + Number(proj.after_curator_score || 0).toFixed(1) + '%) + Wake-Hook Projection: ' + proj.after_wake_hook_score.toFixed(1) + '%', 8, 30);
+        }
+      }
 
       function drawCoherenceGraphCanvas(cv, coh, isMini) {
         if (!cv || !coh) return;
@@ -4700,6 +5402,18 @@ export function renderViewerHtml(initialState) {
           if (el('m-kpi-coherence')) el('m-kpi-coherence').textContent = 'coh 2.0: ' + cScore + '% (' + edSt + ')';
           renderCoherencePanels(s.coherence);
         }
+        if (s.efficacy && typeof s.efficacy === 'object') {
+          latestEfficacy = s.efficacy;
+          if (selected && selected.type === 'efficacy') selected.data = latestEfficacy;
+          var eScore = Number(s.efficacy.score || 0).toFixed(1);
+          var eVel = s.efficacy.velocity || {};
+          var eRet = s.efficacy.retrieval || {};
+          var medTxt = eVel.median_handoff_min != null ? (eVel.median_handoff_min + 'm handoff') : '4-axis';
+          var hitTxt = Number(eRet.query_hit_rate_pct || 0).toFixed(0) + '% hit';
+          if (el('efficacy-val')) el('efficacy-val').textContent = eScore + '%';
+          if (el('efficacy-sub')) el('efficacy-sub').textContent = medTxt + ' · ' + hitTxt + ' · tap';
+          if (el('m-kpi-efficacy')) el('m-kpi-efficacy').textContent = 'eff: ' + eScore + '% (' + medTxt + ')';
+        }
         if (s.curator_state && typeof s.curator_state === 'object') {
           var eigCount = Array.isArray(s.curator_state.topic_eigenvectors) ? s.curator_state.topic_eigenvectors.length : 0;
           var reorgCount = Array.isArray(s.curator_state.topic_reorganizations) ? s.curator_state.topic_reorganizations.length : 0;
@@ -4785,6 +5499,7 @@ export async function startMemoryViewer({
     store_state: { state: 'CONNECTING', write_seq: null, current_claims: null, last_backup_age_sec: null, unbacked_writes: null },
     scope_counts: { canon: 0, ops: 0, rooms: 0, self: 0, canon_unverified: 0, unverified_total: 0 },
     coherence: computeCoherence(),
+    efficacy: computeSynapticEfficacy(),
     curator_state: {
       state_file_present: false,
       last_curated_at: null,
@@ -4950,12 +5665,21 @@ export async function startMemoryViewer({
           }
         }
       }
+      const efficacy = computeSynapticEfficacy({
+        records,
+        history_records: historyRecords,
+        agent_roster: agentRoster,
+        recent_activity: recentActivity,
+        coherence,
+        curator_state: curatorState,
+        now_sec: nowSec,
+      })
       const queryAnswer = firstQuery?.answer === 'unknown'
         ? 'unknown'
         : (records.length > 0 ? 'found' : String(firstQuery?.answer || 'unknown'))
 
       nextSnapshot = {
-        viewer_version: '2026-11-07-v5',
+        viewer_version: '2026-11-07-v9',
         connected: true,
         error: null,
         server_name: client.getServerName() || 'hive-memory-viewer',
@@ -4968,6 +5692,7 @@ export async function startMemoryViewer({
         store_state: storeState,
         scope_counts: scopeCounts,
         coherence,
+        efficacy,
         curator_state: curatorState,
         consolidated_sources: consolidatedSources,
         agent_health: healthResult.summary,

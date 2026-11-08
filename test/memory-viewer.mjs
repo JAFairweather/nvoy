@@ -13,6 +13,7 @@ import {
   computeAgentHealth,
   computeCoherence,
   computeDreamingTelemetry,
+  computeSynapticEfficacy,
   diffViewerSnapshots,
   readWatchStatus,
   watchAlert,
@@ -432,6 +433,79 @@ await test('computeCoherence calculates 5-axis HCI score and retroactive incepti
   assert(cohBlindFleet.epistemic_drift.alerts.some(a => a.category === 'behavioral_noncompliance' && a.code === 'WRITE_WITHOUT_RECALL' && a.actor === 'waggle-dev'))
   assert(cohBlindFleet.epistemic_drift.alerts.some(a => a.category === 'behavioral_noncompliance' && a.code === 'BLIND_ROSTER_SEAT' && a.actor === 'dennis'))
   assert(cohBlindFleet.score < coh.score - 15, `fleet amnesia must significantly lower coherence (${cohBlindFleet.score} vs ${coh.score})`)
+})
+
+await test('computeSynapticEfficacy: quantifies 4-axis information distribution, cross-agent handoff velocity, and post-curator projection', () => {
+  const emptyEff = computeSynapticEfficacy()
+  assert.equal(emptyEff.score, 0)
+  assert.deepEqual(emptyEff.axes, { breadth: 0, precision: 0, velocity: 0, reuse: 0 })
+
+  const roster = [
+    { id: 'mydude', pubkey: '1'.repeat(64), is_reader: true, is_writer: true },
+    { id: 'waggle-dev', pubkey: '2'.repeat(64), is_reader: true, is_writer: true },
+    { id: 'dead-rabbit', pubkey: '3'.repeat(64), is_reader: true, is_writer: true },
+    { id: 'dennis', pubkey: '4'.repeat(64), is_reader: true, is_writer: true },
+  ]
+  const records = [
+    {
+      event_id: 'e1'.padEnd(64, '0'),
+      author_pubkey: '2'.repeat(64),
+      scope: 'room:a8186b53-537d-46ad-a7e7-b6486c58970e',
+      d: 'hive-memory:room:a8186b53-537d-46ad-a7e7-b6486c58970e:nvoy-pr343-owner',
+      topic: 'nvoy',
+      claim: 'Opened nvoy PR #343 at d30aa219',
+      as_of_git: 'd30aa219'.padEnd(40, '0'),
+      created_at: 1000,
+      expires_at: 5000,
+    },
+    {
+      event_id: 'e2'.padEnd(64, '0'),
+      author_pubkey: '1'.repeat(64),
+      scope: 'room:a8186b53-537d-46ad-a7e7-b6486c58970e',
+      d: 'hive-memory:room:a8186b53-537d-46ad-a7e7-b6486c58970e:nvoy-pr343-review',
+      topic: 'nvoy',
+      claim: 'Source-approved nvoy PR #343 at d30aa219',
+      as_of_git: 'd30aa219'.padEnd(40, '0'),
+      created_at: 1120,
+      expires_at: 5000,
+    },
+    {
+      event_id: 'e3'.padEnd(64, '0'),
+      author_pubkey: '3'.repeat(64),
+      scope: 'room:a8186b53-537d-46ad-a7e7-b6486c58970e',
+      d: 'hive-memory:room:a8186b53-537d-46ad-a7e7-b6486c58970e:nvoy-343-deployed',
+      topic: 'nvoy',
+      claim: 'Deployed nvoy #343 on nvoy-fleet',
+      as_of_git: 'ff2cf77b'.padEnd(40, '0'),
+      created_at: 1240,
+      expires_at: null,
+    },
+  ]
+  const activity = [
+    { kind: 'wake', actor: 'mydude', count: 5 },
+    { kind: 'query', actor: 'mydude', count: 3, topic: 'nvoy' },
+    { kind: 'lookup', actor: 'mydude' },
+    { kind: 'submit', actor: 'mydude', accepted: true },
+    { kind: 'lookup', actor: 'waggle-dev' },
+    { kind: 'submit', actor: 'waggle-dev', accepted: true },
+    { kind: 'query', actor: 'dead-rabbit', count: 0, topic: 'missing' },
+    { kind: 'lookup', actor: 'dead-rabbit' },
+    { kind: 'submit', actor: 'dead-rabbit', accepted: true },
+  ]
+  const eff = computeSynapticEfficacy({
+    records,
+    agent_roster: roster,
+    recent_activity: activity,
+    curator_state: { planned_summary: { promotions: 2, distillations: 1 } },
+    now_sec: 1300,
+  })
+  assert(eff.score > 50 && eff.score <= 100)
+  assert.equal(eff.velocity.handoff_count, 2, 'detects waggle-dev -> mydude -> dead-rabbit handoffs')
+  assert.equal(eff.velocity.median_handoff_min, 2)
+  assert.equal(eff.retrieval.query_hit_rate_pct, 50)
+  assert.deepEqual(eff.distribution.compliant_writers, ['mydude', 'dead-rabbit'])
+  assert.deepEqual(eff.distribution.receipt_only_writers, ['waggle-dev'])
+  assert(eff.projected.after_wake_hook_score >= eff.score)
 })
 
 await test('computeAgentHealth: classifies 5m active, 5-20m warm, >20m stale, error, and preserves telemetry across rollover', () => {
