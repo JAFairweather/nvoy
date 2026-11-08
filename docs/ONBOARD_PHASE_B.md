@@ -153,3 +153,34 @@ relay.nave.pub or `--writer-relay`.
   - a runner connection that signs as another key publishes nothing.
 - **Capability start** (`test/capability-start.mjs`, #325): for each capability a manifest can turn
   on, a rendered compose and the broker's start accept a manifest with it on.
+
+## Channel presence (step 4 of the proof)
+
+The page's step 4 needs a signed kind 30078 `nvoy-channel-presence` from the agent's own key (#345).
+Two halves, because only the host sees channel processes and only the broker may sign.
+
+- **Host collector.** `nvoy-presence.timer` runs `nvoy-presence.service` every 30 s as root. It reads
+  `/proc`, the adapter container id and the installed authorized_keys line, and writes one
+  counts-only snapshot per instance to `/var/lib/nvoy/presence`. It signs nothing. A process counts
+  only if its cgroup is the adapter container, its uid is the worker uid, and its whole argv is
+  exactly the channel command naming the line's own key fingerprint.
+- **Broker.** Mounts that directory read-only, and every 30 s judges the snapshot. It signs only on a
+  change, and re-signs an unchanged event every 30 minutes (its expiry is 2 h). A missing, stale or other-key snapshot,
+  or one with only older untagged sessions, signs nothing; that reads as unproven, never as a drop.
+
+**One-time root install on the fleet host** (the deploy runner fetches the files into `/opt/nvoy-hub`;
+it does not install units):
+
+    install -m 0644 /opt/nvoy-hub/deploy/nvoy-presence.service /etc/systemd/system/
+    install -m 0644 /opt/nvoy-hub/deploy/nvoy-presence.timer /etc/systemd/system/
+    # edit --authorized-keys in the service to the channel account's file (see /etc/nvoy/onboard/runner.json)
+    systemctl daemon-reload && systemctl enable --now nvoy-presence.timer
+    ls -l /var/lib/nvoy/presence/        # one <instance>.json per instance, refreshed every 30 s
+
+Seats installed before #345 have no `--key-fp` on their line: they stay present and report unproven,
+and are not rewritten. A new seat's line carries it. The broker's compose gains the read-only mount
+when the deploy runner next re-renders and recreates it.
+
+**Proven by tests, not yet live:** counting, judging, deciding and the collector against a fake
+`/proc`. **Live gates:** the Bunker seat allows kind 30078; the unit points at the real
+authorized_keys; a presence event newer than the bind receipt reads back on the relay.
