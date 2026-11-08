@@ -165,7 +165,7 @@ Two halves, because only the host sees channel processes and only the broker may
   only if its cgroup is the adapter container, its uid is the worker uid, and its whole argv is
   exactly the channel command naming the line's own key fingerprint.
 - **Broker.** Mounts that directory read-only, and every 30 s judges the snapshot. It signs only on a
-  change or when the last event is half way to its 2 h expiry. A missing, stale or other-key snapshot,
+  change, and re-signs an unchanged event every 30 minutes (its expiry is 2 h). A missing, stale or other-key snapshot,
   or one with only older untagged sessions, signs nothing; that reads as unproven, never as a drop.
 
 **One-time root install on the fleet host** (the deploy runner fetches the files into `/opt/nvoy-hub`;
