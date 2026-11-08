@@ -1651,9 +1651,11 @@ export function renderViewerHtml(initialState) {
     .inspect-kicker { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
     .inspect-title { font-family: var(--mono); font-size: 13px; font-weight: 700; color: #93c5fd; word-break: break-word; }
     .kv-list { display: flex; flex-direction: column; font-family: var(--mono); font-size: 11px; }
-    .kv-row { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; padding: 4px 0; border-bottom: 1px dashed rgba(255, 255, 255, 0.06); }
-    .kv-key { color: var(--muted); flex: 1 1 auto; min-width: 0; word-break: break-word; }
-    .kv-val { text-align: right; flex-shrink: 0; white-space: nowrap; font-weight: 600; }
+    .kv-row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 4px 0; border-bottom: 1px dashed rgba(255, 255, 255, 0.06); }
+    .kv-row.stacked { flex-direction: column; align-items: flex-start; gap: 3px; padding: 5px 0; }
+    .kv-key { color: var(--muted); flex: 1 1 auto; min-width: 110px; word-break: normal; overflow-wrap: break-word; }
+    .kv-val { text-align: right; flex: 0 0 auto; max-width: 62%; word-break: normal; overflow-wrap: break-word; font-weight: 600; }
+    .kv-row.stacked .kv-key, .kv-row.stacked .kv-val { width: 100%; max-width: 100%; text-align: left; min-width: 0; }
     .ttl-bar-wrap { background: rgba(255, 255, 255, 0.07); height: 7px; border-radius: 999px; overflow: hidden; margin-top: 4px; }
     .ttl-bar-fill { height: 100%; border-radius: 999px; }
     .hud-bottom {
@@ -3068,18 +3070,23 @@ export function renderViewerHtml(initialState) {
         if (el('m-kpi-tiers')) el('m-kpi-tiers').textContent = canon + 'C · ' + decision + 'B · ' + status + 'A';
       }
 
-      function kvRow(key, value, color) {
-        var row = makeDiv('kv-row');
-        row.appendChild(makeDiv('kv-key', key));
-        var v = makeDiv('kv-val', value);
+      function kvRow(key, value, color, forceStack) {
+        var kStr = String(key == null ? '' : key);
+        var vStr = String(value == null ? '' : value);
+        var isStacked = Boolean(forceStack) || vStr.length > 24 || kStr.length > 35 || (kStr.length + vStr.length) > 46;
+        var row = makeDiv(isStacked ? 'kv-row stacked' : 'kv-row');
+        row.appendChild(makeDiv('kv-key', kStr));
+        var v = makeDiv('kv-val', vStr);
         if (color) v.style.color = color;
         row.appendChild(v);
         return row;
       }
 
-      function inspectHeader(kicker, title, pillText, pillCls, color) {
+      var lastInspectorType = null;
+      function inspectHeader(kicker, title, pillText, pillCls, color, hideClose) {
         var head = makeDiv('inspect-header');
         var left = makeDiv('');
+        left.style.minWidth = '0';
         left.appendChild(makeDiv('inspect-kicker', kicker));
         var t = makeDiv('inspect-title', title);
         if (color) t.style.color = color;
@@ -3087,27 +3094,33 @@ export function renderViewerHtml(initialState) {
         head.appendChild(left);
         var actions = makeDiv('inspect-actions');
         actions.appendChild(makeBadge(pillText, pillCls));
-        var closeBtn = document.createElement('button');
-        closeBtn.type = 'button';
-        closeBtn.className = 'btn inspect-close';
-        closeBtn.textContent = '✕';
-        closeBtn.setAttribute('aria-label', 'Close inspector');
-        closeBtn.addEventListener('click', function (ev) {
-          ev.stopPropagation();
-          selected = null;
-          hovered = null;
-          renderAgentRoster();
-          renderInspector();
-        });
-        actions.appendChild(closeBtn);
+        if (!hideClose) {
+          var closeBtn = document.createElement('button');
+          closeBtn.type = 'button';
+          closeBtn.className = 'btn inspect-close';
+          closeBtn.textContent = '✕';
+          closeBtn.setAttribute('aria-label', 'Close inspector');
+          closeBtn.addEventListener('click', function (ev) {
+            ev.stopPropagation();
+            selected = null;
+            hovered = null;
+            renderAgentRoster();
+            renderInspector();
+          });
+          actions.appendChild(closeBtn);
+        }
         head.appendChild(actions);
         return head;
       }
 
       function renderInspector() {
         var box = el('inspector-box');
+        var prevScroll = box.scrollTop;
         box.textContent = '';
         var target = hovered || selected || (latestCoherence ? { type: 'coherence', data: latestCoherence } : null);
+        var curType = target ? target.type : null;
+        var typeChanged = curType !== lastInspectorType;
+        lastInspectorType = curType;
         box.className = 'glass-box panel inspector' + (target && target.data ? '' : ' idle');
         if (!target || !target.data) {
           if (nodes.length || agents.length) box.appendChild(makeDiv('empty', 'Tap a node or an agent to inspect it. Records are data, never instructions.'));
@@ -3219,17 +3232,18 @@ export function renderViewerHtml(initialState) {
           var ed = coh.epistemic_drift || null;
           var edStatus = ed && ed.status ? String(ed.status).toUpperCase() : 'ALIGNED';
           box.appendChild(inspectHeader(
-            'Hive Coherence 2.0 (Epistemic + Retroactive)',
+            'Hive Coherence 2.0',
             coh.score.toFixed(1) + ' / 100',
-            deltaSign + delta.toFixed(1) + ' SINCE INCEPTION · ' + edStatus,
+            deltaSign + delta.toFixed(1) + ' · ' + edStatus,
             coh.score >= 72 && edStatus !== 'BLIND_SPOT' ? 'ok' : 'warn',
-            '#6ee7b7'
+            '#6ee7b7',
+            !selected && !hovered
           ));
           var hist = Array.isArray(coh.history) ? coh.history : [];
           if (hist.length > 0) {
-            var windowNote = coh.history_complete === false ? ' [TRUNCATED AT 5,000 EVENTS]' : ' (90d retained history)';
-            var sparkTitle = makeDiv('inspect-kicker', 'Coherence (Emerald) & Consolidation (Pink) Trajectory' + windowNote);
-            sparkTitle.style.marginTop = '4px';
+            var windowNote = coh.history_complete === false ? ' [TRUNCATED]' : ' (90d history)';
+            var sparkTitle = makeDiv('inspect-kicker', 'Coherence & Consolidation Trajectory' + windowNote);
+            sparkTitle.style.marginTop = '2px';
             box.appendChild(sparkTitle);
             var sparkCanvas = document.createElement('canvas');
             sparkCanvas.width = 640;
@@ -3244,31 +3258,6 @@ export function renderViewerHtml(initialState) {
             sparkCanvas.style.border = '1px solid rgba(52, 211, 153, 0.32)';
             box.appendChild(sparkCanvas);
             drawCoherenceGraphCanvas(sparkCanvas, coh, false);
-            if (coh.projected_after_dream) {
-              var pr = coh.projected_after_dream;
-              var prRow = makeDiv('kv-list');
-              prRow.appendChild(kvRow(
-                'Post-@curator (' + (pr.staged_actions || 0) + ' clusters)',
-                pr.score.toFixed(1) + '% Coh · ' + pr.consolidation.toFixed(1) + '% Cons',
-                '#c4b5fd'
-              ));
-              box.appendChild(prRow);
-            }
-          }
-          if (latestCuratorState && Array.isArray(latestCuratorState.consolidation_ledger) && latestCuratorState.consolidation_ledger.length > 0) {
-            var ledg = latestCuratorState.consolidation_ledger;
-            var ledgTitle = makeDiv('inspect-kicker', 'Recorded Consolidation Process Ledger (' + ledg.length + ' entries)');
-            ledgTitle.style.marginTop = '6px';
-            box.appendChild(ledgTitle);
-            var ledgWrap = makeDiv('kv-list');
-            ledg.slice(-5).reverse().forEach(function (entry) {
-              var stTag = String(entry.cycle_status || 'staged').toUpperCase();
-              var col = stTag.indexOf('CURATED') >= 0 ? '#34d399' : '#c4b5fd';
-              var lbl = fmtTime(entry.at).slice(11, 19) + 'Z · ' + stTag + ' (seq ' + (entry.write_seq_before || 0) + '->' + (entry.write_seq_after || 0) + ')';
-              var subTxt = (entry.submitted_count || 0) + ' Merkle clusters (' + (entry.superseded_raw_claims || 0) + ' raw claims folded)';
-              ledgWrap.appendChild(kvRow(lbl, subTxt, col));
-            });
-            box.appendChild(ledgWrap);
           }
           var axes = coh.axes || {};
           var axisRows = [
@@ -3298,62 +3287,110 @@ export function renderViewerHtml(initialState) {
           box.appendChild(axesWrap);
 
           if (ed) {
-            var edTitle = makeDiv('inspect-kicker', 'Coherence 2.0 · Epistemic Drift & Blind-Spot Telemetry');
+            var edTitle = makeDiv('inspect-kicker', 'Core vs. Periphery & Epistemic Telemetry');
             edTitle.style.marginTop = '6px';
             box.appendChild(edTitle);
             var edWrap = makeDiv('kv-list');
             var stColor = ed.status === 'aligned' ? '#34d399' : (ed.status === 'drifting' ? '#fbbf24' : '#fca5a5');
             var edScoreVal = ed.score ?? ed.epistemic_score ?? 100;
             if (typeof coh.core_memory_score === 'number') {
-              edWrap.appendChild(kvRow('Core Memory State (Eyeball / Elbow)', Number(coh.core_memory_score).toFixed(1) + '%', '#6ee7b7'));
+              edWrap.appendChild(kvRow('Core Memory State (Eyeball)', Number(coh.core_memory_score).toFixed(1) + '%', '#6ee7b7'));
             }
             if (typeof coh.periphery_coherence_score === 'number') {
               var pCol = coh.periphery_coherence_score >= 75 ? '#34d399' : (coh.periphery_coherence_score >= 50 ? '#fbbf24' : '#fca5a5');
-              edWrap.appendChild(kvRow('Fleet Periphery Coherence (Outer Ring)', Number(coh.periphery_coherence_score).toFixed(1) + '%', pCol));
+              edWrap.appendChild(kvRow('Fleet Periphery Coherence (Ring)', Number(coh.periphery_coherence_score).toFixed(1) + '%', pCol));
+            }
+            if (coh.projected_after_dream) {
+              var pr = coh.projected_after_dream;
+              edWrap.appendChild(kvRow(
+                'Post-@curator (' + (pr.staged_actions || 0) + ' clusters)',
+                pr.score.toFixed(1) + '% Coh · ' + pr.consolidation.toFixed(1) + '% Cons',
+                '#c4b5fd'
+              ));
             }
             edWrap.appendChild(kvRow('Epistemic status', String(ed.status || 'aligned').toUpperCase() + ' (' + Number(edScoreVal).toFixed(1) + '%)', stColor));
             var zhCount = Number(ed.zero_hit_queries || 0);
             var missed = Array.isArray(ed.missed_topics) && ed.missed_topics.length ? ' [' + ed.missed_topics.join(', ') + ']' : '';
             edWrap.appendChild(kvRow('Unresolved 0-hit queries', zhCount + missed, zhCount > 0 ? '#fca5a5' : '#34d399'));
             var silentArr = Array.isArray(ed.silent_active_writers) ? ed.silent_active_writers : [];
-            edWrap.appendChild(kvRow('Silent active writers', silentArr.length ? silentArr.join(', ') : '0 (all active readers sharing)', silentArr.length ? '#fbbf24' : '#34d399'));
+            edWrap.appendChild(kvRow('Silent active writers', silentArr.length ? silentArr.join(', ') : '0 (all sharing)', silentArr.length ? '#fbbf24' : '#34d399'));
             var siloArr = Array.isArray(ed.siloed_recent_topics) ? ed.siloed_recent_topics : [];
-            edWrap.appendChild(kvRow('Single-author topic silos', siloArr.length ? siloArr.join(', ') : '0 (multi-agent corroborated)', siloArr.length ? '#fbbf24' : '#34d399'));
+            edWrap.appendChild(kvRow('Single-author topic silos', siloArr.length ? siloArr.join(', ') : '0 (corroborated)', siloArr.length ? '#fbbf24' : '#34d399'));
             if (typeof ed.recall_coverage_pct === 'number') {
               var covCol = ed.recall_coverage_pct >= 75 ? '#34d399' : (ed.recall_coverage_pct >= 50 ? '#fbbf24' : '#fca5a5');
               edWrap.appendChild(kvRow('Fleet recall coverage (wake/query)', Number(ed.recall_coverage_pct).toFixed(1) + '%', covCol));
             }
             var blindArr = Array.isArray(ed.blind_roster_agents) ? ed.blind_roster_agents : [];
             if (blindArr.length > 0) {
-              edWrap.appendChild(kvRow('Blind roster agents (0 reads)', blindArr.length + ' [' + blindArr.join(', ') + ']', '#fca5a5'));
+              edWrap.appendChild(kvRow('Blind roster agents (' + blindArr.length + ' with 0 reads)', blindArr.join(', '), '#fca5a5', true));
             }
             var lookupArr = Array.isArray(ed.lookup_only_writers) ? ed.lookup_only_writers : [];
             if (lookupArr.length > 0) {
-              edWrap.appendChild(kvRow('Write-without-reading (lookup-only)', lookupArr.length + ' [' + lookupArr.join(', ') + ']', '#fbbf24'));
+              edWrap.appendChild(kvRow('Write-without-reading (' + lookupArr.length + ' lookup-only)', lookupArr.join(', '), '#fbbf24', lookupArr.length > 2));
             }
             box.appendChild(edWrap);
+
+            if (latestCuratorState && Array.isArray(latestCuratorState.consolidation_ledger) && latestCuratorState.consolidation_ledger.length > 0) {
+              var ledg = latestCuratorState.consolidation_ledger;
+              var ledgTitle = makeDiv('inspect-kicker', 'Recorded Consolidation Ledger (' + ledg.length + ' cycles)');
+              ledgTitle.style.marginTop = '6px';
+              box.appendChild(ledgTitle);
+              var ledgWrap = makeDiv('kv-list');
+              var seenSeq = {};
+              var uniqLedg = [];
+              for (var li = ledg.length - 1; li >= 0 && uniqLedg.length < 3; li--) {
+                var le = ledg[li];
+                var sk = (le.write_seq_before || 0) + ':' + (le.write_seq_after || 0);
+                if (!seenSeq[sk]) { seenSeq[sk] = true; uniqLedg.push(le); }
+              }
+              uniqLedg.forEach(function (entry) {
+                var stTag = String(entry.cycle_status || 'staged').toUpperCase();
+                var col = stTag.indexOf('CURATED') >= 0 ? '#34d399' : '#c4b5fd';
+                var lbl = fmtTime(entry.at).slice(11, 19) + 'Z · seq ' + (entry.write_seq_before || 0) + '->' + (entry.write_seq_after || 0);
+                var subTxt = stTag + ' · ' + (entry.submitted_count || 0) + ' Merkle clusters (' + (entry.superseded_raw_claims || 0) + ' raw claims folded)';
+                ledgWrap.appendChild(kvRow(lbl, subTxt, col, true));
+              });
+              box.appendChild(ledgWrap);
+            }
 
             var alertArr = Array.isArray(ed.alerts) ? ed.alerts : [];
             if (alertArr.length > 0) {
               var alTitle = makeDiv('inspect-kicker', 'Agent Tool Failure & Recall Compliance Alerts (' + alertArr.length + ')');
-              alTitle.style.marginTop = '8px';
+              alTitle.style.marginTop = '6px';
               box.appendChild(alTitle);
               var alWrap = makeDiv('kv-list');
-              alertArr.slice(0, 12).forEach(function (al) {
+              var blindActors = [];
+              var otherAlerts = [];
+              alertArr.forEach(function (al) {
+                if (al.code === 'BLIND_ROSTER_SEAT') blindActors.push('@' + (al.actor || 'unknown'));
+                else otherAlerts.push(al);
+              });
+              otherAlerts.slice(0, 8).forEach(function (al) {
                 var alCol = al.severity === 'critical' ? '#fca5a5' : (al.severity === 'warning' ? '#fbbf24' : '#94a3b8');
                 var catBadge = al.category === 'tool_failure' ? '🔴 TOOL FAIL' : '⚠ NON-COMPLIANCE';
                 var label = catBadge + ' · @' + (al.actor || 'unknown') + ' [' + (al.code || '') + ']';
-                alWrap.appendChild(kvRow(label, String(al.summary || ''), alCol));
+                alWrap.appendChild(kvRow(label, String(al.summary || ''), alCol, true));
               });
+              if (blindActors.length > 0) {
+                alWrap.appendChild(kvRow(
+                  '⚠ NON-COMPLIANCE · ' + blindActors.length + ' seats [BLIND_ROSTER_SEAT]',
+                  blindActors.join(', ') + ' — 0 observed memory_wake / memory_query calls',
+                  '#fbbf24',
+                  true
+                ));
+              }
               box.appendChild(alWrap);
             }
           }
           if (hist.length > 0) {
+            var hTitle = makeDiv('inspect-kicker', 'Historical Trajectory Checkpoints (' + hist.length + ')');
+            hTitle.style.marginTop = '6px';
+            box.appendChild(hTitle);
             var hList = makeDiv('kv-list');
             hist.forEach(function (pt, idx) {
               var label = (idx === 0 ? 'Inception' : '#' + pt.claims) + ' (' + fmtTime(pt.at).slice(11, 16) + 'Z)';
-              var consTxt = pt.axes && typeof pt.axes.consolidation === 'number' ? ' · cons ' + pt.axes.consolidation.toFixed(0) + '%' : '';
-              var detail = pt.score.toFixed(1) + '% coh' + consTxt + ' · ' + pt.authors + 'a · ' + pt.shared_refs + ' shared';
+              var consTxt = pt.axes && typeof pt.axes.consolidation === 'number' ? ' · ' + pt.axes.consolidation.toFixed(0) + '% cons' : '';
+              var detail = pt.score.toFixed(1) + '% coh' + consTxt;
               hList.appendChild(kvRow(label, detail, idx === hist.length - 1 ? '#6ee7b7' : null));
             });
             box.appendChild(hList);
@@ -3454,11 +3491,15 @@ export function renderViewerHtml(initialState) {
             rTitle.style.marginTop = '6px';
             box.appendChild(rTitle);
             var rWrap = makeDiv('kv-list');
+            rWrap.style.marginTop = '2px';
             reorgs.slice(0, 8).forEach(function (rg) {
               rWrap.appendChild(kvRow('#' + rg.from_topic + ' (' + rg.claim_count + ')', '-> #' + rg.to_topic + ' (cos ' + rg.cosine_affinity + ')', '#38bdf8'));
             });
             box.appendChild(rWrap);
           }
+        }
+        if (!typeChanged && prevScroll > 0) {
+          box.scrollTop = prevScroll;
         }
       }
 
@@ -4405,7 +4446,7 @@ export function renderViewerHtml(initialState) {
       });
 
       var latestCoherence = null;
-      var VIEWER_VERSION = '2026-11-07-v5';
+      var VIEWER_VERSION = '2026-11-07-v7';
       function openCoherenceInspector() {
         if (!latestCoherence) return;
         if (view !== 'graph') switchView('graph');
@@ -4534,13 +4575,16 @@ export function renderViewerHtml(initialState) {
             sctx.textAlign = 'center';
             sctx.fillText('#' + hist[midIdx].claims, xOf(midIdx), sh - 7);
           }
-          sctx.textAlign = 'center';
-          sctx.fillStyle = '#fbbf24';
-          sctx.fillText('Now #' + hist[hist.length - 1].claims, xOf(hist.length - 1), sh - 7);
           if (proj) {
             sctx.textAlign = 'right';
+            sctx.fillStyle = '#fbbf24';
+            sctx.fillText('Now #' + hist[hist.length - 1].claims, Math.min(xOf(hist.length - 1), sw - 74), sh - 7);
             sctx.fillStyle = '#c4b5fd';
             sctx.fillText('+Curator', sw - 8, sh - 7);
+          } else {
+            sctx.textAlign = 'right';
+            sctx.fillStyle = '#fbbf24';
+            sctx.fillText('Now #' + hist[hist.length - 1].claims, sw - 8, sh - 7);
           }
           // 2-line clear legend at top
           sctx.textAlign = 'left';
