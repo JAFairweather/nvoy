@@ -853,6 +853,11 @@ await test('live integration: memory-viewer polls memory-daemon viewer socket, s
     assert.deepEqual(state1.recent_activity, [])
     assert.deepEqual(state1.agent_roster.map(a => [a.id, a.is_owner]), [['owner', true]])
 
+    // The page reloads whenever the live snapshot's viewer_version differs from its own, so the two must match.
+    const pageRes = await httpGet(viewer.port, '/')
+    assert.equal(typeof state1.viewer_version, 'string')
+    assert(pageRes.body.includes(`var VIEWER_VERSION = '${state1.viewer_version}';`), 'page and snapshot viewer_version must match or the page reloads forever')
+
     // 2. Non-GET/HEAD requests are refused with 405
     const postRes = await httpGet(viewer.port, '/api/state', 'POST')
     assert.equal(postRes.status, 405)
