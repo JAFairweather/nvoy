@@ -30,6 +30,7 @@ const MD_FENCE_RE = /```/
 const MD_HEADER_RE = /(?:^|\n)\s*#{1,6}\s+/
 const URL_RE = /\b(?:https?|file):\/\/\S+/i
 const AT_MENTION_RE = /(?:^|[\s(])@[a-zA-Z0-9_-]+/
+const DIGIT_RE = /\d/
 
 export function countWords(text) {
   const trimmed = String(text || '').trim()
@@ -72,6 +73,9 @@ export function verifyAndAssembleDreamRecord({ packet, draft } = {}) {
     if (AT_MENTION_RE.test(title)) {
       errors.push('draft.title must not contain @mentions')
     }
+    if (DIGIT_RE.test(title)) {
+      errors.push('draft.title must not contain digits, statistics, sequence numbers, scores, or counts')
+    }
   }
 
   const dream = typeof draft.dream === 'string' ? draft.dream.trim() : ''
@@ -99,6 +103,9 @@ export function verifyAndAssembleDreamRecord({ packet, draft } = {}) {
     }
     if (AT_MENTION_RE.test(dream)) {
       errors.push('draft.dream must not contain @mentions')
+    }
+    if (DIGIT_RE.test(dream)) {
+      errors.push('draft.dream must not contain digits, statistics, sequence numbers, scores, or counts')
     }
   }
 
@@ -197,13 +204,13 @@ export function dreamVerifyToolSpec() {
         },
         title: {
           type: 'string',
-          description: 'Plain-text dream title (1..140 chars, no markdown/HTML/hex IDs/@mentions).',
+          description: 'Plain-text dream title (1..140 chars, no digits/statistics/counts, no markdown/HTML/hex IDs/@mentions).',
           minLength: 1,
           maxLength: 140,
         },
         dream: {
           type: 'string',
-          description: 'Plain, voice-friendly dream prose (1..300 words, <=2400 chars, no markdown fences/headers, HTML tags, URLs, raw 16+ hex IDs, or @mentions).',
+          description: 'Plain, voice-friendly dream prose (1..300 words, <=2400 chars, no digits/statistics/sequence numbers/scores/counts, no markdown fences/headers, HTML tags, URLs, raw 16+ hex IDs, or @mentions).',
           minLength: 1,
           maxLength: 2400,
         },

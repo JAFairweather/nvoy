@@ -1389,6 +1389,19 @@ await test('writeDreamPacket writes 0640 global-scope packets, strips @mentions/
     assert.equal(badProseRes.ok, false)
     assert(badProseRes.errors.some(e => e.includes('hex IDs')))
     assert(badProseRes.errors.some(e => e.includes('@mentions')))
+
+    // Digits / statistics / counts in title or dream fail closed at the verifier boundary
+    const digitRes = verifyAndAssembleDreamRecord({
+      packet: pkt,
+      draft: {
+        title: 'Journey 42',
+        dream: 'The 7 agents crossed a bridge after 3 tests passed.',
+        referenced_change_ids: [claimIdGlobal],
+      },
+    })
+    assert.equal(digitRes.ok, false, 'verifier must reject digits/counts in title and dream')
+    assert(digitRes.errors.some(e => e.includes('draft.title') && e.includes('digits')))
+    assert(digitRes.errors.some(e => e.includes('draft.dream') && e.includes('digits')))
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }
