@@ -1135,5 +1135,76 @@ await test('the health check status shows saving off, partly off, stale or unrea
   }
 })
 
+await test('pollOnce coalesces concurrent polls and reuses cached corpus on unchanged write_seq', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'viewer-coalesce-'))
+  const dbPath = join(tmp, 'memory.sqlite')
+  const ledgerPath = join(tmp, 'accepted-ledger.jsonl')
+  const receiptPath = join(tmp, 'last-verified-backup.json')
+  const socketDir = join(tmp, 'sockets')
+  const ownerSk = generateSecretKey()
+  const ownerPk = getPublicKey(ownerSk)
+  const viewerSk = generateSecretKey()
+  const viewerPk = getPublicKey(viewerSk)
+  const room = 'a8186b53-537d-46ad-a7e7-b6486c58970e'
+  const nowSec = Math.floor(Date.now() / 1000)
+  initEmptyStore({ dbPath, ledgerPath })
+  recordVerifiedBackup({ receiptPath, snapshotId: SNAP_ID, writeSeq: 1, at: nowSec })
+  const daemon = await startMemoryDaemon({
+    dbPath,
+    ledgerPath,
+    receiptPath,
+    config: {
+      memoryGlobalChannelId: room,
+      ownerPubkey: ownerPk,
+      maxUnbackedSec: 3600,
+      globalWriters: [ownerPk],
+      canonWriters: [ownerPk],
+      readers: { viewer: viewerPk },
+      writers: { james: { pubkey: ownerPk, perHour: 30 } },
+      rooms: { [room]: { members: [ownerPk, viewerPk], writers: [ownerPk] } },
+    },
+    readers: 'viewer',
+    writers: 'james',
+    socketDir,
+    log: () => {},
+  })
+  let viewer = null
+  try {
+    viewer = await startMemoryViewer({
+      socketPath: join(socketDir, 'viewer.sock'),
+      host: '127.0.0.1',
+      port: 0,
+      pollMs: 60000,
+    })
+    const seq0 = viewer.getState().poll_seq
+    const [s1, s2, s3] = await Promise.all([viewer.pollOnce(), viewer.pollOnce(), viewer.pollOnce()])
+    assert.equal(s1.poll_seq, seq0 + 1, 'concurrent pollOnce calls must coalesce into one in-flight poll')
+    assert.equal(s2.poll_seq, seq0 + 1)
+    assert.equal(s3.poll_seq, seq0 + 1)
+
+    const sCached = await viewer.pollOnce({ forceFull: false })
+    assert.equal(sCached.poll_seq, seq0 + 2)
+    assert.equal(sCached.store_state.write_seq, 1)
+
+    const root1 = await httpGet(viewer.port, '/')
+    const root2 = await httpGet(viewer.port, '/')
+    assert.equal(root1.status, 200)
+    assert.equal(root2.status, 200)
+    assert.equal(root1.body, root2.body, 'same poll_seq reuses cached HTML')
+    assert(root1.body.includes(`"poll_seq":${seq0 + 2}`))
+
+    const sNext = await viewer.pollOnce({ forceFull: false })
+    assert.equal(sNext.poll_seq, seq0 + 3)
+    const root3 = await httpGet(viewer.port, '/')
+    assert.equal(root3.status, 200)
+    assert.notEqual(root3.body, root1.body, 'new poll_seq must invalidate cached HTML and reflect updated state')
+    assert(root3.body.includes(`"poll_seq":${seq0 + 3}`))
+  } finally {
+    if (viewer) await viewer.stop()
+    await daemon.close()
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
 console.log(`\nResults: ${passed} passed, ${failed} failed`)
 process.exit(failed > 0 ? 1 : 0)

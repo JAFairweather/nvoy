@@ -5949,7 +5949,14 @@ export async function startMemoryViewer({
     event_log: [],
   }
 
+  let pollInFlight = null
+  let pollTimer = null
+  let cachedCorpus = null
+  let cachedHtmlKey = null
+  let cachedHtmlBuf = null
+
   function broadcastState() {
+    if (sseClients.size === 0) return
     const payload = `data: ${JSON.stringify(currentState)}\n\n`
     for (const res of sseClients) {
       try {
@@ -5960,49 +5967,105 @@ export async function startMemoryViewer({
     }
   }
 
-  async function pollOnce() {
+  async function runPoll({ forceFull = true } = {}) {
     if (stopped) return currentState
     const nowSec = Math.floor(Date.now() / 1000)
+    const nowMs = Date.now()
     pollSeq += 1
     let nextSnapshot
     try {
       const wake = await client.callReadTool('memory_wake', {})
-      const byKey = new Map()
-      const byEventId = new Map()
-      let firstQuery = null
-      let cursor = '0'
-      let pages = 0
-      while (cursor !== null && pages < 50) {
-        const page = await client.callReadTool('memory_query', {
-          limit: 100,
-          format: 'full',
-          include_history: true,
-          ...(cursor !== '0' ? { cursor } : {}),
-        })
-        if (!firstQuery) firstQuery = page
-        for (const r of Array.isArray(page?.records) ? page.records : []) {
+      const wakeSeq = wake?.store_state?.write_seq
+      const canReuseCorpus =
+        !forceFull &&
+        cachedCorpus !== null &&
+        Number.isSafeInteger(wakeSeq) &&
+        wakeSeq > 0 &&
+        wakeSeq === cachedCorpus.writeSeq &&
+        wake?.store_state?.state === 'READY' &&
+        nowMs - cachedCorpus.atMs < 15_000
+
+      let records
+      let historyRecords
+      let byEventId
+      let firstQuery
+      let historyComplete
+      let spectral
+      let previewPlan
+      let consolidatedSources
+
+      if (canReuseCorpus) {
+        records = cachedCorpus.records
+        historyRecords = cachedCorpus.historyRecords
+        byEventId = cachedCorpus.byEventId
+        firstQuery = cachedCorpus.firstQuery
+        historyComplete = cachedCorpus.historyComplete
+        spectral = cachedCorpus.spectral
+        previewPlan = cachedCorpus.previewPlan
+        consolidatedSources = cachedCorpus.consolidatedSources
+      } else {
+        const byKey = new Map()
+        byEventId = new Map()
+        firstQuery = null
+        let cursor = '0'
+        let pages = 0
+        while (cursor !== null && pages < 50) {
+          const page = await client.callReadTool('memory_query', {
+            limit: 100,
+            format: 'full',
+            include_history: true,
+            ...(cursor !== '0' ? { cursor } : {}),
+          })
+          if (!firstQuery) firstQuery = page
+          for (const r of Array.isArray(page?.records) ? page.records : []) {
+            const clean = sanitizeMemoryRecord(r)
+            if (!clean) continue
+            if (clean.event_id) byEventId.set(clean.event_id, clean)
+            if (clean.is_current && clean.status !== 'withdrawn' && clean.verification === 'accepted') {
+              byKey.set(`${clean.author_pubkey}:${clean.d}`, clean)
+            }
+          }
+          cursor = typeof page?.next_cursor === 'string' && page.next_cursor ? page.next_cursor : null
+          pages += 1
+        }
+        // Since Phase 2 wake records are bare references (no claim); only full records are shown.
+        for (const r of Array.isArray(wake?.records) ? wake.records.filter(x => typeof x?.claim === 'string') : []) {
           const clean = sanitizeMemoryRecord(r)
-          if (!clean) continue
-          if (clean.event_id) byEventId.set(clean.event_id, clean)
-          if (clean.is_current && clean.status !== 'withdrawn' && clean.verification === 'accepted') {
+          if (clean && !byKey.has(`${clean.author_pubkey}:${clean.d}`)) {
             byKey.set(`${clean.author_pubkey}:${clean.d}`, clean)
+            if (clean.event_id && !byEventId.has(clean.event_id)) byEventId.set(clean.event_id, clean)
           }
         }
-        cursor = typeof page?.next_cursor === 'string' && page.next_cursor ? page.next_cursor : null
-        pages += 1
-      }
-      // Since Phase 2 wake records are bare references (no claim); only full records are shown.
-      for (const r of Array.isArray(wake?.records) ? wake.records.filter(x => typeof x?.claim === 'string') : []) {
-        const clean = sanitizeMemoryRecord(r)
-        if (clean && !byKey.has(`${clean.author_pubkey}:${clean.d}`)) {
-          byKey.set(`${clean.author_pubkey}:${clean.d}`, clean)
-          if (clean.event_id && !byEventId.has(clean.event_id)) byEventId.set(clean.event_id, clean)
+        records = [...byKey.values()].sort(
+          (a, b) => (a.computed_rank || 99) - (b.computed_rank || 99) || (b.created_at || 0) - (a.created_at || 0)
+        )
+        historyRecords = [...byEventId.values()]
+        historyComplete = cursor === null
+        spectral = computeTopicEigenvectors(records, { maxComponents: 7 })
+        previewPlan = planMerkleDream({ records, nowSec })
+        consolidatedSources = {}
+        for (const r of records) {
+          if (Array.isArray(r.supersedes)) {
+            for (const sid of r.supersedes) {
+              const srcRec = byEventId.get(sid)
+              if (srcRec) consolidatedSources[sid] = srcRec
+            }
+          }
+        }
+        cachedCorpus = {
+          writeSeq: wakeSeq ?? firstQuery?.store_state?.write_seq ?? null,
+          atMs: nowMs,
+          records,
+          historyRecords,
+          byEventId,
+          firstQuery,
+          historyComplete,
+          spectral,
+          previewPlan,
+          consolidatedSources,
         }
       }
-      const records = [...byKey.values()].sort(
-        (a, b) => (a.computed_rank || 99) - (b.computed_rank || 99) || (b.created_at || 0) - (a.created_at || 0)
-      )
-      const historyRecords = [...byEventId.values()]
+
       const scopeCounts = computeScopeCounts(wake?.counts, records)
       const rawRoster = (Array.isArray(wake?.agent_roster) ? wake.agent_roster : []).map(sanitizeRosterEntry).filter(Boolean)
       const recentActivity = (Array.isArray(wake?.recent_activity) ? wake.recent_activity : []).map(sanitizeActivity).filter(Boolean)
@@ -6016,7 +6079,6 @@ export async function startMemoryViewer({
       })
       const agentRoster = healthResult.roster
       const storeState = wake?.store_state || firstQuery?.store_state || { state: 'UNKNOWN', write_seq: null, current_claims: null, last_backup_age_sec: null, unbacked_writes: null }
-      const historyComplete = cursor === null
       const coherence = computeCoherence({
         records,
         history_records: historyRecords,
@@ -6045,8 +6107,6 @@ export async function startMemoryViewer({
         writeDeltaThreshold,
         topicPressureThreshold,
       })
-      const spectral = computeTopicEigenvectors(records, { maxComponents: 7 })
-      const previewPlan = planMerkleDream({ records, nowSec })
       const hasPersistedEigens =
         lastCuratedAt > 0 &&
         Array.isArray(persistedCurator?.topic_eigenvectors) &&
@@ -6103,15 +6163,6 @@ export async function startMemoryViewer({
           nightmares: previewPlan.nightmares.length,
         },
       }
-      const consolidatedSources = {}
-      for (const r of records) {
-        if (Array.isArray(r.supersedes)) {
-          for (const sid of r.supersedes) {
-            const srcRec = byEventId.get(sid)
-            if (srcRec) consolidatedSources[sid] = srcRec
-          }
-        }
-      }
       curatorState.display_mode = resolveDreamDisplayMode({
         records,
         curator_state: curatorState,
@@ -6155,6 +6206,7 @@ export async function startMemoryViewer({
         recent_activity: recentActivity,
       }
     } catch (err) {
+      cachedCorpus = null
       nextSnapshot = {
         ...currentState,
         connected: false,
@@ -6181,11 +6233,26 @@ export async function startMemoryViewer({
     return currentState
   }
 
-  await pollOnce()
-  const pollTimer = setInterval(() => {
-    void pollOnce()
-  }, pollMs)
-  pollTimer.unref?.()
+  function pollOnce(opts = {}) {
+    if (stopped) return Promise.resolve(currentState)
+    if (pollInFlight) return pollInFlight
+    pollInFlight = runPoll(opts).finally(() => {
+      pollInFlight = null
+    })
+    return pollInFlight
+  }
+
+  function scheduleNextPoll() {
+    if (stopped) return
+    pollTimer = setTimeout(async () => {
+      await pollOnce({ forceFull: false })
+      scheduleNextPoll()
+    }, pollMs)
+    pollTimer.unref?.()
+  }
+
+  await pollOnce({ forceFull: true })
+  scheduleNextPoll()
 
   const securityHeaders = {
     'Content-Security-Policy':
@@ -6235,13 +6302,17 @@ export async function startMemoryViewer({
     }
 
     if (urlPath === '/' || urlPath === '/index.html') {
-      const html = renderViewerHtml(currentState)
+      const htmlKey = `${currentState.poll_seq ?? 0}:${currentState.connected}:${currentState.error || ''}:${currentState.store_state?.state || ''}:${currentState.store_state?.write_seq ?? ''}:${currentState.records?.length ?? 0}:${currentState.curator_state?.last_curated_write_seq ?? 0}:${currentState.event_log?.length ?? 0}`
+      if (cachedHtmlKey !== htmlKey || !cachedHtmlBuf) {
+        cachedHtmlBuf = Buffer.from(renderViewerHtml(currentState), 'utf8')
+        cachedHtmlKey = htmlKey
+      }
       res.writeHead(200, {
         ...securityHeaders,
         'Content-Type': 'text/html; charset=utf-8',
-        'Content-Length': Buffer.byteLength(html),
+        'Content-Length': cachedHtmlBuf.length,
       })
-      res.end(method === 'HEAD' ? undefined : html)
+      res.end(method === 'HEAD' ? undefined : cachedHtmlBuf)
       return
     }
 
@@ -6267,7 +6338,7 @@ export async function startMemoryViewer({
     getState: () => currentState,
     async stop() {
       stopped = true
-      clearInterval(pollTimer)
+      clearTimeout(pollTimer)
       for (const res of sseClients) {
         try {
           res.end()

@@ -844,36 +844,63 @@ export class HiveMemoryStore {
     const out = new Map()
     const curators = this.config?.curators || new Set()
     const excluded = excludeCuratorIds instanceof Set ? excludeCuratorIds : Array.isArray(excludeCuratorIds) ? new Set(excludeCuratorIds) : null
-    const rows = this.db.prepare(`SELECT s.id AS sid, s.d AS sd, c.id AS cid, c.pubkey AS cpubkey FROM links l
+    const rows = this.db.prepare(`SELECT s.id AS sid, s.d AS sd, c.id AS cid, c.pubkey AS cpubkey, c.d AS cd, c.scope AS cscope, c.created_at AS ccreated FROM links l
       JOIN events c ON c.id = l.from_id JOIN events s ON s.id = l.target
       WHERE l.relation = 'supersedes' AND c.is_current = 1 AND c.status = 'active' AND (c.exp IS NULL OR c.exp > ?)
         AND c.scope = s.scope AND c.created_at >= s.created_at AND c.id <> s.id AND s.scope_type <> 'hive:canon'
       ORDER BY c.created_at DESC, c.id`).all(nowSec)
+    const curatedById = new Map()
+    const supByTarget = new Map()
     for (const r of rows) {
       if (excluded && excluded.has(r.cid)) continue
       if (!out.has(r.sid) && (curators.has(r.cpubkey) || isWorkflowSlug(parseFactKey(r.sd)?.slug))) {
         out.set(r.sid, r.cid)
       }
+      if (!supByTarget.has(r.sid)) supByTarget.set(r.sid, [])
+      supByTarget.get(r.sid).push(r)
+      if (curators.has(r.cpubkey) && String(r.cd || '').includes(':curated-')) {
+        let entry = curatedById.get(r.cid)
+        if (!entry) {
+          entry = { cid: r.cid, scope: r.cscope, created_at: r.ccreated, sources: new Set(), sourceDs: new Set() }
+          curatedById.set(r.cid, entry)
+        }
+        entry.sources.add(r.sid)
+        entry.sourceDs.add(r.sd)
+      }
     }
-    const staleCuratedRows = this.db.prepare(`SELECT c.id AS cid, c.pubkey AS cpubkey, c.d AS cd, n.id AS nid
-      FROM links l
-      JOIN events c ON c.id = l.from_id
-      JOIN events s ON s.id = l.target
-      JOIN events n ON n.scope = s.scope AND n.is_current = 1 AND n.status = 'active' AND (n.exp IS NULL OR n.exp > ?)
-      WHERE l.relation = 'supersedes'
-        AND c.is_current = 1 AND c.status = 'active' AND (c.exp IS NULL OR c.exp > ?)
-        AND c.scope = s.scope AND s.scope_type <> 'hive:canon'
-        AND n.created_at >= c.created_at AND n.id <> c.id AND n.id <> s.id
-        AND NOT EXISTS (SELECT 1 FROM links l2 WHERE l2.from_id = c.id AND l2.relation = 'supersedes' AND l2.target = n.id)
-        AND (
-          n.d = s.d
-          OR EXISTS (SELECT 1 FROM links l3 WHERE l3.from_id = n.id AND l3.relation = 'supersedes' AND (l3.target = s.id OR l3.target = c.id))
-        )
-      ORDER BY n.created_at DESC, n.id`).all(nowSec, nowSec)
-    for (const r of staleCuratedRows) {
-      if (excluded && (excluded.has(r.cid) || excluded.has(r.nid))) continue
-      if (!out.has(r.cid) && curators.has(r.cpubkey) && String(r.cd || '').includes(':curated-')) {
-        out.set(r.cid, out.get(r.nid) || r.nid)
+    if (curatedById.size > 0) {
+      const headsByScopeD = new Map()
+      const activeHeads = this.db.prepare(
+        "SELECT id, d, scope, created_at FROM events WHERE is_current = 1 AND status = 'active' AND (exp IS NULL OR exp > ?)"
+      ).all(nowSec)
+      for (const h of activeHeads) {
+        if (excluded && excluded.has(h.id)) continue
+        const key = `${h.scope}\0${h.d}`
+        if (!headsByScopeD.has(key)) headsByScopeD.set(key, [])
+        headsByScopeD.get(key).push(h)
+      }
+      for (const c of curatedById.values()) {
+        if (out.has(c.cid)) continue
+        let bestN = null
+        const consider = (nid, ncreated) => {
+          if (ncreated < c.created_at || nid === c.cid || c.sources.has(nid)) return
+          if (!bestN || ncreated > bestN.created_at || (ncreated === bestN.created_at && nid < bestN.id)) {
+            bestN = { id: nid, created_at: ncreated }
+          }
+        }
+        for (const sd of c.sourceDs) {
+          for (const h of headsByScopeD.get(`${c.scope}\0${sd}`) || []) {
+            consider(h.id, h.created_at)
+          }
+        }
+        for (const targetId of [c.cid, ...c.sources]) {
+          for (const r of supByTarget.get(targetId) || []) {
+            if (r.cscope === c.scope) consider(r.cid, r.ccreated)
+          }
+        }
+        if (bestN) {
+          out.set(c.cid, out.get(bestN.id) || bestN.id)
+        }
       }
     }
     return out
