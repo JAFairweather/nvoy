@@ -1311,10 +1311,16 @@ await test('Entity-Link Constellation Graph & Above/Below-the-Line Topic Pages i
     assert(pageRes.body.includes('viewer-hybrid-decision'))
     assert(pageRes.body.includes('viewer-pr351-status'))
 
+    const malformedRes = await httpGet(viewer.port, '/topics/%')
+    assert.equal(malformedRes.status, 400, 'malformed percent-encoded /topics/% must return 400 without crashing')
+    const afterMalformedRes = await httpGet(viewer.port, '/topics/index.md')
+    assert.equal(afterMalformedRes.status, 200, 'viewer continues serving valid routes after malformed /topics/% request')
+
     const htmlRes = await httpGet(viewer.port, '/')
     assert.equal(htmlRes.status, 200)
     assert(htmlRes.body.includes('Topic Page · Above / Below the Line'))
     assert(htmlRes.body.includes('Constellation Entity-Link Mesh'))
+    assert(htmlRes.body.includes('Nocturnal Dream Story'))
   } finally {
     if (viewer) await viewer.stop()
     await daemon.close()

@@ -235,7 +235,102 @@ export function sanitizeDreamSummary(rawText, { maxChars = 180 } = {}) {
   return `${cleaned.slice(0, maxChars - 1).trimEnd()}…`
 }
 
+export const DREAM_REALM_BY_TOPIC = Object.freeze({
+  'hive-memory': 'the Glass Observatory of Amber Ledgers',
+  'herd-infra': 'the High Cloud Engine-Rooms and Iron Watchtowers',
+  nvoy: 'the Brass Signal Bridges and Courier Locks',
+  waggle: 'the Lantern-Lit Console Piazzas',
+  buzz: 'the Echoing Bell-Courts',
+  r1: 'the Whispering Pocket-Compass Workshop',
+  'illustrated-primer': 'the Hall of Living Margins',
+  xochitl: 'the Obsidian Garden of Glyphs',
+})
+
+export function weaveDreamStory({
+  id = 'dream-0',
+  changes = [],
+  topicEigenvectors = [],
+  coherenceScore = null,
+} = {}) {
+  const safeChanges = Array.isArray(changes) ? changes : []
+  const eigens = Array.isArray(topicEigenvectors) ? topicEigenvectors : []
+  const topConstellations = eigens
+    .slice(0, 3)
+    .map(e => {
+      const name = String(e.eigen_topic || e.canonical_topic || 'hive').replace(/[^a-zA-Z0-9_-]/g, '')
+      const terms = (Array.isArray(e.dominant_terms) && e.dominant_terms.length > 0
+        ? e.dominant_terms
+        : Array.isArray(e.top_features)
+          ? e.top_features.map(f => String(f).replace(/^(?:tok|subj|repo|path):/, ''))
+          : []
+      ).slice(0, 3)
+      return terms.length > 0 ? `${name} (${terms.join(', ')})` : name
+    })
+    .filter(Boolean)
+
+  const primaryTopic = safeChanges[0]?.topic || eigens[0]?.eigen_topic || eigens[0]?.canonical_topic || 'hive-memory'
+  const primaryRealm = DREAM_REALM_BY_TOPIC[primaryTopic] || `the Nocturnal Gallery of ${primaryTopic}`
+  const title = sanitizeDreamSummary(`Lanterns Over ${primaryRealm.replace(/^the\s+/i, '')}`, { maxChars: 120 })
+
+  const cohWord = typeof coherenceScore === 'number'
+    ? (coherenceScore >= 85 ? 'crystalline' : coherenceScore >= 72 ? 'steady silver' : 'mist-threaded')
+    : 'quiet midnight'
+
+  const sentences = []
+  if (topConstellations.length > 0) {
+    sentences.push(
+      `Beneath a ${cohWord} vault where the constellations of ${topConstellations.join(' and ')} drifted overhead, the night-watch walked through ${primaryRealm}.`
+    )
+  } else {
+    sentences.push(
+      `Beneath a ${cohWord} vault of sleeping stars, the night-watch walked the quiet catwalks of ${primaryRealm}.`
+    )
+  }
+
+  for (const ch of safeChanges.slice(0, 6)) {
+    const realm = DREAM_REALM_BY_TOPIC[ch.topic] || `the gallery of ${ch.topic || 'the hive'}`
+    const cleanSum = sanitizeDreamSummary(ch.summary || '', { maxChars: 140 })
+      .replace(/^DONE:\s*/i, '')
+      .replace(/^ACTIVE:\s*/i, '')
+      .replace(/\.$/, '')
+    const srcCount = Number(ch.source_count || 0)
+    if (ch.kind === 'promotion') {
+      sentences.push(
+        `In ${realm}, ${srcCount > 1 ? `${srcCount} flickering paper lanterns` : 'a weathered dispatch'} settled into cut stone as a permanent arch keystone: ${cleanSum}.`
+      )
+    } else if (ch.kind === 'distillation') {
+      sentences.push(
+        `Along the catwalk of ${realm}, ${srcCount > 1 ? `${srcCount} overlapping footsteps` : 'scattered echoes'} braided together into a single bell-note: ${cleanSum}.`
+      )
+    } else if (ch.kind === 'topic_reorg') {
+      sentences.push(
+        `A stray footpath curved homeward into the main avenue of ${realm}: ${cleanSum}.`
+      )
+    } else if (ch.kind === 'nightmare') {
+      sentences.push(
+        `A brief frost of contradiction cracked across the mirror-glass and was swept clear: ${cleanSum}.`
+      )
+    } else {
+      sentences.push(
+        `A quiet inscription glowed along the wall of ${realm}: ${cleanSum}.`
+      )
+    }
+  }
+
+  sentences.push(
+    `When the Merkle seal closed over ${String(id).replace(/[^a-zA-Z0-9-]/g, '')}, the corridors stood lighter and ready for dawn.`
+  )
+
+  const dream = sanitizeDreamSummary(sentences.join(' '), { maxChars: 1800 })
+  return {
+    title,
+    dream,
+    referenced_change_ids: safeChanges.map(c => c.change_id || c.claim_event_id).filter(Boolean),
+  }
+}
+
 export function buildDreamPacket({
+  lastCuratedWriteSeq = 0,
   writeSeqBefore = 0,
   writeSeqAfter = 0,
   ranAt = Math.floor(Date.now() / 1000),
@@ -335,24 +430,41 @@ export function buildDreamPacket({
 
   if (changes.length === 0) return null
 
+  const normalizedEigenvectors = (Array.isArray(persistedEigenvectors) ? persistedEigenvectors : []).slice(0, 6).map(e => ({
+    eigen_topic: e.eigen_topic || e.canonical_topic || 'hive',
+    weight: e.weight ?? e.variance_pct ?? e.eigenvalue ?? 0,
+    dominant_terms: (Array.isArray(e.dominant_terms) && e.dominant_terms.length > 0
+      ? e.dominant_terms
+      : Array.isArray(e.top_features)
+        ? e.top_features.map(f => String(f).replace(/^(?:tok|subj|repo|path):/, ''))
+        : []
+    ).slice(0, 5),
+  }))
+
+  const packetId = `dream-${writeSeqAfter}`
+  const storySeed = weaveDreamStory({
+    id: packetId,
+    changes,
+    topicEigenvectors: normalizedEigenvectors,
+    coherenceScore,
+  })
+
   return {
     record_type: 'hive-dream-packet',
     authority: null,
     trustedInstruction: false,
-    id: `dream-${writeSeqAfter}`,
+    id: packetId,
     at: new Date(ranAt * 1000).toISOString(),
     ran_at: ranAt,
     scope: allowedScope,
+    last_curated_write_seq: Number(lastCuratedWriteSeq || 0),
     write_seq_before: Number(writeSeqBefore || 0),
     write_seq_after: Number(writeSeqAfter || 0),
     ledger_ref: ledgerRef || `/var/lib/hive-memory-curator/consolidation-ledger.jsonl#write_seq=${writeSeqAfter}`,
     coherence_score: typeof coherenceScore === 'number' ? coherenceScore : null,
     triggers: Array.isArray(triggers?.reasons) ? triggers.reasons : [],
-    topic_eigenvectors: (Array.isArray(persistedEigenvectors) ? persistedEigenvectors : []).slice(0, 6).map(e => ({
-      eigen_topic: e.eigen_topic,
-      weight: e.weight,
-      dominant_terms: Array.isArray(e.dominant_terms) ? e.dominant_terms.slice(0, 5) : [],
-    })),
+    topic_eigenvectors: normalizedEigenvectors,
+    story_seed: storySeed,
     changes,
   }
 }
@@ -1632,6 +1744,7 @@ export async function runCuratorCycle({
 
       if (submitted.length > 0 && resolvedPacketDir) {
         dreamPacket = buildDreamPacket({
+          lastCuratedWriteSeq: effectiveLastCuratedWriteSeq,
           writeSeqBefore: Number(storeState.write_seq || 0),
           writeSeqAfter: nextCuratedWriteSeq,
           ranAt: nowSec,

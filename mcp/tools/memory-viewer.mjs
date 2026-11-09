@@ -4494,6 +4494,97 @@ export function renderViewerHtml(initialState) {
           recBtn.addEventListener('click', function () { startDreamRecording(); });
           actRow.appendChild(recBtn);
           box.appendChild(actRow);
+
+          // --- Nocturnal Dream Story (Dream Weaver Fable) ---
+          var realmNames = {
+            'hive-memory': 'the Glass Observatory of Amber Ledgers',
+            'herd-infra': 'the High Cloud Engine-Rooms and Iron Watchtowers',
+            'nvoy': 'the Brass Signal Bridges and Courier Locks',
+            'waggle': 'the Lantern-Lit Console Piazzas',
+            'buzz': 'the Echoing Bell-Courts',
+            'r1': 'the Whispering Pocket-Compass Workshop',
+            'illustrated-primer': 'the Hall of Living Margins',
+            'xochitl': 'the Obsidian Garden of Glyphs'
+          };
+          var dreamClusters = Array.isArray(latestCuratorState && latestCuratorState.clusters) ? latestCuratorState.clusters : [];
+          var dreamEigens = Array.isArray(latestCuratorState && latestCuratorState.topic_eigenvectors) ? latestCuratorState.topic_eigenvectors : [];
+          var topRealmTopic = (dreamClusters[0] && dreamClusters[0].topic) || (dreamEigens[0] && dreamEigens[0].canonical_topic) || 'hive-memory';
+          var topRealmLabel = realmNames[topRealmTopic] || ('the Nocturnal Gallery of #' + topRealmTopic);
+          var dreamTitleText = '🌙 Lanterns Over ' + topRealmLabel.replace(/^the\s+/i, '');
+          var dreamParagraphs = [];
+          var constellationNames = dreamEigens.slice(0, 3).map(function (ev) {
+            return '#' + (ev.canonical_topic || 'hive');
+          });
+          if (constellationNames.length > 0) {
+            dreamParagraphs.push(
+              'Beneath a quiet vault of starlight where the spectral constellations of ' + constellationNames.join(', ') +
+              ' drifted in slow orbit, the sleep-weavers walked the high catwalks of ' + topRealmLabel + '.'
+            );
+          } else {
+            dreamParagraphs.push(
+              'Beneath a quiet vault of sleeping stars, the night-watch walked the high catwalks of ' + topRealmLabel + '.'
+            );
+          }
+          dreamClusters.slice(0, 4).forEach(function (cl) {
+            var rName = realmNames[cl.topic] || ('the gallery of #' + (cl.topic || 'hive'));
+            var rawCl = String(cl.claim_preview || cl.claim || cl.slug || '').replace(/\s*\[(?:Curated|Distilled)[^\]]*\]\s*$/i, '').replace(/^(?:DONE|ACTIVE):\s*/i, '');
+            if (rawCl.length > 130) rawCl = rawCl.slice(0, 129) + '…';
+            var foldCount = Number(cl.source_count || (Array.isArray(cl.source_ids) ? cl.source_ids.length : 2));
+            if (cl.stage === 'promotion' || cl.retention === 'decision') {
+              dreamParagraphs.push(
+                'In ' + rName + ', ' + foldCount + ' flickering paper lanterns were lifted from the tide-line and carved into a permanent keystone above the arch: "' + rawCl + '"'
+              );
+            } else {
+              dreamParagraphs.push(
+                'Along the gallery of ' + rName + ', ' + foldCount + ' overlapping watch-notes braided together like silver threads into a single clear bell-note: "' + rawCl + '"'
+              );
+            }
+          });
+          dreamParagraphs.push(
+            'When the Merkle seal closed at sequence ' + (cs.last_curated_write_seq || 0) + ', ' +
+            (dr.merkleCount || 0) + ' consolidated lineages rested beneath the glass dome, leaving the corridors lighter for dawn.'
+          );
+
+          var storyBox = makeDiv('inspect-claim');
+          storyBox.style.background = 'linear-gradient(145deg, rgba(30, 27, 75, 0.78), rgba(15, 23, 42, 0.92))';
+          storyBox.style.border = '1px solid rgba(196, 181, 253, 0.45)';
+          storyBox.style.borderRadius = '8px';
+          storyBox.style.padding = '10px 12px';
+          storyBox.style.marginBottom = '8px';
+          storyBox.style.boxShadow = '0 6px 20px rgba(139, 92, 246, 0.16)';
+          var storyHead = makeDiv('inspect-kicker', dreamTitleText + ' · Nocturnal Dream Story');
+          storyHead.style.color = '#ddd6fe';
+          storyHead.style.marginBottom = '6px';
+          storyBox.appendChild(storyHead);
+          dreamParagraphs.forEach(function (para) {
+            var pEl = makeDiv('', para);
+            pEl.style.fontFamily = 'Georgia, "Iowan Old Style", "Palatino Linotype", serif';
+            pEl.style.fontSize = '12.5px';
+            pEl.style.lineHeight = '1.55';
+            pEl.style.color = '#ede9fe';
+            pEl.style.marginBottom = '6px';
+            storyBox.appendChild(pEl);
+          });
+          if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+            var ttsBtn = document.createElement('button');
+            ttsBtn.type = 'button';
+            ttsBtn.className = 'btn';
+            ttsBtn.style.marginTop = '4px';
+            ttsBtn.style.fontSize = '10px';
+            ttsBtn.style.borderColor = 'rgba(196, 181, 253, 0.5)';
+            ttsBtn.style.color = '#ddd6fe';
+            ttsBtn.textContent = '🔊 Read Dream Story Aloud';
+            ttsBtn.addEventListener('click', function () {
+              try {
+                window.speechSynthesis.cancel();
+                var utter = new SpeechSynthesisUtterance(dreamTitleText.replace('🌙 ', '') + '. ' + dreamParagraphs.join(' '));
+                utter.rate = 0.94;
+                window.speechSynthesis.speak(utter);
+              } catch (e) {}
+            });
+            storyBox.appendChild(ttsBtn);
+          }
+          box.appendChild(storyBox);
           var dkv = makeDiv('kv-list');
           dkv.appendChild(kvRow('Inspector mode', 'Passive read-only (never triggers curator writes)', '#6ee7b7'));
           var dmLabel = (cs.display_mode && cs.display_mode.label)
@@ -6806,7 +6897,20 @@ export async function startMemoryViewer({
     }
 
     if (urlPath.startsWith('/topics/')) {
-      const rawSlug = decodeURIComponent(urlPath.slice('/topics/'.length)).replace(/\.md$/i, '').trim()
+      let decodedTopicPath = ''
+      try {
+        decodedTopicPath = decodeURIComponent(urlPath.slice('/topics/'.length))
+      } catch {
+        const badBody = 'Bad Request: malformed topic URI encoding\n'
+        res.writeHead(400, {
+          ...securityHeaders,
+          'Content-Type': 'text/plain; charset=utf-8',
+          'Content-Length': Buffer.byteLength(badBody),
+        })
+        res.end(method === 'HEAD' ? undefined : badBody)
+        return
+      }
+      const rawSlug = decodedTopicPath.replace(/\.md$/i, '').trim()
       const page = rawSlug && currentState.topic_pages ? currentState.topic_pages[rawSlug] : null
       if (page) {
         const body = renderTopicPageMarkdown(page)
