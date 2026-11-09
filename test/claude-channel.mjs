@@ -342,10 +342,100 @@ try {
   const alive = (await trimClient.listTools()).tools.map(tool => tool.name)
   ok('the refusal left the session alive — the throw was prevented, not merely caught',
     alive.includes('nvoy_channel_read') && alive.includes('nvoy_channel_list'))
+  const nonCuratorVerify = await trimClient.callTool({
+    name: 'memory_dream_verify',
+    arguments: {
+      packet_path: '/var/lib/hive-memory-curator/packets/dream-1142.json',
+      title: 'Test Dream',
+      dream: 'A short valid dream.',
+      referenced_change_ids: ['chg-1'],
+    },
+  })
+  ok('non-curator instance is refused memory_dream_verify (NVOY_DREAM_VERIFY_NOT_PERMITTED)',
+    nonCuratorVerify.isError === true && /NVOY_DREAM_VERIFY_NOT_PERMITTED/.test(nonCuratorVerify.content[0].text))
 } catch (error) {
   ok(`an envelope read but no longer in the queue is refused, not dereferenced (threw: ${error.message})`, false)
   ok('the refusal left the session alive — the throw was prevented, not merely caught', false)
+  ok('non-curator instance is refused memory_dream_verify (NVOY_DREAM_VERIFY_NOT_PERMITTED)', false)
 } finally { try { await trimClient.close() } catch { /* already gone */ } }
+
+// Curator instance exposes memory_dream_verify, enforces packet directory confinement, and returns checked dream record + buzz_post without shell access.
+const curatorRuntime = join(root, 'curator-runtime')
+const curatorPackets = join(root, 'curator-packets')
+mkdirSync(curatorRuntime); mkdirSync(join(curatorRuntime, 'claude-channel-state')); mkdirSync(curatorPackets)
+writeFileSync(join(manifests, 'curator.json'), JSON.stringify({
+  ...manifest,
+  id: 'curator',
+  pubkey: 'a'.repeat(64),
+  runtime_dir: curatorRuntime,
+  state_dir: join(root, 'curator-state'),
+  spool_dir: join(root, 'curator-spool'),
+}))
+writeFileSync(join(curatorRuntime, 'admitted-tasks.jsonl'), '', { mode: 0o600 })
+writeFileSync(join(curatorRuntime, 'reply-requests.jsonl'), '', { mode: 0o640 })
+const packetFile = join(curatorPackets, 'dream-1142.json')
+writeFileSync(packetFile, JSON.stringify({
+  id: 'dream-1142',
+  at: '2026-11-09T18:58:00.000Z',
+  ledger_ref: 'seq:1142',
+  changes: [
+    {
+      change_id: 'chg-1',
+      kind: 'distilled',
+      claim_event_id: 'a'.repeat(64),
+      summary: 'Consolidated three room status claims on nvoy viewer into a single checkpoint.',
+    },
+  ],
+}), { mode: 0o640 })
+const curatorTransport = new StdioClientTransport({
+  command: process.execPath,
+  args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', 'curator', '--poll-ms', '60000'],
+  env: { ...process.env, NVOY_INSTANCE_ROOT: manifests, HIVE_MEMORY_CURATOR_PACKET_DIR: curatorPackets },
+  stderr: 'pipe',
+})
+const curatorClient = new Client({ name: 'claude-channel-curator', version: '0.1.0' })
+try {
+  await curatorClient.connect(curatorTransport)
+  const curatorTools = (await curatorClient.listTools()).tools.map(t => t.name)
+  ok('curator instance exposes memory_dream_verify tool in listTools',
+    curatorTools.includes('memory_dream_verify'))
+  const outsidePath = await curatorClient.callTool({
+    name: 'memory_dream_verify',
+    arguments: {
+      packet_path: join(root, 'outside.json'),
+      title: 'Nightly Synthesis',
+      dream: 'Three scattered notes folded into one clear stone along the corridor.',
+      referenced_change_ids: ['chg-1'],
+    },
+  })
+  ok('memory_dream_verify refuses packet_path outside HIVE_MEMORY_CURATOR_PACKET_DIR',
+    outsidePath.isError === true && /NVOY_BAD_DREAM_PACKET/.test(outsidePath.content[0].text))
+  const validVerify = await curatorClient.callTool({
+    name: 'memory_dream_verify',
+    arguments: {
+      packet_path: packetFile,
+      title: 'Corridor of Folded Stones',
+      dream: 'Three scattered notes along the observatory wall folded quietly into a single carved keystone.',
+      referenced_change_ids: ['chg-1'],
+    },
+  })
+  const verifiedPayload = JSON.parse(validVerify.content[0].text)
+  ok('memory_dream_verify verifies draft against packet and returns checked record + buzz_post',
+    !validVerify.isError &&
+    verifiedPayload.ok === true &&
+    verifiedPayload.record?.id === 'dream-1142' &&
+    verifiedPayload.record?.checked === true &&
+    verifiedPayload.record?.validation === 'structural' &&
+    typeof verifiedPayload.buzz_post === 'string' &&
+    verifiedPayload.buzz_post.includes('Corridor of Folded Stones') &&
+    !verifiedPayload.buzz_post.includes('dream-1142') &&
+    !verifiedPayload.buzz_post.includes('Consolidated Changes') &&
+    !/\d/.test(verifiedPayload.buzz_post))
+} catch (error) {
+  ok(`curator instance exposes memory_dream_verify tool in listTools (threw: ${error.message})`, false)
+  ok('memory_dream_verify refuses packet_path outside HIVE_MEMORY_CURATOR_PACKET_DIR', false)
+  ok('memory_dream_verify verifies draft against packet and returns checked record + buzz_post', false)
+} finally { try { await curatorClient.close() } catch { /* already gone */ } }
 
 // The shipped window bounds how long a restarted portable harness is refused: 30s × 4 is
 // ~2¼ min, where 60s × 10 was ten. The measured formula above is what makes the default a window.

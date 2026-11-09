@@ -18,9 +18,11 @@
 //       - The Illustrated Primer dream page
 //       - R1's "tell me the latest dream" voice command
 
-import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { dirname, resolve } from 'node:path'
+import { chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { basename, dirname, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
+
+export const DEFAULT_CURATOR_PACKET_DIR = '/var/lib/hive-memory-curator/packets'
 
 const HEX16_RE = /\b[0-9a-fA-F]{16,64}\b/
 const HTML_TAG_RE = /<\/?[a-zA-Z][^>]*>/
@@ -28,6 +30,7 @@ const MD_FENCE_RE = /```/
 const MD_HEADER_RE = /(?:^|\n)\s*#{1,6}\s+/
 const URL_RE = /\b(?:https?|file):\/\/\S+/i
 const AT_MENTION_RE = /(?:^|[\s(])@[a-zA-Z0-9_-]+/
+const DIGIT_RE = /\d/
 
 export function countWords(text) {
   const trimmed = String(text || '').trim()
@@ -70,6 +73,9 @@ export function verifyAndAssembleDreamRecord({ packet, draft } = {}) {
     if (AT_MENTION_RE.test(title)) {
       errors.push('draft.title must not contain @mentions')
     }
+    if (DIGIT_RE.test(title)) {
+      errors.push('draft.title must not contain digits, statistics, sequence numbers, scores, or counts')
+    }
   }
 
   const dream = typeof draft.dream === 'string' ? draft.dream.trim() : ''
@@ -97,6 +103,9 @@ export function verifyAndAssembleDreamRecord({ packet, draft } = {}) {
     }
     if (AT_MENTION_RE.test(dream)) {
       errors.push('draft.dream must not contain @mentions')
+    }
+    if (DIGIT_RE.test(dream)) {
+      errors.push('draft.dream must not contain digits, statistics, sequence numbers, scores, or counts')
     }
   }
 
@@ -173,21 +182,115 @@ export function formatDreamBuzzPost(record) {
   if (!record || !record.checked) {
     throw new Error('cannot format unchecked dream record for Buzz')
   }
-  const changeLines = (record.changes || []).slice(0, 8).map(
-    c => `- [${c.kind}] ${c.summary} (claim ${String(c.claim_event_id).slice(0, 8)})`
-  )
-  const moreCount = Math.max(0, (record.changes || []).length - changeLines.length)
-  if (moreCount > 0) {
-    changeLines.push(`- (+${moreCount} more consolidated changes in ${record.id})`)
-  }
   return [
-    `🌙 **${record.title}** (\`${record.id}\`, validation: \`${record.validation}\`)`,
+    `🌙 ${record.title}`,
     '',
     record.dream,
-    '',
-    '**Consolidated Changes:**',
-    ...changeLines,
   ].join('\n')
+}
+
+export function dreamVerifyToolSpec() {
+  return {
+    name: 'memory_dream_verify',
+    description: 'Structurally verify a post-cycle Merkle Dreaming draft ({ title, dream, referenced_change_ids }) against its cycle packet (dream-<write_seq>.json in /var/lib/hive-memory-curator/packets/) and return the checked canonical dream record and formatted Buzz post, without needing shell access.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        packet_path: {
+          type: 'string',
+          description: 'Path to the cycle dream packet JSON file inside /var/lib/hive-memory-curator/packets/ (e.g. /var/lib/hive-memory-curator/packets/dream-1142.json).',
+          minLength: 1,
+          maxLength: 512,
+        },
+        title: {
+          type: 'string',
+          description: 'Plain-text dream title (1..140 chars, no digits/statistics/counts, no markdown/HTML/hex IDs/@mentions).',
+          minLength: 1,
+          maxLength: 140,
+        },
+        dream: {
+          type: 'string',
+          description: 'Plain, voice-friendly dream prose (1..300 words, <=2400 chars, no digits/statistics/sequence numbers/scores/counts, no markdown fences/headers, HTML tags, URLs, raw 16+ hex IDs, or @mentions).',
+          minLength: 1,
+          maxLength: 2400,
+        },
+        referenced_change_ids: {
+          type: 'array',
+          description: 'Non-empty array of change_id or claim_event_id strings from packet.changes referenced by this dream.',
+          items: { type: 'string', minLength: 1, maxLength: 128 },
+          minItems: 1,
+          maxItems: 64,
+        },
+      },
+      required: ['packet_path', 'title', 'dream', 'referenced_change_ids'],
+      additionalProperties: false,
+    },
+  }
+}
+
+export function runDreamVerifyTool(args = {}, { packetDir } = {}) {
+  const allowedDir = resolve(packetDir || process.env.HIVE_MEMORY_CURATOR_PACKET_DIR || DEFAULT_CURATOR_PACKET_DIR)
+  const rawPath = typeof args.packet_path === 'string' ? args.packet_path.trim() : ''
+  if (!rawPath) {
+    return { error: { code: 'NVOY_BAD_DREAM_PACKET', message: 'packet_path is required' } }
+  }
+  const resolvedPacket = resolve(rawPath)
+  const fileBase = basename(resolvedPacket)
+  if (
+    dirname(resolvedPacket) !== allowedDir ||
+    !resolvedPacket.startsWith(allowedDir + sep) ||
+    !/^(?:dream-\d+|latest)\.json$/.test(fileBase)
+  ) {
+    return {
+      error: {
+        code: 'NVOY_BAD_DREAM_PACKET',
+        message: `packet_path must be dream-<write_seq>.json or latest.json inside ${allowedDir}`,
+      },
+    }
+  }
+  let stat
+  try {
+    stat = lstatSync(resolvedPacket)
+  } catch (err) {
+    return { error: { code: 'NVOY_DREAM_PACKET_UNREADABLE', message: err.message } }
+  }
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    return { error: { code: 'NVOY_BAD_DREAM_PACKET', message: 'packet_path must be a regular non-symlink file' } }
+  }
+  if (stat.size > 4 * 1024 * 1024) {
+    return { error: { code: 'NVOY_BAD_DREAM_PACKET', message: 'packet file exceeds 4 MiB limit' } }
+  }
+  let packet
+  try {
+    packet = JSON.parse(readFileSync(resolvedPacket, 'utf8'))
+  } catch (err) {
+    return { error: { code: 'NVOY_BAD_DREAM_PACKET', message: `failed to parse packet JSON: ${err.message}` } }
+  }
+
+  const res = verifyAndAssembleDreamRecord({
+    packet,
+    draft: {
+      title: args.title,
+      dream: args.dream,
+      referenced_change_ids: args.referenced_change_ids,
+    },
+  })
+  if (!res.ok) {
+    return {
+      error: {
+        code: 'NVOY_DREAM_VERIFY_FAILED',
+        errors: res.errors,
+      },
+    }
+  }
+  return {
+    ok: {
+      ok: true,
+      word_count: res.word_count,
+      record: res.record,
+      buzz_post: formatDreamBuzzPost(res.record),
+    },
+  }
 }
 
 export function parseDreamVerifyFlags(argv = []) {

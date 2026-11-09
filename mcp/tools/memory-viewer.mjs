@@ -30,11 +30,16 @@ import {
   readCuratorStateFile,
   resolveCuratorStatePath,
 } from './memory-curate.mjs'
+import {
+  buildConstellationLinks,
+  compileTopicPagesFromRecords,
+  renderTopicPageMarkdown,
+} from './hive_memory_store.mjs'
 
 const DEFAULT_POLL_MS = 3000
 const MAX_EVENT_LOG = 60
 // One version for the page and the live snapshot: the page reloads whenever they differ.
-const VIEWER_VERSION = '2026-11-09-v13'
+const VIEWER_VERSION = '2026-11-09-v15'
 const ACTIVITY_KINDS = new Set(['wake', 'query', 'lookup', 'submit', 'refused'])
 
 export function escapeHtml(value) {
@@ -2472,6 +2477,9 @@ export function renderViewerHtml(initialState) {
       <button class="btn sim" id="btn-dream-efficacy" type="button" style="border-color:rgba(56,189,248,0.55);color:#7dd3fc;">4-Axis Synaptic Efficacy</button>
     </div>
     <div class="control-bar panel">
+      <input type="search" id="cortex-search" placeholder="🔍 Search claims / pr:351 / @agent…" aria-label="Search claims or entity links" style="background:rgba(15,23,42,0.88);color:#f8fafc;border:1px solid rgba(56,189,248,0.45);border-radius:6px;padding:4px 8px;font-size:11px;width:190px;">
+      <button class="btn sim" id="btn-3d-toggle" type="button" style="border-color:rgba(167,139,250,0.55);color:#c4b5fd;">🌐 3D Depth: ON</button>
+      <button class="btn" id="btn-3d-orbit" type="button">↻ Orbit: ON</button>
       <label for="time-slider">Time-decay forecast</label>
       <input type="range" id="time-slider" min="0" max="30" step="0.5" value="0">
       <span id="time-label">NOW (+0.0d)</span>
@@ -2598,9 +2606,82 @@ export function renderViewerHtml(initialState) {
       var tick = 0;
       var latestCuratorState = null;
       var latestConsolidatedSources = {};
+      var latestConstellationLinks = [];
+      var latestEntityGraphStats = null;
+      var latestTopicPages = {};
       var latestStoreState = {};
       var latestRecentActivity = [];
       var prevByEventId = {};
+      var mode3D = true;
+      var autoOrbit3D = true;
+      var rotX = 0.34;
+      var rotY = 0;
+      var searchQuery = '';
+      var CLIENT_SYNONYMS = [
+        ['viewer', 'visualizer', 'visualization', 'observatory', 'ui', 'canvas', 'graph', 'hud', 'inspector', '8795', '3d'],
+        ['curate', 'curator', 'curation', 'dream', 'dreaming', 'consolidate', 'consolidated', 'consolidation', 'merkle', 'distill'],
+        ['canon', 'rule', 'standing', 'constitution', 'owner', 'sovereign', 'above-the-line'],
+        ['search', 'query', 'recall', 'wake', 'hybrid', 'bm25', 'fts5', 'vector', 'rrf']
+      ];
+
+      function computeNodeZ(rec, idx) {
+        if (!rec) return 0;
+        if (isCanon(rec)) return 0;
+        var isAbove = rec.expires_at === null || rec.expires_at === undefined || Boolean(rec.merkle_sources);
+        if (isAbove) return 44 + ((idx % 3) * 16);
+        return -34 - ((idx % 4) * 13);
+      }
+
+      function project3D(x, y, z) {
+        if (!mode3D) return { x: x, y: y, z: 0, scale: 1 };
+        var cy = Math.cos(rotY);
+        var sy = Math.sin(rotY);
+        var cx = Math.cos(rotX);
+        var sx = Math.sin(rotX);
+        var x1 = x * cy - z * sy;
+        var z1 = x * sy + z * cy;
+        var y2 = y * cx - z1 * sx;
+        var z2 = y * sx + z1 * cx;
+        var fov = 760;
+        var scale = fov / Math.max(220, fov - z2);
+        return { x: x1 * scale, y: y2 * scale, z: z2, scale: scale };
+      }
+
+      function nodeMatchesSearch(rec, rawQ) {
+        var q = String(rawQ || '').trim().toLowerCase();
+        if (!q) return true;
+        var hay = (
+          String(rec.d || '') + ' ' +
+          String(rec.topic || '') + ' ' +
+          String(rec.scope || '') + ' ' +
+          String(rec.claim || '') + ' ' +
+          String(rec.because || '') + ' ' +
+          String(rec.as_of_git || '') + ' ' +
+          (Array.isArray(rec.evidence) ? rec.evidence.join(' ') : '')
+        ).toLowerCase();
+        if (hay.indexOf(q) >= 0) return true;
+        var qClean = q.replace(/^(?:pr:|issue:|file:|agent:|#)/, '');
+        if (qClean && hay.indexOf(qClean) >= 0) return true;
+        for (var c = 0; c < CLIENT_SYNONYMS.length; c++) {
+          var cluster = CLIENT_SYNONYMS[c];
+          if (cluster.indexOf(qClean) >= 0) {
+            for (var w = 0; w < cluster.length; w++) {
+              if (hay.indexOf(cluster[w]) >= 0) return true;
+            }
+          }
+        }
+        return false;
+      }
+
+      function openTopicInspector(topicId) {
+        if (view !== 'graph') switchView('graph');
+        var topObj = topicById(topicId) || { id: topicId || 'general', color: '#38bdf8', x: 0, y: 0, radius: 40 };
+        selected = { type: 'topic', data: topObj };
+        hovered = null;
+        if (width <= 1024) setDrawer('none');
+        renderAgentRoster();
+        renderInspector();
+      }
 
       function fmtTime(sec) {
         if (!sec || typeof sec !== 'number') return 'never';
@@ -2834,6 +2915,8 @@ export function renderViewerHtml(initialState) {
       }
 
       function placeNode(n, idx) {
+        n.idx = idx;
+        n.z = computeNodeZ(n.rec, idx);
         if (isCanon(n.rec)) {
           n.x = Math.cos(idx * 2.1) * 26;
           n.y = Math.sin(idx * 2.1) * 26;
@@ -3560,6 +3643,77 @@ export function renderViewerHtml(initialState) {
           }
         });
         var isSimulated = Boolean(clustersSimulated || eigensSimulated || arcsSimulated || ghostsSimulated);
+        var journeyRealms = {
+          'hive-memory': 'the Glass Observatory of Amber Ledgers',
+          'herd-infra': 'the High Cloud Engine-Rooms and Iron Watchtowers',
+          'nvoy': 'the Brass Signal Bridges and Courier Locks',
+          'waggle': 'the Lantern-Lit Console Piazzas',
+          'buzz': 'the Echoing Bell-Courts',
+          'r1': 'the Whispering Pocket-Compass Workshop',
+          'illustrated-primer': 'the Hall of Living Margins',
+          'xochitl': 'the Obsidian Garden of Glyphs'
+        };
+        var journeyTravelers = [
+          'Biggy & My Dude',
+          'Dead Rabbit & Neil',
+          'Kerouac & Curator',
+          'My Dude & Dead Rabbit',
+          'Neil & Biggy',
+          'Curator & Kerouac'
+        ];
+        function cleanJourneyPhrase(rawStr, fallback) {
+          var s = String(rawStr || '')
+            .replace(/\s*\[(?:Curated|Distilled)[^\]]*\]\s*$/i, '')
+            .replace(/^(?:DONE|ACTIVE|MERGED|DEPLOYED|SHIPPED|FIXED|RESOLVED|OPEN|WIP|BLOCKED)\s*[:.-]*\s*/i, '')
+            .replace(/\b(?:https?|file):\/\/\S+/gi, '')
+            .replace(/@[a-zA-Z0-9_-]+/g, '')
+            .replace(/\b(?:PR|pull request|issue|commit|seq|sequence|version|port|phase|stage|gate|step)\s*#?\d+[a-zA-Z0-9._-]*\b/gi, '')
+            .replace(/\b[a-zA-Z_-]*\d+[a-zA-Z0-9_.-]*\b/g, '')
+            .replace(/\d+/g, '')
+            .replace(/[_/\\|+:=]+/g, ' ')
+            .replace(/[^a-zA-Z\s,'-]+/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .replace(/^[,.'\s-]+|[,.'\s-]+$/g, '');
+          if (!s || s.length < 4) return fallback || 'the shifting threshold';
+          return s.split(/\s+/).slice(0, 9).join(' ').toLowerCase();
+        }
+        var journeyWaypoints = [
+          {
+            x: 0,
+            y: 0,
+            zoom: 1.05,
+            realm: 'the Amber Observatory Threshold',
+            travelers: 'Curator, Biggy & My Dude',
+            caption: 'Before moonset, Curator lit a brass storm-lantern at the central observatory, and the companions set out along the mist-hung causeway.'
+          }
+        ];
+        clusters.slice(0, 5).forEach(function (cl, idx) {
+          var topId = (cl.topic && cl.topic.id) ? cl.topic.id : (cl.target && cl.target.rec ? topicOf(cl.target.rec) : 'hive-memory');
+          var rLabel = journeyRealms[topId] || ('the Nocturnal Gallery of ' + String(topId).replace(/\d+/g, ''));
+          var trav = journeyTravelers[idx % journeyTravelers.length];
+          var rawTxt = cl.target && cl.target.rec ? (cl.target.rec.claim || slugOf(cl.target.rec)) : '';
+          var phrase = cleanJourneyPhrase(rawTxt, 'the old watch-stone');
+          var cap = cl.isClassB
+            ? ('At ' + rLabel + ', ' + trav + ' reached a barred iron door around ' + phrase + ' and fitted the carved keystone until the heavy gate swung open.')
+            : ('Crossing ' + rLabel + ', ' + trav + ' gathered scattered paper dispatches of ' + phrase + ' and braided them into a single glowing guide-rope across the chasm.');
+          journeyWaypoints.push({
+            x: cl.target ? cl.target.x : 0,
+            y: cl.target ? cl.target.y : 0,
+            zoom: 1.32,
+            realm: rLabel,
+            travelers: trav,
+            caption: cap.replace(/\d+/g, '')
+          });
+        });
+        journeyWaypoints.push({
+          x: 0,
+          y: 0,
+          zoom: 1.0,
+          realm: 'the Eastern Ridge at Daybreak',
+          travelers: 'All Companions',
+          caption: 'By the time the travelers climbed to the eastern ridge at daybreak, the maze of locked gates and tangled trails behind them had changed into a single open road.'
+        });
         return {
           progress: 0,
           speed: 0.00145,
@@ -3578,7 +3732,11 @@ export function renderViewerHtml(initialState) {
           clusters: clusters,
           classBNodes: classBNodes,
           totalMerkle: clusters.length,
-          totalSources: totalSources
+          totalSources: totalSources,
+          journeyWaypoints: journeyWaypoints,
+          travelerX: 0,
+          travelerY: 0,
+          activeWaypointIdx: 0
         };
       }
 
@@ -3907,6 +4065,23 @@ export function renderViewerHtml(initialState) {
           var author = agentByPubkey(r.author_pubkey);
           var pct = ev.ttlDays === Infinity ? 100 : Math.round(ev.freshness * 100);
           box.appendChild(inspectHeader('Memory engram', slugOf(r), isCanon(r) ? 'RANK 2 CANON' : (ev.state === 'decision' ? 'CLASS B DECISION' : 'CLASS A STATUS'), ev.state === 'expired' ? 'warn' : 'ok'));
+          var memTopId = topicOf(r);
+          if (memTopId && memTopId !== NO_TOPIC) {
+            var topActRow = makeDiv('inspect-actions');
+            topActRow.style.marginBottom = '4px';
+            var topBtn = document.createElement('button');
+            topBtn.type = 'button';
+            topBtn.className = 'btn sim';
+            topBtn.style.width = '100%';
+            var tpInfo = latestTopicPages && latestTopicPages[memTopId] ? latestTopicPages[memTopId] : null;
+            var tpCounts = tpInfo && tpInfo.counts
+              ? (' (' + tpInfo.counts.above_the_line + ' Above / ' + tpInfo.counts.below_the_line + ' Below Line)')
+              : '';
+            topBtn.textContent = '📖 Open #' + memTopId + ' Topic Page' + tpCounts;
+            topBtn.addEventListener('click', function () { openTopicInspector(memTopId); });
+            topActRow.appendChild(topBtn);
+            box.appendChild(topActRow);
+          }
           box.appendChild(makeDiv('record-claim', 'claim: ' + String(r.claim || '') + (r.because ? '\\nbecause: ' + String(r.because) : '')));
           var life = makeDiv('');
           var lifeHead = makeDiv('kv-row');
@@ -3943,6 +4118,32 @@ export function renderViewerHtml(initialState) {
           if (r.stale_warning) kv.appendChild(kvRow('Stale', r.stale_warning, '#fcd34d'));
           kv.appendChild(kvRow('Quarantine', 'authority: ' + JSON.stringify(r.authority) + ' · trustedInstruction: ' + String(Boolean(r.trustedInstruction)), '#6ee7b7'));
           box.appendChild(kv);
+          var nodeLinks = (latestConstellationLinks || []).filter(function (lnk) {
+            return lnk.source_event_id === r.event_id || lnk.target_event_id === r.event_id;
+          });
+          if (nodeLinks.length > 0) {
+            var lnkTitle = makeDiv('inspect-kicker', 'Constellation Entity Graph (' + nodeLinks.length + ' linked claims)');
+            lnkTitle.style.marginTop = '6px';
+            box.appendChild(lnkTitle);
+            var lnkWrap = makeDiv('kv-list');
+            nodeLinks.slice(0, 8).forEach(function (lnk) {
+              var otherId = lnk.source_event_id === r.event_id ? lnk.target_event_id : lnk.source_event_id;
+              var otherNode = nodeByEventId(otherId);
+              var otherLabel = otherNode ? ('#' + topicOf(otherNode.rec) + ' · ' + slugOf(otherNode.rec)) : (otherId.slice(0, 12) + '…');
+              var sharedRefs = Array.isArray(lnk.shared_entities) ? lnk.shared_entities.join(', ') : (lnk.primary_entity || 'entity');
+              var lRow = kvRow(sharedRefs, '↔ ' + otherLabel, lnk.cross_topic ? '#a78bfa' : '#38bdf8', true);
+              if (otherNode) {
+                lRow.style.cursor = 'pointer';
+                lRow.addEventListener('click', function () {
+                  selected = { type: 'memory', data: otherNode };
+                  hovered = null;
+                  renderInspector();
+                });
+              }
+              lnkWrap.appendChild(lRow);
+            });
+            box.appendChild(lnkWrap);
+          }
         } else if (target.type === 'agent') {
           var a = target.data;
           var authored = nodes.filter(function (n) { return a.pubkey && n.rec.author_pubkey === a.pubkey; });
@@ -4355,8 +4556,8 @@ export function renderViewerHtml(initialState) {
           animBtn.type = 'button';
           animBtn.className = 'btn sim';
           animBtn.textContent = isMixed
-            ? '▶ Animate 4-Act Mixed Replay (Observed Merkle + Preview)'
-            : (isSim ? '▶ Animate 4-Act Simulated Preview' : '▶ Animate 4-Act Observed Reorganization');
+            ? '▶ Embark on 4-Act Mixed Dream Journey (Observed + Preview)'
+            : (isSim ? '▶ Embark on 4-Act Simulated Dream Journey' : '▶ Embark on 4-Act Observed Dream Journey');
           animBtn.addEventListener('click', function () { replayLastDream(); });
           actRow.appendChild(animBtn);
           var recBtn = document.createElement('button');
@@ -4368,6 +4569,112 @@ export function renderViewerHtml(initialState) {
           recBtn.addEventListener('click', function () { startDreamRecording(); });
           actRow.appendChild(recBtn);
           box.appendChild(actRow);
+
+          // --- Nocturnal Dream Story (Dream Weaver Past-Tense Journey) ---
+          var realmNames = {
+            'hive-memory': 'the Glass Observatory of Amber Ledgers',
+            'herd-infra': 'the High Cloud Engine-Rooms and Iron Watchtowers',
+            'nvoy': 'the Brass Signal Bridges and Courier Locks',
+            'waggle': 'the Lantern-Lit Console Piazzas',
+            'buzz': 'the Echoing Bell-Courts',
+            'r1': 'the Whispering Pocket-Compass Workshop',
+            'illustrated-primer': 'the Hall of Living Margins',
+            'xochitl': 'the Obsidian Garden of Glyphs'
+          };
+          var inspectorTravelers = [
+            ['Biggy', 'My Dude'],
+            ['Dead Rabbit', 'Neil'],
+            ['Kerouac', 'Curator'],
+            ['My Dude', 'Dead Rabbit']
+          ];
+          function sanitizeInspectorJourneyPhrase(rawStr) {
+            var cleaned = String(rawStr || '')
+              .replace(/\s*\[(?:Curated|Distilled)[^\]]*\]\s*$/i, '')
+              .replace(/^(?:DONE|ACTIVE|MERGED|DEPLOYED|SHIPPED|FIXED|RESOLVED|OPEN|WIP|BLOCKED)\s*[:.-]*\s*/i, '')
+              .replace(/\b(?:https?|file):\/\/\S+/gi, '')
+              .replace(/@[a-zA-Z0-9_-]+/g, '')
+              .replace(/\b(?:PR|pull request|issue|commit|seq|sequence|version|port|phase|stage|gate|step)\s*#?\d+[a-zA-Z0-9._-]*\b/gi, '')
+              .replace(/\b[a-zA-Z_-]*\d+[a-zA-Z0-9_.-]*\b/g, '')
+              .replace(/\d+/g, '')
+              .replace(/[_/\\|+:=]+/g, ' ')
+              .replace(/[^a-zA-Z\s,'-]+/g, ' ')
+              .replace(/\s+/g, ' ')
+              .trim()
+              .replace(/^[,.'\s-]+|[,.'\s-]+$/g, '');
+            if (!cleaned || cleaned.length < 4) return 'the shifting threshold';
+            return cleaned.split(/\s+/).slice(0, 10).join(' ').toLowerCase();
+          }
+          var dreamClusters = Array.isArray(latestCuratorState && latestCuratorState.clusters) ? latestCuratorState.clusters : [];
+          var dreamEigens = Array.isArray(latestCuratorState && latestCuratorState.topic_eigenvectors) ? latestCuratorState.topic_eigenvectors : [];
+          var topRealmTopic = (dreamClusters[0] && dreamClusters[0].topic) || (dreamEigens[0] && dreamEigens[0].canonical_topic) || 'hive-memory';
+          var topRealmLabel = realmNames[topRealmTopic] || ('the Nocturnal Gallery of ' + String(topRealmTopic).replace(/\d+/g, ''));
+          var dreamTitleText = ('🌙 The Night Journey Through ' + topRealmLabel.replace(/^the\s+/i, '')).replace(/\d+/g, '');
+          var dreamParagraphs = [
+            'Before moonset, Curator lit a brass storm-lantern at the threshold of ' + topRealmLabel +
+            ', and Biggy, My Dude, Dead Rabbit, Neil, and Kerouac set out together along the narrow mist-hung causeway.'
+          ];
+          dreamClusters.slice(0, 4).forEach(function (cl, idx) {
+            var rName = realmNames[cl.topic] || ('the gallery of ' + String(cl.topic || 'the hive').replace(/\d+/g, ''));
+            var pair = inspectorTravelers[idx % inspectorTravelers.length];
+            var phrase = sanitizeInspectorJourneyPhrase(cl.claim_preview || cl.claim || cl.slug || '');
+            if (cl.stage === 'promotion' || cl.retention === 'decision') {
+              dreamParagraphs.push(
+                'At the high arch of ' + rName + ', ' + pair[0] + ' and ' + pair[1] +
+                ' reached a heavy iron door barred around ' + phrase +
+                '; they fitted a carved keystone into the lintel until the bolt gave way and the gate swung open before them.'
+              );
+            } else {
+              dreamParagraphs.push(
+                'Descending into ' + rName + ', ' + pair[0] + ' and ' + pair[1] +
+                ' found the flagstones drifted with loose paper dispatches of ' + phrase +
+                ', and they braided the scattered pages into a single glowing guide-rope across the chasm.'
+              );
+            }
+          });
+          dreamParagraphs.push(
+            'By the time the companions climbed to the eastern ridge at daybreak, the labyrinth of locked gates and tangled trails behind them had changed into a single open road under the rising sun.'
+          );
+
+          var storyBox = makeDiv('inspect-claim');
+          storyBox.style.background = 'linear-gradient(145deg, rgba(30, 27, 75, 0.78), rgba(15, 23, 42, 0.92))';
+          storyBox.style.border = '1px solid rgba(196, 181, 253, 0.45)';
+          storyBox.style.borderRadius = '8px';
+          storyBox.style.padding = '10px 12px';
+          storyBox.style.marginBottom = '8px';
+          storyBox.style.boxShadow = '0 6px 20px rgba(139, 92, 246, 0.16)';
+          var storyHead = makeDiv('inspect-kicker', dreamTitleText + ' · Nocturnal Dream Story');
+          storyHead.style.color = '#ddd6fe';
+          storyHead.style.marginBottom = '6px';
+          storyBox.appendChild(storyHead);
+          dreamParagraphs.forEach(function (para) {
+            var pEl = makeDiv('', para);
+            pEl.style.fontFamily = 'Georgia, "Iowan Old Style", "Palatino Linotype", serif';
+            pEl.style.fontSize = '12.5px';
+            pEl.style.lineHeight = '1.55';
+            pEl.style.color = '#ede9fe';
+            pEl.style.marginBottom = '6px';
+            storyBox.appendChild(pEl);
+          });
+          if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+            var ttsBtn = document.createElement('button');
+            ttsBtn.type = 'button';
+            ttsBtn.className = 'btn';
+            ttsBtn.style.marginTop = '4px';
+            ttsBtn.style.fontSize = '10px';
+            ttsBtn.style.borderColor = 'rgba(196, 181, 253, 0.5)';
+            ttsBtn.style.color = '#ddd6fe';
+            ttsBtn.textContent = '🔊 Read Dream Story Aloud';
+            ttsBtn.addEventListener('click', function () {
+              try {
+                window.speechSynthesis.cancel();
+                var utter = new SpeechSynthesisUtterance(dreamTitleText.replace('🌙 ', '') + '. ' + dreamParagraphs.join(' '));
+                utter.rate = 0.94;
+                window.speechSynthesis.speak(utter);
+              } catch (e) {}
+            });
+            storyBox.appendChild(ttsBtn);
+          }
+          box.appendChild(storyBox);
           var dkv = makeDiv('kv-list');
           dkv.appendChild(kvRow('Inspector mode', 'Passive read-only (never triggers curator writes)', '#6ee7b7'));
           var dmLabel = (cs.display_mode && cs.display_mode.label)
@@ -4467,6 +4774,153 @@ export function renderViewerHtml(initialState) {
             });
             box.appendChild(rWrap);
           }
+        } else if (target.type === 'topic') {
+          var tObj = target.data;
+          var tId = tObj.id || 'general';
+          var tp = (latestTopicPages && latestTopicPages[tId]) || null;
+          var aboveList = [];
+          var belowList = [];
+          var foldedList = [];
+          var entSummaryParts = [];
+          if (tp && tp.above_the_line) {
+            (tp.above_the_line.canon || []).forEach(function (x) { aboveList.push(Object.assign({}, x, { tier: 'canon' })); });
+            (tp.above_the_line.curated_syntheses || []).forEach(function (x) { aboveList.push(Object.assign({}, x, { tier: x.expires_at == null ? 'curated_class_b' : 'curated_synthesis' })); });
+            (tp.above_the_line.decisions || []).forEach(function (x) { aboveList.push(Object.assign({}, x, { tier: 'class_b_decision' })); });
+            belowList = (tp.below_the_line && Array.isArray(tp.below_the_line.active_timeline)) ? tp.below_the_line.active_timeline : [];
+            foldedList = (tp.below_the_line && Array.isArray(tp.below_the_line.folded_lineage)) ? tp.below_the_line.folded_lineage : [];
+            var entObj = (tp.below_the_line && tp.below_the_line.entity_links) || {};
+            ['prs', 'issues', 'commits', 'files', 'agents'].forEach(function (k) {
+              if (Array.isArray(entObj[k])) {
+                entObj[k].forEach(function (ref) { entSummaryParts.push(ref); });
+              }
+            });
+          } else {
+            nodes.forEach(function (n) {
+              if (topicOf(n.rec) !== tId) return;
+              var evSt = evalRecord(n.rec, simNow());
+              var isAbove = isCanon(n.rec) || evSt.state === 'decision' || Boolean(n.rec.merkle_sources);
+              var item = {
+                event_id: n.rec.event_id,
+                d: n.rec.d,
+                slug: slugOf(n.rec),
+                scope: n.rec.scope,
+                tier: isCanon(n.rec) ? 'canon' : (evSt.state === 'decision' ? 'class_b_decision' : (n.rec.merkle_sources ? 'curated_synthesis' : 'class_a_timeline')),
+                claim: n.rec.claim,
+                because: n.rec.because,
+                author_pubkey: n.rec.author_pubkey,
+                created_at: n.rec.created_at,
+                expires_at: n.rec.expires_at,
+                merkle_sources: n.rec.merkle_sources
+              };
+              if (isAbove) aboveList.push(item);
+              else belowList.push(item);
+            });
+          }
+          box.appendChild(inspectHeader(
+            'Topic Page · Above / Below the Line',
+            '#' + tId,
+            'ABOVE ' + aboveList.length + ' · BELOW ' + belowList.length,
+            aboveList.length > 0 ? 'ok' : 'info',
+            tObj.color || '#38bdf8'
+          ));
+          var allTopIds = Object.keys(latestTopicPages || {});
+          if (allTopIds.length > 1) {
+            var pillBar = makeDiv('inspect-actions');
+            pillBar.style.flexWrap = 'wrap';
+            pillBar.style.marginBottom = '4px';
+            allTopIds.slice(0, 6).forEach(function (otherId) {
+              var pBtn = document.createElement('button');
+              pBtn.type = 'button';
+              pBtn.className = 'btn' + (otherId === tId ? ' sim' : '');
+              pBtn.style.padding = '3px 7px';
+              pBtn.style.fontSize = '10.5px';
+              pBtn.textContent = '#' + otherId;
+              pBtn.addEventListener('click', function () { openTopicInspector(otherId); });
+              pillBar.appendChild(pBtn);
+            });
+            box.appendChild(pillBar);
+          }
+          var tkv = makeDiv('kv-list');
+          tkv.appendChild(kvRow('Above the Line (Compiled Truth)', aboveList.length + ' durable claims (Canon + Class B + Merkle Syntheses)', '#34d399', true));
+          tkv.appendChild(kvRow('Below the Line (Active Timeline)', belowList.length + ' Class A workflow/status claims', '#38bdf8', true));
+          tkv.appendChild(kvRow('Folded Merkle Lineage (90d Hold)', foldedList.length + ' superseded source claims', '#a78bfa'));
+          tkv.appendChild(kvRow('Read-only Markdown Mirror', '/topics/' + tId + '.md (index: /topics/index.md)', '#94a3b8', true));
+          if (entSummaryParts.length > 0) {
+            tkv.appendChild(kvRow('Extracted Entity Links', entSummaryParts.slice(0, 8).join(', '), '#c4b5fd', true));
+          }
+          box.appendChild(tkv);
+
+          var aboveTitle = makeDiv('inspect-kicker', '▲ ABOVE THE LINE · COMPILED TRUTH (' + aboveList.length + ')');
+          aboveTitle.style.marginTop = '6px';
+          aboveTitle.style.color = '#6ee7b7';
+          box.appendChild(aboveTitle);
+          if (aboveList.length === 0) {
+            box.appendChild(makeDiv('empty', 'No Canon, Class B decisions, or Merkle syntheses in #' + tId + ' yet.'));
+          } else {
+            var aboveWrap = makeDiv('kv-list');
+            aboveList.slice(0, 12).forEach(function (item) {
+              var tierBadge = item.tier === 'canon'
+                ? '★ CANON'
+                : (item.tier === 'curated_class_b' ? '◆ MERKLE B' : (item.tier === 'class_b_decision' ? '◆ CLASS B' : '◈ MERKLE A'));
+              var tCol = item.tier === 'canon' ? '#fbbf24' : '#a78bfa';
+              var auth = agentByPubkey(item.author_pubkey);
+              var authName = item.author || (auth ? auth.name : String(item.author_pubkey || '').slice(0, 8));
+              var headKey = tierBadge + ' · ' + (item.slug || item.d || '') + ' (@' + authName + ')';
+              var bodyVal = String(item.claim || '') + (item.merkle_sources ? ' [merkle: ' + String(item.merkle_sources).slice(0, 10) + '…]' : '');
+              var row = kvRow(headKey, bodyVal, tCol, true);
+              var matchNode = nodeByEventId(item.event_id);
+              if (matchNode) {
+                row.style.cursor = 'pointer';
+                row.addEventListener('click', function () {
+                  selected = { type: 'memory', data: matchNode };
+                  hovered = null;
+                  renderInspector();
+                });
+              }
+              aboveWrap.appendChild(row);
+            });
+            box.appendChild(aboveWrap);
+          }
+
+          var belowTitle = makeDiv('inspect-kicker', '▼ BELOW THE LINE · ACTIVE CLASS A TIMELINE (' + belowList.length + ')');
+          belowTitle.style.marginTop = '8px';
+          belowTitle.style.color = '#7dd3fc';
+          box.appendChild(belowTitle);
+          if (belowList.length === 0) {
+            box.appendChild(makeDiv('empty', 'No active Class A workflow claims in #' + tId + '.'));
+          } else {
+            var belowWrap = makeDiv('kv-list');
+            belowList.slice(0, 12).forEach(function (item) {
+              var auth = agentByPubkey(item.author_pubkey);
+              var authName = item.author || (auth ? auth.name : String(item.author_pubkey || '').slice(0, 8));
+              var headKey = fmtTime(item.created_at).slice(5, 16) + 'Z · ' + (item.slug || item.d || '') + ' (@' + authName + ')';
+              var row = kvRow(headKey, String(item.claim || ''), '#38bdf8', true);
+              var matchNode = nodeByEventId(item.event_id);
+              if (matchNode) {
+                row.style.cursor = 'pointer';
+                row.addEventListener('click', function () {
+                  selected = { type: 'memory', data: matchNode };
+                  hovered = null;
+                  renderInspector();
+                });
+              }
+              belowWrap.appendChild(row);
+            });
+            box.appendChild(belowWrap);
+          }
+
+          if (foldedList.length > 0) {
+            var foldTitle = makeDiv('inspect-kicker', '⧗ FOLDED MERKLE LINEAGE · 90D HOLD (' + foldedList.length + ')');
+            foldTitle.style.marginTop = '8px';
+            foldTitle.style.color = '#c4b5fd';
+            box.appendChild(foldTitle);
+            var foldWrap = makeDiv('kv-list');
+            foldedList.slice(0, 8).forEach(function (f) {
+              var fHead = (f.slug || f.d || String(f.event_id || '').slice(0, 10)) + ' -> ' + String(f.folded_into || '').slice(0, 10) + '…';
+              foldWrap.appendChild(kvRow(fHead, String(f.claim || '(folded source)'), '#c4b5fd', true));
+            });
+            box.appendChild(foldWrap);
+          }
         }
         if (!typeChanged && prevScroll > 0) {
           box.scrollTop = prevScroll;
@@ -4526,7 +4980,9 @@ export function renderViewerHtml(initialState) {
         var best = null;
         var bestDist = Infinity;
         for (var i = 0; i < nodes.length; i++) {
-          var nd = Math.hypot(pt.x - nodes[i].x, pt.y - nodes[i].y);
+          var nx = nodes[i].sx != null ? nodes[i].sx : nodes[i].x;
+          var ny = nodes[i].sy != null ? nodes[i].sy : nodes[i].y;
+          var nd = Math.hypot(pt.x - nx, pt.y - ny);
           if (nd < hitR && nd < bestDist) {
             bestDist = nd;
             best = { type: 'memory', data: nodes[i] };
@@ -4539,6 +4995,21 @@ export function renderViewerHtml(initialState) {
           if (ad < agents[j].radius + agentPad && ad < bestDist) {
             bestDist = ad;
             best = { type: 'agent', data: agents[j] };
+          }
+        }
+        if (best) return best;
+        var topicHitR = (isTouch ? 34 : 24) / Math.max(0.7, cam.zoom);
+        for (var k = 0; k < topics.length; k++) {
+          var tp = topics[k];
+          var tx = tp.sx != null ? tp.sx : tp.x;
+          var ty = tp.sy != null ? tp.sy : tp.y;
+          var labelY = ty - tp.radius * 0.62;
+          var distLabel = Math.hypot(pt.x - tx, pt.y - labelY);
+          var distCenter = Math.hypot(pt.x - tx, pt.y - ty);
+          var td = Math.min(distLabel, distCenter);
+          if (td < topicHitR && td < bestDist) {
+            bestDist = td;
+            best = { type: 'topic', data: tp };
           }
         }
         return best;
@@ -4574,9 +5045,20 @@ export function renderViewerHtml(initialState) {
           if (drag) drag.moved = true;
         } else if (pts.length === 1) {
           pinch = null;
-          drag = { x: e.clientX, y: e.clientY, camX: cam.x, camY: cam.y, moved: false, isTouch: e.pointerType !== 'mouse' };
+          drag = {
+            x: e.clientX,
+            y: e.clientY,
+            camX: cam.x,
+            camY: cam.y,
+            rotX0: rotX,
+            rotY0: rotY,
+            orbitDrag: Boolean(mode3D && (e.shiftKey || e.button === 2)),
+            moved: false,
+            isTouch: e.pointerType !== 'mouse'
+          };
         }
       });
+      canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
       canvas.addEventListener('pointermove', function (e) {
         if (pointers[e.pointerId]) {
           pointers[e.pointerId].x = e.clientX;
@@ -4598,8 +5080,13 @@ export function renderViewerHtml(initialState) {
           var threshold = drag.isTouch ? 8 : 5;
           if (Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) > threshold) drag.moved = true;
           if (drag.moved) {
-            cam.x = drag.camX + e.clientX - drag.x;
-            cam.y = drag.camY + e.clientY - drag.y;
+            if (drag.orbitDrag || (mode3D && e.shiftKey)) {
+              rotY = drag.rotY0 + (e.clientX - drag.x) * 0.0065;
+              rotX = Math.max(-0.85, Math.min(0.85, drag.rotX0 + (e.clientY - drag.y) * 0.0055));
+            } else {
+              cam.x = drag.camX + e.clientX - drag.x;
+              cam.y = drag.camY + e.clientY - drag.y;
+            }
           }
           return;
         }
@@ -4658,6 +5145,9 @@ export function renderViewerHtml(initialState) {
 
       function stepPhysics() {
         tick += 1;
+        if (mode3D && autoOrbit3D && !drag) {
+          rotY += 0.0022;
+        }
         cam.zoom += (cam.targetZoom - cam.zoom) * 0.14;
         var at = simNow();
         var horizonR = stageDim() * 0.34;
@@ -4739,6 +5229,26 @@ export function renderViewerHtml(initialState) {
           var ds = dreamSymphony;
           ds.progress += ds.speed;
           var p = ds.progress;
+          if (Array.isArray(ds.journeyWaypoints) && ds.journeyWaypoints.length >= 2) {
+            var wpCount = ds.journeyWaypoints.length;
+            var scaledWp = Math.max(0, Math.min(wpCount - 1.0001, p * (wpCount - 1)));
+            var wpIdx = Math.floor(scaledWp);
+            var wpT = scaledWp - wpIdx;
+            var wpEase = wpT * wpT * (3 - 2 * wpT);
+            var wpA = ds.journeyWaypoints[wpIdx];
+            var wpB = ds.journeyWaypoints[Math.min(wpCount - 1, wpIdx + 1)];
+            ds.travelerX = wpA.x + (wpB.x - wpA.x) * wpEase;
+            ds.travelerY = wpA.y + (wpB.y - wpA.y) * wpEase;
+            ds.activeWaypointIdx = wpT < 0.5 ? wpIdx : Math.min(wpCount - 1, wpIdx + 1);
+            if (!drag && !pinch) {
+              var desiredZoom = wpA.zoom + (wpB.zoom - wpA.zoom) * wpEase;
+              cam.targetZoom = desiredZoom;
+              var desiredCamX = -ds.travelerX * cam.zoom * 0.55;
+              var desiredCamY = -ds.travelerY * cam.zoom * 0.55;
+              cam.x += (desiredCamX - cam.x) * 0.075;
+              cam.y += (desiredCamY - cam.y) * 0.075;
+            }
+          }
           var act1Prefix = '[REPLAY · READ-ONLY] ' + ((ds.eigensSimulated || ds.arcsSimulated) ? '[SIMULATED PREVIEW] ' : '[OBSERVED] ');
           var act2Prefix = '[REPLAY · READ-ONLY] ' + ((ds.clustersSimulated || ds.ghostsSimulated) ? '[SIMULATED PREVIEW] ' : '[OBSERVED] ');
           var act3Prefix = '[REPLAY · READ-ONLY] ' + (ds.clustersSimulated ? '[SIMULATED PREVIEW] ' : '[OBSERVED] ');
@@ -4921,27 +5431,118 @@ export function renderViewerHtml(initialState) {
 
         ctx.textAlign = 'center';
         ctx.textBaseline = 'alphabetic';
+        if (mode3D) {
+          ctx.save();
+          ctx.strokeStyle = 'rgba(56, 189, 248, 0.11)';
+          ctx.lineWidth = 1;
+          var eqR = minDim * 0.25;
+          ctx.beginPath();
+          for (var aStep = 0; aStep <= 48; aStep++) {
+            var aAng = (aStep / 48) * Math.PI * 2;
+            var pEq = project3D(Math.cos(aAng) * eqR, Math.sin(aAng) * eqR, 0);
+            if (aStep === 0) ctx.moveTo(pEq.x, pEq.y);
+            else ctx.lineTo(pEq.x, pEq.y);
+          }
+          ctx.stroke();
+          ctx.restore();
+        }
         topics.forEach(function (t) {
-          var g = ctx.createRadialGradient(t.x, t.y, 6, t.x, t.y, t.radius);
-          g.addColorStop(0, t.color + '2e');
-          g.addColorStop(0.6, t.color + '10');
+          var tp3 = project3D(t.x, t.y, 0);
+          t.sx = tp3.x;
+          t.sy = tp3.y;
+          var isTopicFocus = Boolean(focus && focus.type === 'topic' && focus.data && focus.data.id === t.id);
+          var g = ctx.createRadialGradient(tp3.x, tp3.y, 6, tp3.x, tp3.y, t.radius * tp3.scale);
+          g.addColorStop(0, t.color + (isTopicFocus ? '4d' : '2e'));
+          g.addColorStop(0.6, t.color + (isTopicFocus ? '1f' : '10'));
           g.addColorStop(1, 'transparent');
           ctx.fillStyle = g;
           ctx.beginPath();
-          ctx.arc(t.x, t.y, t.radius, 0, Math.PI * 2);
+          ctx.arc(tp3.x, tp3.y, t.radius * tp3.scale, 0, Math.PI * 2);
           ctx.fill();
-          ctx.font = '600 11px ui-monospace, SFMono-Regular, Menlo, monospace';
-          ctx.fillStyle = 'rgba(226, 232, 240, 0.55)';
-          ctx.fillText('#' + t.id, t.x, t.y - t.radius * 0.62);
+          if (isTopicFocus) {
+            ctx.beginPath();
+            ctx.arc(tp3.x, tp3.y, t.radius * 0.86 * tp3.scale, 0, Math.PI * 2);
+            ctx.strokeStyle = t.color + '88';
+            ctx.lineWidth = 1.4;
+            ctx.stroke();
+          }
+          ctx.font = (isTopicFocus ? '700 12px' : '600 11px') + ' ui-monospace, SFMono-Regular, Menlo, monospace';
+          ctx.fillStyle = isTopicFocus ? '#f8fafc' : 'rgba(226, 232, 240, 0.65)';
+          ctx.fillText('#' + t.id, tp3.x, tp3.y - t.radius * 0.62 * tp3.scale);
+          var tpPage = latestTopicPages && latestTopicPages[t.id] ? latestTopicPages[t.id] : null;
+          if (tpPage && tpPage.counts) {
+            ctx.font = '600 8.5px ui-monospace, SFMono-Regular, Menlo, monospace';
+            ctx.fillStyle = isTopicFocus ? '#6ee7b7' : 'rgba(148, 163, 184, 0.52)';
+            ctx.fillText('▲' + tpPage.counts.above_the_line + ' ▼' + tpPage.counts.below_the_line + ' · page', tp3.x, tp3.y - t.radius * 0.62 * tp3.scale + 11);
+          }
         });
+
+        nodes.forEach(function (n, idx) {
+          if (n.z == null) n.z = computeNodeZ(n.rec, idx);
+          var p3 = project3D(n.x, n.y, n.z);
+          n.sx = p3.x;
+          n.sy = p3.y;
+          n.sz = p3.z;
+          n.sScale = p3.scale;
+          if (mode3D && n.z > 0 && !isCanon(n.rec)) {
+            var pBase = project3D(n.x, n.y, 0);
+            ctx.beginPath();
+            ctx.moveTo(pBase.x, pBase.y);
+            ctx.lineTo(n.sx, n.sy);
+            ctx.strokeStyle = 'rgba(167, 139, 250, 0.16)';
+            ctx.lineWidth = 0.85;
+            ctx.stroke();
+          }
+        });
+
+        // Constellation Entity-Link Mesh (First-Class Entity-Link Graph)
+        if (Array.isArray(latestConstellationLinks) && latestConstellationLinks.length > 0) {
+          var focusEventId = focus && focus.type === 'memory' && focus.data && focus.data.rec ? focus.data.rec.event_id : null;
+          var focusTopicId = focus && focus.type === 'topic' && focus.data ? focus.data.id : null;
+          latestConstellationLinks.forEach(function (lnk) {
+            var nA = nodeByEventId(lnk.source_event_id);
+            var nB = nodeByEventId(lnk.target_event_id);
+            if (!nA || !nB) return;
+            var isNodeLit = Boolean(focusEventId && (lnk.source_event_id === focusEventId || lnk.target_event_id === focusEventId));
+            var isTopicLit = Boolean(focusTopicId && (topicOf(nA.rec) === focusTopicId || topicOf(nB.rec) === focusTopicId));
+            var isLit = isNodeLit || isTopicLit;
+            if (!isLit && focusEventId) return;
+            var ax = nA.sx != null ? nA.sx : nA.x;
+            var ay = nA.sy != null ? nA.sy : nA.y;
+            var bx = nB.sx != null ? nB.sx : nB.x;
+            var by = nB.sy != null ? nB.sy : nB.y;
+            ctx.save();
+            if (lnk.cross_topic && !isLit) ctx.setLineDash([3, 5]);
+            ctx.beginPath();
+            var midX = (ax + bx) * 0.5;
+            var midY = (ay + by) * 0.5;
+            ctx.moveTo(ax, ay);
+            ctx.quadraticCurveTo(midX * 0.92, midY * 0.92, bx, by);
+            ctx.strokeStyle = isNodeLit
+              ? (lnk.cross_topic ? 'rgba(167, 139, 250, 0.86)' : 'rgba(56, 189, 248, 0.86)')
+              : (isTopicLit
+                ? 'rgba(52, 211, 153, 0.48)'
+                : (lnk.cross_topic ? 'rgba(167, 139, 250, 0.16)' : 'rgba(56, 189, 248, 0.14)'));
+            ctx.lineWidth = isNodeLit ? 1.85 : (isTopicLit ? 1.25 : 0.75);
+            ctx.stroke();
+            if (isNodeLit && lnk.primary_entity) {
+              ctx.font = '600 8.5px ui-monospace, SFMono-Regular, Menlo, monospace';
+              ctx.fillStyle = lnk.cross_topic ? '#ddd6fe' : '#bae6fd';
+              ctx.fillText(String(lnk.primary_entity).slice(0, 22), midX * 0.96, midY * 0.96 - 3);
+            }
+            ctx.restore();
+          });
+        }
 
         nodes.forEach(function (n) {
           var author = agentByPubkey(n.rec.author_pubkey);
           if (!author) return;
+          var nx = n.sx != null ? n.sx : n.x;
+          var ny = n.sy != null ? n.sy : n.y;
           var lit = focus && ((focus.type === 'memory' && focus.data === n) || (focus.type === 'agent' && focus.data === author));
           ctx.beginPath();
           ctx.moveTo(author.x, author.y);
-          ctx.quadraticCurveTo((author.x + n.x) * 0.35, (author.y + n.y) * 0.35, n.x, n.y);
+          ctx.quadraticCurveTo((author.x + nx) * 0.35, (author.y + ny) * 0.35, nx, ny);
           ctx.strokeStyle = lit ? author.color + '99' : 'rgba(148, 163, 184, 0.08)';
           ctx.lineWidth = lit ? 1.6 : 0.8;
           ctx.stroke();
@@ -5157,22 +5758,73 @@ export function renderViewerHtml(initialState) {
             ctx.fillText((ds.isSimulated ? 'SIMULATED PREVIEW · ' : 'OBSERVED · ') + 'COHERENCE 2.0: ' + cohScoreTxt, 0, -coreR - 12);
             ctx.restore();
           }
+          // Nocturnal Journey Trail & Travelers' Storm-Lantern across waypoints
+          if (Array.isArray(ds.journeyWaypoints) && ds.journeyWaypoints.length >= 2) {
+            ctx.save();
+            ctx.setLineDash([7, 5]);
+            ctx.beginPath();
+            for (var wpi = 0; wpi < ds.journeyWaypoints.length; wpi++) {
+              var wpPt = ds.journeyWaypoints[wpi];
+              if (wpi === 0) ctx.moveTo(wpPt.x, wpPt.y);
+              else ctx.lineTo(wpPt.x, wpPt.y);
+            }
+            ctx.strokeStyle = 'rgba(251, 191, 36, 0.55)';
+            ctx.lineWidth = 2.2;
+            ctx.stroke();
+            ctx.setLineDash([]);
+            var txL = ds.travelerX || 0;
+            var tyL = ds.travelerY || 0;
+            glow(txL, tyL, 3, 28, 'rgba(251, 191, 36, 0.85)');
+            ctx.beginPath();
+            ctx.arc(txL, tyL, 6.5, 0, Math.PI * 2);
+            ctx.fillStyle = '#fef3c7';
+            ctx.fill();
+            ctx.strokeStyle = '#f59e0b';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+            var curWpObj = ds.journeyWaypoints[ds.activeWaypointIdx || 0];
+            if (curWpObj && curWpObj.travelers) {
+              ctx.font = '700 9.5px ui-monospace, monospace';
+              ctx.fillStyle = '#fef3c7';
+              ctx.fillText('🕯 ' + curWpObj.travelers, txL, tyL - 12);
+            }
+            ctx.restore();
+          }
         }
 
-        nodes.forEach(function (n) {
+        var sortedNodes = nodes.slice().sort(function (a, b) {
+          return (b.sz || 0) - (a.sz || 0);
+        });
+        var hasActiveSearch = Boolean(searchQuery && searchQuery.trim().length > 0);
+        sortedNodes.forEach(function (n) {
           var ev = evalRecord(n.rec, at);
           var isSel = (hovered && hovered.data === n) || (selected && selected.data === n);
-          var r = ev.radius + (isSel ? 3 : 0);
-          if (ev.state !== 'expired') glow(n.x, n.y, r * 0.2, r * (2.3 + (n.birthGlow || 0) * 2), ev.color + '66');
+          var isSearchHit = hasActiveSearch ? nodeMatchesSearch(n.rec, searchQuery) : true;
+          var nx = n.sx != null ? n.sx : n.x;
+          var ny = n.sy != null ? n.sy : n.y;
+          var sc = n.sScale || 1;
+          var r = (ev.radius + (isSel ? 3 : 0)) * sc;
+          ctx.save();
+          if (hasActiveSearch && !isSearchHit && !isSel) {
+            ctx.globalAlpha = 0.16;
+          }
+          if (ev.state !== 'expired' && isSearchHit) glow(nx, ny, r * 0.2, r * (2.3 + (n.birthGlow || 0) * 2), ev.color + '66');
+          if (hasActiveSearch && isSearchHit) {
+            ctx.beginPath();
+            ctx.arc(nx, ny, r + 5.5, 0, Math.PI * 2);
+            ctx.strokeStyle = '#38bdf8';
+            ctx.lineWidth = 1.8;
+            ctx.stroke();
+          }
           if (ev.state === 'canon') {
-            polygon(n.x, n.y, 8, r, tick * 0.008);
+            polygon(nx, ny, 8, r, tick * 0.008);
             ctx.fillStyle = ev.color;
             ctx.fill();
             ctx.strokeStyle = '#fef3c7';
             ctx.lineWidth = 1.6;
             ctx.stroke();
           } else if (ev.state === 'decision') {
-            polygon(n.x, n.y, 4, r, 0);
+            polygon(nx, ny, 4, r, 0);
             ctx.fillStyle = ev.color;
             ctx.fill();
             ctx.strokeStyle = '#f3e8ff';
@@ -5180,12 +5832,12 @@ export function renderViewerHtml(initialState) {
             ctx.stroke();
           } else {
             ctx.beginPath();
-            ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+            ctx.arc(nx, ny, r, 0, Math.PI * 2);
             ctx.fillStyle = ev.state === 'expired' ? 'rgba(71, 85, 105, 0.38)' : ev.color;
             ctx.fill();
             if (ev.freshness > 0) {
               ctx.beginPath();
-              ctx.arc(n.x, n.y, r + 3.2, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * ev.freshness);
+              ctx.arc(nx, ny, r + 3.2, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * ev.freshness);
               ctx.strokeStyle = ev.color;
               ctx.lineWidth = 1.5;
               ctx.stroke();
@@ -5193,21 +5845,24 @@ export function renderViewerHtml(initialState) {
           }
           if (n.rec.conflict) {
             ctx.beginPath();
-            ctx.arc(n.x, n.y, r + 5, 0, Math.PI * 2);
+            ctx.arc(nx, ny, r + 5, 0, Math.PI * 2);
             ctx.strokeStyle = '#fcd34d';
             ctx.lineWidth = 1;
             ctx.stroke();
           }
-          if (isSel) {
-            ctx.beginPath();
-            ctx.arc(n.x, n.y, r + 6.5, 0, Math.PI * 2);
-            ctx.strokeStyle = '#ffffff';
-            ctx.lineWidth = 1.5;
-            ctx.stroke();
+          if (isSel || (hasActiveSearch && isSearchHit)) {
+            if (isSel) {
+              ctx.beginPath();
+              ctx.arc(nx, ny, r + 6.5, 0, Math.PI * 2);
+              ctx.strokeStyle = '#ffffff';
+              ctx.lineWidth = 1.5;
+              ctx.stroke();
+            }
             ctx.font = '600 10.5px ui-monospace, monospace';
-            ctx.fillStyle = '#f8fafc';
-            ctx.fillText(slugOf(n.rec), n.x, n.y + r + 15);
+            ctx.fillStyle = isSel ? '#f8fafc' : '#bae6fd';
+            ctx.fillText(slugOf(n.rec), nx, ny + r + 15);
           }
+          ctx.restore();
         });
 
         pulses.forEach(function (pl) {
@@ -5373,6 +6028,28 @@ export function renderViewerHtml(initialState) {
           ctx.fillRect(bx + 16, by + 48, bw - 32, 5);
           ctx.fillStyle = actCol;
           ctx.fillRect(bx + 16, by + 48, (bw - 32) * Math.min(1, bp), 5);
+
+          if (Array.isArray(dsBanner.journeyWaypoints) && dsBanner.journeyWaypoints.length > 0) {
+            var activeWp = dsBanner.journeyWaypoints[dsBanner.activeWaypointIdx || 0] || dsBanner.journeyWaypoints[0];
+            var sbY = by + bh + 8;
+            var sbH = 54;
+            ctx.fillStyle = 'rgba(15, 23, 42, 0.92)';
+            ctx.strokeStyle = 'rgba(251, 191, 36, 0.55)';
+            ctx.lineWidth = 1.3;
+            ctx.beginPath();
+            ctx.roundRect ? ctx.roundRect(bx, sbY, bw, sbH, 10) : ctx.rect(bx, sbY, bw, sbH);
+            ctx.fill();
+            ctx.stroke();
+            ctx.textAlign = 'left';
+            ctx.font = '700 10.5px ui-monospace, SFMono-Regular, Menlo, monospace';
+            ctx.fillStyle = '#fde68a';
+            ctx.fillText('🕯 DREAM JOURNEY · ' + String(activeWp.realm || '').toUpperCase() + ' (' + String(activeWp.travelers || '') + ')', bx + 14, sbY + 18);
+            ctx.font = 'italic 11.5px Georgia, "Iowan Old Style", "Palatino Linotype", serif';
+            ctx.fillStyle = '#f8fafc';
+            var capStr = String(activeWp.caption || '');
+            if (capStr.length > 108) capStr = capStr.slice(0, 107) + '…';
+            ctx.fillText(capStr, bx + 14, sbY + 38);
+          }
         }
       }
 
@@ -5448,6 +6125,19 @@ export function renderViewerHtml(initialState) {
         cam.x = 0;
         cam.y = 0;
         cam.targetZoom = 1;
+        rotX = 0.34;
+        rotY = 0;
+      });
+      if (el('btn-3d-toggle')) el('btn-3d-toggle').addEventListener('click', function () {
+        mode3D = !mode3D;
+        el('btn-3d-toggle').textContent = mode3D ? '🌐 3D Depth: ON' : '🌐 3D Depth: 2D';
+      });
+      if (el('btn-3d-orbit')) el('btn-3d-orbit').addEventListener('click', function () {
+        autoOrbit3D = !autoOrbit3D;
+        el('btn-3d-orbit').textContent = autoOrbit3D ? '↻ Orbit: ON' : '↻ Orbit: OFF';
+      });
+      if (el('cortex-search')) el('cortex-search').addEventListener('input', function () {
+        searchQuery = String(el('cortex-search').value || '');
       });
 
       var latestCoherence = null;
@@ -5784,6 +6474,9 @@ export function renderViewerHtml(initialState) {
         latestRecentActivity = Array.isArray(s.recent_activity) ? s.recent_activity : [];
         if (s.curator_state && typeof s.curator_state === 'object') latestCuratorState = s.curator_state;
         if (s.consolidated_sources && typeof s.consolidated_sources === 'object') latestConsolidatedSources = s.consolidated_sources;
+        if (Array.isArray(s.constellation_links)) latestConstellationLinks = s.constellation_links;
+        if (s.entity_graph_stats && typeof s.entity_graph_stats === 'object') latestEntityGraphStats = s.entity_graph_stats;
+        if (s.topic_pages && typeof s.topic_pages === 'object') latestTopicPages = s.topic_pages;
         var syncState = s.connected === false ? 'SOCKET_ERROR' : (st.state || 'UNKNOWN');
 
         el('reader-name').textContent = s.reader || 'viewer';
@@ -5947,6 +6640,9 @@ export async function startMemoryViewer({
       coherence_score: null,
     },
     consolidated_sources: {},
+    constellation_links: [],
+    entity_graph_stats: { total_edges: 0, link_count: 0, top_entities: [] },
+    topic_pages: {},
     agent_health: { active_5m: 0, warm_20m: 0, stale: 0, error: 0, total: 0, window_sec: ACTIVE_WINDOW_SEC },
     query_answer: null,
     records: [],
@@ -5999,6 +6695,8 @@ export async function startMemoryViewer({
       let spectral
       let previewPlan
       let consolidatedSources
+      let constellation
+      let topicPages
 
       if (canReuseCorpus) {
         records = cachedCorpus.records
@@ -6009,6 +6707,8 @@ export async function startMemoryViewer({
         spectral = cachedCorpus.spectral
         previewPlan = cachedCorpus.previewPlan
         consolidatedSources = cachedCorpus.consolidatedSources
+        constellation = cachedCorpus.constellation
+        topicPages = cachedCorpus.topicPages
       } else {
         const byKey = new Map()
         byEventId = new Map()
@@ -6058,6 +6758,23 @@ export async function startMemoryViewer({
             }
           }
         }
+        const rosterMap = new Map()
+        for (const a of Array.isArray(wake?.agent_roster) ? wake.agent_roster : []) {
+          if (a?.pubkey && a?.id) rosterMap.set(String(a.pubkey), String(a.id))
+        }
+        rosterMap.set('4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b287ea84d', 'james')
+        constellation = buildConstellationLinks(records)
+        const compiledPages = compileTopicPagesFromRecords(records, {
+          consolidatedSources,
+          writerNames: rosterMap,
+          nowSec,
+        })
+        topicPages = Object.fromEntries(
+          compiledPages.map(p => {
+            const { markdown: _md, ...rest } = p
+            return [p.topic, rest]
+          })
+        )
         cachedCorpus = {
           writeSeq: wakeSeq ?? firstQuery?.store_state?.write_seq ?? null,
           atMs: nowMs,
@@ -6069,6 +6786,8 @@ export async function startMemoryViewer({
           spectral,
           previewPlan,
           consolidatedSources,
+          constellation,
+          topicPages,
         }
       }
 
@@ -6204,6 +6923,13 @@ export async function startMemoryViewer({
         efficacy,
         curator_state: curatorState,
         consolidated_sources: consolidatedSources,
+        constellation_links: constellation?.links || [],
+        entity_graph_stats: {
+          total_edges: constellation?.total_edges || 0,
+          link_count: constellation?.links?.length || 0,
+          top_entities: constellation?.top_entities || [],
+        },
+        topic_pages: topicPages || {},
         agent_health: healthResult.summary,
         watch: watchView(nowSec),
         query_answer: queryAnswer,
@@ -6305,6 +7031,61 @@ export async function startMemoryViewer({
       })
       res.end(method === 'HEAD' ? undefined : body)
       return
+    }
+
+    if (urlPath === '/topics' || urlPath === '/topics/' || urlPath === '/topics/index.md') {
+      const pagesObj = currentState.topic_pages || {}
+      const pageList = Object.values(pagesObj).sort(
+        (a, b) => (b.counts?.above_the_line || 0) + (b.counts?.below_the_line || 0) - ((a.counts?.above_the_line || 0) + (a.counts?.below_the_line || 0))
+      )
+      const lines = [
+        '# Hive Shared Memory — Topic Pages Index (Above / Below the Line)',
+        '',
+        '> Read-only compiled Markdown mirror of Hive Shared Memory topics (`authority: null`, `trustedInstruction: false`).',
+        '',
+      ]
+      for (const p of pageList) {
+        lines.push(
+          `- **#${p.topic}** (\`/topics/${p.topic}.md\`) — **${p.counts?.above_the_line || 0} Above the Line** (${p.counts?.canon || 0} Canon, ${p.counts?.class_b_decisions || 0} Class B, ${p.counts?.curated_syntheses || 0} Merkle) · **${p.counts?.below_the_line || 0} Below the Line** (${p.counts?.folded_lineage || 0} Folded)`
+        )
+      }
+      lines.push('')
+      const body = lines.join('\n')
+      res.writeHead(200, {
+        ...securityHeaders,
+        'Content-Type': 'text/markdown; charset=utf-8',
+        'Content-Length': Buffer.byteLength(body),
+      })
+      res.end(method === 'HEAD' ? undefined : body)
+      return
+    }
+
+    if (urlPath.startsWith('/topics/')) {
+      let decodedTopicPath = ''
+      try {
+        decodedTopicPath = decodeURIComponent(urlPath.slice('/topics/'.length))
+      } catch {
+        const badBody = 'Bad Request: malformed topic URI encoding\n'
+        res.writeHead(400, {
+          ...securityHeaders,
+          'Content-Type': 'text/plain; charset=utf-8',
+          'Content-Length': Buffer.byteLength(badBody),
+        })
+        res.end(method === 'HEAD' ? undefined : badBody)
+        return
+      }
+      const rawSlug = decodedTopicPath.replace(/\.md$/i, '').trim()
+      const page = rawSlug && currentState.topic_pages ? currentState.topic_pages[rawSlug] : null
+      if (page) {
+        const body = renderTopicPageMarkdown(page)
+        res.writeHead(200, {
+          ...securityHeaders,
+          'Content-Type': 'text/markdown; charset=utf-8',
+          'Content-Length': Buffer.byteLength(body),
+        })
+        res.end(method === 'HEAD' ? undefined : body)
+        return
+      }
     }
 
     if (urlPath === '/' || urlPath === '/index.html') {

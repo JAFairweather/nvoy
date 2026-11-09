@@ -1317,6 +1317,11 @@ await test('writeDreamPacket writes 0640 global-scope packets, strips @mentions/
     assert(!pkt.changes[0].summary.includes('0d7ac776bf6e9cd0b5f6216ea2f59ac7932a9948'), 'raw 64-hex commit SHA must be sanitized in summary')
     assert(!pkt.changes[0].summary.includes('@mydude'), '@mention syntax must be stripped from packet summary')
     assert(!pkt.changes[0].summary.includes('https://'), 'raw URLs must be stripped from packet summary')
+    assert(pkt.story_seed && typeof pkt.story_seed.dream === 'string', 'packet must include a pre-woven story_seed journey')
+    assert(!/\d/.test(pkt.story_seed.title) && !/\d/.test(pkt.story_seed.dream), 'story_seed journey must contain zero statistics, sequence numbers, scores, or counts')
+    assert(pkt.story_seed.dream.includes('Biggy') && pkt.story_seed.dream.includes('My Dude'), 'story_seed journey must feature the agents as characters')
+    const seedRes = verifyAndAssembleDreamRecord({ packet: pkt, draft: pkt.story_seed })
+    assert.equal(seedRes.ok, true, 'story_seed must pass verifyAndAssembleDreamRecord directly')
 
     const paths = writeDreamPacket({ packetDir, packet: pkt })
     assert.equal(statSync(paths.cyclePath).mode & 0o777, 0o640, 'dream-<write_seq>.json must be mode 0640')
@@ -1339,6 +1344,9 @@ await test('writeDreamPacket writes 0640 global-scope packets, strips @mentions/
     assert.deepEqual(goodRes.record.changes[0], pkt.changes[0], 'verifier must copy each packet change verbatim including change_id, d, topic, and source_count')
     const buzzPost = formatDreamBuzzPost(goodRes.record)
     assert(!buzzPost.includes('@mydude') && !buzzPost.includes('https://'), 'formatted Buzz post must contain no @mentions or URLs')
+    assert(!buzzPost.includes('dream-1023') && !buzzPost.includes('Consolidated Changes') && !buzzPost.includes('validation'), 'formatted Buzz post must be journey-only without dream ID, validation metadata, or Consolidated Changes list')
+    const seedBuzzPost = formatDreamBuzzPost(seedRes.record)
+    assert(!/\d/.test(seedBuzzPost), 'formatted Buzz post from story_seed must contain zero statistics, sequence numbers, or counts')
 
     // Unsanitized packet summary with @mention or URL fails closed in verifier
     const dirtyPkt = {
@@ -1381,6 +1389,19 @@ await test('writeDreamPacket writes 0640 global-scope packets, strips @mentions/
     assert.equal(badProseRes.ok, false)
     assert(badProseRes.errors.some(e => e.includes('hex IDs')))
     assert(badProseRes.errors.some(e => e.includes('@mentions')))
+
+    // Digits / statistics / counts in title or dream fail closed at the verifier boundary
+    const digitRes = verifyAndAssembleDreamRecord({
+      packet: pkt,
+      draft: {
+        title: 'Journey 42',
+        dream: 'The 7 agents crossed a bridge after 3 tests passed.',
+        referenced_change_ids: [claimIdGlobal],
+      },
+    })
+    assert.equal(digitRes.ok, false, 'verifier must reject digits/counts in title and dream')
+    assert(digitRes.errors.some(e => e.includes('draft.title') && e.includes('digits')))
+    assert(digitRes.errors.some(e => e.includes('draft.dream') && e.includes('digits')))
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }

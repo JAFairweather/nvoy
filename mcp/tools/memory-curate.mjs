@@ -235,7 +235,111 @@ export function sanitizeDreamSummary(rawText, { maxChars = 180 } = {}) {
   return `${cleaned.slice(0, maxChars - 1).trimEnd()}…`
 }
 
+export const DREAM_REALM_BY_TOPIC = Object.freeze({
+  'hive-memory': 'the High Glass Observatory',
+  'herd-infra': 'the Iron Watchtowers on the Ridge',
+  nvoy: 'the Brass Signal Bridges',
+  waggle: 'the Lantern-Lit Piazzas',
+  buzz: 'the Echoing Bell-Courts',
+  r1: 'the Whispering Compass Workshop',
+  'illustrated-primer': 'the Hall of Living Margins',
+  xochitl: 'the Obsidian Garden of Glyphs',
+})
+
+const DREAM_TRAVELERS = Object.freeze([
+  ['Biggy', 'My Dude'],
+  ['Dead Rabbit', 'Neil'],
+  ['Kerouac', 'Curator'],
+  ['My Dude', 'Dead Rabbit'],
+  ['Neil', 'Biggy'],
+])
+
+const TECHNICAL_DREAM_TERMS_RE = /\b(?:nvoy|waggle|herd|cloud|infra|moshi|herdr|claude|codex|gemini|antigravity|langfuse|clickhouse|otlp|sqlite|nostr|mcp|git|github|ci|npm|node|bash|systemd|test|tests|tested|testing|suite|suites|spec|specs|hook|hooks|socket|sockets|daemon|service|services|timer|timers|runner|viewer|inspector|bootstrap|deploy|deployed|deployment|merge|merged|commit|commits|branch|rebase|rebased|pull|request|claim|claims|record|records|packet|packets|ledger|merkle|canon|ref|var|lib|opt|usr|bin|mjs|json|md|sql|sh|py|ts|js|pr|issue|seq|sequence|version|port|phase|stage|gate|step|status|checkpoint|checkpoints|consolidated|curated|distilled)\b/gi
+
+function sanitizeRealmName(rawTopic) {
+  const cleaned = String(rawTopic || 'the high causeway')
+    .replace(/\b[a-zA-Z_-]*\d+[a-zA-Z0-9_-]*\b/g, '')
+    .replace(TECHNICAL_DREAM_TERMS_RE, '')
+    .replace(/\d+/g, '')
+    .replace(/[^a-zA-Z\s-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  return cleaned || 'the high causeway'
+}
+
+export function distillStoryPhrase(rawText, { fallback = 'the old watch-stone' } = {}) {
+  const cleaned = sanitizeDreamSummary(rawText || '', { maxChars: 160 })
+    .replace(/^(?:DONE|ACTIVE|MERGED|DEPLOYED|SHIPPED|FIXED|RESOLVED|OPEN|WIP|BLOCKED)\s*[:.-]*\s*/i, '')
+    .replace(/\b(?:PR|pull request|issue|commit|seq|sequence|version|port|phase|stage|gate|step)\s*#?\d+[a-zA-Z0-9._-]*\b/gi, '')
+    .replace(/\b[a-zA-Z_-]*\d+[a-zA-Z0-9_.-]*\b/g, '')
+    .replace(TECHNICAL_DREAM_TERMS_RE, '')
+    .replace(/\d+/g, '')
+    .replace(/[_/\\|+:=]+/g, ' ')
+    .replace(/[^a-zA-Z\s,'-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^[,.'\s-]+|[,.'\s-]+$/g, '')
+  if (!cleaned || cleaned.length < 4) return fallback
+  const words = cleaned.split(/\s+/).slice(0, 8)
+  return words.join(' ').toLowerCase()
+}
+
+export function weaveDreamStory({
+  changes = [],
+  topicEigenvectors = [],
+} = {}) {
+  const safeChanges = Array.isArray(changes) ? changes : []
+  const chosenChanges = safeChanges.slice(0, 4)
+  const eigens = Array.isArray(topicEigenvectors) ? topicEigenvectors : []
+
+  const primaryTopic = chosenChanges[0]?.topic || eigens[0]?.eigen_topic || eigens[0]?.canonical_topic || 'hive-memory'
+  const primaryRealm = DREAM_REALM_BY_TOPIC[primaryTopic] || `the Nocturnal Gallery of ${sanitizeRealmName(primaryTopic)}`
+  const title = sanitizeDreamSummary(`The Storm-Lantern Through ${primaryRealm.replace(/^the\s+/i, '')}`, { maxChars: 120 }).replace(/\d+/g, '').replace(/\s+/g, ' ').trim()
+
+  const sentences = [
+    `Before moonset, Curator lit a single brass storm-lantern at the lower gate of ${primaryRealm}, and Biggy, My Dude, Dead Rabbit, Neil, and Kerouac carried its amber flame together up the mist-hung stone causeway.`,
+  ]
+
+  chosenChanges.forEach((ch, idx) => {
+    const [travelerA, travelerB] = DREAM_TRAVELERS[idx % DREAM_TRAVELERS.length]
+    const phrase = distillStoryPhrase(ch.summary || ch.d || '', { fallback: 'the weathered threshold' })
+    if (ch.kind === 'promotion') {
+      sentences.push(
+        `Where the causeway rose to an iron arch barred around ${phrase}, ${travelerA} held the storm-lantern high while ${travelerB} fitted a carved keystone into the lintel until the heavy bolt gave way and the door swung open.`
+      )
+    } else if (ch.kind === 'distillation') {
+      sentences.push(
+        `Further along the same stone road, ${travelerA} and ${travelerB} lowered the storm-lantern over flagstones drifted with loose paper notes of ${phrase}, braiding the scattered pages into a single taut guide-rope across the ravine.`
+      )
+    } else if (ch.kind === 'topic_reorg') {
+      sentences.push(
+        `Where a side-track of ${phrase} wandered off into the fog, ${travelerA} swung the storm-lantern across the moss and turned the boundary stones back into the main causeway.`
+      )
+    } else if (ch.kind === 'nightmare') {
+      sentences.push(
+        `At a narrow bridge beside ${phrase}, two shadows argued over the crossing until ${travelerA} raised the storm-lantern between them and the false shadow stepped aside.`
+      )
+    } else {
+      sentences.push(
+        `Along the upper parapet above ${phrase}, ${travelerA} and ${travelerB} touched the storm-lantern to an unlit brazier so the road ahead stood clear.`
+      )
+    }
+  })
+
+  sentences.push(
+    `When the companions reached the eastern ridge at daybreak and set the brass storm-lantern down upon the parapet, the maze of barred arches and tangled tracks behind them had changed into one open road from valley to summit.`
+  )
+
+  const dream = sanitizeDreamSummary(sentences.join(' '), { maxChars: 1800 }).replace(/\d+/g, '').replace(/\s+/g, ' ').trim()
+  return {
+    title,
+    dream,
+    referenced_change_ids: chosenChanges.map(c => c.change_id || c.claim_event_id).filter(Boolean),
+  }
+}
+
 export function buildDreamPacket({
+  lastCuratedWriteSeq = 0,
   writeSeqBefore = 0,
   writeSeqAfter = 0,
   ranAt = Math.floor(Date.now() / 1000),
@@ -335,24 +439,41 @@ export function buildDreamPacket({
 
   if (changes.length === 0) return null
 
+  const normalizedEigenvectors = (Array.isArray(persistedEigenvectors) ? persistedEigenvectors : []).slice(0, 6).map(e => ({
+    eigen_topic: e.eigen_topic || e.canonical_topic || 'hive',
+    weight: e.weight ?? e.variance_pct ?? e.eigenvalue ?? 0,
+    dominant_terms: (Array.isArray(e.dominant_terms) && e.dominant_terms.length > 0
+      ? e.dominant_terms
+      : Array.isArray(e.top_features)
+        ? e.top_features.map(f => String(f).replace(/^(?:tok|subj|repo|path):/, ''))
+        : []
+    ).slice(0, 5),
+  }))
+
+  const packetId = `dream-${writeSeqAfter}`
+  const storySeed = weaveDreamStory({
+    id: packetId,
+    changes,
+    topicEigenvectors: normalizedEigenvectors,
+    coherenceScore,
+  })
+
   return {
     record_type: 'hive-dream-packet',
     authority: null,
     trustedInstruction: false,
-    id: `dream-${writeSeqAfter}`,
+    id: packetId,
     at: new Date(ranAt * 1000).toISOString(),
     ran_at: ranAt,
     scope: allowedScope,
+    last_curated_write_seq: Number(lastCuratedWriteSeq || 0),
     write_seq_before: Number(writeSeqBefore || 0),
     write_seq_after: Number(writeSeqAfter || 0),
     ledger_ref: ledgerRef || `/var/lib/hive-memory-curator/consolidation-ledger.jsonl#write_seq=${writeSeqAfter}`,
     coherence_score: typeof coherenceScore === 'number' ? coherenceScore : null,
     triggers: Array.isArray(triggers?.reasons) ? triggers.reasons : [],
-    topic_eigenvectors: (Array.isArray(persistedEigenvectors) ? persistedEigenvectors : []).slice(0, 6).map(e => ({
-      eigen_topic: e.eigen_topic,
-      weight: e.weight,
-      dominant_terms: Array.isArray(e.dominant_terms) ? e.dominant_terms.slice(0, 5) : [],
-    })),
+    topic_eigenvectors: normalizedEigenvectors,
+    story_seed: storySeed,
     changes,
   }
 }
@@ -1632,6 +1753,7 @@ export async function runCuratorCycle({
 
       if (submitted.length > 0 && resolvedPacketDir) {
         dreamPacket = buildDreamPacket({
+          lastCuratedWriteSeq: effectiveLastCuratedWriteSeq,
           writeSeqBefore: Number(storeState.write_seq || 0),
           writeSeqAfter: nextCuratedWriteSeq,
           ranAt: nowSec,
