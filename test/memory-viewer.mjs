@@ -23,6 +23,7 @@ import {
   parseListenTarget,
   parseViewerFlags,
   renderViewerHtml,
+  resolveDreamDisplayMode,
   safeJsonForScript,
   sanitizeActivity,
   startMemoryViewer,
@@ -610,6 +611,119 @@ await test('computeDreamingTelemetry: groups Gate 8 Class A by scope+topic, rest
   assert.equal(room1Ops?.ready, false, '5 claims in room:1 must not trigger >8 curation ready')
   assert.equal(room2Ops?.count, 5)
   assert.equal(room2Ops?.ready, false, '5 claims in room:2 must not trigger >8 curation ready')
+  assert.equal(dt.display_mode.mode, 'simulated_preview')
+  assert.equal(dt.display_mode.is_simulated_preview, true)
+  assert.deepEqual(dt.display_mode.components, {
+    clusters: 'simulated_preview',
+    eigenvalues: 'simulated_preview',
+    topic_arcs: 'simulated_preview',
+    ghost_sources: 'simulated_preview',
+  })
+})
+
+await test('resolveDreamDisplayMode & zero-activity fleet recall: distinguishes simulated preview from observed curation and never reports 100% recall without reads', () => {
+  const zeroActivityRoster = [
+    { id: 'mydude', pubkey: '1'.repeat(64), is_reader: true, is_writer: true },
+    { id: 'neil', pubkey: '2'.repeat(64), is_reader: true, is_writer: true },
+    { id: 'waggle-dev', pubkey: '3'.repeat(64), is_reader: true, is_writer: true },
+    { id: 'biggy', pubkey: '4'.repeat(64), is_reader: true, is_writer: true },
+  ]
+  const zeroActCoh = computeCoherence({
+    records: [
+      {
+        event_id: 'a'.repeat(64),
+        author_pubkey: '1'.repeat(64),
+        scope: 'room:1',
+        d: 'hive-memory:room:1:test',
+        topic: 'nvoy',
+        claim: 'Test claim',
+        evidence: ['nvoy@1111111'],
+        as_of_git: '1'.repeat(40),
+        created_at: 1000,
+        expires_at: 5000,
+      },
+    ],
+    agent_roster: zeroActivityRoster,
+    recent_activity: [],
+    store_state: { write_seq: 1 },
+  })
+  assert.equal(zeroActCoh.epistemic_drift.recall_coverage_pct, 0, 'zero-activity reader fleet must report 0% recall coverage, never 100%')
+  assert.equal(zeroActCoh.epistemic_drift.blind_roster_agents.length, 3)
+  assert.equal(zeroActCoh.epistemic_drift.lookup_only_writers.length, 1)
+
+  // 1. No persisted curator state and 0 merkle_sources records -> simulated_preview across all 4 components
+  const simMode = resolveDreamDisplayMode({
+    records: [{ event_id: '1'.repeat(64), d: 'hive-memory:room:1:item', topic: 'nvoy' }],
+    curator_state: {
+      state_file_present: false,
+      last_curated_at: null,
+      topic_eigenvectors: [{ axis: 1, canonical_topic: 'nvoy', eigenvalue: 2.1, variance_pct: 50 }],
+      topic_reorganizations: [{ from_topic: 'ops', to_topic: 'nvoy', cosine_affinity: 0.72, claim_count: 2 }],
+    },
+    consolidated_sources: {},
+  })
+  assert.equal(simMode.mode, 'simulated_preview')
+  assert.equal(simMode.is_simulated_preview, true)
+  assert.deepEqual(simMode.components, {
+    clusters: 'simulated_preview',
+    eigenvalues: 'simulated_preview',
+    topic_arcs: 'simulated_preview',
+    ghost_sources: 'simulated_preview',
+  })
+
+  // 2. Persisted curator state + merkle_sources record, but superseded source is missing (synthetic ghost) -> simulated_preview
+  const ghostSimMode = resolveDreamDisplayMode({
+    records: [
+      {
+        event_id: '2'.repeat(64),
+        d: 'hive-memory:room:1:curated-nvoy',
+        topic: 'nvoy',
+        merkle_sources: 'f'.repeat(64),
+        supersedes: ['missing-src'.padEnd(64, '0')],
+      },
+    ],
+    curator_state: {
+      state_file_present: true,
+      last_curated_at: 1700000000,
+      topic_eigenvectors: [{ axis: 1, canonical_topic: 'nvoy', eigenvalue: 2.1, variance_pct: 50 }],
+      topic_reorganizations: [{ from_topic: 'ops', to_topic: 'nvoy', cosine_affinity: 0.72, claim_count: 2 }],
+    },
+    consolidated_sources: {},
+  })
+  assert.equal(ghostSimMode.mode, 'simulated_preview')
+  assert.equal(ghostSimMode.components.clusters, 'observed')
+  assert.equal(ghostSimMode.components.ghost_sources, 'simulated_preview')
+
+  // 3. Persisted curator state + merkle_sources record + resolved source in consolidated_sources + real eigens & arcs -> observed
+  const srcId = '9'.repeat(64)
+  const observedMode = resolveDreamDisplayMode({
+    records: [
+      {
+        event_id: '2'.repeat(64),
+        d: 'hive-memory:room:1:curated-nvoy',
+        topic: 'nvoy',
+        merkle_sources: 'f'.repeat(64),
+        supersedes: [srcId],
+      },
+    ],
+    curator_state: {
+      state_file_present: true,
+      last_curated_at: 1700000000,
+      topic_eigenvectors: [{ axis: 1, canonical_topic: 'nvoy', eigenvalue: 2.1, variance_pct: 50 }],
+      topic_reorganizations: [{ from_topic: 'ops', to_topic: 'nvoy', cosine_affinity: 0.72, claim_count: 2 }],
+    },
+    consolidated_sources: {
+      [srcId]: { event_id: srcId, d: 'hive-memory:room:1:prior' },
+    },
+  })
+  assert.equal(observedMode.mode, 'observed')
+  assert.equal(observedMode.is_simulated_preview, false)
+  assert.deepEqual(observedMode.components, {
+    clusters: 'observed',
+    eigenvalues: 'observed',
+    topic_arcs: 'observed',
+    ghost_sources: 'observed',
+  })
 })
 
 await test('live integration: memory-viewer polls memory-daemon viewer socket, streams SSE, and refuses non-GET', async () => {
@@ -922,6 +1036,8 @@ await test('daemon activity ring: only the viewer wake carries it, metadata only
 
     const renderedHtml = renderViewerHtml(next)
     assert(renderedHtml.includes('[REPLAY · READ-ONLY]'), '4-act animation logs must be explicitly read-only replay')
+    assert(renderedHtml.includes('SIMULATED PREVIEW'), 'page must label synthetic/fallback clusters, eigenvalues, topic arcs and ghost sources as SIMULATED PREVIEW')
+    assert(renderedHtml.includes('SIMULATED PREVIEW CLUSTER') && renderedHtml.includes('SIMULATED PREVIEW EIGENVALUE') && renderedHtml.includes('SIMULATED PREVIEW TOPIC ARC') && renderedHtml.includes('SIMULATED PREVIEW GHOST'), 'all 4 fallback categories must carry explicit SIMULATED PREVIEW labels')
     assert(renderedHtml.includes('buildPreviewDreamClusters'), 'replayLastDream must fall back to buildPreviewDreamClusters when store has 0 merkle_sources records')
     assert(!renderedHtml.includes('92.4%'), '4-act animation must not contain invented coherence uplift fallback')
   } finally {

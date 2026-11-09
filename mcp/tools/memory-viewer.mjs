@@ -697,10 +697,10 @@ export function computeCoherence({
       at: now_sec,
     })
   }
-  const hasExplicitReaderFleet = peerReaders.length >= 4 && (activityList.length > 0 || peerReaders.some(a => a.last_read_at || a.last_write_at))
-  const recallCoveragePct = hasExplicitReaderFleet
+  const hasExplicitReaderFleet = peerReaders.length >= 4
+  const recallCoveragePct = peerReaders.length > 0
     ? Math.round((verifiedRecallAgents.length / peerReaders.length) * 1000) / 10
-    : 100
+    : (recallByActor.size > 0 ? 100 : 0)
   const alerts = [...toolFailureAlerts, ...(hasExplicitReaderFleet ? behavioralAlerts : [])].map(a => ({
     ...a,
     actor: a.actor || a.agent,
@@ -1012,7 +1012,9 @@ export function computeSynapticEfficacy({
 
   const recallCoveragePct = peerReaders.length > 0
     ? Math.round((recalledSeatCount / peerReaders.length) * 1000) / 10
-    : (coherence?.epistemic_drift?.recall_coverage_pct ?? 75)
+    : (typeof coherence?.epistemic_drift?.recall_coverage_pct === 'number'
+        ? coherence.epistemic_drift.recall_coverage_pct
+        : (compliantWriters.length > 0 ? 100 : 0))
   const totalActiveWriters = compliantWriters.length + receiptOnlyWriters.length
   const readBeforeWritePct = totalActiveWriters > 0
     ? Math.round((compliantWriters.length / totalActiveWriters) * 1000) / 10
@@ -1626,8 +1628,68 @@ export function diffViewerSnapshots(prev, next, nowSec = Math.floor(Date.now() /
   return events
 }
 
+export function resolveDreamDisplayMode({ records = [], curator_state = null, consolidated_sources = {} } = {}) {
+  const recs = Array.isArray(records) ? records.filter(Boolean) : []
+  const byEventId = new Set(recs.map(r => r.event_id).filter(Boolean))
+  const consolidatedMap = consolidated_sources && typeof consolidated_sources === 'object' ? consolidated_sources : {}
+  const merkleRecords = recs.filter(r => typeof r.merkle_sources === 'string' && r.merkle_sources.length > 0)
+  const hasPersistedCurator = Boolean(curator_state?.state_file_present && Number(curator_state?.last_curated_at) > 0)
+  const hasObservedClusters = hasPersistedCurator && merkleRecords.length > 0
+  let missingSourceCount = 0
+  let observedSourceCount = 0
+  for (const r of merkleRecords) {
+    const sups = Array.isArray(r.supersedes) ? r.supersedes : []
+    for (const sid of sups) {
+      if (byEventId.has(sid) || Boolean(consolidatedMap[sid])) {
+        observedSourceCount += 1
+      } else {
+        missingSourceCount += 1
+      }
+    }
+  }
+  const hasObservedEigens =
+    hasObservedClusters &&
+    Array.isArray(curator_state?.topic_eigenvectors) &&
+    curator_state.topic_eigenvectors.length > 0 &&
+    !curator_state.topic_eigenvectors.some(e => e?.simulated)
+  const hasObservedArcs =
+    hasObservedClusters &&
+    Array.isArray(curator_state?.topic_reorganizations) &&
+    curator_state.topic_reorganizations.length > 0 &&
+    !curator_state.topic_reorganizations.some(a => a?.simulated)
+  const hasObservedGhosts = hasObservedClusters && observedSourceCount > 0 && missingSourceCount === 0
+  const components = {
+    clusters: hasObservedClusters ? 'observed' : 'simulated_preview',
+    eigenvalues: hasObservedEigens ? 'observed' : 'simulated_preview',
+    topic_arcs: hasObservedArcs ? 'observed' : 'simulated_preview',
+    ghost_sources: hasObservedGhosts ? 'observed' : 'simulated_preview',
+  }
+  const isSimulated =
+    components.clusters !== 'observed' ||
+    components.eigenvalues !== 'observed' ||
+    components.topic_arcs !== 'observed' ||
+    components.ghost_sources !== 'observed'
+  return {
+    mode: isSimulated ? 'simulated_preview' : 'observed',
+    is_simulated_preview: isSimulated,
+    persisted_curation: hasPersistedCurator,
+    observed_merkle_count: merkleRecords.length,
+    observed_source_count: observedSourceCount,
+    missing_source_count: missingSourceCount,
+    components,
+    label: isSimulated
+      ? 'SIMULATED PREVIEW (synthetic/fallback preview — no persisted Merkle curation)'
+      : 'OBSERVED (persisted Merkle curation)',
+  }
+}
+
 export function computeDreamingTelemetry(records = [], curatorState = null) {
   const recs = Array.isArray(records) ? records : []
+  const displayMode = resolveDreamDisplayMode({
+    records: recs,
+    curator_state: curatorState,
+    consolidated_sources: curatorState?.consolidated_sources || {},
+  })
   const fullBytes = JSON.stringify(recs).length
   let indexBytes = 0
   let canonBytes = 0
@@ -1675,6 +1737,7 @@ export function computeDreamingTelemetry(records = [], curatorState = null) {
   return {
     estimated_from_visible: true,
     passive_inspection: true,
+    display_mode: displayMode,
     total: recs.length,
     fullBytes,
     indexBytes,
@@ -2899,6 +2962,7 @@ export function renderViewerHtml(initialState) {
           if (existing) return existing;
           var angle = -Math.PI / 2 + (idx / Math.max(1, srcIds.length)) * Math.PI * 2;
           var dist = 36 + (idx % 2) * 14;
+          var hasConsolidated = Boolean(latestConsolidatedSources && latestConsolidatedSources[id]);
           var histRec = (latestConsolidatedSources && latestConsolidatedSources[id]) || {
             event_id: id,
             scope: rec.scope,
@@ -2912,7 +2976,10 @@ export function renderViewerHtml(initialState) {
             y: cy + Math.sin(angle) * dist,
             vx: 0,
             vy: 0,
-            isSourceGhost: true
+            isSourceGhost: true,
+            isSyntheticGhost: !hasConsolidated,
+            simulated: !hasConsolidated,
+            ghostLabel: hasConsolidated ? 'HISTORICAL SOURCE' : 'SIMULATED PREVIEW GHOST'
           };
         });
       }
@@ -3131,9 +3198,13 @@ export function renderViewerHtml(initialState) {
           ? cs.should_run
           : Boolean(triggers.circadian_dream || triggers.synaptic_volume || triggers.nightmare_interrupt);
         var reasons = Array.isArray(cs.reasons) ? cs.reasons : [];
+        var hasPersistedCuration = Boolean(cs.state_file_present && lastCuratedAt > 0 && merkleCount > 0);
+        var displayMode = (cs.display_mode && cs.display_mode.mode) || (hasPersistedCuration ? 'observed' : 'simulated_preview');
         return {
           estimated_from_visible: true,
           passive_inspection: true,
+          displayMode: displayMode,
+          isSimulatedPreview: displayMode !== 'observed',
           total: recs.length,
           fullBytes: fullBytes,
           indexBytes: indexBytes,
@@ -3161,7 +3232,11 @@ export function renderViewerHtml(initialState) {
             triggers: triggers,
             reasons: reasons,
             refusal_count_15m: Number(cs.refusal_count_15m) || 0,
-            stale_count: Number(cs.stale_count) || 0
+            stale_count: Number(cs.stale_count) || 0,
+            display_mode: cs.display_mode || {
+              mode: displayMode,
+              is_simulated_preview: displayMode !== 'observed'
+            }
           }
         };
       }
@@ -3171,16 +3246,17 @@ export function renderViewerHtml(initialState) {
         if (!bar) return;
         var d = computeDreamingTelemetry();
         var cs = d.curatorState;
+        var modeTag = d.isSimulatedPreview ? '[SIMULATED PREVIEW · 0 persisted merkle_sources] · ' : '[OBSERVED CURATION] · ';
         var lastLabel = cs.last_curated_at ? ('last curated ' + fmtShortAge(cs.last_curated_at, nowSec()) + ' ago (seq ' + cs.last_curated_write_seq + ')') : 'last curated: never (seq 0)';
         var deltaLabel = '+' + cs.write_delta + '/' + cs.write_delta_threshold + ' writes';
         if (cs.triggers.nightmare_interrupt || d.nightmareCount > 0) {
-          bar.textContent = 'NIGHTMARE TRIGGER ACTIVE · ' + lastLabel + ' · ' + deltaLabel + ' · ' + d.merkleCount + ' merkle_sources tags';
+          bar.textContent = modeTag + 'NIGHTMARE TRIGGER ACTIVE · ' + lastLabel + ' · ' + deltaLabel + ' · ' + d.merkleCount + ' merkle_sources tags';
           bar.style.color = '#f87171';
         } else if (cs.should_run) {
-          bar.textContent = 'CURATOR TRIGGER DUE (' + (cs.reasons[0] || deltaLabel) + ') · ' + lastLabel + ' · ' + d.merkleCount + ' merkle_sources tags';
+          bar.textContent = modeTag + 'CURATOR TRIGGER DUE (' + (cs.reasons[0] || deltaLabel) + ') · ' + lastLabel + ' · ' + d.merkleCount + ' merkle_sources tags';
           bar.style.color = '#fbbf24';
         } else {
-          bar.textContent = 'Passive Read-Only · ' + lastLabel + ' · ' + deltaLabel + ' · ' + d.merkleCount + ' merkle_sources tags · -' + d.wakeSavings + '% wake';
+          bar.textContent = modeTag + 'Passive Read-Only · ' + lastLabel + ' · ' + deltaLabel + ' · ' + d.merkleCount + ' merkle_sources tags · -' + d.wakeSavings + '% wake';
           bar.style.color = '#94a3b8';
         }
       }
@@ -3217,8 +3293,8 @@ export function renderViewerHtml(initialState) {
             var rawSources = matched.slice(1);
             if (rawSources.length === 0) {
               rawSources = [
-                { x: target.x + 28, y: target.y - 22, rec: target.rec, isSourceGhost: true },
-                { x: target.x - 26, y: target.y + 24, rec: target.rec, isSourceGhost: true }
+                { x: target.x + 28, y: target.y - 22, rec: target.rec, isSourceGhost: true, isSyntheticGhost: true, simulated: true, ghostLabel: 'SIMULATED PREVIEW GHOST' },
+                { x: target.x - 26, y: target.y + 24, rec: target.rec, isSourceGhost: true, isSyntheticGhost: true, simulated: true, ghostLabel: 'SIMULATED PREVIEW GHOST' }
               ];
             }
             var srcs = rawSources.map(function (sn, sIdx) {
@@ -3226,6 +3302,7 @@ export function renderViewerHtml(initialState) {
               var dist = 42 + (sIdx % 3) * 16;
               return {
                 node: sn,
+                simulated: true,
                 angle: ang,
                 dist: dist,
                 initX: target.x + Math.cos(ang) * dist,
@@ -3238,7 +3315,9 @@ export function renderViewerHtml(initialState) {
               target: target,
               topic: top,
               sources: srcs,
-              merkleDigest: String(pc.merkle_sources || ('staged-' + (pc.topic || 'hive') + '-' + cIdx)),
+              simulated: true,
+              clusterLabel: 'SIMULATED PREVIEW CLUSTER',
+              merkleDigest: 'sim-preview-' + String(pc.merkle_sources || ((pc.topic || 'hive') + '-' + cIdx)),
               isClassB: pc.stage === 'promotion' || (pc.author_count && pc.author_count >= 2),
               stagger: (cIdx / Math.max(1, planned.length)) * 0.45,
               shocked: false
@@ -3247,7 +3326,7 @@ export function renderViewerHtml(initialState) {
         }
         if (built.length > 0) return built;
 
-        // Client-side fallback clustering by (topic, workSubject) across visible non-canon nodes
+        // Client-side fallback clustering by (topic, workSubject) across visible non-canon nodes (SIMULATED PREVIEW)
         var groups = {};
         nodes.forEach(function (n) {
           if (!n || !n.rec || isCanon(n.rec)) return;
@@ -3283,6 +3362,7 @@ export function renderViewerHtml(initialState) {
             var dist = 42 + (sIdx % 3) * 16;
             return {
               node: sn,
+              simulated: true,
               angle: ang,
               dist: dist,
               initX: target.x + Math.cos(ang) * dist,
@@ -3295,7 +3375,9 @@ export function renderViewerHtml(initialState) {
             target: target,
             topic: top,
             sources: srcs,
-            merkleDigest: String(target.rec.event_id || ('staged-' + cIdx)).slice(0, 16),
+            simulated: true,
+            clusterLabel: 'SIMULATED PREVIEW CLUSTER',
+            merkleDigest: 'sim-preview-' + String(target.rec.event_id || cIdx).slice(0, 12),
             isClassB: isPromoted,
             stagger: (cIdx / Math.max(1, groupKeys.length)) * 0.45,
             shocked: false
@@ -3305,10 +3387,14 @@ export function renderViewerHtml(initialState) {
       }
 
       function buildDreamSymphony(merkleNodes) {
+        var hasPersistedCurator = Boolean(latestCuratorState && latestCuratorState.state_file_present && Number(latestCuratorState.last_curated_at) > 0);
+        var hasObservedMerkle = Boolean(hasPersistedCurator && merkleNodes && merkleNodes.length > 0);
         var eigens = Array.isArray(latestCuratorState && latestCuratorState.topic_eigenvectors)
           ? latestCuratorState.topic_eigenvectors.slice()
           : [];
+        var eigensSimulated = !hasObservedMerkle;
         if (eigens.length === 0 && topics.length > 0) {
+          eigensSimulated = true;
           var topCounts = topics.map(function (t) {
             var c = nodes.filter(function (n) { return topicOf(n.rec) === t.id; }).length;
             return { id: t.id, count: c };
@@ -3319,13 +3405,20 @@ export function renderViewerHtml(initialState) {
               axis: i + 1,
               canonical_topic: x.id,
               eigenvalue: Math.round(x.count * 10) / 10,
-              variance_pct: Math.round((x.count / totalC) * 1000) / 10
+              variance_pct: Math.round((x.count / totalC) * 1000) / 10,
+              simulated: true,
+              label: 'SIMULATED PREVIEW EIGENVALUE'
             };
+          });
+        } else if (eigensSimulated) {
+          eigens = eigens.map(function (e) {
+            return Object.assign({}, e, { simulated: true, label: 'SIMULATED PREVIEW EIGENVALUE' });
           });
         }
         var reorgs = Array.isArray(latestCuratorState && latestCuratorState.topic_reorganizations)
           ? latestCuratorState.topic_reorganizations
           : [];
+        var arcsSimulated = !hasObservedMerkle;
         var outerR = stageDim() * 0.33;
         var reorgArcs = reorgs.map(function (rg, idx) {
           var fromTop = topicById(rg.from_topic);
@@ -3342,10 +3435,13 @@ export function renderViewerHtml(initialState) {
             fromY: fy,
             toX: toTop.x,
             toY: toTop.y,
-            color: toTop.color || '#38bdf8'
+            color: toTop.color || '#38bdf8',
+            simulated: arcsSimulated,
+            label: arcsSimulated ? 'SIMULATED PREVIEW TOPIC ARC' : 'OBSERVED TOPIC ARC'
           };
         });
         if (reorgArcs.length === 0 && topics.length >= 2) {
+          arcsSimulated = true;
           var primaryTop = topics[0];
           topics.slice(1, Math.min(6, topics.length)).forEach(function (t) {
             reorgArcs.push({
@@ -3357,20 +3453,30 @@ export function renderViewerHtml(initialState) {
               fromY: t.y,
               toX: primaryTop.x,
               toY: primaryTop.y,
-              color: primaryTop.color || '#38bdf8'
+              color: primaryTop.color || '#38bdf8',
+              simulated: true,
+              label: 'SIMULATED PREVIEW TOPIC ARC'
             });
           });
         }
         var totalSources = 0;
+        var ghostSourcesCount = 0;
+        var clustersSimulated = !hasObservedMerkle;
+        var ghostsSimulated = !hasObservedMerkle;
         var clusters = [];
         if (merkleNodes && merkleNodes.length > 0) {
           clusters = merkleNodes.map(function (mn, cIdx) {
             var top = topicById(topicOf(mn.rec));
             var srcs = resolveSourceNodes(mn.rec, mn).map(function (sn, sIdx) {
+              if (sn && (sn.isSyntheticGhost || sn.simulated || sn.isSourceGhost)) {
+                ghostSourcesCount += 1;
+                if (sn.isSyntheticGhost || sn.simulated) ghostsSimulated = true;
+              }
               var ang = -Math.PI / 2 + (sIdx / Math.max(1, (mn.rec.supersedes || []).length)) * Math.PI * 2 + cIdx * 0.37;
               var dist = 42 + (sIdx % 3) * 16;
               return {
                 node: sn,
+                simulated: Boolean(sn && sn.simulated),
                 angle: ang,
                 dist: dist,
                 initX: mn.x + Math.cos(ang) * dist,
@@ -3384,6 +3490,8 @@ export function renderViewerHtml(initialState) {
               target: mn,
               topic: top,
               sources: srcs,
+              simulated: clustersSimulated,
+              clusterLabel: clustersSimulated ? 'SIMULATED PREVIEW CLUSTER' : 'OBSERVED MERKLE CLUSTER',
               merkleDigest: String(mn.rec.merkle_sources || ''),
               isClassB: mn.rec.expires_at === null || mn.rec.expires_at === undefined,
               stagger: (cIdx / Math.max(1, merkleNodes.length)) * 0.45,
@@ -3391,9 +3499,14 @@ export function renderViewerHtml(initialState) {
             };
           });
         } else {
+          clustersSimulated = true;
+          ghostsSimulated = true;
           clusters = buildPreviewDreamClusters();
           clusters.forEach(function (cl) {
             totalSources += cl.sources.length;
+            cl.sources.forEach(function (s) {
+              if (s.node && s.node.isSourceGhost) ghostSourcesCount += 1;
+            });
           });
         }
         var classBNodes = nodes.filter(function (mn) {
@@ -3404,10 +3517,18 @@ export function renderViewerHtml(initialState) {
             classBNodes.push(cl.target);
           }
         });
+        var isSimulated = Boolean(clustersSimulated || eigensSimulated || arcsSimulated || ghostsSimulated);
         return {
           progress: 0,
           speed: 0.00145,
           actLogged: { 1: false, 2: false, 3: false, 4: false },
+          displayMode: isSimulated ? 'simulated_preview' : 'observed',
+          isSimulated: isSimulated,
+          clustersSimulated: Boolean(clustersSimulated),
+          eigensSimulated: Boolean(eigensSimulated),
+          arcsSimulated: Boolean(arcsSimulated),
+          ghostsSimulated: Boolean(ghostsSimulated),
+          ghostSourcesCount: ghostSourcesCount,
           eigens: eigens,
           reorgArcs: reorgArcs,
           clusters: clusters,
@@ -3515,6 +3636,7 @@ export function renderViewerHtml(initialState) {
           if (top && srcNodes.length > 0) {
             consolidator = {
               mode: 'replay',
+              simulated: Boolean(dreamSymphony.clustersSimulated || dreamSymphony.ghostsSimulated),
               topic: top,
               targetNode: latest,
               targets: srcNodes,
@@ -3535,10 +3657,11 @@ export function renderViewerHtml(initialState) {
           if (clTop && clSrcs.length > 0) {
             consolidator = {
               mode: 'replay',
+              simulated: true,
               topic: clTop,
               targetNode: clTarget,
               targets: clSrcs,
-              merkleDigest: firstCl.merkleDigest || 'staged-merkle-root',
+              merkleDigest: firstCl.merkleDigest || 'sim-preview-merkle-root',
               x: clTarget.x,
               y: clTarget.y,
               progress: 0
@@ -3550,11 +3673,12 @@ export function renderViewerHtml(initialState) {
         if (width <= 1024) setDrawer('none');
         renderAgentRoster();
         renderInspector();
+        var simPrefix = dreamSymphony.isSimulated ? '[REPLAY · READ-ONLY] [SIMULATED PREVIEW] ' : '[REPLAY · READ-ONLY] [OBSERVED] ';
         logStream(
           'recall',
-          '[REPLAY · READ-ONLY] 4-ACT CORTEX REORGANIZATION SYMPHONY · ' + dreamSymphony.eigens.length + ' Eigen-Axes · ' +
-          dreamSymphony.reorgArcs.length + ' Topic Reorgs · ' + dreamSymphony.totalSources + ' Sources -> ' +
-          dreamSymphony.totalMerkle + ' Merkle Clusters'
+          simPrefix + '4-ACT CORTEX REORGANIZATION SYMPHONY · ' + dreamSymphony.eigens.length + (dreamSymphony.eigensSimulated ? ' Simulated' : ' Observed') + ' Eigen-Axes · ' +
+          dreamSymphony.reorgArcs.length + (dreamSymphony.arcsSimulated ? ' Simulated' : ' Observed') + ' Topic Arcs · ' + dreamSymphony.totalSources + (dreamSymphony.ghostsSimulated ? ' Simulated/Ghost' : ' Observed') + ' Sources -> ' +
+          dreamSymphony.totalMerkle + (dreamSymphony.clustersSimulated ? ' Simulated Preview' : ' Observed Merkle') + ' Clusters'
         );
       }
 
@@ -4163,11 +4287,12 @@ export function renderViewerHtml(initialState) {
         } else if (target.type === 'dreaming') {
           var dr = computeDreamingTelemetry();
           var cs = dr.curatorState;
+          var isSim = Boolean(dr.isSimulatedPreview);
           box.appendChild(inspectHeader(
             'Merkle Dreaming & Curation · Passive Inspector',
             '-' + dr.wakeSavings.toFixed(1) + '% Est. Wake Bytes',
-            'PASSIVE INSPECTION · READ-ONLY',
-            'info',
+            isSim ? 'SIMULATED PREVIEW · PASSIVE INSPECTION · READ-ONLY' : 'OBSERVED CURATION · PASSIVE INSPECTION · READ-ONLY',
+            isSim ? 'warn' : 'info',
             '#a78bfa'
           ));
           var actRow = makeDiv('inspect-actions');
@@ -4176,7 +4301,7 @@ export function renderViewerHtml(initialState) {
           var animBtn = document.createElement('button');
           animBtn.type = 'button';
           animBtn.className = 'btn sim';
-          animBtn.textContent = '▶ Animate 4-Act Reorganization';
+          animBtn.textContent = isSim ? '▶ Animate 4-Act Simulated Preview' : '▶ Animate 4-Act Observed Reorganization';
           animBtn.addEventListener('click', function () { replayLastDream(); });
           actRow.appendChild(animBtn);
           var recBtn = document.createElement('button');
@@ -4190,6 +4315,14 @@ export function renderViewerHtml(initialState) {
           box.appendChild(actRow);
           var dkv = makeDiv('kv-list');
           dkv.appendChild(kvRow('Inspector mode', 'Passive read-only (never triggers curator writes)', '#6ee7b7'));
+          dkv.appendChild(kvRow(
+            'Display mode',
+            isSim
+              ? 'SIMULATED PREVIEW (synthetic/fallback clusters, eigenvalues, topic arcs & ghost sources)'
+              : 'OBSERVED (persisted merkle_sources curation)',
+            isSim ? '#fbbf24' : '#34d399',
+            true
+          ));
           dkv.appendChild(kvRow(
             'Last curated cycle',
             cs.last_curated_at ? (fmtTime(cs.last_curated_at) + ' (seq ' + cs.last_curated_write_seq + ')') : 'never persisted (seq 0)',
@@ -4221,9 +4354,10 @@ export function renderViewerHtml(initialState) {
           var ps = latestCuratorState && latestCuratorState.planned_summary ? latestCuratorState.planned_summary : null;
           if (ps) {
             dkv.appendChild(kvRow(
-              'Queued Dream Plan',
-              ps.promotions + ' Class B Promotions · ' + ps.distillations + ' Class A Distillations · ' + ps.solidifications + ' Canon Nominations',
-              '#34d399'
+              isSim ? 'Simulated Preview Plan (unpersisted)' : 'Queued Dream Plan',
+              ps.promotions + ' Class B Promotions · ' + ps.distillations + ' Class A Distillations · ' + ps.solidifications + ' Canon Nominations' + (isSim ? ' [SIMULATED PREVIEW]' : ''),
+              isSim ? '#fbbf24' : '#34d399',
+              true
             ));
           }
           box.appendChild(dkv);
@@ -4240,25 +4374,25 @@ export function renderViewerHtml(initialState) {
           }
           var eigens = Array.isArray(latestCuratorState && latestCuratorState.topic_eigenvectors) ? latestCuratorState.topic_eigenvectors : [];
           if (eigens.length > 0) {
-            var eTitle = makeDiv('inspect-kicker', 'Stage 0 · Spectral Topic Eigenvectors (PCA)');
+            var eTitle = makeDiv('inspect-kicker', 'Stage 0 · Spectral Topic Eigenvectors (' + (isSim ? 'SIMULATED PREVIEW PCA' : 'Observed PCA') + ')');
             eTitle.style.marginTop = '6px';
             box.appendChild(eTitle);
             var eWrap = makeDiv('kv-list');
             eigens.slice(0, 6).forEach(function (ev) {
               var loads = Array.isArray(ev.topic_loadings) ? ev.topic_loadings.slice(0, 3).map(function (l) { return l.topic + (l.loading >= 0 ? '+' : '') + Number(l.loading).toFixed(2); }).join(', ') : '';
-              eWrap.appendChild(kvRow('Axis ' + ev.axis + ' · #' + ev.canonical_topic, 'λ=' + ev.eigenvalue + ' (' + ev.variance_pct + '%) · ' + loads, '#a78bfa'));
+              eWrap.appendChild(kvRow('Axis ' + ev.axis + ' · #' + ev.canonical_topic, 'λ=' + ev.eigenvalue + ' (' + ev.variance_pct + '%) · ' + loads + (isSim ? ' [SIMULATED PREVIEW]' : ''), '#a78bfa', true));
             });
             box.appendChild(eWrap);
           }
           var reorgs = Array.isArray(latestCuratorState && latestCuratorState.topic_reorganizations) ? latestCuratorState.topic_reorganizations : [];
           if (reorgs.length > 0) {
-            var rTitle = makeDiv('inspect-kicker', 'Stage 0 · Topic Reorganizations (Outliers -> Eigen-Topics)');
+            var rTitle = makeDiv('inspect-kicker', 'Stage 0 · Topic Reorganizations (' + (isSim ? 'SIMULATED PREVIEW ARCS' : 'Observed Arcs') + ')');
             rTitle.style.marginTop = '6px';
             box.appendChild(rTitle);
             var rWrap = makeDiv('kv-list');
             rWrap.style.marginTop = '2px';
             reorgs.slice(0, 8).forEach(function (rg) {
-              rWrap.appendChild(kvRow('#' + rg.from_topic + ' (' + rg.claim_count + ')', '-> #' + rg.to_topic + ' (cos ' + rg.cosine_affinity + ')', '#38bdf8'));
+              rWrap.appendChild(kvRow('#' + rg.from_topic + ' (' + rg.claim_count + ')', '-> #' + rg.to_topic + ' (cos ' + rg.cosine_affinity + ')' + (isSim ? ' [SIMULATED PREVIEW]' : ''), '#38bdf8', true));
             });
             box.appendChild(rWrap);
           }
@@ -4521,9 +4655,10 @@ export function renderViewerHtml(initialState) {
             } else {
               logStream(
                 'recall',
-                'PASSIVE REPLAY complete (read-only): ' + consolidator.targets.length + ' superseded source claims folded into ' +
+                (consolidator.simulated ? 'SIMULATED PREVIEW REPLAY complete (read-only): ' : 'PASSIVE REPLAY complete (read-only): ') +
+                consolidator.targets.length + (consolidator.simulated ? ' simulated/ghost source claims preview-folded into ' : ' superseded source claims folded into ') +
                 (consolidator.targetNode ? slugOf(consolidator.targetNode.rec) : 'curated claim') +
-                ' (merkle_sources ' + String(consolidator.merkleDigest || '').slice(0, 12) + '…)'
+                ' (' + (consolidator.simulated ? 'simulated digest ' : 'merkle_sources ') + String(consolidator.merkleDigest || '').slice(0, 12) + '…)'
               );
             }
             consolidator = null;
@@ -4533,14 +4668,15 @@ export function renderViewerHtml(initialState) {
           var ds = dreamSymphony;
           ds.progress += ds.speed;
           var p = ds.progress;
+          var dsLogPrefix = ds.isSimulated ? '[REPLAY · READ-ONLY] [SIMULATED PREVIEW] ' : '[REPLAY · READ-ONLY] [OBSERVED] ';
           if (!ds.actLogged[1] && p >= 0.01) {
             ds.actLogged[1] = true;
             shockwaves.push({ x: 0, y: 0, r: 12, maxR: stageDim() * 0.38, color: '#a78bfa', alpha: 0.9, hex: true });
-            logStream('lookup', '[REPLAY · READ-ONLY] ACT I · STAGE 0 SPECTRAL TOPIC EIGENVECTORS (PCA): Visualizing ' + ds.eigens.length + ' Eigen-Axes & ' + ds.reorgArcs.length + ' Topic Reorganizations');
+            logStream('lookup', dsLogPrefix + 'ACT I · STAGE 0 SPECTRAL TOPIC EIGENVECTORS: Visualizing ' + ds.eigens.length + (ds.eigensSimulated ? ' Simulated Preview Eigen-Axes & ' : ' Observed Eigen-Axes & ') + ds.reorgArcs.length + (ds.arcsSimulated ? ' Simulated Preview Topic Arcs' : ' Observed Topic Reorganizations'));
           }
           if (!ds.actLogged[2] && p >= 0.25) {
             ds.actLogged[2] = true;
-            logStream('lookup', '[REPLAY · READ-ONLY] ACT II · STAGE 1 SYNAPTIC DISTILLATION: Visualizing ' + ds.totalSources + ' superseded checkpoints across ' + ds.totalMerkle + ' merkle_sources claims');
+            logStream('lookup', dsLogPrefix + 'ACT II · STAGE 1 SYNAPTIC DISTILLATION: Visualizing ' + ds.totalSources + (ds.ghostsSimulated ? ' Simulated/Ghost Sources across ' : ' Superseded Checkpoints across ') + ds.totalMerkle + (ds.clustersSimulated ? ' Simulated Preview Clusters (0 persisted merkle_sources)' : ' merkle_sources Claims'));
           }
           if (!ds.actLogged[3] && p >= 0.62) {
             ds.actLogged[3] = true;
@@ -4551,7 +4687,7 @@ export function renderViewerHtml(initialState) {
                 pulses.push({ kind: 'recall', fromNode: cn, fromX: cn.x, fromY: cn.y, toX: ag.x, toY: ag.y, agent: ag, color: '#a78bfa', t: 0, speed: 0.024 });
               }
             });
-            logStream('lookup', '[REPLAY · READ-ONLY] ACT III · STAGE 2 CLASS B PROMOTION: Highlighting ' + ds.classBNodes.length + ' existing Class B crystals across multi-agent ganglia');
+            logStream('lookup', dsLogPrefix + 'ACT III · STAGE 2 CLASS B PROMOTION: Highlighting ' + ds.classBNodes.length + (ds.clustersSimulated ? ' Simulated Preview Class B Candidates across multi-agent ganglia' : ' Observed Class B crystals across multi-agent ganglia'));
           }
           if (!ds.actLogged[4] && p >= 0.85) {
             ds.actLogged[4] = true;
@@ -4559,7 +4695,7 @@ export function renderViewerHtml(initialState) {
             ds.classBNodes.slice(0, 10).forEach(function (cn) {
               pulses.push({ kind: 'recall', fromNode: cn, fromX: cn.x, fromY: cn.y, toX: 0, toY: 0, color: '#fbbf24', t: 0, speed: 0.028 });
             });
-            logStream('lookup', '[REPLAY · READ-ONLY] ACT IV · STAGE 3 CANON SOLIDIFICATION: Observed Hive Coherence ' + (latestCoherence && typeof latestCoherence.score === 'number' ? Number(latestCoherence.score).toFixed(1) + '%' : 'N/A'));
+            logStream('lookup', dsLogPrefix + 'ACT IV · STAGE 3 CANON SOLIDIFICATION: ' + (ds.isSimulated ? 'Simulated Preview Overlay · Current Hive Coherence ' : 'Observed Hive Coherence ') + (latestCoherence && typeof latestCoherence.score === 'number' ? Number(latestCoherence.score).toFixed(1) + '%' : 'N/A'));
           }
           if (p >= 0.22 && p <= 0.68) {
             var act2P = Math.max(0, Math.min(1, (p - 0.22) / 0.40));
@@ -4580,7 +4716,7 @@ export function renderViewerHtml(initialState) {
             });
           }
           if (p >= 1) {
-            logStream('recall', '4-ACT CORTEX REORGANIZATION COMPLETE · ' + ds.totalSources + ' sources -> ' + ds.totalMerkle + ' merkle_sources claims');
+            logStream('recall', (ds.isSimulated ? '[SIMULATED PREVIEW] ' : '[OBSERVED] ') + '4-ACT CORTEX REORGANIZATION COMPLETE · ' + ds.totalSources + (ds.ghostsSimulated ? ' simulated/ghost sources -> ' : ' sources -> ') + ds.totalMerkle + (ds.clustersSimulated ? ' simulated preview clusters' : ' merkle_sources claims'));
             dreamSymphony = null;
             if (dreamRecorder) {
               stopDreamRecording();
@@ -4780,6 +4916,11 @@ export function renderViewerHtml(initialState) {
               ctx.strokeStyle = '#fde68a';
               ctx.lineWidth = 1.2;
               ctx.stroke();
+              if (tn.simulated || tn.isSyntheticGhost || c.simulated) {
+                ctx.font = '600 8.5px ui-monospace, monospace';
+                ctx.fillStyle = '#fde68a';
+                ctx.fillText('SIMULATED PREVIEW GHOST', tn.x, tn.y - 9);
+              }
             }
           });
           polygon(c.x, c.y, 6, 15, tick * 0.06);
@@ -4787,7 +4928,9 @@ export function renderViewerHtml(initialState) {
           ctx.fill();
           ctx.font = '700 10px ui-monospace, monospace';
           ctx.fillStyle = '#fde68a';
-          var foldLabel = c.mode === 'replay' ? 'PASSIVE DREAM REPLAY ' : 'MERKLE FOLD ';
+          var foldLabel = c.simulated
+            ? 'SIMULATED PREVIEW FOLD '
+            : (c.mode === 'replay' ? 'OBSERVED DREAM REPLAY ' : 'MERKLE FOLD ');
           ctx.fillText(foldLabel + Math.round(c.progress * 100) + '% (' + String(c.merkleDigest || '').slice(0, 8) + '…)', c.x, c.y - 22);
         }
 
@@ -4811,7 +4954,8 @@ export function renderViewerHtml(initialState) {
               var ly = Math.sin(labelAng) * ringR - 6;
               ctx.font = '700 10px ui-monospace, monospace';
               ctx.fillStyle = '#fde68a';
-              ctx.fillText('λ' + ev.axis + ' #' + ev.canonical_topic + ' (' + ev.variance_pct + '%)', lx, ly);
+              var eigSimPrefix = (ds.eigensSimulated || ev.simulated) ? '[SIMULATED PREVIEW] ' : '';
+              ctx.fillText(eigSimPrefix + 'λ' + ev.axis + ' #' + ev.canonical_topic + ' (' + ev.variance_pct + '%)', lx, ly);
             });
             ds.reorgArcs.forEach(function (arc, idx) {
               var arcP = Math.max(0, Math.min(1, (dp - idx * 0.015) / 0.20));
@@ -4836,11 +4980,12 @@ export function renderViewerHtml(initialState) {
               ctx.fill();
               ctx.font = '600 9.5px ui-monospace, monospace';
               ctx.fillStyle = '#7dd3fc';
-              ctx.fillText('#' + arc.from_topic + ' -> #' + arc.to_topic, px, py - 10);
+              var arcSimPrefix = (ds.arcsSimulated || arc.simulated) ? '[SIMULATED PREVIEW] ' : '';
+              ctx.fillText(arcSimPrefix + '#' + arc.from_topic + ' -> #' + arc.to_topic, px, py - 10);
             });
             ctx.restore();
           }
-          // Act II: Synaptic Distillation Cascade across all 38 Merkle clusters (0.20 - 0.68)
+          // Act II: Synaptic Distillation Cascade across clusters (0.20 - 0.68)
           if (dp >= 0.20 && dp <= 0.70) {
             var a2Alpha = dp < 0.25 ? (dp - 0.20) / 0.05 : (dp > 0.62 ? Math.max(0, 1 - (dp - 0.62) / 0.08) : 1);
             ctx.save();
@@ -4863,11 +5008,21 @@ export function renderViewerHtml(initialState) {
                 ctx.strokeStyle = '#fde68a';
                 ctx.lineWidth = 1;
                 ctx.stroke();
+                if (src.node && (src.node.isSourceGhost || src.simulated)) {
+                  ctx.font = '600 8px ui-monospace, monospace';
+                  ctx.fillStyle = '#fde68a';
+                  ctx.fillText('SIMULATED GHOST', src.x, src.y - 7);
+                }
               });
               polygon(tx, ty, 6, 11, tick * 0.07);
               ctx.strokeStyle = '#fbbf24';
               ctx.lineWidth = 1.6;
               ctx.stroke();
+              if (cl.simulated || ds.clustersSimulated) {
+                ctx.font = '700 8.5px ui-monospace, monospace';
+                ctx.fillStyle = '#fbbf24';
+                ctx.fillText('SIMULATED CLUSTER', tx, ty - 14);
+              }
             });
             ctx.restore();
           }
@@ -4917,7 +5072,7 @@ export function renderViewerHtml(initialState) {
             ctx.font = '800 12px ui-monospace, monospace';
             ctx.fillStyle = '#6ee7b7';
             var cohScoreTxt = latestCoherence && typeof latestCoherence.score === 'number' ? Number(latestCoherence.score).toFixed(1) + '%' : 'N/A';
-            ctx.fillText('OBSERVED COHERENCE 2.0: ' + cohScoreTxt, 0, -coreR - 12);
+            ctx.fillText((ds.isSimulated ? 'SIMULATED PREVIEW · ' : 'OBSERVED · ') + 'COHERENCE 2.0: ' + cohScoreTxt, 0, -coreR - 12);
             ctx.restore();
           }
         }
@@ -5099,21 +5254,23 @@ export function renderViewerHtml(initialState) {
           var actSub = '';
           var actCol = '#a78bfa';
           if (bp < 0.25) {
-            actTitle = 'ACT I / IV · STAGE 0: SPECTRAL TOPIC EIGENVECTORS (READ-ONLY REPLAY)';
-            actSub = 'Observed ' + dsBanner.eigens.length + ' Eigen-Axes · ' + dsBanner.reorgArcs.length + ' Topic Affinity Links';
+            actTitle = 'ACT I / IV · STAGE 0: SPECTRAL TOPIC EIGENVECTORS (' + (dsBanner.eigensSimulated || dsBanner.arcsSimulated ? 'SIMULATED PREVIEW' : 'OBSERVED REPLAY') + ')';
+            actSub = (dsBanner.eigensSimulated ? 'Simulated Preview: ' : 'Observed: ') + dsBanner.eigens.length + ' Eigen-Axes · ' + (dsBanner.arcsSimulated ? 'Simulated Preview: ' : 'Observed: ') + dsBanner.reorgArcs.length + ' Topic Affinity Arcs';
             actCol = '#38bdf8';
           } else if (bp < 0.62) {
-            actTitle = 'ACT II / IV · STAGE 1: SYNAPTIC DISTILLATION (READ-ONLY REPLAY)';
-            actSub = 'Observed ' + dsBanner.totalSources + ' Superseded Checkpoints across ' + dsBanner.totalMerkle + ' merkle_sources Claims';
+            actTitle = 'ACT II / IV · STAGE 1: SYNAPTIC DISTILLATION (' + (dsBanner.clustersSimulated || dsBanner.ghostsSimulated ? 'SIMULATED PREVIEW' : 'OBSERVED REPLAY') + ')';
+            actSub = dsBanner.clustersSimulated
+              ? ('Simulated Preview: ' + dsBanner.totalSources + ' Synthetic/Ghost Sources across ' + dsBanner.totalMerkle + ' Preview Clusters (0 persisted merkle_sources)')
+              : ('Observed: ' + dsBanner.totalSources + ' Superseded Checkpoints across ' + dsBanner.totalMerkle + ' merkle_sources Claims' + (dsBanner.ghostsSimulated ? ' (' + dsBanner.ghostSourcesCount + ' simulated ghost sources)' : ''));
             actCol = '#fbbf24';
           } else if (bp < 0.85) {
-            actTitle = 'ACT III / IV · STAGE 2: CLASS B CRYSTALS (READ-ONLY REPLAY)';
-            actSub = 'Observed ' + dsBanner.classBNodes.length + ' Multi-Agent Corroborated Class B Decisions';
+            actTitle = 'ACT III / IV · STAGE 2: CLASS B CRYSTALS (' + (dsBanner.clustersSimulated ? 'SIMULATED PREVIEW' : 'OBSERVED REPLAY') + ')';
+            actSub = (dsBanner.clustersSimulated ? 'Simulated Preview: ' : 'Observed: ') + dsBanner.classBNodes.length + ' Multi-Agent Class B Decisions';
             actCol = '#c084fc';
           } else {
             var cohTxt = latestCoherence && typeof latestCoherence.score === 'number' ? Number(latestCoherence.score).toFixed(1) + '%' : 'N/A';
-            actTitle = 'ACT IV / IV · STAGE 3: CANON SOLIDIFICATION (READ-ONLY REPLAY)';
-            actSub = 'Constitutional Core Visualization · Observed Hive Coherence 2.0: ' + cohTxt;
+            actTitle = 'ACT IV / IV · STAGE 3: CANON SOLIDIFICATION (' + (dsBanner.isSimulated ? 'SIMULATED PREVIEW' : 'OBSERVED REPLAY') + ')';
+            actSub = (dsBanner.isSimulated ? 'Simulated Preview Overlay · ' : 'Constitutional Core Visualization · ') + 'Current Hive Coherence 2.0: ' + cohTxt;
             actCol = '#34d399';
           }
           ctx.textAlign = 'left';
@@ -5863,6 +6020,11 @@ export async function startMemoryViewer({
           }
         }
       }
+      curatorState.display_mode = resolveDreamDisplayMode({
+        records,
+        curator_state: curatorState,
+        consolidated_sources: consolidatedSources,
+      })
       const efficacy = computeSynapticEfficacy({
         records,
         history_records: historyRecords,
@@ -5877,7 +6039,7 @@ export async function startMemoryViewer({
         : (records.length > 0 ? 'found' : String(firstQuery?.answer || 'unknown'))
 
       nextSnapshot = {
-        viewer_version: '2026-11-08-v10',
+        viewer_version: '2026-11-09-v11',
         connected: true,
         error: null,
         server_name: client.getServerName() || 'hive-memory-viewer',

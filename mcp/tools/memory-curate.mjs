@@ -21,6 +21,7 @@ import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameS
 import { createConnection } from 'node:net'
 import { dirname, join, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
+import { fileURLToPath } from 'node:url'
 import { finalizeEvent, getPublicKey } from 'nostr-tools/pure'
 import {
   DEFAULT_TTL_SEC,
@@ -1402,4 +1403,115 @@ export async function runCuratorCycle({
   } finally {
     reader.close()
   }
+}
+
+export function parseCuratorFlags(argv = []) {
+  let readerSocket = process.env.HIVE_MEMORY_READER_SOCKET || '/run/hive-memory/curator.sock'
+  let writerSocket = process.env.HIVE_MEMORY_WRITER_SOCKET || null
+  let stateFile = process.env.HIVE_MEMORY_CURATOR_STATE_FILE || undefined
+  let secretKeyFile = process.env.HIVE_MEMORY_CURATOR_SECRET_KEY_FILE || null
+  let memoryGlobalChannelId = process.env.HIVE_MEMORY_GLOBAL_CHANNEL_ID || 'a8186b53-537d-46ad-a7e7-b6486c58970e'
+  let dreamIntervalSec = Number(process.env.HIVE_MEMORY_DREAM_INTERVAL_SEC || DEFAULT_DREAM_INTERVAL_SEC)
+  let writeDeltaThreshold = Number(process.env.HIVE_MEMORY_WRITE_DELTA_THRESHOLD || DEFAULT_WRITE_DELTA_THRESHOLD)
+  let topicPressureThreshold = Number(process.env.HIVE_MEMORY_TOPIC_PRESSURE_THRESHOLD || DEFAULT_TOPIC_PRESSURE_THRESHOLD)
+  let force = false
+  let dryRun = false
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    if ((arg === '--reader-socket' || arg === '--socket') && argv[i + 1]) {
+      readerSocket = argv[++i]
+    } else if (arg === '--writer-socket' && argv[i + 1]) {
+      writerSocket = argv[++i]
+    } else if (arg === '--state-file' && argv[i + 1]) {
+      stateFile = argv[++i]
+    } else if (arg === '--secret-key-file' && argv[i + 1]) {
+      secretKeyFile = argv[++i]
+    } else if (arg === '--global-channel' && argv[i + 1]) {
+      memoryGlobalChannelId = argv[++i]
+    } else if (arg === '--dream-interval-sec' && argv[i + 1]) {
+      dreamIntervalSec = Number(argv[++i])
+    } else if (arg === '--write-delta-threshold' && argv[i + 1]) {
+      writeDeltaThreshold = Number(argv[++i])
+    } else if (arg === '--topic-pressure-threshold' && argv[i + 1]) {
+      topicPressureThreshold = Number(argv[++i])
+    } else if (arg === '--force') {
+      force = true
+    } else if (arg === '--dry-run') {
+      dryRun = true
+    } else {
+      throw new Error(`unknown argument: ${arg}`)
+    }
+  }
+
+  return {
+    readerSocket,
+    writerSocket,
+    stateFile,
+    secretKeyFile,
+    memoryGlobalChannelId,
+    dreamIntervalSec,
+    writeDeltaThreshold,
+    topicPressureThreshold,
+    force,
+    dryRun,
+  }
+}
+
+async function main() {
+  let flags
+  try {
+    flags = parseCuratorFlags(process.argv.slice(2))
+  } catch (err) {
+    console.error(`memory-curate: ${err.message}`)
+    process.exit(1)
+  }
+
+  let curatorSecretKey = null
+  if (flags.secretKeyFile) {
+    const rawHex = readFileSync(flags.secretKeyFile, 'utf8').trim()
+    if (!/^[0-9a-fA-F]{64}$/.test(rawHex)) {
+      console.error('memory-curate: secret-key-file must contain a 64-hex secret key')
+      process.exit(1)
+    }
+    curatorSecretKey = Uint8Array.from(Buffer.from(rawHex, 'hex'))
+  }
+
+  try {
+    const result = await runCuratorCycle({
+      readerSocket: flags.readerSocket,
+      writerSocket: flags.writerSocket,
+      curatorSecretKey,
+      memoryGlobalChannelId: flags.memoryGlobalChannelId,
+      stateFile: flags.stateFile,
+      dreamIntervalSec: flags.dreamIntervalSec,
+      writeDeltaThreshold: flags.writeDeltaThreshold,
+      topicPressureThreshold: flags.topicPressureThreshold,
+      force: flags.force,
+      dryRun: flags.dryRun,
+    })
+    console.log(
+      JSON.stringify({
+        ok: result.ok,
+        cycle_status: result.cycle_status,
+        cursor_advanced: result.cursor_advanced,
+        ran_at: result.ran_at,
+        state_file: result.state_file,
+        last_curated_write_seq: result.last_curated_write_seq,
+        next_curated_write_seq: result.next_curated_write_seq,
+        coherence_score: result.coherence?.score ?? null,
+        plan_summary: result.plan?.summary ?? null,
+        submitted_count: result.submitted.length,
+        refused_count: result.refused.length,
+      })
+    )
+    if (!result.ok) process.exit(1)
+  } catch (err) {
+    console.error(`memory-curate: cycle failed: ${err.message || err}`)
+    process.exit(1)
+  }
+}
+
+if (process.argv[1] && resolve(fileURLToPath(import.meta.url)) === resolve(process.argv[1])) {
+  main()
 }
