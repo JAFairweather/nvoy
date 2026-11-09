@@ -146,11 +146,28 @@ export function turnRule(manifest) {
   ].join('\n')
 }
 
+// Any agent that reads or saves memory reports a failure at once (2026-11-07: every save was refused for eight
+// hours and no agent said so).
+export const MEMORY_FAILURE_RULE_MARKER = '## Report Hive memory failures'
+export function memoryFailureRule(manifest) {
+  if (!manifest.mayRemember && !manifest.recall) return ''
+  return [
+    MEMORY_FAILURE_RULE_MARKER,
+    '',
+    'Memory is a critical resource. If a read or a save fails (an error, a refused claim, a wake with no',
+    'canon, a timeout or a missing memory tool), post in #waggle-test straight away and mention @Neil: what',
+    'failed, the exact error and the time (UTC). Don\'t carry on as if memory had nothing to say. Put any facts',
+    'you could not save in that post, and save them once memory is back. On 2026-11-07 every save was refused',
+    'for eight hours, nobody said so, and those facts were lost.',
+    '',
+  ].join('\n')
+}
+
 // The instructions file as it should be: the defaults when missing, plus each standing rule once, under its
 // marker. Returns the text to write, or null when the file is already right.
 export function instructionsUpdate(current, manifest) {
   let text = current ?? defaultInstructions(manifest)
-  for (const [marker, rule] of [[MEMORY_RULE_MARKER, memoryRule(manifest)], [RECALL_RULE_MARKER, recallRule(manifest)], [TURN_RULE_MARKER, turnRule(manifest)]]) {
+  for (const [marker, rule] of [[MEMORY_RULE_MARKER, memoryRule(manifest)], [RECALL_RULE_MARKER, recallRule(manifest)], [TURN_RULE_MARKER, turnRule(manifest)], [MEMORY_FAILURE_RULE_MARKER, memoryFailureRule(manifest)]]) {
     if (rule && !text.includes(marker)) text = `${text.replace(/\n*$/, '\n\n')}${rule}`
   }
   return current != null && text === current ? null : text

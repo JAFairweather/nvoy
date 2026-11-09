@@ -10,7 +10,7 @@ import { join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { sshChannelEntry } from '../mcp/tools/channel_client.mjs'
 import { fakeHerdr } from './fake-herdr.mjs'
-import { CODEX_CHANNEL_TOOLS, channelProcessUp, classifyPane, claudeArgs, codexConfigToml, codexTurnText, defaultInstructions, ensureInstructions, hasPriorSession, instructionsUpdate, MEMORY_RULE_MARKER, mcpConfig, RECALL_RULE_MARKER, TURN_RULE_MARKER, pendingEnvelopes, seedClaudeJson, seedSettings, serverName } from '../mcp/tools/harness_session.mjs'
+import { CODEX_CHANNEL_TOOLS, channelProcessUp, classifyPane, claudeArgs, codexConfigToml, codexTurnText, defaultInstructions, ensureInstructions, hasPriorSession, instructionsUpdate, MEMORY_FAILURE_RULE_MARKER, memoryFailureRule, MEMORY_RULE_MARKER, mcpConfig, RECALL_RULE_MARKER, TURN_RULE_MARKER, pendingEnvelopes, seedClaudeJson, seedSettings, serverName } from '../mcp/tools/harness_session.mjs'
 
 let fails = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); if (!value) fails++ }
@@ -141,6 +141,18 @@ ok('a file that already has the rule is left alone, so an edit to it survives', 
 ok('an agent without memory gets no rule, and an existing file is left alone', instructionsUpdate(null, { id: 'x', buzz: {} }) === defaultInstructions({ id: 'x', buzz: {} }) &&
   !instructionsUpdate(null, { id: 'x', buzz: {} }).includes(MEMORY_RULE_MARKER) && instructionsUpdate(own, { id: 'x', buzz: {} }) === null)
 ok('the rule never asks the agent to read memory it has no tool for', !/memory_query|memory_wake/.test(created))
+{
+  // An agent set up before the failure rule existed has the memory and recall rules only; it gains the new one.
+  const before = both.slice(0, both.indexOf(MEMORY_FAILURE_RULE_MARKER)).replace(/\n*$/, '\n')
+  const after = instructionsUpdate(before, recaller)
+  ok('an existing reader and writer gains the failure rule once, and is then left alone', !before.includes(MEMORY_FAILURE_RULE_MARKER) &&
+    after.startsWith(before) && after.split(MEMORY_FAILURE_RULE_MARKER).length === 2 && instructionsUpdate(after, recaller) === null &&
+    /post in #waggle-test straight away/.test(after))
+  ok('a reader without saving still gets the failure rule', instructionsUpdate(null, { ...recaller, mayRemember: undefined }).includes(MEMORY_FAILURE_RULE_MARKER))
+  ok('a writer gets the failure rule', created.includes(MEMORY_FAILURE_RULE_MARKER))
+  ok('the failure rule mentions Neil by his exact Buzz display name', memoryFailureRule({ mayRemember: true }).includes('mention @Neil:') && !memoryFailureRule({ mayRemember: true }).includes('@neil'))
+  ok('an agent without memory gets no failure rule', !instructionsUpdate(null, { id: 'x', buzz: {} }).includes(MEMORY_FAILURE_RULE_MARKER))
+}
 {
   const dir = join(root, 'instructions'), path = join(dir, 'CLAUDE.md')
   mkdirSync(dir, { recursive: true })
