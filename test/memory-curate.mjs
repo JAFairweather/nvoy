@@ -3,7 +3,7 @@
 
 import assert from 'node:assert/strict'
 import { execFile as execFileCb } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -1483,15 +1483,39 @@ await test('runCuratorCycle does not advance cursor or ledger when writeDreamPac
       'runCuratorCycle must fail when packet publication fails'
     )
 
-    // Verify cursor was NOT advanced and consolidation-ledger.jsonl was NOT written yet, while pending_dream_packet is staged
+    // Verify cursor was NOT advanced and consolidation-ledger.jsonl was NOT written yet, while pending_dream_packet is staged in 0640 state file
+    const stagedMode = statSync(stateFile).mode & 0o777
+    assert.equal(stagedMode, 0o640, 'curator-state.json with staged pending_dream_packet must be mode 0640 (never world-readable)')
+    assert.equal(stagedMode & 0o007, 0, 'curator-state.json must have zero world permissions')
     const stagedState = readCuratorStateFile(stateFile)
     assert.equal(stagedState.last_curated_write_seq, 0, 'cursor must not advance when packet write fails')
     assert(stagedState.pending_dream_packet, 'pending_dream_packet must be staged in curator-state.json for retry recovery')
     const consLedgerPath = join(tmp, 'consolidation-ledger.jsonl')
     assert.equal(readConsolidationLedger(consLedgerPath).length, 0, 'consolidation ledger must not advance before packet write succeeds')
 
-    // Remove blocker file and restart runCuratorCycle
+    // Case 2: Remove packet blocker, but place a directory at consLedgerPath so appendConsolidationLedger fails on I/O
     rmSync(blockedPacketPath, { force: true })
+    mkdirSync(consLedgerPath, { recursive: true })
+    await assert.rejects(
+      () => runCuratorCycle({
+        readerSocket: join(sockDir, 'curator.sock'),
+        writerSocket: join(sockDir, 'writers', 'curator.sock'),
+        curatorSecretKey: curatorSk,
+        memoryGlobalChannelId: GLOBAL_CH,
+        stateFile,
+        packetDir: blockedPacketPath,
+        force: false,
+        nowSec: nowSec + 55,
+      }),
+      /consolidation ledger append failed/,
+      'runCuratorCycle must fail and not advance cursor when consolidation ledger append fails'
+    )
+    const afterLedgerFailState = readCuratorStateFile(stateFile)
+    assert.equal(afterLedgerFailState.last_curated_write_seq, 0, 'cursor must not advance when ledger append fails')
+    assert(afterLedgerFailState.pending_ledger_entry, 'pending_ledger_entry remains staged after ledger append failure')
+
+    // Remove ledger blocker and restart runCuratorCycle
+    rmSync(consLedgerPath, { recursive: true, force: true })
     const recovered = await runCuratorCycle({
       readerSocket: join(sockDir, 'curator.sock'),
       writerSocket: join(sockDir, 'writers', 'curator.sock'),
@@ -1515,6 +1539,29 @@ await test('runCuratorCycle does not advance cursor or ledger when writeDreamPac
     const ledgerRows = readConsolidationLedger(consLedgerPath)
     assert.equal(ledgerRows.length, 1, 'consolidation ledger entry written on recovery')
     assert.equal(ledgerRows[0].write_seq_after, 4)
+
+    // Case 3: Simulate crash AFTER appendConsolidationLedger succeeded but BEFORE final state write cleared pending_ledger_entry
+    writeFileSync(stateFile, JSON.stringify({
+      ...stagedState,
+      last_curated_write_seq: 0,
+      pending_curated_at: nowSec + 50,
+      pending_curated_write_seq: 4,
+      pending_dream_packet: stagedState.pending_dream_packet,
+      pending_ledger_entry: stagedState.pending_ledger_entry,
+    }, null, 2) + '\n', { mode: 0o640 })
+    const idempotentRestart = await runCuratorCycle({
+      readerSocket: join(sockDir, 'curator.sock'),
+      writerSocket: join(sockDir, 'writers', 'curator.sock'),
+      curatorSecretKey: curatorSk,
+      memoryGlobalChannelId: GLOBAL_CH,
+      stateFile,
+      packetDir: blockedPacketPath,
+      force: false,
+      nowSec: nowSec + 70,
+    })
+    assert.equal(idempotentRestart.ok, true)
+    assert.equal(readCuratorStateFile(stateFile).last_curated_write_seq, 4)
+    assert.equal(readConsolidationLedger(consLedgerPath).length, 1, 'ledger append is idempotent by cycle/write_seq on crash recovery')
   } finally {
     if (daemon) await daemon.close()
     rmSync(tmp, { recursive: true, force: true })

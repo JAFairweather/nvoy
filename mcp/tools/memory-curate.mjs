@@ -147,14 +147,44 @@ export function readConsolidationLedger(ledgerFilePath, { limit = 40 } = {}) {
 }
 
 export function appendConsolidationLedger(ledgerFilePath, entry) {
-  if (!ledgerFilePath || typeof ledgerFilePath !== 'string' || !entry || typeof entry !== 'object') return false
+  if (!ledgerFilePath || typeof ledgerFilePath !== 'string' || !entry || typeof entry !== 'object') {
+    const wrapped = new Error('consolidation ledger path and entry object are required')
+    wrapped.code = 'HIVE_MEMORY_CONSOLIDATION_LEDGER_WRITE_FAILED'
+    throw wrapped
+  }
   try {
     const resolved = resolve(ledgerFilePath)
-    mkdirSync(dirname(resolved), { recursive: true, mode: 0o755 })
-    appendFileSync(resolved, JSON.stringify(entry) + '\n', { encoding: 'utf8', mode: 0o644 })
-    return true
-  } catch {
-    return false
+    mkdirSync(dirname(resolved), { recursive: true, mode: 0o750 })
+    if (existsSync(resolved)) {
+      const existingRaw = readFileSync(resolved, 'utf8')
+      for (const line of existingRaw.split('\n')) {
+        const trimmed = line.trim()
+        if (!trimmed) continue
+        let parsed = null
+        try { parsed = JSON.parse(trimmed) } catch {}
+        if (!parsed || typeof parsed !== 'object') continue
+        const sameNonEmptySeq =
+          typeof entry.write_seq_after === 'number' &&
+          typeof entry.write_seq_before === 'number' &&
+          entry.write_seq_after > entry.write_seq_before &&
+          parsed.write_seq_after === entry.write_seq_after &&
+          parsed.write_seq_before === entry.write_seq_before
+        const sameExactCycle =
+          parsed.write_seq_after === entry.write_seq_after &&
+          parsed.write_seq_before === entry.write_seq_before &&
+          parsed.at === entry.at
+        if (sameNonEmptySeq || sameExactCycle) {
+          return { appended: false, duplicate: true }
+        }
+      }
+    }
+    appendFileSync(resolved, JSON.stringify(entry) + '\n', { encoding: 'utf8', mode: 0o640 })
+    chmodSync(resolved, 0o640)
+    return { appended: true, duplicate: false }
+  } catch (err) {
+    const wrapped = new Error(`consolidation ledger append failed (${ledgerFilePath}): ${err?.message || err}`, { cause: err })
+    wrapped.code = 'HIVE_MEMORY_CONSOLIDATION_LEDGER_WRITE_FAILED'
+    throw wrapped
   }
 }
 
@@ -166,10 +196,10 @@ export function writeCuratorStateFile(stateFilePath, state) {
   }
   try {
     const resolved = resolve(stateFilePath)
-    mkdirSync(dirname(resolved), { recursive: true, mode: 0o755 })
+    mkdirSync(dirname(resolved), { recursive: true, mode: 0o750 })
     const tmpPath = `${resolved}.tmp.${process.pid}`
-    writeFileSync(tmpPath, JSON.stringify(state, null, 2) + '\n', { encoding: 'utf8', mode: 0o644 })
-    chmodSync(tmpPath, 0o644)
+    writeFileSync(tmpPath, JSON.stringify(state, null, 2) + '\n', { encoding: 'utf8', mode: 0o640 })
+    chmodSync(tmpPath, 0o640)
     renameSync(tmpPath, resolved)
     return true
   } catch (err) {
