@@ -1782,6 +1782,7 @@ export function createSingleSocketMcpClient(socketPath) {
   let connected = false
   let initialized = false
   let serverName = null
+  let connectionGeneration = 0
   let nextId = 1
   const pending = new Map()
   let connectPromise = null
@@ -1837,7 +1838,7 @@ export function createSingleSocketMcpClient(socketPath) {
           connected = true
           resolveConn()
         })
-        sock.once('error', err => {
+        sock.on('error', err => {
           if (!settled) {
             settled = true
             rejectConn(err)
@@ -1851,6 +1852,9 @@ export function createSingleSocketMcpClient(socketPath) {
           disconnect()
         })
         const rl = createInterface({ input: sock, crlfDelay: Infinity })
+        rl.on('error', () => {
+          /* handled by sock error listener */
+        })
         rl.on('line', line => {
           if (!line.trim()) return
           let msg
@@ -1882,6 +1886,7 @@ export function createSingleSocketMcpClient(socketPath) {
         socket.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} }) + '\n')
       }
       initialized = true
+      connectionGeneration += 1
     })().finally(() => {
       connectPromise = null
     })
@@ -1892,11 +1897,23 @@ export function createSingleSocketMcpClient(socketPath) {
     if (name !== 'memory_wake' && name !== 'memory_query') {
       throw new Error(`refusing non-read tool in memory-viewer: ${name}`)
     }
+    const hadOpenSocket = Boolean(connected && initialized && socket)
     await ensureConnected()
-    const res = await sendRaw({
-      method: 'tools/call',
-      params: { name, arguments: args },
-    })
+    let res
+    try {
+      res = await sendRaw({
+        method: 'tools/call',
+        params: { name, arguments: args },
+      })
+    } catch (err) {
+      if (!hadOpenSocket) throw err
+      disconnect()
+      await ensureConnected()
+      res = await sendRaw({
+        method: 'tools/call',
+        params: { name, arguments: args },
+      })
+    }
     if (res?.isError) {
       throw new Error(res?.content?.[0]?.text || `tool ${name} returned error`)
     }
@@ -1907,6 +1924,7 @@ export function createSingleSocketMcpClient(socketPath) {
   return {
     callReadTool,
     getServerName: () => serverName,
+    getConnectionGeneration: () => connectionGeneration,
     close: disconnect,
   }
 }
@@ -6682,13 +6700,29 @@ export async function startMemoryViewer({
       const wake = await client.callReadTool('memory_wake', {})
       const wakeSeq = wake?.store_state?.write_seq
       const wakeCurrentClaims = wake?.store_state?.current_claims ?? null
+      const wakeReader = String(wake?.reader || '')
+      const wakeReaderPubkey = String(wake?.reader_pubkey || '')
+      const wakeConnGen = typeof client.getConnectionGeneration === 'function' ? client.getConnectionGeneration() : 0
+      const wakeScopeSig = JSON.stringify([
+        wakeReader,
+        wakeReaderPubkey,
+        wakeConnGen,
+        wake?.counts || null,
+        wake?.topic_directory || null,
+      ])
       const canReuseCorpus =
         !forceFull &&
         cachedCorpus !== null &&
         Number.isSafeInteger(wakeSeq) &&
         wakeSeq > 0 &&
         wakeSeq === cachedCorpus.writeSeq &&
-        (wakeCurrentClaims === null || cachedCorpus.currentClaims === null || wakeCurrentClaims === cachedCorpus.currentClaims) &&
+        wakeCurrentClaims !== null &&
+        wakeCurrentClaims === cachedCorpus.currentClaims &&
+        wakeReader !== '' &&
+        wakeReader === cachedCorpus.reader &&
+        wakeReaderPubkey === cachedCorpus.readerPubkey &&
+        wakeConnGen === cachedCorpus.connGen &&
+        wakeScopeSig === cachedCorpus.scopeSig &&
         wake?.store_state?.state === 'READY' &&
         nowMs - cachedCorpus.atMs < CORPUS_CACHE_TTL_MS
 
@@ -6783,6 +6817,10 @@ export async function startMemoryViewer({
         cachedCorpus = {
           writeSeq: wakeSeq ?? firstQuery?.store_state?.write_seq ?? null,
           currentClaims: wakeCurrentClaims ?? firstQuery?.store_state?.current_claims ?? null,
+          reader: wakeReader,
+          readerPubkey: wakeReaderPubkey,
+          connGen: wakeConnGen,
+          scopeSig: wakeScopeSig,
           atMs: nowMs,
           records,
           historyRecords,
@@ -6826,9 +6864,26 @@ export async function startMemoryViewer({
       let efficacy
       if (canReuseCorpus && cachedCorpus?.derived && cachedCorpus.derived.key === derivedKey) {
         coherence = cachedCorpus.derived.coherence
+        const triggerEval = evaluateDreamTriggers({
+          records,
+          storeState,
+          recentActivity,
+          coherence,
+          lastCuratedAt,
+          lastCuratedWriteSeq,
+          nowSec,
+          dreamIntervalSec,
+          writeDeltaThreshold,
+          topicPressureThreshold,
+        })
         curatorState = {
           ...cachedCorpus.derived.curatorState,
-          elapsed_sec: lastCuratedAt > 0 ? Math.max(0, nowSec - lastCuratedAt) : null,
+          elapsed_sec: triggerEval.elapsed_sec,
+          write_delta: triggerEval.write_delta,
+          should_run: triggerEval.shouldRun,
+          triggers: triggerEval.triggers,
+          reasons: triggerEval.reasons,
+          refusal_count_15m: triggerEval.refusal_count_15m,
         }
         efficacy = cachedCorpus.derived.efficacy
       } else {
@@ -6963,6 +7018,7 @@ export async function startMemoryViewer({
         recent_activity: recentActivity,
       }
     } catch (err) {
+      cachedCorpus = null
       nextSnapshot = {
         ...currentState,
         connected: false,
