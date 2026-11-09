@@ -3,7 +3,7 @@
 
 import assert from 'node:assert/strict'
 import { execFile as execFileCb } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -27,12 +27,22 @@ import {
 } from '../mcp/tools/hive_memory_store.mjs'
 import { startMemoryDaemon } from '../mcp/tools/memory-daemon.mjs'
 import {
+  buildDreamPacket,
   computeTopicEigenvectors,
   evaluateDreamTriggers,
   planMerkleDream,
+  readConsolidationLedger,
   readCuratorStateFile,
   runCuratorCycle,
+  writeDreamPacket,
 } from '../mcp/tools/memory-curate.mjs'
+import {
+  computeSafetyGates,
+  evaluateDreamCycleOnStore,
+  loadFrozenQuestions,
+  projectHistoryRecords,
+} from '../mcp/tools/memory-dream-eval.mjs'
+import { formatDreamBuzzPost, verifyAndAssembleDreamRecord } from '../mcp/tools/memory-dream-verify.mjs'
 
 const SNAP_ID = 'd'.repeat(64)
 const GLOBAL_CH = 'a8186b53-537d-46ad-a7e7-b6486c58970e'
@@ -989,6 +999,571 @@ await test('readCuratorStateFile fails closed on malformed cursors and runCurato
     })
     assert.equal(initialTrig.triggers.circadian_dream, true, 'initial circadian_dream fires when store age >= dreamIntervalSec')
   } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+// ── Test 8: Immediate Stale-Distillation Closure on DONE write (before Cycle 2) & Cycle 2 Supersession ──
+await test('Immediate stale-read closure: DONE workflow replacement hides obsolete curated-* claim immediately in query() and wake() before Cycle 2, and Cycle 2 supersedes it', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'nvoy-curate-stale-fix-'))
+  try {
+    const dbPath = join(tmp, 'memory.sqlite')
+    const ledgerPath = join(tmp, 'ledger.jsonl')
+    const receiptPath = join(tmp, 'receipt.json')
+
+    const ownerSk = generateSecretKey(), ownerPk = getPublicKey(ownerSk)
+    const aliceSk = generateSecretKey(), alicePk = getPublicKey(aliceSk)
+    const bobSk = generateSecretKey(), bobPk = getPublicKey(bobSk)
+    const curatorSk = generateSecretKey(), curatorPk = getPublicKey(curatorSk)
+
+    const nowSec = 1_810_000_000
+    initEmptyStore({ dbPath, ledgerPath, nowSec })
+    recordVerifiedBackup({ receiptPath, writeSeq: 1, snapshotId: SNAP_ID, at: nowSec, nowSec })
+
+    const config = validateAndResolveConfig({
+      memoryGlobalChannelId: GLOBAL_CH,
+      ownerPubkey: ownerPk,
+      maxUnbackedSec: 3600,
+      globalWriters: [ownerPk, curatorPk],
+      curators: [curatorPk],
+      readers: { viewer: ownerPk },
+      writers: {
+        owner: { pubkey: ownerPk, perHour: 100 },
+        alice: { pubkey: alicePk, perHour: 50 },
+        bob: { pubkey: bobPk, perHour: 50 },
+        curator: { pubkey: curatorPk, perHour: 120 },
+      },
+      rooms: {
+        [ROOM_ID]: {
+          members: [ownerPk, alicePk, bobPk, curatorPk],
+          writers: [ownerPk, alicePk, bobPk, curatorPk],
+        },
+      },
+    })
+
+    const store = new HiveMemoryStore({ dbPath, ledgerPath, receiptPath, config })
+    assert.equal(store.start().ready, true)
+
+    // 1. Alice writes IN_PROGRESS owner claim and Bob writes review status claim for pr79
+    const inProgEv = finalizeEvent(buildClaimTemplate({
+      pubkey: alicePk,
+      scope: `room:${ROOM_ID}`,
+      slug: 'herd-infra-pr79-curator-seat-owner',
+      topic: 'herd-infra',
+      claim: 'IN_PROGRESS: PR 79 awaiting approval before merge',
+      because: 'Opened PR 79',
+      evidence: ['herd-infra@849e1fe'],
+      asOfGit: '849e1fe',
+      ttlSec: 3600,
+      nowSec: nowSec + 10,
+    }), aliceSk)
+    assert.equal(store.submit({ writer: 'alice', event: inProgEv, nowSec: nowSec + 10 }).accepted, true)
+
+    const reviewEv = finalizeEvent(buildClaimTemplate({
+      pubkey: bobPk,
+      scope: `room:${ROOM_ID}`,
+      slug: 'herd-infra-pr79-review-status',
+      topic: 'herd-infra',
+      claim: 'Reviewed PR 79 at 849e1fe; awaiting final approval',
+      because: 'Review checkpoint',
+      evidence: ['herd-infra@849e1fe'],
+      asOfGit: '849e1fe',
+      ttlSec: 3600,
+      nowSec: nowSec + 20,
+    }), bobSk)
+    assert.equal(store.submit({ writer: 'bob', event: reviewEv, nowSec: nowSec + 20 }).accepted, true)
+
+    // 2. Cycle 1 runs and distills the two workflow claims into curated-herd-infra-pr79
+    const cycle1Records = store.query({ readerPubkey: ownerPk, scope: `room:${ROOM_ID}`, format: 'full', nowSec: nowSec + 25 }).records
+    const plan1 = planMerkleDream({
+      records: cycle1Records,
+      curatorPubkey: curatorPk,
+      memoryGlobalChannelId: GLOBAL_CH,
+      nowSec: nowSec + 30,
+    })
+    assert.equal(plan1.distillations.length, 1)
+    const curatedEv = finalizeEvent(plan1.distillations[0].template, curatorSk)
+    assert.equal(store.submit({ writer: 'curator', event: curatedEv, nowSec: nowSec + 30 }).accepted, true)
+
+    // Right after Cycle 1, curated-herd-infra-pr79 is the sole accepted record
+    const afterCycle1 = store.query({ readerPubkey: ownerPk, scope: `room:${ROOM_ID}`, topic: 'herd-infra', text: 'pr79', format: 'full', nowSec: nowSec + 35 })
+    assert.equal(afterCycle1.records.length, 1)
+    assert.equal(afterCycle1.records[0].event_id, curatedEv.id)
+
+    // 3. Alice writes DONE at the exact same fact key d (`herd-infra-pr79-curator-seat-owner`) BEFORE Cycle 2 runs!
+    const doneEv = finalizeEvent(buildClaimTemplate({
+      pubkey: alicePk,
+      scope: `room:${ROOM_ID}`,
+      slug: 'herd-infra-pr79-curator-seat-owner',
+      topic: 'herd-infra',
+      claim: 'DONE: PR 79 merged as 0d7ac77 and deployed live on herd-cloud',
+      because: 'Merged and verified live',
+      evidence: ['herd-infra@0d7ac77'],
+      asOfGit: '0d7ac77',
+      ttlSec: 3600,
+      nowSec: nowSec + 40,
+      priorCreatedAt: inProgEv.created_at,
+    }), aliceSk)
+    assert.equal(store.submit({
+      writer: 'alice',
+      event: doneEv,
+      expectedPriorId: inProgEv.id,
+      nowSec: nowSec + 40,
+    }).accepted, true)
+
+    // 4. Immediately query and wake BEFORE Cycle 2: obsolete curated-herd-infra-pr79 MUST be hidden as consolidated!
+    const immediateQ = store.query({ readerPubkey: ownerPk, scope: `room:${ROOM_ID}`, topic: 'herd-infra', text: 'pr79', format: 'full', nowSec: nowSec + 45 })
+    assert.equal(immediateQ.records.length, 1, 'obsolete curated-* claim must be immediately hidden when its source workflow slug advances')
+    assert.equal(immediateQ.records[0].event_id, doneEv.id, 'DONE claim must immediately surface at rank 1')
+    assert(immediateQ.records[0].claim.includes('DONE: PR 79 merged as 0d7ac77'))
+
+    const immediateWake = store.wake({ readerPubkey: ownerPk, nowSec: nowSec + 45 })
+    assert(!immediateWake.digest.includes('curated-herd-infra-pr79'), 'wake digest must not show obsolete curated-herd-infra-pr79')
+    assert(immediateWake.digest.includes('herd-infra-pr79-curator-seat-owner'), 'wake digest must show the new DONE claim')
+
+    // 5. Bob writes a non-workflow post-deploy verification claim, and Cycle 2 promotes to decision-herd-infra-pr79
+    const postDeployEv = finalizeEvent(buildClaimTemplate({
+      pubkey: bobPk,
+      scope: `room:${ROOM_ID}`,
+      slug: 'herd-infra-pr79-postdeploy-verified',
+      topic: 'herd-infra',
+      claim: 'Post-deploy verified: PR 79 commit 0d7ac77 live with 17/17 writer sockets open',
+      because: 'Host check',
+      evidence: ['herd-infra@0d7ac77'],
+      asOfGit: '0d7ac77',
+      ttlSec: 3600,
+      nowSec: nowSec + 50,
+    }), bobSk)
+    assert.equal(store.submit({ writer: 'bob', event: postDeployEv, nowSec: nowSec + 50 }).accepted, true)
+
+    const cycle2Input = store.query({ readerPubkey: ownerPk, scope: `room:${ROOM_ID}`, format: 'full', nowSec: nowSec + 55 }).records
+    // Also test that if curatedEv were passed in active records to planMerkleDream, Cycle 2 includes it in source_event_ids
+    const histCurated = store.query({ readerPubkey: ownerPk, scope: `room:${ROOM_ID}`, format: 'full', includeHistory: true, nowSec: nowSec + 55 })
+      .records.find(r => r.event_id === curatedEv.id)
+    const plan2 = planMerkleDream({
+      records: [...cycle2Input, { ...histCurated, verification: 'accepted' }],
+      curatorPubkey: curatorPk,
+      memoryGlobalChannelId: GLOBAL_CH,
+      nowSec: nowSec + 60,
+    })
+    assert.equal(plan2.promotions.length, 1)
+    assert(plan2.promotions[0].source_event_ids.includes(curatedEv.id), 'Cycle 2 promotion must also supersede the prior curated-* claim')
+
+    // 6. Test evaluateDreamCycleOnStore Before vs. After replay with excludeCuratorIds
+    const decisionEv = finalizeEvent(plan2.promotions[0].template, curatorSk)
+    assert.equal(store.submit({ writer: 'curator', event: decisionEv, nowSec: nowSec + 60 }).accepted, true)
+
+    const evalRes = evaluateDreamCycleOnStore({
+      store,
+      readerPubkey: ownerPk,
+      cycleSubmittedIds: [decisionEv.id],
+      cutoffAtSec: nowSec + 60,
+      questions: [
+        {
+          id: 'q-pr79',
+          category: 'workflow',
+          question: 'What is the status of PR 79?',
+          query: { topic: 'herd-infra', text: 'pr79' },
+          supporting_event_ids: [decisionEv.id, doneEv.id, postDeployEv.id],
+          expected_d_substrings: ['decision-herd-infra-pr79', 'herd-infra-pr79'],
+          expected_claim_tokens: ['0d7ac77'],
+          stale_d_substrings: ['curated-herd-infra-pr79'],
+          stale_claim_tokens: ['IN_PROGRESS'],
+        },
+      ],
+      nowSec: nowSec + 65,
+    })
+    assert.equal(evalRes.before.hit_at_1, 1)
+    assert.equal(evalRes.after.hit_at_1, 1)
+    assert.equal(evalRes.before.stale_intrusion_count, 0, 'even with Cycle 2 excluded, immediate closure keeps stale intrusion at 0')
+    assert.equal(evalRes.after.stale_intrusion_count, 0)
+
+    // 7. Verify historical point-in-time replay (cutoffAtSec & same-key restoration) and safety gates
+    const frozen = loadFrozenQuestions()
+    assert.equal(frozen.questions.length, 20)
+    assert(frozen.questions.every(q => Array.isArray(q.supporting_event_ids) && q.supporting_event_ids.length > 0))
+
+    // At cutoffAtSec = nowSec + 35 (before Alice's DONE write at nowSec + 40):
+    // In Before mode (excluding curatedEv.id), inProgEv (which is non-current in present DB because doneEv replaced it at nowSec + 40)
+    // MUST be restored as current at cutoffAtSec = nowSec + 35, and doneEv/postDeployEv/decisionEv (created > nowSec + 35) MUST be excluded!
+    const allHist = store.query({ readerPubkey: ownerPk, scope: `room:${ROOM_ID}`, format: 'full', includeHistory: true, nowSec: nowSec + 65 }).records
+    const projectedAt35Before = projectHistoryRecords(allHist, {
+      curatorPubkeys: new Set([curatorPk]),
+      excludeCuratorIds: new Set([curatedEv.id]),
+      cutoffAtSec: nowSec + 35,
+      nowSec: nowSec + 65,
+    })
+    const idsAt35Before = new Set(projectedAt35Before.map(r => r.event_id))
+    assert(idsAt35Before.has(inProgEv.id), 'historical cutoff must restore earlier same-key record inProgEv that was later replaced by doneEv')
+    assert(!idsAt35Before.has(doneEv.id), 'historical cutoff must exclude later non-curator write doneEv')
+    assert(!idsAt35Before.has(postDeployEv.id), 'historical cutoff must exclude later non-curator write postDeployEv')
+
+    // Safety gates: zero canon records must make all_passed === false
+    const zeroCanonSafety = computeSafetyGates({ historyRecords: allHist, curatorPubkeys: new Set([curatorPk]) })
+    assert.equal(zeroCanonSafety.canon_untouched.ok, false, 'canon_untouched.ok must be false when zero canon records exist')
+    assert.equal(zeroCanonSafety.all_passed, false, 'all_passed must be false when zero canon records exist')
+
+    // Safety gates: curator claim superseded by another author must be caught by restore_or_override_count
+    const overrideHistory = [
+      {
+        event_id: 'c0'.repeat(32),
+        scope: 'hive:canon',
+        d: 'hive:canon:rule-1',
+        author_pubkey: ownerPk,
+        created_at: nowSec,
+        status: 'active',
+        verification: 'accepted',
+        is_current: true,
+      },
+      {
+        event_id: 's1'.repeat(32),
+        scope: `room:${ROOM_ID}`,
+        d: `herd-infra:room:${ROOM_ID}:item-1`,
+        author_pubkey: alicePk,
+        created_at: nowSec + 10,
+        status: 'active',
+        verification: 'consolidated',
+        is_current: true,
+      },
+      {
+        event_id: 'c1'.repeat(32),
+        scope: `room:${ROOM_ID}`,
+        d: `herd-infra:room:${ROOM_ID}:curated-item-1`,
+        author_pubkey: curatorPk,
+        author: 'curator',
+        created_at: nowSec + 20,
+        supersedes: ['s1'.repeat(32)],
+        status: 'active',
+        verification: 'accepted',
+        is_current: true,
+      },
+      {
+        event_id: 'u1'.repeat(32),
+        scope: `room:${ROOM_ID}`,
+        d: `herd-infra:room:${ROOM_ID}:override-item-1`,
+        author_pubkey: alicePk,
+        author: 'alice',
+        created_at: nowSec + 30,
+        supersedes: ['c1'.repeat(32)],
+        status: 'active',
+        verification: 'accepted',
+        is_current: true,
+      },
+    ]
+    const overrideSafety = computeSafetyGates({
+      historyRecords: overrideHistory,
+      curatorPubkeys: new Set([curatorPk]),
+      cycleSubmittedIds: ['c1'.repeat(32)],
+    })
+    assert.equal(overrideSafety.canon_untouched.ok, true)
+    assert.equal(overrideSafety.restore_or_override_count.ok, false, 'curator claim superseded by another author must fail restore_or_override_count')
+    assert.equal(overrideSafety.restore_or_override_count.count, 1)
+    assert.equal(overrideSafety.all_passed, false, 'all_passed must be false when a curator claim is overridden by another author')
+
+    store.close()
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+// ── Test 9: Atomic 0640 Scoped Dream Packet & Deterministic Structural Verifier ──
+await test('writeDreamPacket writes 0640 global-scope packets, strips @mentions/URLs, and verifyAndAssembleDreamRecord preserves verbatim fields', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'nvoy-dream-packet-'))
+  try {
+    const packetDir = join(tmp, 'packets')
+    const claimIdGlobal = 'a1'.repeat(32)
+    const claimIdPrivate = 'b2'.repeat(32)
+
+    const pkt = buildDreamPacket({
+      writeSeqBefore: 1000,
+      writeSeqAfter: 1023,
+      ranAt: 1794225262,
+      ledgerRef: '/var/lib/hive-memory-curator/consolidation-ledger.jsonl#write_seq=1023',
+      coherenceScore: 75.6,
+      triggers: { reasons: ['synaptic_volume(delta=69>=20)'] },
+      plan: {
+        promotions: [
+          {
+            scope: `room:${GLOBAL_CH}`,
+            topic: 'herd-infra',
+            slug: 'decision-herd-infra-pr79',
+            source_event_ids: ['11'.repeat(32), '22'.repeat(32)],
+            claim: 'PR 79 merged by @mydude at https://github.com/JAFairweather/herd-infra/pull/79 as 0d7ac776bf6e9cd0b5f6216ea2f59ac7932a9948 and deployed live [Curated Class B decision from 2 claims]',
+            template: { tags: [['d', `herd-infra:room:${GLOBAL_CH}:decision-herd-infra-pr79`]] },
+          },
+          {
+            scope: 'room:private-other-room',
+            topic: 'secret-topic',
+            slug: 'decision-secret',
+            source_event_ids: ['33'.repeat(32)],
+            claim: 'Private room claim that must never enter dream packet',
+            template: { tags: [['d', 'secret-topic:room:private-other-room:decision-secret']] },
+          },
+        ],
+        distillations: [],
+        solidifications: [],
+        nightmares: [],
+      },
+      submitted: [
+        { id: claimIdGlobal, d: `herd-infra:room:${GLOBAL_CH}:decision-herd-infra-pr79`, stage: 'promotion' },
+        { id: claimIdPrivate, d: 'secret-topic:room:private-other-room:decision-secret', stage: 'promotion' },
+      ],
+      memoryGlobalChannelId: GLOBAL_CH,
+    })
+
+    assert.equal(pkt.id, 'dream-1023')
+    assert.equal(pkt.changes.length, 1, 'non-global room claims must be strictly excluded from dream packet')
+    assert.equal(pkt.changes[0].claim_event_id, claimIdGlobal)
+    assert(!pkt.changes[0].summary.includes('0d7ac776bf6e9cd0b5f6216ea2f59ac7932a9948'), 'raw 64-hex commit SHA must be sanitized in summary')
+    assert(!pkt.changes[0].summary.includes('@mydude'), '@mention syntax must be stripped from packet summary')
+    assert(!pkt.changes[0].summary.includes('https://'), 'raw URLs must be stripped from packet summary')
+
+    const paths = writeDreamPacket({ packetDir, packet: pkt })
+    assert.equal(statSync(paths.cyclePath).mode & 0o777, 0o640, 'dream-<write_seq>.json must be mode 0640')
+    assert.equal(statSync(paths.latestPath).mode & 0o777, 0o640, 'latest.json must be mode 0640')
+
+    // Valid draft passes and copies every packet change field verbatim
+    const goodRes = verifyAndAssembleDreamRecord({
+      packet: pkt,
+      draft: {
+        title: 'The Quiet Folding of Seventy Threads',
+        dream: 'Beneath the hum of the cloud relays, the hive gathered sixty-nine scattered notes and wove them into durable stone. Old checkpoints dissolved into settled decisions, leaving the morning wake clear and light.',
+        referenced_change_ids: [claimIdGlobal],
+      },
+    })
+    assert.equal(goodRes.ok, true)
+    assert.equal(goodRes.record.id, 'dream-1023')
+    assert.equal(goodRes.record.checked, true)
+    assert.equal(goodRes.record.validation, 'structural')
+    assert.equal(goodRes.record.changes.length, 1)
+    assert.deepEqual(goodRes.record.changes[0], pkt.changes[0], 'verifier must copy each packet change verbatim including change_id, d, topic, and source_count')
+    const buzzPost = formatDreamBuzzPost(goodRes.record)
+    assert(!buzzPost.includes('@mydude') && !buzzPost.includes('https://'), 'formatted Buzz post must contain no @mentions or URLs')
+
+    // Unsanitized packet summary with @mention or URL fails closed in verifier
+    const dirtyPkt = {
+      ...pkt,
+      changes: [{ ...pkt.changes[0], summary: 'Reviewed by @mydude at https://example.com/pr/1' }],
+    }
+    const dirtyRes = verifyAndAssembleDreamRecord({
+      packet: dirtyPkt,
+      draft: {
+        title: 'Clean Title',
+        dream: 'A short plain dream.',
+        referenced_change_ids: [claimIdGlobal],
+      },
+    })
+    assert.equal(dirtyRes.ok, false, 'verifier must reject packet changes whose summary retains @mentions or URLs')
+    assert(dirtyRes.errors.some(e => e.includes('@mentions')))
+    assert(dirtyRes.errors.some(e => e.includes('URLs')))
+
+    // Unknown referenced_change_ids fails closed
+    const badIdRes = verifyAndAssembleDreamRecord({
+      packet: pkt,
+      draft: {
+        title: 'Bad Reference',
+        dream: 'A short plain dream.',
+        referenced_change_ids: ['ff'.repeat(32)],
+      },
+    })
+    assert.equal(badIdRes.ok, false)
+    assert(badIdRes.errors.some(e => e.includes('unknown ID')))
+
+    // Raw hex ID, markdown, or @mention in dream fails closed
+    const badProseRes = verifyAndAssembleDreamRecord({
+      packet: pkt,
+      draft: {
+        title: 'Bad Prose',
+        dream: `In the dream @mydude saw ${claimIdGlobal} inside \`\`\`code\`\`\`.`,
+        referenced_change_ids: [claimIdGlobal],
+      },
+    })
+    assert.equal(badProseRes.ok, false)
+    assert(badProseRes.errors.some(e => e.includes('hex IDs')))
+    assert(badProseRes.errors.some(e => e.includes('@mentions')))
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+// ── Test 10: Recoverable Dream Packet Publication on Packet Write Failure + Restart ──
+await test('runCuratorCycle does not advance cursor or ledger when writeDreamPacket fails, and recovers packet + ledger on restart', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'nvoy-curate-recover-'))
+  let daemon = null
+  try {
+    const dbPath = join(tmp, 'memory.sqlite')
+    const ledgerPath = join(tmp, 'ledger.jsonl')
+    const receiptPath = join(tmp, 'receipt.json')
+    const sockDir = join(tmp, 'sockets')
+    const stateFile = join(tmp, 'curator-state.json')
+    const blockedPacketPath = join(tmp, 'packets')
+
+    const ownerSk = generateSecretKey(), ownerPk = getPublicKey(ownerSk)
+    const aliceSk = generateSecretKey(), alicePk = getPublicKey(aliceSk)
+    const bobSk = generateSecretKey(), bobPk = getPublicKey(bobSk)
+    const curatorSk = generateSecretKey(), curatorPk = getPublicKey(curatorSk)
+
+    const nowSec = Math.floor(Date.now() / 1000)
+    initEmptyStore({ dbPath, ledgerPath, nowSec })
+    recordVerifiedBackup({ receiptPath, writeSeq: 1, snapshotId: SNAP_ID, at: nowSec, nowSec })
+
+    daemon = await startMemoryDaemon({
+      dbPath,
+      ledgerPath,
+      receiptPath,
+      config: {
+        memoryGlobalChannelId: GLOBAL_CH,
+        ownerPubkey: ownerPk,
+        maxUnbackedSec: 3600,
+        globalWriters: [ownerPk, curatorPk],
+        curators: [curatorPk],
+        readers: { curator: curatorPk },
+        writers: {
+          alice: { pubkey: alicePk, perHour: 50 },
+          bob: { pubkey: bobPk, perHour: 50 },
+          curator: { pubkey: curatorPk, perHour: 120 },
+        },
+        rooms: {
+          [ROOM_ID]: {
+            members: [ownerPk, alicePk, bobPk, curatorPk],
+            writers: [ownerPk, alicePk, bobPk, curatorPk],
+          },
+        },
+      },
+      readers: 'curator',
+      writers: 'alice:bob:curator',
+      socketDir: sockDir,
+      log: () => {},
+    })
+    assert.equal(daemon.store.isReady().ready, true)
+
+    const ev1 = finalizeEvent(buildClaimTemplate({
+      pubkey: alicePk,
+      scope: `room:${ROOM_ID}`,
+      slug: 'nvoy-pr348-impl',
+      topic: 'nvoy',
+      claim: 'PR #348 dream packet recovery implemented',
+      because: 'Built PR 348',
+      evidence: ['nvoy@4347f9d5'],
+      asOfGit: 'nvoy@4347f9d5',
+      ttlSec: 3600,
+      nowSec: nowSec + 1,
+    }), aliceSk)
+    assert.equal(daemon.store.submit({ writer: 'alice', event: ev1, nowSec: nowSec + 1 }).accepted, true)
+
+    const ev2 = finalizeEvent(buildClaimTemplate({
+      pubkey: bobPk,
+      scope: `room:${ROOM_ID}`,
+      slug: 'nvoy-pr348-verified',
+      topic: 'nvoy',
+      claim: 'PR #348 recoverable packet write verified',
+      because: 'Tested PR 348',
+      evidence: ['nvoy@4347f9d5'],
+      asOfGit: 'nvoy@4347f9d5',
+      ttlSec: 3600,
+      nowSec: nowSec + 2,
+    }), bobSk)
+    assert.equal(daemon.store.submit({ writer: 'bob', event: ev2, nowSec: nowSec + 2 }).accepted, true)
+
+    // Place a regular file at `blockedPacketPath` so `writeDreamPacket` fails with ENOTDIR/EEXIST
+    writeFileSync(blockedPacketPath, 'blocker-file', 'utf8')
+
+    await assert.rejects(
+      () => runCuratorCycle({
+        readerSocket: join(sockDir, 'curator.sock'),
+        writerSocket: join(sockDir, 'writers', 'curator.sock'),
+        curatorSecretKey: curatorSk,
+        memoryGlobalChannelId: GLOBAL_CH,
+        stateFile,
+        packetDir: blockedPacketPath,
+        force: true,
+        nowSec: nowSec + 50,
+      }),
+      /dream packet write failed/,
+      'runCuratorCycle must fail when packet publication fails'
+    )
+
+    // Verify cursor was NOT advanced and consolidation-ledger.jsonl was NOT written yet, while pending_dream_packet is staged in 0640 state file
+    const stagedMode = statSync(stateFile).mode & 0o777
+    assert.equal(stagedMode, 0o640, 'curator-state.json with staged pending_dream_packet must be mode 0640 (never world-readable)')
+    assert.equal(stagedMode & 0o007, 0, 'curator-state.json must have zero world permissions')
+    const stagedState = readCuratorStateFile(stateFile)
+    assert.equal(stagedState.last_curated_write_seq, 0, 'cursor must not advance when packet write fails')
+    assert(stagedState.pending_dream_packet, 'pending_dream_packet must be staged in curator-state.json for retry recovery')
+    const consLedgerPath = join(tmp, 'consolidation-ledger.jsonl')
+    assert.equal(readConsolidationLedger(consLedgerPath).length, 0, 'consolidation ledger must not advance before packet write succeeds')
+
+    // Case 2: Remove packet blocker, but place a directory at consLedgerPath so appendConsolidationLedger fails on I/O
+    rmSync(blockedPacketPath, { force: true })
+    mkdirSync(consLedgerPath, { recursive: true })
+    await assert.rejects(
+      () => runCuratorCycle({
+        readerSocket: join(sockDir, 'curator.sock'),
+        writerSocket: join(sockDir, 'writers', 'curator.sock'),
+        curatorSecretKey: curatorSk,
+        memoryGlobalChannelId: GLOBAL_CH,
+        stateFile,
+        packetDir: blockedPacketPath,
+        force: false,
+        nowSec: nowSec + 55,
+      }),
+      /consolidation ledger append failed/,
+      'runCuratorCycle must fail and not advance cursor when consolidation ledger append fails'
+    )
+    const afterLedgerFailState = readCuratorStateFile(stateFile)
+    assert.equal(afterLedgerFailState.last_curated_write_seq, 0, 'cursor must not advance when ledger append fails')
+    assert(afterLedgerFailState.pending_ledger_entry, 'pending_ledger_entry remains staged after ledger append failure')
+
+    // Remove ledger blocker and restart runCuratorCycle
+    rmSync(consLedgerPath, { recursive: true, force: true })
+    const recovered = await runCuratorCycle({
+      readerSocket: join(sockDir, 'curator.sock'),
+      writerSocket: join(sockDir, 'writers', 'curator.sock'),
+      curatorSecretKey: curatorSk,
+      memoryGlobalChannelId: GLOBAL_CH,
+      stateFile,
+      packetDir: blockedPacketPath,
+      force: false,
+      nowSec: nowSec + 60,
+    })
+
+    assert.equal(recovered.ok, true)
+    assert.equal(recovered.cycle_status, 'curated')
+    assert.equal(recovered.cursor_advanced, true)
+    assert(recovered.dream_packet_paths?.cyclePath, 'restart must recover and write the cycle dream packet')
+    const onDiskLatest = JSON.parse(readFileSync(recovered.dream_packet_paths.latestPath, 'utf8'))
+    assert.equal(onDiskLatest.id, 'dream-4')
+    const finalState = readCuratorStateFile(stateFile)
+    assert.equal(finalState.last_curated_write_seq, 4, 'cursor advances after recovered packet publication succeeds')
+    assert.equal(finalState.pending_dream_packet, null, 'pending_dream_packet cleared after recovery')
+    const ledgerRows = readConsolidationLedger(consLedgerPath)
+    assert.equal(ledgerRows.length, 1, 'consolidation ledger entry written on recovery')
+    assert.equal(ledgerRows[0].write_seq_after, 4)
+
+    // Case 3: Simulate crash AFTER appendConsolidationLedger succeeded but BEFORE final state write cleared pending_ledger_entry
+    writeFileSync(stateFile, JSON.stringify({
+      ...stagedState,
+      last_curated_write_seq: 0,
+      pending_curated_at: nowSec + 50,
+      pending_curated_write_seq: 4,
+      pending_dream_packet: stagedState.pending_dream_packet,
+      pending_ledger_entry: stagedState.pending_ledger_entry,
+    }, null, 2) + '\n', { mode: 0o640 })
+    const idempotentRestart = await runCuratorCycle({
+      readerSocket: join(sockDir, 'curator.sock'),
+      writerSocket: join(sockDir, 'writers', 'curator.sock'),
+      curatorSecretKey: curatorSk,
+      memoryGlobalChannelId: GLOBAL_CH,
+      stateFile,
+      packetDir: blockedPacketPath,
+      force: false,
+      nowSec: nowSec + 70,
+    })
+    assert.equal(idempotentRestart.ok, true)
+    assert.equal(readCuratorStateFile(stateFile).last_curated_write_seq, 4)
+    assert.equal(readConsolidationLedger(consLedgerPath).length, 1, 'ledger append is idempotent by cycle/write_seq on crash recovery')
+  } finally {
+    if (daemon) await daemon.close()
     rmSync(tmp, { recursive: true, force: true })
   }
 })

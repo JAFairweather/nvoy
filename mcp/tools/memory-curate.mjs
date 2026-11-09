@@ -107,6 +107,10 @@ export function readCuratorStateFile(stateFilePath) {
     topic_reorganizations: Array.isArray(raw.topic_reorganizations)
       ? raw.topic_reorganizations.map(r => ({ ...r, persisted: r?.persisted !== false, simulated: Boolean(r?.simulated) }))
       : null,
+    pending_curated_at: typeof raw.pending_curated_at === 'number' && Number.isFinite(raw.pending_curated_at) ? raw.pending_curated_at : null,
+    pending_curated_write_seq: typeof raw.pending_curated_write_seq === 'number' && Number.isFinite(raw.pending_curated_write_seq) ? raw.pending_curated_write_seq : null,
+    pending_dream_packet: raw.pending_dream_packet && typeof raw.pending_dream_packet === 'object' ? raw.pending_dream_packet : null,
+    pending_ledger_entry: raw.pending_ledger_entry && typeof raw.pending_ledger_entry === 'object' ? raw.pending_ledger_entry : null,
     consolidation_ledger: readConsolidationLedger(ledgerPath),
   }
 }
@@ -143,14 +147,44 @@ export function readConsolidationLedger(ledgerFilePath, { limit = 40 } = {}) {
 }
 
 export function appendConsolidationLedger(ledgerFilePath, entry) {
-  if (!ledgerFilePath || typeof ledgerFilePath !== 'string' || !entry || typeof entry !== 'object') return false
+  if (!ledgerFilePath || typeof ledgerFilePath !== 'string' || !entry || typeof entry !== 'object') {
+    const wrapped = new Error('consolidation ledger path and entry object are required')
+    wrapped.code = 'HIVE_MEMORY_CONSOLIDATION_LEDGER_WRITE_FAILED'
+    throw wrapped
+  }
   try {
     const resolved = resolve(ledgerFilePath)
-    mkdirSync(dirname(resolved), { recursive: true, mode: 0o755 })
-    appendFileSync(resolved, JSON.stringify(entry) + '\n', { encoding: 'utf8', mode: 0o644 })
-    return true
-  } catch {
-    return false
+    mkdirSync(dirname(resolved), { recursive: true, mode: 0o750 })
+    if (existsSync(resolved)) {
+      const existingRaw = readFileSync(resolved, 'utf8')
+      for (const line of existingRaw.split('\n')) {
+        const trimmed = line.trim()
+        if (!trimmed) continue
+        let parsed = null
+        try { parsed = JSON.parse(trimmed) } catch {}
+        if (!parsed || typeof parsed !== 'object') continue
+        const sameNonEmptySeq =
+          typeof entry.write_seq_after === 'number' &&
+          typeof entry.write_seq_before === 'number' &&
+          entry.write_seq_after > entry.write_seq_before &&
+          parsed.write_seq_after === entry.write_seq_after &&
+          parsed.write_seq_before === entry.write_seq_before
+        const sameExactCycle =
+          parsed.write_seq_after === entry.write_seq_after &&
+          parsed.write_seq_before === entry.write_seq_before &&
+          parsed.at === entry.at
+        if (sameNonEmptySeq || sameExactCycle) {
+          return { appended: false, duplicate: true }
+        }
+      }
+    }
+    appendFileSync(resolved, JSON.stringify(entry) + '\n', { encoding: 'utf8', mode: 0o640 })
+    chmodSync(resolved, 0o640)
+    return { appended: true, duplicate: false }
+  } catch (err) {
+    const wrapped = new Error(`consolidation ledger append failed (${ledgerFilePath}): ${err?.message || err}`, { cause: err })
+    wrapped.code = 'HIVE_MEMORY_CONSOLIDATION_LEDGER_WRITE_FAILED'
+    throw wrapped
   }
 }
 
@@ -162,16 +196,194 @@ export function writeCuratorStateFile(stateFilePath, state) {
   }
   try {
     const resolved = resolve(stateFilePath)
-    mkdirSync(dirname(resolved), { recursive: true, mode: 0o755 })
+    mkdirSync(dirname(resolved), { recursive: true, mode: 0o750 })
     const tmpPath = `${resolved}.tmp.${process.pid}`
-    writeFileSync(tmpPath, JSON.stringify(state, null, 2) + '\n', { encoding: 'utf8', mode: 0o644 })
-    chmodSync(tmpPath, 0o644)
+    writeFileSync(tmpPath, JSON.stringify(state, null, 2) + '\n', { encoding: 'utf8', mode: 0o640 })
+    chmodSync(tmpPath, 0o640)
     renameSync(tmpPath, resolved)
     return true
   } catch (err) {
     const wrapped = new Error(`curator state file write failed (${stateFilePath}): ${err?.message || err}`)
     wrapped.code = 'HIVE_MEMORY_CURATOR_STATE_WRITE_FAILED'
     throw wrapped
+  }
+}
+
+export function resolveDreamPacketDir({ packetDir = undefined, stateFile = undefined, socketPath = null } = {}) {
+  if (packetDir === null || packetDir === '') return null
+  if (typeof packetDir === 'string' && packetDir.trim()) return resolve(packetDir.trim())
+  if (typeof process.env.HIVE_MEMORY_CURATOR_PACKET_DIR === 'string' && process.env.HIVE_MEMORY_CURATOR_PACKET_DIR.trim()) {
+    return resolve(process.env.HIVE_MEMORY_CURATOR_PACKET_DIR.trim())
+  }
+  const stPath = resolveCuratorStatePath({ stateFile, socketPath })
+  if (!stPath) return null
+  return join(dirname(stPath), 'packets')
+}
+
+export function sanitizeDreamSummary(rawText, { maxChars = 180 } = {}) {
+  const cleaned = String(rawText || '')
+    .replace(/\s*\[(?:Curated Class B decision|Distilled)[^\]]*\]\s*$/i, '')
+    .replace(/<\/?[a-zA-Z][^>]*>/g, '')
+    .replace(/\b(?:https?|file):\/\/\S+/gi, 'ref')
+    .replace(/@([a-zA-Z0-9_-]+)/g, '$1')
+    .replace(/@+/g, '')
+    .replace(/\b[0-9a-fA-F]{16,64}\b/g, 'ref')
+    .replace(/[`*_~#>]+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (cleaned.length <= maxChars) return cleaned
+  return `${cleaned.slice(0, maxChars - 1).trimEnd()}…`
+}
+
+export function buildDreamPacket({
+  writeSeqBefore = 0,
+  writeSeqAfter = 0,
+  ranAt = Math.floor(Date.now() / 1000),
+  ledgerRef = null,
+  coherenceScore = null,
+  triggers = null,
+  plan = null,
+  submitted = [],
+  persistedReorganizations = [],
+  persistedEigenvectors = [],
+  memoryGlobalChannelId = 'a8186b53-537d-46ad-a7e7-b6486c58970e',
+} = {}) {
+  const cleanRoom = String(memoryGlobalChannelId || 'a8186b53-537d-46ad-a7e7-b6486c58970e').trim().toLowerCase()
+  const allowedScope = `room:${cleanRoom}`
+  const submittedByD = new Map()
+  for (const s of Array.isArray(submitted) ? submitted : []) {
+    if (s && typeof s.d === 'string' && typeof s.id === 'string') {
+      submittedByD.set(s.d, s)
+    }
+  }
+
+  const changes = []
+  for (const p of Array.isArray(plan?.promotions) ? plan.promotions : []) {
+    if (p.scope !== allowedScope) continue
+    const dTag = p.template?.tags?.find(t => t[0] === 'd')?.[1] || `${p.topic}:${p.scope}:${p.slug}`
+    const sub = submittedByD.get(dTag)
+    if (!sub) continue
+    changes.push({
+      change_id: sub.id,
+      kind: 'promotion',
+      claim_event_id: sub.id,
+      d: dTag,
+      topic: p.topic,
+      source_count: Array.isArray(p.source_event_ids) ? p.source_event_ids.length : 0,
+      summary: sanitizeDreamSummary(p.claim),
+    })
+  }
+
+  for (const dist of Array.isArray(plan?.distillations) ? plan.distillations : []) {
+    if (dist.scope !== allowedScope) continue
+    const dTag = dist.template?.tags?.find(t => t[0] === 'd')?.[1] || `${dist.topic}:${dist.scope}:${dist.slug}`
+    const sub = submittedByD.get(dTag)
+    if (!sub) continue
+    changes.push({
+      change_id: sub.id,
+      kind: 'distillation',
+      claim_event_id: sub.id,
+      d: dTag,
+      topic: dist.topic,
+      source_count: Array.isArray(dist.source_event_ids) ? dist.source_event_ids.length : 0,
+      summary: sanitizeDreamSummary(dist.claim),
+    })
+  }
+
+  for (const r of Array.isArray(persistedReorganizations) ? persistedReorganizations : []) {
+    if (!r || !r.from_topic || !r.to_topic) continue
+    const matchingChange = changes.find(c => c.topic === r.to_topic)
+    if (!matchingChange) continue
+    const changeId = `reorg:${r.from_topic}->${r.to_topic}`
+    changes.push({
+      change_id: changeId,
+      kind: 'topic_reorg',
+      claim_event_id: matchingChange.claim_event_id,
+      topic: r.to_topic,
+      summary: sanitizeDreamSummary(`Reorganized outlier topic ${r.from_topic} into ${r.to_topic} across ${r.claim_count || 1} claim(s)`),
+    })
+  }
+
+  for (const sol of Array.isArray(plan?.solidifications) ? plan.solidifications : []) {
+    if (sol.scope !== allowedScope) continue
+    const cid = String(sol.event_id || '')
+    if (!cid) continue
+    changes.push({
+      change_id: `solidify:${cid}`,
+      kind: 'solidification',
+      claim_event_id: cid,
+      d: sol.d,
+      topic: sol.topic,
+      summary: sanitizeDreamSummary(sol.claim),
+    })
+  }
+
+  for (const nm of Array.isArray(plan?.nightmares) ? plan.nightmares : []) {
+    if (nm.scope !== allowedScope) continue
+    const dTag = nm.template?.tags?.find(t => t[0] === 'd')?.[1] || nm.d
+    const sub = dTag ? submittedByD.get(dTag) : null
+    const cid = sub?.id || nm.winner_event_id || nm.event_id || (Array.isArray(nm.event_ids) ? nm.event_ids[0] : null)
+    if (!cid) continue
+    changes.push({
+      change_id: `nightmare:${cid}`,
+      kind: 'nightmare',
+      claim_event_id: cid,
+      d: dTag || null,
+      summary: sanitizeDreamSummary(nm.message || nm.stale_warning || `Nightmare (${nm.kind}) on ${dTag || cid}`),
+    })
+  }
+
+  if (changes.length === 0) return null
+
+  return {
+    record_type: 'hive-dream-packet',
+    authority: null,
+    trustedInstruction: false,
+    id: `dream-${writeSeqAfter}`,
+    at: new Date(ranAt * 1000).toISOString(),
+    ran_at: ranAt,
+    scope: allowedScope,
+    write_seq_before: Number(writeSeqBefore || 0),
+    write_seq_after: Number(writeSeqAfter || 0),
+    ledger_ref: ledgerRef || `/var/lib/hive-memory-curator/consolidation-ledger.jsonl#write_seq=${writeSeqAfter}`,
+    coherence_score: typeof coherenceScore === 'number' ? coherenceScore : null,
+    triggers: Array.isArray(triggers?.reasons) ? triggers.reasons : [],
+    topic_eigenvectors: (Array.isArray(persistedEigenvectors) ? persistedEigenvectors : []).slice(0, 6).map(e => ({
+      eigen_topic: e.eigen_topic,
+      weight: e.weight,
+      dominant_terms: Array.isArray(e.dominant_terms) ? e.dominant_terms.slice(0, 5) : [],
+    })),
+    changes,
+  }
+}
+
+export function writeDreamPacket({ packetDir, packet } = {}) {
+  if (!packetDir || typeof packetDir !== 'string' || !packet || typeof packet !== 'object' || !packet.id) {
+    return null
+  }
+  try {
+    const resolvedDir = resolve(packetDir)
+    mkdirSync(resolvedDir, { recursive: true, mode: 0o750 })
+    const payload = JSON.stringify(packet, null, 2) + '\n'
+    const cyclePath = join(resolvedDir, `${packet.id}.json`)
+    const latestPath = join(resolvedDir, 'latest.json')
+    const suffix = `.tmp.${process.pid}.${Date.now()}`
+
+    // 1. Write dream-<write_seq>.json atomically first (mode 0640)
+    const tmpCycle = `${cyclePath}${suffix}`
+    writeFileSync(tmpCycle, payload, { encoding: 'utf8', mode: 0o640 })
+    chmodSync(tmpCycle, 0o640)
+    renameSync(tmpCycle, cyclePath)
+
+    // 2. Advance latest.json atomically only after dream-<write_seq>.json is in place (mode 0640)
+    const tmpLatest = `${latestPath}${suffix}`
+    writeFileSync(tmpLatest, payload, { encoding: 'utf8', mode: 0o640 })
+    chmodSync(tmpLatest, 0o640)
+    renameSync(tmpLatest, latestPath)
+
+    return { cyclePath, latestPath }
+  } catch (err) {
+    throw new Error(`dream packet write failed: ${err?.message || err}`, { cause: err })
   }
 }
 
@@ -890,12 +1102,12 @@ export function planMerkleDream({
   const distillations = []
   const promotions = []
   const classAByScopeTopic = new Map()
+  const isCuratorDistillation = r =>
+    Boolean(cleanCuratorPk && r.author_pubkey === cleanCuratorPk && String(r.d || '').includes(':curated-'))
 
   for (const r of active) {
     if (r.scope === 'hive:canon') continue
     if (conflictedFactKeys.has(r.d)) continue
-    // Skip claims already authored by Curator so Curator doesn't re-curate its own solitary summary
-    if (cleanCuratorPk && r.author_pubkey === cleanCuratorPk && String(r.d || '').includes(':curated-')) continue
     if (r.expires_at !== null && r.expires_at !== undefined) {
       const sc = String(r.scope || '')
       const top = resolveEigenTopic(r.topic)
@@ -924,18 +1136,22 @@ export function planMerkleDream({
 
     for (const cl of clusters) {
       if (cl.members.length < 2) continue
-      const sorted = [...cl.members].sort((a, b) => (b.created_at || 0) - (a.created_at || 0) || (a.event_id < b.event_id ? -1 : 1))
-      const head = sorted[0]
-      const sourceIds = sorted.map(r => r.event_id).sort()
+      const nonCuratorMembers = cl.members.filter(r => !isCuratorDistillation(r))
+      // Skip clusters that have no new non-curator claims (so Curator never re-curates a solitary curated-* summary)
+      if (nonCuratorMembers.length === 0) continue
+      const sortedAll = [...cl.members].sort((a, b) => (b.created_at || 0) - (a.created_at || 0) || (a.event_id < b.event_id ? -1 : 1))
+      const sortedPrimary = [...nonCuratorMembers].sort((a, b) => (b.created_at || 0) - (a.created_at || 0) || (a.event_id < b.event_id ? -1 : 1))
+      const head = sortedPrimary[0]
+      const sourceIds = sortedAll.map(r => r.event_id).sort()
       const merkleRoot = computeSourceMerkleRoot(sourceIds)
-      const distinctAuthors = new Set(sorted.map(r => r.author_pubkey))
-      const mergedEvidence = [...new Set(sorted.flatMap(r => Array.isArray(r.evidence) ? r.evidence : []))].slice(0, 24)
-      const anyStale = sorted.some(r => Boolean(r.stale_warning))
-      const nonWorkflowCount = sorted.filter(r => !isWorkflowSlug(parseFactKey(r.d)?.slug)).length
-      const maxCreated = Math.max(...sorted.map(r => r.created_at || 0))
+      const distinctAuthors = new Set(sortedPrimary.map(r => r.author_pubkey))
+      const mergedEvidence = [...new Set(sortedAll.flatMap(r => Array.isArray(r.evidence) ? r.evidence : []))].slice(0, 24)
+      const anyStale = sortedPrimary.some(r => Boolean(r.stale_warning))
+      const nonWorkflowCount = sortedPrimary.filter(r => !isWorkflowSlug(parseFactKey(r.d)?.slug)).length
+      const maxCreated = Math.max(...sortedAll.map(r => r.created_at || 0))
       const cleanSubj = sanitizeSlugPart(cl.subject)
       const reorganizedFromTopics = [
-        ...new Set(sorted.map(r => String(r.topic || '').trim()).filter(t => t && t !== topic)),
+        ...new Set(sortedPrimary.map(r => String(r.topic || '').trim()).filter(t => t && t !== topic)),
       ]
 
       // Stage 2 Promotion criterion: >=2 distinct authors (or >=3 non-workflow claims with >=3 evidence citations)
@@ -944,8 +1160,8 @@ export function planMerkleDream({
 
       if (shouldPromote) {
         const slug = `decision-${topic}-${cleanSubj}`.slice(0, 120)
-        const synthesizedClaim = `${head.claim} [Curated Class B decision from ${sorted.length} claims across ${distinctAuthors.size} author(s)]`
-        const synthesizedBecause = `Promoted to Class B durable decision by Merkle Dreaming: ${sorted.length} converging claims (${sourceIds.map(id => id.slice(0, 8)).join(', ')}) established settled state in ${topic}. Latest rationale: ${head.because}`
+        const synthesizedClaim = `${head.claim} [Curated Class B decision from ${sortedAll.length} claims across ${distinctAuthors.size} author(s)]`
+        const synthesizedBecause = `Promoted to Class B durable decision by Merkle Dreaming: ${sortedAll.length} converging claims (${sourceIds.map(id => id.slice(0, 8)).join(', ')}) established settled state in ${topic}. Latest rationale: ${head.because}`
         const template = cleanCuratorPk
           ? buildClaimTemplate({
               pubkey: cleanCuratorPk,
@@ -982,8 +1198,8 @@ export function planMerkleDream({
       } else {
         // Stage 1 Distillation: fold noisy Class A trail / workflow checkpoints into 1 curated Class A claim
         const slug = `curated-${topic}-${cleanSubj}`.slice(0, 120)
-        const synthesizedClaim = `${head.claim} [Distilled from ${sorted.length} Class A claims]`
-        const synthesizedBecause = `Distilled ${sorted.length} Class A claims in #${topic} (${sourceIds.map(id => id.slice(0, 8)).join(', ')}). Latest rationale: ${head.because}`
+        const synthesizedClaim = `${head.claim} [Distilled from ${sortedAll.length} Class A claims]`
+        const synthesizedBecause = `Distilled ${sortedAll.length} Class A claims in #${topic} (${sourceIds.map(id => id.slice(0, 8)).join(', ')}). Latest rationale: ${head.because}`
         const template = cleanCuratorPk
           ? buildClaimTemplate({
               pubkey: cleanCuratorPk,
@@ -1165,6 +1381,7 @@ export async function runCuratorCycle({
   force = false,
   dryRun = false,
   stateFile = undefined,
+  packetDir = undefined,
   lastCuratedAt = null,
   lastCuratedWriteSeq = null,
   coherence = null,
@@ -1178,6 +1395,7 @@ export async function runCuratorCycle({
   nowSec = Math.floor(Date.now() / 1000),
 } = {}) {
   const resolvedStateFile = resolveCuratorStatePath({ stateFile, socketPath: readerSocket })
+  const resolvedPacketDir = resolveDreamPacketDir({ packetDir, stateFile: resolvedStateFile, socketPath: readerSocket })
   const persisted = resolvedStateFile ? readCuratorStateFile(resolvedStateFile) : null
   const effectiveLastCuratedAt =
     lastCuratedAt !== null && lastCuratedAt !== undefined
@@ -1337,10 +1555,27 @@ export async function runCuratorCycle({
     }
 
     const postWriteSeq = Number(storeState.write_seq || 0) + submitted.length
-    const nextCuratedAt = cursorAdvanced ? nowSec : effectiveLastCuratedAt
-    const nextCuratedWriteSeq = cursorAdvanced ? postWriteSeq : effectiveLastCuratedWriteSeq
+    const hasPendingRecovery = Boolean(
+      hasWriteCapability &&
+      resolvedStateFile &&
+      (persisted?.pending_dream_packet || persisted?.pending_ledger_entry)
+    )
+    if (hasPendingRecovery && submitted.length === 0 && refused.length === 0 && historyComplete) {
+      cycleStatus = 'curated'
+      cursorAdvanced = true
+    }
+    const nextCuratedAt = cursorAdvanced
+      ? (submitted.length === 0 && persisted?.pending_curated_at ? Number(persisted.pending_curated_at) : nowSec)
+      : effectiveLastCuratedAt
+    const nextCuratedWriteSeq = cursorAdvanced
+      ? (submitted.length === 0 && persisted?.pending_curated_write_seq ? Number(persisted.pending_curated_write_seq) : postWriteSeq)
+      : effectiveLastCuratedWriteSeq
+
+    let dreamPacket = null
+    let dreamPacketPaths = null
 
     if (hasWriteCapability && resolvedStateFile && cursorAdvanced) {
+      const ledgerPath = resolveConsolidationLedgerPath({ stateFile: resolvedStateFile, socketPath: readerSocket })
       const submittedDs = new Set(submitted.map(s => s.d))
       const executedReorgPairs = new Set()
       for (const item of [...plan.promotions, ...plan.distillations]) {
@@ -1363,11 +1598,91 @@ export async function runCuratorCycle({
                 .map(r => ({ ...r, persisted: true, simulated: false }))
             : [])
         : (Array.isArray(persisted?.topic_reorganizations) ? persisted.topic_reorganizations : [])
+
+      const ledgerEntry = submitted.length > 0
+        ? {
+            at: nowSec,
+            cycle_status: cycleStatus,
+            write_seq_before: Number(storeState.write_seq || 0),
+            write_seq_after: nextCuratedWriteSeq,
+            claims_before: records.length,
+            submitted_count: submitted.length,
+            coherence_score: triggerEval.coherence_score,
+            reasons: triggerEval.reasons || [],
+            plan_summary: plan.summary || {},
+            submitted: submitted.map(s => ({
+              id: s.id,
+              d: s.d,
+              stage: s.stage,
+              merkle_sources: s.merkle_sources,
+            })),
+          }
+        : (persisted?.pending_ledger_entry || {
+            at: nowSec,
+            cycle_status: cycleStatus,
+            write_seq_before: Number(storeState.write_seq || 0),
+            write_seq_after: nextCuratedWriteSeq,
+            claims_before: records.length,
+            submitted_count: 0,
+            coherence_score: triggerEval.coherence_score,
+            reasons: triggerEval.reasons || [],
+            plan_summary: plan.summary || {},
+            submitted: [],
+          })
+
+      if (submitted.length > 0 && resolvedPacketDir) {
+        dreamPacket = buildDreamPacket({
+          writeSeqBefore: Number(storeState.write_seq || 0),
+          writeSeqAfter: nextCuratedWriteSeq,
+          ranAt: nowSec,
+          ledgerRef: ledgerPath ? `${ledgerPath}#write_seq=${nextCuratedWriteSeq}` : null,
+          coherenceScore: triggerEval.coherence_score,
+          triggers: triggerEval,
+          plan,
+          submitted,
+          persistedReorganizations,
+          persistedEigenvectors,
+          memoryGlobalChannelId: memoryGlobalChannelId || 'a8186b53-537d-46ad-a7e7-b6486c58970e',
+        })
+      } else if (persisted?.pending_dream_packet) {
+        dreamPacket = persisted.pending_dream_packet
+      }
+
+      // Stage pending packet & ledger entry BEFORE writing the packet or advancing the cursor/ledger,
+      // so if packet publication fails, the cursor/ledger are NOT advanced and a retry recovers cleanly.
+      if (dreamPacket || persisted?.pending_ledger_entry) {
+        writeCuratorStateFile(resolvedStateFile, {
+          last_curated_at: effectiveLastCuratedAt,
+          last_curated_write_seq: effectiveLastCuratedWriteSeq,
+          last_ran_at: nowSec,
+          last_submitted_count: ledgerEntry.submitted_count ?? submitted.length,
+          dream_interval_sec: dreamIntervalSec,
+          write_delta_threshold: writeDeltaThreshold,
+          topic_pressure_threshold: topicPressureThreshold,
+          triggers: triggerEval,
+          coherence_score: triggerEval.coherence_score,
+          topic_eigenvectors: persistedEigenvectors,
+          topic_reorganizations: persistedReorganizations,
+          pending_curated_at: nextCuratedAt,
+          pending_curated_write_seq: nextCuratedWriteSeq,
+          pending_dream_packet: dreamPacket || null,
+          pending_ledger_entry: ledgerEntry,
+        })
+      }
+
+      if (dreamPacket && resolvedPacketDir) {
+        dreamPacketPaths = writeDreamPacket({ packetDir: resolvedPacketDir, packet: dreamPacket })
+      }
+
+      if (ledgerPath) {
+        appendConsolidationLedger(ledgerPath, ledgerEntry)
+      }
+
       writeCuratorStateFile(resolvedStateFile, {
         last_curated_at: nextCuratedAt,
         last_curated_write_seq: nextCuratedWriteSeq,
         last_ran_at: nowSec,
-        last_submitted_count: submitted.length,
+        last_submitted_count: ledgerEntry.submitted_count ?? submitted.length,
         dream_interval_sec: dreamIntervalSec,
         write_delta_threshold: writeDeltaThreshold,
         topic_pressure_threshold: topicPressureThreshold,
@@ -1375,27 +1690,11 @@ export async function runCuratorCycle({
         coherence_score: triggerEval.coherence_score,
         topic_eigenvectors: persistedEigenvectors,
         topic_reorganizations: persistedReorganizations,
+        pending_curated_at: null,
+        pending_curated_write_seq: null,
+        pending_dream_packet: null,
+        pending_ledger_entry: null,
       })
-      const ledgerPath = resolveConsolidationLedgerPath({ stateFile: resolvedStateFile, socketPath: readerSocket })
-      if (ledgerPath) {
-        appendConsolidationLedger(ledgerPath, {
-          at: nowSec,
-          cycle_status: cycleStatus,
-          write_seq_before: Number(storeState.write_seq || 0),
-          write_seq_after: nextCuratedWriteSeq,
-          claims_before: records.length,
-          submitted_count: submitted.length,
-          coherence_score: triggerEval.coherence_score,
-          reasons: triggerEval.reasons || [],
-          plan_summary: plan.summary || {},
-          submitted: submitted.map(s => ({
-            id: s.id,
-            d: s.d,
-            stage: s.stage,
-            merkle_sources: s.merkle_sources,
-          })),
-        })
-      }
     }
 
     const cycleOk = cycleStatus !== 'write_refused' && cycleStatus !== 'history_incomplete'
@@ -1418,6 +1717,8 @@ export async function runCuratorCycle({
       forced: Boolean(force),
       dry_run: Boolean(dryRun),
       state_file: resolvedStateFile || null,
+      dream_packet: dreamPacket,
+      dream_packet_paths: dreamPacketPaths,
       last_curated_at: effectiveLastCuratedAt,
       last_curated_write_seq: effectiveLastCuratedWriteSeq,
       next_curated_at: nextCuratedAt,
