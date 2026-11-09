@@ -13,6 +13,7 @@ import {
   computeAgentHealth,
   computeCoherence,
   computeDreamingTelemetry,
+  computeSynapticEfficacy,
   diffViewerSnapshots,
   readWatchStatus,
   watchAlert,
@@ -22,6 +23,7 @@ import {
   parseListenTarget,
   parseViewerFlags,
   renderViewerHtml,
+  resolveDreamDisplayMode,
   safeJsonForScript,
   sanitizeActivity,
   startMemoryViewer,
@@ -379,6 +381,132 @@ await test('computeCoherence calculates 5-axis HCI score and retroactive incepti
   })
   const step5 = coh4.history.find(h => h.events === 5)
   assert.equal(step5.claims, 4, 'at step 5 (t=110), c2 is active and consolidates c1 via supersedes even after c2 later expires')
+
+  // Verify epistemic drift & blind-spot detection: zero-hit queries and silent active writers dip coherence
+  const cohDrift = computeCoherence({
+    records,
+    agent_roster: [
+      ...roster,
+      { id: 'biggy', pubkey: '4'.repeat(64), is_writer: true },
+    ],
+    recent_activity: [
+      { kind: 'wake', actor: 'biggy' },
+      { kind: 'query', actor: 'biggy', count: 2, topic: 'r1' },
+      { kind: 'lookup', actor: 'biggy' },
+      { kind: 'wake', actor: 'biggy' },
+      { kind: 'query', actor: 'mc-claude', count: 0, topic: 'wonder-lab' },
+      { kind: 'query', actor: 'mydude', count: 0, topic: 'wonder-lab' },
+    ],
+    store_state: { write_seq: 6 },
+  })
+  assert.equal(cohDrift.epistemic_drift.status, 'blind_spot')
+  assert.equal(cohDrift.epistemic_drift.zero_hit_queries, 2)
+  assert.deepEqual(cohDrift.epistemic_drift.missed_topics, ['wonder-lab'])
+  assert.deepEqual(cohDrift.epistemic_drift.silent_active_writers, ['biggy'])
+  assert(cohDrift.score < coh.score, `coherence must dip on epistemic blind spots (${cohDrift.score} < ${coh.score})`)
+
+  // Verify fleet recall blindness: when a multi-agent reader roster has blind (0 reads) or lookup-only agents, coherence drops
+  const cohBlindFleet = computeCoherence({
+    records,
+    agent_roster: [
+      { id: 'mydude', pubkey: '1'.repeat(64), is_reader: true, is_writer: true },
+      { id: 'neil', pubkey: '2'.repeat(64), is_reader: true, is_writer: true },
+      { id: 'waggle-dev', pubkey: '3'.repeat(64), is_reader: true, is_writer: true },
+      { id: 'djcodex', pubkey: '4'.repeat(64), is_reader: true, is_writer: true },
+      { id: 'dennis', pubkey: '5'.repeat(64), is_reader: true, is_writer: true },
+      { id: 'kerouac', pubkey: '6'.repeat(64), is_reader: true, is_writer: true },
+    ],
+    recent_activity: [
+      { kind: 'wake', actor: 'mydude' },
+      { kind: 'submit', actor: 'mydude' },
+      { kind: 'lookup', actor: 'waggle-dev' },
+      { kind: 'submit', actor: 'waggle-dev' },
+      { kind: 'refused', actor: 'djcodex', code: 'HIVE_MEMORY_INVALID_EVENT' },
+    ],
+    store_state: { write_seq: 8 },
+  })
+  assert.equal(cohBlindFleet.epistemic_drift.recall_coverage_pct, 16.7)
+  assert.deepEqual(cohBlindFleet.epistemic_drift.lookup_only_writers, ['neil', 'waggle-dev'])
+  assert.deepEqual(cohBlindFleet.epistemic_drift.blind_roster_agents, ['djcodex', 'dennis', 'kerouac'])
+  assert.equal(cohBlindFleet.epistemic_drift.status, 'blind_spot')
+  assert(Array.isArray(cohBlindFleet.epistemic_drift.alerts) && cohBlindFleet.epistemic_drift.alerts.length >= 6)
+  assert(cohBlindFleet.epistemic_drift.alerts.some(a => a.category === 'tool_failure' && a.code === 'HIVE_MEMORY_INVALID_EVENT' && a.actor === 'djcodex'))
+  assert(cohBlindFleet.epistemic_drift.alerts.some(a => a.category === 'behavioral_noncompliance' && a.code === 'WRITE_WITHOUT_RECALL' && a.actor === 'waggle-dev'))
+  assert(cohBlindFleet.epistemic_drift.alerts.some(a => a.category === 'behavioral_noncompliance' && a.code === 'BLIND_ROSTER_SEAT' && a.actor === 'dennis'))
+  assert(cohBlindFleet.score < coh.score - 15, `fleet amnesia must significantly lower coherence (${cohBlindFleet.score} vs ${coh.score})`)
+})
+
+await test('computeSynapticEfficacy: quantifies 4-axis information distribution, cross-agent handoff velocity, and post-curator projection', () => {
+  const emptyEff = computeSynapticEfficacy()
+  assert.equal(emptyEff.score, 0)
+  assert.deepEqual(emptyEff.axes, { breadth: 0, precision: 0, velocity: 0, reuse: 0 })
+
+  const roster = [
+    { id: 'mydude', pubkey: '1'.repeat(64), is_reader: true, is_writer: true },
+    { id: 'waggle-dev', pubkey: '2'.repeat(64), is_reader: true, is_writer: true },
+    { id: 'dead-rabbit', pubkey: '3'.repeat(64), is_reader: true, is_writer: true },
+    { id: 'dennis', pubkey: '4'.repeat(64), is_reader: true, is_writer: true },
+  ]
+  const records = [
+    {
+      event_id: 'e1'.padEnd(64, '0'),
+      author_pubkey: '2'.repeat(64),
+      scope: 'room:a8186b53-537d-46ad-a7e7-b6486c58970e',
+      d: 'hive-memory:room:a8186b53-537d-46ad-a7e7-b6486c58970e:nvoy-pr343-owner',
+      topic: 'nvoy',
+      claim: 'Opened nvoy PR #343 at d30aa219',
+      as_of_git: 'd30aa219'.padEnd(40, '0'),
+      created_at: 1000,
+      expires_at: 5000,
+    },
+    {
+      event_id: 'e2'.padEnd(64, '0'),
+      author_pubkey: '1'.repeat(64),
+      scope: 'room:a8186b53-537d-46ad-a7e7-b6486c58970e',
+      d: 'hive-memory:room:a8186b53-537d-46ad-a7e7-b6486c58970e:nvoy-pr343-review',
+      topic: 'nvoy',
+      claim: 'Source-approved nvoy PR #343 at d30aa219',
+      as_of_git: 'd30aa219'.padEnd(40, '0'),
+      created_at: 1120,
+      expires_at: 5000,
+    },
+    {
+      event_id: 'e3'.padEnd(64, '0'),
+      author_pubkey: '3'.repeat(64),
+      scope: 'room:a8186b53-537d-46ad-a7e7-b6486c58970e',
+      d: 'hive-memory:room:a8186b53-537d-46ad-a7e7-b6486c58970e:nvoy-343-deployed',
+      topic: 'nvoy',
+      claim: 'Deployed nvoy #343 on nvoy-fleet',
+      as_of_git: 'ff2cf77b'.padEnd(40, '0'),
+      created_at: 1240,
+      expires_at: null,
+    },
+  ]
+  const activity = [
+    { kind: 'wake', actor: 'mydude', count: 5 },
+    { kind: 'query', actor: 'mydude', count: 3, topic: 'nvoy' },
+    { kind: 'lookup', actor: 'mydude' },
+    { kind: 'submit', actor: 'mydude', accepted: true },
+    { kind: 'lookup', actor: 'waggle-dev' },
+    { kind: 'submit', actor: 'waggle-dev', accepted: true },
+    { kind: 'query', actor: 'dead-rabbit', count: 0, topic: 'missing' },
+    { kind: 'lookup', actor: 'dead-rabbit' },
+    { kind: 'submit', actor: 'dead-rabbit', accepted: true },
+  ]
+  const eff = computeSynapticEfficacy({
+    records,
+    agent_roster: roster,
+    recent_activity: activity,
+    curator_state: { planned_summary: { promotions: 2, distillations: 1 } },
+    now_sec: 1300,
+  })
+  assert(eff.score > 50 && eff.score <= 100)
+  assert.equal(eff.velocity.handoff_count, 2, 'detects waggle-dev -> mydude -> dead-rabbit handoffs')
+  assert.equal(eff.velocity.median_handoff_min, 2)
+  assert.equal(eff.retrieval.query_hit_rate_pct, 50)
+  assert.deepEqual(eff.distribution.compliant_writers, ['mydude', 'dead-rabbit'])
+  assert.deepEqual(eff.distribution.receipt_only_writers, ['waggle-dev'])
+  assert(eff.projected.after_wake_hook_score >= eff.score)
 })
 
 await test('computeAgentHealth: classifies 5m active, 5-20m warm, >20m stale, error, and preserves telemetry across rollover', () => {
@@ -483,6 +611,154 @@ await test('computeDreamingTelemetry: groups Gate 8 Class A by scope+topic, rest
   assert.equal(room1Ops?.ready, false, '5 claims in room:1 must not trigger >8 curation ready')
   assert.equal(room2Ops?.count, 5)
   assert.equal(room2Ops?.ready, false, '5 claims in room:2 must not trigger >8 curation ready')
+  assert.equal(dt.display_mode.mode, 'simulated_preview')
+  assert.equal(dt.display_mode.is_simulated_preview, true)
+  assert.deepEqual(dt.display_mode.components, {
+    clusters: 'simulated_preview',
+    eigenvalues: 'simulated_preview',
+    topic_arcs: 'simulated_preview',
+    ghost_sources: 'simulated_preview',
+  })
+})
+
+await test('resolveDreamDisplayMode & zero-activity fleet recall: distinguishes simulated preview from observed curation and never reports 100% recall without reads', () => {
+  const zeroActivityRoster = [
+    { id: 'mydude', pubkey: '1'.repeat(64), is_reader: true, is_writer: true },
+    { id: 'neil', pubkey: '2'.repeat(64), is_reader: true, is_writer: true },
+    { id: 'waggle-dev', pubkey: '3'.repeat(64), is_reader: true, is_writer: true },
+    { id: 'biggy', pubkey: '4'.repeat(64), is_reader: true, is_writer: true },
+  ]
+  const zeroActCoh = computeCoherence({
+    records: [
+      {
+        event_id: 'a'.repeat(64),
+        author_pubkey: '1'.repeat(64),
+        scope: 'room:1',
+        d: 'hive-memory:room:1:test',
+        topic: 'nvoy',
+        claim: 'Test claim',
+        evidence: ['nvoy@1111111'],
+        as_of_git: '1'.repeat(40),
+        created_at: 1000,
+        expires_at: 5000,
+      },
+    ],
+    agent_roster: zeroActivityRoster,
+    recent_activity: [],
+    store_state: { write_seq: 1 },
+  })
+  assert.equal(zeroActCoh.epistemic_drift.recall_coverage_pct, 0, 'zero-activity reader fleet must report 0% recall coverage, never 100%')
+  assert.equal(zeroActCoh.epistemic_drift.blind_roster_agents.length, 3)
+  assert.equal(zeroActCoh.epistemic_drift.lookup_only_writers.length, 1)
+
+  // 1. No persisted curator state and 0 merkle_sources records -> simulated_preview across all 4 components
+  const simMode = resolveDreamDisplayMode({
+    records: [{ event_id: '1'.repeat(64), d: 'hive-memory:room:1:item', topic: 'nvoy' }],
+    curator_state: {
+      state_file_present: false,
+      last_curated_at: null,
+      topic_eigenvectors: [{ axis: 1, canonical_topic: 'nvoy', eigenvalue: 2.1, variance_pct: 50 }],
+      topic_reorganizations: [{ from_topic: 'ops', to_topic: 'nvoy', cosine_affinity: 0.72, claim_count: 2 }],
+    },
+    consolidated_sources: {},
+  })
+  assert.equal(simMode.mode, 'simulated_preview')
+  assert.equal(simMode.is_simulated_preview, true)
+  assert.deepEqual(simMode.components, {
+    clusters: 'simulated_preview',
+    eigenvalues: 'simulated_preview',
+    topic_arcs: 'simulated_preview',
+    ghost_sources: 'simulated_preview',
+  })
+
+  // 2. Persisted curator state + merkle_sources record, but superseded source is missing (synthetic ghost) -> simulated_preview
+  const ghostSimMode = resolveDreamDisplayMode({
+    records: [
+      {
+        event_id: '2'.repeat(64),
+        d: 'hive-memory:room:1:curated-nvoy',
+        topic: 'nvoy',
+        merkle_sources: 'f'.repeat(64),
+        supersedes: ['missing-src'.padEnd(64, '0')],
+      },
+    ],
+    curator_state: {
+      state_file_present: true,
+      last_curated_at: 1700000000,
+      topic_eigenvectors: [{ axis: 1, canonical_topic: 'nvoy', eigenvalue: 2.1, variance_pct: 50 }],
+      topic_reorganizations: [{ from_topic: 'ops', to_topic: 'nvoy', cosine_affinity: 0.72, claim_count: 2 }],
+    },
+    consolidated_sources: {},
+  })
+  assert.equal(ghostSimMode.mode, 'simulated_preview')
+  assert.equal(ghostSimMode.is_mixed, true)
+  assert.equal(ghostSimMode.observed_merkle_count, 1)
+  assert.equal(ghostSimMode.components.clusters, 'observed')
+  assert.equal(ghostSimMode.components.ghost_sources, 'simulated_preview')
+  assert(ghostSimMode.label.includes('MIXED: OBSERVED MERKLE CURATION (1 persisted merkle_sources'), 'mixed state must report persisted merkle_sources count')
+  assert(!ghostSimMode.label.includes('no persisted Merkle curation'), 'mixed state must never claim no persisted Merkle curation')
+
+  // 2b. Persisted curator state + merkle_sources record + resolved historical source, but unpersisted poll-recomputed eigens/arcs (simulated: true, persisted: false) -> mixed preview
+  const unpersistedSpectralMode = resolveDreamDisplayMode({
+    records: [
+      {
+        event_id: '2'.repeat(64),
+        d: 'hive-memory:room:1:curated-nvoy',
+        topic: 'nvoy',
+        merkle_sources: 'f'.repeat(64),
+        supersedes: ['9'.repeat(64)],
+      },
+    ],
+    curator_state: {
+      state_file_present: true,
+      last_curated_at: 1700000000,
+      topic_eigenvectors: [{ axis: 1, canonical_topic: 'nvoy', eigenvalue: 2.1, variance_pct: 50, simulated: true, persisted: false }],
+      topic_reorganizations: [{ from_topic: 'ops', to_topic: 'nvoy', cosine_affinity: 0.72, claim_count: 2, simulated: true, persisted: false }],
+    },
+    consolidated_sources: {
+      ['9'.repeat(64)]: { event_id: '9'.repeat(64), d: 'hive-memory:room:1:prior' },
+    },
+  })
+  assert.equal(unpersistedSpectralMode.mode, 'simulated_preview')
+  assert.equal(unpersistedSpectralMode.is_mixed, true)
+  assert.deepEqual(unpersistedSpectralMode.components, {
+    clusters: 'observed',
+    eigenvalues: 'simulated_preview',
+    topic_arcs: 'simulated_preview',
+    ghost_sources: 'observed',
+  })
+  assert(unpersistedSpectralMode.label.includes('MIXED: OBSERVED MERKLE CURATION (1 persisted merkle_sources: clusters, ghost_sources) + SIMULATED PREVIEW (eigenvalues, topic_arcs)'))
+
+  // 3. Persisted curator state + merkle_sources record + resolved source in consolidated_sources + real eigens & arcs -> observed
+  const srcId = '9'.repeat(64)
+  const observedMode = resolveDreamDisplayMode({
+    records: [
+      {
+        event_id: '2'.repeat(64),
+        d: 'hive-memory:room:1:curated-nvoy',
+        topic: 'nvoy',
+        merkle_sources: 'f'.repeat(64),
+        supersedes: [srcId],
+      },
+    ],
+    curator_state: {
+      state_file_present: true,
+      last_curated_at: 1700000000,
+      topic_eigenvectors: [{ axis: 1, canonical_topic: 'nvoy', eigenvalue: 2.1, variance_pct: 50 }],
+      topic_reorganizations: [{ from_topic: 'ops', to_topic: 'nvoy', cosine_affinity: 0.72, claim_count: 2 }],
+    },
+    consolidated_sources: {
+      [srcId]: { event_id: srcId, d: 'hive-memory:room:1:prior' },
+    },
+  })
+  assert.equal(observedMode.mode, 'observed')
+  assert.equal(observedMode.is_simulated_preview, false)
+  assert.deepEqual(observedMode.components, {
+    clusters: 'observed',
+    eigenvalues: 'observed',
+    topic_arcs: 'observed',
+    ghost_sources: 'observed',
+  })
 })
 
 await test('live integration: memory-viewer polls memory-daemon viewer socket, streams SSE, and refuses non-GET', async () => {
@@ -536,6 +812,25 @@ await test('live integration: memory-viewer polls memory-daemon viewer socket, s
     assert(htmlRes.body.includes('id="dock-agents"'))
     assert(htmlRes.body.includes('id="dock-pulses"'))
     assert(htmlRes.body.includes('id="dock-tools"'))
+    assert(htmlRes.body.includes('Dream / Time'))
+    assert(htmlRes.body.includes('id="dream-bar-status"'))
+    assert(htmlRes.body.includes('id="btn-dream-replay"'))
+    assert(htmlRes.body.includes('Replay Last Dream'))
+    assert(htmlRes.body.includes('id="btn-dream-consolidate"'))
+    assert(htmlRes.body.includes('Inspect Curation (Passive)'))
+    assert(htmlRes.body.includes('id="btn-dream-triggers"'))
+    assert(htmlRes.body.includes('Inspect 3-Trigger State'))
+    assert(htmlRes.body.includes('id="btn-dream-coherence"'))
+    assert(htmlRes.body.includes('PASSIVE INSPECTION · READ-ONLY'))
+    assert(htmlRes.body.includes('merkle_sources digest tags'))
+    assert(!htmlRes.body.includes('verified SHA-256 trees'))
+    assert(!htmlRes.body.includes('merkle_sources.event_ids'))
+    assert(!htmlRes.body.includes('merkle_sources.root'))
+    assert(!htmlRes.body.includes('ms.event_ids'))
+    assert(!htmlRes.body.includes('ms.root'))
+    assert(!htmlRes.body.includes('Sim write'))
+    assert(!htmlRes.body.includes('Sim recall'))
+    assert(!htmlRes.body.includes('Sim refusal'))
     assert(htmlRes.body.includes('id="btn-zoom-in"'))
     assert(htmlRes.body.includes('inspect-close'))
     assert(!/relay|SYNCED/i.test(htmlRes.body.replace('never synced to a relay', '')))
@@ -549,6 +844,9 @@ await test('live integration: memory-viewer polls memory-daemon viewer socket, s
     assert.equal(state1.trustedInstruction, false)
     assert.equal(state1.store_state.state, 'READY')
     assert.equal(state1.store_state.write_seq, 1)
+    assert.equal(typeof state1.curator_state, 'object')
+    assert.equal(state1.curator_state.write_delta, 1)
+    assert.equal(state1.curator_state.should_run, false)
     assert.equal(state1.query_answer, 'none')
     assert(!('global_sync' in state1) && !('relays_answered' in state1) && !('grants_checked_at' in state1))
     assert.equal(state1.records.length, 0)
@@ -622,6 +920,38 @@ await test('live integration: memory-viewer polls memory-daemon viewer socket, s
     const htmlRes2 = await httpGet(viewer.port, '/')
     assert(!htmlRes2.body.includes('<script>alert(1)</script>'))
     assert(htmlRes2.body.includes('\\u003cscript\\u003ealert(1)\\u003c/script\\u003e'))
+
+    // Verify viewer honors HIVE_MEMORY_CURATOR_STATE_FILE / stateFile override and fails closed on corrupt state file
+    const overrideStatePath = join(tmp, 'custom-curator-state.json')
+    process.env.HIVE_MEMORY_CURATOR_STATE_FILE = overrideStatePath
+    try {
+      const parsedFlags = parseViewerFlags(['--socket', join(sockDir, 'viewer.sock'), '--state-file', overrideStatePath, '--listen', '127.0.0.1:0'])
+      assert.equal(parsedFlags.stateFile, overrideStatePath)
+
+      const { writeCuratorStateFile } = await import('../mcp/tools/memory-curate.mjs')
+      writeCuratorStateFile(overrideStatePath, {
+        last_curated_at: nowSec - 120,
+        last_curated_write_seq: 2,
+        last_ran_at: nowSec - 120,
+        last_submitted_count: 1,
+      })
+      const polledWithOverride = await viewer.pollOnce()
+      assert.equal(polledWithOverride.curator_state.state_file, overrideStatePath)
+      assert.equal(polledWithOverride.curator_state.state_file_present, true)
+      assert.equal(polledWithOverride.curator_state.last_curated_write_seq, 2)
+      assert.equal(polledWithOverride.curator_state.write_delta, 0)
+      assert(Array.isArray(polledWithOverride.curator_state.planned_clusters), 'curator_state includes planned_clusters for 4-Act Replay')
+      assert(
+        polledWithOverride.curator_state.topic_eigenvectors.every(e => e.simulated === true && e.persisted === false),
+        'poll-recomputed eigenvectors without persisted state entries must be marked simulated: true, persisted: false'
+      )
+      assert(
+        polledWithOverride.curator_state.topic_reorganizations.every(r => r.simulated === true && r.persisted === false),
+        'poll-recomputed topic reorganization proposals must be marked simulated: true, persisted: false'
+      )
+    } finally {
+      delete process.env.HIVE_MEMORY_CURATOR_STATE_FILE
+    }
 
     sseReq.destroy()
 
@@ -706,9 +1036,9 @@ await test('daemon activity ring: only the viewer wake carries it, metadata only
     const roomed = claim(neilSk, neilPk, `room:${room}`, 'secret-room-plan')
     assert.equal(payload(call({ kind: 'writer', name: 'neil' }, 'memory_submit', { event: roomed, expected_prior_id: null })).accepted, true)
 
-    // Another reader's wake is byte-for-byte what it was without the ring.
+    // Another reader's wake is byte-for-byte what it was without the ring, even if include_telemetry: true is passed.
     const plain = call(biggy, 'memory_wake', {}, null)
-    const ringed = call(biggy, 'memory_wake', {})
+    const ringed = call(biggy, 'memory_wake', { include_telemetry: true })
     assert.equal(JSON.stringify(ringed), JSON.stringify(plain))
     assert(!('recent_activity' in payload(ringed)) && !('agent_roster' in payload(ringed)))
     call(biggy, 'memory_query', { topic: 'governance', text: 'SECRET-CLAIM-TEXT' })
@@ -746,6 +1076,15 @@ await test('daemon activity ring: only the viewer wake carries it, metadata only
     const logged = diffViewerSnapshots(prev, next, nowSec).filter(e => e.kind.startsWith('activity-'))
     assert.deepEqual(logged.map(e => e.kind), ['activity-wake', 'activity-wake'])
     assert(!logged.some(e => /relay|sync/i.test(e.summary)))
+
+    const renderedHtml = renderViewerHtml(next)
+    assert(renderedHtml.includes('[REPLAY · READ-ONLY]'), '4-act animation logs must be explicitly read-only replay')
+    assert(renderedHtml.includes('SIMULATED PREVIEW'), 'page must label synthetic/fallback clusters, eigenvalues, topic arcs and ghost sources as SIMULATED PREVIEW')
+    assert(renderedHtml.includes('SIMULATED PREVIEW CLUSTER') && renderedHtml.includes('SIMULATED PREVIEW EIGENVALUE') && renderedHtml.includes('SIMULATED PREVIEW TOPIC ARC') && renderedHtml.includes('SIMULATED PREVIEW GHOST'), 'all 4 fallback categories must carry explicit SIMULATED PREVIEW labels')
+    assert(renderedHtml.includes('buildPreviewDreamClusters'), 'replayLastDream must fall back to buildPreviewDreamClusters when store has 0 merkle_sources records')
+    assert(renderedHtml.includes('src.node.isSyntheticGhost || src.node.simulated'), 'Act II only labels synthetic/missing ghosts as SIMULATED GHOST, never resolved historical sources')
+    assert(!renderedHtml.includes('src.node.isSourceGhost || src.simulated'), 'Act II must not treat resolved isSourceGhost historical sources as SIMULATED GHOST')
+    assert(!renderedHtml.includes('92.4%'), '4-act animation must not contain invented coherence uplift fallback')
   } finally {
     await daemon.close()
     rmSync(tmp, { recursive: true, force: true })

@@ -9,6 +9,7 @@
 //   3. An active hive:ops or room claim is either Class A (an `exp` within 30 days, no `retention`
 //      tag) or Class B (`["retention", "decision"]`, no `exp`). hive:canon may omit `exp`.
 
+import { createHash } from 'node:crypto'
 import { verifyEvent } from 'nostr-tools/pure'
 import { credentialIn } from './outbound_secrets.mjs'
 
@@ -164,6 +165,29 @@ export function nip01Newer(candidate, existing) {
   return String(candidate?.id || '') < String(existing?.id || '')
 }
 
+const sha256Hex = str => createHash('sha256').update(String(str), 'utf8').digest('hex')
+
+// Canonical Source Merkle Root (Phase 2, Gate 2): binds a curated/consolidated claim to the exact set of
+// superseded 64-hex event IDs via domain-separated leaf and pairwise node hashes.
+export function computeSourceMerkleRoot(eventIds = []) {
+  const raw = Array.isArray(eventIds) ? eventIds : []
+  const clean = [...new Set(raw.map(x => String(x || '').toLowerCase()).filter(Boolean))].sort()
+  if (!clean.length || clean.some(id => !HEX64.test(id))) return null
+  let level = clean.map(id => sha256Hex(`hive-memory-source-leaf-v1:${id}`))
+  while (level.length > 1) {
+    const next = []
+    for (let i = 0; i < level.length; i += 2) {
+      if (i + 1 < level.length) {
+        next.push(sha256Hex(`hive-memory-source-node-v1:${level[i]}:${level[i + 1]}`))
+      } else {
+        next.push(level[i])
+      }
+    }
+    level = next
+  }
+  return level[0]
+}
+
 // Validates wire structure, scope/route consistency, mandatory fields, retention class, and secret guard.
 export function validateMemoryEvent(ev, {
   memoryGlobalChannelId = '',
@@ -256,6 +280,22 @@ export function validateMemoryEvent(ev, {
     return { ok: false, reason: 'operational and room claims require an exp tag or a retention decision tag' }
   }
 
+  const supersedes = tagValues(ev, 'supersedes')
+  const merkleTags = tagValues(ev, 'merkle_sources')
+  if (merkleTags.length > 1) return { ok: false, reason: 'more than one merkle_sources tag' }
+  let merkleSources = null
+  if (merkleTags.length === 1) {
+    merkleSources = String(merkleTags[0] || '')
+    if (!HEX64.test(merkleSources)) return { ok: false, reason: 'merkle_sources must be a 64-hex sha256 digest' }
+    if (!supersedes.length || supersedes.some(id => !HEX64.test(String(id || '')))) {
+      return { ok: false, reason: 'merkle_sources requires at least one valid 64-hex supersedes event id' }
+    }
+    const expectedRoot = computeSourceMerkleRoot(supersedes)
+    if (expectedRoot !== merkleSources) {
+      return { ok: false, reason: 'merkle_sources does not match supersedes' }
+    }
+  }
+
   const secretHit = checkClaimPayloadSecrets({ claim, because, evidence, tags: ev.tags })
   if (secretHit) return { ok: false, reason: `secret guard blocked payload: ${secretHit}`, secret: secretHit }
 
@@ -279,7 +319,8 @@ export function validateMemoryEvent(ev, {
     asOfEvt: asOfEvt ? String(asOfEvt).toLowerCase() : null,
     expiresAt,
     retention: expiresAt == null ? 'decision' : 'ephemeral',
-    supersedes: tagValues(ev, 'supersedes'),
+    supersedes,
+    merkleSources,
     status,
     claim,
     because,
@@ -314,6 +355,7 @@ export function buildClaimTemplate({
   asOfEvt,
   ttlSec = null,
   supersedes = [],
+  merkleSources = false,
   memoryGlobalChannelId = '',
   kind = MEMORY_KIND,
   nowSec = Math.floor(Date.now() / 1000),
@@ -341,8 +383,16 @@ export function buildClaimTemplate({
   if (asOfGit) tags.push(['as_of_git', String(asOfGit)])
   if (asOfEvt) tags.push(['as_of_evt', String(asOfEvt).toLowerCase()])
   tags.push(effectiveTtl === 0 ? ['retention', DECISION_RETENTION] : ['exp', String(createdAt + effectiveTtl)])
-  for (const sup of Array.isArray(supersedes) ? supersedes : []) {
-    if (sup) tags.push(['supersedes', String(sup)])
+  const cleanSupersedes = (Array.isArray(supersedes) ? supersedes : []).map(s => String(s || '').trim()).filter(Boolean)
+  for (const sup of cleanSupersedes) {
+    tags.push(['supersedes', sup])
+  }
+  if (merkleSources === true) {
+    const root = computeSourceMerkleRoot(cleanSupersedes)
+    if (!root) throw new Error('merkleSources requires at least one valid 64-hex supersedes event id')
+    tags.push(['merkle_sources', root])
+  } else if (typeof merkleSources === 'string' && merkleSources) {
+    tags.push(['merkle_sources', merkleSources])
   }
 
   const contentObj = {
