@@ -10,7 +10,7 @@ import { join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { sshChannelEntry } from '../mcp/tools/channel_client.mjs'
 import { fakeHerdr } from './fake-herdr.mjs'
-import { CODEX_CHANNEL_TOOLS, channelProcessUp, classifyPane, claudeArgs, codexConfigToml, codexTurnText, defaultInstructions, ensureInstructions, hasPriorSession, instructionsUpdate, MEMORY_FAILURE_RULE_MARKER, MEMORY_RULE_MARKER, mcpConfig, RECALL_RULE_MARKER, TURN_RULE_MARKER, pendingEnvelopes, seedClaudeJson, seedSettings, serverName } from '../mcp/tools/harness_session.mjs'
+import { CODEX_CHANNEL_TOOLS, channelProcessUp, classifyPane, claudeArgs, codexConfigToml, codexTurnText, defaultInstructions, ensureInstructions, hasPriorSession, instructionsUpdate, MEMORY_FAILURE_RULE_MARKER, memoryFailureRule, MEMORY_RULE_MARKER, mcpConfig, RECALL_RULE_MARKER, TURN_RULE_MARKER, pendingEnvelopes, seedClaudeJson, seedSettings, serverName } from '../mcp/tools/harness_session.mjs'
 
 let fails = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); if (!value) fails++ }
@@ -150,6 +150,7 @@ ok('the rule never asks the agent to read memory it has no tool for', !/memory_q
     /post in #waggle-test straight away/.test(after))
   ok('a reader without saving still gets the failure rule', instructionsUpdate(null, { ...recaller, mayRemember: undefined }).includes(MEMORY_FAILURE_RULE_MARKER))
   ok('a writer gets the failure rule', created.includes(MEMORY_FAILURE_RULE_MARKER))
+  ok('the failure rule mentions Neil by his exact Buzz display name', memoryFailureRule({ mayRemember: true }).includes('mention @Neil:') && !memoryFailureRule({ mayRemember: true }).includes('@neil'))
   ok('an agent without memory gets no failure rule', !instructionsUpdate(null, { id: 'x', buzz: {} }).includes(MEMORY_FAILURE_RULE_MARKER))
 }
 {
