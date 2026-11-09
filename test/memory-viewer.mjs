@@ -1212,5 +1212,115 @@ await test('pollOnce coalesces concurrent polls and reuses cached corpus on unch
   }
 })
 
+await test('Entity-Link Constellation Graph & Above/Below-the-Line Topic Pages in state and Markdown endpoints', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'viewer-topics-'))
+  const dbPath = join(tmp, 'memory.sqlite')
+  const ledgerPath = join(tmp, 'accepted-ledger.jsonl')
+  const receiptPath = join(tmp, 'last-verified-backup.json')
+  const socketDir = join(tmp, 'sockets')
+  const ownerSk = generateSecretKey()
+  const ownerPk = getPublicKey(ownerSk)
+  const viewerSk = generateSecretKey()
+  const viewerPk = getPublicKey(viewerSk)
+  const room = 'a8186b53-537d-46ad-a7e7-b6486c58970e'
+  const nowSec = Math.floor(Date.now() / 1000)
+  initEmptyStore({ dbPath, ledgerPath })
+  recordVerifiedBackup({ receiptPath, snapshotId: SNAP_ID, writeSeq: 1, at: nowSec })
+  const daemon = await startMemoryDaemon({
+    dbPath,
+    ledgerPath,
+    receiptPath,
+    config: {
+      memoryGlobalChannelId: room,
+      ownerPubkey: ownerPk,
+      maxUnbackedSec: 3600,
+      globalWriters: [ownerPk],
+      canonWriters: [ownerPk],
+      readers: { viewer: viewerPk },
+      writers: { james: { pubkey: ownerPk, perHour: 30 } },
+      rooms: { [room]: { members: [ownerPk, viewerPk], writers: [ownerPk] } },
+    },
+    readers: 'viewer',
+    writers: 'james',
+    socketDir,
+    log: () => {},
+  })
+
+  const signClaim = (scope, slug, opts = {}) =>
+    finalizeEvent(
+      buildClaimTemplate({
+        pubkey: ownerPk,
+        scope,
+        slug,
+        memoryGlobalChannelId: room,
+        topic: opts.topic || 'hive-memory',
+        claim: opts.claim,
+        because: opts.because || 'viewer topic page test',
+        evidence: opts.evidence || ['nvoy@e2cd9ebe:mcp/tools/memory-viewer.mjs'],
+        asOfGit: opts.asOfGit || 'e2cd9ebea92579c98cda558d003270941ba50d97',
+        ttlSec: opts.ttlSec ?? 86400 * 14,
+        nowSec: opts.createdAt || nowSec,
+      }),
+      ownerSk
+    )
+
+  const canonEv = signClaim('hive:canon', 'viewer-canon-rule', {
+    ttlSec: 0,
+    claim: 'All changes to mcp/tools/memory-viewer.mjs in PR #351 require @mydude approval.',
+    createdAt: nowSec - 30,
+  })
+  const decisionEv = signClaim(`room:${room}`, 'viewer-hybrid-decision', {
+    ttlSec: 0,
+    claim: 'Shipped Hybrid BM25+Vector RRF and claim_edges in PR #351 with @biggy and @mydude.',
+    createdAt: nowSec - 20,
+  })
+  const statusEv = signClaim(`room:${room}`, 'viewer-pr351-status', {
+    ttlSec: 86400 * 14,
+    claim: 'Opened PR #351 for mcp/tools/memory-viewer.mjs review by @mydude.',
+    createdAt: nowSec - 10,
+  })
+  daemon.store.submit({ writer: 'james', event: canonEv, expectedPriorId: null, nowSec: nowSec - 30 })
+  daemon.store.submit({ writer: 'james', event: decisionEv, expectedPriorId: null, nowSec: nowSec - 20 })
+  daemon.store.submit({ writer: 'james', event: statusEv, expectedPriorId: null, nowSec: nowSec - 10 })
+
+  let viewer = null
+  try {
+    viewer = await startMemoryViewer({
+      socketPath: join(socketDir, 'viewer.sock'),
+      host: '127.0.0.1',
+      port: 0,
+      pollMs: 60000,
+    })
+    const st = viewer.getState()
+    assert(Array.isArray(st.constellation_links) && st.constellation_links.length >= 2, 'constellation_links should link claims sharing PR #351 and memory-viewer.mjs')
+    assert(st.constellation_links.some(l => l.shared_entities.includes('pr:351')), 'constellation link should include pr:351')
+    assert(st.topic_pages && st.topic_pages['hive-memory'], 'topic_pages should include hive-memory')
+    assert.equal(st.topic_pages['hive-memory'].counts.above_the_line, 2, 'Canon + Class B decision should be Above the Line')
+    assert.equal(st.topic_pages['hive-memory'].counts.below_the_line, 1, 'Class A status claim should be Below the Line')
+
+    const idxRes = await httpGet(viewer.port, '/topics/index.md')
+    assert.equal(idxRes.status, 200)
+    assert.match(String(idxRes.headers['content-type'] || ''), /^text\/markdown/)
+    assert(idxRes.body.includes('#hive-memory'))
+
+    const pageRes = await httpGet(viewer.port, '/topics/hive-memory.md')
+    assert.equal(pageRes.status, 200)
+    assert.match(String(pageRes.headers['content-type'] || ''), /^text\/markdown/)
+    assert(pageRes.body.includes('## Above the Line — Compiled Truth'))
+    assert(pageRes.body.includes('## Below the Line — Active Class A Evidence Timeline & Lineage'))
+    assert(pageRes.body.includes('viewer-hybrid-decision'))
+    assert(pageRes.body.includes('viewer-pr351-status'))
+
+    const htmlRes = await httpGet(viewer.port, '/')
+    assert.equal(htmlRes.status, 200)
+    assert(htmlRes.body.includes('Topic Page · Above / Below the Line'))
+    assert(htmlRes.body.includes('Constellation Entity-Link Mesh'))
+  } finally {
+    if (viewer) await viewer.stop()
+    await daemon.close()
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
 console.log(`\nResults: ${passed} passed, ${failed} failed`)
 process.exit(failed > 0 ? 1 : 0)

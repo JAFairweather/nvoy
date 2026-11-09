@@ -10,7 +10,7 @@
 import { DatabaseSync, backup as sqliteBackup } from 'node:sqlite'
 import { createHash, randomUUID } from 'node:crypto'
 import {
-  closeSync, copyFileSync, existsSync, fsyncSync, ftruncateSync, linkSync, lstatSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, writeSync,
+  closeSync, copyFileSync, existsSync, fsyncSync, ftruncateSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, writeSync,
 } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { verifyEvent } from 'nostr-tools/pure'
@@ -71,6 +71,23 @@ CREATE TABLE IF NOT EXISTS links (
   PRIMARY KEY (from_id, relation, target)
 );
 CREATE INDEX IF NOT EXISTS idx_links_target ON links(relation, target);
+CREATE TABLE IF NOT EXISTS claim_edges (
+  from_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+  edge_type TEXT NOT NULL,
+  target_ref TEXT NOT NULL,
+  weight REAL NOT NULL DEFAULT 1.0,
+  PRIMARY KEY (from_id, edge_type, target_ref)
+);
+CREATE INDEX IF NOT EXISTS idx_claim_edges_target ON claim_edges(edge_type, target_ref);
+CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
+  event_id UNINDEXED,
+  d,
+  topic,
+  claim,
+  because,
+  evidence,
+  tokenize='porter unicode61'
+);
 CREATE TABLE IF NOT EXISTS writer_rate_log (
   event_id TEXT PRIMARY KEY,
   pubkey TEXT NOT NULL,
@@ -373,6 +390,281 @@ export function checkEvent(event, config) {
   return { ...v, ev, raw }
 }
 
+// --- Hybrid Retrieval (BM25 + Local Semantic Vector RRF) & First-Class Entity-Link Graph ---
+
+export const SEMANTIC_CONCEPT_CLUSTERS = [
+  ['viewer', 'visualizer', 'visualization', 'observatory', 'cortex', 'canvas', 'hud', 'ui', 'dashboard', 'graph', 'inspector', '8795', 'display', 'render', '3d', '2d', 'webgl'],
+  ['curator', 'curation', 'curate', 'dream', 'dreaming', 'consolidate', 'consolidation', 'consolidated', 'merkle', 'compaction', 'distill', 'distillation', 'fold', 'folded', 'synthesis', 'eigen', 'eigenvector', 'sleep'],
+  ['canon', 'canonical', 'standing', 'rule', 'rules', 'directive', 'constitution', 'rank2', 'permanent', 'decision', 'decisions', 'classb'],
+  ['ephemeral', 'status', 'checkpoint', 'checkpoints', 'workflow', 'wip', 'handoff', 'owner', 'classa', 'ttl', 'expire', 'expired', 'expiry'],
+  ['auth', 'acl', 'permission', 'permissions', 'grant', 'revoke', 'seat', 'seats', 'writer', 'writers', 'reader', 'readers', 'socket', 'pubkey', 'signature', 'nostr', 'nip01', 'quarantine'],
+  ['backup', 'restore', 'snapshot', 'restic', 'b2', 'receipt', 'fence', 'fenced', 'unbacked', 'ledger', 'purge', 'purged', 'retention'],
+  ['quota', 'rate', 'limit', 'limited', 'hourly', 'cap', 'throttle', 'gauge', 'usage'],
+  ['search', 'query', 'queries', 'retrieve', 'retrieval', 'recall', 'wake', 'digest', 'hybrid', 'bm25', 'fts', 'fts5', 'vector', 'embedding', 'rrf', 'semantic', 'lexical'],
+  ['deploy', 'deployed', 'deployment', 'bootstrap', 'systemd', 'service', 'unit', 'live', 'production', 'herd', 'cloud'],
+  ['test', 'tests', 'testing', 'ci', 'check', 'checks', 'verify', 'verified', 'verification', 'benchmark', 'pass', 'passed', 'fail', 'failed'],
+  ['coherence', 'efficacy', 'drift', 'blind', 'silo', 'siloed', 'convergence', 'coupling', 'alignment', 'grounding', 'telemetry', 'metric', 'metrics', 'score'],
+  ['link', 'links', 'linked', 'edge', 'edges', 'constellation', 'mesh', 'lineage', 'supersede', 'supersedes', 'superseded', 'chain', 'hop', 'hops', 'entity', 'entities'],
+  ['topic', 'topics', 'page', 'pages', 'markdown', 'mirror', 'wiki', 'compiled', 'truth', 'timeline', 'above', 'below'],
+  ['bug', 'fix', 'fixed', 'fixes', 'error', 'failure', 'broken', 'busted', 'crash', 'incident', 'refused', 'timeout', 'wrap', 'wrapping', 'header'],
+]
+
+export function stemToken(word) {
+  let w = String(word || '').toLowerCase().trim()
+  if (w.length <= 3) return w
+  if (w.endsWith('izations')) w = w.slice(0, -8) + 'ize'
+  else if (w.endsWith('ization')) w = w.slice(0, -7) + 'ize'
+  else if (w.endsWith('isers') || w.endsWith('izers')) w = w.slice(0, -5)
+  else if (w.endsWith('iser') || w.endsWith('izer')) w = w.slice(0, -4)
+  else if (w.endsWith('ating')) w = w.slice(0, -5) + 'at'
+  else if (w.endsWith('ation')) w = w.slice(0, -5) + 'at'
+  else if (w.endsWith('ness')) w = w.slice(0, -4)
+  else if (w.endsWith('ment')) w = w.slice(0, -4)
+  else if (w.endsWith('ings') && w.length > 5) w = w.slice(0, -4)
+  else if (w.endsWith('ing') && w.length > 4) w = w.slice(0, -3)
+  else if (w.endsWith('ies') && w.length > 4) w = w.slice(0, -3) + 'y'
+  else if (w.endsWith('ers') && w.length > 4) w = w.slice(0, -3)
+  else if (w.endsWith('er') && w.length > 4) w = w.slice(0, -2)
+  else if (w.endsWith('ed') && w.length > 4) w = w.slice(0, -2)
+  else if (w.endsWith('es') && w.length > 4) w = w.slice(0, -2)
+  else if (w.endsWith('s') && !w.endsWith('ss') && w.length > 3) w = w.slice(0, -1)
+  return w
+}
+
+const TERM_TO_CLUSTERS = new Map()
+for (let cIdx = 0; cIdx < SEMANTIC_CONCEPT_CLUSTERS.length; cIdx++) {
+  for (const rawWord of SEMANTIC_CONCEPT_CLUSTERS[cIdx]) {
+    for (const k of [rawWord, stemToken(rawWord)]) {
+      let set = TERM_TO_CLUSTERS.get(k)
+      if (!set) { set = new Set(); TERM_TO_CLUSTERS.set(k, set) }
+      set.add(cIdx)
+    }
+  }
+}
+
+const STOP_WORDS = new Set(['the', 'and', 'for', 'with', 'that', 'this', 'from', 'are', 'was', 'were', 'has', 'have', 'had', 'not', 'but', 'into', 'when', 'where', 'what', 'who', 'why', 'how', 'can', 'will', 'all', 'any', 'its', 'our'])
+
+export function tokenizeForSearch(text) {
+  return String(text || '')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(t => t.length >= 2 && !STOP_WORDS.has(t))
+}
+
+function fnv1a32(str) {
+  let h = 0x811c9dc5
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  return h >>> 0
+}
+
+const EMBED_DIM = 64
+const CONCEPT_DIMS = 16
+const HASH_DIMS = EMBED_DIM - CONCEPT_DIMS
+
+export function computeSemanticEmbedding(text) {
+  const vec = new Float32Array(EMBED_DIM)
+  const tokens = tokenizeForSearch(text)
+  const stems = tokens.map(stemToken)
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i]
+    const st = stems[i]
+    const clusters = new Set([...(TERM_TO_CLUSTERS.get(tok) || []), ...(TERM_TO_CLUSTERS.get(st) || [])])
+    for (const cIdx of clusters) {
+      if (cIdx < CONCEPT_DIMS) vec[cIdx] = Math.min(4.5, vec[cIdx] + 1.5)
+    }
+    const h = fnv1a32(st)
+    const dim = CONCEPT_DIMS + (h % HASH_DIMS)
+    const sign = (h & 0x10000) ? 1 : -1
+    vec[dim] += sign * 1.0
+    if (i + 1 < stems.length) {
+      const bg = fnv1a32(`${st}_${stems[i + 1]}`)
+      const bDim = CONCEPT_DIMS + (bg % HASH_DIMS)
+      const bSign = (bg & 0x10000) ? 1 : -1
+      vec[bDim] += bSign * 0.6
+    }
+  }
+  let normSq = 0
+  for (let i = 0; i < EMBED_DIM; i++) normSq += vec[i] * vec[i]
+  if (normSq > 0) {
+    const inv = 1 / Math.sqrt(normSq)
+    for (let i = 0; i < EMBED_DIM; i++) vec[i] *= inv
+  }
+  return vec
+}
+
+export function cosineSimilarity(a, b) {
+  if (!a || !b || a.length !== b.length) return 0
+  let dot = 0
+  for (let i = 0; i < a.length; i++) dot += a[i] * b[i]
+  return dot
+}
+
+export function buildFtsMatchExpression(qText) {
+  const tokens = tokenizeForSearch(qText)
+  if (!tokens.length) return null
+  const terms = new Set()
+  for (const tok of tokens) {
+    if (/^[a-z0-9]+$/.test(tok)) terms.add(tok)
+    const st = stemToken(tok)
+    if (/^[a-z0-9]+$/.test(st) && st.length >= 3) terms.add(st)
+    const clusters = new Set([...(TERM_TO_CLUSTERS.get(tok) || []), ...(TERM_TO_CLUSTERS.get(st) || [])])
+    for (const cIdx of clusters) {
+      for (const syn of SEMANTIC_CONCEPT_CLUSTERS[cIdx].slice(0, 6)) {
+        if (/^[a-z0-9]+$/.test(syn)) terms.add(syn)
+      }
+    }
+  }
+  if (!terms.size) return null
+  return [...terms].slice(0, 24).map(t => `"${t}"`).join(' OR ')
+}
+
+const SLUG_STEP_SUFFIX_RE = /-(?:owner|status|review|reviewed|approved|approval|deployed|deploy|merged|merge|hold|live|fix|fixes|fixed|verified|verify|wip|handoff|ready|done|receipt|v\d+)(?:-[a-z0-9]+)*$/i
+const REPO_PR_RE = /\b(nvoy|herd-infra|waggle|buzz|illustrated-primer|rabidrabbit|nave\.pub|nave-pub)[-\s#]*(?:(?:pr|pull)[-\s#:/]*)?#?(\d{1,5})\b/gi
+const GENERIC_PR_RE = /\b(?:pr|pull(?:\s+request)?|pulls)[-\s#:/]+(\d{1,5})\b/gi
+const SLUG_PR_RE = /(?:^|-)pr-?(\d{2,5})(?:-|$)/gi
+const ISSUE_RE = /\b(?:issue|epic|waggle)[-\s#]+(\d{2,5})\b|#(\d{2,5})\b/gi
+const COMMIT_REF_RE = /\b(?:[a-z0-9._-]+@)?([0-9a-f]{7,40})\b/gi
+const FILE_PATH_RE = /(?:^|[\s:(\[`'"@])((?:\/?(?:mcp|bin|test|src|docs|PLANS|systemd|etc|opt|run)\/[a-zA-Z0-9._/-]+)|(?:[a-zA-Z0-9_-]+\.(?:mjs|js|ts|json|md|sh|py|sql|service|yml|yaml)))\b/g
+const AGENT_MENTION_RE = /@(?:(my\s+dude|dead\s+rabbit)|([a-z0-9][a-z0-9_-]{1,24}))\b/gi
+
+// Deterministically extracts typed entity links from a claim record at write/index time.
+export function extractClaimEdges({
+  d = '',
+  topic = '',
+  asOfGit = null,
+  asOfEvt = null,
+  supersedes = [],
+  claim = '',
+  because = '',
+  evidence = [],
+} = {}) {
+  const edges = new Map()
+  const addEdge = (edgeType, targetRef, weight = 1.0) => {
+    const cleanRef = String(targetRef || '').trim()
+    if (!cleanRef) return
+    const key = `${edgeType}\0${cleanRef}`
+    const prev = edges.get(key)
+    if (!prev || weight > prev.weight) {
+      edges.set(key, { edge_type: edgeType, target_ref: cleanRef, weight })
+    }
+  }
+
+  for (const sup of Array.isArray(supersedes) ? supersedes : []) {
+    if (typeof sup === 'string' && sup.trim()) addEdge('supersedes', sup.trim().toLowerCase(), 1.0)
+  }
+  if (asOfEvt && typeof asOfEvt === 'string' && asOfEvt.trim()) {
+    addEdge('event', asOfEvt.trim().toLowerCase(), 0.95)
+  }
+  const evList = Array.isArray(evidence) ? evidence.map(e => String(e || '')) : []
+  for (const evStr of evList) {
+    if (HEX64.test(evStr.trim())) addEdge('event', evStr.trim().toLowerCase(), 0.9)
+  }
+
+  const slug = String(d || '').split(':').pop() || ''
+  if (slug) {
+    const stem = slug
+      .toLowerCase()
+      .replace(SLUG_STEP_SUFFIX_RE, '')
+      .replace(/^(?:curated|decision)-/, '')
+    if (stem && stem.length >= 4 && stem !== topic) {
+      addEdge('subject', `subject:${stem}`, 0.8)
+    }
+  }
+
+  const textBlob = [d, claim, because, ...evList].join(' ')
+  const seenPrNums = new Set()
+
+  REPO_PR_RE.lastIndex = 0
+  let m
+  while ((m = REPO_PR_RE.exec(textBlob)) !== null) {
+    const repo = m[1].toLowerCase().replace('nave.pub', 'nave-pub').replace('rabidrabbit', 'illustrated-primer')
+    const num = m[2]
+    seenPrNums.add(num)
+    addEdge('pr', `pr:${repo}#${num}`, 1.0)
+    addEdge('pr', `pr:${num}`, 0.95)
+  }
+
+  GENERIC_PR_RE.lastIndex = 0
+  while ((m = GENERIC_PR_RE.exec(textBlob)) !== null) {
+    const num = m[1]
+    seenPrNums.add(num)
+    addEdge('pr', `pr:${num}`, 0.95)
+  }
+
+  SLUG_PR_RE.lastIndex = 0
+  while ((m = SLUG_PR_RE.exec(slug)) !== null) {
+    const num = m[1]
+    seenPrNums.add(num)
+    addEdge('pr', `pr:${num}`, 0.95)
+  }
+
+  ISSUE_RE.lastIndex = 0
+  while ((m = ISSUE_RE.exec(textBlob)) !== null) {
+    const num = m[1] || m[2]
+    if (num && !seenPrNums.has(num)) {
+      addEdge('issue', `issue:${num}`, 0.85)
+    }
+  }
+
+  if (asOfGit && typeof asOfGit === 'string') {
+    const gitMatch = asOfGit.match(/([0-9a-f]{7,40})/i)
+    if (gitMatch) {
+      addEdge('commit', `commit:${gitMatch[1].slice(0, 7).toLowerCase()}`, 0.92)
+    }
+  }
+
+  COMMIT_REF_RE.lastIndex = 0
+  while ((m = COMMIT_REF_RE.exec(textBlob)) !== null) {
+    const fullMatch = m[0]
+    const hexPart = m[1].toLowerCase()
+    if (hexPart.length === 64) continue
+    const hasAtPrefix = fullMatch.includes('@')
+    const hasLettersAndDigits = /[a-f]/.test(hexPart) && /[0-9]/.test(hexPart)
+    if ((hasAtPrefix || (hasLettersAndDigits && (hexPart.length === 7 || hexPart.length === 8 || hexPart.length === 40))) && !UUID.test(fullMatch)) {
+      addEdge('commit', `commit:${hexPart.slice(0, 7)}`, 0.88)
+    }
+  }
+
+  FILE_PATH_RE.lastIndex = 0
+  while ((m = FILE_PATH_RE.exec(textBlob)) !== null) {
+    const rawPath = m[1].replace(/^[./]+/, '').replace(/[.,;:)\]`'"]+$/, '')
+    if (rawPath && rawPath.length >= 4 && !rawPath.startsWith('http')) {
+      addEdge('file', `file:${rawPath}`, 0.88)
+    }
+  }
+
+  const mentionBlob = `${claim} ${because}`
+  AGENT_MENTION_RE.lastIndex = 0
+  while ((m = AGENT_MENTION_RE.exec(mentionBlob)) !== null) {
+    const rawAgent = (m[1] || m[2] || '').toLowerCase().replace(/\s+/g, '-')
+    const normAgent = rawAgent === 'my-dude' ? 'mydude' : rawAgent
+    if (normAgent && normAgent.length >= 2) {
+      addEdge('agent', `agent:${normAgent}`, 0.75)
+    }
+  }
+
+  return [...edges.values()]
+}
+
+function indexDerivedEvent(db, { id, d, topic, asOfGit, asOfEvt, supersedes = [], claim = '', because = '', evidence = [] }) {
+  const normTopic = normalizeMemoryTopic(topic) ?? (topic || '')
+  const evArr = Array.isArray(evidence) ? evidence : []
+  db.prepare('DELETE FROM events_fts WHERE event_id = ?').run(id)
+  db.prepare('INSERT INTO events_fts (event_id, d, topic, claim, because, evidence) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(id, String(d || ''), String(normTopic), String(claim || ''), String(because || ''), evArr.join(' '))
+
+  const extracted = extractClaimEdges({ d, topic: normTopic, asOfGit, asOfEvt, supersedes, claim, because, evidence: evArr })
+  const edgeStmt = db.prepare('INSERT OR REPLACE INTO claim_edges (from_id, edge_type, target_ref, weight) VALUES (?, ?, ?, ?)')
+  const linkStmt = db.prepare('INSERT OR IGNORE INTO links (from_id, relation, target) VALUES (?, ?, ?)')
+  for (const edge of extracted) {
+    edgeStmt.run(id, edge.edge_type, edge.target_ref, edge.weight)
+    linkStmt.run(id, edge.edge_type, edge.target_ref)
+  }
+}
+
 // Topics are stored normalized so the topic index groups aliases; the signed tag keeps what the writer sent.
 function insertEvent(db, { ev, raw, ...v }, isCurrent, nowSec) {
   v.topic = normalizeMemoryTopic(v.topic) ?? v.topic
@@ -386,6 +678,19 @@ function insertEvent(db, { ev, raw, ...v }, isCurrent, nowSec) {
   for (const e of v.evidence) link.run(ev.id, 'evidence', e)
   if (v.asOfEvt) link.run(ev.id, 'as_of', v.asOfEvt)
   if (v.asOfGit) link.run(ev.id, 'as_of', v.asOfGit)
+  let body = {}
+  try { body = JSON.parse(ev.content) } catch { body = {} }
+  indexDerivedEvent(db, {
+    id: ev.id,
+    d: v.d,
+    topic: v.topic,
+    asOfGit: v.asOfGit,
+    asOfEvt: v.asOfEvt,
+    supersedes: v.supersedes,
+    claim: body.claim || '',
+    because: body.because || '',
+    evidence: v.evidence,
+  })
 }
 
 function dbFileState(dbPath) {
@@ -744,6 +1049,7 @@ export class HiveMemoryStore {
     const staged = inTransaction(db, () => {
       const list = JSON.stringify(ids)
       db.prepare('DELETE FROM events WHERE id IN (SELECT value FROM json_each(?))').run(list)
+      try { db.prepare('DELETE FROM events_fts WHERE event_id IN (SELECT value FROM json_each(?))').run(list) } catch { /* fts table may not exist yet */ }
       db.prepare('DELETE FROM writer_rate_log WHERE event_id IN (SELECT value FROM json_each(?)) OR accepted_at < ?').run(list, nowSec - 86400)
       const last = db.prepare('SELECT id FROM events ORDER BY ingested_at DESC, rowid DESC LIMIT 1').get()?.id ?? null
       const staged = this.#stage(readMeta(db), 'purge', { purged_ids: [...ids].sort(), reason }, nowSec, last)
@@ -809,8 +1115,71 @@ export class HiveMemoryStore {
   }
 
   #targetHidden(readerPubkey, target) {
-    const row = HEX64.test(target) ? this.db.prepare('SELECT pubkey, scope_type, room_id FROM events WHERE id = ?').get(target) : null
+    const raw = String(target ?? '').replace(/^(?:event|supersedes):/i, '')
+    const row = HEX64.test(raw) ? this.db.prepare('SELECT pubkey, scope_type, room_id FROM events WHERE id = ?').get(raw) : null
     return row ? !canRead(readerPubkey, row, this.config) : false
+  }
+
+  // Ensures `events_fts` and `claim_edges` exist and backfills any rows inserted into `events` directly
+  // (e.g. pre-upgrade snapshots or raw SQLite fixtures). Lazy so startup/reconcile have zero overhead.
+  #ensureDerivedTables() {
+    if (!this.db) return
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS claim_edges (
+        from_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+        edge_type TEXT NOT NULL,
+        target_ref TEXT NOT NULL,
+        weight REAL NOT NULL DEFAULT 1.0,
+        PRIMARY KEY (from_id, edge_type, target_ref)
+      );
+      CREATE INDEX IF NOT EXISTS idx_claim_edges_target ON claim_edges(edge_type, target_ref);
+      CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
+        event_id UNINDEXED,
+        d,
+        topic,
+        claim,
+        because,
+        evidence,
+        tokenize='porter unicode61'
+      );
+    `)
+    const totalEvents = this.db.prepare('SELECT count(*) AS n FROM events').get().n
+    const indexedFts = this.db.prepare('SELECT count(*) AS n FROM events_fts').get().n
+    if (indexedFts >= totalEvents) return
+    const missingRows = this.db.prepare(`
+      SELECT id, d, topic, as_of_git, as_of_evt, raw_json
+      FROM events
+      WHERE id NOT IN (SELECT event_id FROM events_fts)
+    `).all()
+    if (!missingRows.length) return
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      for (const r of missingRows) {
+        let ev = {}
+        let body = {}
+        try {
+          ev = JSON.parse(r.raw_json)
+          body = JSON.parse(ev.content)
+        } catch { /* ignore malformed raw_json */ }
+        const tags = Array.isArray(ev.tags) ? ev.tags : []
+        const supersedes = tags.filter(t => Array.isArray(t) && t[0] === 'supersedes' && typeof t[1] === 'string').map(t => t[1])
+        indexDerivedEvent(this.db, {
+          id: r.id,
+          d: r.d,
+          topic: r.topic,
+          asOfGit: r.as_of_git,
+          asOfEvt: r.as_of_evt,
+          supersedes,
+          claim: body.claim || '',
+          because: body.because || '',
+          evidence: Array.isArray(body.evidence) ? body.evidence : [],
+        })
+      }
+      this.db.exec('COMMIT')
+    } catch (err) {
+      try { this.db.exec('ROLLBACK') } catch { /* ignore */ }
+      throw err
+    }
   }
 
   // Event ids reached from `start` along supersedes edges, at most MAX_LINK_HOPS hops, both ends readable.
@@ -935,8 +1304,12 @@ export class HiveMemoryStore {
     if (since != null) add('created_at >= ?', Number(since))
     if (until != null) add('created_at <= ?', Number(until))
     if (linkedTo) {
-      if (this.#targetHidden(readerPubkey, String(linkedTo))) return empty('none', null)
-      add('id IN (SELECT from_id FROM links WHERE target = ?)', String(linkedTo))
+      const targetStr = String(linkedTo)
+      if (this.#targetHidden(readerPubkey, targetStr)) return empty('none', null)
+      this.#ensureDerivedTables()
+      const normTarget = targetStr.toLowerCase()
+      where.push("id IN (SELECT from_id FROM links WHERE target = ? UNION SELECT from_id FROM claim_edges WHERE target_ref = ? OR (edge_type || ':' || target_ref) = ?)")
+      params.push(targetStr, normTarget, normTarget)
     }
     if (supersedesOf) add('id IN (SELECT value FROM json_each(?))', JSON.stringify([...this.#lineage(readerPubkey, String(supersedesOf))]))
     const wantTopic = topic ? normalizeMemoryTopic(topic) ?? String(topic) : null
@@ -953,11 +1326,110 @@ export class HiveMemoryStore {
       byFactKey.get(row.d).add(body.claim)
     }
     const conflict = dk => (byFactKey.get(dk)?.size || 0) > 1
-    const qText = text ? String(text).toLowerCase() : null
-    const matched = rows.filter(({ row, body }) => !qText ||
-      `${row.d} ${row.topic} ${body.claim} ${body.because} ${(body.evidence || []).join(' ')}`.toLowerCase().includes(qText))
-    matched.sort((a, b) => (conflict(b.row.d) - conflict(a.row.d)) || ((a.verdict.computedRank ?? 9) - (b.verdict.computedRank ?? 9)) ||
-      (b.row.created_at - a.row.created_at) || (a.row.id < b.row.id ? -1 : 1))
+    const qText = text ? String(text).trim().toLowerCase() : null
+    let matched
+    if (!qText) {
+      matched = [...rows]
+      matched.sort((a, b) => (conflict(b.row.d) - conflict(a.row.d)) || ((a.verdict.computedRank ?? 9) - (b.verdict.computedRank ?? 9)) ||
+        (b.row.created_at - a.row.created_at) || (a.row.id < b.row.id ? -1 : 1))
+    } else {
+      // Hybrid Retrieval: Lexical Substring/Token + SQLite FTS5 BM25 + Local Semantic Vector Cosine fused via RRF (k=60).
+      this.#ensureDerivedTables()
+      const qTokens = tokenizeForSearch(qText)
+      const qStems = qTokens.map(stemToken)
+      const qClusters = new Set()
+      for (let i = 0; i < qTokens.length; i++) {
+        for (const cIdx of TERM_TO_CLUSTERS.get(qTokens[i]) || []) qClusters.add(cIdx)
+        for (const cIdx of TERM_TO_CLUSTERS.get(qStems[i]) || []) qClusters.add(cIdx)
+      }
+      const qVec = computeSemanticEmbedding(qText)
+
+      const bm25RankById = new Map()
+      const ftsExpr = buildFtsMatchExpression(qText)
+      if (ftsExpr) {
+        try {
+          const ftsRows = this.db.prepare(
+            'SELECT event_id, bm25(events_fts, 0.0, 3.0, 2.5, 2.0, 1.0, 1.5) AS score FROM events_fts WHERE events_fts MATCH ? ORDER BY score ASC LIMIT 500'
+          ).all(ftsExpr)
+          for (let idx = 0; idx < ftsRows.length; idx++) {
+            if (!bm25RankById.has(ftsRows[idx].event_id)) bm25RankById.set(ftsRows[idx].event_id, idx + 1)
+          }
+        } catch { /* fallback to lexical + vector if FTS expression cannot be parsed */ }
+      }
+
+      const lexCandidates = []
+      const vecCandidates = []
+      const candidateMeta = new Map()
+
+      for (const item of rows) {
+        const { row, body } = item
+        const docText = `${row.d} ${row.topic || ''} ${body.claim || ''} ${body.because || ''} ${(body.evidence || []).join(' ')}`.toLowerCase()
+        const exactHit = docText.includes(qText)
+        let lexScore = 0
+        let matchedStems = 0
+        let sharedConcept = false
+
+        const docTokens = tokenizeForSearch(docText)
+        const docStemSet = new Set(docTokens.map(stemToken))
+        for (let i = 0; i < qTokens.length; i++) {
+          if (docText.includes(qTokens[i]) || (qStems[i].length >= 3 && docStemSet.has(qStems[i]))) {
+            matchedStems += 1
+          }
+        }
+        if (qClusters.size > 0) {
+          for (const dt of docStemSet) {
+            const cls = TERM_TO_CLUSTERS.get(dt)
+            if (cls && [...cls].some(c => qClusters.has(c))) { sharedConcept = true; break }
+          }
+        }
+
+        if (exactHit) {
+          lexScore = 1000 + (String(row.topic || '').toLowerCase().includes(qText) ? 200 : 0) + (String(row.d || '').toLowerCase().includes(qText) ? 100 : 0)
+        } else if (qTokens.length > 0 && matchedStems === qTokens.length) {
+          lexScore = 500 + matchedStems * 25
+        } else if (qTokens.length >= 2 && matchedStems / qTokens.length >= 0.5) {
+          lexScore = 200 * (matchedStems / qTokens.length)
+        }
+
+        if (lexScore > 0) lexCandidates.push({ id: row.id, score: lexScore })
+
+        const dVec = computeSemanticEmbedding(docText)
+        const cos = cosineSimilarity(qVec, dVec)
+        if ((exactHit || matchedStems > 0 || sharedConcept) && cos >= 0.25) {
+          vecCandidates.push({ id: row.id, cos })
+        }
+        candidateMeta.set(row.id, { item, exactHit, lexScore, cos })
+      }
+
+      lexCandidates.sort((a, b) => b.score - a.score)
+      vecCandidates.sort((a, b) => b.cos - a.cos)
+      const lexRankById = new Map(lexCandidates.map((x, idx) => [x.id, idx + 1]))
+      const vecRankById = new Map(vecCandidates.map((x, idx) => [x.id, idx + 1]))
+
+      const RRF_K = 60
+      const scored = []
+      for (const [id, meta] of candidateMeta.entries()) {
+        const rLex = lexRankById.get(id)
+        const rBm25 = bm25RankById.get(id)
+        const rVec = vecRankById.get(id)
+        if (!meta.exactHit && !rLex && !rBm25 && !rVec) continue
+        const rrfScore =
+          (rLex ? 1.5 / (RRF_K + rLex) : 0) +
+          (rBm25 ? 1.2 / (RRF_K + rBm25) : 0) +
+          (rVec ? 1.0 / (RRF_K + rVec) : 0)
+        scored.push({ ...meta, rrfScore })
+      }
+
+      scored.sort((a, b) =>
+        (Number(b.exactHit) - Number(a.exactHit)) ||
+        (conflict(b.item.row.d) - conflict(a.item.row.d)) ||
+        ((a.item.verdict.computedRank ?? 9) - (b.item.verdict.computedRank ?? 9)) ||
+        (!a.exactHit && Math.abs(b.rrfScore - a.rrfScore) > 1e-6 ? b.rrfScore - a.rrfScore : 0) ||
+        (b.item.row.created_at - a.item.row.created_at) ||
+        (a.item.row.id < b.item.row.id ? -1 : 1)
+      )
+      matched = scored.map(s => s.item)
+    }
     const scopeCounts = {}
     for (const { row } of matched) scopeCounts[row.scope] = (scopeCounts[row.scope] || 0) + 1
     const page = matched.slice(startIdx, startIdx + pageLimit)
@@ -1073,6 +1545,194 @@ export class HiveMemoryStore {
     if (!fits(out)) return { ...out, budget_exceeded: true, code: 'HIVE_MEMORY_WAKE_OVER_BUDGET', message: `wake needs ${out.non_canon_bytes} bytes with every optional part dropped; max_chars is ${budget}` }
     return out
   }
+
+  // Returns ACL-filtered entity edges (`claim_edges`) and claim-to-claim constellation links across active readable claims.
+  claimEdges({
+    readerPubkey = '',
+    topic = null,
+    edgeType = null,
+    targetRef = null,
+    nowSec = nowSecDefault(),
+  } = {}) {
+    const base = {
+      record_type: 'memory-entity-graph',
+      authority: null,
+      trustedInstruction: false,
+      store_state: this.storeState(readerPubkey, nowSec),
+    }
+    if (!this.isReady().ready) {
+      return { ...base, answer: 'unknown', answer_reason: `store-not-ready:${this.state}`, entity_edges: [], constellation_links: [], total_edges: 0 }
+    }
+    if (targetRef && this.#targetHidden(readerPubkey, String(targetRef))) {
+      return { ...base, answer: 'none', answer_reason: null, entity_edges: [], constellation_links: [], total_edges: 0 }
+    }
+    this.#ensureDerivedTables()
+    const wantTopic = topic ? normalizeMemoryTopic(topic) ?? String(topic) : null
+    const consolidated = this.#consolidatedBy(nowSec)
+    const activeRows = this.#activeRows(readerPubkey, nowSec)
+      .filter(r => !consolidated.has(r.id) && (!wantTopic || topicOf(r) === wantTopic))
+    const readableById = new Map(activeRows.map(r => [r.id, r]))
+    if (!readableById.size) {
+      return { ...base, answer: 'none', answer_reason: null, entity_edges: [], constellation_links: [], total_edges: 0 }
+    }
+
+    const edgeRows = this.db.prepare('SELECT from_id, edge_type, target_ref, weight FROM claim_edges').all()
+    const filteredEdges = []
+    for (const e of edgeRows) {
+      if (!readableById.has(e.from_id)) continue
+      if (edgeType && e.edge_type !== String(edgeType)) continue
+      if (targetRef) {
+        const want = String(targetRef).toLowerCase()
+        if (e.target_ref.toLowerCase() !== want && `${e.edge_type}:${e.target_ref}`.toLowerCase() !== want) continue
+      }
+      if ((e.edge_type === 'supersedes' || e.edge_type === 'event') && this.#targetHidden(readerPubkey, e.target_ref)) continue
+      filteredEdges.push({
+        authority: null,
+        trustedInstruction: false,
+        from_id: e.from_id,
+        edge_type: e.edge_type,
+        target_ref: e.target_ref,
+        weight: Number(e.weight || 1.0),
+      })
+    }
+
+    const recordsForConstellation = activeRows.map(r => {
+      const body = JSON.parse(JSON.parse(r.raw_json).content)
+      const tags = JSON.parse(r.raw_json).tags || []
+      const supersedes = tags.filter(t => Array.isArray(t) && t[0] === 'supersedes' && typeof t[1] === 'string').map(t => t[1])
+      return {
+        event_id: r.id,
+        d: r.d,
+        topic: topicOf(r),
+        scope: r.scope,
+        author_pubkey: r.pubkey,
+        created_at: r.created_at,
+        as_of_git: r.as_of_git,
+        as_of_evt: r.as_of_evt,
+        supersedes,
+        claim: body.claim,
+        because: body.because,
+        evidence: body.evidence || [],
+      }
+    })
+    const constellation = buildConstellationLinks(recordsForConstellation)
+    return {
+      ...base,
+      answer: filteredEdges.length ? 'found' : 'none',
+      answer_reason: null,
+      entity_edges: filteredEdges,
+      constellation_links: constellation.links,
+      total_edges: filteredEdges.length,
+    }
+  }
+
+  // Compiles an "Above-the-Line (Canon + Class B Decisions + Curated Syntheses) / Below-the-Line (Class A Timeline + Lineage)"
+  // topic page for a single topic, strictly filtered by reader ACL.
+  compileTopicPage({
+    readerPubkey = '',
+    topic,
+    roomId = null,
+    staleFiles = new Set(),
+    nowSec = nowSecDefault(),
+  } = {}) {
+    const wantTopic = normalizeMemoryTopic(topic) ?? String(topic || '').trim()
+    const pagesRes = this.compileAllTopicPages({ readerPubkey, roomId, staleFiles, nowSec, onlyTopic: wantTopic })
+    const page = pagesRes.pages.find(p => p.topic === wantTopic) || null
+    return {
+      record_type: 'memory-topic-page-result',
+      authority: null,
+      trustedInstruction: false,
+      answer: page ? 'found' : (pagesRes.answer === 'unknown' ? 'unknown' : 'none'),
+      answer_reason: pagesRes.answer_reason,
+      topic: wantTopic,
+      page,
+      store_state: pagesRes.store_state,
+    }
+  }
+
+  compileAllTopicPages({
+    readerPubkey = '',
+    roomId = null,
+    staleFiles = new Set(),
+    nowSec = nowSecDefault(),
+    onlyTopic = null,
+  } = {}) {
+    const storeState = this.storeState(readerPubkey, nowSec)
+    if (!this.isReady().ready) {
+      return {
+        record_type: 'memory-topic-pages',
+        authority: null,
+        trustedInstruction: false,
+        answer: 'unknown',
+        answer_reason: `store-not-ready:${this.state}`,
+        pages: [],
+        store_state: storeState,
+      }
+    }
+    this.#ensureDerivedTables()
+    const cleanRoom = roomId ? String(roomId).toLowerCase() : null
+    const consolidated = this.#consolidatedBy(nowSec)
+    const allReadableRows = this.db.prepare('SELECT * FROM events WHERE status = ?').all('active')
+      .filter(r => canRead(readerPubkey, r, this.config) && (r.scope_type !== 'room' || !cleanRoom || r.room_id === cleanRoom))
+
+    const byEventId = new Map()
+    const activeRecords = []
+    const factKeyClaims = new Map()
+    for (const r of allReadableRows) {
+      const verdict = verdictOf(r, nowSec, staleFiles, consolidated)
+      const body = JSON.parse(JSON.parse(r.raw_json).content)
+      if (verdict.verification === 'accepted' && r.is_current) {
+        if (!factKeyClaims.has(r.d)) factKeyClaims.set(r.d, new Set())
+        factKeyClaims.get(r.d).add(body.claim)
+      }
+      const env = envelope({ row: r, verdict, body })
+      byEventId.set(r.id, env)
+      if (verdict.verification === 'accepted' && r.is_current) {
+        activeRecords.push(env)
+      }
+    }
+    const conflict = dk => (factKeyClaims.get(dk)?.size || 0) > 1
+    for (const rec of activeRecords) rec.conflict = conflict(rec.d)
+
+    const consolidatedSources = {}
+    for (const rec of activeRecords) {
+      for (const sid of rec.supersedes || []) {
+        const src = byEventId.get(sid)
+        if (src) consolidatedSources[sid] = src
+      }
+    }
+
+    const pages = compileTopicPagesFromRecords(activeRecords, {
+      consolidatedSources,
+      writerNames: this.#writerNames(),
+      nowSec,
+      onlyTopic,
+    })
+    return {
+      record_type: 'memory-topic-pages',
+      authority: null,
+      trustedInstruction: false,
+      answer: pages.length ? 'found' : 'none',
+      answer_reason: null,
+      pages,
+      store_state: storeState,
+    }
+  }
+
+  exportTopicMarkdownMirror(mirrorDir, {
+    readerPubkey = '',
+    roomId = null,
+    staleFiles = new Set(),
+    nowSec = nowSecDefault(),
+  } = {}) {
+    const res = this.compileAllTopicPages({ readerPubkey, roomId, staleFiles, nowSec })
+    if (res.answer === 'unknown') return res
+    const written = writeTopicMarkdownMirror(mirrorDir, res.pages, {
+      writeSeq: res.store_state?.write_seq ?? 0,
+      nowSec,
+    })
+    return { ...res, mirror_dir: mirrorDir, files_written: written }
+  }
 }
 
 const topicOf = row => normalizeMemoryTopic(row.topic) ?? row.topic
@@ -1147,6 +1807,406 @@ function envelope({ row, verdict, body }) {
     ...(merkleSources ? { merkle_sources: merkleSources } : {}),
     ...(verdict.consolidatedBy ? { consolidated_by: verdict.consolidatedBy } : {}),
   }
+}
+
+const CONSTELLATION_EDGE_TYPES = new Set(['supersedes', 'event', 'pr', 'commit', 'file', 'issue', 'subject'])
+
+// Builds claim-to-claim constellation links and entity statistics from a list of claim records.
+export function buildConstellationLinks(records = []) {
+  const recs = Array.isArray(records) ? records.filter(r => r && r.event_id) : []
+  const byId = new Map(recs.map(r => [r.event_id, r]))
+  const byEntity = new Map()
+  const edgesByClaim = new Map()
+  let totalEdges = 0
+
+  for (const r of recs) {
+    const extracted = extractClaimEdges({
+      d: r.d,
+      topic: r.topic,
+      asOfGit: r.as_of_git,
+      asOfEvt: r.as_of_evt,
+      supersedes: r.supersedes || [],
+      claim: r.claim,
+      because: r.because,
+      evidence: r.evidence || [],
+    })
+    edgesByClaim.set(r.event_id, extracted)
+    totalEdges += extracted.length
+    for (const e of extracted) {
+      if (!CONSTELLATION_EDGE_TYPES.has(e.edge_type)) continue
+      const key = `${e.edge_type}\0${e.target_ref}`
+      let list = byEntity.get(key)
+      if (!list) {
+        list = { edge_type: e.edge_type, target_ref: e.target_ref, weight: e.weight, claims: [] }
+        byEntity.set(key, list)
+      }
+      list.claims.push(r)
+    }
+  }
+
+  const pairMap = new Map()
+  const addLink = (srcId, dstId, edgeType, sharedRef, weight) => {
+    if (!srcId || !dstId || srcId === dstId) return
+    const [a, b] = srcId < dstId ? [srcId, dstId] : [dstId, srcId]
+    const pairKey = `${a}\0${b}`
+    const prev = pairMap.get(pairKey)
+    const recA = byId.get(srcId)
+    const recB = byId.get(dstId)
+    const crossTopic = Boolean(recA && recB && (recA.topic || '') !== (recB.topic || ''))
+    if (!prev) {
+      pairMap.set(pairKey, {
+        authority: null,
+        trustedInstruction: false,
+        source_id: srcId,
+        target_id: dstId,
+        source_event_id: srcId,
+        target_event_id: dstId,
+        edge_type: edgeType,
+        shared_ref: sharedRef,
+        primary_entity: sharedRef,
+        shared_entities: [sharedRef],
+        cross_topic: crossTopic,
+        weight,
+      })
+    } else {
+      if (!prev.shared_entities.includes(sharedRef)) prev.shared_entities.push(sharedRef)
+      if (weight > prev.weight) {
+        prev.edge_type = edgeType
+        prev.shared_ref = sharedRef
+        prev.primary_entity = sharedRef
+        prev.weight = weight
+      }
+    }
+  }
+
+  for (const r of recs) {
+    for (const e of edgesByClaim.get(r.event_id) || []) {
+      if ((e.edge_type === 'supersedes' || e.edge_type === 'event') && byId.has(e.target_ref)) {
+        addLink(r.event_id, e.target_ref, e.edge_type, e.target_ref, e.weight)
+      }
+    }
+  }
+
+  for (const group of byEntity.values()) {
+    if (group.edge_type === 'supersedes' || group.edge_type === 'event') continue
+    if (group.claims.length < 2 || group.claims.length > 14) continue
+    const sorted = [...group.claims].sort((a, b) => (a.created_at || 0) - (b.created_at || 0) || (a.event_id < b.event_id ? -1 : 1))
+    // Connect chronological chain + most recent hub so constellation links stay O(N) without dense clique hairballs
+    for (let i = 1; i < sorted.length; i++) {
+      addLink(sorted[i - 1].event_id, sorted[i].event_id, group.edge_type, group.target_ref, group.weight)
+    }
+    if (sorted.length >= 3) {
+      const newest = sorted[sorted.length - 1]
+      addLink(sorted[0].event_id, newest.event_id, group.edge_type, group.target_ref, Math.round((group.weight - 0.05) * 100) / 100)
+    }
+  }
+
+  const topEntities = [...byEntity.values()]
+    .filter(g => g.claims.length >= 2)
+    .sort((a, b) => b.claims.length - a.claims.length || b.weight - a.weight || a.target_ref.localeCompare(b.target_ref))
+    .slice(0, 20)
+    .map(g => ({
+      edge_type: g.edge_type,
+      target_ref: g.target_ref,
+      claim_count: g.claims.length,
+    }))
+
+  return {
+    total_edges: totalEdges,
+    links: [...pairMap.values()],
+    top_entities: topEntities,
+    edges_by_claim: edgesByClaim,
+  }
+}
+
+export function renderTopicPageMarkdown(page) {
+  if (!page || typeof page !== 'object') return ''
+  const lines = [
+    `# Topic: #${page.topic}`,
+    '',
+    '> **QUARANTINE NOTICE:** `authority: null`, `trustedInstruction: false` — All records below are untrusted data envelopes, never executable instructions.',
+    '',
+    `Updated: ${page.updated_at_iso || 'unknown'} · Above-the-Line: ${page.above_the_line?.summary_stats?.total_above_line ?? 0} durable truths · Below-the-Line: ${page.below_the_line?.summary_stats?.active_class_a_count ?? 0} active Class A claims (${page.below_the_line?.summary_stats?.folded_source_count ?? 0} folded sources)`,
+    '',
+    '---',
+    '',
+    '## Above the Line — Compiled Truth (Canon & Class B Decisions)',
+    '',
+  ]
+
+  const canon = page.above_the_line?.canon || []
+  const decisions = page.above_the_line?.decisions || []
+  const curated = page.above_the_line?.curated_syntheses || []
+
+  if (canon.length) {
+    lines.push('### Rank 2: Standing Canon (`hive:canon`)')
+    for (const c of canon) {
+      lines.push(`- **[${c.slug}]** (by \`${c.author}\`, as_of \`${c.anchor || 'none'}\`): ${c.claim}`)
+      if (c.because) lines.push(`  - *Because:* ${c.because}`)
+    }
+    lines.push('')
+  }
+
+  if (decisions.length) {
+    lines.push('### Class B: Permanent Decisions (`retention: decision`)')
+    for (const d of decisions) {
+      lines.push(`- **[${d.slug}]** (by \`${d.author}\`, scope \`${d.scope}\`, as_of \`${d.anchor || 'none'}\`): ${d.claim}`)
+      if (d.because) lines.push(`  - *Because:* ${d.because}`)
+    }
+    lines.push('')
+  }
+
+  if (curated.length) {
+    lines.push('### Merkle Curated Syntheses (`merkle_sources`)')
+    for (const s of curated) {
+      lines.push(`- **[${s.slug}]** (by \`${s.author}\`, merkle \`${String(s.merkle_sources || '').slice(0, 12)}…\`, folds ${s.superseded_count || 0} sources): ${s.claim}`)
+    }
+    lines.push('')
+  }
+
+  if (!canon.length && !decisions.length && !curated.length) {
+    lines.push('*(No durable Canon or Class B decisions recorded for this topic yet — see Below-the-Line timeline.)*')
+    lines.push('')
+  }
+
+  lines.push('---')
+  lines.push('')
+  lines.push('## Below the Line — Active Class A Evidence Timeline & Lineage')
+  lines.push('')
+
+  const timeline = page.below_the_line?.active_timeline || []
+  if (timeline.length) {
+    lines.push('### Active Ephemeral / Workflow Claims (Newest First)')
+    for (const item of timeline) {
+      const ts = item.created_at ? new Date(item.created_at * 1000).toISOString().slice(0, 16).replace('T', ' ') + 'Z' : 'unknown'
+      lines.push(`- \`${ts}\` **[${item.slug}]** (\`${item.author}\` · \`${item.scope}\`): ${item.claim}`)
+    }
+    lines.push('')
+  } else {
+    lines.push('*(No active Class A ephemeral claims.)*')
+    lines.push('')
+  }
+
+  const folded = page.below_the_line?.folded_lineage || []
+  if (folded.length) {
+    lines.push('### Folded Merkle Source Lineage (90-Day Hold)')
+    for (const f of folded) {
+      lines.push(`- \`${String(f.event_id || '').slice(0, 10)}…\` **[${f.slug}]** -> folded into \`${String(f.consolidated_into || '').slice(0, 10)}…\`: ${f.claim_preview}`)
+    }
+    lines.push('')
+  }
+
+  const ent = page.below_the_line?.entity_links || {}
+  const entParts = []
+  if (ent.prs?.length) entParts.push(`- **Pull Requests:** ${ent.prs.join(', ')}`)
+  if (ent.issues?.length) entParts.push(`- **Issues:** ${ent.issues.join(', ')}`)
+  if (ent.commits?.length) entParts.push(`- **Commits:** ${ent.commits.join(', ')}`)
+  if (ent.files?.length) entParts.push(`- **Files:** ${ent.files.join(', ')}`)
+  if (ent.agents?.length) entParts.push(`- **Mentioned Agents:** ${ent.agents.join(', ')}`)
+  if (entParts.length) {
+    lines.push('### Extracted Entity-Link Graph')
+    lines.push(...entParts)
+    lines.push('')
+  }
+
+  return lines.join('\n')
+}
+
+export function compileTopicPagesFromRecords(records = [], {
+  consolidatedSources = {},
+  writerNames = new Map(),
+  nowSec = nowSecDefault(),
+  onlyTopic = null,
+} = {}) {
+  const recs = Array.isArray(records) ? records.filter(Boolean) : []
+  const byTopic = new Map()
+  const want = onlyTopic ? (normalizeMemoryTopic(onlyTopic) ?? String(onlyTopic)) : null
+
+  for (const r of recs) {
+    const t = normalizeMemoryTopic(r.topic) ?? (r.topic || 'general')
+    if (want && t !== want) continue
+    if (!byTopic.has(t)) byTopic.set(t, [])
+    byTopic.get(t).push(r)
+  }
+
+  const resolveAuthor = pk => {
+    if (!pk) return 'unknown'
+    if (writerNames instanceof Map && writerNames.has(pk)) return writerNames.get(pk)
+    if (writerNames && typeof writerNames === 'object' && writerNames[pk]) return writerNames[pk]
+    return String(pk).slice(0, 12)
+  }
+  const slugOf = d => String(d || '').split(':').pop() || String(d || '')
+
+  const pages = []
+  for (const [top, list] of [...byTopic.entries()].sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]))) {
+    const sorted = [...list].sort((a, b) => (b.created_at || 0) - (a.created_at || 0) || (String(a.event_id || '') < String(b.event_id || '') ? -1 : 1))
+    const canon = []
+    const decisions = []
+    const curatedSyntheses = []
+    const activeTimeline = []
+    const foldedLineage = []
+    const prs = new Set()
+    const issues = new Set()
+    const commits = new Set()
+    const files = new Set()
+    const agents = new Set()
+
+    for (const r of sorted) {
+      const item = {
+        authority: null,
+        trustedInstruction: false,
+        event_id: r.event_id,
+        d: r.d,
+        slug: slugOf(r.d),
+        scope: r.scope,
+        author: resolveAuthor(r.author_pubkey),
+        author_pubkey: r.author_pubkey,
+        claim: String(r.claim || ''),
+        because: String(r.because || ''),
+        evidence: Array.isArray(r.evidence) ? r.evidence : [],
+        anchor: r.as_of_git || r.as_of_evt || null,
+        created_at: r.created_at || null,
+        expires_at: r.expires_at ?? null,
+        merkle_sources: r.merkle_sources || null,
+        superseded_count: Array.isArray(r.supersedes) ? r.supersedes.length : 0,
+        conflict: Boolean(r.conflict),
+      }
+
+      if (r.scope === 'hive:canon') {
+        canon.push(item)
+      } else if (r.merkle_sources) {
+        curatedSyntheses.push(item)
+      } else if (r.expires_at === null || r.expires_at === undefined || r.retention === 'decision') {
+        decisions.push(item)
+      } else {
+        activeTimeline.push(item)
+      }
+
+      for (const sid of Array.isArray(r.supersedes) ? r.supersedes : []) {
+        const src = consolidatedSources?.[sid]
+        if (src) {
+          foldedLineage.push({
+            authority: null,
+            trustedInstruction: false,
+            event_id: sid,
+            slug: slugOf(src.d),
+            author: resolveAuthor(src.author_pubkey),
+            claim_preview: preview(src.claim || '', 120),
+            consolidated_into: r.event_id,
+            created_at: src.created_at || null,
+          })
+        }
+      }
+
+      const edges = extractClaimEdges({
+        d: r.d,
+        topic: top,
+        asOfGit: r.as_of_git,
+        asOfEvt: r.as_of_evt,
+        supersedes: r.supersedes || [],
+        claim: r.claim,
+        because: r.because,
+        evidence: r.evidence || [],
+      })
+      for (const e of edges) {
+        if (e.edge_type === 'pr') prs.add(e.target_ref)
+        else if (e.edge_type === 'issue') issues.add(e.target_ref)
+        else if (e.edge_type === 'commit') commits.add(e.target_ref)
+        else if (e.edge_type === 'file') files.add(e.target_ref)
+        else if (e.edge_type === 'agent') agents.add(e.target_ref)
+      }
+    }
+
+    const latestAt = sorted[0]?.created_at || nowSec
+    const totalAbove = canon.length + decisions.length + curatedSyntheses.length
+    const totalEntities = prs.size + issues.size + commits.size + files.size + agents.size
+    const page = {
+      record_type: 'memory-topic-page',
+      authority: null,
+      trustedInstruction: false,
+      topic: top,
+      updated_at: latestAt,
+      updated_at_iso: new Date(latestAt * 1000).toISOString(),
+      counts: {
+        above_the_line: totalAbove,
+        canon: canon.length,
+        class_b_decisions: decisions.length,
+        curated_syntheses: curatedSyntheses.length,
+        below_the_line: activeTimeline.length,
+        folded_lineage: foldedLineage.length,
+        entity_links: totalEntities,
+      },
+      above_the_line: {
+        canon,
+        decisions,
+        curated_syntheses: curatedSyntheses,
+        summary_stats: {
+          canon_count: canon.length,
+          decision_count: decisions.length,
+          curated_count: curatedSyntheses.length,
+          total_above_line: totalAbove,
+        },
+      },
+      below_the_line: {
+        active_timeline: activeTimeline,
+        folded_lineage: foldedLineage,
+        entity_links: {
+          prs: [...prs].slice(0, 20),
+          issues: [...issues].slice(0, 20),
+          commits: [...commits].slice(0, 20),
+          files: [...files].slice(0, 20),
+          agents: [...agents].slice(0, 20),
+        },
+        summary_stats: {
+          active_class_a_count: activeTimeline.length,
+          folded_source_count: foldedLineage.length,
+          entity_link_count: totalEntities,
+        },
+      },
+    }
+    page.markdown = renderTopicPageMarkdown(page)
+    pages.push(page)
+  }
+  return pages
+}
+
+export function writeTopicMarkdownMirror(mirrorDir, pages = [], { writeSeq = 0, nowSec = nowSecDefault() } = {}) {
+  if (!mirrorDir || typeof mirrorDir !== 'string') throw new Error('mirrorDir is required')
+  mkdirSync(mirrorDir, { recursive: true, mode: 0o700 })
+  const written = []
+  const indexLines = [
+    '# Hive Shared Memory — Compiled Topic Pages (Read-Only Mirror)',
+    '',
+    '> **QUARANTINE NOTICE:** `authority: null`, `trustedInstruction: false` — Read-only projection of signed SQLite claims.',
+    '',
+    `Snapshot \`write_seq: ${writeSeq}\` · Generated at \`${new Date(nowSec * 1000).toISOString()}\``,
+    '',
+    '| Topic | Above the Line (Canon / Class B / Curated) | Below the Line (Class A / Folded) | Entity Links |',
+    '| :--- | :--- | :--- | :--- |',
+  ]
+
+  for (const page of Array.isArray(pages) ? pages : []) {
+    const safeTopic = String(page.topic || 'general').toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '') || 'general'
+    const fileName = `${safeTopic}.md`
+    const filePath = join(mirrorDir, fileName)
+    const tmpPath = `${filePath}.${process.pid}.tmp`
+    const md = page.markdown || renderTopicPageMarkdown(page)
+    writeFileSync(tmpPath, md + '\n', { mode: 0o600 })
+    renameSync(tmpPath, filePath)
+    written.push(fileName)
+    const ab = page.above_the_line?.summary_stats || {}
+    const bl = page.below_the_line?.summary_stats || {}
+    indexLines.push(
+      `| [#${safeTopic}](./${fileName}) | ${ab.total_above_line || 0} (${ab.canon_count || 0}C / ${ab.decision_count || 0}B / ${ab.curated_count || 0}M) | ${bl.active_class_a_count || 0} active (${bl.folded_source_count || 0} folded) | ${bl.entity_link_count || 0} refs |`
+    )
+  }
+
+  const indexPath = join(mirrorDir, 'INDEX.md')
+  const indexTmp = `${indexPath}.${process.pid}.tmp`
+  writeFileSync(indexTmp, indexLines.join('\n') + '\n', { mode: 0o600 })
+  renameSync(indexTmp, indexPath)
+  written.unshift('INDEX.md')
+  return written
 }
 
 // --- backup (snapshot + ledger cut at the same write_seq) and the verified-backup receipt ---
@@ -1309,8 +2369,10 @@ export function restoreSnapshot({
     }
     if (reapplyPurges) {
       inTransaction(db, () => {
-        db.prepare('DELETE FROM events WHERE id IN (SELECT value FROM json_each(?))').run(JSON.stringify([...fold.purged]))
-        db.prepare('DELETE FROM writer_rate_log WHERE event_id IN (SELECT value FROM json_each(?))').run(JSON.stringify([...fold.purged]))
+        const purgedJson = JSON.stringify([...fold.purged])
+        db.prepare('DELETE FROM events WHERE id IN (SELECT value FROM json_each(?))').run(purgedJson)
+        try { db.prepare('DELETE FROM events_fts WHERE event_id IN (SELECT value FROM json_each(?))').run(purgedJson) } catch { /* fts may not exist */ }
+        db.prepare('DELETE FROM writer_rate_log WHERE event_id IN (SELECT value FROM json_each(?))').run(purgedJson)
         const last = db.prepare('SELECT id FROM events ORDER BY ingested_at DESC, rowid DESC LIMIT 1').get()?.id ?? null
         db.prepare('UPDATE store_meta SET last_event_id = ? WHERE singleton = 1').run(last)
         db.prepare('UPDATE store_meta SET last_purge_seq = ? WHERE singleton = 1').run(fold.lastPurgeSeq)
@@ -1344,8 +2406,10 @@ export function restoreSnapshot({
         let seq = fold.maxSeq
         if (acked.length) staged.push(JSON.stringify({ seq: ++seq, op: 'restore-gap-ack', store_id: fold.storeId, acked_ids: acked, at: nowSec }))
         if (due.length) {
-          db.prepare('DELETE FROM events WHERE id IN (SELECT value FROM json_each(?))').run(JSON.stringify(due))
-          db.prepare('DELETE FROM writer_rate_log WHERE event_id IN (SELECT value FROM json_each(?))').run(JSON.stringify(due))
+          const dueJson = JSON.stringify(due)
+          db.prepare('DELETE FROM events WHERE id IN (SELECT value FROM json_each(?))').run(dueJson)
+          try { db.prepare('DELETE FROM events_fts WHERE event_id IN (SELECT value FROM json_each(?))').run(dueJson) } catch { /* fts may not exist */ }
+          db.prepare('DELETE FROM writer_rate_log WHERE event_id IN (SELECT value FROM json_each(?))').run(dueJson)
           const last = db.prepare('SELECT id FROM events ORDER BY ingested_at DESC, rowid DESC LIMIT 1').get()?.id ?? null
           db.prepare('UPDATE store_meta SET last_event_id = ? WHERE singleton = 1').run(last)
           staged.push(JSON.stringify({ seq: ++seq, op: 'purge', store_id: fold.storeId, purged_ids: due, reason: 'retention', at: nowSec }))
