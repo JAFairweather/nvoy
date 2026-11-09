@@ -691,8 +691,43 @@ await test('resolveDreamDisplayMode & zero-activity fleet recall: distinguishes 
     consolidated_sources: {},
   })
   assert.equal(ghostSimMode.mode, 'simulated_preview')
+  assert.equal(ghostSimMode.is_mixed, true)
+  assert.equal(ghostSimMode.observed_merkle_count, 1)
   assert.equal(ghostSimMode.components.clusters, 'observed')
   assert.equal(ghostSimMode.components.ghost_sources, 'simulated_preview')
+  assert(ghostSimMode.label.includes('MIXED: OBSERVED MERKLE CURATION (1 persisted merkle_sources'), 'mixed state must report persisted merkle_sources count')
+  assert(!ghostSimMode.label.includes('no persisted Merkle curation'), 'mixed state must never claim no persisted Merkle curation')
+
+  // 2b. Persisted curator state + merkle_sources record + resolved historical source, but unpersisted poll-recomputed eigens/arcs (simulated: true, persisted: false) -> mixed preview
+  const unpersistedSpectralMode = resolveDreamDisplayMode({
+    records: [
+      {
+        event_id: '2'.repeat(64),
+        d: 'hive-memory:room:1:curated-nvoy',
+        topic: 'nvoy',
+        merkle_sources: 'f'.repeat(64),
+        supersedes: ['9'.repeat(64)],
+      },
+    ],
+    curator_state: {
+      state_file_present: true,
+      last_curated_at: 1700000000,
+      topic_eigenvectors: [{ axis: 1, canonical_topic: 'nvoy', eigenvalue: 2.1, variance_pct: 50, simulated: true, persisted: false }],
+      topic_reorganizations: [{ from_topic: 'ops', to_topic: 'nvoy', cosine_affinity: 0.72, claim_count: 2, simulated: true, persisted: false }],
+    },
+    consolidated_sources: {
+      ['9'.repeat(64)]: { event_id: '9'.repeat(64), d: 'hive-memory:room:1:prior' },
+    },
+  })
+  assert.equal(unpersistedSpectralMode.mode, 'simulated_preview')
+  assert.equal(unpersistedSpectralMode.is_mixed, true)
+  assert.deepEqual(unpersistedSpectralMode.components, {
+    clusters: 'observed',
+    eigenvalues: 'simulated_preview',
+    topic_arcs: 'simulated_preview',
+    ghost_sources: 'observed',
+  })
+  assert(unpersistedSpectralMode.label.includes('MIXED: OBSERVED MERKLE CURATION (1 persisted merkle_sources: clusters, ghost_sources) + SIMULATED PREVIEW (eigenvalues, topic_arcs)'))
 
   // 3. Persisted curator state + merkle_sources record + resolved source in consolidated_sources + real eigens & arcs -> observed
   const srcId = '9'.repeat(64)
@@ -906,6 +941,14 @@ await test('live integration: memory-viewer polls memory-daemon viewer socket, s
       assert.equal(polledWithOverride.curator_state.last_curated_write_seq, 2)
       assert.equal(polledWithOverride.curator_state.write_delta, 0)
       assert(Array.isArray(polledWithOverride.curator_state.planned_clusters), 'curator_state includes planned_clusters for 4-Act Replay')
+      assert(
+        polledWithOverride.curator_state.topic_eigenvectors.every(e => e.simulated === true && e.persisted === false),
+        'poll-recomputed eigenvectors without persisted state entries must be marked simulated: true, persisted: false'
+      )
+      assert(
+        polledWithOverride.curator_state.topic_reorganizations.every(r => r.simulated === true && r.persisted === false),
+        'poll-recomputed topic reorganization proposals must be marked simulated: true, persisted: false'
+      )
     } finally {
       delete process.env.HIVE_MEMORY_CURATOR_STATE_FILE
     }
@@ -1039,6 +1082,8 @@ await test('daemon activity ring: only the viewer wake carries it, metadata only
     assert(renderedHtml.includes('SIMULATED PREVIEW'), 'page must label synthetic/fallback clusters, eigenvalues, topic arcs and ghost sources as SIMULATED PREVIEW')
     assert(renderedHtml.includes('SIMULATED PREVIEW CLUSTER') && renderedHtml.includes('SIMULATED PREVIEW EIGENVALUE') && renderedHtml.includes('SIMULATED PREVIEW TOPIC ARC') && renderedHtml.includes('SIMULATED PREVIEW GHOST'), 'all 4 fallback categories must carry explicit SIMULATED PREVIEW labels')
     assert(renderedHtml.includes('buildPreviewDreamClusters'), 'replayLastDream must fall back to buildPreviewDreamClusters when store has 0 merkle_sources records')
+    assert(renderedHtml.includes('src.node.isSyntheticGhost || src.node.simulated'), 'Act II only labels synthetic/missing ghosts as SIMULATED GHOST, never resolved historical sources')
+    assert(!renderedHtml.includes('src.node.isSourceGhost || src.simulated'), 'Act II must not treat resolved isSourceGhost historical sources as SIMULATED GHOST')
     assert(!renderedHtml.includes('92.4%'), '4-act animation must not contain invented coherence uplift fallback')
   } finally {
     await daemon.close()

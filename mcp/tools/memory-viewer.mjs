@@ -1651,12 +1651,12 @@ export function resolveDreamDisplayMode({ records = [], curator_state = null, co
     hasObservedClusters &&
     Array.isArray(curator_state?.topic_eigenvectors) &&
     curator_state.topic_eigenvectors.length > 0 &&
-    !curator_state.topic_eigenvectors.some(e => e?.simulated)
+    !curator_state.topic_eigenvectors.some(e => e?.simulated || e?.persisted === false)
   const hasObservedArcs =
     hasObservedClusters &&
     Array.isArray(curator_state?.topic_reorganizations) &&
     curator_state.topic_reorganizations.length > 0 &&
-    !curator_state.topic_reorganizations.some(a => a?.simulated)
+    !curator_state.topic_reorganizations.some(a => a?.simulated || a?.persisted === false)
   const hasObservedGhosts = hasObservedClusters && observedSourceCount > 0 && missingSourceCount === 0
   const components = {
     clusters: hasObservedClusters ? 'observed' : 'simulated_preview',
@@ -1669,17 +1669,29 @@ export function resolveDreamDisplayMode({ records = [], curator_state = null, co
     components.eigenvalues !== 'observed' ||
     components.topic_arcs !== 'observed' ||
     components.ghost_sources !== 'observed'
+  const observedParts = Object.entries(components)
+    .filter(([, mode]) => mode === 'observed')
+    .map(([name]) => name)
+  const previewParts = Object.entries(components)
+    .filter(([, mode]) => mode !== 'observed')
+    .map(([name]) => name)
+  const label = !isSimulated
+    ? `OBSERVED (persisted Merkle curation · ${merkleRecords.length} merkle_sources)`
+    : hasObservedClusters
+      ? `MIXED: OBSERVED MERKLE CURATION (${merkleRecords.length} persisted merkle_sources: ${observedParts.join(', ')}) + SIMULATED PREVIEW (${previewParts.join(', ')})`
+      : merkleRecords.length > 0
+        ? `SIMULATED PREVIEW (${merkleRecords.length} merkle_sources in store — curator state file not persisted)`
+        : 'SIMULATED PREVIEW (synthetic/fallback preview — no persisted Merkle curation)'
   return {
     mode: isSimulated ? 'simulated_preview' : 'observed',
     is_simulated_preview: isSimulated,
+    is_mixed: Boolean(hasObservedClusters && isSimulated),
     persisted_curation: hasPersistedCurator,
     observed_merkle_count: merkleRecords.length,
     observed_source_count: observedSourceCount,
     missing_source_count: missingSourceCount,
     components,
-    label: isSimulated
-      ? 'SIMULATED PREVIEW (synthetic/fallback preview — no persisted Merkle curation)'
-      : 'OBSERVED (persisted Merkle curation)',
+    label,
   }
 }
 
@@ -2977,6 +2989,7 @@ export function renderViewerHtml(initialState) {
             vx: 0,
             vy: 0,
             isSourceGhost: true,
+            isHistoricalSource: hasConsolidated,
             isSyntheticGhost: !hasConsolidated,
             simulated: !hasConsolidated,
             ghostLabel: hasConsolidated ? 'HISTORICAL SOURCE' : 'SIMULATED PREVIEW GHOST'
@@ -3199,12 +3212,25 @@ export function renderViewerHtml(initialState) {
           : Boolean(triggers.circadian_dream || triggers.synaptic_volume || triggers.nightmare_interrupt);
         var reasons = Array.isArray(cs.reasons) ? cs.reasons : [];
         var hasPersistedCuration = Boolean(cs.state_file_present && lastCuratedAt > 0 && merkleCount > 0);
-        var displayMode = (cs.display_mode && cs.display_mode.mode) || (hasPersistedCuration ? 'observed' : 'simulated_preview');
+        var dm = (cs.display_mode && typeof cs.display_mode === 'object') ? cs.display_mode : null;
+        var comps = (dm && dm.components) || {
+          clusters: hasPersistedCuration ? 'observed' : 'simulated_preview',
+          eigenvalues: (hasPersistedCuration && Array.isArray(cs.topic_eigenvectors) && cs.topic_eigenvectors.length > 0 && !cs.topic_eigenvectors.some(function (e) { return !e || e.simulated || e.persisted === false; })) ? 'observed' : 'simulated_preview',
+          topic_arcs: (hasPersistedCuration && Array.isArray(cs.topic_reorganizations) && cs.topic_reorganizations.length > 0 && !cs.topic_reorganizations.some(function (a) { return !a || a.simulated || a.persisted === false; })) ? 'observed' : 'simulated_preview',
+          ghost_sources: hasPersistedCuration ? 'observed' : 'simulated_preview'
+        };
+        var isSimulatedPreview = comps.clusters !== 'observed' || comps.eigenvalues !== 'observed' || comps.topic_arcs !== 'observed' || comps.ghost_sources !== 'observed';
+        var displayMode = (dm && dm.mode) || (isSimulatedPreview ? 'simulated_preview' : 'observed');
         return {
           estimated_from_visible: true,
           passive_inspection: true,
           displayMode: displayMode,
-          isSimulatedPreview: displayMode !== 'observed',
+          isSimulatedPreview: isSimulatedPreview,
+          components: comps,
+          clustersObserved: comps.clusters === 'observed',
+          eigensObserved: comps.eigenvalues === 'observed',
+          arcsObserved: comps.topic_arcs === 'observed',
+          ghostsObserved: comps.ghost_sources === 'observed',
           total: recs.length,
           fullBytes: fullBytes,
           indexBytes: indexBytes,
@@ -3233,9 +3259,10 @@ export function renderViewerHtml(initialState) {
             reasons: reasons,
             refusal_count_15m: Number(cs.refusal_count_15m) || 0,
             stale_count: Number(cs.stale_count) || 0,
-            display_mode: cs.display_mode || {
+            display_mode: dm || {
               mode: displayMode,
-              is_simulated_preview: displayMode !== 'observed'
+              is_simulated_preview: isSimulatedPreview,
+              components: comps
             }
           }
         };
@@ -3246,7 +3273,11 @@ export function renderViewerHtml(initialState) {
         if (!bar) return;
         var d = computeDreamingTelemetry();
         var cs = d.curatorState;
-        var modeTag = d.isSimulatedPreview ? '[SIMULATED PREVIEW · 0 persisted merkle_sources] · ' : '[OBSERVED CURATION] · ';
+        var modeTag = !d.isSimulatedPreview
+          ? ('[OBSERVED CURATION · ' + d.merkleCount + ' persisted merkle_sources] · ')
+          : (d.clustersObserved
+            ? ('[MIXED · ' + d.merkleCount + ' persisted merkle_sources + PREVIEW PROPOSALS] · ')
+            : ('[SIMULATED PREVIEW · ' + d.merkleCount + ' persisted merkle_sources] · '));
         var lastLabel = cs.last_curated_at ? ('last curated ' + fmtShortAge(cs.last_curated_at, nowSec()) + ' ago (seq ' + cs.last_curated_write_seq + ')') : 'last curated: never (seq 0)';
         var deltaLabel = '+' + cs.write_delta + '/' + cs.write_delta_threshold + ' writes';
         if (cs.triggers.nightmare_interrupt || d.nightmareCount > 0) {
@@ -3388,11 +3419,12 @@ export function renderViewerHtml(initialState) {
 
       function buildDreamSymphony(merkleNodes) {
         var hasPersistedCurator = Boolean(latestCuratorState && latestCuratorState.state_file_present && Number(latestCuratorState.last_curated_at) > 0);
-        var hasObservedMerkle = Boolean(hasPersistedCurator && merkleNodes && merkleNodes.length > 0);
+        var observedMerkleCount = merkleNodes ? merkleNodes.length : 0;
+        var hasObservedMerkle = Boolean(hasPersistedCurator && observedMerkleCount > 0);
         var eigens = Array.isArray(latestCuratorState && latestCuratorState.topic_eigenvectors)
           ? latestCuratorState.topic_eigenvectors.slice()
           : [];
-        var eigensSimulated = !hasObservedMerkle;
+        var eigensSimulated = !hasObservedMerkle || eigens.length === 0 || eigens.some(function (e) { return Boolean(!e || e.simulated || e.persisted === false); });
         if (eigens.length === 0 && topics.length > 0) {
           eigensSimulated = true;
           var topCounts = topics.map(function (t) {
@@ -3407,6 +3439,7 @@ export function renderViewerHtml(initialState) {
               eigenvalue: Math.round(x.count * 10) / 10,
               variance_pct: Math.round((x.count / totalC) * 1000) / 10,
               simulated: true,
+              persisted: false,
               label: 'SIMULATED PREVIEW EIGENVALUE'
             };
           });
@@ -3418,7 +3451,7 @@ export function renderViewerHtml(initialState) {
         var reorgs = Array.isArray(latestCuratorState && latestCuratorState.topic_reorganizations)
           ? latestCuratorState.topic_reorganizations
           : [];
-        var arcsSimulated = !hasObservedMerkle;
+        var arcsSimulated = !hasObservedMerkle || reorgs.length === 0 || reorgs.some(function (r) { return Boolean(!r || r.simulated || r.persisted === false); });
         var outerR = stageDim() * 0.33;
         var reorgArcs = reorgs.map(function (rg, idx) {
           var fromTop = topicById(rg.from_topic);
@@ -3460,6 +3493,7 @@ export function renderViewerHtml(initialState) {
           });
         }
         var totalSources = 0;
+        var observedSourcesCount = 0;
         var ghostSourcesCount = 0;
         var clustersSimulated = !hasObservedMerkle;
         var ghostsSimulated = !hasObservedMerkle;
@@ -3468,15 +3502,18 @@ export function renderViewerHtml(initialState) {
           clusters = merkleNodes.map(function (mn, cIdx) {
             var top = topicById(topicOf(mn.rec));
             var srcs = resolveSourceNodes(mn.rec, mn).map(function (sn, sIdx) {
-              if (sn && (sn.isSyntheticGhost || sn.simulated || sn.isSourceGhost)) {
+              var isMissingGhost = Boolean(sn && (sn.isSyntheticGhost || sn.simulated));
+              if (isMissingGhost) {
                 ghostSourcesCount += 1;
-                if (sn.isSyntheticGhost || sn.simulated) ghostsSimulated = true;
+                ghostsSimulated = true;
+              } else if (sn) {
+                observedSourcesCount += 1;
               }
               var ang = -Math.PI / 2 + (sIdx / Math.max(1, (mn.rec.supersedes || []).length)) * Math.PI * 2 + cIdx * 0.37;
               var dist = 42 + (sIdx % 3) * 16;
               return {
                 node: sn,
-                simulated: Boolean(sn && sn.simulated),
+                simulated: isMissingGhost,
                 angle: ang,
                 dist: dist,
                 initX: mn.x + Math.cos(ang) * dist,
@@ -3498,6 +3535,7 @@ export function renderViewerHtml(initialState) {
               shocked: false
             };
           });
+          if (observedSourcesCount === 0) ghostsSimulated = true;
         } else {
           clustersSimulated = true;
           ghostsSimulated = true;
@@ -3505,7 +3543,7 @@ export function renderViewerHtml(initialState) {
           clusters.forEach(function (cl) {
             totalSources += cl.sources.length;
             cl.sources.forEach(function (s) {
-              if (s.node && s.node.isSourceGhost) ghostSourcesCount += 1;
+              if (s.simulated || (s.node && (s.node.isSyntheticGhost || s.node.simulated))) ghostSourcesCount += 1;
             });
           });
         }
@@ -3528,6 +3566,8 @@ export function renderViewerHtml(initialState) {
           eigensSimulated: Boolean(eigensSimulated),
           arcsSimulated: Boolean(arcsSimulated),
           ghostsSimulated: Boolean(ghostsSimulated),
+          observedMerkleCount: observedMerkleCount,
+          observedSourcesCount: observedSourcesCount,
           ghostSourcesCount: ghostSourcesCount,
           eigens: eigens,
           reorgArcs: reorgArcs,
@@ -4288,10 +4328,17 @@ export function renderViewerHtml(initialState) {
           var dr = computeDreamingTelemetry();
           var cs = dr.curatorState;
           var isSim = Boolean(dr.isSimulatedPreview);
+          var clustersSim = !dr.clustersObserved;
+          var eigensSim = !dr.eigensObserved;
+          var arcsSim = !dr.arcsObserved;
+          var ghostsSim = !dr.ghostsObserved;
+          var isMixed = Boolean(dr.clustersObserved && isSim);
           box.appendChild(inspectHeader(
             'Merkle Dreaming & Curation · Passive Inspector',
             '-' + dr.wakeSavings.toFixed(1) + '% Est. Wake Bytes',
-            isSim ? 'SIMULATED PREVIEW · PASSIVE INSPECTION · READ-ONLY' : 'OBSERVED CURATION · PASSIVE INSPECTION · READ-ONLY',
+            isMixed
+              ? ('OBSERVED MERKLE (' + dr.merkleCount + ' persisted merkle_sources) + SIMULATED PREVIEW · READ-ONLY')
+              : (isSim ? 'SIMULATED PREVIEW · PASSIVE INSPECTION · READ-ONLY' : 'OBSERVED CURATION · PASSIVE INSPECTION · READ-ONLY'),
             isSim ? 'warn' : 'info',
             '#a78bfa'
           ));
@@ -4301,7 +4348,9 @@ export function renderViewerHtml(initialState) {
           var animBtn = document.createElement('button');
           animBtn.type = 'button';
           animBtn.className = 'btn sim';
-          animBtn.textContent = isSim ? '▶ Animate 4-Act Simulated Preview' : '▶ Animate 4-Act Observed Reorganization';
+          animBtn.textContent = isMixed
+            ? '▶ Animate 4-Act Mixed Replay (Observed Merkle + Preview)'
+            : (isSim ? '▶ Animate 4-Act Simulated Preview' : '▶ Animate 4-Act Observed Reorganization');
           animBtn.addEventListener('click', function () { replayLastDream(); });
           actRow.appendChild(animBtn);
           var recBtn = document.createElement('button');
@@ -4315,12 +4364,26 @@ export function renderViewerHtml(initialState) {
           box.appendChild(actRow);
           var dkv = makeDiv('kv-list');
           dkv.appendChild(kvRow('Inspector mode', 'Passive read-only (never triggers curator writes)', '#6ee7b7'));
+          var dmLabel = (cs.display_mode && cs.display_mode.label)
+            ? cs.display_mode.label
+            : (isMixed
+              ? ('MIXED: OBSERVED MERKLE CURATION (' + dr.merkleCount + ' persisted merkle_sources) + SIMULATED PREVIEW (' + [clustersSim && 'clusters', eigensSim && 'eigenvalues', arcsSim && 'topic_arcs', ghostsSim && 'ghost_sources'].filter(Boolean).join(', ') + ')')
+              : (isSim
+                ? ('SIMULATED PREVIEW (synthetic/fallback preview — ' + dr.merkleCount + ' persisted merkle_sources)')
+                : ('OBSERVED (persisted Merkle curation · ' + dr.merkleCount + ' merkle_sources)')));
           dkv.appendChild(kvRow(
             'Display mode',
-            isSim
-              ? 'SIMULATED PREVIEW (synthetic/fallback clusters, eigenvalues, topic arcs & ghost sources)'
-              : 'OBSERVED (persisted merkle_sources curation)',
+            dmLabel,
             isSim ? '#fbbf24' : '#34d399',
+            true
+          ));
+          dkv.appendChild(kvRow(
+            'Component modes',
+            'Clusters: ' + (clustersSim ? 'SIMULATED PREVIEW' : 'OBSERVED (' + dr.merkleCount + ' merkle_sources)') +
+              ' · PCA: ' + (eigensSim ? 'SIMULATED PREVIEW' : 'OBSERVED') +
+              ' · Arcs: ' + (arcsSim ? 'SIMULATED PREVIEW' : 'OBSERVED') +
+              ' · Sources: ' + (ghostsSim ? 'SIMULATED PREVIEW' : 'OBSERVED'),
+            isMixed ? '#38bdf8' : (isSim ? '#fbbf24' : '#34d399'),
             true
           ));
           dkv.appendChild(kvRow(
@@ -4374,25 +4437,27 @@ export function renderViewerHtml(initialState) {
           }
           var eigens = Array.isArray(latestCuratorState && latestCuratorState.topic_eigenvectors) ? latestCuratorState.topic_eigenvectors : [];
           if (eigens.length > 0) {
-            var eTitle = makeDiv('inspect-kicker', 'Stage 0 · Spectral Topic Eigenvectors (' + (isSim ? 'SIMULATED PREVIEW PCA' : 'Observed PCA') + ')');
+            var eTitle = makeDiv('inspect-kicker', 'Stage 0 · Spectral Topic Eigenvectors (' + (eigensSim ? 'SIMULATED PREVIEW PCA' : 'Observed PCA') + ')');
             eTitle.style.marginTop = '6px';
             box.appendChild(eTitle);
             var eWrap = makeDiv('kv-list');
             eigens.slice(0, 6).forEach(function (ev) {
+              var evSim = Boolean(eigensSim || ev.simulated || ev.persisted === false);
               var loads = Array.isArray(ev.topic_loadings) ? ev.topic_loadings.slice(0, 3).map(function (l) { return l.topic + (l.loading >= 0 ? '+' : '') + Number(l.loading).toFixed(2); }).join(', ') : '';
-              eWrap.appendChild(kvRow('Axis ' + ev.axis + ' · #' + ev.canonical_topic, 'λ=' + ev.eigenvalue + ' (' + ev.variance_pct + '%) · ' + loads + (isSim ? ' [SIMULATED PREVIEW]' : ''), '#a78bfa', true));
+              eWrap.appendChild(kvRow('Axis ' + ev.axis + ' · #' + ev.canonical_topic, 'λ=' + ev.eigenvalue + ' (' + ev.variance_pct + '%) · ' + loads + (evSim ? ' [SIMULATED PREVIEW]' : ' [OBSERVED]'), '#a78bfa', true));
             });
             box.appendChild(eWrap);
           }
           var reorgs = Array.isArray(latestCuratorState && latestCuratorState.topic_reorganizations) ? latestCuratorState.topic_reorganizations : [];
           if (reorgs.length > 0) {
-            var rTitle = makeDiv('inspect-kicker', 'Stage 0 · Topic Reorganizations (' + (isSim ? 'SIMULATED PREVIEW ARCS' : 'Observed Arcs') + ')');
+            var rTitle = makeDiv('inspect-kicker', 'Stage 0 · Topic Reorganizations (' + (arcsSim ? 'SIMULATED PREVIEW ARCS' : 'Observed Arcs') + ')');
             rTitle.style.marginTop = '6px';
             box.appendChild(rTitle);
             var rWrap = makeDiv('kv-list');
             rWrap.style.marginTop = '2px';
             reorgs.slice(0, 8).forEach(function (rg) {
-              rWrap.appendChild(kvRow('#' + rg.from_topic + ' (' + rg.claim_count + ')', '-> #' + rg.to_topic + ' (cos ' + rg.cosine_affinity + ')' + (isSim ? ' [SIMULATED PREVIEW]' : ''), '#38bdf8', true));
+              var rgSim = Boolean(arcsSim || rg.simulated || rg.persisted === false);
+              rWrap.appendChild(kvRow('#' + rg.from_topic + ' (' + rg.claim_count + ')', '-> #' + rg.to_topic + ' (cos ' + rg.cosine_affinity + ')' + (rgSim ? ' [SIMULATED PREVIEW]' : ' [OBSERVED]'), '#38bdf8', true));
             });
             box.appendChild(rWrap);
           }
@@ -4668,15 +4733,18 @@ export function renderViewerHtml(initialState) {
           var ds = dreamSymphony;
           ds.progress += ds.speed;
           var p = ds.progress;
-          var dsLogPrefix = ds.isSimulated ? '[REPLAY · READ-ONLY] [SIMULATED PREVIEW] ' : '[REPLAY · READ-ONLY] [OBSERVED] ';
+          var act1Prefix = '[REPLAY · READ-ONLY] ' + ((ds.eigensSimulated || ds.arcsSimulated) ? '[SIMULATED PREVIEW] ' : '[OBSERVED] ');
+          var act2Prefix = '[REPLAY · READ-ONLY] ' + ((ds.clustersSimulated || ds.ghostsSimulated) ? '[SIMULATED PREVIEW] ' : '[OBSERVED] ');
+          var act3Prefix = '[REPLAY · READ-ONLY] ' + (ds.clustersSimulated ? '[SIMULATED PREVIEW] ' : '[OBSERVED] ');
+          var act4Prefix = '[REPLAY · READ-ONLY] ' + (ds.isSimulated ? '[SIMULATED PREVIEW] ' : '[OBSERVED] ');
           if (!ds.actLogged[1] && p >= 0.01) {
             ds.actLogged[1] = true;
             shockwaves.push({ x: 0, y: 0, r: 12, maxR: stageDim() * 0.38, color: '#a78bfa', alpha: 0.9, hex: true });
-            logStream('lookup', dsLogPrefix + 'ACT I · STAGE 0 SPECTRAL TOPIC EIGENVECTORS: Visualizing ' + ds.eigens.length + (ds.eigensSimulated ? ' Simulated Preview Eigen-Axes & ' : ' Observed Eigen-Axes & ') + ds.reorgArcs.length + (ds.arcsSimulated ? ' Simulated Preview Topic Arcs' : ' Observed Topic Reorganizations'));
+            logStream('lookup', act1Prefix + 'ACT I · STAGE 0 SPECTRAL TOPIC EIGENVECTORS: Visualizing ' + ds.eigens.length + (ds.eigensSimulated ? ' Simulated Preview Eigen-Axes & ' : ' Observed Eigen-Axes & ') + ds.reorgArcs.length + (ds.arcsSimulated ? ' Simulated Preview Topic Arcs' : ' Observed Topic Reorganizations'));
           }
           if (!ds.actLogged[2] && p >= 0.25) {
             ds.actLogged[2] = true;
-            logStream('lookup', dsLogPrefix + 'ACT II · STAGE 1 SYNAPTIC DISTILLATION: Visualizing ' + ds.totalSources + (ds.ghostsSimulated ? ' Simulated/Ghost Sources across ' : ' Superseded Checkpoints across ') + ds.totalMerkle + (ds.clustersSimulated ? ' Simulated Preview Clusters (0 persisted merkle_sources)' : ' merkle_sources Claims'));
+            logStream('lookup', act2Prefix + 'ACT II · STAGE 1 SYNAPTIC DISTILLATION: Visualizing ' + ds.totalSources + (ds.ghostsSimulated ? ' Simulated/Ghost Sources across ' : ' Superseded Checkpoints across ') + ds.totalMerkle + (ds.clustersSimulated ? ' Simulated Preview Clusters (' + (ds.observedMerkleCount || 0) + ' persisted merkle_sources)' : ' merkle_sources Claims'));
           }
           if (!ds.actLogged[3] && p >= 0.62) {
             ds.actLogged[3] = true;
@@ -4687,7 +4755,7 @@ export function renderViewerHtml(initialState) {
                 pulses.push({ kind: 'recall', fromNode: cn, fromX: cn.x, fromY: cn.y, toX: ag.x, toY: ag.y, agent: ag, color: '#a78bfa', t: 0, speed: 0.024 });
               }
             });
-            logStream('lookup', dsLogPrefix + 'ACT III · STAGE 2 CLASS B PROMOTION: Highlighting ' + ds.classBNodes.length + (ds.clustersSimulated ? ' Simulated Preview Class B Candidates across multi-agent ganglia' : ' Observed Class B crystals across multi-agent ganglia'));
+            logStream('lookup', act3Prefix + 'ACT III · STAGE 2 CLASS B PROMOTION: Highlighting ' + ds.classBNodes.length + (ds.clustersSimulated ? ' Simulated Preview Class B Candidates across multi-agent ganglia' : ' Observed Class B crystals across multi-agent ganglia'));
           }
           if (!ds.actLogged[4] && p >= 0.85) {
             ds.actLogged[4] = true;
@@ -4695,7 +4763,7 @@ export function renderViewerHtml(initialState) {
             ds.classBNodes.slice(0, 10).forEach(function (cn) {
               pulses.push({ kind: 'recall', fromNode: cn, fromX: cn.x, fromY: cn.y, toX: 0, toY: 0, color: '#fbbf24', t: 0, speed: 0.028 });
             });
-            logStream('lookup', dsLogPrefix + 'ACT IV · STAGE 3 CANON SOLIDIFICATION: ' + (ds.isSimulated ? 'Simulated Preview Overlay · Current Hive Coherence ' : 'Observed Hive Coherence ') + (latestCoherence && typeof latestCoherence.score === 'number' ? Number(latestCoherence.score).toFixed(1) + '%' : 'N/A'));
+            logStream('lookup', act4Prefix + 'ACT IV · STAGE 3 CANON SOLIDIFICATION: ' + (ds.isSimulated ? 'Simulated Preview Overlay · Current Hive Coherence ' : 'Observed Hive Coherence ') + (latestCoherence && typeof latestCoherence.score === 'number' ? Number(latestCoherence.score).toFixed(1) + '%' : 'N/A'));
           }
           if (p >= 0.22 && p <= 0.68) {
             var act2P = Math.max(0, Math.min(1, (p - 0.22) / 0.40));
@@ -4920,6 +4988,10 @@ export function renderViewerHtml(initialState) {
                 ctx.font = '600 8.5px ui-monospace, monospace';
                 ctx.fillStyle = '#fde68a';
                 ctx.fillText('SIMULATED PREVIEW GHOST', tn.x, tn.y - 9);
+              } else if (tn.isHistoricalSource) {
+                ctx.font = '600 8.5px ui-monospace, monospace';
+                ctx.fillStyle = '#7dd3fc';
+                ctx.fillText('HISTORICAL SOURCE', tn.x, tn.y - 9);
               }
             }
           });
@@ -5008,10 +5080,14 @@ export function renderViewerHtml(initialState) {
                 ctx.strokeStyle = '#fde68a';
                 ctx.lineWidth = 1;
                 ctx.stroke();
-                if (src.node && (src.node.isSourceGhost || src.simulated)) {
+                if (src.simulated || (src.node && (src.node.isSyntheticGhost || src.node.simulated))) {
                   ctx.font = '600 8px ui-monospace, monospace';
                   ctx.fillStyle = '#fde68a';
                   ctx.fillText('SIMULATED GHOST', src.x, src.y - 7);
+                } else if (src.node && src.node.isHistoricalSource) {
+                  ctx.font = '600 8px ui-monospace, monospace';
+                  ctx.fillStyle = '#7dd3fc';
+                  ctx.fillText('HISTORICAL SOURCE', src.x, src.y - 7);
                 }
               });
               polygon(tx, ty, 6, 11, tick * 0.07);
@@ -5260,7 +5336,7 @@ export function renderViewerHtml(initialState) {
           } else if (bp < 0.62) {
             actTitle = 'ACT II / IV · STAGE 1: SYNAPTIC DISTILLATION (' + (dsBanner.clustersSimulated || dsBanner.ghostsSimulated ? 'SIMULATED PREVIEW' : 'OBSERVED REPLAY') + ')';
             actSub = dsBanner.clustersSimulated
-              ? ('Simulated Preview: ' + dsBanner.totalSources + ' Synthetic/Ghost Sources across ' + dsBanner.totalMerkle + ' Preview Clusters (0 persisted merkle_sources)')
+              ? ('Simulated Preview: ' + dsBanner.totalSources + ' Synthetic/Ghost Sources across ' + dsBanner.totalMerkle + ' Preview Clusters (' + (dsBanner.observedMerkleCount || 0) + ' persisted merkle_sources)')
               : ('Observed: ' + dsBanner.totalSources + ' Superseded Checkpoints across ' + dsBanner.totalMerkle + ' merkle_sources Claims' + (dsBanner.ghostsSimulated ? ' (' + dsBanner.ghostSourcesCount + ' simulated ghost sources)' : ''));
             actCol = '#fbbf24';
           } else if (bp < 0.85) {
@@ -5971,6 +6047,22 @@ export async function startMemoryViewer({
       })
       const spectral = computeTopicEigenvectors(records, { maxComponents: 7 })
       const previewPlan = planMerkleDream({ records, nowSec })
+      const hasPersistedEigens =
+        lastCuratedAt > 0 &&
+        Array.isArray(persistedCurator?.topic_eigenvectors) &&
+        persistedCurator.topic_eigenvectors.length > 0 &&
+        !persistedCurator.topic_eigenvectors.some(e => e?.simulated || e?.persisted === false)
+      const hasPersistedReorgs =
+        lastCuratedAt > 0 &&
+        Array.isArray(persistedCurator?.topic_reorganizations) &&
+        persistedCurator.topic_reorganizations.length > 0 &&
+        !persistedCurator.topic_reorganizations.some(r => r?.simulated || r?.persisted === false)
+      const topicEigenvectors = hasPersistedEigens
+        ? persistedCurator.topic_eigenvectors.map(e => ({ ...e, persisted: true, simulated: false }))
+        : spectral.eigenvectors.map(e => ({ ...e, persisted: false, simulated: true }))
+      const topicReorganizations = hasPersistedReorgs
+        ? persistedCurator.topic_reorganizations.map(r => ({ ...r, persisted: true, simulated: false }))
+        : spectral.reorganizations.map(r => ({ ...r, persisted: false, simulated: true }))
       const curatorState = {
         state_file: activeStateFile,
         state_file_present: Boolean(persistedCurator),
@@ -5991,8 +6083,8 @@ export async function startMemoryViewer({
         stale_count: triggerEval.stale_count,
         refusal_count_15m: triggerEval.refusal_count_15m,
         coherence_score: triggerEval.coherence_score,
-        topic_eigenvectors: spectral.eigenvectors,
-        topic_reorganizations: spectral.reorganizations,
+        topic_eigenvectors: topicEigenvectors,
+        topic_reorganizations: topicReorganizations,
         consolidation_ledger: Array.isArray(persistedCurator?.consolidation_ledger) ? persistedCurator.consolidation_ledger : [],
         planned_clusters: [...previewPlan.promotions, ...previewPlan.distillations].slice(0, 60).map(c => ({
           stage: c.stage,
@@ -6039,7 +6131,7 @@ export async function startMemoryViewer({
         : (records.length > 0 ? 'found' : String(firstQuery?.answer || 'unknown'))
 
       nextSnapshot = {
-        viewer_version: '2026-11-09-v11',
+        viewer_version: '2026-11-09-v12',
         connected: true,
         error: null,
         server_name: client.getServerName() || 'hive-memory-viewer',

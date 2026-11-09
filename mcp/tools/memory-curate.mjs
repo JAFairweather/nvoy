@@ -101,6 +101,12 @@ export function readCuratorStateFile(stateFilePath) {
     topic_pressure_threshold: typeof raw.topic_pressure_threshold === 'number' && Number.isFinite(raw.topic_pressure_threshold) ? raw.topic_pressure_threshold : DEFAULT_TOPIC_PRESSURE_THRESHOLD,
     triggers: raw.triggers && typeof raw.triggers === 'object' ? raw.triggers : null,
     coherence_score: typeof raw.coherence_score === 'number' ? raw.coherence_score : null,
+    topic_eigenvectors: Array.isArray(raw.topic_eigenvectors)
+      ? raw.topic_eigenvectors.map(e => ({ ...e, persisted: e?.persisted !== false, simulated: Boolean(e?.simulated) }))
+      : null,
+    topic_reorganizations: Array.isArray(raw.topic_reorganizations)
+      ? raw.topic_reorganizations.map(r => ({ ...r, persisted: r?.persisted !== false, simulated: Boolean(r?.simulated) }))
+      : null,
     consolidation_ledger: readConsolidationLedger(ledgerPath),
   }
 }
@@ -1335,6 +1341,28 @@ export async function runCuratorCycle({
     const nextCuratedWriteSeq = cursorAdvanced ? postWriteSeq : effectiveLastCuratedWriteSeq
 
     if (hasWriteCapability && resolvedStateFile && cursorAdvanced) {
+      const submittedDs = new Set(submitted.map(s => s.d))
+      const executedReorgPairs = new Set()
+      for (const item of [...plan.promotions, ...plan.distillations]) {
+        const dTag = item.template?.tags?.find(t => t[0] === 'd')?.[1]
+        if (dTag && submittedDs.has(dTag) && Array.isArray(item.reorganized_from_topics)) {
+          for (const fromTop of item.reorganized_from_topics) {
+            executedReorgPairs.add(`${fromTop}->${item.topic}`)
+          }
+        }
+      }
+      const persistedEigenvectors = submitted.length > 0
+        ? (Array.isArray(plan.topic_eigenvectors)
+            ? plan.topic_eigenvectors.map(e => ({ ...e, persisted: true, simulated: false }))
+            : [])
+        : (Array.isArray(persisted?.topic_eigenvectors) ? persisted.topic_eigenvectors : [])
+      const persistedReorganizations = submitted.length > 0
+        ? (Array.isArray(plan.topic_reorganizations)
+            ? plan.topic_reorganizations
+                .filter(r => executedReorgPairs.has(`${r.from_topic}->${r.to_topic}`))
+                .map(r => ({ ...r, persisted: true, simulated: false }))
+            : [])
+        : (Array.isArray(persisted?.topic_reorganizations) ? persisted.topic_reorganizations : [])
       writeCuratorStateFile(resolvedStateFile, {
         last_curated_at: nextCuratedAt,
         last_curated_write_seq: nextCuratedWriteSeq,
@@ -1345,6 +1373,8 @@ export async function runCuratorCycle({
         topic_pressure_threshold: topicPressureThreshold,
         triggers: triggerEval,
         coherence_score: triggerEval.coherence_score,
+        topic_eigenvectors: persistedEigenvectors,
+        topic_reorganizations: persistedReorganizations,
       })
       const ledgerPath = resolveConsolidationLedgerPath({ stateFile: resolvedStateFile, socketPath: readerSocket })
       if (ledgerPath) {
