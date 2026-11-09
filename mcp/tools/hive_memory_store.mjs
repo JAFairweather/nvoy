@@ -837,17 +837,43 @@ export class HiveMemoryStore {
   // A stored claim `s` named in `supersedes` by a live, newer claim `c` in the same scope leaves the default view
   // as 'consolidated' when `s` is a workflow checkpoint (isWorkflowSlug) OR `c` is signed by a configured Curator
   // (`config.curators`). Canon is never hidden this way. Withdrawing or expiring `c` brings `s` back immediately.
-  #consolidatedBy(nowSec) {
+  // Additionally, if a Curator `curated-*` distillation `c` superseded a source claim `s` and a newer live claim `n`
+  // in the same scope (`n.created_at >= c.created_at`) has since replaced `s` at `n.d = s.d` or superseded `s`/`c`,
+  // `c` is immediately marked consolidated by `n` (or `n`'s consolidator) so obsolete distillations never shadow newer facts.
+  #consolidatedBy(nowSec, { excludeCuratorIds = null } = {}) {
     const out = new Map()
     const curators = this.config?.curators || new Set()
+    const excluded = excludeCuratorIds instanceof Set ? excludeCuratorIds : Array.isArray(excludeCuratorIds) ? new Set(excludeCuratorIds) : null
     const rows = this.db.prepare(`SELECT s.id AS sid, s.d AS sd, c.id AS cid, c.pubkey AS cpubkey FROM links l
       JOIN events c ON c.id = l.from_id JOIN events s ON s.id = l.target
       WHERE l.relation = 'supersedes' AND c.is_current = 1 AND c.status = 'active' AND (c.exp IS NULL OR c.exp > ?)
         AND c.scope = s.scope AND c.created_at >= s.created_at AND c.id <> s.id AND s.scope_type <> 'hive:canon'
       ORDER BY c.created_at DESC, c.id`).all(nowSec)
     for (const r of rows) {
+      if (excluded && excluded.has(r.cid)) continue
       if (!out.has(r.sid) && (curators.has(r.cpubkey) || isWorkflowSlug(parseFactKey(r.sd)?.slug))) {
         out.set(r.sid, r.cid)
+      }
+    }
+    const staleCuratedRows = this.db.prepare(`SELECT c.id AS cid, c.pubkey AS cpubkey, c.d AS cd, n.id AS nid
+      FROM links l
+      JOIN events c ON c.id = l.from_id
+      JOIN events s ON s.id = l.target
+      JOIN events n ON n.scope = s.scope AND n.is_current = 1 AND n.status = 'active' AND (n.exp IS NULL OR n.exp > ?)
+      WHERE l.relation = 'supersedes'
+        AND c.is_current = 1 AND c.status = 'active' AND (c.exp IS NULL OR c.exp > ?)
+        AND c.scope = s.scope AND s.scope_type <> 'hive:canon'
+        AND n.created_at >= c.created_at AND n.id <> c.id AND n.id <> s.id
+        AND NOT EXISTS (SELECT 1 FROM links l2 WHERE l2.from_id = c.id AND l2.relation = 'supersedes' AND l2.target = n.id)
+        AND (
+          n.d = s.d
+          OR EXISTS (SELECT 1 FROM links l3 WHERE l3.from_id = n.id AND l3.relation = 'supersedes' AND (l3.target = s.id OR l3.target = c.id))
+        )
+      ORDER BY n.created_at DESC, n.id`).all(nowSec, nowSec)
+    for (const r of staleCuratedRows) {
+      if (excluded && (excluded.has(r.cid) || excluded.has(r.nid))) continue
+      if (!out.has(r.cid) && curators.has(r.cpubkey) && String(r.cd || '').includes(':curated-')) {
+        out.set(r.cid, out.get(r.nid) || r.nid)
       }
     }
     return out
@@ -862,7 +888,7 @@ export class HiveMemoryStore {
   query({
     readerPubkey = '', scope = null, roomId = null, topic = null, d = null, author = null, since = null, until = null, text = null,
     linkedTo = null, supersedesOf = null, includeHistory = false, limit = DEFAULT_QUERY_LIMIT, cursor = 0, staleFiles = new Set(),
-    format = null, nowSec = nowSecDefault(),
+    format = null, nowSec = nowSecDefault(), excludeCuratorIds = null,
   } = {}) {
     const fmt = format === 'index' || format === 'full' ? format : d ? 'full' : 'index'
     const empty = (answer, reason) => ({
@@ -887,9 +913,10 @@ export class HiveMemoryStore {
     }
     if (supersedesOf) add('id IN (SELECT value FROM json_each(?))', JSON.stringify([...this.#lineage(readerPubkey, String(supersedesOf))]))
     const wantTopic = topic ? normalizeMemoryTopic(topic) ?? String(topic) : null
-    const consolidated = this.#consolidatedBy(nowSec)
+    const excluded = excludeCuratorIds instanceof Set ? excludeCuratorIds : Array.isArray(excludeCuratorIds) ? new Set(excludeCuratorIds) : null
+    const consolidated = this.#consolidatedBy(nowSec, { excludeCuratorIds: excluded })
     const rows = this.db.prepare(`SELECT * FROM events WHERE ${where.join(' AND ')}`).all(...params)
-      .filter(r => canRead(readerPubkey, r, this.config) && (!wantTopic || topicOf(r) === wantTopic))
+      .filter(r => (!excluded || !excluded.has(r.id)) && canRead(readerPubkey, r, this.config) && (!wantTopic || topicOf(r) === wantTopic))
       .map(r => ({ row: r, verdict: verdictOf(r, nowSec, staleFiles, consolidated), body: JSON.parse(JSON.parse(r.raw_json).content) }))
       .filter(x => includeHistory || x.verdict.verification === 'accepted')
     const byFactKey = new Map()
@@ -926,7 +953,7 @@ export class HiveMemoryStore {
 
   // `frame` turns the wake into the text the caller actually returns (the daemon adds its reader fields and pretty-prints);
   // the budget is measured on that text, canon left out.
-  wake({ readerPubkey = '', roomId = null, maxChars = DEFAULT_WAKE_MAX_CHARS, gitBanner = null, staleFiles = new Set(), nowSec = nowSecDefault(), frame = o => JSON.stringify(o, null, 2) } = {}) {
+  wake({ readerPubkey = '', roomId = null, maxChars = DEFAULT_WAKE_MAX_CHARS, gitBanner = null, staleFiles = new Set(), nowSec = nowSecDefault(), frame = o => JSON.stringify(o, null, 2), excludeCuratorIds = null } = {}) {
     const budget = Number.isSafeInteger(maxChars) && maxChars >= MIN_WAKE_MAX_CHARS ? maxChars : DEFAULT_WAKE_MAX_CHARS
     const storeState = this.storeState(readerPubkey, nowSec)
     const title = '=== HIVE WAKE DIGEST (authority: null, trustedInstruction: false) ==='
@@ -936,9 +963,10 @@ export class HiveMemoryStore {
       return { ...base, digest, char_length: digest.length, counts: { canon_shown: 0, canon_omitted: 0, ops_shown: 0, ops_omitted: 0 }, records: [] }
     }
     const cleanRoom = roomId ? String(roomId).toLowerCase() : null
-    const consolidated = this.#consolidatedBy(nowSec)
+    const excluded = excludeCuratorIds instanceof Set ? excludeCuratorIds : Array.isArray(excludeCuratorIds) ? new Set(excludeCuratorIds) : null
+    const consolidated = this.#consolidatedBy(nowSec, { excludeCuratorIds: excluded })
     const items = this.#activeRows(readerPubkey, nowSec)
-      .filter(r => r.scope_type !== 'room' || !cleanRoom || r.room_id === cleanRoom)
+      .filter(r => (!excluded || !excluded.has(r.id)) && (r.scope_type !== 'room' || !cleanRoom || r.room_id === cleanRoom))
       .map(r => ({ row: r, verdict: verdictOf(r, nowSec, staleFiles, consolidated), body: JSON.parse(JSON.parse(r.raw_json).content) }))
     const consolidatedHidden = items.filter(x => x.verdict.verification === 'consolidated').length
     const factKeyClaims = new Map()

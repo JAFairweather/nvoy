@@ -1,0 +1,188 @@
+{
+  "benchmark_version": "1.0.0",
+  "frozen_at": "2026-11-09T12:30:00Z",
+  "description": "Frozen 20-question settled-answer benchmark for Hive Memory Merkle Dreaming before/after evaluation.",
+  "questions": [
+    {
+      "id": "q01",
+      "category": "canon",
+      "question": "Who approves PRs and architectural designs across Hive repositories before merge?",
+      "query": { "scope": "hive:canon", "text": "approves PRs" },
+      "expected_d_substrings": ["hive:canon:review-merge-deploy-authority"],
+      "expected_claim_tokens": ["My Dude approves PRs"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q02",
+      "category": "canon",
+      "question": "What are James's active Hive priorities in order?",
+      "query": { "scope": "hive:canon", "text": "active Hive priorities" },
+      "expected_d_substrings": ["hive:canon:active-hive-priorities"],
+      "expected_claim_tokens": ["Illustrated Primer", "Waggle Hive"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q03",
+      "category": "canon",
+      "question": "What is the target fleet topology and isolation rule for agents?",
+      "query": { "scope": "hive:canon", "text": "isolated from the others" },
+      "expected_d_substrings": ["hive:canon:fleet-topology-and-isolation"],
+      "expected_claim_tokens": ["own host user", "own keys"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q04",
+      "category": "canon",
+      "question": "Who are the delegated leads for research, sysops, and report authoring through My Dude?",
+      "query": { "scope": "hive:canon", "text": "Dennis for research" },
+      "expected_d_substrings": ["hive:canon:mydude-delegation-roles"],
+      "expected_claim_tokens": ["Dennis", "Neil", "Kerouac"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q05",
+      "category": "workflow",
+      "question": "What is the current status of herd-infra PR 79 (curator seat and watch check)?",
+      "query": { "topic": "herd-infra", "text": "pr79" },
+      "expected_d_substrings": ["decision-herd-infra-pr79", "herd-infra-pr79-curator-seat-owner", "herd-infra-pr79-postdeploy-verification"],
+      "expected_claim_tokens": ["0d7ac77"],
+      "stale_d_substrings": ["curated-herd-infra-pr79"],
+      "stale_claim_tokens": ["awaiting @mydude approval"]
+    },
+    {
+      "id": "q06",
+      "category": "decision",
+      "question": "Did the PR 79 bootstrap write fence end with all 17 writer sockets open?",
+      "query": { "topic": "hive-memory", "text": "write fence" },
+      "expected_d_substrings": ["decision-hive-memory-pr79", "hive-memory-pr79-write-fence"],
+      "expected_claim_tokens": ["17 writer sockets open"],
+      "stale_claim_tokens": ["write_fence_closed"]
+    },
+    {
+      "id": "q07",
+      "category": "decision",
+      "question": "What is the status of nvoy PR 340 and live viewer HTTP 200 verification?",
+      "query": { "topic": "nvoy", "text": "340" },
+      "expected_d_substrings": ["decision-nvoy-pr340", "nvoy-pr340"],
+      "expected_claim_tokens": ["0b2a3ef"],
+      "stale_claim_tokens": ["awaiting review"]
+    },
+    {
+      "id": "q08",
+      "category": "decision",
+      "question": "What commit merged nvoy PR 336 and deployed to herd-cloud:8795?",
+      "query": { "topic": "nvoy", "text": "336" },
+      "expected_d_substrings": ["decision-nvoy-pr336", "nvoy-pr336"],
+      "expected_claim_tokens": ["08417b2"],
+      "stale_claim_tokens": ["unmerged"]
+    },
+    {
+      "id": "q09",
+      "category": "decision",
+      "question": "What commit merged nvoy PR 335 on herd-cloud?",
+      "query": { "topic": "hive-memory", "text": "335" },
+      "expected_d_substrings": ["decision-hive-memory-pr335", "pr335"],
+      "expected_claim_tokens": ["58e731d"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q10",
+      "category": "decision",
+      "question": "Is the 'Check memory every turn' rule from herd-infra PR 74 live across agent rules?",
+      "query": { "topic": "herd-infra", "text": "Check memory every turn" },
+      "expected_d_substrings": ["decision-herd-infra-pr74", "pr74"],
+      "expected_claim_tokens": ["6e53ea0"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q11",
+      "category": "decision",
+      "question": "How does LukeDog's view run on herd-cloud after herd-infra PR 69?",
+      "query": { "topic": "herd-infra", "text": "lukedog" },
+      "expected_d_substrings": ["decision-herd-infra-pr69", "pr69"],
+      "expected_claim_tokens": ["openclaw-view"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q12",
+      "category": "decision",
+      "question": "Why does herdr 0.9.5 refuse R1 voice prompts to LukeDog?",
+      "query": { "topic": "r1", "text": "openclaw" },
+      "expected_d_substrings": ["decision-r1-pr70", "pr70", "lukedog"],
+      "expected_claim_tokens": ["agent_not_ready"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q13",
+      "category": "distillation",
+      "question": "What PRs merged the R1 home screen and made it live on R1?",
+      "query": { "topic": "r1", "text": "home screen" },
+      "expected_d_substrings": ["curated-r1-pr89", "pr89", "pr88"],
+      "expected_claim_tokens": ["2a608a4"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q14",
+      "category": "decision",
+      "question": "What commit merged the Herd Board to Illustrated Primer rename (rabidrabbit PR 79)?",
+      "query": { "topic": "illustrated-primer", "text": "Illustrated Primer rename" },
+      "expected_d_substrings": ["decision-illustrated-primer-pr79", "pr79"],
+      "expected_claim_tokens": ["6d6315f"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q15",
+      "category": "decision",
+      "question": "How does The Illustrated Primer handle Pi Dog's lesson route after PR 90?",
+      "query": { "topic": "illustrated-primer", "text": "lesson route" },
+      "expected_d_substrings": ["decision-illustrated-primer-pr90", "pr90"],
+      "expected_claim_tokens": ["b504e68"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q16",
+      "category": "decision",
+      "question": "What is the recommended publication boundary for exposing Cortex data to Buzz?",
+      "query": { "topic": "hive-memory", "text": "Cortex projection" },
+      "expected_d_substrings": ["decision-hive-memory-buzz-cortex-publication-boundary", "cortex-publication-boundary"],
+      "expected_claim_tokens": ["allowlisted static public Cortex projection"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q17",
+      "category": "distillation",
+      "question": "Is nvoy PR 333 superseded by merged PR 344?",
+      "query": { "topic": "nvoy", "text": "333" },
+      "expected_d_substrings": ["curated-nvoy-pr333", "pr333"],
+      "expected_claim_tokens": ["not superseded by merged PR 344"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q18",
+      "category": "decision",
+      "question": "How does Claude Code reach herd-cloud agents after herd-infra PR 44?",
+      "query": { "topic": "herd-infra", "text": "native installer" },
+      "expected_d_substrings": ["decision-herd-infra-pr44", "pr44"],
+      "expected_claim_tokens": ["install-agent"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q19",
+      "category": "decision",
+      "question": "Where did James decide the curator's dream narratives should be published?",
+      "query": { "topic": "hive-memory", "text": "dream-journal" },
+      "expected_d_substrings": ["hive-memory-dream-narrative-destinations", "decision-hive-memory-dream-narrative"],
+      "expected_claim_tokens": ["#dream-journal"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q20",
+      "category": "decision",
+      "question": "How does the Merkle Dreaming curator sign and submit claims on herd-cloud?",
+      "query": { "topic": "hive-memory", "text": "curator.sec" },
+      "expected_d_substrings": ["merkle-dreaming-curator-seat-architecture", "decision-hive-memory-curator"],
+      "expected_claim_tokens": ["curator.sec"],
+      "stale_claim_tokens": []
+    }
+  ]
+}
