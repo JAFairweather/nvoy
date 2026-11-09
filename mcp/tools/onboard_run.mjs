@@ -11,6 +11,7 @@ import { join } from 'node:path'
 import { readManifest } from './runtime_manifest.mjs'
 import { newestRequest, OnboardRefusal, parseSetupRequest } from './onboard_request.mjs'
 import { joinHive, joinRooms } from './onboard_join.mjs'
+import { readStagedKey } from './onboard_stage.mjs'
 import { profileRequestIdsPath, profileResultsPath, profileStatus, queueProfile } from './agent_profile.mjs'
 
 export const WRITERS_KIND = 30000, WRITERS_D = 'nave-relay-writers'
@@ -246,6 +247,10 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
   // Stop at the first step that is not done. After those four, givers, the relay writer and the hive
   // do not depend on each other; rooms waits for the hive's login.
   let agentLink = null, session = null
+  // A hosted agent's public channel key, staged across by the operator helper, is reported first so the owner
+  // can bind it; the loop below waits on pairing and the bind. No staged file means an own-box agent: no row.
+  const staged = readStagedKey({ stateDir, request: add.id, instance: name, bound: bind?.channelKey || null })
+  if (staged) { receipt('channel_key', staged.state, staged.detail); await publish() }
   try {
     for (const [index, [, step]] of steps.entries()) {
       const done = await step()

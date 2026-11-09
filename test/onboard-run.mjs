@@ -70,6 +70,14 @@ const staged = JSON.parse(readFileSync(join(out, 'hr.json'), 'utf8'))
 assert.equal(staged.may_set_profile.pubkey, agent); assert.equal(staged.may_set_profile.per_day, 1)
 assert.deepEqual(staged.may_set_profile.picture_hosts, ['nave.pub']); assert.match(staged.may_set_profile.grant_id, /^[0-9a-f]{64}$/)
 
+// A hosted agent's public key, staged for this request, is reported before the pairing wait ends; no file, no row.
+const stage = join(stateDir, `${add.id}.staged-channel.pub`)
+writeFileSync(stage, `${KEY.split(' ').slice(0, 2).join(' ')} nvoy-stage:hr:${add.id}\n`)
+result = await run()
+assert.equal(states(result).channel_key, 'done'); assert.equal(states(result).paired, 'pending')
+assert.match(result.receipts.find(row => row.step === 'channel_key').detail, /staged for the owner to bind/)
+rmSync(stage)
+
 // Approved: paired and checked, then waits for the box's bind_runtime.
 approved = true
 result = await run()
@@ -148,16 +156,16 @@ assert.equal(JSON.parse(readFileSync(join(backupRoot, backups[0], readdirSync(jo
 
 // Each tool that changes state ran once, except the pairing the owner had not yet approved; the
 // read-only check runs again before the install. A further run runs nothing.
-assert.deepEqual(calls, ['allocate', 'pair', 'pair', 'check', 'check', 'apply'])
+assert.deepEqual(calls, ['allocate', 'pair', 'pair', 'pair', 'check', 'check', 'apply'])
 result = await run({ giversRedeploy: true })
-assert.deepEqual(calls, ['allocate', 'pair', 'pair', 'check', 'check', 'apply'])
+assert.deepEqual(calls, ['allocate', 'pair', 'pair', 'pair', 'check', 'check', 'apply'])
 assert.match(result.receipts.find(row => row.step === 'givers').detail, /every seat giver can mention hr/)
 assert.equal(JSON.parse(readFileSync(join(root, 'pi-dog.json'), 'utf8')).may_post.mention.length, 1)
 
 // A bind_runtime for another key is refused before anything runs.
 events = [add, sign([...bind.tags.filter(tag => tag[0] !== 'p'), ['p', outsider]])]
 await assert.rejects(run(), error => error.code === 'ONBOARD_BIND_MISMATCH')
-assert.deepEqual(calls, ['allocate', 'pair', 'pair', 'check', 'check', 'apply'])
+assert.deepEqual(calls, ['allocate', 'pair', 'pair', 'pair', 'check', 'check', 'apply'])
 
 // Signed again after it started (the terms changed, or the invite expired): the new request continues
 // to the hive with nothing reinstalled. A re-sign that changes its harness is refused.
@@ -165,7 +173,7 @@ events = [sign(add.tags, at + 1), bind]
 result = await run({ giversRedeploy: true })
 assert.deepEqual(states(result), { staged: 'done', paired: 'done', checked: 'done', started: 'done', profile: 'done', givers: 'pending', 'relay writer': 'pending', hive: 'pending', rooms: 'pending' })
 assert.match(result.receipts.find(row => row.step === 'started').detail, /^installed$/)
-assert.deepEqual(calls, ['allocate', 'pair', 'pair', 'check', 'check', 'apply'])
+assert.deepEqual(calls, ['allocate', 'pair', 'pair', 'pair', 'check', 'check', 'apply'])
 events = [sign(add.tags.map(tag => tag[0] === 'harness' ? ['harness', 'codex'] : tag), at + 2), bind]
 await assert.rejects(run(), error => error.code === 'ONBOARD_EXISTS')
 
