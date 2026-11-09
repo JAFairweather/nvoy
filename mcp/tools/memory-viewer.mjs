@@ -32,8 +32,6 @@ import {
 } from './memory-curate.mjs'
 
 const DEFAULT_POLL_MS = 3000
-// Deep history pages take ~3 s each from the daemon today; 5 s failed whole polls under load.
-const TOOL_CALL_TIMEOUT_MS = 30_000
 const MAX_EVENT_LOG = 60
 // One version for the page and the live snapshot: the page reloads whenever they differ.
 const VIEWER_VERSION = '2026-11-09-v12'
@@ -1890,7 +1888,7 @@ export function createSingleSocketMcpClient(socketPath) {
     const res = await sendRaw({
       method: 'tools/call',
       params: { name, arguments: args },
-    }, TOOL_CALL_TIMEOUT_MS)
+    })
     if (res?.isError) {
       throw new Error(res?.content?.[0]?.text || `tool ${name} returned error`)
     }
@@ -6186,13 +6184,8 @@ export async function startMemoryViewer({
   }
 
   await pollOnce()
-  // A full history sweep can outlast pollMs (16 s at ~1,100 writes); overlapping sweeps pile onto the daemon and
-  // the viewer's memory, so a tick is skipped while one is still running.
-  let polling = false
   const pollTimer = setInterval(() => {
-    if (polling) return
-    polling = true
-    pollOnce().finally(() => { polling = false })
+    void pollOnce()
   }, pollMs)
   pollTimer.unref?.()
 
