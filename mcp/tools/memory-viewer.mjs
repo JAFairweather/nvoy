@@ -34,7 +34,7 @@ import {
 const DEFAULT_POLL_MS = 3000
 const MAX_EVENT_LOG = 60
 // One version for the page and the live snapshot: the page reloads whenever they differ.
-const VIEWER_VERSION = '2026-11-09-v12'
+const VIEWER_VERSION = '2026-11-09-v13'
 const ACTIVITY_KINDS = new Set(['wake', 'query', 'lookup', 'submit', 'refused'])
 
 export function escapeHtml(value) {
@@ -2133,8 +2133,10 @@ export function renderViewerHtml(initialState) {
     .stream-item.sim { border-left-style: dashed; border-left-color: #fbbf24; color: #fde68a; }
     .inspector { flex: 1 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 9px; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
     .inspector > *, #coherence-graphs-box > *, .glass-box > canvas { flex-shrink: 0; }
-    .inspect-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; border-bottom: 1px solid var(--border); padding-bottom: 7px; }
-    .inspect-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+    .inspect-header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; gap: 8px; border-bottom: 1px solid var(--border); padding-bottom: 7px; }
+    .inspect-header > div:first-child { flex: 1 1 180px; }
+    .inspect-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 1; min-width: 0; max-width: 100%; }
+    .inspect-actions .badge { white-space: normal; }
     .inspect-close { padding: 3px 8px; font-size: 12px; line-height: 1.2; border-radius: 6px; }
     .inspect-kicker { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
     .inspect-title { font-family: var(--mono); font-size: 13px; font-weight: 700; color: #93c5fd; word-break: break-word; }
@@ -3725,6 +3727,7 @@ export function renderViewerHtml(initialState) {
       }
 
       function openDreamingInspector() {
+        if (view !== 'graph') switchView('graph');
         var d = computeDreamingTelemetry();
         var cs = d.curatorState;
         selected = { type: 'dreaming', data: d };
@@ -3740,6 +3743,7 @@ export function renderViewerHtml(initialState) {
       }
 
       function inspectDreamTriggers() {
+        if (view !== 'graph') switchView('graph');
         var d = computeDreamingTelemetry();
         var cs = d.curatorState;
         var lastAtStr = cs.last_curated_at ? (fmtTime(cs.last_curated_at) + ' (' + cs.elapsed_sec + 's/' + cs.dream_interval_sec + 's)') : 'never (0s/' + cs.dream_interval_sec + 's)';
@@ -4339,7 +4343,7 @@ export function renderViewerHtml(initialState) {
             'Merkle Dreaming & Curation · Passive Inspector',
             '-' + dr.wakeSavings.toFixed(1) + '% Est. Wake Bytes',
             isMixed
-              ? ('OBSERVED MERKLE (' + dr.merkleCount + ' persisted merkle_sources) + SIMULATED PREVIEW · READ-ONLY')
+              ? ('MIXED · ' + dr.merkleCount + ' MERKLE + PREVIEW')
               : (isSim ? 'SIMULATED PREVIEW · PASSIVE INSPECTION · READ-ONLY' : 'OBSERVED CURATION · PASSIVE INSPECTION · READ-ONLY'),
             isSim ? 'warn' : 'info',
             '#a78bfa'
