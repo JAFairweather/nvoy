@@ -37,19 +37,29 @@ export function loadFrozenQuestions(questionsPath = DEFAULT_QUESTIONS_PATH) {
   if (!raw || !Array.isArray(raw.questions) || raw.questions.length === 0) {
     throw new Error(`invalid dream-eval questions file: ${questionsPath}`)
   }
+  for (const q of raw.questions) {
+    if (!Array.isArray(q.supporting_event_ids) || q.supporting_event_ids.length === 0) {
+      throw new Error(`question ${q?.id || '<unknown>'} in ${questionsPath} is missing supporting_event_ids`)
+    }
+  }
   return raw
 }
 
 function matchesGroundTruth(record, q) {
   const d = String(record.d || '').toLowerCase()
   const claim = String(record.claim || record.claim_preview || '').toLowerCase()
+  const hasSupportingIds = Array.isArray(q.supporting_event_ids) && q.supporting_event_ids.length > 0
+  const idMatches = hasSupportingIds
+    ? (q.supporting_event_ids.includes(record.event_id) ||
+       (Array.isArray(record.supersedes) && record.supersedes.some(sid => q.supporting_event_ids.includes(sid))))
+    : true
   const dMatches = Array.isArray(q.expected_d_substrings) && q.expected_d_substrings.length > 0
     ? q.expected_d_substrings.some(sub => d.includes(String(sub).toLowerCase()))
     : true
   const tokenMatches = Array.isArray(q.expected_claim_tokens) && q.expected_claim_tokens.length > 0
     ? q.expected_claim_tokens.every(tok => claim.includes(String(tok).toLowerCase()))
     : true
-  return dMatches && tokenMatches
+  return idMatches && dMatches && tokenMatches
 }
 
 function isStaleIntrusion(record, q) {
@@ -65,25 +75,54 @@ function isStaleIntrusion(record, q) {
   return false
 }
 
-// Reconstructs the exact HiveMemoryStore consolidation projection on an in-memory history array
-// when evaluating over the MCP reader socket (where SQLite is read via `include_history: true`).
-export function projectHistoryRecords(historyRecords, { curatorPubkeys = new Set(), excludeCuratorIds = null, nowSec = Math.floor(Date.now() / 1000) } = {}) {
+// Reconstructs the exact HiveMemoryStore point-in-time consolidation projection on an in-memory history array.
+// Recomputes same-author `(author_pubkey, d)` currentness from scratch on the filtered eligible corpus so that:
+//   1. Excluding a cycle's `excludeCuratorIds` restores any earlier same-key `(author_pubkey, d)` record.
+//   2. Applying `cutoffAtSec` removes all later writes (`created_at > cutoffAtSec`) and restores the exact
+//      `(author_pubkey, d)` winners that were current at `cutoffAtSec`.
+export function projectHistoryRecords(
+  historyRecords,
+  { curatorPubkeys = new Set(), excludeCuratorIds = null, cutoffAtSec = null, nowSec = Math.floor(Date.now() / 1000) } = {}
+) {
   const excluded = excludeCuratorIds instanceof Set
     ? excludeCuratorIds
     : Array.isArray(excludeCuratorIds)
       ? new Set(excludeCuratorIds)
       : null
+  const evalNowSec = cutoffAtSec !== null && cutoffAtSec !== undefined ? Number(cutoffAtSec) : Number(nowSec)
 
-  const activeCurrent = historyRecords.filter(r => {
+  const eligible = historyRecords.filter(r => {
+    if (!r || !r.event_id) return false
     if (excluded && excluded.has(r.event_id)) return false
-    const isCurrent = r.is_current === undefined ? r.verification !== 'superseded' : Boolean(r.is_current)
-    if (!isCurrent) return false
-    if (r.status === 'withdrawn' || r.verification === 'withdrawn') return false
-    if (r.expires_at != null && Number(r.expires_at) <= nowSec) return false
+    if (cutoffAtSec !== null && cutoffAtSec !== undefined && Number(r.created_at || 0) > Number(cutoffAtSec)) {
+      return false
+    }
     return true
   })
 
-  const byId = new Map(historyRecords.map(r => [r.event_id, r]))
+  // Recompute `is_current` per `(author_pubkey, d)` at the evaluated cutoff instead of reading present `r.is_current`.
+  const latestByAuthorAndKey = new Map()
+  for (const r of eligible) {
+    const authorKey = String(r.author_pubkey || r.pubkey || r.author || '').toLowerCase()
+    const slotKey = `${authorKey}::${r.d || ''}`
+    const prev = latestByAuthorAndKey.get(slotKey)
+    if (
+      !prev ||
+      Number(r.created_at || 0) > Number(prev.created_at || 0) ||
+      (Number(r.created_at || 0) === Number(prev.created_at || 0) && String(r.event_id) < String(prev.event_id))
+    ) {
+      latestByAuthorAndKey.set(slotKey, r)
+    }
+  }
+
+  const activeCurrent = []
+  for (const r of latestByAuthorAndKey.values()) {
+    if (r.status === 'withdrawn' || r.verification === 'withdrawn') continue
+    if (r.expires_at != null && Number(r.expires_at) <= evalNowSec) continue
+    activeCurrent.push(r)
+  }
+
+  const byId = new Map(eligible.map(r => [r.event_id, r]))
   const consolidatedBy = new Map()
 
   // 1. Standard Gate 1 (Curator) + Gate 7 (peer workflow supersession)
@@ -259,53 +298,61 @@ export function evaluateDreamCycleOnStore({
   store,
   readerPubkey,
   cycleSubmittedIds = [],
+  cutoffAtSec = null,
   questions = loadFrozenQuestions().questions,
   nowSec = Math.floor(Date.now() / 1000),
 } = {}) {
   const excludedSet = new Set(cycleSubmittedIds)
+  const historyRecords = []
+  let cursor = '0'
+  let pages = 0
+  while (cursor !== null && pages < 500) {
+    const page = store.query({
+      readerPubkey,
+      includeHistory: true,
+      format: 'full',
+      limit: 200,
+      cursor: Number(cursor),
+      nowSec,
+    })
+    for (const r of Array.isArray(page?.records) ? page.records : []) {
+      historyRecords.push(r)
+    }
+    cursor = typeof page?.next_cursor === 'string' && page.next_cursor ? page.next_cursor : null
+    pages += 1
+  }
+
+  const curatorPubkeys = new Set([
+    ...(store.config?.curators || []),
+    ...historyRecords
+      .filter(r => r.author === 'curator' || String(r.d || '').includes(':curated-') || String(r.d || '').includes(':decision-'))
+      .map(r => r.author_pubkey)
+      .filter(Boolean),
+  ])
+
+  const beforeAccepted = projectHistoryRecords(historyRecords, {
+    curatorPubkeys,
+    excludeCuratorIds: excludedSet,
+    cutoffAtSec,
+    nowSec,
+  })
+  const afterAccepted = projectHistoryRecords(historyRecords, {
+    curatorPubkeys,
+    excludeCuratorIds: null,
+    cutoffAtSec,
+    nowSec,
+  })
 
   const beforePass = scoreBenchmarkPass({
     questions,
-    queryFn: q => store.query({
-      readerPubkey,
-      scope: q.scope || null,
-      topic: q.topic || null,
-      text: q.text || null,
-      limit: q.limit || 5,
-      format: 'full',
-      nowSec,
-      excludeCuratorIds: excludedSet,
-    }).records,
-    wakeFn: () => {
-      const w = store.wake({ readerPubkey, maxChars: 1500, nowSec, excludeCuratorIds: excludedSet })
-      return {
-        ops_shown: w.counts?.ops_shown || 0,
-        distinct_topics: Object.keys(w.topic_directory || {}).length,
-        chars_used: w.char_length || 0,
-      }
-    },
+    queryFn: q => queryProjectedRecords(beforeAccepted, q),
+    wakeFn: () => simulateWakeDigest1500(beforeAccepted, { maxChars: 1500 }),
   })
 
   const afterPass = scoreBenchmarkPass({
     questions,
-    queryFn: q => store.query({
-      readerPubkey,
-      scope: q.scope || null,
-      topic: q.topic || null,
-      text: q.text || null,
-      limit: q.limit || 5,
-      format: 'full',
-      nowSec,
-      excludeCuratorIds: null,
-    }).records,
-    wakeFn: () => {
-      const w = store.wake({ readerPubkey, maxChars: 1500, nowSec, excludeCuratorIds: null })
-      return {
-        ops_shown: w.counts?.ops_shown || 0,
-        distinct_topics: Object.keys(w.topic_directory || {}).length,
-        chars_used: w.char_length || 0,
-      }
-    },
+    queryFn: q => queryProjectedRecords(afterAccepted, q),
+    wakeFn: () => simulateWakeDigest1500(afterAccepted, { maxChars: 1500 }),
   })
 
   return {
@@ -322,49 +369,101 @@ export function evaluateDreamCycleOnStore({
   }
 }
 
-export function computeSafetyGates({ historyRecords, curatorPubkeys = new Set(), cycleSubmittedIds = [] } = {}) {
-  const byId = new Map(historyRecords.map(r => [r.event_id, r]))
-  const currentCanonRecords = historyRecords.filter(r =>
+export function computeSafetyGates({ historyRecords, curatorPubkeys = new Set(), cycleSubmittedIds = [], cutoffAtSec = null } = {}) {
+  const eligible = (Array.isArray(historyRecords) ? historyRecords : []).filter(r => {
+    if (!r || !r.event_id) return false
+    if (cutoffAtSec !== null && cutoffAtSec !== undefined && Number(r.created_at || 0) > Number(cutoffAtSec)) {
+      return false
+    }
+    return true
+  })
+  const byId = new Map(eligible.map(r => [r.event_id, r]))
+
+  // Recompute point-in-time currentness per (author_pubkey, d) when cutoffAtSec is specified
+  const latestBySlot = new Map()
+  for (const r of eligible) {
+    const authorKey = String(r.author_pubkey || r.pubkey || r.author || '').toLowerCase()
+    const slotKey = `${authorKey}::${r.d || ''}`
+    const prev = latestBySlot.get(slotKey)
+    if (
+      !prev ||
+      Number(r.created_at || 0) > Number(prev.created_at || 0) ||
+      (Number(r.created_at || 0) === Number(prev.created_at || 0) && String(r.event_id) < String(prev.event_id))
+    ) {
+      latestBySlot.set(slotKey, r)
+    }
+  }
+  const currentIdsAtCutoff = new Set([...latestBySlot.values()].map(r => r.event_id))
+  const isCurrentRecord = r => {
+    if (cutoffAtSec !== null && cutoffAtSec !== undefined) return currentIdsAtCutoff.has(r.event_id)
+    if (r.is_current !== undefined) return Boolean(r.is_current) && r.verification !== 'superseded'
+    return currentIdsAtCutoff.has(r.event_id) && r.verification !== 'superseded'
+  }
+
+  const isCuratorRecord = r => Boolean(r && (curatorPubkeys.has(r.author_pubkey) || r.author === 'curator'))
+
+  const currentCanonRecords = eligible.filter(r =>
     r.scope === 'hive:canon' &&
-    r.verification !== 'superseded' &&
+    r.status !== 'withdrawn' &&
     r.verification !== 'withdrawn' &&
-    r.is_current !== false
+    isCurrentRecord(r)
   )
-  const hiddenCanon = historyRecords.filter(r =>
+  const hiddenCanon = eligible.filter(r =>
     r.scope === 'hive:canon' &&
     (r.verification === 'consolidated' || Boolean(r.consolidated_by))
   )
 
-  // Check if any Curator claim was withdrawn or overridden by a newer non-curator claim
-  const curatorClaims = historyRecords.filter(r => curatorPubkeys.has(r.author_pubkey) || r.author === 'curator')
-  const withdrawnOrOverridden = curatorClaims.filter(c => c.status === 'withdrawn' || c.verification === 'withdrawn')
+  const curatorClaims = eligible.filter(isCuratorRecord)
+  const nonCuratorClaims = eligible.filter(r => !isCuratorRecord(r) && r.status !== 'withdrawn' && r.verification !== 'withdrawn')
+  const targetSet = cycleSubmittedIds.length > 0 ? new Set(cycleSubmittedIds) : new Set(curatorClaims.map(c => c.event_id))
+  const evaluatedCuratorClaims = curatorClaims.filter(c => targetSet.has(c.event_id))
+
+  // Check if any evaluated Curator claim was withdrawn OR superseded/overridden by another author
+  const withdrawnOrOverridden = evaluatedCuratorClaims.filter(c => {
+    if (c.status === 'withdrawn' || c.verification === 'withdrawn') return true
+    if (c.consolidated_by) {
+      const consolidator = byId.get(c.consolidated_by)
+      if (!consolidator || !isCuratorRecord(consolidator)) return true
+    }
+    const supersededByOther = nonCuratorClaims.some(r => {
+      const sups = Array.isArray(r.supersedes) ? r.supersedes : []
+      if (sups.includes(c.event_id)) return true
+      if (r.scope === c.scope && r.d && r.d === c.d && Number(r.created_at || 0) >= Number(c.created_at || 0)) {
+        return true
+      }
+      return false
+    })
+    return supersededByOther
+  })
 
   // Check that 100% of supersedes[] source IDs on evaluated curator claims exist in historyRecords
-  const targetSet = cycleSubmittedIds.length > 0 ? new Set(cycleSubmittedIds) : new Set(curatorClaims.map(c => c.event_id))
   let checkedSupersedesCount = 0
   const missingSourceIds = []
-  for (const c of curatorClaims) {
-    if (!targetSet.has(c.event_id)) continue
+  for (const c of evaluatedCuratorClaims) {
     for (const sid of Array.isArray(c.supersedes) ? c.supersedes : []) {
       checkedSupersedesCount += 1
       if (!byId.has(sid)) missingSourceIds.push(sid)
     }
   }
 
+  const canonUntouchedOk = hiddenCanon.length === 0 && currentCanonRecords.length > 0
+  const restoreOrOverrideOk = withdrawnOrOverridden.length === 0
+  const sourceHoldIntactOk = missingSourceIds.length === 0
+
   return {
-    all_passed: hiddenCanon.length === 0 && withdrawnOrOverridden.length === 0 && missingSourceIds.length === 0,
+    all_passed: canonUntouchedOk && restoreOrOverrideOk && sourceHoldIntactOk,
     canon_untouched: {
-      ok: hiddenCanon.length === 0 && currentCanonRecords.length > 0,
+      ok: canonUntouchedOk,
       canon_count: currentCanonRecords.length,
       hidden_or_consolidated_count: hiddenCanon.length,
     },
     restore_or_override_count: {
-      ok: withdrawnOrOverridden.length === 0,
+      ok: restoreOrOverrideOk,
       count: withdrawnOrOverridden.length,
       withdrawn_curator_ids: withdrawnOrOverridden.map(c => c.event_id),
     },
     source_hold_intact: {
-      ok: missingSourceIds.length === 0,
+      ok: sourceHoldIntactOk,
       checked_supersedes_count: checkedSupersedesCount,
       missing_source_ids: missingSourceIds,
     },
@@ -534,17 +633,20 @@ export async function evaluateDreamCycleOverSocket({
       }
     }
 
+    const cutoffAtSec = targetEntry?.at ? Number(targetEntry.at) : null
     const beforeExcluded = new Set([...laterCycleIds, ...cycleSubmittedIds])
     const afterExcluded = new Set([...laterCycleIds])
 
     const beforeAccepted = projectHistoryRecords(historyRecords, {
       curatorPubkeys,
       excludeCuratorIds: beforeExcluded,
+      cutoffAtSec,
       nowSec,
     })
     const afterAccepted = projectHistoryRecords(historyRecords, {
       curatorPubkeys,
       excludeCuratorIds: afterExcluded,
+      cutoffAtSec,
       nowSec,
     })
 
@@ -563,6 +665,7 @@ export async function evaluateDreamCycleOverSocket({
       historyRecords,
       curatorPubkeys,
       cycleSubmittedIds,
+      cutoffAtSec,
     })
     const unlabeledTrend = computeUnlabeledRealUseTrend({
       recentActivity: Array.isArray(wake?.recent_activity) ? wake.recent_activity : [],

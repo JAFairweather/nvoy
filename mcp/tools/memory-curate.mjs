@@ -107,6 +107,10 @@ export function readCuratorStateFile(stateFilePath) {
     topic_reorganizations: Array.isArray(raw.topic_reorganizations)
       ? raw.topic_reorganizations.map(r => ({ ...r, persisted: r?.persisted !== false, simulated: Boolean(r?.simulated) }))
       : null,
+    pending_curated_at: typeof raw.pending_curated_at === 'number' && Number.isFinite(raw.pending_curated_at) ? raw.pending_curated_at : null,
+    pending_curated_write_seq: typeof raw.pending_curated_write_seq === 'number' && Number.isFinite(raw.pending_curated_write_seq) ? raw.pending_curated_write_seq : null,
+    pending_dream_packet: raw.pending_dream_packet && typeof raw.pending_dream_packet === 'object' ? raw.pending_dream_packet : null,
+    pending_ledger_entry: raw.pending_ledger_entry && typeof raw.pending_ledger_entry === 'object' ? raw.pending_ledger_entry : null,
     consolidation_ledger: readConsolidationLedger(ledgerPath),
   }
 }
@@ -189,6 +193,10 @@ export function resolveDreamPacketDir({ packetDir = undefined, stateFile = undef
 export function sanitizeDreamSummary(rawText, { maxChars = 180 } = {}) {
   const cleaned = String(rawText || '')
     .replace(/\s*\[(?:Curated Class B decision|Distilled)[^\]]*\]\s*$/i, '')
+    .replace(/<\/?[a-zA-Z][^>]*>/g, '')
+    .replace(/\b(?:https?|file):\/\/\S+/gi, 'ref')
+    .replace(/@([a-zA-Z0-9_-]+)/g, '$1')
+    .replace(/@+/g, '')
     .replace(/\b[0-9a-fA-F]{16,64}\b/g, 'ref')
     .replace(/[`*_~#>]+/g, '')
     .replace(/\s+/g, ' ')
@@ -323,26 +331,30 @@ export function writeDreamPacket({ packetDir, packet } = {}) {
   if (!packetDir || typeof packetDir !== 'string' || !packet || typeof packet !== 'object' || !packet.id) {
     return null
   }
-  const resolvedDir = resolve(packetDir)
-  mkdirSync(resolvedDir, { recursive: true, mode: 0o750 })
-  const payload = JSON.stringify(packet, null, 2) + '\n'
-  const cyclePath = join(resolvedDir, `${packet.id}.json`)
-  const latestPath = join(resolvedDir, 'latest.json')
-  const suffix = `.tmp.${process.pid}.${Date.now()}`
+  try {
+    const resolvedDir = resolve(packetDir)
+    mkdirSync(resolvedDir, { recursive: true, mode: 0o750 })
+    const payload = JSON.stringify(packet, null, 2) + '\n'
+    const cyclePath = join(resolvedDir, `${packet.id}.json`)
+    const latestPath = join(resolvedDir, 'latest.json')
+    const suffix = `.tmp.${process.pid}.${Date.now()}`
 
-  // 1. Write dream-<write_seq>.json atomically first (mode 0640)
-  const tmpCycle = `${cyclePath}${suffix}`
-  writeFileSync(tmpCycle, payload, { encoding: 'utf8', mode: 0o640 })
-  chmodSync(tmpCycle, 0o640)
-  renameSync(tmpCycle, cyclePath)
+    // 1. Write dream-<write_seq>.json atomically first (mode 0640)
+    const tmpCycle = `${cyclePath}${suffix}`
+    writeFileSync(tmpCycle, payload, { encoding: 'utf8', mode: 0o640 })
+    chmodSync(tmpCycle, 0o640)
+    renameSync(tmpCycle, cyclePath)
 
-  // 2. Advance latest.json atomically only after dream-<write_seq>.json is in place (mode 0640)
-  const tmpLatest = `${latestPath}${suffix}`
-  writeFileSync(tmpLatest, payload, { encoding: 'utf8', mode: 0o640 })
-  chmodSync(tmpLatest, 0o640)
-  renameSync(tmpLatest, latestPath)
+    // 2. Advance latest.json atomically only after dream-<write_seq>.json is in place (mode 0640)
+    const tmpLatest = `${latestPath}${suffix}`
+    writeFileSync(tmpLatest, payload, { encoding: 'utf8', mode: 0o640 })
+    chmodSync(tmpLatest, 0o640)
+    renameSync(tmpLatest, latestPath)
 
-  return { cyclePath, latestPath }
+    return { cyclePath, latestPath }
+  } catch (err) {
+    throw new Error(`dream packet write failed: ${err?.message || err}`, { cause: err })
+  }
 }
 
 function createCuratorWriteClient(socketPath) {
@@ -1513,13 +1525,27 @@ export async function runCuratorCycle({
     }
 
     const postWriteSeq = Number(storeState.write_seq || 0) + submitted.length
-    const nextCuratedAt = cursorAdvanced ? nowSec : effectiveLastCuratedAt
-    const nextCuratedWriteSeq = cursorAdvanced ? postWriteSeq : effectiveLastCuratedWriteSeq
+    const hasPendingRecovery = Boolean(
+      hasWriteCapability &&
+      resolvedStateFile &&
+      (persisted?.pending_dream_packet || persisted?.pending_ledger_entry)
+    )
+    if (hasPendingRecovery && submitted.length === 0 && refused.length === 0 && historyComplete) {
+      cycleStatus = 'curated'
+      cursorAdvanced = true
+    }
+    const nextCuratedAt = cursorAdvanced
+      ? (submitted.length === 0 && persisted?.pending_curated_at ? Number(persisted.pending_curated_at) : nowSec)
+      : effectiveLastCuratedAt
+    const nextCuratedWriteSeq = cursorAdvanced
+      ? (submitted.length === 0 && persisted?.pending_curated_write_seq ? Number(persisted.pending_curated_write_seq) : postWriteSeq)
+      : effectiveLastCuratedWriteSeq
 
     let dreamPacket = null
     let dreamPacketPaths = null
 
     if (hasWriteCapability && resolvedStateFile && cursorAdvanced) {
+      const ledgerPath = resolveConsolidationLedgerPath({ stateFile: resolvedStateFile, socketPath: readerSocket })
       const submittedDs = new Set(submitted.map(s => s.d))
       const executedReorgPairs = new Set()
       for (const item of [...plan.promotions, ...plan.distillations]) {
@@ -1542,39 +1568,38 @@ export async function runCuratorCycle({
                 .map(r => ({ ...r, persisted: true, simulated: false }))
             : [])
         : (Array.isArray(persisted?.topic_reorganizations) ? persisted.topic_reorganizations : [])
-      writeCuratorStateFile(resolvedStateFile, {
-        last_curated_at: nextCuratedAt,
-        last_curated_write_seq: nextCuratedWriteSeq,
-        last_ran_at: nowSec,
-        last_submitted_count: submitted.length,
-        dream_interval_sec: dreamIntervalSec,
-        write_delta_threshold: writeDeltaThreshold,
-        topic_pressure_threshold: topicPressureThreshold,
-        triggers: triggerEval,
-        coherence_score: triggerEval.coherence_score,
-        topic_eigenvectors: persistedEigenvectors,
-        topic_reorganizations: persistedReorganizations,
-      })
-      const ledgerPath = resolveConsolidationLedgerPath({ stateFile: resolvedStateFile, socketPath: readerSocket })
-      if (ledgerPath) {
-        appendConsolidationLedger(ledgerPath, {
-          at: nowSec,
-          cycle_status: cycleStatus,
-          write_seq_before: Number(storeState.write_seq || 0),
-          write_seq_after: nextCuratedWriteSeq,
-          claims_before: records.length,
-          submitted_count: submitted.length,
-          coherence_score: triggerEval.coherence_score,
-          reasons: triggerEval.reasons || [],
-          plan_summary: plan.summary || {},
-          submitted: submitted.map(s => ({
-            id: s.id,
-            d: s.d,
-            stage: s.stage,
-            merkle_sources: s.merkle_sources,
-          })),
-        })
-      }
+
+      const ledgerEntry = submitted.length > 0
+        ? {
+            at: nowSec,
+            cycle_status: cycleStatus,
+            write_seq_before: Number(storeState.write_seq || 0),
+            write_seq_after: nextCuratedWriteSeq,
+            claims_before: records.length,
+            submitted_count: submitted.length,
+            coherence_score: triggerEval.coherence_score,
+            reasons: triggerEval.reasons || [],
+            plan_summary: plan.summary || {},
+            submitted: submitted.map(s => ({
+              id: s.id,
+              d: s.d,
+              stage: s.stage,
+              merkle_sources: s.merkle_sources,
+            })),
+          }
+        : (persisted?.pending_ledger_entry || {
+            at: nowSec,
+            cycle_status: cycleStatus,
+            write_seq_before: Number(storeState.write_seq || 0),
+            write_seq_after: nextCuratedWriteSeq,
+            claims_before: records.length,
+            submitted_count: 0,
+            coherence_score: triggerEval.coherence_score,
+            reasons: triggerEval.reasons || [],
+            plan_summary: plan.summary || {},
+            submitted: [],
+          })
+
       if (submitted.length > 0 && resolvedPacketDir) {
         dreamPacket = buildDreamPacket({
           writeSeqBefore: Number(storeState.write_seq || 0),
@@ -1589,10 +1614,57 @@ export async function runCuratorCycle({
           persistedEigenvectors,
           memoryGlobalChannelId: memoryGlobalChannelId || 'a8186b53-537d-46ad-a7e7-b6486c58970e',
         })
-        if (dreamPacket) {
-          dreamPacketPaths = writeDreamPacket({ packetDir: resolvedPacketDir, packet: dreamPacket })
-        }
+      } else if (persisted?.pending_dream_packet) {
+        dreamPacket = persisted.pending_dream_packet
       }
+
+      // Stage pending packet & ledger entry BEFORE writing the packet or advancing the cursor/ledger,
+      // so if packet publication fails, the cursor/ledger are NOT advanced and a retry recovers cleanly.
+      if (dreamPacket || persisted?.pending_ledger_entry) {
+        writeCuratorStateFile(resolvedStateFile, {
+          last_curated_at: effectiveLastCuratedAt,
+          last_curated_write_seq: effectiveLastCuratedWriteSeq,
+          last_ran_at: nowSec,
+          last_submitted_count: ledgerEntry.submitted_count ?? submitted.length,
+          dream_interval_sec: dreamIntervalSec,
+          write_delta_threshold: writeDeltaThreshold,
+          topic_pressure_threshold: topicPressureThreshold,
+          triggers: triggerEval,
+          coherence_score: triggerEval.coherence_score,
+          topic_eigenvectors: persistedEigenvectors,
+          topic_reorganizations: persistedReorganizations,
+          pending_curated_at: nextCuratedAt,
+          pending_curated_write_seq: nextCuratedWriteSeq,
+          pending_dream_packet: dreamPacket || null,
+          pending_ledger_entry: ledgerEntry,
+        })
+      }
+
+      if (dreamPacket && resolvedPacketDir) {
+        dreamPacketPaths = writeDreamPacket({ packetDir: resolvedPacketDir, packet: dreamPacket })
+      }
+
+      if (ledgerPath) {
+        appendConsolidationLedger(ledgerPath, ledgerEntry)
+      }
+
+      writeCuratorStateFile(resolvedStateFile, {
+        last_curated_at: nextCuratedAt,
+        last_curated_write_seq: nextCuratedWriteSeq,
+        last_ran_at: nowSec,
+        last_submitted_count: ledgerEntry.submitted_count ?? submitted.length,
+        dream_interval_sec: dreamIntervalSec,
+        write_delta_threshold: writeDeltaThreshold,
+        topic_pressure_threshold: topicPressureThreshold,
+        triggers: triggerEval,
+        coherence_score: triggerEval.coherence_score,
+        topic_eigenvectors: persistedEigenvectors,
+        topic_reorganizations: persistedReorganizations,
+        pending_curated_at: null,
+        pending_curated_write_seq: null,
+        pending_dream_packet: null,
+        pending_ledger_entry: null,
+      })
     }
 
     const cycleOk = cycleStatus !== 'write_refused' && cycleStatus !== 'history_incomplete'

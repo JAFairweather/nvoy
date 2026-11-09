@@ -26,7 +26,7 @@ const HEX16_RE = /\b[0-9a-fA-F]{16,64}\b/
 const HTML_TAG_RE = /<\/?[a-zA-Z][^>]*>/
 const MD_FENCE_RE = /```/
 const MD_HEADER_RE = /(?:^|\n)\s*#{1,6}\s+/
-const URL_RE = /\bhttps?:\/\/\S+/i
+const URL_RE = /\b(?:https?|file):\/\/\S+/i
 const AT_MENTION_RE = /(?:^|[\s(])@[a-zA-Z0-9_-]+/
 
 export function countWords(text) {
@@ -101,9 +101,32 @@ export function verifyAndAssembleDreamRecord({ packet, draft } = {}) {
   }
 
   const validIds = new Set()
-  for (const ch of Array.isArray(packet.changes) ? packet.changes : []) {
-    if (ch && typeof ch.change_id === 'string' && ch.change_id) validIds.add(ch.change_id)
-    if (ch && typeof ch.claim_event_id === 'string' && ch.claim_event_id) validIds.add(ch.claim_event_id)
+  const rawChanges = Array.isArray(packet.changes) ? packet.changes : []
+  for (let i = 0; i < rawChanges.length; i++) {
+    const ch = rawChanges[i]
+    if (!ch || typeof ch !== 'object' || Array.isArray(ch)) {
+      errors.push(`packet.changes[${i}] must be an object`)
+      continue
+    }
+    if (typeof ch.change_id === 'string' && ch.change_id) validIds.add(ch.change_id)
+    if (typeof ch.claim_event_id === 'string' && ch.claim_event_id) validIds.add(ch.claim_event_id)
+    const summary = typeof ch.summary === 'string' ? ch.summary.trim() : ''
+    if (!summary) {
+      errors.push(`packet.changes[${i}].summary must be a non-empty string`)
+    } else {
+      if (AT_MENTION_RE.test(summary)) {
+        errors.push(`packet.changes[${i}].summary must not contain @mentions`)
+      }
+      if (URL_RE.test(summary)) {
+        errors.push(`packet.changes[${i}].summary must not contain raw URLs`)
+      }
+      if (HTML_TAG_RE.test(summary)) {
+        errors.push(`packet.changes[${i}].summary must not contain HTML tags`)
+      }
+      if (HEX16_RE.test(summary)) {
+        errors.push(`packet.changes[${i}].summary must not contain raw 16+ hex IDs`)
+      }
+    }
   }
 
   if (!Array.isArray(draft.referenced_change_ids) || draft.referenced_change_ids.length === 0) {
@@ -124,11 +147,7 @@ export function verifyAndAssembleDreamRecord({ packet, draft } = {}) {
     return { ok: false, errors, record: null }
   }
 
-  const canonicalChanges = packet.changes.map(ch => ({
-    kind: String(ch.kind || 'distillation'),
-    claim_event_id: String(ch.claim_event_id || ch.change_id || ''),
-    summary: String(ch.summary || ''),
-  }))
+  const canonicalChanges = packet.changes.map(ch => ({ ...ch }))
 
   const record = {
     id: packet.id,
