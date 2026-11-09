@@ -33,6 +33,8 @@ import {
 
 const DEFAULT_POLL_MS = 3000
 const MAX_EVENT_LOG = 60
+// One version for the page and the live snapshot: the page reloads whenever they differ.
+const VIEWER_VERSION = '2026-11-09-v12'
 const ACTIVITY_KINDS = new Set(['wake', 'query', 'lookup', 'submit', 'refused'])
 
 export function escapeHtml(value) {
@@ -5446,7 +5448,7 @@ export function renderViewerHtml(initialState) {
 
       var latestCoherence = null;
       var latestEfficacy = null;
-      var VIEWER_VERSION = '2026-11-08-v10';
+      var VIEWER_VERSION = '${VIEWER_VERSION}';
       function openCoherenceInspector() {
         if (!latestCoherence) return;
         if (view !== 'graph') switchView('graph');
@@ -6131,7 +6133,7 @@ export async function startMemoryViewer({
         : (records.length > 0 ? 'found' : String(firstQuery?.answer || 'unknown'))
 
       nextSnapshot = {
-        viewer_version: '2026-11-09-v12',
+        viewer_version: VIEWER_VERSION,
         connected: true,
         error: null,
         server_name: client.getServerName() || 'hive-memory-viewer',
