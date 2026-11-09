@@ -86,6 +86,14 @@ content NIP-44 (runner → owner) of:
 - `pairing` is present only while a pairing waits for the owner. The receipt that ends the wait
   (approved, or timed out after 300 s) drops it. The link's secret is spent by the handshake either
   way, and the next tick seals a new link.
+- `channel_key` is a step row that appears only for a hosted agent (no staged file, no row). An operator
+  helper on herd-cloud reads the agent's `channel.pub`, and only that file, and writes it atomically to
+  `<state dir>/<request id>.staged-channel.pub` on the fleet host: a regular file under 1 KiB, one OpenSSH
+  line (`ssh-ed25519` or `ecdsa-sha2-nistp256`) whose comment is `nvoy-stage:<instance>:<request id>`. The
+  runner checks that and reports `<type> <key> (SHA256:<fingerprint>)` in the row's `detail`, a public key
+  only. Anything private-looking, a link, a second line or another binding is `refused` and never echoed.
+  If the owner's `bind_runtime` names a different key, the row is `refused`. It is reported work, not proof:
+  the bind is the owner's act and the presence event stays the proof. The helper is not built yet.
 - `install` is present once the agent is staged. It holds the four fields waggle's step 4 builds the
   install line from (`DESIGN_ADD_AN_AGENT.md`, "What the page checks"):
   - `host_key` is the fleet's own `/etc/ssh/ssh_host_ed25519_key.pub`;
