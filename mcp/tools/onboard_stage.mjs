@@ -20,24 +20,29 @@ export const keyFingerprint = ({ keyBody }) =>
   `SHA256:${createHash('sha256').update(Buffer.from(keyBody, 'base64')).digest('base64').replace(/=+$/, '')}`
 
 // -> null when nothing is staged for this request (an own-box agent), else { state, detail, key? }.
-export function readStagedKey({ stateDir, request, instance, bound = null }) {
+export function readStagedKey({ stateDir, request, instance, bound = null, fs = { lstatSync, readFileSync } }) {
   const path = stagedKeyPath(stateDir, request)
   let st
-  try { st = lstatSync(path) } catch (error) {
+  try { st = (fs.lstatSync || lstatSync)(path) } catch (error) {
     if (error?.code === 'ENOENT') return null
     return { state: 'refused', detail: `cannot read the staged channel key: ${error?.code || 'error'}` }
   }
   if (!st.isFile()) return { state: 'refused', detail: 'the staged channel key is not a plain file' }
   if (st.size > STAGED_MAX_BYTES) return { state: 'refused', detail: 'the staged channel key file is too large' }
-  const text = readFileSync(path, 'utf8')
+  let text
+  try { text = (fs.readFileSync || readFileSync)(path, 'utf8') } catch (error) {
+    return { state: 'refused', detail: `cannot read the staged channel key: ${error?.code || 'error'}` }
+  }
   let key
   try { key = readPublicKey(text) } catch (error) {
     // readPublicKey's messages never repeat the input.
     return { state: 'refused', detail: `the staged channel key is not one public key: ${error.message}` }
   }
-  const comment = text.trim().split(/\s+/)[2] || ''
-  if (comment !== `nvoy-stage:${instance}:${request}`)
-    return { state: 'refused', detail: 'the staged channel key is not bound to this instance and request' }
+  // Exactly three tokens: type, key, binding comment. readPublicKey allows trailing text; the contract does not.
+  const tokens = text.trim().split(/\s+/)
+  if (tokens.length !== 3 || tokens[2] !== `nvoy-stage:${instance}:${request}`)
+    return { state: 'refused', detail: tokens.length > 3 ? 'the staged channel key line has extra text after its binding comment'
+      : 'the staged channel key is not bound to this instance and request' }
   const fingerprint = keyFingerprint(key)
   if (bound && (bound.keyType !== key.keyType || bound.keyBody !== key.keyBody))
     return { state: 'refused', detail: `the staged channel key ${fingerprint} differs from the key the owner bound ${keyFingerprint(bound)}`, key }

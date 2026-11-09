@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { keyFingerprint, readStagedKey, stagedKeyPath } from '../mcp/tools/onboard_stage.mjs'
@@ -29,6 +29,19 @@ row = read(); assert.equal(row.state, 'refused'); assert.ok(!row.detail.includes
 put(line(`nvoy-stage:${instance}:${request}`) + line(`nvoy-stage:${instance}:${request}`)); assert.equal(read().state, 'refused', 'two lines')
 put('ssh-rsa AAAA ' + `nvoy-stage:${instance}:${request}\n`); assert.equal(read().state, 'refused', 'an unsupported type')
 put('x'.repeat(2000)); assert.match(read().detail, /too large/)
+
+// Exactly one line of three tokens: extra text after the binding is refused.
+put(line(`nvoy-stage:${instance}:${request}`).trim() + ' extra\n'); assert.match(read().detail, /extra text after its binding comment/)
+put(line(`nvoy-stage:${instance}:${request} # note`)); assert.equal(read().state, 'refused')
+
+// A file that cannot be read, or vanishes between the check and the read, is a refused row and not a throw.
+put(line(`nvoy-stage:${instance}:${request}`)); chmodSync(stagedKeyPath(tmp, request), 0)
+if (process.getuid?.() !== 0) { row = read(); assert.equal(row.state, 'refused'); assert.match(row.detail, /cannot read the staged channel key: EACCES/) }
+chmodSync(stagedKeyPath(tmp, request), 0o644)
+{
+  const raced = readStagedKey({ stateDir: tmp, request, instance, fs: { readFileSync: () => { const e = new Error('gone'); e.code = 'ENOENT'; throw e } } })
+  assert.equal(raced.state, 'refused'); assert.match(raced.detail, /cannot read the staged channel key: ENOENT/)
+}
 
 // A link is not a file.
 rmSync(stagedKeyPath(tmp, request)); writeFileSync(join(tmp, 'elsewhere'), line(`nvoy-stage:${instance}:${request}`))
