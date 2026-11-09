@@ -6302,7 +6302,7 @@ export async function startMemoryViewer({
     }
 
     if (urlPath === '/' || urlPath === '/index.html') {
-      const htmlKey = `${currentState.connected}:${currentState.error || ''}:${currentState.store_state?.state || ''}:${currentState.store_state?.write_seq ?? ''}:${currentState.records?.length ?? 0}:${currentState.curator_state?.last_curated_write_seq ?? 0}:${currentState.event_log?.length ?? 0}`
+      const htmlKey = `${currentState.poll_seq ?? 0}:${currentState.connected}:${currentState.error || ''}:${currentState.store_state?.state || ''}:${currentState.store_state?.write_seq ?? ''}:${currentState.records?.length ?? 0}:${currentState.curator_state?.last_curated_write_seq ?? 0}:${currentState.event_log?.length ?? 0}`
       if (cachedHtmlKey !== htmlKey || !cachedHtmlBuf) {
         cachedHtmlBuf = Buffer.from(renderViewerHtml(currentState), 'utf8')
         cachedHtmlKey = htmlKey

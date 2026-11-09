@@ -1190,7 +1190,15 @@ await test('pollOnce coalesces concurrent polls and reuses cached corpus on unch
     const root2 = await httpGet(viewer.port, '/')
     assert.equal(root1.status, 200)
     assert.equal(root2.status, 200)
-    assert.equal(root1.body, root2.body)
+    assert.equal(root1.body, root2.body, 'same poll_seq reuses cached HTML')
+    assert(root1.body.includes(`"poll_seq":${seq0 + 2}`))
+
+    const sNext = await viewer.pollOnce({ forceFull: false })
+    assert.equal(sNext.poll_seq, seq0 + 3)
+    const root3 = await httpGet(viewer.port, '/')
+    assert.equal(root3.status, 200)
+    assert.notEqual(root3.body, root1.body, 'new poll_seq must invalidate cached HTML and reflect updated state')
+    assert(root3.body.includes(`"poll_seq":${seq0 + 3}`))
   } finally {
     if (viewer) await viewer.stop()
     await daemon.close()
