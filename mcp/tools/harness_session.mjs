@@ -130,6 +130,22 @@ export function recallRule(manifest) {
   ].join('\n')
 }
 
+// James, 2026-11-08: check memory at the start of every turn, not only when a task starts. Its own marker,
+// so a file that already carries the recall rule gains it (rules are appended by marker, never rewritten).
+export const TURN_RULE_MARKER = '## Check memory every turn'
+export function turnRule(manifest) {
+  if (!manifest.recall) return ''
+  return [
+    TURN_RULE_MARKER,
+    '',
+    'At the start of every turn, before you act on the message, call `memory_query` for the facts that bear',
+    'on your current work and tasks, by the work\'s topic and a few words of the task. The wake digest at',
+    'session start does not replace this; other agents save while you work. Say which records you relied',
+    'on, or that none bore on it.',
+    '',
+  ].join('\n')
+}
+
 // Any agent that reads or saves memory reports a failure at once (2026-11-07: every save was refused for eight
 // hours and no agent said so).
 export const MEMORY_FAILURE_RULE_MARKER = '## Report Hive memory failures'
@@ -151,7 +167,7 @@ export function memoryFailureRule(manifest) {
 // marker. Returns the text to write, or null when the file is already right.
 export function instructionsUpdate(current, manifest) {
   let text = current ?? defaultInstructions(manifest)
-  for (const [marker, rule] of [[MEMORY_RULE_MARKER, memoryRule(manifest)], [RECALL_RULE_MARKER, recallRule(manifest)], [MEMORY_FAILURE_RULE_MARKER, memoryFailureRule(manifest)]]) {
+  for (const [marker, rule] of [[MEMORY_RULE_MARKER, memoryRule(manifest)], [RECALL_RULE_MARKER, recallRule(manifest)], [TURN_RULE_MARKER, turnRule(manifest)], [MEMORY_FAILURE_RULE_MARKER, memoryFailureRule(manifest)]]) {
     if (rule && !text.includes(marker)) text = `${text.replace(/\n*$/, '\n\n')}${rule}`
   }
   return current != null && text === current ? null : text
