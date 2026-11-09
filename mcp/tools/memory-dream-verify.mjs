@@ -175,20 +175,10 @@ export function formatDreamBuzzPost(record) {
   if (!record || !record.checked) {
     throw new Error('cannot format unchecked dream record for Buzz')
   }
-  const changeLines = (record.changes || []).slice(0, 8).map(
-    c => `- [${c.kind}] ${c.summary} (claim ${String(c.claim_event_id).slice(0, 8)})`
-  )
-  const moreCount = Math.max(0, (record.changes || []).length - changeLines.length)
-  if (moreCount > 0) {
-    changeLines.push(`- (+${moreCount} more consolidated changes in ${record.id})`)
-  }
   return [
-    `🌙 **${record.title}** (\`${record.id}\`, validation: \`${record.validation}\`)`,
+    `🌙 ${record.title}`,
     '',
     record.dream,
-    '',
-    '**Consolidated Changes:**',
-    ...changeLines,
   ].join('\n')
 }
 

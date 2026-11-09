@@ -236,12 +236,12 @@ export function sanitizeDreamSummary(rawText, { maxChars = 180 } = {}) {
 }
 
 export const DREAM_REALM_BY_TOPIC = Object.freeze({
-  'hive-memory': 'the Glass Observatory of Amber Ledgers',
-  'herd-infra': 'the High Cloud Engine-Rooms and Iron Watchtowers',
-  nvoy: 'the Brass Signal Bridges and Courier Locks',
-  waggle: 'the Lantern-Lit Console Piazzas',
+  'hive-memory': 'the High Glass Observatory',
+  'herd-infra': 'the Iron Watchtowers on the Ridge',
+  nvoy: 'the Brass Signal Bridges',
+  waggle: 'the Lantern-Lit Piazzas',
   buzz: 'the Echoing Bell-Courts',
-  r1: 'the Whispering Pocket-Compass Workshop',
+  r1: 'the Whispering Compass Workshop',
   'illustrated-primer': 'the Hall of Living Margins',
   xochitl: 'the Obsidian Garden of Glyphs',
 })
@@ -252,17 +252,19 @@ const DREAM_TRAVELERS = Object.freeze([
   ['Kerouac', 'Curator'],
   ['My Dude', 'Dead Rabbit'],
   ['Neil', 'Biggy'],
-  ['Curator', 'Kerouac'],
 ])
 
+const TECHNICAL_DREAM_TERMS_RE = /\b(?:nvoy|waggle|herd|cloud|infra|moshi|herdr|claude|codex|gemini|antigravity|langfuse|clickhouse|otlp|sqlite|nostr|mcp|git|github|ci|npm|node|bash|systemd|test|tests|tested|testing|suite|suites|spec|specs|hook|hooks|socket|sockets|daemon|service|services|timer|timers|runner|viewer|inspector|bootstrap|deploy|deployed|deployment|merge|merged|commit|commits|branch|rebase|rebased|pull|request|claim|claims|record|records|packet|packets|ledger|merkle|canon|ref|var|lib|opt|usr|bin|mjs|json|md|sql|sh|py|ts|js|pr|issue|seq|sequence|version|port|phase|stage|gate|step|status|checkpoint|checkpoints|consolidated|curated|distilled)\b/gi
+
 function sanitizeRealmName(rawTopic) {
-  const cleaned = String(rawTopic || 'the hive')
+  const cleaned = String(rawTopic || 'the high causeway')
     .replace(/\b[a-zA-Z_-]*\d+[a-zA-Z0-9_-]*\b/g, '')
+    .replace(TECHNICAL_DREAM_TERMS_RE, '')
     .replace(/\d+/g, '')
     .replace(/[^a-zA-Z\s-]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
-  return cleaned || 'the quiet gallery'
+  return cleaned || 'the high causeway'
 }
 
 export function distillStoryPhrase(rawText, { fallback = 'the old watch-stone' } = {}) {
@@ -270,15 +272,15 @@ export function distillStoryPhrase(rawText, { fallback = 'the old watch-stone' }
     .replace(/^(?:DONE|ACTIVE|MERGED|DEPLOYED|SHIPPED|FIXED|RESOLVED|OPEN|WIP|BLOCKED)\s*[:.-]*\s*/i, '')
     .replace(/\b(?:PR|pull request|issue|commit|seq|sequence|version|port|phase|stage|gate|step)\s*#?\d+[a-zA-Z0-9._-]*\b/gi, '')
     .replace(/\b[a-zA-Z_-]*\d+[a-zA-Z0-9_.-]*\b/g, '')
+    .replace(TECHNICAL_DREAM_TERMS_RE, '')
     .replace(/\d+/g, '')
     .replace(/[_/\\|+:=]+/g, ' ')
-    .replace(/\b(?:ref|var|lib|opt|usr|bin|mjs|json|md|sql|sh|py|ts|js)\b/gi, '')
     .replace(/[^a-zA-Z\s,'-]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
     .replace(/^[,.'\s-]+|[,.'\s-]+$/g, '')
   if (!cleaned || cleaned.length < 4) return fallback
-  const words = cleaned.split(/\s+/).slice(0, 12)
+  const words = cleaned.split(/\s+/).slice(0, 8)
   return words.join(' ').toLowerCase()
 }
 
@@ -287,52 +289,52 @@ export function weaveDreamStory({
   topicEigenvectors = [],
 } = {}) {
   const safeChanges = Array.isArray(changes) ? changes : []
+  const chosenChanges = safeChanges.slice(0, 4)
   const eigens = Array.isArray(topicEigenvectors) ? topicEigenvectors : []
 
-  const primaryTopic = safeChanges[0]?.topic || eigens[0]?.eigen_topic || eigens[0]?.canonical_topic || 'hive-memory'
+  const primaryTopic = chosenChanges[0]?.topic || eigens[0]?.eigen_topic || eigens[0]?.canonical_topic || 'hive-memory'
   const primaryRealm = DREAM_REALM_BY_TOPIC[primaryTopic] || `the Nocturnal Gallery of ${sanitizeRealmName(primaryTopic)}`
-  const title = sanitizeDreamSummary(`The Night Journey Through ${primaryRealm.replace(/^the\s+/i, '')}`, { maxChars: 120 }).replace(/\d+/g, '').replace(/\s+/g, ' ').trim()
+  const title = sanitizeDreamSummary(`The Storm-Lantern Through ${primaryRealm.replace(/^the\s+/i, '')}`, { maxChars: 120 }).replace(/\d+/g, '').replace(/\s+/g, ' ').trim()
 
   const sentences = [
-    `Before moonset, Curator lit a brass storm-lantern at the threshold of ${primaryRealm}, and Biggy, My Dude, Dead Rabbit, Neil, and Kerouac set out together along the narrow mist-hung causeway.`,
+    `Before moonset, Curator lit a single brass storm-lantern at the lower gate of ${primaryRealm}, and Biggy, My Dude, Dead Rabbit, Neil, and Kerouac carried its amber flame together up the mist-hung stone causeway.`,
   ]
 
-  safeChanges.slice(0, 6).forEach((ch, idx) => {
-    const realm = DREAM_REALM_BY_TOPIC[ch.topic] || `the gallery of ${sanitizeRealmName(ch.topic)}`
+  chosenChanges.forEach((ch, idx) => {
     const [travelerA, travelerB] = DREAM_TRAVELERS[idx % DREAM_TRAVELERS.length]
-    const phrase = distillStoryPhrase(ch.summary || ch.d || '', { fallback: 'the shifting threshold' })
+    const phrase = distillStoryPhrase(ch.summary || ch.d || '', { fallback: 'the weathered threshold' })
     if (ch.kind === 'promotion') {
       sentences.push(
-        `At the high arch of ${realm}, ${travelerA} and ${travelerB} reached a heavy iron door barred around ${phrase}; they fitted a carved keystone into the lintel until the bolt gave way and the gate swung open before them.`
+        `Where the causeway rose to an iron arch barred around ${phrase}, ${travelerA} held the storm-lantern high while ${travelerB} fitted a carved keystone into the lintel until the heavy bolt gave way and the door swung open.`
       )
     } else if (ch.kind === 'distillation') {
       sentences.push(
-        `Descending into ${realm}, ${travelerA} and ${travelerB} found the flagstones drifted with loose paper dispatches of ${phrase}, and they braided the scattered pages into a single glowing guide-rope across the chasm.`
+        `Further along the same stone road, ${travelerA} and ${travelerB} lowered the storm-lantern over flagstones drifted with loose paper notes of ${phrase}, braiding the scattered pages into a single taut guide-rope across the ravine.`
       )
     } else if (ch.kind === 'topic_reorg') {
       sentences.push(
-        `Where the road forked beside ${realm}, ${travelerA} followed a stray footpath of ${phrase} through the fog and turned its boundary markers back into the main causeway.`
+        `Where a side-track of ${phrase} wandered off into the fog, ${travelerA} swung the storm-lantern across the moss and turned the boundary stones back into the main causeway.`
       )
     } else if (ch.kind === 'nightmare') {
       sentences.push(
-        `At a narrow bridge in ${realm}, two voices argued over a single lantern beside ${phrase} until ${travelerA} held the glass up to the moon and one voice yielded the crossing.`
+        `At a narrow bridge beside ${phrase}, two shadows argued over the crossing until ${travelerA} raised the storm-lantern between them and the false shadow stepped aside.`
       )
     } else {
       sentences.push(
-        `Along the parapet of ${realm}, ${travelerA} and ${travelerB} set a permanent watch-fire above ${phrase} to light the road ahead.`
+        `Along the upper parapet above ${phrase}, ${travelerA} and ${travelerB} touched the storm-lantern to an unlit brazier so the road ahead stood clear.`
       )
     }
   })
 
   sentences.push(
-    `By the time the companions climbed to the eastern ridge at daybreak, the labyrinth of locked gates and tangled trails behind them had changed into a single open road under the rising sun.`
+    `When the companions reached the eastern ridge at daybreak and set the brass storm-lantern down upon the parapet, the maze of barred arches and tangled tracks behind them had changed into one open road from valley to summit.`
   )
 
   const dream = sanitizeDreamSummary(sentences.join(' '), { maxChars: 1800 }).replace(/\d+/g, '').replace(/\s+/g, ' ').trim()
   return {
     title,
     dream,
-    referenced_change_ids: safeChanges.map(c => c.change_id || c.claim_event_id).filter(Boolean),
+    referenced_change_ids: chosenChanges.map(c => c.change_id || c.claim_event_id).filter(Boolean),
   }
 }
 

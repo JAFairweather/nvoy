@@ -1344,6 +1344,9 @@ await test('writeDreamPacket writes 0640 global-scope packets, strips @mentions/
     assert.deepEqual(goodRes.record.changes[0], pkt.changes[0], 'verifier must copy each packet change verbatim including change_id, d, topic, and source_count')
     const buzzPost = formatDreamBuzzPost(goodRes.record)
     assert(!buzzPost.includes('@mydude') && !buzzPost.includes('https://'), 'formatted Buzz post must contain no @mentions or URLs')
+    assert(!buzzPost.includes('dream-1023') && !buzzPost.includes('Consolidated Changes') && !buzzPost.includes('validation'), 'formatted Buzz post must be journey-only without dream ID, validation metadata, or Consolidated Changes list')
+    const seedBuzzPost = formatDreamBuzzPost(seedRes.record)
+    assert(!/\d/.test(seedBuzzPost), 'formatted Buzz post from story_seed must contain zero statistics, sequence numbers, or counts')
 
     // Unsanitized packet summary with @mention or URL fails closed in verifier
     const dirtyPkt = {
