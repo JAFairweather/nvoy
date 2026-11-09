@@ -34,7 +34,7 @@ import {
 const DEFAULT_POLL_MS = 3000
 const MAX_EVENT_LOG = 60
 // One version for the page and the live snapshot: the page reloads whenever they differ.
-const VIEWER_VERSION = '2026-11-09-v12'
+const VIEWER_VERSION = '2026-11-09-v13'
 const ACTIVITY_KINDS = new Set(['wake', 'query', 'lookup', 'submit', 'refused'])
 
 export function escapeHtml(value) {
@@ -3727,6 +3727,7 @@ export function renderViewerHtml(initialState) {
       }
 
       function openDreamingInspector() {
+        if (view !== 'graph') switchView('graph');
         var d = computeDreamingTelemetry();
         var cs = d.curatorState;
         selected = { type: 'dreaming', data: d };
@@ -3742,6 +3743,7 @@ export function renderViewerHtml(initialState) {
       }
 
       function inspectDreamTriggers() {
+        if (view !== 'graph') switchView('graph');
         var d = computeDreamingTelemetry();
         var cs = d.curatorState;
         var lastAtStr = cs.last_curated_at ? (fmtTime(cs.last_curated_at) + ' (' + cs.elapsed_sec + 's/' + cs.dream_interval_sec + 's)') : 'never (0s/' + cs.dream_interval_sec + 's)';
@@ -4341,7 +4343,7 @@ export function renderViewerHtml(initialState) {
             'Merkle Dreaming & Curation · Passive Inspector',
             '-' + dr.wakeSavings.toFixed(1) + '% Est. Wake Bytes',
             isMixed
-              ? ('OBSERVED MERKLE (' + dr.merkleCount + ' persisted merkle_sources) + SIMULATED PREVIEW · READ-ONLY')
+              ? ('MIXED · ' + dr.merkleCount + ' MERKLE + PREVIEW')
               : (isSim ? 'SIMULATED PREVIEW · PASSIVE INSPECTION · READ-ONLY' : 'OBSERVED CURATION · PASSIVE INSPECTION · READ-ONLY'),
             isSim ? 'warn' : 'info',
             '#a78bfa'
