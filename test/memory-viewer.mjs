@@ -14,6 +14,7 @@ import {
   computeCoherence,
   computeDreamingTelemetry,
   computeSynapticEfficacy,
+  CORPUS_CACHE_TTL_MS,
   diffViewerSnapshots,
   readWatchStatus,
   watchAlert,
@@ -1191,6 +1192,10 @@ await test('pollOnce coalesces concurrent polls and reuses cached corpus on unch
     const sCached = await viewer.pollOnce({ forceFull: false })
     assert.equal(sCached.poll_seq, seq0 + 2)
     assert.equal(sCached.store_state.write_seq, 1)
+    assert(CORPUS_CACHE_TTL_MS >= 300_000, 'CORPUS_CACHE_TTL_MS must be at least 5 minutes to prevent 15s full-history rescan throttling')
+    assert.equal(sCached.records, s1.records, 'unchanged write_seq must reuse cached records array')
+    assert.equal(sCached.coherence, s1.coherence, 'unchanged write_seq and activity tail must reuse cached coherence')
+    assert.equal(sCached.efficacy, s1.efficacy, 'unchanged write_seq and activity tail must reuse cached synaptic efficacy')
 
     const root1 = await httpGet(viewer.port, '/')
     const root2 = await httpGet(viewer.port, '/')
