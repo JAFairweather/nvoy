@@ -805,6 +805,7 @@ await test('live integration: memory-viewer polls memory-daemon viewer socket, s
     assert.equal(htmlRes.status, 200)
     assert(String(htmlRes.headers['content-security-policy']).includes("default-src 'none'"))
     assert(htmlRes.body.includes('Hive Shared Memory'))
+    assert(/\.inspect-header \{ display: flex; flex-wrap: wrap;/.test(htmlRes.body) && htmlRes.body.includes('.inspect-actions .badge { white-space: normal; }'), 'a long inspector badge must wrap, not squeeze the title to one letter per line')
     assert(htmlRes.body.includes('READY'))
     assert(htmlRes.body.includes('viewport-fit=cover'))
     assert(htmlRes.body.includes('100dvh'))

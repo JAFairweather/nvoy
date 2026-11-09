@@ -2131,8 +2131,10 @@ export function renderViewerHtml(initialState) {
     .stream-item.sim { border-left-style: dashed; border-left-color: #fbbf24; color: #fde68a; }
     .inspector { flex: 1 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 9px; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
     .inspector > *, #coherence-graphs-box > *, .glass-box > canvas { flex-shrink: 0; }
-    .inspect-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; border-bottom: 1px solid var(--border); padding-bottom: 7px; }
-    .inspect-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+    .inspect-header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; gap: 8px; border-bottom: 1px solid var(--border); padding-bottom: 7px; }
+    .inspect-header > div:first-child { flex: 1 1 180px; }
+    .inspect-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 1; min-width: 0; max-width: 100%; }
+    .inspect-actions .badge { white-space: normal; }
     .inspect-close { padding: 3px 8px; font-size: 12px; line-height: 1.2; border-radius: 6px; }
     .inspect-kicker { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
     .inspect-title { font-family: var(--mono); font-size: 13px; font-weight: 700; color: #93c5fd; word-break: break-word; }
