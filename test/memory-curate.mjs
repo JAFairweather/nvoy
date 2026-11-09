@@ -1317,6 +1317,11 @@ await test('writeDreamPacket writes 0640 global-scope packets, strips @mentions/
     assert(!pkt.changes[0].summary.includes('0d7ac776bf6e9cd0b5f6216ea2f59ac7932a9948'), 'raw 64-hex commit SHA must be sanitized in summary')
     assert(!pkt.changes[0].summary.includes('@mydude'), '@mention syntax must be stripped from packet summary')
     assert(!pkt.changes[0].summary.includes('https://'), 'raw URLs must be stripped from packet summary')
+    assert(pkt.story_seed && typeof pkt.story_seed.dream === 'string', 'packet must include a pre-woven story_seed journey')
+    assert(!/\d/.test(pkt.story_seed.title) && !/\d/.test(pkt.story_seed.dream), 'story_seed journey must contain zero statistics, sequence numbers, scores, or counts')
+    assert(pkt.story_seed.dream.includes('Biggy') && pkt.story_seed.dream.includes('My Dude'), 'story_seed journey must feature the agents as characters')
+    const seedRes = verifyAndAssembleDreamRecord({ packet: pkt, draft: pkt.story_seed })
+    assert.equal(seedRes.ok, true, 'story_seed must pass verifyAndAssembleDreamRecord directly')
 
     const paths = writeDreamPacket({ packetDir, packet: pkt })
     assert.equal(statSync(paths.cyclePath).mode & 0o777, 0o640, 'dream-<write_seq>.json must be mode 0640')

@@ -39,7 +39,7 @@ import {
 const DEFAULT_POLL_MS = 3000
 const MAX_EVENT_LOG = 60
 // One version for the page and the live snapshot: the page reloads whenever they differ.
-const VIEWER_VERSION = '2026-11-09-v14'
+const VIEWER_VERSION = '2026-11-09-v15'
 const ACTIVITY_KINDS = new Set(['wake', 'query', 'lookup', 'submit', 'refused'])
 
 export function escapeHtml(value) {
@@ -3643,6 +3643,77 @@ export function renderViewerHtml(initialState) {
           }
         });
         var isSimulated = Boolean(clustersSimulated || eigensSimulated || arcsSimulated || ghostsSimulated);
+        var journeyRealms = {
+          'hive-memory': 'the Glass Observatory of Amber Ledgers',
+          'herd-infra': 'the High Cloud Engine-Rooms and Iron Watchtowers',
+          'nvoy': 'the Brass Signal Bridges and Courier Locks',
+          'waggle': 'the Lantern-Lit Console Piazzas',
+          'buzz': 'the Echoing Bell-Courts',
+          'r1': 'the Whispering Pocket-Compass Workshop',
+          'illustrated-primer': 'the Hall of Living Margins',
+          'xochitl': 'the Obsidian Garden of Glyphs'
+        };
+        var journeyTravelers = [
+          'Biggy & My Dude',
+          'Dead Rabbit & Neil',
+          'Kerouac & Curator',
+          'My Dude & Dead Rabbit',
+          'Neil & Biggy',
+          'Curator & Kerouac'
+        ];
+        function cleanJourneyPhrase(rawStr, fallback) {
+          var s = String(rawStr || '')
+            .replace(/\s*\[(?:Curated|Distilled)[^\]]*\]\s*$/i, '')
+            .replace(/^(?:DONE|ACTIVE|MERGED|DEPLOYED|SHIPPED|FIXED|RESOLVED|OPEN|WIP|BLOCKED)\s*[:.-]*\s*/i, '')
+            .replace(/\b(?:https?|file):\/\/\S+/gi, '')
+            .replace(/@[a-zA-Z0-9_-]+/g, '')
+            .replace(/\b(?:PR|pull request|issue|commit|seq|sequence|version|port|phase|stage|gate|step)\s*#?\d+[a-zA-Z0-9._-]*\b/gi, '')
+            .replace(/\b[a-zA-Z_-]*\d+[a-zA-Z0-9_.-]*\b/g, '')
+            .replace(/\d+/g, '')
+            .replace(/[_/\\|+:=]+/g, ' ')
+            .replace(/[^a-zA-Z\s,'-]+/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .replace(/^[,.'\s-]+|[,.'\s-]+$/g, '');
+          if (!s || s.length < 4) return fallback || 'the shifting threshold';
+          return s.split(/\s+/).slice(0, 9).join(' ').toLowerCase();
+        }
+        var journeyWaypoints = [
+          {
+            x: 0,
+            y: 0,
+            zoom: 1.05,
+            realm: 'the Amber Observatory Threshold',
+            travelers: 'Curator, Biggy & My Dude',
+            caption: 'Before moonset, Curator lit a brass storm-lantern at the central observatory, and the companions set out along the mist-hung causeway.'
+          }
+        ];
+        clusters.slice(0, 5).forEach(function (cl, idx) {
+          var topId = (cl.topic && cl.topic.id) ? cl.topic.id : (cl.target && cl.target.rec ? topicOf(cl.target.rec) : 'hive-memory');
+          var rLabel = journeyRealms[topId] || ('the Nocturnal Gallery of ' + String(topId).replace(/\d+/g, ''));
+          var trav = journeyTravelers[idx % journeyTravelers.length];
+          var rawTxt = cl.target && cl.target.rec ? (cl.target.rec.claim || slugOf(cl.target.rec)) : '';
+          var phrase = cleanJourneyPhrase(rawTxt, 'the old watch-stone');
+          var cap = cl.isClassB
+            ? ('At ' + rLabel + ', ' + trav + ' reached a barred iron door around ' + phrase + ' and fitted the carved keystone until the heavy gate swung open.')
+            : ('Crossing ' + rLabel + ', ' + trav + ' gathered scattered paper dispatches of ' + phrase + ' and braided them into a single glowing guide-rope across the chasm.');
+          journeyWaypoints.push({
+            x: cl.target ? cl.target.x : 0,
+            y: cl.target ? cl.target.y : 0,
+            zoom: 1.32,
+            realm: rLabel,
+            travelers: trav,
+            caption: cap.replace(/\d+/g, '')
+          });
+        });
+        journeyWaypoints.push({
+          x: 0,
+          y: 0,
+          zoom: 1.0,
+          realm: 'the Eastern Ridge at Daybreak',
+          travelers: 'All Companions',
+          caption: 'By the time the travelers climbed to the eastern ridge at daybreak, the maze of locked gates and tangled trails behind them had changed into a single open road.'
+        });
         return {
           progress: 0,
           speed: 0.00145,
@@ -3661,7 +3732,11 @@ export function renderViewerHtml(initialState) {
           clusters: clusters,
           classBNodes: classBNodes,
           totalMerkle: clusters.length,
-          totalSources: totalSources
+          totalSources: totalSources,
+          journeyWaypoints: journeyWaypoints,
+          travelerX: 0,
+          travelerY: 0,
+          activeWaypointIdx: 0
         };
       }
 
@@ -4481,8 +4556,8 @@ export function renderViewerHtml(initialState) {
           animBtn.type = 'button';
           animBtn.className = 'btn sim';
           animBtn.textContent = isMixed
-            ? '▶ Animate 4-Act Mixed Replay (Observed Merkle + Preview)'
-            : (isSim ? '▶ Animate 4-Act Simulated Preview' : '▶ Animate 4-Act Observed Reorganization');
+            ? '▶ Embark on 4-Act Mixed Dream Journey (Observed + Preview)'
+            : (isSim ? '▶ Embark on 4-Act Simulated Dream Journey' : '▶ Embark on 4-Act Observed Dream Journey');
           animBtn.addEventListener('click', function () { replayLastDream(); });
           actRow.appendChild(animBtn);
           var recBtn = document.createElement('button');
@@ -4495,7 +4570,7 @@ export function renderViewerHtml(initialState) {
           actRow.appendChild(recBtn);
           box.appendChild(actRow);
 
-          // --- Nocturnal Dream Story (Dream Weaver Fable) ---
+          // --- Nocturnal Dream Story (Dream Weaver Past-Tense Journey) ---
           var realmNames = {
             'hive-memory': 'the Glass Observatory of Amber Ledgers',
             'herd-infra': 'the High Cloud Engine-Rooms and Iron Watchtowers',
@@ -4506,43 +4581,58 @@ export function renderViewerHtml(initialState) {
             'illustrated-primer': 'the Hall of Living Margins',
             'xochitl': 'the Obsidian Garden of Glyphs'
           };
+          var inspectorTravelers = [
+            ['Biggy', 'My Dude'],
+            ['Dead Rabbit', 'Neil'],
+            ['Kerouac', 'Curator'],
+            ['My Dude', 'Dead Rabbit']
+          ];
+          function sanitizeInspectorJourneyPhrase(rawStr) {
+            var cleaned = String(rawStr || '')
+              .replace(/\s*\[(?:Curated|Distilled)[^\]]*\]\s*$/i, '')
+              .replace(/^(?:DONE|ACTIVE|MERGED|DEPLOYED|SHIPPED|FIXED|RESOLVED|OPEN|WIP|BLOCKED)\s*[:.-]*\s*/i, '')
+              .replace(/\b(?:https?|file):\/\/\S+/gi, '')
+              .replace(/@[a-zA-Z0-9_-]+/g, '')
+              .replace(/\b(?:PR|pull request|issue|commit|seq|sequence|version|port|phase|stage|gate|step)\s*#?\d+[a-zA-Z0-9._-]*\b/gi, '')
+              .replace(/\b[a-zA-Z_-]*\d+[a-zA-Z0-9_.-]*\b/g, '')
+              .replace(/\d+/g, '')
+              .replace(/[_/\\|+:=]+/g, ' ')
+              .replace(/[^a-zA-Z\s,'-]+/g, ' ')
+              .replace(/\s+/g, ' ')
+              .trim()
+              .replace(/^[,.'\s-]+|[,.'\s-]+$/g, '');
+            if (!cleaned || cleaned.length < 4) return 'the shifting threshold';
+            return cleaned.split(/\s+/).slice(0, 10).join(' ').toLowerCase();
+          }
           var dreamClusters = Array.isArray(latestCuratorState && latestCuratorState.clusters) ? latestCuratorState.clusters : [];
           var dreamEigens = Array.isArray(latestCuratorState && latestCuratorState.topic_eigenvectors) ? latestCuratorState.topic_eigenvectors : [];
           var topRealmTopic = (dreamClusters[0] && dreamClusters[0].topic) || (dreamEigens[0] && dreamEigens[0].canonical_topic) || 'hive-memory';
-          var topRealmLabel = realmNames[topRealmTopic] || ('the Nocturnal Gallery of #' + topRealmTopic);
-          var dreamTitleText = '🌙 Lanterns Over ' + topRealmLabel.replace(/^the\s+/i, '');
-          var dreamParagraphs = [];
-          var constellationNames = dreamEigens.slice(0, 3).map(function (ev) {
-            return '#' + (ev.canonical_topic || 'hive');
-          });
-          if (constellationNames.length > 0) {
-            dreamParagraphs.push(
-              'Beneath a quiet vault of starlight where the spectral constellations of ' + constellationNames.join(', ') +
-              ' drifted in slow orbit, the sleep-weavers walked the high catwalks of ' + topRealmLabel + '.'
-            );
-          } else {
-            dreamParagraphs.push(
-              'Beneath a quiet vault of sleeping stars, the night-watch walked the high catwalks of ' + topRealmLabel + '.'
-            );
-          }
-          dreamClusters.slice(0, 4).forEach(function (cl) {
-            var rName = realmNames[cl.topic] || ('the gallery of #' + (cl.topic || 'hive'));
-            var rawCl = String(cl.claim_preview || cl.claim || cl.slug || '').replace(/\s*\[(?:Curated|Distilled)[^\]]*\]\s*$/i, '').replace(/^(?:DONE|ACTIVE):\s*/i, '');
-            if (rawCl.length > 130) rawCl = rawCl.slice(0, 129) + '…';
-            var foldCount = Number(cl.source_count || (Array.isArray(cl.source_ids) ? cl.source_ids.length : 2));
+          var topRealmLabel = realmNames[topRealmTopic] || ('the Nocturnal Gallery of ' + String(topRealmTopic).replace(/\d+/g, ''));
+          var dreamTitleText = ('🌙 The Night Journey Through ' + topRealmLabel.replace(/^the\s+/i, '')).replace(/\d+/g, '');
+          var dreamParagraphs = [
+            'Before moonset, Curator lit a brass storm-lantern at the threshold of ' + topRealmLabel +
+            ', and Biggy, My Dude, Dead Rabbit, Neil, and Kerouac set out together along the narrow mist-hung causeway.'
+          ];
+          dreamClusters.slice(0, 4).forEach(function (cl, idx) {
+            var rName = realmNames[cl.topic] || ('the gallery of ' + String(cl.topic || 'the hive').replace(/\d+/g, ''));
+            var pair = inspectorTravelers[idx % inspectorTravelers.length];
+            var phrase = sanitizeInspectorJourneyPhrase(cl.claim_preview || cl.claim || cl.slug || '');
             if (cl.stage === 'promotion' || cl.retention === 'decision') {
               dreamParagraphs.push(
-                'In ' + rName + ', ' + foldCount + ' flickering paper lanterns were lifted from the tide-line and carved into a permanent keystone above the arch: "' + rawCl + '"'
+                'At the high arch of ' + rName + ', ' + pair[0] + ' and ' + pair[1] +
+                ' reached a heavy iron door barred around ' + phrase +
+                '; they fitted a carved keystone into the lintel until the bolt gave way and the gate swung open before them.'
               );
             } else {
               dreamParagraphs.push(
-                'Along the gallery of ' + rName + ', ' + foldCount + ' overlapping watch-notes braided together like silver threads into a single clear bell-note: "' + rawCl + '"'
+                'Descending into ' + rName + ', ' + pair[0] + ' and ' + pair[1] +
+                ' found the flagstones drifted with loose paper dispatches of ' + phrase +
+                ', and they braided the scattered pages into a single glowing guide-rope across the chasm.'
               );
             }
           });
           dreamParagraphs.push(
-            'When the Merkle seal closed at sequence ' + (cs.last_curated_write_seq || 0) + ', ' +
-            (dr.merkleCount || 0) + ' consolidated lineages rested beneath the glass dome, leaving the corridors lighter for dawn.'
+            'By the time the companions climbed to the eastern ridge at daybreak, the labyrinth of locked gates and tangled trails behind them had changed into a single open road under the rising sun.'
           );
 
           var storyBox = makeDiv('inspect-claim');
@@ -5139,6 +5229,26 @@ export function renderViewerHtml(initialState) {
           var ds = dreamSymphony;
           ds.progress += ds.speed;
           var p = ds.progress;
+          if (Array.isArray(ds.journeyWaypoints) && ds.journeyWaypoints.length >= 2) {
+            var wpCount = ds.journeyWaypoints.length;
+            var scaledWp = Math.max(0, Math.min(wpCount - 1.0001, p * (wpCount - 1)));
+            var wpIdx = Math.floor(scaledWp);
+            var wpT = scaledWp - wpIdx;
+            var wpEase = wpT * wpT * (3 - 2 * wpT);
+            var wpA = ds.journeyWaypoints[wpIdx];
+            var wpB = ds.journeyWaypoints[Math.min(wpCount - 1, wpIdx + 1)];
+            ds.travelerX = wpA.x + (wpB.x - wpA.x) * wpEase;
+            ds.travelerY = wpA.y + (wpB.y - wpA.y) * wpEase;
+            ds.activeWaypointIdx = wpT < 0.5 ? wpIdx : Math.min(wpCount - 1, wpIdx + 1);
+            if (!drag && !pinch) {
+              var desiredZoom = wpA.zoom + (wpB.zoom - wpA.zoom) * wpEase;
+              cam.targetZoom = desiredZoom;
+              var desiredCamX = -ds.travelerX * cam.zoom * 0.55;
+              var desiredCamY = -ds.travelerY * cam.zoom * 0.55;
+              cam.x += (desiredCamX - cam.x) * 0.075;
+              cam.y += (desiredCamY - cam.y) * 0.075;
+            }
+          }
           var act1Prefix = '[REPLAY · READ-ONLY] ' + ((ds.eigensSimulated || ds.arcsSimulated) ? '[SIMULATED PREVIEW] ' : '[OBSERVED] ');
           var act2Prefix = '[REPLAY · READ-ONLY] ' + ((ds.clustersSimulated || ds.ghostsSimulated) ? '[SIMULATED PREVIEW] ' : '[OBSERVED] ');
           var act3Prefix = '[REPLAY · READ-ONLY] ' + (ds.clustersSimulated ? '[SIMULATED PREVIEW] ' : '[OBSERVED] ');
@@ -5648,6 +5758,38 @@ export function renderViewerHtml(initialState) {
             ctx.fillText((ds.isSimulated ? 'SIMULATED PREVIEW · ' : 'OBSERVED · ') + 'COHERENCE 2.0: ' + cohScoreTxt, 0, -coreR - 12);
             ctx.restore();
           }
+          // Nocturnal Journey Trail & Travelers' Storm-Lantern across waypoints
+          if (Array.isArray(ds.journeyWaypoints) && ds.journeyWaypoints.length >= 2) {
+            ctx.save();
+            ctx.setLineDash([7, 5]);
+            ctx.beginPath();
+            for (var wpi = 0; wpi < ds.journeyWaypoints.length; wpi++) {
+              var wpPt = ds.journeyWaypoints[wpi];
+              if (wpi === 0) ctx.moveTo(wpPt.x, wpPt.y);
+              else ctx.lineTo(wpPt.x, wpPt.y);
+            }
+            ctx.strokeStyle = 'rgba(251, 191, 36, 0.55)';
+            ctx.lineWidth = 2.2;
+            ctx.stroke();
+            ctx.setLineDash([]);
+            var txL = ds.travelerX || 0;
+            var tyL = ds.travelerY || 0;
+            glow(txL, tyL, 3, 28, 'rgba(251, 191, 36, 0.85)');
+            ctx.beginPath();
+            ctx.arc(txL, tyL, 6.5, 0, Math.PI * 2);
+            ctx.fillStyle = '#fef3c7';
+            ctx.fill();
+            ctx.strokeStyle = '#f59e0b';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+            var curWpObj = ds.journeyWaypoints[ds.activeWaypointIdx || 0];
+            if (curWpObj && curWpObj.travelers) {
+              ctx.font = '700 9.5px ui-monospace, monospace';
+              ctx.fillStyle = '#fef3c7';
+              ctx.fillText('🕯 ' + curWpObj.travelers, txL, tyL - 12);
+            }
+            ctx.restore();
+          }
         }
 
         var sortedNodes = nodes.slice().sort(function (a, b) {
@@ -5886,6 +6028,28 @@ export function renderViewerHtml(initialState) {
           ctx.fillRect(bx + 16, by + 48, bw - 32, 5);
           ctx.fillStyle = actCol;
           ctx.fillRect(bx + 16, by + 48, (bw - 32) * Math.min(1, bp), 5);
+
+          if (Array.isArray(dsBanner.journeyWaypoints) && dsBanner.journeyWaypoints.length > 0) {
+            var activeWp = dsBanner.journeyWaypoints[dsBanner.activeWaypointIdx || 0] || dsBanner.journeyWaypoints[0];
+            var sbY = by + bh + 8;
+            var sbH = 54;
+            ctx.fillStyle = 'rgba(15, 23, 42, 0.92)';
+            ctx.strokeStyle = 'rgba(251, 191, 36, 0.55)';
+            ctx.lineWidth = 1.3;
+            ctx.beginPath();
+            ctx.roundRect ? ctx.roundRect(bx, sbY, bw, sbH, 10) : ctx.rect(bx, sbY, bw, sbH);
+            ctx.fill();
+            ctx.stroke();
+            ctx.textAlign = 'left';
+            ctx.font = '700 10.5px ui-monospace, SFMono-Regular, Menlo, monospace';
+            ctx.fillStyle = '#fde68a';
+            ctx.fillText('🕯 DREAM JOURNEY · ' + String(activeWp.realm || '').toUpperCase() + ' (' + String(activeWp.travelers || '') + ')', bx + 14, sbY + 18);
+            ctx.font = 'italic 11.5px Georgia, "Iowan Old Style", "Palatino Linotype", serif';
+            ctx.fillStyle = '#f8fafc';
+            var capStr = String(activeWp.caption || '');
+            if (capStr.length > 108) capStr = capStr.slice(0, 107) + '…';
+            ctx.fillText(capStr, bx + 14, sbY + 38);
+          }
         }
       }
 
