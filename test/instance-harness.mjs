@@ -10,7 +10,7 @@ import { join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { sshChannelEntry } from '../mcp/tools/channel_client.mjs'
 import { fakeHerdr } from './fake-herdr.mjs'
-import { CODEX_CHANNEL_TOOLS, channelProcessUp, classifyPane, claudeArgs, codexConfigToml, codexTurnText, defaultInstructions, ensureInstructions, hasPriorSession, instructionsUpdate, MEMORY_RULE_MARKER, mcpConfig, RECALL_RULE_MARKER, pendingEnvelopes, seedClaudeJson, seedSettings, serverName } from '../mcp/tools/harness_session.mjs'
+import { CODEX_CHANNEL_TOOLS, channelProcessUp, classifyPane, claudeArgs, codexConfigToml, codexTurnText, defaultInstructions, ensureInstructions, hasPriorSession, instructionsUpdate, MEMORY_RULE_MARKER, mcpConfig, RECALL_RULE_MARKER, TURN_RULE_MARKER, pendingEnvelopes, seedClaudeJson, seedSettings, serverName } from '../mcp/tools/harness_session.mjs'
 
 let fails = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); if (!value) fails++ }
@@ -123,7 +123,13 @@ const gained = instructionsUpdate(savedOnly, recaller)
 ok('a file that has the memory rule gains the recall rule, appended once, and is then left alone', gained.startsWith(savedOnly) && gained.split(RECALL_RULE_MARKER).length === 2 &&
   gained.split(MEMORY_RULE_MARKER).length === 2 && instructionsUpdate(gained, recaller) === null)
 ok('local recall carries the same recall rule', instructionsUpdate(null, { ...recaller, recall: { local: true, bridge: '/b' } }) === both)
-ok('without a recall block there is no recall rule', !instructionsUpdate(null, { ...recaller, recall: undefined }).includes(RECALL_RULE_MARKER))
+const recallOnly = gained.replace(/\n## Check memory every turn[\s\S]*$/, '\n')
+const turned = instructionsUpdate(recallOnly, recaller)
+ok('a file that has the recall rule gains the every-turn check, appended once after it, and is then left alone',
+  turned.split(TURN_RULE_MARKER).length === 2 && turned.indexOf(RECALL_RULE_MARKER) < turned.indexOf(TURN_RULE_MARKER) &&
+  /start of every turn/.test(turned) && instructionsUpdate(turned, recaller) === null)
+ok('without a recall block there is no recall rule', !instructionsUpdate(null, { ...recaller, recall: undefined }).includes(RECALL_RULE_MARKER) &&
+  !instructionsUpdate(null, { ...recaller, recall: undefined }).includes(TURN_RULE_MARKER))
 const rememberer = { id: 'mc-test', pubkey: 'c'.repeat(64), buzz: { channels: [channel] }, mayRemember: { rooms: ['r'], perHour: 10 } }
 const created = instructionsUpdate(null, rememberer)
 ok('a new writer\'s instructions carry the standing memory rule once', created.startsWith(defaultInstructions(rememberer)) &&
