@@ -93,7 +93,26 @@ content NIP-44 (runner → owner) of:
   runner checks that and reports `<type> <key> (SHA256:<fingerprint>)` in the row's `detail`, a public key
   only. Anything private-looking, a link, a second line or another binding is `refused` and never echoed.
   If the owner's `bind_runtime` names a different key, the row is `refused`. It is reported work, not proof:
-  the bind is the owner's act and the presence event stays the proof. The helper is not built yet.
+  the bind is the owner's act and the presence event stays the proof. The helper is herd-infra's
+  `bin/stage-channel-key`.
+- `feed_key` is the same row for a Pi or Codex agent's second key, its wake feed (`mcp/tools/principal_family.mjs`:
+  `pi` and `codex` are the two-key family; every other harness has one key). The file is
+  `<request id>.staged-feed.pub` with the comment `nvoy-stage-feed:<instance>:<request id>`, under the same rules, and
+  the row is also `refused` when it is the same key as the channel key. The owner's `bind_runtime` carries `channel_key`
+  and, for these harnesses, `feed_key`; a bind without it, or with one for a one-key harness, is refused when the
+  request is read. Before the apply both staged keys are read again against the bind, so a swapped, replaced or
+  mismatched file seats nothing. The apply plans both principal lines before changing anything and seats the channel
+  key under `codex-channel-mcp.mjs` and the feed key under `codex-channel-feed.mjs`, the same lines
+  `instance-codex-channel-authorized-key.mjs` prints; `instance-unit.mjs verify --family codex` checks both. The Claude
+  baseline is not run for this family: the wake feed baselines on its first start.
+  A bind must match its `add_agent` exactly in `harness` and `like`; another harness (even in the same family) or
+  another template is refused as `ONBOARD_BIND_MISMATCH`.
+- Retry after a partial install. `instance-identity apply` refuses an id already in the instance root, so when the manifest
+  went in but the seat or the verify failed, the next run uses `instance-identity repair` instead (only for an agent this
+  request staged, with a recorded `started` row that did not finish, and only when the installed manifest is byte-identical
+  to the one staged for the request). It installs and re-checks nothing about the estate; it requires
+  the runner to have recorded exactly the installed manifest, then plans, seats and verifies the principals as `apply`
+  does, appending only the lines that are missing. A `started` row that is `done` is never repaired again.
 - `install` is present once the agent is staged. It holds the four fields waggle's step 4 builds the
   install line from (`DESIGN_ADD_AN_AGENT.md`, "What the page checks"):
   - `host_key` is the fleet's own `/etc/ssh/ssh_host_ed25519_key.pub`;

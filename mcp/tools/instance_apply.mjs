@@ -32,6 +32,7 @@ import { createHash } from 'node:crypto'
 import { appendFileSync, closeSync, existsSync, fsyncSync, linkSync, lstatSync, openSync, readdirSync, readFileSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
 import { join } from 'node:path'
 import { parsePrincipal, principalComment, principalLine } from './participant_unit.mjs'
+import { codexComment, codexManifestRefusal, codexPrincipalPlan, distinctKeys } from './principal_family.mjs'
 import { NUMERIC_FIELDS, parseBlockRecord, recordedClashes } from './identity_allocation.mjs'
 
 const KEY_LINE = /^(ssh-ed25519|ecdsa-sha2-nistp256)\s+([A-Za-z0-9+/]+={0,2})(?:\s+\S.*)?$/
@@ -74,6 +75,78 @@ export function estateHash(root) {
   const digests = readdirSync(root).filter(f => f.endsWith('.json')).map(f => f.slice(0, -5)).sort()
     .map(k => [k, digestOf(readFileSync(join(root, `${k}.json`)))])
   return digestOf(`{${digests.map(([k, v]) => `${JSON.stringify(k)}: ${JSON.stringify(v)}`).join(', ')}}`)
+}
+
+// What the family needs, decided before anything changes. Returns { plans } or { error }.
+export function planPrincipals(text, manifest, { family = 'claude', publicKey, feedKey = null }) {
+  const codex = family === 'codex'
+  if (codex) {
+    const bad = codexManifestRefusal(manifest)
+    if (bad) return { error: bad }
+    if (!feedKey) return { error: 'a Pi or Codex agent needs two keys and the bind carries no feed key' }
+    if (!distinctKeys(publicKey, feedKey)) return { error: 'the channel key and the feed key are the same key; each forced command admits exactly one' }
+  }
+  const plans = codex
+    ? [codexPrincipalPlan(text, manifest, 'channel', publicKey), codexPrincipalPlan(text, manifest, 'feed', feedKey)]
+    : [{ role: 'channel', ...principalPlan(text, manifest, publicKey) }]
+  const refused = plans.find(plan => plan.action === 'refuse')
+  return refused ? { error: refused.why, plans } : { plans }
+}
+export const principalCommentOf = (manifest, family, role) => family === 'codex' ? codexComment(manifest, role) : principalComment(manifest)
+
+// Seat the planned principals, then check them as the operator would. Shared by a fresh apply and by the repair of an
+// install that stopped after the manifest went in. `done(state, ok, detail)` reports each state as it is observed.
+export function seatPrincipals({ manifest, keysPath, publicKey, feedKey = null, family = 'claude', run, done, when = 'the deploy' }) {
+  const codex = family === 'codex'
+  const id = manifest.id
+  const again = planPrincipals(readFileSync(keysPath, 'utf8'), manifest, { family, publicKey, feedKey })
+  if (again.error) return done('principal seated', false, `${keysPath} changed during ${when}: ${again.error}`)
+  const seated = []
+  try {
+    for (const plan of again.plans) {
+      if (plan.action === 'append') {
+        const text = readFileSync(keysPath, 'utf8')
+        appendFileSync(keysPath, `${text && !text.endsWith('\n') ? '\n' : ''}${plan.line}\n`)
+      }
+      seated.push(`${plan.role} ${plan.action === 'append' ? 'appended' : 'already present'}`)
+    }
+  } catch (error) {
+    // Partial seat: say which lines are in. A re-run plans again, finds them present and appends only the rest.
+    return done('principal seated', false, `${seated.join(', ') || 'nothing seated'}; stopped at ${error.message}; run again to seat the rest`)
+  }
+  done('principal seated', true, codex ? seated.join(', ') : again.plans[0].action === 'present' ? 'already present' : `appended to ${keysPath}`)
+
+  // 6 and 7. The operator's own checks, run as the operator would.
+  const verify = run(['verify', '--instance', id, '--authorized-keys', keysPath, ...(codex ? ['--family', 'codex'] : [])])
+  if (verify.status !== 0) return done('principal verified', false, (verify.stderr || verify.stdout).trim().split('\n').slice(-3).join(' | '))
+  done('principal verified', true, 'instance-unit verify passed')
+  // A Pi or Codex agent baselines through its feed: the first start with no cursor begins from now
+  // (codex-channel-feed.mjs), so there is no admitted backlog to mark read and no tool to run.
+  if (codex) return done('baselined', true, 'not run: the wake feed baselines on its first start (codex-channel-feed.mjs)')
+  const baseline = run(['baseline'])
+  return done('baselined', baseline.status === 0, (baseline.status === 0 ? baseline.stdout : baseline.stderr || baseline.stdout).trim().split('\n').slice(-1)[0] || `exit ${baseline.status}`)
+}
+
+// An install that stopped after the manifest went in (a failed append, a failed verify) is repaired here, not
+// re-applied: the identity checks, the block record and the install already ran and are not weakened or repeated.
+// The manifest must be the one in the instance root, and the runner must have recorded exactly its bytes.
+export function repairInstalled({ manifest, root, stateDir, keysPath, publicKey, feedKey = null, family = 'claude', run, log = () => {} }) {
+  const states = []
+  const done = (state, ok, detail) => { states.push({ state, ok, detail }); log(state, ok, detail); return { ok, states } }
+  const target = join(root, `${manifest.id}.json`), compose = join(root, `${manifest.id}.compose.yml`)
+  let keysStat
+  try { keysStat = lstatSync(keysPath) } catch { return done('principal planned', false, `${keysPath} does not exist; create the channel account first`) }
+  if (!keysStat.isFile() || keysStat.isSymbolicLink()) return done('principal planned', false, `${keysPath} must be a regular file, not a link`)
+  const plan = planPrincipals(readFileSync(keysPath, 'utf8'), manifest, { family, publicKey, feedKey })
+  if (plan.error) return done('principal planned', false, plan.error)
+  done('principal planned', true, plan.plans.every(p => p.action === 'present') ? 'already present, unchanged'
+    : `will append ${plan.plans.filter(p => p.action === 'append').map(p => principalCommentOf(manifest, family, p.role)).join(' and ')}`)
+  const deployed = readJson(join(stateDir, 'DEPLOYED_MANIFESTS.json'))
+  if (!existsSync(target) || deployed?.[manifest.id] !== digestOf(readFileSync(target)) || !existsSync(compose))
+    return { ...done('deployed', null, 'the runner has not recorded the installed manifest and its compose file yet; nothing was seated'), inconclusive: true }
+  done('deployed', true, `the runner recorded the installed manifest and wrote ${compose}`)
+  const result = seatPrincipals({ manifest, keysPath, publicKey, feedKey, family, run, done, when: 'the repair' })
+  return { ok: states.every(st => st.ok), states }
 }
 
 // Read the runner's record for one install. `deployed` is DEPLOYED_MANIFESTS.json, `failed` is
@@ -119,7 +192,7 @@ export function reserveBlock(ledgerPath, manifest, now = () => Date.now()) {
 }
 
 // `run(argv)` returns { status, stdout, stderr }. `sleep` and `now` (ms) are injected for the suite.
-export async function applyStaged({ manifest, stagedPath, root, stateDir, keysPath, publicKey, run, ledgerPath, waitMs = 600000, pollMs = 5000,
+export async function applyStaged({ manifest, stagedPath, root, stateDir, keysPath, publicKey, family = 'claude', feedKey = null, run, ledgerPath, waitMs = 600000, pollMs = 5000,
   sleep = ms => new Promise(r => setTimeout(r, ms)), now = () => Date.now(), log = () => {} }) {
   const states = []
   const done = (state, ok, detail) => { states.push({ state, ok, detail }); log(state, ok, detail); return { ok, states } }
@@ -129,9 +202,13 @@ export async function applyStaged({ manifest, stagedPath, root, stateDir, keysPa
   let keysStat
   try { keysStat = lstatSync(keysPath) } catch { return done('principal planned', false, `${keysPath} does not exist; create the channel account first`) }
   if (!keysStat.isFile() || keysStat.isSymbolicLink()) return done('principal planned', false, `${keysPath} must be a regular file, not a link`)
-  const plan = principalPlan(readFileSync(keysPath, 'utf8'), manifest, publicKey)
-  if (plan.action === 'refuse') return done('principal planned', false, plan.why)
-  done('principal planned', true, plan.action === 'present' ? 'already present, unchanged' : `will append ${principalComment(manifest)}`)
+  // The plan covers every key the family needs, and is decided whole: one refused line refuses the apply
+  // before anything changes, so a two-key agent is never half-seated by a plan it could have rejected.
+  const codex = family === 'codex'
+  const plan = planPrincipals(readFileSync(keysPath, 'utf8'), manifest, { family, publicKey, feedKey })
+  if (plan.error) return done('principal planned', false, plan.error)
+  done('principal planned', true, plan.plans.every(p => p.action === 'present') ? 'already present, unchanged'
+    : `will append ${plan.plans.filter(p => p.action === 'append').map(p => principalCommentOf(manifest, family, p.role)).join(' and ')}`)
 
   // 2. Reserve the block in the record, as the record is now, before anything can run as it.
   const reserved = reserveBlock(ledgerPath, manifest, now)
@@ -171,20 +248,7 @@ export async function applyStaged({ manifest, stagedPath, root, stateDir, keysPa
   }
   done('deployed', true, `the runner recorded this manifest and wrote ${compose}`)
 
-  // 5. Seat the principal, re-planned against the file as it is now.
-  const again = principalPlan(readFileSync(keysPath, 'utf8'), manifest, publicKey)
-  if (again.action === 'refuse') return done('principal seated', false, `${keysPath} changed during the deploy: ${again.why}`)
-  if (again.action === 'append') {
-    const text = readFileSync(keysPath, 'utf8')
-    appendFileSync(keysPath, `${text && !text.endsWith('\n') ? '\n' : ''}${again.line}\n`)
-  }
-  done('principal seated', true, again.action === 'present' ? 'already present' : `appended to ${keysPath}`)
-
-  // 6 and 7. The operator's own checks, run as the operator would.
-  const verify = run(['verify', '--instance', id, '--authorized-keys', keysPath])
-  if (verify.status !== 0) return done('principal verified', false, (verify.stderr || verify.stdout).trim().split('\n').slice(-3).join(' | '))
-  done('principal verified', true, 'instance-unit verify passed')
-  const baseline = run(['baseline'])
-  done('baselined', baseline.status === 0, (baseline.status === 0 ? baseline.stdout : baseline.stderr || baseline.stdout).trim().split('\n').slice(-1)[0] || `exit ${baseline.status}`)
+  // 5-7. Seat the principals, re-planned against the file as it is now, then verify and baseline.
+  seatPrincipals({ manifest, keysPath, publicKey, feedKey, family, run, done })
   return { ok: states.every(st => st.ok), states }
 }
