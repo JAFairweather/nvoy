@@ -95,7 +95,7 @@ assert.match(applies[0].feed, /^ssh-ed25519 /); assert.ok(applies[0].feed.includ
 assert.ok(readFileSync(args[args.indexOf('--public-key-file') + 1], 'utf8').includes(body('a')), 'the channel file holds the channel key')
 
 // Swapped: the staged feed file holds the channel key. Nothing is applied.
-rmSync(join(root, 'crusty.json')); applies.length = 0
+rmSync(join(root, 'crusty.json'), { force: true }); applies.length = 0
 stageFeed(CHANNEL)
 result = await run([addEvent, bindEvent])
 assert.equal(states(result).feed_key, 'refused'); assert.equal(states(result).started, 'refused'); assert.equal(applies.length, 0, 'a swapped key reaches no apply')
@@ -111,8 +111,50 @@ rmSync(stageOf('channel')); rmSync(stageOf('feed'))
 result = await run([addEvent, bindEvent])
 assert.equal(states(result).channel_key, undefined); assert.equal(states(result).feed_key, undefined); assert.equal(states(result).started, 'done'); assert.equal(applies.length, 1)
 
+// A failure AFTER the manifest went in is repaired by the next run, once, and not on every tick after that.
+rmSync(join(root, 'crusty.json'), { force: true }); applies.length = 0
+{
+  const verbs = []
+  const flaky = (tool, args) => {
+    if (args[0] === 'apply') { verbs.push('apply'); writeFileSync(join(root, 'crusty.json'), readFileSync(join(out, 'crusty.json'))); return 1 }   // installed, then the seat or verify failed
+    if (args[0] === 'repair') { verbs.push('repair'); assert.ok(args.includes('--feed-public-key-file') && !args.includes('--out')); return repairCode }
+    return runTool(tool, args)
+  }
+  let repairCode = 1
+  const flakyRun = () => onboard({ command: 'run', name: 'crusty', root, out, stateDir, backupRoot, keysPath: join(tmp, 'authorized_keys'),
+    fetchEvents: async () => [addEvent, bindEvent], runTool: flaky, joinWith: () => ({ signer: {}, open: async () => { throw new Error('AUTH refused: not a member') }, close() {} }), log: () => {} })
+  let result = await flakyRun()
+  assert.equal(states(result).started, 'refused'); assert.deepEqual(verbs, ['apply'], 'the first run applied and failed after installing')
+  result = await flakyRun()
+  assert.deepEqual(verbs, ['apply', 'repair'], 'the next run repairs the installed agent instead of calling it installed')
+  assert.equal(states(result).started, 'refused'); assert.match(result.receipts.find(row => row.step === 'started').detail, /repair exited 1/)
+  repairCode = 0
+  result = await flakyRun()
+  assert.deepEqual(verbs, ['apply', 'repair', 'repair']); assert.equal(states(result).started, 'done')
+  assert.match(result.receipts.find(row => row.step === 'started').detail, /repaired/)
+  result = await flakyRun()
+  assert.deepEqual(verbs, ['apply', 'repair', 'repair'], 'once done, later ticks do not repair again'); assert.equal(states(result).started, 'done')
+  rmSync(join(root, 'crusty.json')); rmSync(join(stateDir, `${addEvent.id}.jsonl`))
+}
+
+// The bind must match the add exactly: another harness (even in the same family) or another template is another intent.
+rmSync(join(stateDir, `${addEvent.id}.jsonl`), { force: true })
+for (const [label, tags] of [['harness in the same family', bindTags('codex', ['channel_key', CHANNEL], ['feed_key', FEED])],
+  ['template', [...bindTags('pi', ['channel_key', CHANNEL], ['feed_key', FEED])].map(tag => tag[0] === 'like' ? ['like', 'pi-dog'] : tag)]]) {
+  if (label === 'template') {
+    // a second installed template, so `like` can differ and still parse
+    const second = raw('crystalclaude', getPublicKey(generateSecretKey()))
+    second.may_set_profile = { kind: 0, pubkey: second.pubkey, grant_id: 'cd'.repeat(32), per_day: 1, picture_hosts: ['nave.pub'] }
+    writeFileSync(join(root, 'crystalclaude.json'), JSON.stringify(second))
+    const other = sign(bindTags('pi', ['channel_key', CHANNEL], ['feed_key', FEED]).map(tag => tag[0] === 'like' ? ['like', 'crystalclaude'] : tag))
+    await assert.rejects(run([addEvent, other]), error => error.code === 'ONBOARD_BIND_MISMATCH' && /starts like/.test(error.message), label)
+  } else {
+    await assert.rejects(run([addEvent, sign(tags)]), error => error.code === 'ONBOARD_BIND_MISMATCH' && /is for a codex agent but add_agent is pi/.test(error.message), label)
+  }
+}
+
 // An add_agent for a Claude harness, a bind for a Pi one: refused, not guessed at.
-rmSync(join(root, 'crusty.json')); applies.length = 0
+rmSync(join(root, 'crusty.json'), { force: true }); applies.length = 0
 const mismatched = sign([...addTags('claude-code')])
 await assert.rejects(run([mismatched, bindEvent]), error => error.code === 'ONBOARD_BIND_MISMATCH')
 assert.equal(applies.length, 0)

@@ -105,6 +105,13 @@ content NIP-44 (runner → owner) of:
   key under `codex-channel-mcp.mjs` and the feed key under `codex-channel-feed.mjs`, the same lines
   `instance-codex-channel-authorized-key.mjs` prints; `instance-unit.mjs verify --family codex` checks both. The Claude
   baseline is not run for this family: the wake feed baselines on its first start.
+  A bind must match its `add_agent` exactly in `harness` and `like`; another harness (even in the same family) or
+  another template is refused as `ONBOARD_BIND_MISMATCH`.
+- Retry after a partial install. `instance-identity apply` refuses an id already in the instance root, so when the manifest
+  went in but the seat or the verify failed, the next run uses `instance-identity repair` instead (only for an agent this
+  request staged whose last `started` row did not finish). It installs and re-checks nothing about the estate; it requires
+  the runner to have recorded exactly the installed manifest, then plans, seats and verifies the principals as `apply`
+  does, appending only the lines that are missing. A `started` row that is `done` is never repaired again.
 - `install` is present once the agent is staged. It holds the four fields waggle's step 4 builds the
   install line from (`DESIGN_ADD_AN_AGENT.md`, "What the page checks"):
   - `host_key` is the fleet's own `/etc/ssh/ssh_host_ed25519_key.pub`;

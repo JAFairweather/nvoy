@@ -81,7 +81,10 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
   if (bindEvent) {
     bind = parseSetupRequest(bindEvent, { name, manifests, seen, now: now() })
     if (bind.pubkey !== add.pubkey || bind.owner !== add.owner) throw new OnboardRefusal('ONBOARD_BIND_MISMATCH', 'bind_runtime names a different key or owner than add_agent')
-    if (familyOf(bind.harness) !== familyOf(add.harness)) throw new OnboardRefusal('ONBOARD_BIND_MISMATCH', `bind_runtime is for a ${bind.harness} agent but add_agent is ${add.harness}: they need different keys`)
+    // Both signed fields must agree, exactly: the harness decides which principals are seated and `like` which template
+    // the agent started like. A bind for another harness, or another template, is a different intent, not a variant.
+    if (bind.harness !== add.harness) throw new OnboardRefusal('ONBOARD_BIND_MISMATCH', `bind_runtime is for a ${bind.harness} agent but add_agent is ${add.harness}`)
+    if (bind.like !== add.like) throw new OnboardRefusal('ONBOARD_BIND_MISMATCH', `bind_runtime starts like ${bind.like} but add_agent starts like ${add.like}`)
   }
 
   log(`request ${add.id.slice(0, 12)} from ${add.owner.slice(0, 8)}: add ${name} (${add.harness}) like ${add.like}`)
@@ -154,9 +157,16 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
       return code === 0 ? receipt('checked', 'done', 'clear of every identity and block') : receipt('checked', 'refused', `check exited ${code}`)
     }],
     ['started', () => {
-      if (isInstalled()) return receipt('started', 'done', 'installed')
+      // An install that stopped after its manifest went in (a failed append, a failed verify) is repaired, not skipped:
+      // the principals are seated and verified for the manifest that is there. That is only for an agent this request
+      // staged whose last `started` row did not finish; one installed some other way, or already done, is left as it is
+      // (a repair on every tick would verify, and for the Claude family baseline, again and again).
+      const prior = lines(receiptPath).filter(row => row.step === 'started').at(-1)
+      const ours = existsSync(stagedFor) && readFileSync(stagedFor, 'utf8').trim() === add.id
+      if (isInstalled() && !(bind && keysPath && ours && prior?.state !== 'done')) return receipt('started', 'done', 'installed')
       if (!bind) return receipt('started', 'pending', 'waiting for bind_runtime: the install line on the agent\'s box')
       if (!keysPath) return receipt('started', 'pending', 'give --authorized-keys for the channel account')
+      if (isInstalled() && manifests.get(name).pubkey !== add.pubkey) return receipt('started', 'refused', 'the installed manifest is for another key; nothing was seated')
       const pub = join(stateDir, `${add.id}.channel.pub`)
       writeFileSync(pub, `${bind.channelKey.keyType} ${bind.channelKey.keyBody} nvoy-onboard-${name}\n`, { mode: 0o644 })
       // A Pi or Codex agent seats a second principal for its wake feed. Both keys are re-read against the bind
@@ -174,10 +184,13 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
         writeFileSync(feedPub, `${bind.feedKey.keyType} ${bind.feedKey.keyBody} nvoy-onboard-feed-${name}\n`, { mode: 0o644 })
         extra.push('--feed-public-key-file', feedPub)
       }
-      const code = runTool('instance-identity.mjs', ['apply', '--id', name, '--public-key-file', pub, ...extra, '--harness', add.harness, '--authorized-keys', keysPath, '--out', out, '--instance-root', root])
+      const repairing = isInstalled()
+      const verb = repairing ? 'repair' : 'apply'
+      const code = runTool('instance-identity.mjs', [verb, '--id', name, '--public-key-file', pub, ...extra, '--harness', add.harness, '--authorized-keys', keysPath,
+        ...(repairing ? [] : ['--out', out]), '--instance-root', root])
       manifests = installed(root)
-      return code === 0 && isInstalled() ? receipt('started', 'done', 'applied, principal seated, channel baselined') :
-        receipt('started', code === 3 ? 'pending' : 'refused', `apply exited ${code}`)
+      return code === 0 && isInstalled() ? receipt('started', 'done', repairing ? 'repaired: principals seated and verified for the installed agent' : 'applied, principal seated, channel baselined') :
+        receipt('started', code === 3 ? 'pending' : 'refused', `${verb} exited ${code}`)
     }],
     // The name the owner gave, queued for the agent's own broker to sign and publish as its first
     // kind 0 (waggle #717). The request id comes from the name and the fields, so a run again, or the

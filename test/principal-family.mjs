@@ -21,7 +21,7 @@ import { fileURLToPath } from 'node:url'
 import { allocateIdentityBlock, buildParticipantManifest } from '../mcp/tools/identity_allocation.mjs'
 import { readManifest } from '../mcp/tools/runtime_manifest.mjs'
 import { principalLine } from '../mcp/tools/participant_unit.mjs'
-import { applyStaged, digestOf } from '../mcp/tools/instance_apply.mjs'
+import { applyStaged, digestOf, repairInstalled } from '../mcp/tools/instance_apply.mjs'
 import { familyOf, keysFor, codexPrincipalLine, codexPrincipalPlan, verifyCodexPrincipal, codexForcedCommand, distinctKeys } from '../mcp/tools/principal_family.mjs'
 
 let pass = true
@@ -173,6 +173,56 @@ const lines = path => readFileSync(path, 'utf8').split('\n').filter(Boolean)
   const r = await go()
   check(r.ok && lines(ctx.keysPath).length === 1 && lines(ctx.keysPath)[0] === principalLine(manifest, CHANNEL.keyType, CHANNEL.keyBody)
     && ctx.calls.some(c => c[0] === 'baseline') && !ctx.calls.find(c => c[0] === 'verify').includes('--family'), 'the Claude family is unchanged: one principal, the Claude verify, the Claude baseline')
+}
+
+// ── repair: an install that stopped after the manifest went in ───────────────────────────────────
+// apply refuses an id already installed, so a retry after a failed seat or verify needs its own path. It installs
+// nothing, checks the runner recorded exactly the installed bytes, then seats and verifies as apply does.
+{
+  const repairScenario = ({ keys = '', family = 'codex', feedKey = FEED, deployed = true, verifyStatus = 0, link = false }) => {
+    const dir = join(tmp, `r${++n}`), root = join(dir, 'instances'), state = join(dir, 'state'), keysPath = join(dir, 'authorized_keys')
+    mkdirSync(root, { recursive: true }); mkdirSync(state)
+    writeFileSync(join(root, 'hr.json'), readFileSync(stagedPath))
+    if (deployed) { writeFileSync(join(state, 'DEPLOYED_MANIFESTS.json'), JSON.stringify({ hr: digest })); writeFileSync(join(root, 'hr.compose.yml'), 'services: {}\n') }
+    writeFileSync(keysPath, keys)
+    const calls = []
+    return { keysPath, calls, go: () => repairInstalled({ manifest, root, stateDir: state, keysPath, publicKey: CHANNEL, family, feedKey,
+      run: argv => { calls.push(argv); return argv[0] === 'verify' ? { status: verifyStatus, stdout: 'verified', stderr: verifyStatus ? 'FAIL' : '' } : { status: 0, stdout: 'baselined 3', stderr: '' } } }) }
+  }
+  {
+    const { keysPath, calls, go } = repairScenario({ keys: `${channelLine}\n` })
+    const r = go()
+    check(r.ok && states(r) === 'principal planned:true deployed:true principal seated:true principal verified:true baselined:true', `repair of a half-seated agent: ${states(r)}`)
+    check(lines(keysPath).join('\n') === `${channelLine}\n${feedLine}` && /channel already present, feed appended/.test(r.states.find(st => st.state === 'principal seated').detail), 'it appends only the missing feed line')
+    check(!calls.some(c => c[0] === 'baseline'), 'and runs no Claude baseline for this family')
+    check(go().ok && lines(keysPath).length === 2, 'a second repair changes nothing')
+  }
+  {
+    const { keysPath, go } = repairScenario({ keys: '' })
+    const r = go()
+    check(r.ok && lines(keysPath).join('\n') === `${channelLine}\n${feedLine}`, 'repair seats both lines when neither was seated')
+  }
+  {
+    const { keysPath, calls, go } = repairScenario({ deployed: false })
+    const r = go()
+    check(!r.ok && r.inconclusive && states(r) === 'principal planned:true deployed:null' && lines(keysPath).length === 0 && !calls.length, 'repair seats nothing while the runner has not recorded the installed manifest')
+  }
+  {
+    const { keysPath, go } = repairScenario({ keys: `${codexPrincipalLine(manifest, 'feed', CHANNEL.keyType, CHANNEL.keyBody)}\n` })
+    const r = go()
+    check(!r.ok && states(r) === 'principal planned:false' && lines(keysPath).length === 1, 'repair keeps the plan\'s refusals: a different key under the feed comment is not overwritten')
+  }
+  {
+    const { go } = repairScenario({ feedKey: null })
+    check(!go().ok, 'repair of a two-key agent without a feed key refuses')
+    const r = repairScenario({ verifyStatus: 1 }).go()
+    check(!r.ok && states(r).endsWith('principal seated:true principal verified:false'), 'a failed verify is reported and is not ok')
+  }
+  {
+    const { keysPath, calls, go } = repairScenario({ family: 'claude', feedKey: null })
+    const r = go()
+    check(r.ok && lines(keysPath)[0] === principalLine(manifest, CHANNEL.keyType, CHANNEL.keyBody) && calls.some(c => c[0] === 'baseline'), 'repair of a Claude-family agent seats its one line and baselines, as apply does')
+  }
 }
 
 if (!pass) { console.error('principal-family: FAILED'); process.exit(1) }

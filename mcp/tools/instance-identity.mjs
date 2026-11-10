@@ -57,7 +57,7 @@ import { fileURLToPath } from 'node:url'
 import { readManifest } from './runtime_manifest.mjs'
 import { auditIdentityBlocks, allocateIdentityBlock, buildParticipantManifest, seatingPlan,
   policyFromTemplate, auditUniqueFields, credentialVerdict, parseBlockRecord, recordedClashes, NUMERIC_FIELDS, TEMPLATE_FIELDS } from './identity_allocation.mjs'
-import { applyStaged, readPublicKey } from './instance_apply.mjs'
+import { applyStaged, readPublicKey, repairInstalled } from './instance_apply.mjs'
 import { familyOf } from './principal_family.mjs'
 
 const argv = process.argv.slice(2)
@@ -67,9 +67,10 @@ const all = n => argv.reduce((acc, a, i) => (a === n && argv[i + 1] ? [...acc, a
 const die = m => { console.error(`instance-identity: ${m}`); process.exit(1) }
 const root = resolve(flag('--instance-root') || process.env.NVOY_INSTANCE_ROOT || '/etc/nvoy/instances')
 
-if (!['audit', 'allocate', 'check', 'apply'].includes(verb)) {
+if (!['audit', 'allocate', 'check', 'apply', 'repair'].includes(verb)) {
   die('usage: audit | allocate --id <name> --pubkey <npub|hex> [--like <id>] [--grantor <npub|hex>] [--relay wss://…] | check --id <name>'
-    + ' | apply --id <name> --public-key-file <path> --authorized-keys <path>')
+    + ' | apply --id <name> --public-key-file <path> --authorized-keys <path> [--harness <h> [--feed-public-key-file <path>]]'
+    + ' | repair --id <name> --public-key-file <path> --authorized-keys <path> [--harness <h> [--feed-public-key-file <path>]]')
 }
 const outDir = resolve(flag('--out') || join(process.env.HOME || '/tmp', '.nvoy', 'staged'))
 // The durable record of every block ever installed, beside the instance root. Without it a retired
@@ -130,6 +131,48 @@ if (unreadable.length) {
 
 const id = flag('--id')
 
+// The public key files an apply or a repair seats. A harness picks the family: Pi and Codex need a second key for
+// their wake feed and get two principals; every other harness keeps the one Claude channel principal.
+function readKeys() {
+  const keyFile = flag('--public-key-file'), keysPath = flag('--authorized-keys')
+  if (!keyFile || !keysPath) die(`${verb} needs --public-key-file <path> and --authorized-keys <path>`)
+  const harness = flag('--harness') || 'claude-code', family = familyOf(harness), feedFile = flag('--feed-public-key-file')
+  if (family === 'codex' && !feedFile) die(`a ${harness} agent needs --feed-public-key-file: its wake feed is a second key`)
+  if (family !== 'codex' && feedFile) die(`--feed-public-key-file is for Pi and Codex agents; ${harness} has one key`)
+  const read = (file, what) => {
+    try {
+      const st = lstatSync(file)
+      if (!st.isFile() || st.isSymbolicLink() || st.size > 16 * 1024) throw new Error('must be a regular file under 16 KiB')
+      if (st.mode & 0o022) throw new Error('must not be group or world writable')
+      return readPublicKey(readFileSync(file, 'utf8'))
+    } catch (e) { return die(`${what} ${file}: ${e.message}`) }
+  }
+  return { keysPath, family, publicKey: read(keyFile, 'public key file'), feedKey: feedFile ? read(feedFile, 'feed public key file') : null }
+}
+
+// ---- repair: an install that stopped after the manifest went in ------------------------------------
+// `apply` refuses an id already in the instance root, which is right for a new identity. A retry after a failed
+// append or verify comes here instead: it checks nothing about the estate again and installs nothing, it seats and
+// verifies the principals for the manifest that is installed, and refuses unless the runner recorded its bytes.
+if (verb === 'repair') {
+  if (unreadable.length) { console.error('\ninstance-identity: INCONCLUSIVE — cannot repair against an estate it cannot fully read'); process.exit(3) }
+  const m = manifests.find(x => x.id === flag('--id'))
+  if (!m) die(`${flag('--id')} is not in the instance root; repair is for an installed identity`)
+  const { keysPath, family, publicKey, feedKey } = readKeys()
+  const unit = join(dirname(fileURLToPath(import.meta.url)), 'instance-unit.mjs')
+  const run = ([what, ...args]) => {
+    const r = what === 'verify'
+      ? spawnSync(process.execPath, [unit, 'verify', ...args], { encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: root } })
+      : spawnSync('/usr/bin/docker', ['exec', '--user', `${m.workerUid}:${m.workerHandoffGid}`, m.adapterContainer,
+        '/usr/local/bin/node', '/srv/nvoy/mcp/tools/claude-channel.mjs', '--instance', m.id, '--baseline'], { encoding: 'utf8' })
+    return { status: r.status, stdout: r.stdout || '', stderr: r.stderr || (r.error ? r.error.message : '') }
+  }
+  console.log(`\nrepair ${m.id}:`)
+  const result = repairInstalled({ manifest: m, root, stateDir: resolve(flag('--state-dir') || '/var/lib/nvoy-deploy'), keysPath, publicKey, feedKey, family, run,
+    log: (state, ok, detail) => console.log(`  ${ok === null ? 'INCONCLUSIVE' : ok ? 'PASS' : 'FAIL'}  ${state}: ${detail}`) })
+  process.exit(result.ok ? 0 : result.inconclusive ? 3 : 1)
+}
+
 // ---- check (and the gate apply runs first) -------------------------------------------------------
 if (verb === 'check' || verb === 'apply') {
   if (unreadable.length) {
@@ -162,27 +205,7 @@ if (verb === 'check' || verb === 'apply') {
   if (verb === 'check') process.exit(passed ? 0 : 1)
   if (!passed) die('apply refused: the check above did not pass, and nothing was installed')
 
-  const keyFile = flag('--public-key-file'), keysPath = flag('--authorized-keys')
-  if (!keyFile || !keysPath) die('apply needs --public-key-file <path> and --authorized-keys <path>')
-  // The harness picks the family. A Pi or Codex agent needs a second key for its wake feed and gets two
-  // principals; every other harness keeps the one Claude channel principal, as before.
-  const harness = flag('--harness') || 'claude-code', family = familyOf(harness), feedFile = flag('--feed-public-key-file')
-  if (family === 'codex' && !feedFile) die(`a ${harness} agent needs --feed-public-key-file: its wake feed is a second key`)
-  if (family !== 'codex' && feedFile) die(`--feed-public-key-file is for Pi and Codex agents; ${harness} has one key`)
-  let publicKey
-  try {
-    const st = lstatSync(keyFile)
-    if (!st.isFile() || st.isSymbolicLink() || st.size > 16 * 1024) throw new Error('must be a regular file under 16 KiB')
-    if (st.mode & 0o022) throw new Error('must not be group or world writable')
-    publicKey = readPublicKey(readFileSync(keyFile, 'utf8'))
-  } catch (e) { die(`public key file ${keyFile}: ${e.message}`) }
-  let feedKey = null
-  if (feedFile) try {
-    const st = lstatSync(feedFile)
-    if (!st.isFile() || st.isSymbolicLink() || st.size > 16 * 1024) throw new Error('must be a regular file under 16 KiB')
-    if (st.mode & 0o022) throw new Error('must not be group or world writable')
-    feedKey = readPublicKey(readFileSync(feedFile, 'utf8'))
-  } catch (e) { die(`feed public key file ${feedFile}: ${e.message}`) }
+  const { keysPath, family, publicKey, feedKey } = readKeys()
   const unit = join(dirname(fileURLToPath(import.meta.url)), 'instance-unit.mjs')
   // verify reads the manifest from the root, as an operator's run would; baseline runs inside the
   // adapter, where node and the tool exist (claude-channel-doctor.mjs states why).
