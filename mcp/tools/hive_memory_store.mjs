@@ -649,7 +649,30 @@ export function extractClaimEdges({
   return [...edges.values()]
 }
 
+function ensureDerivedSchema(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS claim_edges (
+      from_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+      edge_type TEXT NOT NULL,
+      target_ref TEXT NOT NULL,
+      weight REAL NOT NULL DEFAULT 1.0,
+      PRIMARY KEY (from_id, edge_type, target_ref)
+    );
+    CREATE INDEX IF NOT EXISTS idx_claim_edges_target ON claim_edges(edge_type, target_ref);
+    CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
+      event_id UNINDEXED,
+      d,
+      topic,
+      claim,
+      because,
+      evidence,
+      tokenize='porter unicode61'
+    );
+  `)
+}
+
 function indexDerivedEvent(db, { id, d, topic, asOfGit, asOfEvt, supersedes = [], claim = '', because = '', evidence = [] }) {
+  ensureDerivedSchema(db)
   const normTopic = normalizeMemoryTopic(topic) ?? (topic || '')
   const evArr = Array.isArray(evidence) ? evidence : []
   db.prepare('DELETE FROM events_fts WHERE event_id = ?').run(id)
@@ -864,6 +887,7 @@ export class HiveMemoryStore {
     const extra = difference(ids, fold.expected)
     if (extra.size) return this.#fail('DB_HAS_UNEXPECTED_OR_PURGED_EVENTS', `${extra.size} unrecorded event(s) present`)
     if (meta.last_purge_seq !== fold.lastPurgeSeq) return this.#fail('PURGE_SEQ_MISMATCH', `last_purge_seq ${meta.last_purge_seq}, ledger ${fold.lastPurgeSeq}`)
+    try { this.#ensureDerivedTables() } catch (e) { return this.#fail('DERIVED_INDEX_INIT_FAILED', e.code || e.message) }
     this.ledgerMaxSeq = fold.maxSeq
     this.purgedIds = fold.purged
     this.state = 'READY'
@@ -1121,28 +1145,10 @@ export class HiveMemoryStore {
   }
 
   // Ensures `events_fts` and `claim_edges` exist and backfills any rows inserted into `events` directly
-  // (e.g. pre-upgrade snapshots or raw SQLite fixtures). Lazy so startup/reconcile have zero overhead.
+  // (e.g. pre-upgrade snapshots or raw SQLite fixtures). Runs during reconcile() before READY and is idempotent.
   #ensureDerivedTables() {
     if (!this.db) return
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS claim_edges (
-        from_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
-        edge_type TEXT NOT NULL,
-        target_ref TEXT NOT NULL,
-        weight REAL NOT NULL DEFAULT 1.0,
-        PRIMARY KEY (from_id, edge_type, target_ref)
-      );
-      CREATE INDEX IF NOT EXISTS idx_claim_edges_target ON claim_edges(edge_type, target_ref);
-      CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
-        event_id UNINDEXED,
-        d,
-        topic,
-        claim,
-        because,
-        evidence,
-        tokenize='porter unicode61'
-      );
-    `)
+    ensureDerivedSchema(this.db)
     const totalEvents = this.db.prepare('SELECT count(*) AS n FROM events').get().n
     const indexedFts = this.db.prepare('SELECT count(*) AS n FROM events_fts').get().n
     if (indexedFts >= totalEvents) return
