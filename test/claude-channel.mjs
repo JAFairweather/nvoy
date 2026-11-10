@@ -437,6 +437,23 @@ try {
   ok('memory_dream_verify verifies draft against packet and returns checked record + buzz_post', false)
 } finally { try { await curatorClient.close() } catch { /* already gone */ } }
 
+// When the packet directory is absent on the host (e.g. remote nave.pub channel), curator omits memory_dream_verify from listTools so local hive-dream is not shadowed.
+const remoteCuratorTransport = new StdioClientTransport({
+  command: process.execPath,
+  args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', 'curator', '--poll-ms', '60000'],
+  env: { ...process.env, NVOY_INSTANCE_ROOT: manifests, HIVE_MEMORY_CURATOR_PACKET_DIR: join(root, 'missing-packets') },
+  stderr: 'pipe',
+})
+const remoteCuratorClient = new Client({ name: 'claude-channel-curator-remote', version: '0.1.0' })
+try {
+  await remoteCuratorClient.connect(remoteCuratorTransport)
+  const remoteCuratorTools = (await remoteCuratorClient.listTools()).tools.map(t => t.name)
+  ok('curator instance omits memory_dream_verify in listTools when packet directory is absent on host',
+    !remoteCuratorTools.includes('memory_dream_verify'))
+} catch (error) {
+  ok(`curator instance omits memory_dream_verify in listTools when packet directory is absent on host (threw: ${error.message})`, false)
+} finally { try { await remoteCuratorClient.close() } catch { /* already gone */ } }
+
 // The shipped window bounds how long a restarted portable harness is refused: 30s × 4 is
 // ~2¼ min, where 60s × 10 was ten. The measured formula above is what makes the default a window.
 const channelSource = readFileSync('mcp/tools/claude-channel.mjs', 'utf8')
