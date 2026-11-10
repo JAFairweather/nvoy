@@ -2,8 +2,8 @@
 // Curation (Distillation -> Promotion -> Solidification), and Nightmare handling.
 
 import assert from 'node:assert/strict'
-import { execFile as execFileCb } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { execFile as execFileCb, spawn } from 'node:child_process'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -1666,6 +1666,33 @@ await test('memory-dream-verify.mjs --mcp serves local stdio JSON-RPC for memory
     }, { packetDir: tmp })
     assert.equal(callBad.result.isError, true)
     assert.equal(JSON.parse(callBad.result.content[0].text).code, 'NVOY_DREAM_PACKET_UNREADABLE')
+
+    // Regression: when invoked via a symlinked directory (like /opt/hive-memory/nvoy -> releases/<sha>),
+    // process.argv[1] has the symlink path while import.meta.url resolves to realpath; isEntrypoint() must still run main().
+    const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)))
+    const symlinkRepo = join(tmp, 'nvoy-symlink')
+    symlinkSync(repoRoot, symlinkRepo)
+    const symlinkScript = join(symlinkRepo, 'mcp', 'tools', 'memory-dream-verify.mjs')
+    const childOut = await new Promise((resolveOut, rejectOut) => {
+      const child = spawn(process.execPath, [symlinkScript, '--mcp'], {
+        env: { ...process.env, HIVE_MEMORY_CURATOR_PACKET_DIR: tmp },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+      let stdout = ''
+      let stderr = ''
+      child.stdout.on('data', (chunk) => { stdout += chunk.toString('utf8') })
+      child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8') })
+      child.on('error', rejectOut)
+      child.on('close', (code) => resolveOut({ code, stdout, stderr }))
+      child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 10, method: 'initialize', params: {} }) + '\n')
+      child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 11, method: 'tools/list' }) + '\n')
+      child.stdin.end()
+    })
+    assert.equal(childOut.code, 0, `symlinked --mcp exited ${childOut.code}: ${childOut.stderr}`)
+    const lines = childOut.stdout.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l))
+    assert.equal(lines.length, 2, 'symlinked --mcp child process must emit initialize + tools/list JSON-RPC responses')
+    assert.equal(lines[0].result.serverInfo.name, 'hive-dream')
+    assert.equal(lines[1].result.tools[0].name, 'memory_dream_verify')
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }

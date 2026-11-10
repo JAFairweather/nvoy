@@ -17,7 +17,7 @@
 //      - `source_hold_intact` (100% of `supersedes[]` source event IDs present in history)
 //   4. 10-Consolidation Side-by-Side Audit Sampler & Owner Grade (`pass | needs_work | fail`).
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { isWorkflowSlug, normalizeMemoryTopic, parseFactKey } from './memory.mjs'
@@ -863,6 +863,15 @@ async function main() {
   }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
+function isEntrypoint() {
+  if (!process.argv[1]) return false
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))
+  } catch {
+    return resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))
+  }
+}
+
+if (isEntrypoint()) {
   main()
 }

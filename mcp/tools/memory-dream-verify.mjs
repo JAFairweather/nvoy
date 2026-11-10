@@ -18,7 +18,7 @@
 //       - The Illustrated Primer dream page
 //       - R1's "tell me the latest dream" voice command
 
-import { chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { chmodSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs'
 import { basename, dirname, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -435,6 +435,15 @@ function main() {
   }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
+function isEntrypoint() {
+  if (!process.argv[1]) return false
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))
+  } catch {
+    return resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))
+  }
+}
+
+if (isEntrypoint()) {
   main()
 }

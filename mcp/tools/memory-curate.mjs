@@ -17,7 +17,7 @@
 //        caller-verified git ancestry) orders one claim after the other.
 //      - Escalates ambiguous conflicts to `@james` and `@mydude` without guessing.
 
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs'
 import { createConnection } from 'node:net'
 import { dirname, join, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
@@ -2017,6 +2017,15 @@ async function main() {
   }
 }
 
-if (process.argv[1] && resolve(fileURLToPath(import.meta.url)) === resolve(process.argv[1])) {
+function isEntrypoint() {
+  if (!process.argv[1]) return false
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))
+  } catch {
+    return resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))
+  }
+}
+
+if (isEntrypoint()) {
   main()
 }
