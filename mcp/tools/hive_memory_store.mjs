@@ -1613,10 +1613,10 @@ export class HiveMemoryStore {
         created_at: r.created_at,
         as_of_git: r.as_of_git,
         as_of_evt: r.as_of_evt,
-        supersedes,
+        supersedes: [...supersedes],
         claim: body.claim,
         because: body.because,
-        evidence: body.evidence || [],
+        evidence: Array.isArray(body.evidence) ? [...body.evidence] : [],
       }
     })
     const constellation = buildConstellationLinks(recordsForConstellation)
@@ -1745,17 +1745,6 @@ const preview = (text, n) => { const t = String(text ?? '').replace(/\s+/g, ' ')
 const PARSED_EVENT_CACHE = new Map()
 const MAX_PARSED_EVENT_CACHE = 8192
 
-function deepFreeze(val) {
-  if (!val || typeof val !== 'object' || Object.isFrozen(val)) return val
-  Object.freeze(val)
-  if (Array.isArray(val)) {
-    for (let i = 0; i < val.length; i++) deepFreeze(val[i])
-  } else {
-    for (const k of Object.keys(val)) deepFreeze(val[k])
-  }
-  return val
-}
-
 function parseEventRaw(row) {
   const id = row?.id
   if (id && PARSED_EVENT_CACHE.has(id)) {
@@ -1764,12 +1753,17 @@ function parseEventRaw(row) {
   }
   const ev = JSON.parse(row.raw_json)
   const rawBody = JSON.parse(ev.content)
-  const body = deepFreeze({
-    ...rawBody,
-    evidence: Array.isArray(rawBody?.evidence) ? rawBody.evidence.map(String) : [],
+  const body = Object.freeze({
+    claim: typeof rawBody?.claim === 'string' ? rawBody.claim : '',
+    because: typeof rawBody?.because === 'string' ? rawBody.because : null,
+    evidence: Object.freeze(Array.isArray(rawBody?.evidence) ? rawBody.evidence.map(String) : []),
   })
-  const tags = deepFreeze(Array.isArray(ev.tags) ? ev.tags.map(t => (Array.isArray(t) ? [...t] : t)) : [])
-  const supersedes = deepFreeze(tags.filter(t => Array.isArray(t) && t[0] === 'supersedes' && typeof t[1] === 'string').map(t => t[1]))
+  const tags = Object.freeze(
+    Array.isArray(ev.tags) ? ev.tags.map(t => (Array.isArray(t) ? Object.freeze([...t]) : t)) : []
+  )
+  const supersedes = Object.freeze(
+    tags.filter(t => Array.isArray(t) && t[0] === 'supersedes' && typeof t[1] === 'string').map(t => t[1])
+  )
   const merkleSources = tags.find(t => Array.isArray(t) && t[0] === 'merkle_sources' && typeof t[1] === 'string')?.[1] || null
   const entry = Object.freeze({ raw: row.raw_json, body, tags, supersedes, merkleSources })
   if (id) {

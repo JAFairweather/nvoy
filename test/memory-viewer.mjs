@@ -1535,6 +1535,33 @@ await test('PR #354 regressions: cached event immutability, pre-curation elapsed
     const sDirectB = await viewer.pollOnce({ forceFull: false })
     assert.equal(sDirectB.reader_pubkey, viewerPkB)
     assert.equal(sDirectB.records.length, 1, 'direct rebind from reader A to reader B without intermediate error poll must not leak private room claim')
+
+    // 4. Verify 12,000-deep nested extra JSON in an accepted claim does not throw RangeError in parseEventRaw / store.query / viewer.pollOnce
+    const deepTmpl = buildClaimTemplate({
+      pubkey: ownerPk,
+      scope: `room:${globalRoom}`,
+      slug: 'deep-nested-extra-claim',
+      memoryGlobalChannelId: globalRoom,
+      topic: 'hive-memory',
+      claim: 'Claim with 12000-deep nested extra field.',
+      because: 'PR 354 depth regression test',
+      evidence: ['nvoy@e2cd9ebe:mcp/tools/hive_memory_store.mjs'],
+      asOfGit: 'e2cd9ebea92579c98cda558d003270941ba50d97',
+      ttlSec: 86400 * 14,
+      nowSec: nowSec - 3400,
+    })
+    deepTmpl.content = deepTmpl.content.replace(/\}$/, `,"extra":${'['.repeat(12000)}${']'.repeat(12000)}}`)
+    const deepEv = finalizeEvent(deepTmpl, ownerSk)
+    const submitDeep = daemon.store.submit({ writer: 'james', event: deepEv, expectedPriorId: null, nowSec: nowSec - 3400 })
+    assert.equal(submitDeep.accepted, true, '12000-deep extra claim should be accepted by store.submit')
+
+    const qDeep = daemon.store.query({ readerPubkey: viewerPkB, format: 'full', nowSec })
+    assert.equal(qDeep.records.length, 2, 'store.query must succeed without RangeError on 12000-deep extra field')
+    assert(qDeep.records.some(r => r.event_id === deepEv.id))
+
+    const sDeep = await viewer.pollOnce({ forceFull: false })
+    assert.equal(sDeep.connected, true, 'viewer must stay connected when polling a 12000-deep extra claim')
+    assert.equal(sDeep.records.length, 2)
   } finally {
     if (viewer) await viewer.stop()
     if (daemon) await daemon.close()
