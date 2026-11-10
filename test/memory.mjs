@@ -1447,6 +1447,24 @@ os.execv(sys.argv[3], [sys.argv[3], sys.argv[4], "--db", sys.argv[5], "--ledger"
     !topicMd.includes('secret-visualizer-plan') &&
     indexMd.includes('#hive-memory'))
 
+  // 4. Regression for pre-#352 database / snapshot upgrade: submit() immediately after reconcile()
+  // (before any text or linked_to query) must succeed without 'the SQLite transaction failed'.
+  s.db.exec('DROP TABLE IF EXISTS events_fts; DROP TABLE IF EXISTS claim_edges;')
+  const recAfterDrop = s.reconcile()
+  const cPreQueryWrite = claim(biggy, roomA, 'hive-memory-post-upgrade-first-submit', {
+    topic: 'hive-memory',
+    ttlSec: 14 * DAY,
+    claim: 'First submit after pre-#352 database upgrade succeeds before any text query.',
+    because: 'reconcile() and indexDerivedEvent() ensure events_fts and claim_edges exist before READY.',
+    evidence: ['nvoy@14b30ef:mcp/tools/hive_memory_store.mjs'],
+    nowSec: T0 + 60,
+  })
+  const firstSubmitRes = s.submit({ writer: 'biggy', event: cPreQueryWrite, expectedPriorId: null, nowSec: T0 + 60 })
+  ok('Pre-#352 DB upgrade regression: reconcile() initializes derived tables before READY so immediate submit() succeeds',
+    recAfterDrop.ready === true &&
+    firstSubmitRes.accepted === true &&
+    firstSubmitRes.id === cPreQueryWrite.id)
+
   s.close()
 }
 
