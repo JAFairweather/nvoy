@@ -267,22 +267,87 @@ function sanitizeRealmName(rawTopic) {
   return cleaned || 'the high causeway'
 }
 
-export function distillStoryPhrase(rawText, { fallback = 'the old watch-stone' } = {}) {
-  const cleaned = sanitizeDreamSummary(rawText || '', { maxChars: 160 })
-    .replace(/^(?:DONE|ACTIVE|MERGED|DEPLOYED|SHIPPED|FIXED|RESOLVED|OPEN|WIP|BLOCKED)\s*[:.-]*\s*/i, '')
-    .replace(/\b(?:PR|pull request|issue|commit|seq|sequence|version|port|phase|stage|gate|step)\s*#?\d+[a-zA-Z0-9._-]*\b/gi, '')
-    .replace(/\b[a-zA-Z_-]*\d+[a-zA-Z0-9_.-]*\b/g, '')
-    .replace(TECHNICAL_DREAM_TERMS_RE, '')
-    .replace(/\d+/g, '')
-    .replace(/[_/\\|+:=]+/g, ' ')
-    .replace(/[^a-zA-Z\s,'-]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .replace(/^[,.'\s-]+|[,.'\s-]+$/g, '')
-  if (!cleaned || cleaned.length < 4) return fallback
-  const words = cleaned.split(/\s+/).slice(0, 8)
-  return words.join(' ').toLowerCase()
+const DREAM_MOTIF_RULES = Object.freeze([
+  { re: /\b(?:viewer|primer|glass|page|ui|render|display)\b/i, phrase: 'the illuminated glass lectern' },
+  { re: /\b(?:dream|wake|story|sleep|nightmare|journal)\b/i, phrase: 'the nocturnal bell-rope' },
+  { re: /\b(?:socket|group|permission|reader|seat|grant|access|sandbox)\b/i, phrase: 'the bronze key-ring at the inner postern' },
+  { re: /\b(?:store|sqlite|fts|table|index|query|reconcile|schema|edge)\b/i, phrase: 'the vaulted stone catalogue' },
+  { re: /\b(?:channel|buzz|reply|post|envelope|mention|relay)\b/i, phrase: 'the wind-strung signal bridge' },
+  { re: /\b(?:backup|snapshot|restore|ledger|merkle|receipt)\b/i, phrase: 'the sealed wax charter chest' },
+  { re: /\b(?:bootstrap|deploy|service|unit|timer|systemd|daemon)\b/i, phrase: 'the watchtower clockwork wheel' },
+])
+
+const DREAM_FALLBACK_MOTIFS = Object.freeze([
+  'the weathered keystone arch',
+  'the cedar charter table',
+  'the moss-rimmed courtyard well',
+  'the brass astrolabe stand',
+  'the high coping wall',
+])
+
+export function distillStoryPhrase(rawText, { index = 0, fallback = '' } = {}) {
+  const text = String(rawText || '')
+  for (const rule of DREAM_MOTIF_RULES) {
+    if (rule.re.test(text)) return rule.phrase
+  }
+  if (fallback && typeof fallback === 'string' && fallback.trim()) {
+    return fallback.trim()
+  }
+  return DREAM_FALLBACK_MOTIFS[Math.abs(Number(index) || 0) % DREAM_FALLBACK_MOTIFS.length]
 }
+
+const DREAM_SCENE_BY_KIND = Object.freeze({
+  promotion: [
+    (a, b, motif) =>
+      `Where the lower causeway met a barred iron gate beside ${motif}, ${a} held the storm-lantern steady while ${b} seated a carved keystone into the arch until the bolt drew back and the heavy doors swung wide.`,
+    (a, b, motif) =>
+      `Higher on the stepped terrace near ${motif}, ${a} and ${b} lifted the lantern to the frost-locked sluice wheel, warming the bronze pawls until the counterweight settled into place.`,
+    (a, b, motif) =>
+      `At the windward gallery overlooking ${motif}, ${a} sheltered the amber flame in a cloak while ${b} fastened the oak crossbeam that joined the two spans of the parapet.`,
+    (a, b, motif) =>
+      `Below the summit tower beside ${motif}, ${a} and ${b} set the lantern upon the capstone and turned the great iron latch that opened the watch-chamber to the morning air.`,
+  ],
+  distillation: [
+    (a, b, motif) =>
+      `On the broad flagstones beside ${motif}, ${a} and ${b} lowered the storm-lantern over drifts of scattered parchment and braided the loose leaves into a single taut guide-rope across the gorge.`,
+    (a, b, motif) =>
+      `Inside the quiet cloister near ${motif}, ${a} held the light above a table of duplicate wax tablets while ${b} melted the cracked fragments down into one clear seal.`,
+    (a, b, motif) =>
+      `At the cistern steps by ${motif}, ${a} and ${b} gathered several trickling hillside rills into a single carved stone channel that ran clear and steady beside the road.`,
+    (a, b, motif) =>
+      `Under the vaulted colonnade near ${motif}, ${a} steadied the lantern hook while ${b} bound a sheaf of weathered travel maps into one stitched leather atlas.`,
+  ],
+  topic_reorg: [
+    (a, _b, motif) =>
+      `Where a stray footpath near ${motif} wandered into the mist, ${a} swung the storm-lantern low across the moss and reset the boundary stones so the track rejoined the main highway.`,
+    (a, b, motif) =>
+      `At a forked landing beside ${motif}, ${a} and ${b} turned a crooked wooden signpost back toward the ridge so no traveler would lose the ascent.`,
+    (a, _b, motif) =>
+      `Along the terraced orchard near ${motif}, ${a} lifted the lantern to the boundary wall and opened a stile between two neighboring courts.`,
+    (a, b, motif) =>
+      `By the old milestone near ${motif}, ${a} and ${b} cleared the brambles from a forgotten shortcut and joined its steps to the central stair.`,
+  ],
+  nightmare: [
+    (a, _b, motif) =>
+      `At a narrow bridge beside ${motif}, two Echo-Shadows argued over the right of way until ${a} raised the storm-lantern between them and the hollow double faded into the mist.`,
+    (a, b, motif) =>
+      `Near the echoing archway by ${motif}, a pair of contradictory bells rang out of time until ${a} and ${b} rested a hand on the cracked rim and left only the true bell sounding.`,
+    (a, _b, motif) =>
+      `Where twin reflections flickered in the dark pool beside ${motif}, ${a} lowered the lantern to the water until the false image dissolved and the stepping-stones appeared.`,
+    (a, b, motif) =>
+      `At the wind-gate near ${motif}, ${a} and ${b} unknotted two crossed signal cords that had pulled against each other in the dark.`,
+  ],
+  default: [
+    (a, b, motif) =>
+      `Along the upper parapet beside ${motif}, ${a} and ${b} touched the storm-lantern to an unlit brazier so the stone road ahead stood clear.`,
+    (a, b, motif) =>
+      `At the mid-slope watch-post near ${motif}, ${a} trimmed the lantern wick while ${b} brushed the winter ash from the carved direction dial.`,
+    (a, b, motif) =>
+      `Beside the stone balustrade near ${motif}, ${a} and ${b} wedged a firm oak chock beneath the loose flagstone so the company could pass without stumbling.`,
+    (a, b, motif) =>
+      `Near the ridge shelter by ${motif}, ${a} hung the storm-lantern from the lintel hook while ${b} unbarred the shutters toward the eastern sky.`,
+  ],
+})
 
 export function weaveDreamStory({
   changes = [],
@@ -300,34 +365,21 @@ export function weaveDreamStory({
     `Before moonset, Curator lit a single brass storm-lantern at the lower gate of ${primaryRealm}, and Biggy, My Dude, Dead Rabbit, Neil, and Kerouac carried its amber flame together up the mist-hung stone causeway.`,
   ]
 
+  const usedMotifs = new Set()
   chosenChanges.forEach((ch, idx) => {
     const [travelerA, travelerB] = DREAM_TRAVELERS[idx % DREAM_TRAVELERS.length]
-    const phrase = distillStoryPhrase(ch.summary || ch.d || '', { fallback: 'the weathered threshold' })
-    if (ch.kind === 'promotion') {
-      sentences.push(
-        `Where the causeway rose to an iron arch barred around ${phrase}, ${travelerA} held the storm-lantern high while ${travelerB} fitted a carved keystone into the lintel until the heavy bolt gave way and the door swung open.`
-      )
-    } else if (ch.kind === 'distillation') {
-      sentences.push(
-        `Further along the same stone road, ${travelerA} and ${travelerB} lowered the storm-lantern over flagstones drifted with loose paper notes of ${phrase}, braiding the scattered pages into a single taut guide-rope across the ravine.`
-      )
-    } else if (ch.kind === 'topic_reorg') {
-      sentences.push(
-        `Where a side-track of ${phrase} wandered off into the fog, ${travelerA} swung the storm-lantern across the moss and turned the boundary stones back into the main causeway.`
-      )
-    } else if (ch.kind === 'nightmare') {
-      sentences.push(
-        `At a narrow bridge beside ${phrase}, two shadows argued over the crossing until ${travelerA} raised the storm-lantern between them and the false shadow stepped aside.`
-      )
-    } else {
-      sentences.push(
-        `Along the upper parapet above ${phrase}, ${travelerA} and ${travelerB} touched the storm-lantern to an unlit brazier so the road ahead stood clear.`
-      )
+    let motif = distillStoryPhrase(`${ch.summary || ''} ${ch.d || ''}`, { index: idx })
+    if (usedMotifs.has(motif)) {
+      motif = DREAM_FALLBACK_MOTIFS[idx % DREAM_FALLBACK_MOTIFS.length]
     }
+    usedMotifs.add(motif)
+    const scenes = DREAM_SCENE_BY_KIND[ch.kind] || DREAM_SCENE_BY_KIND.default
+    const renderScene = scenes[idx % scenes.length]
+    sentences.push(renderScene(travelerA, travelerB, motif))
   })
 
   sentences.push(
-    `When the companions reached the eastern ridge at daybreak and set the brass storm-lantern down upon the parapet, the maze of barred arches and tangled tracks behind them had changed into one open road from valley to summit.`
+    `When the companions reached the eastern ridge at daybreak and set the brass storm-lantern down upon the parapet, the maze of barred gates and scattered tracks behind them had become one open road from valley to summit.`
   )
 
   const dream = sanitizeDreamSummary(sentences.join(' '), { maxChars: 1800 }).replace(/\d+/g, '').replace(/\s+/g, ' ').trim()

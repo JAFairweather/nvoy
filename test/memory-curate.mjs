@@ -34,6 +34,7 @@ import {
   readConsolidationLedger,
   readCuratorStateFile,
   runCuratorCycle,
+  weaveDreamStory,
   writeDreamPacket,
 } from '../mcp/tools/memory-curate.mjs'
 import {
@@ -1322,6 +1323,24 @@ await test('writeDreamPacket writes 0640 global-scope packets, strips @mentions/
     assert(pkt.story_seed.dream.includes('Biggy') && pkt.story_seed.dream.includes('My Dude'), 'story_seed journey must feature the agents as characters')
     const seedRes = verifyAndAssembleDreamRecord({ packet: pkt, draft: pkt.story_seed })
     assert.equal(seedRes.ok, true, 'story_seed must pass verifyAndAssembleDreamRecord directly')
+
+    // Multiple same-kind changes in buildDreamPacket / weaveDreamStory must produce distinct scenes without repeated passages or broken sentence fragments
+    const multiChanges = [
+      { change_id: 'c1'.repeat(32), kind: 'distillation', claim_event_id: 'c1'.repeat(32), topic: 'hive-memory', summary: 'DONE: PR 356 deployed on herd-cloud by mydude' },
+      { change_id: 'c2'.repeat(32), kind: 'distillation', claim_event_id: 'c2'.repeat(32), topic: 'herd-infra', summary: 'MERGED: PR 103 in herd-infra for socket group access' },
+      { change_id: 'c3'.repeat(32), kind: 'distillation', claim_event_id: 'c3'.repeat(32), topic: 'nvoy', summary: 'FIXED: viewer page render and sqlite fts query' },
+      { change_id: 'c4'.repeat(32), kind: 'distillation', claim_event_id: 'c4'.repeat(32), topic: 'buzz', summary: 'SHIPPED: channel reply and post envelope check' },
+    ]
+    const multiSeed = weaveDreamStory({ changes: multiChanges })
+    const multiSentences = multiSeed.dream.split(/(?<=\.)\s+/).filter(Boolean)
+    assert.equal(multiSentences.length, 6, '4 changes + opening + closing should produce 6 sentences')
+    assert.equal(new Set(multiSentences).size, multiSentences.length, 'each sentence in story_seed must be unique without repeated passages')
+    assert(!/\b(?:by mydude|in for|and to|on by)\b/i.test(multiSeed.dream), 'story_seed must not contain garbled sentence fragments stripped from technical prose')
+    const multiVerify = verifyAndAssembleDreamRecord({
+      packet: { ...pkt, changes: multiChanges },
+      draft: multiSeed,
+    })
+    assert.equal(multiVerify.ok, true, `multi-change story_seed must pass verifyAndAssembleDreamRecord: ${(multiVerify.errors || []).join('; ')}`)
 
     const paths = writeDreamPacket({ packetDir, packet: pkt })
     assert.equal(statSync(paths.cyclePath).mode & 0o777, 0o640, 'dream-<write_seq>.json must be mode 0640')
