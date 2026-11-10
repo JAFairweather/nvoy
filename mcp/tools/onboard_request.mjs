@@ -6,6 +6,7 @@
 // request copies, so an owner the fleet already trusts is the only one who can ask.
 
 import { verifyEvent } from 'nostr-tools/pure'
+import { familyOf } from './principal_family.mjs'
 import { readPublicKey } from './instance_apply.mjs'
 
 export const SETUP_KIND = 30078
@@ -18,7 +19,7 @@ const NAME = /^[a-z0-9][a-z0-9._-]{1,63}$/i
 const HEX = /^[0-9a-f]{64}$/
 const ROOM = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const SECRETISH = /nsec1|bunker:|nostrconnect:|PRIVATE KEY|secret=/i
-const ONE = ['d', 'op', 'p', 'harness', 'like', 'channel_key', 'invite', 'policy', 'age', 'display_name', 'about']
+const ONE = ['d', 'op', 'p', 'harness', 'like', 'channel_key', 'feed_key', 'invite', 'policy', 'age', 'display_name', 'about']
 const JOIN_TAGS = ['invite', 'policy', 'age']
 const PROFILE_TAGS = ['display_name', 'about']
 // Shown text, one line for the name: no control characters, and short enough for a member list.
@@ -98,6 +99,7 @@ export function parseSetupRequest(event, { name, manifests, seen = new Set(), in
     if (manifests.has(name) && !resumed) refuse('ONBOARD_EXISTS', `${name} is already installed`)
     if (installed && !resumed) refuse('ONBOARD_EXISTS', `that key is already ${installed.id}`)
     if ('channel_key' in one) refuse('ONBOARD_BAD_TAG', 'channel_key belongs to bind_runtime')
+    if ('feed_key' in one) refuse('ONBOARD_BAD_TAG', 'feed_key belongs to bind_runtime')
     if ('invite' in one && !sealedShape(one.invite)) refuse('ONBOARD_BAD_INVITE', 'the invite must be sealed to the agent (NIP-44), never plain')
     if ('invite' in one && !('policy' in one)) refuse('ONBOARD_BAD_TAG', 'an invite needs the policy the owner agreed to, or none')
     if ('policy' in one && !POLICY.test(one.policy)) refuse('ONBOARD_BAD_TAG', 'policy is a terms version, or none')
@@ -113,6 +115,14 @@ export function parseSetupRequest(event, { name, manifests, seen = new Set(), in
     if (PROFILE_TAGS.some(key => key in one)) refuse('ONBOARD_BAD_TAG', 'the profile belongs to add_agent')
   }
   if (!HARNESSES.includes(one.harness)) refuse('ONBOARD_BAD_HARNESS', `harness must be one of ${HARNESSES.join(', ')}`)
+  // A Pi or Codex agent reaches the fleet on two keys, one forced to each program (principal_family.mjs); every
+  // other harness has one. The owner signs both in the bind, so a bind that lacks the second, or carries a second
+  // for a one-key harness, is refused here and never reaches the apply.
+  if (one.op === 'bind_runtime') {
+    const two = familyOf(one.harness) === 'codex'
+    if (two && !('feed_key' in one)) refuse('ONBOARD_BAD_TAG', `a ${one.harness} agent needs feed_key: its wake feed is a second key`)
+    if (!two && 'feed_key' in one) refuse('ONBOARD_BAD_TAG', `feed_key is for Pi and Codex agents; ${one.harness} has one key`)
+  }
 
   const seatKeys = new Map([...manifests.values()].map(manifest => [manifest.pubkey, manifest.id]))
   const givers = [...new Set(many.giver)].map(giver => {
@@ -135,7 +145,13 @@ export function parseSetupRequest(event, { name, manifests, seen = new Set(), in
     try { channelKey = readPublicKey(one.channel_key) } catch (error) { refuse('ONBOARD_BAD_CHANNEL_KEY', error.message) }
   }
 
+  let feedKey = null
+  if ('feed_key' in one) {
+    try { feedKey = readPublicKey(one.feed_key) } catch (error) { refuse('ONBOARD_BAD_FEED_KEY', error.message) }
+    if (channelKey && feedKey.keyBody === channelKey.keyBody) refuse('ONBOARD_BAD_FEED_KEY', 'the channel key and the feed key are the same key; each forced command admits exactly one')
+  }
+
   return Object.freeze({ id: event.id, owner: event.pubkey, created_at: event.created_at, name, op: one.op,
-    pubkey, harness: one.harness, like: template.id, givers, rooms, channelKey,
+    pubkey, harness: one.harness, like: template.id, givers, rooms, channelKey, feedKey,
     invite: one.invite || '', policy: one.policy || '', ageConfirmed: one.age === 'confirmed', profile })
 }

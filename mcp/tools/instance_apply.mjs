@@ -32,6 +32,7 @@ import { createHash } from 'node:crypto'
 import { appendFileSync, closeSync, existsSync, fsyncSync, linkSync, lstatSync, openSync, readdirSync, readFileSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
 import { join } from 'node:path'
 import { parsePrincipal, principalComment, principalLine } from './participant_unit.mjs'
+import { codexComment, codexManifestRefusal, codexPrincipalPlan, distinctKeys } from './principal_family.mjs'
 import { NUMERIC_FIELDS, parseBlockRecord, recordedClashes } from './identity_allocation.mjs'
 
 const KEY_LINE = /^(ssh-ed25519|ecdsa-sha2-nistp256)\s+([A-Za-z0-9+/]+={0,2})(?:\s+\S.*)?$/
@@ -119,7 +120,7 @@ export function reserveBlock(ledgerPath, manifest, now = () => Date.now()) {
 }
 
 // `run(argv)` returns { status, stdout, stderr }. `sleep` and `now` (ms) are injected for the suite.
-export async function applyStaged({ manifest, stagedPath, root, stateDir, keysPath, publicKey, run, ledgerPath, waitMs = 600000, pollMs = 5000,
+export async function applyStaged({ manifest, stagedPath, root, stateDir, keysPath, publicKey, family = 'claude', feedKey = null, run, ledgerPath, waitMs = 600000, pollMs = 5000,
   sleep = ms => new Promise(r => setTimeout(r, ms)), now = () => Date.now(), log = () => {} }) {
   const states = []
   const done = (state, ok, detail) => { states.push({ state, ok, detail }); log(state, ok, detail); return { ok, states } }
@@ -129,9 +130,24 @@ export async function applyStaged({ manifest, stagedPath, root, stateDir, keysPa
   let keysStat
   try { keysStat = lstatSync(keysPath) } catch { return done('principal planned', false, `${keysPath} does not exist; create the channel account first`) }
   if (!keysStat.isFile() || keysStat.isSymbolicLink()) return done('principal planned', false, `${keysPath} must be a regular file, not a link`)
-  const plan = principalPlan(readFileSync(keysPath, 'utf8'), manifest, publicKey)
-  if (plan.action === 'refuse') return done('principal planned', false, plan.why)
-  done('principal planned', true, plan.action === 'present' ? 'already present, unchanged' : `will append ${principalComment(manifest)}`)
+  // The plan covers every key the family needs, and is decided whole: one refused line refuses the apply
+  // before anything changes, so a two-key agent is never half-seated by a plan it could have rejected.
+  const codex = family === 'codex'
+  if (codex) {
+    const bad = codexManifestRefusal(manifest)
+    if (bad) return done('principal planned', false, bad)
+    if (!feedKey) return done('principal planned', false, 'a Pi or Codex agent needs two keys and the bind carries no feed key')
+    if (!distinctKeys(publicKey, feedKey)) return done('principal planned', false, 'the channel key and the feed key are the same key; each forced command admits exactly one')
+  }
+  const planAll = text => codex
+    ? [codexPrincipalPlan(text, manifest, 'channel', publicKey), codexPrincipalPlan(text, manifest, 'feed', feedKey)]
+    : [{ role: 'channel', ...principalPlan(text, manifest, publicKey) }]
+  const plans = planAll(readFileSync(keysPath, 'utf8'))
+  const refused = plans.find(plan => plan.action === 'refuse')
+  if (refused) return done('principal planned', false, refused.why)
+  const commentOf = plan => codex ? codexComment(manifest, plan.role) : principalComment(manifest)
+  done('principal planned', true, plans.every(plan => plan.action === 'present') ? 'already present, unchanged'
+    : `will append ${plans.filter(plan => plan.action === 'append').map(commentOf).join(' and ')}`)
 
   // 2. Reserve the block in the record, as the record is now, before anything can run as it.
   const reserved = reserveBlock(ledgerPath, manifest, now)
@@ -172,18 +188,34 @@ export async function applyStaged({ manifest, stagedPath, root, stateDir, keysPa
   done('deployed', true, `the runner recorded this manifest and wrote ${compose}`)
 
   // 5. Seat the principal, re-planned against the file as it is now.
-  const again = principalPlan(readFileSync(keysPath, 'utf8'), manifest, publicKey)
-  if (again.action === 'refuse') return done('principal seated', false, `${keysPath} changed during the deploy: ${again.why}`)
-  if (again.action === 'append') {
-    const text = readFileSync(keysPath, 'utf8')
-    appendFileSync(keysPath, `${text && !text.endsWith('\n') ? '\n' : ''}${again.line}\n`)
+  const again = planAll(readFileSync(keysPath, 'utf8'))
+  const changed = again.find(plan => plan.action === 'refuse')
+  if (changed) return done('principal seated', false, `${keysPath} changed during the deploy: ${changed.why}`)
+  const seated = []
+  try {
+    for (const plan of again) {
+      if (plan.action === 'append') {
+        const text = readFileSync(keysPath, 'utf8')
+        appendFileSync(keysPath, `${text && !text.endsWith('\n') ? '\n' : ''}${plan.line}\n`)
+      }
+      seated.push(`${plan.role} ${plan.action === 'append' ? 'appended' : 'already present'}`)
+    }
+  } catch (error) {
+    // Partial seat: say which lines are in. A re-run plans again, finds them present and appends only the rest.
+    return done('principal seated', false, `${seated.join(', ') || 'nothing seated'}; stopped at ${error.message}; run again to seat the rest`)
   }
-  done('principal seated', true, again.action === 'present' ? 'already present' : `appended to ${keysPath}`)
+  done('principal seated', true, codex ? seated.join(', ') : again[0].action === 'present' ? 'already present' : `appended to ${keysPath}`)
 
   // 6 and 7. The operator's own checks, run as the operator would.
-  const verify = run(['verify', '--instance', id, '--authorized-keys', keysPath])
+  const verify = run(['verify', '--instance', id, '--authorized-keys', keysPath, ...(codex ? ['--family', 'codex'] : [])])
   if (verify.status !== 0) return done('principal verified', false, (verify.stderr || verify.stdout).trim().split('\n').slice(-3).join(' | '))
   done('principal verified', true, 'instance-unit verify passed')
+  // A Pi or Codex agent baselines through its feed: the first start with no cursor begins from now
+  // (codex-channel-feed.mjs), so there is no admitted backlog to mark read and no tool to run.
+  if (codex) {
+    done('baselined', true, 'not run: the wake feed baselines on its first start (codex-channel-feed.mjs)')
+    return { ok: states.every(st => st.ok), states }
+  }
   const baseline = run(['baseline'])
   done('baselined', baseline.status === 0, (baseline.status === 0 ? baseline.stdout : baseline.stderr || baseline.stdout).trim().split('\n').slice(-1)[0] || `exit ${baseline.status}`)
   return { ok: states.every(st => st.ok), states }

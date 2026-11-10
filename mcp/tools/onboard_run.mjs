@@ -12,6 +12,7 @@ import { readManifest } from './runtime_manifest.mjs'
 import { newestRequest, OnboardRefusal, parseSetupRequest } from './onboard_request.mjs'
 import { joinHive, joinRooms } from './onboard_join.mjs'
 import { readStagedKey } from './onboard_stage.mjs'
+import { familyOf } from './principal_family.mjs'
 import { profileRequestIdsPath, profileResultsPath, profileStatus, queueProfile } from './agent_profile.mjs'
 
 export const WRITERS_KIND = 30000, WRITERS_D = 'nave-relay-writers'
@@ -80,6 +81,7 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
   if (bindEvent) {
     bind = parseSetupRequest(bindEvent, { name, manifests, seen, now: now() })
     if (bind.pubkey !== add.pubkey || bind.owner !== add.owner) throw new OnboardRefusal('ONBOARD_BIND_MISMATCH', 'bind_runtime names a different key or owner than add_agent')
+    if (familyOf(bind.harness) !== familyOf(add.harness)) throw new OnboardRefusal('ONBOARD_BIND_MISMATCH', `bind_runtime is for a ${bind.harness} agent but add_agent is ${add.harness}: they need different keys`)
   }
 
   log(`request ${add.id.slice(0, 12)} from ${add.owner.slice(0, 8)}: add ${name} (${add.harness}) like ${add.like}`)
@@ -157,7 +159,22 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
       if (!keysPath) return receipt('started', 'pending', 'give --authorized-keys for the channel account')
       const pub = join(stateDir, `${add.id}.channel.pub`)
       writeFileSync(pub, `${bind.channelKey.keyType} ${bind.channelKey.keyBody} nvoy-onboard-${name}\n`, { mode: 0o644 })
-      const code = runTool('instance-identity.mjs', ['apply', '--id', name, '--public-key-file', pub, '--authorized-keys', keysPath, '--out', out, '--instance-root', root])
+      // A Pi or Codex agent seats a second principal for its wake feed. Both keys are re-read against the bind
+      // just before the apply: a staged file that changed since it was reported (swapped, replaced, bound to
+      // another request) refuses here, with nothing seated.
+      const two = familyOf(add.harness) === 'codex'
+      const extra = []
+      for (const role of two ? ['channel', 'feed'] : ['channel']) {
+        const again = readStagedKey({ stateDir, request: add.id, instance: name, role, bound: role === 'feed' ? bind.feedKey : bind.channelKey })
+        if (again?.state === 'refused') return receipt('started', 'refused', again.detail)
+      }
+      if (two) {
+        if (!bind.feedKey) return receipt('started', 'refused', 'the bind carries no feed key, so a second principal cannot be seated')
+        const feedPub = join(stateDir, `${add.id}.feed.pub`)
+        writeFileSync(feedPub, `${bind.feedKey.keyType} ${bind.feedKey.keyBody} nvoy-onboard-feed-${name}\n`, { mode: 0o644 })
+        extra.push('--feed-public-key-file', feedPub)
+      }
+      const code = runTool('instance-identity.mjs', ['apply', '--id', name, '--public-key-file', pub, ...extra, '--harness', add.harness, '--authorized-keys', keysPath, '--out', out, '--instance-root', root])
       manifests = installed(root)
       return code === 0 && isInstalled() ? receipt('started', 'done', 'applied, principal seated, channel baselined') :
         receipt('started', code === 3 ? 'pending' : 'refused', `apply exited ${code}`)
@@ -251,6 +268,13 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
   // can bind it; the loop below waits on pairing and the bind. No staged file means an own-box agent: no row.
   const staged = readStagedKey({ stateDir, request: add.id, instance: name, bound: bind?.channelKey || null })
   if (staged) { receipt('channel_key', staged.state, staged.detail); await publish() }
+  // And, for a Pi or Codex agent, its wake-feed key beside it. It must be a different key from the channel's.
+  if (familyOf(add.harness) === 'codex') {
+    let fed = readStagedKey({ stateDir, request: add.id, instance: name, role: 'feed', bound: bind?.feedKey || null })
+    if (fed && staged?.key && fed.key && fed.key.keyBody === staged.key.keyBody)
+      fed = { state: 'refused', detail: 'the staged feed key is the same key as the channel key; each forced command admits exactly one' }
+    if (fed) { receipt('feed_key', fed.state, fed.detail); await publish() }
+  }
   try {
     for (const [index, [, step]] of steps.entries()) {
       const done = await step()

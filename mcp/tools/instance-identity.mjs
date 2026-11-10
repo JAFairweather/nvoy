@@ -58,6 +58,7 @@ import { readManifest } from './runtime_manifest.mjs'
 import { auditIdentityBlocks, allocateIdentityBlock, buildParticipantManifest, seatingPlan,
   policyFromTemplate, auditUniqueFields, credentialVerdict, parseBlockRecord, recordedClashes, NUMERIC_FIELDS, TEMPLATE_FIELDS } from './identity_allocation.mjs'
 import { applyStaged, readPublicKey } from './instance_apply.mjs'
+import { familyOf } from './principal_family.mjs'
 
 const argv = process.argv.slice(2)
 const verb = argv[0]
@@ -163,6 +164,11 @@ if (verb === 'check' || verb === 'apply') {
 
   const keyFile = flag('--public-key-file'), keysPath = flag('--authorized-keys')
   if (!keyFile || !keysPath) die('apply needs --public-key-file <path> and --authorized-keys <path>')
+  // The harness picks the family. A Pi or Codex agent needs a second key for its wake feed and gets two
+  // principals; every other harness keeps the one Claude channel principal, as before.
+  const harness = flag('--harness') || 'claude-code', family = familyOf(harness), feedFile = flag('--feed-public-key-file')
+  if (family === 'codex' && !feedFile) die(`a ${harness} agent needs --feed-public-key-file: its wake feed is a second key`)
+  if (family !== 'codex' && feedFile) die(`--feed-public-key-file is for Pi and Codex agents; ${harness} has one key`)
   let publicKey
   try {
     const st = lstatSync(keyFile)
@@ -170,6 +176,13 @@ if (verb === 'check' || verb === 'apply') {
     if (st.mode & 0o022) throw new Error('must not be group or world writable')
     publicKey = readPublicKey(readFileSync(keyFile, 'utf8'))
   } catch (e) { die(`public key file ${keyFile}: ${e.message}`) }
+  let feedKey = null
+  if (feedFile) try {
+    const st = lstatSync(feedFile)
+    if (!st.isFile() || st.isSymbolicLink() || st.size > 16 * 1024) throw new Error('must be a regular file under 16 KiB')
+    if (st.mode & 0o022) throw new Error('must not be group or world writable')
+    feedKey = readPublicKey(readFileSync(feedFile, 'utf8'))
+  } catch (e) { die(`feed public key file ${feedFile}: ${e.message}`) }
   const unit = join(dirname(fileURLToPath(import.meta.url)), 'instance-unit.mjs')
   // verify reads the manifest from the root, as an operator's run would; baseline runs inside the
   // adapter, where node and the tool exist (claude-channel-doctor.mjs states why).
@@ -183,7 +196,7 @@ if (verb === 'check' || verb === 'apply') {
   const waitS = Number(flag('--wait-s') || 600)
   if (!Number.isInteger(waitS) || waitS < 30 || waitS > 3600) die('--wait-s is 30..3600')
   console.log(`\napply ${id}:`)
-  const result = await applyStaged({ manifest: m, stagedPath: join(outDir, `${id}.json`), root, keysPath, publicKey, run, ledgerPath: ledger,
+  const result = await applyStaged({ manifest: m, stagedPath: join(outDir, `${id}.json`), root, keysPath, publicKey, family, feedKey, run, ledgerPath: ledger,
     stateDir: resolve(flag('--state-dir') || '/var/lib/nvoy-deploy'), waitMs: waitS * 1000,
     log: (state, ok, detail) => console.log(`  ${ok === null ? 'INCONCLUSIVE' : ok ? 'PASS' : 'FAIL'}  ${state}: ${detail}`) })
   console.log(result.ok ? `\n${id} is installed, deployed, seated and baselined. The pairing and a live wake are still yours to prove.`
