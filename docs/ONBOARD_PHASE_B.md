@@ -109,7 +109,8 @@ content NIP-44 (runner → owner) of:
   another template is refused as `ONBOARD_BIND_MISMATCH`.
 - Retry after a partial install. `instance-identity apply` refuses an id already in the instance root, so when the manifest
   went in but the seat or the verify failed, the next run uses `instance-identity repair` instead (only for an agent this
-  request staged whose last `started` row did not finish). It installs and re-checks nothing about the estate; it requires
+  request staged, with a recorded `started` row that did not finish, and only when the installed manifest is byte-identical
+  to the one staged for the request). It installs and re-checks nothing about the estate; it requires
   the runner to have recorded exactly the installed manifest, then plans, seats and verifies the principals as `apply`
   does, appending only the lines that are missing. A `started` row that is `done` is never repaired again.
 - `install` is present once the agent is staged. It holds the four fields waggle's step 4 builds the

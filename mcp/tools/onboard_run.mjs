@@ -163,7 +163,13 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
       // (a repair on every tick would verify, and for the Claude family baseline, again and again).
       const prior = lines(receiptPath).filter(row => row.step === 'started').at(-1)
       const ours = existsSync(stagedFor) && readFileSync(stagedFor, 'utf8').trim() === add.id
-      if (isInstalled() && !(bind && keysPath && ours && prior?.state !== 'done')) return receipt('started', 'done', 'installed')
+      // Repair needs a recorded unfinished attempt AND proof that what is installed is what this request staged, byte for
+      // byte: the runner having deployed the installed bytes (which repair checks) does not say whose bytes they are.
+      const installedFile = join(root, `${name}.json`)
+      const sameBytes = isInstalled() && existsSync(stagedPath) && existsSync(installedFile) && readFileSync(installedFile).equals(readFileSync(stagedPath))
+      const unfinished = Boolean(prior) && prior.state !== 'done'
+      if (isInstalled() && !(bind && keysPath && ours && unfinished)) return receipt('started', 'done', 'installed')
+      if (isInstalled() && !sameBytes) return receipt('started', 'refused', 'the installed manifest is not the one this request staged; nothing was seated')
       if (!bind) return receipt('started', 'pending', 'waiting for bind_runtime: the install line on the agent\'s box')
       if (!keysPath) return receipt('started', 'pending', 'give --authorized-keys for the channel account')
       if (isInstalled() && manifests.get(name).pubkey !== add.pubkey) return receipt('started', 'refused', 'the installed manifest is for another key; nothing was seated')

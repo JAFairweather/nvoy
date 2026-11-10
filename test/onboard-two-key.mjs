@@ -134,7 +134,21 @@ rmSync(join(root, 'crusty.json'), { force: true }); applies.length = 0
   assert.match(result.receipts.find(row => row.step === 'started').detail, /repaired/)
   result = await flakyRun()
   assert.deepEqual(verbs, ['apply', 'repair', 'repair'], 'once done, later ticks do not repair again'); assert.equal(states(result).started, 'done')
-  rmSync(join(root, 'crusty.json')); rmSync(join(stateDir, `${addEvent.id}.jsonl`))
+  // No recorded unfinished attempt: an installed agent whose request has no `started` row is left alone, marker or not.
+  const receiptsFile = join(stateDir, `${addEvent.id}.jsonl`)
+  writeFileSync(receiptsFile, readFileSync(receiptsFile, 'utf8').split('\n').filter(line => line && JSON.parse(line).step !== 'started').join('\n') + '\n')
+  verbs.length = 0
+  result = await flakyRun()
+  assert.deepEqual(verbs, [], 'an installed agent with no unfinished started row is not repaired'); assert.equal(states(result).started, 'done')
+  // An unfinished attempt, but the installed bytes are not the ones this request staged: refused, nothing seated.
+  writeFileSync(receiptsFile, readFileSync(receiptsFile, 'utf8').split('\n').filter(line => line && JSON.parse(line).step !== 'started').join('\n') + '\n'
+    + JSON.stringify({ step: 'started', state: 'refused', at: Date.now(), detail: 'apply exited 1' }) + '\n')
+  const installedCopy = JSON.parse(readFileSync(join(root, 'crusty.json'), 'utf8'))
+  writeFileSync(join(root, 'crusty.json'), JSON.stringify({ ...installedCopy, relays: ['wss://relay.other.example'] }))
+  result = await flakyRun()
+  assert.deepEqual(verbs, [], 'changed installed bytes are never repaired'); assert.equal(states(result).started, 'refused')
+  assert.match(result.receipts.find(row => row.step === 'started').detail, /not the one this request staged/)
+  rmSync(join(root, 'crusty.json')); rmSync(receiptsFile)
 }
 
 // The bind must match the add exactly: another harness (even in the same family) or another template is another intent.
