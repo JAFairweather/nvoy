@@ -2389,6 +2389,7 @@ export function renderViewerHtml(initialState) {
           <span id="sse-badge" class="badge info">SSE: connecting</span>
           <span id="sync-badge" class="badge">${syncState}</span>
           <button id="view-toggle" class="btn" type="button">Raw cards</button>
+          <button id="pocket-view-btn" class="btn" type="button" style="border-color:rgba(56,189,248,0.45);color:#7dd3fc;">Pocket View</button>
         </div>
         <div class="mobile-kpi-strip" id="mobile-kpi-strip">
           <span class="mobile-kpi-pill" id="m-kpi-seq">seq: -</span>
@@ -6095,6 +6096,9 @@ export function renderViewerHtml(initialState) {
       el('view-toggle').addEventListener('click', function () {
         switchView(view === 'graph' ? 'cards' : 'graph');
       });
+      if (el('pocket-view-btn')) el('pocket-view-btn').addEventListener('click', function () {
+        window.location.href = '/mobile';
+      });
       if (el('dock-graph')) el('dock-graph').addEventListener('click', function () {
         if (view !== 'graph') switchView('graph');
         else setDrawer('none');
@@ -6607,6 +6611,992 @@ export function renderViewerHtml(initialState) {
 </html>`
 }
 
+function sanitizeMobileAlertSummary(a = {}) {
+  const kind = String(a?.kind || 'alert')
+  const agent = a?.agent ? `@${String(a.agent)}` : 'agent'
+  const code = a?.code ? String(a.code) : ''
+  const slug = a?.d ? (String(a.d).split(':').slice(2).join(':') || String(a.d)) : ''
+  if (kind === 'write_without_recall') {
+    return `${agent} submitted ${slug || 'a claim'} without prior recall in active window`
+  }
+  if (kind === 'blind_seat') {
+    return `${agent} active seat has zero recall events in window`
+  }
+  if (kind === 'tool_failure' || kind === 'submit_refused') {
+    return `${agent} write refused${code ? ` (${code})` : ''}`
+  }
+  if (kind === 'conflict') {
+    return `Unresolved claim conflict${slug ? ` on ${slug}` : ''}`
+  }
+  if (kind === 'stale_canon' || kind === 'stale') {
+    return `Stale anchor detected${slug ? ` on ${slug}` : ''}`
+  }
+  return `${kind.replace(/_/g, ' ')}${agent !== 'agent' ? ` (${agent})` : ''}${code ? ` [${code}]` : ''}`
+}
+
+export function buildMobileState(state = {}, nowSec = undefined, extraHistoryRecords = undefined) {
+  const effectiveNow = Number.isFinite(nowSec)
+    ? Math.floor(nowSec)
+    : Number.isFinite(state?.polled_at)
+      ? Math.floor(state.polled_at)
+      : Math.floor(Date.now() / 1000)
+
+  const records = Array.isArray(state?.records) ? state.records.filter(r => r && typeof r === 'object') : []
+  const historyList = Array.isArray(extraHistoryRecords)
+    ? extraHistoryRecords
+    : Array.isArray(state?.history_records)
+      ? state.history_records
+      : Array.isArray(state?.historyRecords)
+        ? state.historyRecords
+        : []
+  const consolidatedMap =
+    state?.consolidated_sources && typeof state.consolidated_sources === 'object' ? state.consolidated_sources : {}
+  const consolidatedList = Array.isArray(state?.consolidatedRecords)
+    ? state.consolidatedRecords.filter(r => r && typeof r === 'object')
+    : Object.values(consolidatedMap).filter(r => r && typeof r === 'object')
+  const recentActivity = Array.isArray(state?.recent_activity)
+    ? state.recent_activity.filter(a => a && typeof a === 'object')
+    : []
+  const rawRoster = Array.isArray(state?.agent_roster)
+    ? state.agent_roster
+    : Array.isArray(state?.agent_heartbeats)
+      ? state.agent_heartbeats
+      : []
+  const roster = rawRoster.filter(a => a && typeof a === 'object').map(a => ({ ...a, id: a.id || a.actor || 'unknown' }))
+
+  const ss = state?.store_state && typeof state.store_state === 'object' ? state.store_state : {}
+  const writeSeq = Number.isSafeInteger(ss.write_seq) ? ss.write_seq : null
+  const currentClaims = Number.isSafeInteger(ss.current_claims) ? ss.current_claims : records.length
+  const ageSec = Number.isFinite(ss.last_backup_age_sec) ? Math.max(0, Math.floor(ss.last_backup_age_sec)) : null
+  const unbackedWrites = Number.isSafeInteger(ss.unbacked_writes) ? Math.max(0, ss.unbacked_writes) : null
+  const receiptAt = Number.isFinite(ss.last_backup_at)
+    ? Math.floor(ss.last_backup_at)
+    : ageSec !== null
+      ? Math.max(0, effectiveNow - ageSec)
+      : null
+  const receiptWriteSeq = Number.isSafeInteger(ss.last_backup_write_seq)
+    ? ss.last_backup_write_seq
+    : writeSeq !== null && unbackedWrites !== null
+      ? Math.max(0, writeSeq - unbackedWrites)
+      : null
+  const receiptSnapshotId =
+    typeof ss.last_backup_snapshot_id === 'string' && ss.last_backup_snapshot_id
+      ? ss.last_backup_snapshot_id.slice(0, 12)
+      : null
+
+  const watch = state?.watch && typeof state.watch === 'object' ? state.watch : watchView(effectiveNow)
+  const fenceWindowSec = 3600
+  const backupStatus =
+    ss.state !== 'READY'
+      ? 'not_ready'
+      : ageSec === null
+        ? 'missing_receipt'
+        : ageSec > fenceWindowSec
+          ? 'stale_fenced'
+          : (unbackedWrites ?? 0) > 0
+            ? 'dirty_open'
+            : 'verified_clean'
+  const backupFreshnessPct =
+    ageSec !== null ? Math.max(0, Math.min(100, Math.round((1 - ageSec / fenceWindowSec) * 100))) : 0
+
+  // --- New-Memory Velocity (strictly from timestamps & metadata, deduplicated by signed event ID) ---
+  const seenWriteEvents = new Map()
+  const seenWriteFactKeys = new Map()
+  const addWriteEvent = (id, dKey, at) => {
+    const ts = Number(at)
+    if (!Number.isFinite(ts) || ts <= 0) return
+    const cleanId = typeof id === 'string' && id.trim() ? id.trim() : null
+    const cleanD = typeof dKey === 'string' && dKey.trim() ? dKey.trim() : null
+    if (cleanId && seenWriteEvents.has(cleanId)) return
+    if (!cleanId && cleanD && seenWriteFactKeys.has(cleanD)) {
+      const priorTs = seenWriteFactKeys.get(cleanD)
+      if (Math.abs(priorTs - ts) <= 5) return
+    }
+    const mapKey = cleanId || (cleanD ? `d:${cleanD}:${ts}` : `ts:${ts}:${seenWriteEvents.size}`)
+    seenWriteEvents.set(mapKey, ts)
+    if (cleanD) seenWriteFactKeys.set(cleanD, ts)
+  }
+  for (const r of historyList) addWriteEvent(r?.event_id, r?.d, r?.created_at)
+  for (const r of records) addWriteEvent(r?.event_id, r?.d, r?.created_at)
+  for (const r of consolidatedList) addWriteEvent(r?.event_id, r?.d, r?.created_at)
+  for (const a of recentActivity) {
+    if (a.kind === 'submit' && a.accepted !== false && Number.isFinite(a.at) && a.at > 0) {
+      const ids =
+        Array.isArray(a.event_ids) && a.event_ids.length > 0
+          ? a.event_ids.filter(id => typeof id === 'string' && id.trim()).map(id => id.trim())
+          : typeof a.event_id === 'string' && a.event_id.trim()
+            ? [a.event_id.trim()]
+            : []
+      if (ids.length > 0) {
+        for (const id of ids) addWriteEvent(id, a.d, a.at)
+      } else {
+        addWriteEvent(null, a.d, a.at)
+      }
+    }
+  }
+  const writeTimestamps = [...seenWriteEvents.values()].sort((a, b) => a - b)
+  let writes1h = 0
+  let writes6h = 0
+  let writes24h = 0
+  const sparkline12h = new Array(12).fill(0)
+  for (const ts of writeTimestamps) {
+    const age = effectiveNow - ts
+    if (age < -60) continue
+    if (age <= 3600) writes1h += 1
+    if (age <= 21600) writes6h += 1
+    if (age <= 86400) writes24h += 1
+    if (age >= 0 && age < 43200) {
+      const bucketIdx = 11 - Math.min(11, Math.floor(age / 3600))
+      sparkline12h[bucketIdx] += 1
+    }
+  }
+  const lastWriteAt = writeTimestamps.length > 0 ? writeTimestamps[writeTimestamps.length - 1] : null
+  const isRefusalActivity = a =>
+    Boolean(a && (a.kind === 'refused' || (a.kind === 'submit' && a.accepted === false)))
+  const isWithin15m = at => !Number.isFinite(at) || at <= 0 || (effectiveNow - at <= 900 && effectiveNow - at >= -60)
+  const refusals15m = recentActivity.filter(a => isRefusalActivity(a) && isWithin15m(Number(a.at))).length
+
+  // --- Recall Velocity (from recent_activity + agent_roster + efficacy) ---
+  const recallEvents = recentActivity.filter(
+    a => (a.kind === 'wake' || a.kind === 'query') && String(a.actor || '') !== 'viewer'
+  )
+  let recalls5m = 0
+  let recalls15m = 0
+  let recalls1h = 0
+  let wakesWindow = 0
+  let queriesWindow = 0
+  const sparkline60m = new Array(12).fill(0)
+  let lastRecallAt = null
+  for (const a of recallEvents) {
+    const ts = Number(a.at)
+    if (a.kind === 'wake') wakesWindow += 1
+    if (a.kind === 'query') queriesWindow += 1
+    if (!Number.isFinite(ts) || ts <= 0) continue
+    if (lastRecallAt === null || ts > lastRecallAt) lastRecallAt = ts
+    const age = effectiveNow - ts
+    if (age < -60) continue
+    if (age <= 300) recalls5m += 1
+    if (age <= 900) recalls15m += 1
+    if (age <= 3600) recalls1h += 1
+    if (age >= 0 && age < 3600) {
+      const bucketIdx = 11 - Math.min(11, Math.floor(age / 300))
+      sparkline60m[bucketIdx] += 1
+    }
+  }
+  const rosterReads5m = roster.reduce((sum, a) => sum + (Number(a.reads_5m) || 0), 0)
+  if (rosterReads5m > recalls5m) recalls5m = rosterReads5m
+  if (recalls5m > recalls15m) recalls15m = recalls5m
+  if (recalls15m > recalls1h) recalls1h = recalls15m
+  for (const a of roster) {
+    const lr = Number(a.last_recall_at)
+    if (Number.isFinite(lr) && lr > 0 && (lastRecallAt === null || lr > lastRecallAt)) {
+      lastRecallAt = lr
+    }
+  }
+
+  const coh =
+    state?.coherence && typeof state.coherence === 'object'
+      ? state.coherence
+      : computeCoherence({
+          records,
+          history_records: historyList,
+          agent_roster: roster,
+          recent_activity: recentActivity,
+          store_state: ss,
+          now_sec: effectiveNow,
+        })
+  const cs = state?.curator_state && typeof state.curator_state === 'object' ? state.curator_state : {}
+  const eff =
+    state?.efficacy && typeof state.efficacy === 'object'
+      ? state.efficacy
+      : computeSynapticEfficacy({
+          records,
+          history_records: historyList,
+          agent_roster: roster,
+          recent_activity: recentActivity,
+          coherence: coh,
+          curator_state: cs,
+          now_sec: effectiveNow,
+        })
+  const dreamTel = computeDreamingTelemetry(records, {
+    ...cs,
+    consolidated_sources: consolidatedMap,
+  })
+
+  // --- Per-author active claim counts (by pubkey and id) ---
+  const activeClaimsByPubkey = new Map()
+  for (const r of records) {
+    if (r.author_pubkey) {
+      const pk = String(r.author_pubkey)
+      activeClaimsByPubkey.set(pk, (activeClaimsByPubkey.get(pk) || 0) + 1)
+    }
+  }
+
+  const fencedSet = new Set(Array.isArray(watch?.fenced) ? watch.fenced.map(String) : [])
+  const healthOrder = { error: 0, active: 1, warm: 2, stale: 3 }
+  const agentList = roster
+    .map(a => {
+      const id = String(a.id || 'unknown')
+      const pk = String(a.pubkey || '')
+      const rawWriteKey = a.last_write_d || a.last_write_key || null
+      const lastWriteSlug = rawWriteKey
+        ? String(rawWriteKey).split(':').slice(2).join(':') || String(rawWriteKey)
+        : null
+      const actorRefusals15m = recentActivity.filter(
+        act => isRefusalActivity(act) && String(act.actor || '') === id && isWithin15m(Number(act.at))
+      ).length
+      return {
+        id,
+        pubkey_prefix: pk ? pk.slice(0, 12) : null,
+        is_writer: Boolean(a.is_writer),
+        is_reader: Boolean(a.is_reader),
+        fenced: fencedSet.has(id),
+        health: String(a.health || 'stale'),
+        compliance_status: String(a.compliance_status || 'compliant'),
+        coherence_score: Number.isFinite(a.coherence_score) ? a.coherence_score : 100,
+        reads_5m: Number(a.reads_5m || 0),
+        writes_5m: Number(a.writes_5m || 0),
+        queries_5m: Number(a.queries_5m || 0),
+        hits_5m: Number(a.hits_5m || 0),
+        refusals_15m: Math.max(Number(a.refusals_15m || 0), actorRefusals15m),
+        active_claims: pk ? activeClaimsByPubkey.get(pk) || 0 : 0,
+        last_recall_at: Number.isFinite(a.last_recall_at) && a.last_recall_at > 0 ? a.last_recall_at : null,
+        last_write_at: Number.isFinite(a.last_write_at) && a.last_write_at > 0 ? a.last_write_at : null,
+        last_write_slug: lastWriteSlug,
+      }
+    })
+    .sort((a, b) => {
+      const ha = healthOrder[a.health] ?? 9
+      const hb = healthOrder[b.health] ?? 9
+      if (ha !== hb) return ha - hb
+      const actA = Math.max(a.last_recall_at || 0, a.last_write_at || 0)
+      const actB = Math.max(b.last_recall_at || 0, b.last_write_at || 0)
+      if (actA !== actB) return actB - actA
+      return a.id.localeCompare(b.id)
+    })
+
+  // --- Dream consolidation metadata ledger ---
+  const rawLedger = Array.isArray(cs.consolidation_ledger) ? cs.consolidation_ledger : []
+  const recentConsolidations = (
+    rawLedger.length > 0
+      ? rawLedger.slice(-8).reverse()
+      : records
+          .filter(r => typeof r.merkle_sources === 'string' && r.merkle_sources.length > 0)
+          .sort((a, b) => (b.created_at || 0) - (a.created_at || 0))
+          .slice(0, 8)
+          .map(r => ({
+            at: r.created_at || null,
+            stage: r.scope === 'hive:canon' ? 'stage3_canon' : r.expires_at == null ? 'stage2_distill' : 'stage1_promote',
+            scope: r.scope || null,
+            topic: r.topic || 'general',
+            slug: String(r.d || '').split(':').slice(2).join(':') || String(r.d || ''),
+            source_count: Array.isArray(r.supersedes) ? r.supersedes.length : 0,
+            merkle_sources: r.merkle_sources,
+            event_id: r.event_id,
+          }))
+  ).map(entry => ({
+    at: Number.isFinite(entry?.at) ? entry.at : null,
+    stage: String(entry?.stage || 'consolidated'),
+    scope: String(entry?.scope || ''),
+    topic: String(entry?.topic || 'general'),
+    slug: String(entry?.slug || entry?.d || '').split(':').pop() || 'synthesis',
+    source_count: Number(entry?.source_count || (Array.isArray(entry?.source_event_ids) ? entry.source_event_ids.length : 0)),
+    merkle_sources: typeof entry?.merkle_sources === 'string' ? entry.merkle_sources.slice(0, 12) : null,
+    event_id: typeof entry?.event_id === 'string' ? entry.event_id.slice(0, 12) : null,
+  }))
+
+  const eigenvectors = (Array.isArray(cs.topic_eigenvectors) ? cs.topic_eigenvectors : []).slice(0, 6).map((e, i) => ({
+    rank: Number(e?.rank || i + 1),
+    label: String(e?.label || e?.primary_topic || `axis-${i + 1}`),
+    primary_topic: String(e?.primary_topic || 'general'),
+    eigenvalue: Number.isFinite(e?.eigenvalue) ? Math.round(e.eigenvalue * 100) / 100 : 0,
+    variance_pct: Number.isFinite(e?.variance_pct) ? Math.round(e.variance_pct * 10) / 10 : 0,
+    claim_count: Number(e?.claim_count || 0),
+    persisted: Boolean(e?.persisted && !e?.simulated),
+  }))
+
+  // --- Metadata-only Alerts ---
+  const alerts = []
+  if (!state.connected) {
+    alerts.push({
+      severity: 'critical',
+      kind: 'socket_disconnected',
+      code: 'VIEWER_SOCKET_DISCONNECTED',
+      agent: null,
+      at: effectiveNow,
+      summary: 'Viewer socket is disconnected from hive-memory daemon',
+    })
+  }
+  if (ss.state && ss.state !== 'READY' && state.connected) {
+    alerts.push({
+      severity: 'critical',
+      kind: 'store_not_ready',
+      code: String(ss.state),
+      agent: null,
+      at: effectiveNow,
+      summary: `Store state is ${ss.state} (writes fenced until READY)`,
+    })
+  }
+  if (watch?.alert) {
+    alerts.push({
+      severity: watch.saving === 'OFF' ? 'critical' : 'warn',
+      kind: 'watch_fence',
+      code: watch.saving === 'OFF' ? 'SAVING_OFF' : 'SAVING_WARN',
+      agent: null,
+      at: watch.checked_at || effectiveNow,
+      summary: String(watch.alert),
+    })
+  }
+  if (backupStatus === 'stale_fenced' || backupStatus === 'missing_receipt') {
+    alerts.push({
+      severity: 'critical',
+      kind: 'backup_fence',
+      code: 'HIVE_MEMORY_BACKUP_STALE_WRITES_FENCED',
+      agent: null,
+      at: effectiveNow,
+      summary:
+        backupStatus === 'missing_receipt'
+          ? 'No verified backup receipt found; writes fenced'
+          : `Last verified backup is ${ageSec}s old (> ${fenceWindowSec}s fence window)`,
+    })
+  }
+  const rawDriftAlerts = Array.isArray(coh?.epistemic_drift?.alerts) ? coh.epistemic_drift.alerts : []
+  for (const a of rawDriftAlerts.slice(0, 12)) {
+    alerts.push({
+      severity: a?.severity === 'critical' || a?.severity === 'error' ? 'critical' : 'warn',
+      kind: String(a?.kind || 'epistemic_drift'),
+      code: a?.code ? String(a.code) : null,
+      agent: a?.agent ? String(a.agent) : null,
+      at: Number.isFinite(a?.at) ? a.at : effectiveNow,
+      summary: sanitizeMobileAlertSummary(a),
+    })
+  }
+
+  // --- Topic counts (metadata only) ---
+  const topicPagesObj = state?.topic_pages && typeof state.topic_pages === 'object' ? state.topic_pages : {}
+  const topicsFromPages = Object.values(topicPagesObj)
+    .filter(p => p && typeof p === 'object' && p.topic)
+    .map(p => ({
+      topic: String(p.topic),
+      above_the_line: Number(p.counts?.above_the_line || 0),
+      below_the_line: Number(p.counts?.below_the_line || 0),
+      canon: Number(p.counts?.canon || 0),
+      decisions: Number(p.counts?.class_b_decisions || 0),
+      merkle: Number(p.counts?.curated_syntheses || 0),
+      folded: Number(p.counts?.folded_lineage || 0),
+      total: Number(p.counts?.above_the_line || 0) + Number(p.counts?.below_the_line || 0),
+    }))
+    .sort((a, b) => b.total - a.total || a.topic.localeCompare(b.topic))
+
+  let topics = topicsFromPages.slice(0, 12)
+  if (topics.length === 0 && records.length > 0) {
+    const byTopic = new Map()
+    for (const r of records) {
+      const t = String(r.topic || 'general')
+      const entry = byTopic.get(t) || {
+        topic: t,
+        above_the_line: 0,
+        below_the_line: 0,
+        canon: 0,
+        decisions: 0,
+        merkle: 0,
+        folded: 0,
+        total: 0,
+      }
+      entry.total += 1
+      if (r.scope === 'hive:canon') {
+        entry.canon += 1
+        entry.above_the_line += 1
+      } else if (typeof r.merkle_sources === 'string' && r.merkle_sources.length > 0) {
+        entry.merkle += 1
+        entry.above_the_line += 1
+      } else if (r.expires_at === null || r.expires_at === undefined) {
+        entry.decisions += 1
+        entry.above_the_line += 1
+      } else {
+        entry.below_the_line += 1
+      }
+      byTopic.set(t, entry)
+    }
+    topics = [...byTopic.values()].sort((a, b) => b.total - a.total || a.topic.localeCompare(b.topic)).slice(0, 12)
+  }
+
+  // --- Recent synaptic pulses (metadata only) ---
+  const recentPulses = recentActivity
+    .slice(-15)
+    .reverse()
+    .map(a => ({
+      seq: Number(a.seq || 0),
+      at: Number.isFinite(a.at) ? a.at : null,
+      kind: String(a.kind || 'activity'),
+      actor: String(a.actor || 'unknown'),
+      scope: a.scope ? String(a.scope) : null,
+      slug: a.d ? String(a.d).split(':').slice(2).join(':') || String(a.d) : null,
+      accepted: a.accepted !== undefined ? Boolean(a.accepted) : null,
+      code: a.code ? String(a.code) : null,
+      count: Number.isFinite(a.count) ? a.count : null,
+      hits: Number.isFinite(a.hits) ? a.hits : null,
+    }))
+
+  const sc = state?.scope_counts && typeof state.scope_counts === 'object' ? state.scope_counts : {}
+  const ah = state?.agent_health && typeof state.agent_health === 'object' ? state.agent_health : {}
+  const synapticEfficiency = {
+    score: Number.isFinite(eff?.score) ? eff.score : 0,
+    axes: {
+      breadth: Number(eff?.axes?.breadth ?? 0),
+      precision: Number(eff?.axes?.precision ?? 0),
+      velocity: Number(eff?.axes?.velocity ?? 0),
+      reuse: Number(eff?.axes?.reuse ?? 0),
+    },
+    distribution: {
+      recall_coverage_pct: Number(eff?.distribution?.recall_coverage_pct ?? 0),
+      recalling_agents_count: Number(eff?.distribution?.recalling_agents_count ?? 0),
+      active_agents_count: Number(eff?.distribution?.active_agents_count ?? 0),
+      cross_agent_topic_reach_pct: Number(eff?.distribution?.cross_agent_topic_reach_pct ?? 0),
+      multi_reader_topics: Number(eff?.distribution?.multi_reader_topics ?? 0),
+      active_topics_count: Number(eff?.distribution?.active_topics_count ?? 0),
+    },
+    retrieval: {
+      query_hit_rate_pct: Number(eff?.retrieval?.query_hit_rate_pct ?? 0),
+      queries_matched: Number(eff?.retrieval?.queries_matched ?? 0),
+      queries_total: Number(eff?.retrieval?.queries_total ?? 0),
+      wakes_total: Number(eff?.retrieval?.wakes_total ?? 0),
+      read_before_write_pct: Number(eff?.retrieval?.read_before_write_pct ?? 0),
+      recall_grounded_writes: Number(eff?.retrieval?.recall_grounded_writes ?? 0),
+      total_writes_window: Number(eff?.retrieval?.total_writes_window ?? 0),
+    },
+    handoff: {
+      median_handoff_min: eff?.handoff?.median_handoff_min ?? null,
+      handoff_events_count: Number(eff?.handoff?.handoff_events_count ?? 0),
+      fast_handoffs_count: Number(eff?.handoff?.fast_handoffs_count ?? 0),
+    },
+    reuse: {
+      state_compression_pct: Number(eff?.reuse?.state_compression_pct ?? 0),
+      durable_claims: Number(eff?.reuse?.durable_claims ?? 0),
+      raw_class_a_claims: Number(eff?.reuse?.raw_class_a_claims ?? 0),
+      corroborated_topic_pct: Number(eff?.reuse?.corroborated_topic_pct ?? 0),
+      multi_author_topics: Number(eff?.reuse?.multi_author_topics ?? 0),
+      total_topics: Number(eff?.reuse?.total_topics ?? 0),
+    },
+  }
+
+  const hasCriticalAlert = alerts.some(a => a.severity === 'critical')
+  const healthy = Boolean(
+    state.connected &&
+      ss.state === 'READY' &&
+      watch?.saving !== 'OFF' &&
+      backupStatus !== 'stale_fenced' &&
+      backupStatus !== 'missing_receipt' &&
+      !hasCriticalAlert
+  )
+
+  return {
+    viewer_version: state?.viewer_version || VIEWER_VERSION,
+    view_mode: 'mobile_pocket_cortex',
+    metadata_only: true,
+    authority: null,
+    trustedInstruction: false,
+    connected: Boolean(state?.connected),
+    error: state?.error ? String(state.error) : null,
+    server_name: String(state?.server_name || 'hive-memory-viewer'),
+    reader: String(state?.reader || 'viewer'),
+    polled_at: effectiveNow,
+    poll_seq: Number.isSafeInteger(state?.poll_seq) ? state.poll_seq : 0,
+    store_state: {
+      state: String(ss.state || 'CONNECTING'),
+      write_seq: writeSeq,
+      current_claims: currentClaims,
+      last_backup_age_sec: ageSec,
+      unbacked_writes: unbackedWrites,
+      last_backup_at: receiptAt,
+      last_backup_write_seq: receiptWriteSeq,
+      last_backup_snapshot_id: receiptSnapshotId,
+    },
+    backup: {
+      status: backupStatus,
+      age_sec: ageSec,
+      fence_window_sec: fenceWindowSec,
+      freshness_pct: backupFreshnessPct,
+      unbacked_writes: unbackedWrites,
+      last_receipt: {
+        at: receiptAt,
+        write_seq: receiptWriteSeq,
+        snapshot_id: receiptSnapshotId,
+      },
+      watch: {
+        saving: String(watch?.saving || 'unknown'),
+        fenced: Array.isArray(watch?.fenced) ? watch.fenced.map(String) : [],
+        checked_at: watch?.checked_at || null,
+        stale: Boolean(watch?.stale),
+        alert: watch?.alert ? String(watch.alert) : null,
+      },
+    },
+    velocities: {
+      new_memory: {
+        writes_1h: writes1h,
+        writes_6h: writes6h,
+        writes_24h: writes24h,
+        rate_per_hour_1h: writes1h,
+        rate_per_hour_6h: Math.round((writes6h / 6) * 10) / 10,
+        rate_per_hour_24h: Math.round((writes24h / 24) * 10) / 10,
+        sparkline_12h: sparkline12h,
+        last_write_at: lastWriteAt,
+        last_write_age_sec: lastWriteAt !== null ? Math.max(0, effectiveNow - lastWriteAt) : null,
+        refusals_15m: refusals15m,
+        write_seq: writeSeq,
+      },
+      recall: {
+        recalls_5m: recalls5m,
+        recalls_15m: recalls15m,
+        recalls_1h: recalls1h,
+        wakes_window: wakesWindow,
+        queries_window: queriesWindow,
+        rate_per_min_5m: Math.round((recalls5m / 5) * 10) / 10,
+        rate_per_hour_1h: recalls1h,
+        query_hit_rate_pct: synapticEfficiency.retrieval.query_hit_rate_pct,
+        recall_coverage_pct: synapticEfficiency.distribution.recall_coverage_pct,
+        recalling_agents: synapticEfficiency.distribution.recalling_agents_count,
+        active_agents: synapticEfficiency.distribution.active_agents_count,
+        sparkline_60m: sparkline60m,
+        last_recall_at: lastRecallAt,
+        last_recall_age_sec: lastRecallAt !== null ? Math.max(0, effectiveNow - lastRecallAt) : null,
+      },
+    },
+    coherence: {
+      score: Number(coh?.score ?? 0),
+      core_memory_score: Number(coh?.core_memory_score ?? 0),
+      periphery_coherence_score: Number(coh?.periphery_coherence_score ?? 0),
+      inception_score: Number(coh?.inception_score ?? 0),
+      inception_at: coh?.inception_at ?? null,
+      delta_since_inception: Number(coh?.delta_since_inception ?? 0),
+      axes: {
+        alignment: Number(coh?.axes?.alignment ?? 0),
+        grounding: Number(coh?.axes?.grounding ?? 0),
+        convergence: Number(coh?.axes?.convergence ?? 0),
+        coupling: Number(coh?.axes?.coupling ?? 0),
+        consolidation: Number(coh?.axes?.consolidation ?? 0),
+      },
+      counts: {
+        active_claims: Number(coh?.active_claims ?? records.length),
+        consolidated_claims: Number(coh?.consolidated_claims ?? Object.keys(consolidatedMap).length),
+        superseded_events: Number(coh?.superseded_events ?? 0),
+        withdrawn_events: Number(coh?.withdrawn_events ?? 0),
+        expired_events: Number(coh?.expired_events ?? 0),
+        conflict_claims: Number(coh?.conflict_claims ?? 0),
+        stale_claims: Number(coh?.stale_claims ?? 0),
+        grounded_claims: Number(coh?.grounded_claims ?? 0),
+        shared_artifacts: Number(coh?.shared_artifacts ?? 0),
+      },
+      drift_status: String(coh?.epistemic_drift?.status || 'aligned'),
+      history: (Array.isArray(coh?.history) ? coh.history : []).slice(-12).map(h => ({
+        at: Number(h?.at || 0),
+        score: Number(h?.score || 0),
+      })),
+    },
+    synaptic_efficiency: synapticEfficiency,
+    dreams: {
+      mode: dreamTel.display_mode.mode,
+      mode_label: dreamTel.display_mode.label,
+      persisted_curation: Boolean(dreamTel.display_mode.persisted_curation),
+      last_curated_at: cs.last_curated_at || null,
+      last_curated_write_seq: Number(cs.last_curated_write_seq || 0),
+      last_ran_at: cs.last_ran_at || null,
+      last_submitted_count: Number(cs.last_submitted_count || 0),
+      elapsed_sec: Number.isFinite(cs.elapsed_sec) ? cs.elapsed_sec : null,
+      dream_interval_sec: Number(cs.dream_interval_sec || DEFAULT_DREAM_INTERVAL_SEC),
+      write_delta: Number(cs.write_delta || 0),
+      write_delta_threshold: Number(cs.write_delta_threshold || DEFAULT_WRITE_DELTA_THRESHOLD),
+      topic_pressure_threshold: Number(cs.topic_pressure_threshold || DEFAULT_TOPIC_PRESSURE_THRESHOLD),
+      should_run: Boolean(cs.should_run),
+      triggers: {
+        circadian_dream: Boolean(cs.triggers?.circadian_dream),
+        synaptic_volume: Boolean(cs.triggers?.synaptic_volume),
+        nightmare_interrupt: Boolean(cs.triggers?.nightmare_interrupt),
+      },
+      counts: {
+        merkle_syntheses: Number(dreamTel.merkleCount || 0),
+        consolidated_sources: Object.keys(consolidatedMap).length,
+        class_b_decisions: Number(dreamTel.classBCount || 0),
+        workflow_claims: Number(dreamTel.wfCount || 0),
+        short_ttl_workflow: Number(dreamTel.shortTtlCount || 0),
+        nightmares: Number(dreamTel.nightmareCount || 0),
+        wake_savings_pct: Number(dreamTel.wakeSavings || 0),
+        index_savings_pct: Number(dreamTel.indexSavings || 0),
+      },
+      planned_summary: {
+        promotions: Number(cs.planned_summary?.promotions || 0),
+        distillations: Number(cs.planned_summary?.distillations || 0),
+        solidifications: Number(cs.planned_summary?.solidifications || 0),
+        nightmares: Number(cs.planned_summary?.nightmares || 0),
+      },
+      recent_consolidations: recentConsolidations,
+      eigenvectors,
+    },
+    agents: {
+      summary: {
+        active_5m: Number(ah.active_5m ?? agentList.filter(a => a.health === 'active').length),
+        warm_20m: Number(ah.warm_20m ?? agentList.filter(a => a.health === 'warm').length),
+        stale: Number(ah.stale ?? agentList.filter(a => a.health === 'stale').length),
+        error: Number(ah.error ?? agentList.filter(a => a.health === 'error').length),
+        total: agentList.length,
+        window_sec: Number(ah.window_sec || ACTIVE_WINDOW_SEC),
+      },
+      roster: agentList,
+    },
+    alerts,
+    vitals: {
+      healthy,
+      scope_counts: {
+        canon: Number(sc.canon ?? 0),
+        ops: Number(sc.ops ?? 0),
+        rooms: Number(sc.rooms ?? 0),
+        self: Number(sc.self ?? 0),
+        unverified_total: Number(sc.unverified_total ?? 0),
+      },
+      entity_graph: {
+        total_edges: Number(state?.entity_graph_stats?.total_edges || 0),
+        link_count: Number(state?.entity_graph_stats?.link_count || 0),
+        top_entities: (Array.isArray(state?.entity_graph_stats?.top_entities)
+          ? state.entity_graph_stats.top_entities
+          : []
+        )
+          .slice(0, 8)
+          .map(e => ({
+            ref: String(e?.ref || ''),
+            count: Number(e?.count || 0),
+          })),
+      },
+      topics,
+      recent_pulses: recentPulses,
+    },
+  }
+}
+
+export function renderMobileViewerHtml(initialMobileState = {}) {
+  const mobileData =
+    initialMobileState && initialMobileState.view_mode === 'mobile_pocket_cortex'
+      ? initialMobileState
+      : buildMobileState(initialMobileState)
+  const escapedInitial = safeJsonForScript(mobileData)
+  const syncState = escapeHtml(mobileData.store_state?.state || 'CONNECTING')
+  const readerName = escapeHtml(mobileData.reader || 'viewer')
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=5,viewport-fit=cover">
+<meta name="theme-color" content="#040711">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Pocket Cortex · Hive Memory Status</title>
+<style>
+:root{--bg:#040711;--card:rgba(11,18,35,0.86);--border:rgba(100,138,205,0.24);--text:#eef4ff;--muted:#8ea2c4;--ok:#22c55e;--warn:#f59e0b;--err:#ef4444;--cyan:#38bdf8;--emerald:#34d399;--violet:#a78bfa;--gold:#fbbf24;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;--mono:"SF Mono",ui-monospace,Menlo,monospace}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;padding:0;background:radial-gradient(circle at 18% 6%,rgba(56,189,248,0.16),transparent 42%),radial-gradient(circle at 84% 14%,rgba(167,139,250,0.15),transparent 46%),var(--bg);color:var(--text);font-family:var(--sans);font-variant-numeric:tabular-nums;overflow-x:hidden}
+.shell{max-width:520px;margin:0 auto;padding:12px 12px calc(84px + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:11px}
+.glass{background:var(--card);border:1px solid var(--border);border-radius:16px;box-shadow:0 12px 32px rgba(0,0,0,0.45);backdrop-filter:blur(14px)}
+.top-bar{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 13px}
+.brand{display:flex;align-items:center;gap:10px;min-width:0}
+.orb{width:28px;height:28px;border-radius:999px;flex-shrink:0;background:radial-gradient(circle at 32% 30%,#a5f3fc,#38bdf8 45%,#6366f1 80%);box-shadow:0 0 16px rgba(56,189,248,0.65)}
+.brand-title{font-size:15px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.brand-sub{font-size:10.5px;color:var(--muted);font-family:var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.top-actions{display:flex;align-items:center;gap:6px;flex-shrink:0}
+.pill{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;font-size:10.5px;font-weight:700;font-family:var(--mono);border:1px solid var(--border);background:rgba(15,23,42,0.8);color:var(--text)}
+.pill.ok{color:#86efac;border-color:rgba(34,197,94,0.45);background:rgba(34,197,94,0.14)}
+.pill.warn{color:#fcd34d;border-color:rgba(245,158,11,0.45);background:rgba(245,158,11,0.15)}
+.pill.err{color:#fca5a5;border-color:rgba(239,68,68,0.5);background:rgba(239,68,68,0.16)}
+.pill.info{color:#7dd3fc;border-color:rgba(56,189,248,0.45);background:rgba(56,189,248,0.13)}
+.pill.violet{color:#ddd6fe;border-color:rgba(167,139,250,0.45);background:rgba(167,139,250,0.14)}
+.btn-ghost{border:1px solid rgba(125,211,252,0.35);background:rgba(15,23,42,0.85);color:#bae6fd;border-radius:999px;padding:4px 10px;font-size:11px;font-weight:600;cursor:pointer}
+.cortex-hero{position:relative;overflow:hidden}
+#pocket-cortex{display:block;width:100%;height:196px;touch-action:manipulation}
+.ov-top,.ov-bot{position:absolute;left:12px;right:12px;display:flex;justify-content:space-between;align-items:center;pointer-events:none}
+.ov-top{top:10px}.ov-bot{bottom:8px;font-size:10.5px;color:var(--muted);font-family:var(--mono)}
+.health-banner{padding:10px 13px;display:flex;flex-direction:column;gap:6px}
+.health-banner.healthy{border-color:rgba(34,197,94,0.42)}
+.health-banner.alerting{border-color:rgba(245,158,11,0.52)}
+.health-banner.critical{border-color:rgba(239,68,68,0.65)}
+.health-headline,.section-head,.agent-top,.axis-meta{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.health-headline{font-size:13px;font-weight:700}
+.alert-list,.axis-list,.agent-rows,.compact-list{display:flex;flex-direction:column;gap:6px}
+.alert-item{padding:6px 9px;border-radius:9px;font-size:11px;background:rgba(2,6,23,0.66);border-left:3px solid var(--warn);display:flex;justify-content:space-between;gap:8px}
+.alert-item.critical{border-left-color:var(--err);color:#fecaca}
+.vitals-grid,.sub-grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
+.sub-grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}
+.vital-card{padding:11px 12px;display:flex;flex-direction:column;gap:3px}
+.vital-label{font-size:10px;font-weight:700;text-transform:uppercase;color:var(--muted);display:flex;justify-content:space-between}
+.vital-val{font-size:23px;font-weight:800;line-height:1.1}
+.vital-sub,.stat-s{font-size:10px;color:var(--muted);font-family:var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.spark-svg{width:100%;height:28px;margin-top:3px}
+.section-card{padding:13px;display:flex;flex-direction:column;gap:10px}
+.section-title{font-size:13px;font-weight:700;margin:0}
+.stat-box{background:rgba(4,9,22,0.62);border:1px solid rgba(100,138,205,0.18);border-radius:11px;padding:7px 9px;display:flex;flex-direction:column;gap:2px}
+.stat-k{font-size:9.5px;text-transform:uppercase;color:var(--muted)}
+.stat-v{font-size:14px;font-weight:700;font-family:var(--mono)}
+.axis-row{display:flex;flex-direction:column;gap:3px;font-size:11px}
+.bar-track{height:6px;border-radius:999px;background:rgba(15,23,42,0.9);overflow:hidden}
+.bar-fill{height:100%;border-radius:999px}
+.filter-row{display:flex;gap:6px;overflow-x:auto}
+.filter-btn{border:1px solid var(--border);background:rgba(15,23,42,0.72);color:var(--muted);border-radius:999px;padding:4px 10px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap}
+.filter-btn.active{color:var(--text);border-color:var(--cyan);background:rgba(56,189,248,0.18)}
+.agent-card{background:rgba(4,9,22,0.66);border:1px solid rgba(100,138,205,0.2);border-radius:12px;padding:8px 10px;display:flex;flex-direction:column;gap:4px}
+.agent-card.highlight{border-color:var(--cyan)}
+.agent-id{display:flex;align-items:center;gap:6px;font-weight:700;font-size:12.5px}
+.dot{width:8px;height:8px;border-radius:999px;flex-shrink:0}
+.agent-metrics{display:flex;flex-wrap:wrap;gap:6px 10px;font-size:10px;color:var(--muted);font-family:var(--mono)}
+.compact-row{background:rgba(4,9,22,0.56);border:1px solid rgba(100,138,205,0.16);border-radius:9px;padding:6px 9px;display:flex;justify-content:space-between;gap:8px;font-size:10.5px;font-family:var(--mono)}
+.compact-main{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bottom-nav{position:fixed;left:50%;transform:translateX(-50%);bottom:max(8px,env(safe-area-inset-bottom));width:calc(100% - 20px);max-width:500px;z-index:50;padding:5px;display:grid;grid-template-columns:repeat(5,1fr);gap:4px;border-radius:999px;background:rgba(7,12,26,0.94);border:1px solid rgba(125,211,252,0.3)}
+.nav-btn{border:none;background:transparent;color:var(--muted);padding:6px 4px;border-radius:999px;font-size:11px;font-weight:700;cursor:pointer}
+.nav-btn.active{background:rgba(56,189,248,0.2);color:#e0f2fe}
+.meta-footer{text-align:center;font-size:10px;color:var(--muted);font-family:var(--mono);padding:6px}
+</style>
+</head>
+<body>
+<div class="shell" id="top-sec">
+<header class="glass top-bar">
+<div class="brand"><div class="orb"></div><div style="min-width:0"><div class="brand-title">Pocket Cortex · Hive Memory</div><div class="brand-sub">reader: <span id="m-reader">${readerName}</span> · metadata-only</div></div></div>
+<div class="top-actions"><span id="m-sse-pill" class="pill info">LIVE</span><button id="m-desktop-btn" class="btn-ghost" type="button">3D View</button></div>
+</header>
+<section class="glass cortex-hero">
+<canvas id="pocket-cortex" width="480" height="196"></canvas>
+<div class="ov-top"><span id="m-store-pill" class="pill ok">${syncState}</span><span id="m-seq-pill" class="pill">seq #-</span></div>
+<div class="ov-bot"><span id="m-canvas-caption">Tap any agent node to inspect</span><span id="m-poll-age">polled just now</span></div>
+</section>
+<section id="m-health-banner" class="glass health-banner healthy">
+<div class="health-headline"><span id="m-health-title">✓ Brain Healthy · Saving Open</span><span id="m-alert-count" class="pill ok">0 alerts</span></div>
+<div id="m-alert-list" class="alert-list"></div>
+</section>
+<section class="vitals-grid" id="velocity-sec">
+<div class="glass vital-card"><div class="vital-label"><span>New Memory</span><span class="pill ok">1h</span></div><div id="v-write-val" class="vital-val" style="color:var(--emerald)">0/hr</div><div id="v-write-sub" class="vital-sub">24h: 0</div><svg id="svg-write-spark" class="spark-svg" viewBox="0 0 160 28" preserveAspectRatio="none"></svg></div>
+<div class="glass vital-card"><div class="vital-label"><span>Recall Velocity</span><span class="pill info">5m/1h</span></div><div id="v-recall-val" class="vital-val" style="color:var(--cyan)">0/hr</div><div id="v-recall-sub" class="vital-sub">5m: 0</div><svg id="svg-recall-spark" class="spark-svg" viewBox="0 0 160 28" preserveAspectRatio="none"></svg></div>
+<div class="glass vital-card"><div class="vital-label"><span>Coherence 2.0</span><span id="v-coh-delta" class="pill ok">+0%</span></div><div id="v-coh-val" class="vital-val" style="color:#6ee7b7">0%</div><div id="v-coh-sub" class="vital-sub">core 0%</div><svg id="svg-coh-spark" class="spark-svg" viewBox="0 0 160 28" preserveAspectRatio="none"></svg></div>
+<div class="glass vital-card"><div class="vital-label"><span>Synaptic Eff</span><span class="pill violet">4-axis</span></div><div id="v-eff-val" class="vital-val" style="color:var(--violet)">0%</div><div id="v-eff-sub" class="vital-sub">R→W 0%</div><svg id="svg-eff-spark" class="spark-svg" viewBox="0 0 160 28" preserveAspectRatio="none"></svg></div>
+</section>
+<section class="glass section-card">
+<div class="section-head"><h2 class="section-title" style="color:var(--cyan)">⚡ Synaptic Velocity &amp; Flow</h2><span class="pill info">12h / 60m</span></div>
+<div class="sub-grid-3">
+<div class="stat-box"><span class="stat-k">Writes (1h/6h)</span><span id="f-writes-1h6h" class="stat-v" style="color:var(--emerald)">0 / 0</span><span id="f-writes-24h" class="stat-s">24h: 0</span></div>
+<div class="stat-box"><span class="stat-k">Recalls (5m/1h)</span><span id="f-recalls-5m1h" class="stat-v" style="color:var(--cyan)">0 / 0</span><span id="f-recalls-wq" class="stat-s">0 wakes</span></div>
+<div class="stat-box"><span class="stat-k">Recall Reach</span><span id="f-coverage" class="stat-v" style="color:#93c5fd">0%</span><span id="f-hit-rate" class="stat-s">hit: 0%</span></div>
+</div>
+<div class="compact-list" id="m-pulse-list"></div>
+</section>
+<section class="glass section-card" id="health-sec">
+<div class="section-head"><h2 class="section-title" style="color:#6ee7b7">🧭 Coherence &amp; Synaptic Efficiency</h2><span id="m-drift-pill" class="pill ok">aligned</span></div>
+<div class="sub-grid-2">
+<div class="stat-box"><span class="stat-k">Core Canon + Class B</span><span id="c-core-score" class="stat-v" style="color:var(--gold)">0%</span><span id="c-grounded" class="stat-s">0 grounded</span></div>
+<div class="stat-box"><span class="stat-k">State Compression</span><span id="e-compress" class="stat-v" style="color:var(--violet)">0%</span><span id="e-durable" class="stat-s">0 durable</span></div>
+</div>
+<div class="axis-list" id="m-coh-axes"></div>
+<div class="axis-list" id="m-eff-axes"></div>
+</section>
+<section class="glass section-card" id="backup-sec">
+<div class="section-head"><h2 class="section-title" style="color:var(--gold)">🛡️ Backup State &amp; Write Fence</h2><span id="b-status-pill" class="pill ok">VERIFIED</span></div>
+<div class="sub-grid-3">
+<div class="stat-box"><span class="stat-k">Backup Age</span><span id="b-age-val" class="stat-v">-</span><span class="stat-s">fence 60m</span></div>
+<div class="stat-box"><span class="stat-k">Unbacked</span><span id="b-unbacked-val" class="stat-v">0</span><span id="b-seq-sub" class="stat-s">seq #-</span></div>
+<div class="stat-box"><span class="stat-k">Saving Gate</span><span id="b-saving-val" class="stat-v" style="color:var(--ok)">OPEN</span><span id="b-fenced-sub" class="stat-s">0 fenced</span></div>
+</div>
+<div class="axis-row"><div class="axis-meta"><span>Backup Window Freshness</span><span id="b-fresh-pct">100%</span></div><div class="bar-track"><div id="b-fresh-bar" class="bar-fill" style="width:100%;background:#22c55e"></div></div></div>
+<div class="stat-box"><span class="stat-k">Last Verified Backup Receipt</span><span id="b-receipt-main" class="stat-v" style="font-size:12.5px;color:#fde68a">receipt seq #-</span><span id="b-receipt-sub" class="stat-s">snapshot: -</span></div>
+</section>
+<section class="glass section-card" id="dream-sec">
+<div class="section-head"><h2 class="section-title" style="color:var(--violet)">🌙 Merkle Dream &amp; Curator</h2><span id="d-mode-pill" class="pill violet">OBSERVED</span></div>
+<div class="sub-grid-3">
+<div class="stat-box"><span class="stat-k">Last Dream</span><span id="d-last-val" class="stat-v">-</span><span id="d-last-seq" class="stat-s">seq #-</span></div>
+<div class="stat-box"><span class="stat-k">Syntheses</span><span id="d-merkle-val" class="stat-v" style="color:var(--violet)">0</span><span id="d-folded-sub" class="stat-s">0 folded</span></div>
+<div class="stat-box"><span class="stat-k">Wake Savings</span><span id="d-savings-val" class="stat-v" style="color:var(--emerald)">0%</span><span id="d-planned-sub" class="stat-s">0 planned</span></div>
+</div>
+<div class="axis-list" id="d-trigger-bars"></div>
+<div class="compact-list" id="d-ledger-list"></div>
+</section>
+<section class="glass section-card" id="agents-sec">
+<div class="section-head"><h2 class="section-title" style="color:#93c5fd">🐝 Per-Agent Usage Status</h2><span id="a-summary-pill" class="pill info">0 active</span></div>
+<div class="filter-row" id="a-filter-row">
+<button class="filter-btn active" type="button" data-filter="all">All Seats</button>
+<button class="filter-btn" type="button" data-filter="active">Active / Warm</button>
+<button class="filter-btn" type="button" data-filter="writers">Writers</button>
+<button class="filter-btn" type="button" data-filter="alerts">Drift / Fenced</button>
+</div>
+<div class="agent-rows" id="m-agent-list"></div>
+</section>
+<section class="glass section-card">
+<div class="section-head"><h2 class="section-title" style="color:var(--emerald)">📚 Memory Tiers &amp; Topics</h2><span id="t-total-pill" class="pill">0 claims</span></div>
+<div class="sub-grid-3">
+<div class="stat-box"><span class="stat-k">Rank 2 Canon</span><span id="t-canon" class="stat-v" style="color:var(--gold)">0</span><span class="stat-s">James canon</span></div>
+<div class="stat-box"><span class="stat-k">Class B Durable</span><span id="t-decisions" class="stat-v" style="color:var(--violet)">0</span><span class="stat-s">ttl: 0</span></div>
+<div class="stat-box"><span class="stat-k">Graph Edges</span><span id="t-edges" class="stat-v" style="color:var(--cyan)">0</span><span id="t-unverified" class="stat-s">0 unverified</span></div>
+</div>
+<div class="axis-list" id="m-topic-bars"></div>
+</section>
+<footer class="meta-footer">Hive Memory Pocket Cortex · DATA ONLY (authority=null, trustedInstruction=false)</footer>
+</div>
+<nav class="bottom-nav">
+<button class="nav-btn active" type="button" data-jump="top-sec">Brain</button>
+<button class="nav-btn" type="button" data-jump="velocity-sec">Velocity</button>
+<button class="nav-btn" type="button" data-jump="health-sec">Coherence</button>
+<button class="nav-btn" type="button" data-jump="dream-sec">Dream</button>
+<button class="nav-btn" type="button" data-jump="agents-sec">Agents</button>
+</nav>
+<script id="initial-mobile-state" type="application/json">${escapedInitial}</script>
+<script>
+(function(){
+'use strict';
+var el=function(id){return document.getElementById(id);};
+var txt=function(id,v){var n=el(id);if(n)n.textContent=v;};
+var cls=function(id,c){var n=el(id);if(n)n.className=c;};
+var AM={james:['James','#fbbf24'],biggy:['Biggy','#818cf8'],rabidrabbit:['RabidRabbit','#f59e0b'],'dead-rabbit':['Dead Rabbit','#f59e0b'],mydude:['My Dude','#10b981'],neil:['Neil','#38bdf8'],'waggle-dev':['Waggle-Dev','#fb923c'],crystalclaude:['CrystalClaude','#f472b6'],'dj-codex':['DJ-Codex','#34d399'],dennis:['Dennis','#60a5fa'],kerouac:['Kerouac','#c084fc'],grokdoggydog:['GrokDoggyDog','#f87171'],'pi-dog':['Pi-Dog','#2dd4bf'],lukedog:['LukeDog','#a3e635'],'mc-claude':['MC-Claude','#e879f9'],curator:['Curator','#a78bfa']};
+var FB=['#38bdf8','#a78bfa','#34d399','#f472b6','#fbbf24','#60a5fa','#fb923c'];
+function aInfo(id,i){var m=AM[String(id||'').toLowerCase()];return m?{name:m[0],color:m[1]}:{name:String(id||'agent'),color:FB[i%FB.length]};}
+function fmtDur(sec){if(sec==null||!Number.isFinite(sec))return '-';var s=Math.max(0,Math.floor(sec));return s<60?s+'s':s<3600?Math.floor(s/60)+'m '+(s%60)+'s':s<86400?Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m':Math.floor(s/86400)+'d';}
+function fmtAgo(ts,now){return (!ts||!Number.isFinite(ts))?'never':fmtDur(Math.max(0,now-ts))+' ago';}
+function fmtUtc(ts){if(!ts||!Number.isFinite(ts))return '-';try{return new Date(ts*1000).toISOString().replace('T',' ').slice(5,19)+'Z';}catch(_){return '-';}}
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function spark(id,vals,stroke,fill){
+var svg=el(id);if(!svg)return;
+var a=Array.isArray(vals)&&vals.length?vals.map(function(v){return Number(v)||0;}):[0,0];
+if(a.length===1)a=[a[0],a[0]];
+var w=160,h=28,max=Math.max.apply(null,a.concat([1])),min=Math.min.apply(null,a.concat([0])),sp=Math.max(1,max-min);
+var pts=a.map(function(v,i){return ((i/(a.length-1))*w).toFixed(1)+','+(h-3-((v-min)/sp)*(h-6)).toFixed(1);}).join(' ');
+svg.innerHTML='<polygon points="0,'+h+' '+pts+' '+w+','+h+'" fill="'+fill+'"></polygon><polyline points="'+pts+'" fill="none" stroke="'+stroke+'" stroke-width="2"></polyline>';
+}
+function bars(id,rows){
+var b=el(id);if(!b)return;
+b.innerHTML=rows.map(function(r){
+var p=Math.max(0,Math.min(100,Math.round(Number(r[1])||0)));
+return '<div class="axis-row"><div class="axis-meta"><span>'+esc(r[0])+'</span><span style="color:'+r[2]+';font-family:var(--mono);font-weight:700">'+esc(r[3]!=null?r[3]:p+'%')+'</span></div><div class="bar-track"><div class="bar-fill" style="width:'+p+'%;background:'+r[2]+'"></div></div></div>';
+}).join('');
+}
+var curData=null,aFilter='all',selAgent=null;
+function renderAgents(data){
+var b=el('m-agent-list');if(!b||!data||!data.agents)return;
+var now=data.polled_at||Math.floor(Date.now()/1000);
+var list=(data.agents.roster||[]).filter(function(a){
+return aFilter==='active'?(a.health==='active'||a.health==='warm'):aFilter==='writers'?Boolean(a.is_writer):aFilter==='alerts'?(a.fenced||a.health==='error'||(a.compliance_status&&a.compliance_status!=='compliant')||a.refusals_15m>0):true;
+});
+if(!list.length){b.innerHTML='<div class="stat-box"><span class="stat-s">No matching seats.</span></div>';return;}
+b.innerHTML=list.map(function(a,i){
+var inf=aInfo(a.id,i),hc=a.health==='active'?'ok':a.health==='warm'?'info':a.health==='error'?'err':'';
+var bdg=a.fenced?'<span class="pill err">FENCED</span>':(a.compliance_status&&a.compliance_status!=='compliant')?'<span class="pill warn">'+esc(a.compliance_status)+'</span>':'';
+return '<div class="agent-card'+(selAgent===a.id?' highlight':'')+'" data-agent-id="'+esc(a.id)+'"><div class="agent-top"><div class="agent-id"><span class="dot" style="background:'+inf.color+'"></span><span>'+esc(inf.name)+'</span><span style="font-size:10px;color:var(--muted)">@'+esc(a.id)+'</span></div><div>'+bdg+' <span class="pill '+hc+'">'+esc(a.health)+'</span></div></div><div class="agent-metrics"><span>5m: <b>'+a.reads_5m+'R/'+a.writes_5m+'W</b></span><span>claims: <b>'+a.active_claims+'</b></span><span>coh: <b>'+a.coherence_score+'%</b></span>'+(a.refusals_15m?'<span style="color:#fca5a5">refused: <b>'+a.refusals_15m+'</b></span>':'')+'<span>R: '+esc(fmtAgo(a.last_recall_at,now))+'</span><span>W: '+esc(fmtAgo(a.last_write_at,now))+(a.last_write_slug?' ('+esc(a.last_write_slug.slice(0,18))+')':'')+'</span></div></div>';
+}).join('');
+}
+function renderMobile(d){
+if(!d||typeof d!=='object')return;
+curData=d;
+var now=d.polled_at||Math.floor(Date.now()/1000),ss=d.store_state||{},bk=d.backup||{},vel=d.velocities||{},nm=vel.new_memory||{},rc=vel.recall||{},coh=d.coherence||{},eff=d.synaptic_efficiency||{},dr=d.dreams||{},ag=d.agents||{},vt=d.vitals||{};
+txt('m-reader',d.reader||'viewer');
+txt('m-store-pill',ss.state||(d.connected?'READY':'OFFLINE'));
+cls('m-store-pill','pill '+(ss.state==='READY'&&d.connected?'ok':'err'));
+txt('m-seq-pill','seq #'+(ss.write_seq??'-')+' · '+(ss.current_claims??0)+' claims');
+txt('m-poll-age','poll #'+(d.poll_seq||0)+' · '+fmtUtc(now));
+var al=d.alerts||[],crit=al.some(function(a){return a.severity==='critical';});
+cls('m-health-banner','glass health-banner '+(crit?'critical':al.length?'alerting':'healthy'));
+txt('m-health-title',crit?'⚠ Critical Memory Alert':al.length?'⚡ '+al.length+' Notice(s)':'✓ Brain Healthy · Saving Open');
+txt('m-alert-count',al.length+' alerts');cls('m-alert-count','pill '+(crit?'err':al.length?'warn':'ok'));
+if(el('m-alert-list'))el('m-alert-list').innerHTML=al.slice(0,5).map(function(a){return '<div class="alert-item '+(a.severity==='critical'?'critical':'')+'"><span>'+esc(a.summary)+'</span><span>'+esc(fmtAgo(a.at,now))+'</span></div>';}).join('');
+txt('v-write-val',(nm.writes_1h||0)+'/hr');txt('v-write-sub','24h: '+(nm.writes_24h||0)+' · last '+fmtAgo(nm.last_write_at,now));
+spark('svg-write-spark',nm.sparkline_12h,'#34d399','rgba(52,211,153,0.18)');
+txt('v-recall-val',(rc.recalls_1h||0)+'/hr');txt('v-recall-sub','5m: '+(rc.recalls_5m||0)+' · hit '+Math.round(rc.query_hit_rate_pct||0)+'%');
+spark('svg-recall-spark',rc.sparkline_60m,'#38bdf8','rgba(56,189,248,0.18)');
+var dl=Number(coh.delta_since_inception||0);
+txt('v-coh-val',Math.round(coh.score||0)+'%');txt('v-coh-delta',(dl>=0?'+':'')+dl.toFixed(1)+'%');cls('v-coh-delta','pill '+(dl>=0?'ok':'warn'));
+txt('v-coh-sub','core '+Math.round(coh.core_memory_score||0)+'% · periph '+Math.round(coh.periphery_coherence_score||0)+'%');
+spark('svg-coh-spark',(coh.history||[]).map(function(h){return h.score;}),'#6ee7b7','rgba(110,231,183,0.18)');
+var ea=eff.axes||{};
+txt('v-eff-val',Math.round(eff.score||0)+'%');txt('v-eff-sub','R→W '+Math.round((eff.retrieval&&eff.retrieval.read_before_write_pct)||0)+'%');
+spark('svg-eff-spark',[ea.breadth||0,ea.precision||0,ea.velocity||0,ea.reuse||0,eff.score||0],'#a78bfa','rgba(167,139,250,0.18)');
+txt('f-writes-1h6h',(nm.writes_1h||0)+' / '+(nm.writes_6h||0));txt('f-writes-24h','24h: '+(nm.writes_24h||0)+' · '+(nm.refusals_15m||0)+' refused');
+txt('f-recalls-5m1h',(rc.recalls_5m||0)+' / '+(rc.recalls_1h||0));txt('f-recalls-wq',(rc.wakes_window||0)+'W · '+(rc.queries_window||0)+'Q');
+txt('f-coverage',Math.round(rc.recall_coverage_pct||0)+'%');txt('f-hit-rate','hit '+Math.round(rc.query_hit_rate_pct||0)+'% ('+(rc.recalling_agents||0)+'/'+(rc.active_agents||0)+')');
+if(el('m-pulse-list'))el('m-pulse-list').innerHTML=(vt.recent_pulses||[]).slice(0,5).map(function(p){
+var pc=p.kind==='refused'?'err':p.kind==='submit'?(p.accepted===false?'err':'ok'):'info';
+var ds=p.kind==='refused'?'refused '+(p.code||''):p.kind==='submit'?'write '+(p.slug||''):p.kind==='query'?'query ('+(p.hits??0)+' hits)':'wake ('+(p.count??0)+')';
+return '<div class="compact-row"><span class="compact-main"><span class="pill '+pc+'">'+esc(p.kind)+'</span> <b>@'+esc(p.actor)+'</b> · '+esc(ds)+'</span><span>'+esc(fmtAgo(p.at,now))+'</span></div>';
+}).join('');
+var dst=coh.drift_status||'aligned';txt('m-drift-pill',dst.replace(/_/g,' '));cls('m-drift-pill','pill '+(dst==='aligned'?'ok':'warn'));
+var cc=coh.counts||{}, ca=coh.axes||{};
+txt('c-core-score',Math.round(coh.core_memory_score||0)+'%');txt('c-grounded',(cc.grounded_claims||0)+' grounded · '+(cc.shared_artifacts||0)+' refs');
+txt('e-compress',Math.round((eff.reuse&&eff.reuse.state_compression_pct)||0)+'%');txt('e-durable',((eff.reuse&&eff.reuse.durable_claims)||0)+' durable');
+bars('m-coh-axes',[['Canon Alignment',ca.alignment,'#fbbf24'],['Evidence Grounding',ca.grounding,'#34d399'],['Cross-Agent Convergence',ca.convergence,'#38bdf8'],['Recall-Before-Write',ca.coupling,'#818cf8'],['Lifecycle Hygiene',ca.consolidation,'#a78bfa']]);
+bars('m-eff-axes',[['Distribution Breadth',ea.breadth,'#38bdf8'],['Retrieval Precision',ea.precision,'#34d399'],['Handoff Velocity',ea.velocity,'#fbbf24'],['State Compression',ea.reuse,'#a78bfa']]);
+var bs=bk.status||'verified_clean';txt('b-status-pill',bs.replace(/_/g,' ').toUpperCase());cls('b-status-pill','pill '+(bs==='verified_clean'?'ok':bs==='dirty_open'?'info':'err'));
+txt('b-age-val',bk.age_sec!=null?fmtDur(bk.age_sec):'none');txt('b-unbacked-val',String(bk.unbacked_writes??'-'));txt('b-seq-sub','seq #'+(ss.write_seq??'-'));
+var bw=bk.watch||{},sv=String(bw.saving||'open').toUpperCase();txt('b-saving-val',sv);txt('b-fenced-sub',(bw.fenced||[]).length+' fenced');
+var fp=Number(bk.freshness_pct??0);txt('b-fresh-pct',fp+'%');if(el('b-fresh-bar'))el('b-fresh-bar').style.width=fp+'%';
+var rcpt=bk.last_receipt||{};txt('b-receipt-main',rcpt.write_seq!=null?'seq #'+rcpt.write_seq+' · '+fmtUtc(rcpt.at)+' ('+fmtAgo(rcpt.at,now)+')':'No receipt');
+txt('b-receipt-sub','snapshot: '+(rcpt.snapshot_id||'store_state'));
+txt('d-mode-pill',dr.persisted_curation?'OBSERVED':'PREVIEW');cls('d-mode-pill','pill '+(dr.persisted_curation?'ok':'violet'));
+var dc=dr.counts||{},ps=dr.planned_summary||{};
+txt('d-last-val',dr.last_curated_at?fmtAgo(dr.last_curated_at,now):'pending');txt('d-last-seq','seq #'+(dr.last_curated_write_seq||0));
+txt('d-merkle-val',String(dc.merkle_syntheses||0));txt('d-folded-sub',(dc.consolidated_sources||0)+' folded');
+txt('d-savings-val',(dc.wake_savings_pct||0)+'%');txt('d-planned-sub',((ps.promotions||0)+(ps.distillations||0)+(ps.solidifications||0))+' planned');
+var elp=Number(dr.elapsed_sec||0),dI=Math.max(1,Number(dr.dream_interval_sec||28800)),wD=Number(dr.write_delta||0),wT=Math.max(1,Number(dr.write_delta_threshold||25));
+bars('d-trigger-bars',[['Circadian ('+fmtDur(elp)+'/'+fmtDur(dI)+')',Math.min(100,Math.round(elp/dI*100)),'#38bdf8'],['Synaptic Volume ('+wD+'/'+wT+')',Math.min(100,Math.round(wD/wT*100)),'#a78bfa',wD+'/'+wT],['Nightmare Interrupts',Math.min(100,(dc.nightmares||0)*25),'#34d399',(dc.nightmares||0)+' active']]);
+if(el('d-ledger-list')){
+var rows=(dr.recent_consolidations||[]).slice(0,4).map(function(c){return '<div class="compact-row"><span class="compact-main"><span class="pill violet">#'+esc(c.topic)+'</span> <b>'+esc(c.slug)+'</b> ('+c.source_count+' folded)</span><span>'+esc(fmtAgo(c.at,now))+'</span></div>';});
+var eg=(dr.eigenvectors||[])[0];if(eg)rows.push('<div class="compact-row"><span class="compact-main"><span class="pill info">Eigen λ1</span> <b>'+esc(eg.label)+'</b> ('+eg.variance_pct+'% var)</span><span>'+(eg.persisted?'persisted':'spectral')+'</span></div>');
+el('d-ledger-list').innerHTML=rows.join('')||'<div class="stat-box"><span class="stat-s">No consolidations yet.</span></div>';
+}
+var as=ag.summary||{};txt('a-summary-pill',(as.active_5m||0)+' active · '+(as.warm_20m||0)+' warm / '+(as.total||0));
+renderAgents(d);
+var sc=vt.scope_counts||{};txt('t-total-pill',(ss.current_claims||0)+' claims');txt('t-canon',String(sc.canon||0));txt('t-decisions',String(dc.class_b_decisions||0));
+txt('t-edges',String((vt.entity_graph&&vt.entity_graph.total_edges)||0));txt('t-unverified',(sc.unverified_total||0)+' unverified');
+var tps=vt.topics||[],mT=Math.max.apply(null,tps.map(function(t){return t.total||0;}).concat([1]));
+bars('m-topic-bars',tps.slice(0,7).map(function(t){return ['#'+t.topic+' ('+t.above_the_line+' durable)',Math.round((t.total||0)/mT*100),t.canon>0?'#fbbf24':'#38bdf8',t.total+' claims'];}));
+}
+var cv=el('pocket-cortex'),ctx=cv?cv.getContext('2d'):null,pts=[],nodes=[],tick=0;
+function draw(){
+if(!cv||!ctx)return;
+var dpr=Math.min(window.devicePixelRatio||1,2),r=cv.getBoundingClientRect(),w=Math.max(300,Math.floor(r.width)),h=Math.max(180,Math.floor(r.height));
+if(cv.width!==w*dpr||cv.height!==h*dpr){cv.width=w*dpr;cv.height=h*dpr;}
+ctx.save();ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);tick+=0.025;
+var cx=w*0.5,cy=h*0.52,rx=Math.min(w*0.38,160),ry=Math.min(h*0.34,66),d=curData||{},cs=(d.coherence&&d.coherence.score)||85,roster=(d.agents&&d.agents.roster)||[];
+if(roster.length&&Math.random()<0.18){pts.push({i:Math.floor(Math.random()*roster.length),t:0,w:Math.random()<0.4});if(pts.length>28)pts.shift();}
+ctx.strokeStyle='rgba(99,130,190,0.18)';ctx.beginPath();ctx.ellipse(cx,cy,rx,ry,0,0,Math.PI*2);ctx.stroke();
+nodes=[];
+for(var i=0;i<roster.length;i++){
+var a=roster[i],ang=-Math.PI/2+(i/roster.length)*Math.PI*2+Math.sin(tick*0.3+i)*0.03,nx=cx+Math.cos(ang)*rx,ny=cy+Math.sin(ang)*ry,inf=aInfo(a.id,i);
+nodes.push({id:a.id,name:inf.name,x:nx,y:ny,color:inf.color,health:a.health});
+ctx.strokeStyle=a.health==='active'?'rgba(56,189,248,0.28)':'rgba(148,163,184,0.12)';ctx.beginPath();ctx.moveTo(cx,cy);ctx.lineTo(nx,ny);ctx.stroke();
+}
+for(var k=pts.length-1;k>=0;k--){
+var p=pts[k];p.t+=0.02;if(p.t>=1||!nodes[p.i]){pts.splice(k,1);continue;}
+var tg=nodes[p.i],pr=p.w?(1-p.t):p.t;ctx.fillStyle=p.w?'#34d399':'#38bdf8';ctx.beginPath();ctx.arc(cx+(tg.x-cx)*pr,cy+(tg.y-cy)*pr,2.3,0,Math.PI*2);ctx.fill();
+}
+ctx.fillStyle='rgba(56,189,248,0.25)';ctx.beginPath();ctx.arc(cx,cy,26,0,Math.PI*2);ctx.fill();
+ctx.strokeStyle='#34d399';ctx.lineWidth=2.5;ctx.beginPath();ctx.arc(cx,cy,24,-Math.PI/2,-Math.PI/2+(Math.PI*2*Math.min(100,cs))/100);ctx.stroke();
+ctx.fillStyle='#f8fafc';ctx.font='700 11px sans-serif';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(Math.round(cs)+'%',cx,cy);
+for(var j=0;j<nodes.length;j++){
+var n=nodes[j],sel=selAgent===n.id;ctx.fillStyle=n.color;ctx.beginPath();ctx.arc(n.x,n.y,sel?7:5,0,Math.PI*2);ctx.fill();
+ctx.fillStyle='#e2e8f0';ctx.font='9.5px sans-serif';ctx.fillText(n.name.slice(0,9),n.x,n.y<cy?n.y-9:n.y+11);
+}
+ctx.restore();requestAnimationFrame(draw);
+}
+if(cv)cv.addEventListener('click',function(ev){
+var r=cv.getBoundingClientRect(),x=ev.clientX-r.left,y=ev.clientY-r.top;
+for(var i=0;i<nodes.length;i++){var n=nodes[i];if(Math.hypot(x-n.x,y-n.y)<26){selAgent=n.id;txt('m-canvas-caption','Selected @'+n.id+' ('+n.health+')');renderAgents(curData);break;}}
+});
+var fb=document.querySelectorAll('#a-filter-row .filter-btn');
+for(var f=0;f<fb.length;f++)fb[f].addEventListener('click',function(){aFilter=this.getAttribute('data-filter')||'all';for(var k=0;k<fb.length;k++)fb[k].classList.remove('active');this.classList.add('active');renderAgents(curData);});
+var nb=document.querySelectorAll('.bottom-nav .nav-btn');
+for(var b=0;b<nb.length;b++)nb[b].addEventListener('click',function(){var s=el(this.getAttribute('data-jump'));for(var k=0;k<nb.length;k++)nb[k].classList.remove('active');this.classList.add('active');if(s&&s.scrollIntoView)s.scrollIntoView({behavior:'smooth'});});
+if(el('m-desktop-btn'))el('m-desktop-btn').addEventListener('click',function(){window.location.href='/';});
+try{var raw=el('initial-mobile-state').textContent;if(raw)renderMobile(JSON.parse(raw));}catch(_){}
+requestAnimationFrame(draw);
+if(typeof EventSource!=='undefined'){
+var es=new EventSource('/events?mode=mobile');
+es.onopen=function(){txt('m-sse-pill','LIVE');cls('m-sse-pill','pill ok');};
+es.onmessage=function(e){try{renderMobile(JSON.parse(e.data));}catch(_){}};
+es.onerror=function(){txt('m-sse-pill','POLL');cls('m-sse-pill','pill warn');};
+}
+})();
+</script>
+</body>
+</html>`
+}
+
 export async function startMemoryViewer({
   socketPath,
   stateFile = undefined,
@@ -6621,6 +7611,7 @@ export async function startMemoryViewer({
   const target = parseListenTarget({ host, port })
   const client = createSingleSocketMcpClient(socketPath)
   const sseClients = new Set()
+  const mobileSseClients = new Set()
   const eventLog = []
   const agentTelemetry = new Map()
   let pollSeq = 0
@@ -6677,15 +7668,32 @@ export async function startMemoryViewer({
   let cachedCorpus = null
   let cachedHtmlKey = null
   let cachedHtmlBuf = null
+  let cachedMobileHtmlKey = null
+  let cachedMobileHtmlBuf = null
+
+  function currentMobileSnapshot() {
+    return buildMobileState(currentState, currentState.polled_at ?? undefined, cachedCorpus?.historyRecords)
+  }
 
   function broadcastState() {
-    if (sseClients.size === 0) return
-    const payload = `data: ${JSON.stringify(currentState)}\n\n`
-    for (const res of sseClients) {
-      try {
-        res.write(payload)
-      } catch {
-        sseClients.delete(res)
+    if (sseClients.size > 0) {
+      const payload = `data: ${JSON.stringify(currentState)}\n\n`
+      for (const res of sseClients) {
+        try {
+          res.write(payload)
+        } catch {
+          sseClients.delete(res)
+        }
+      }
+    }
+    if (mobileSseClients.size > 0) {
+      const mobilePayload = `data: ${JSON.stringify(currentMobileSnapshot())}\n\n`
+      for (const res of mobileSseClients) {
+        try {
+          res.write(mobilePayload)
+        } catch {
+          mobileSseClients.delete(res)
+        }
       }
     }
   }
@@ -6848,7 +7856,13 @@ export async function startMemoryViewer({
         now_sec: nowSec,
       })
       const agentRoster = healthResult.roster
-      const storeState = wake?.store_state || firstQuery?.store_state || { state: 'UNKNOWN', write_seq: null, current_claims: null, last_backup_age_sec: null, unbacked_writes: null }
+      const rawStoreState = wake?.store_state || firstQuery?.store_state || { state: 'UNKNOWN', write_seq: null, current_claims: null, last_backup_age_sec: null, unbacked_writes: null }
+      const storeState = {
+        ...rawStoreState,
+        ...(firstQuery?.store_state?.last_backup_at !== undefined ? { last_backup_at: firstQuery.store_state.last_backup_at } : {}),
+        ...(firstQuery?.store_state?.last_backup_write_seq !== undefined ? { last_backup_write_seq: firstQuery.store_state.last_backup_write_seq } : {}),
+        ...(firstQuery?.store_state?.last_backup_snapshot_id !== undefined ? { last_backup_snapshot_id: firstQuery.store_state.last_backup_snapshot_id } : {}),
+      }
       const activeStateFile = resolveCuratorStatePath({ stateFile, socketPath })
       let persistedCurator = null
       let curatorStateReadError = null
@@ -7089,7 +8103,32 @@ export async function startMemoryViewer({
       return
     }
 
-    const urlPath = String(req.url || '/').split('?')[0]
+    const rawUrl = String(req.url || '/')
+    const qIdx = rawUrl.indexOf('?')
+    const urlPath = qIdx >= 0 ? rawUrl.slice(0, qIdx) : rawUrl
+    const queryStr = qIdx >= 0 ? rawUrl.slice(qIdx + 1) : ''
+    const isMobileEventsQuery = /(?:^|&)(?:mode=mobile|mobile=1)(?:&|$)/.test(queryStr)
+    const isMobileViewQuery = /(?:^|&)(?:view=mobile|mode=mobile|mobile=1)(?:&|$)/.test(queryStr)
+
+    if (urlPath === '/mobile/events' || (urlPath === '/events' && isMobileEventsQuery)) {
+      res.writeHead(200, {
+        ...securityHeaders,
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+      })
+      if (method === 'HEAD') {
+        res.end()
+        return
+      }
+      res.write(`data: ${JSON.stringify(currentMobileSnapshot())}\n\n`)
+      mobileSseClients.add(res)
+      req.on('close', () => {
+        mobileSseClients.delete(res)
+      })
+      return
+    }
+
     if (urlPath === '/events') {
       res.writeHead(200, {
         ...securityHeaders,
@@ -7106,6 +8145,17 @@ export async function startMemoryViewer({
       req.on('close', () => {
         sseClients.delete(res)
       })
+      return
+    }
+
+    if (urlPath === '/api/mobile' || urlPath === '/mobile.json') {
+      const body = JSON.stringify(currentMobileSnapshot(), null, 2) + '\n'
+      res.writeHead(200, {
+        ...securityHeaders,
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Length': Buffer.byteLength(body),
+      })
+      res.end(method === 'HEAD' ? undefined : body)
       return
     }
 
@@ -7175,8 +8225,29 @@ export async function startMemoryViewer({
       }
     }
 
+    const htmlKey = `${currentState.poll_seq ?? 0}:${currentState.connected}:${currentState.error || ''}:${currentState.store_state?.state || ''}:${currentState.store_state?.write_seq ?? ''}:${currentState.records?.length ?? 0}:${currentState.curator_state?.last_curated_write_seq ?? 0}:${currentState.event_log?.length ?? 0}`
+
+    if (
+      urlPath === '/mobile' ||
+      urlPath === '/mobile/' ||
+      urlPath === '/m' ||
+      urlPath === '/phone' ||
+      ((urlPath === '/' || urlPath === '/index.html') && isMobileViewQuery)
+    ) {
+      if (cachedMobileHtmlKey !== htmlKey || !cachedMobileHtmlBuf) {
+        cachedMobileHtmlBuf = Buffer.from(renderMobileViewerHtml(currentMobileSnapshot()), 'utf8')
+        cachedMobileHtmlKey = htmlKey
+      }
+      res.writeHead(200, {
+        ...securityHeaders,
+        'Content-Type': 'text/html; charset=utf-8',
+        'Content-Length': cachedMobileHtmlBuf.length,
+      })
+      res.end(method === 'HEAD' ? undefined : cachedMobileHtmlBuf)
+      return
+    }
+
     if (urlPath === '/' || urlPath === '/index.html') {
-      const htmlKey = `${currentState.poll_seq ?? 0}:${currentState.connected}:${currentState.error || ''}:${currentState.store_state?.state || ''}:${currentState.store_state?.write_seq ?? ''}:${currentState.records?.length ?? 0}:${currentState.curator_state?.last_curated_write_seq ?? 0}:${currentState.event_log?.length ?? 0}`
       if (cachedHtmlKey !== htmlKey || !cachedHtmlBuf) {
         cachedHtmlBuf = Buffer.from(renderViewerHtml(currentState), 'utf8')
         cachedHtmlKey = htmlKey
@@ -7210,6 +8281,7 @@ export async function startMemoryViewer({
     port: boundPort,
     pollOnce,
     getState: () => currentState,
+    getMobileState: () => currentMobileSnapshot(),
     async stop() {
       stopped = true
       clearTimeout(pollTimer)
@@ -7221,6 +8293,14 @@ export async function startMemoryViewer({
         }
       }
       sseClients.clear()
+      for (const res of mobileSseClients) {
+        try {
+          res.end()
+        } catch {
+          /* ignore */
+        }
+      }
+      mobileSseClients.clear()
       client.close()
       httpServer.closeIdleConnections?.()
       httpServer.closeAllConnections?.()

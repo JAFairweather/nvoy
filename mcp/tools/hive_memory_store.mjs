@@ -1109,8 +1109,17 @@ export class HiveMemoryStore {
 
   // --- reads ---
 
-  storeState(readerPubkey, nowSec = nowSecDefault()) {
-    if (!this.isReady().ready) return { state: this.state, write_seq: null, current_claims: null, last_backup_age_sec: null, unbacked_writes: null }
+  storeState(readerPubkey, nowSec = nowSecDefault(), { includeReceipt = false } = {}) {
+    if (!this.isReady().ready) {
+      return {
+        state: this.state,
+        write_seq: null,
+        current_claims: null,
+        last_backup_age_sec: null,
+        unbacked_writes: null,
+        ...(includeReceipt ? { last_backup_at: null, last_backup_write_seq: null, last_backup_snapshot_id: null } : {}),
+      }
+    }
     const seq = readMeta(this.db).write_seq
     const receipt = this.readReceipt()
     return {
@@ -1119,6 +1128,14 @@ export class HiveMemoryStore {
       current_claims: this.#activeRows(readerPubkey, nowSec).length,
       last_backup_age_sec: receipt ? nowSec - receipt.at : null,
       unbacked_writes: receipt ? Math.max(0, seq - receipt.write_seq) : seq,
+      ...(includeReceipt
+        ? {
+            last_backup_at: receipt ? receipt.at : null,
+            last_backup_write_seq: receipt ? receipt.write_seq : null,
+            last_backup_snapshot_id:
+              receipt && typeof receipt.snapshot_id === 'string' ? receipt.snapshot_id.slice(0, 12) : null,
+          }
+        : {}),
     }
   }
 
@@ -1455,7 +1472,7 @@ export class HiveMemoryStore {
       next_cursor: omitted > 0 ? String(startIdx + page.length) : null,
       unverified: 0,
       scope_counts: scopeCounts,
-      store_state: this.storeState(readerPubkey, nowSec),
+      store_state: this.storeState(readerPubkey, nowSec, { includeReceipt: true }),
     }
   }
 

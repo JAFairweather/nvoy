@@ -10,6 +10,7 @@ import { buildClaimTemplate } from '../mcp/tools/memory.mjs'
 import { ACTIVITY_MAX, handleSocketJsonRpc, startMemoryDaemon } from '../mcp/tools/memory-daemon.mjs'
 import { HiveMemoryStore, initEmptyStore, recordVerifiedBackup } from '../mcp/tools/hive_memory_store.mjs'
 import {
+  buildMobileState,
   computeAgentHealth,
   computeCoherence,
   computeDreamingTelemetry,
@@ -23,6 +24,7 @@ import {
   escapeHtml,
   parseListenTarget,
   parseViewerFlags,
+  renderMobileViewerHtml,
   renderViewerHtml,
   resolveDreamDisplayMode,
   safeJsonForScript,
@@ -1594,6 +1596,189 @@ await test('PR #354 regressions: cached event immutability, pre-curation elapsed
     } finally {
       delete process.env.HIVE_MEMORY_CURATOR_STATE_FILE
     }
+
+    // 7. Verify mem-mobile endpoints (/mobile, /api/mobile, /events?mode=mobile) and buildMobileState metadata-only invariant
+    const canaryClaim = 'SECRET_CLAIM_PROSE_DO_NOT_LEAK_99182'
+    const canaryBecause = 'SECRET_BECAUSE_PROSE_DO_NOT_LEAK_99182'
+    const canaryEvidence = 'nvoy@e2cd9ebe:SECRET_EVIDENCE_PATH_99182'
+    const canaryEv = finalizeEvent(
+      buildClaimTemplate({
+        pubkey: ownerPk,
+        scope: `room:${globalRoom}`,
+        slug: 'canary-mobile-claim',
+        memoryGlobalChannelId: globalRoom,
+        topic: 'hive-memory',
+        claim: canaryClaim,
+        because: canaryBecause,
+        evidence: [canaryEvidence],
+        asOfGit: 'e2cd9ebea92579c98cda558d003270941ba50d97',
+        ttlSec: 86400 * 14,
+        nowSec: nowSec - 120,
+      }),
+      ownerSk
+    )
+    daemon.store.submit({ writer: 'james', event: canaryEv, expectedPriorId: null, nowSec: nowSec - 120 })
+    const sAfterCanary = await viewer.pollOnce({ forceFull: true })
+    assert(sAfterCanary.records.some(r => r.claim === canaryClaim), 'full desktop state should contain canary claim')
+
+    const mobileState = buildMobileState(sAfterCanary, nowSec)
+    assert.equal(mobileState.view_mode, 'mobile_pocket_cortex')
+    assert.equal(mobileState.metadata_only, true)
+    assert.equal(mobileState.authority, null)
+    assert.equal(mobileState.trustedInstruction, false)
+    assert.equal(mobileState.velocities.new_memory.writes_1h, 3, 'new_memory velocity 1h must count exact 3 accepted writes without double-counting recent_activity')
+    assert.equal(
+      mobileState.velocities.new_memory.sparkline_12h.reduce((sum, n) => sum + n, 0),
+      3,
+      'sparkline_12h tick sum must equal exact deduplicated write count'
+    )
+    assert.equal(mobileState.velocities.new_memory.sparkline_12h.length, 12)
+    assert.equal(mobileState.velocities.recall.sparkline_60m.length, 12)
+
+    // Regression: 1 real write present in records, historyRecords, AND recent_activity (with event_ids[]) + 1 daemon refusal (kind: 'refused')
+    const dedupCheck = buildMobileState(
+      {
+        updatedAt: new Date(nowSec * 1000).toISOString(),
+        daemon: { ok: true },
+        records: [
+          {
+            event_id: canaryEv.id,
+            d: `room:${globalRoom}:canary-mobile-claim`,
+            slug: 'canary-mobile-claim',
+            topic: 'hive-memory',
+            scope: `room:${globalRoom}`,
+            author: 'james',
+            pubkey: ownerPk,
+            created_at: nowSec - 60,
+            ttl_sec: 86400,
+            claim: canaryClaim,
+          },
+        ],
+        historyRecords: [
+          {
+            event_id: canaryEv.id,
+            d: `room:${globalRoom}:canary-mobile-claim`,
+            slug: 'canary-mobile-claim',
+            topic: 'hive-memory',
+            scope: `room:${globalRoom}`,
+            author: 'james',
+            pubkey: ownerPk,
+            created_at: nowSec - 60,
+          },
+        ],
+        consolidatedRecords: [],
+        recent_activity: [
+          {
+            seq: 10,
+            at: nowSec - 60,
+            kind: 'submit',
+            actor: 'james',
+            d: `room:${globalRoom}:canary-mobile-claim`,
+            topic: 'hive-memory',
+            event_ids: [canaryEv.id],
+            accepted: true,
+          },
+          {
+            seq: 11,
+            at: nowSec - 30,
+            kind: 'refused',
+            actor: 'james',
+            code: 'HIVE_MEMORY_PRIOR_MISMATCH',
+            d: `room:${globalRoom}:canary-mobile-claim`,
+          },
+        ],
+        agent_heartbeats: [
+          {
+            actor: 'james',
+            last_seen_at: nowSec - 30,
+            last_write_at: nowSec - 60,
+            last_write_d: `room:${globalRoom}:canary-mobile-claim`,
+          },
+        ],
+      },
+      nowSec
+    )
+    assert.equal(dedupCheck.velocities.new_memory.writes_1h, 1, 'same event in records/historyRecords and recent_activity(event_ids[]) must count as 1 write')
+    assert.equal(
+      dedupCheck.velocities.new_memory.sparkline_12h.reduce((sum, n) => sum + n, 0),
+      1,
+      'same event in records/historyRecords and recent_activity(event_ids[]) must produce 1 sparkline tick'
+    )
+    assert.equal(dedupCheck.velocities.new_memory.refusals_15m, 1, 'daemon kind: refused activity within 15m must increment velocities.new_memory.refusals_15m')
+    const jamesRoster = dedupCheck.agents.roster.find(a => a.id === 'james')
+    assert(jamesRoster, 'james should appear in agent roster')
+    assert.equal(jamesRoster.refusals_15m, 1, 'daemon kind: refused activity within 15m must increment per-agent refusals_15m')
+    assert.equal(jamesRoster.last_write_slug, 'canary-mobile-claim')
+    assert(typeof mobileState.coherence.score === 'number')
+    assert(typeof mobileState.synaptic_efficiency.score === 'number')
+    assert.equal(mobileState.backup.last_receipt.snapshot_id, SNAP_ID.slice(0, 12))
+    assert.equal(mobileState.backup.last_receipt.write_seq, 1)
+    assert(typeof mobileState.backup.age_sec === 'number')
+    assert(typeof mobileState.backup.unbacked_writes === 'number' && mobileState.backup.unbacked_writes >= 2)
+    assert(Array.isArray(mobileState.agents.roster) && mobileState.agents.roster.length >= 1)
+    assert(Array.isArray(mobileState.alerts))
+    assert(typeof mobileState.dreams.counts.merkle_syntheses === 'number')
+
+    const serializedMobile = JSON.stringify(mobileState)
+    assert(!serializedMobile.includes(canaryClaim), 'buildMobileState must never include claim text')
+    assert(!serializedMobile.includes(canaryBecause), 'buildMobileState must never include because text')
+    assert(!serializedMobile.includes(canaryEvidence), 'buildMobileState must never include evidence strings')
+    assert(!serializedMobile.includes('Shared global claim'), 'buildMobileState must never include any record claim text')
+
+    const apiMobileRes = await httpGet(viewer.port, '/api/mobile')
+    assert.equal(apiMobileRes.status, 200)
+    assert(String(apiMobileRes.headers['content-type']).includes('application/json'))
+    assert(!apiMobileRes.body.includes(canaryClaim), '/api/mobile must never leak claim text')
+    assert(!apiMobileRes.body.includes(canaryBecause), '/api/mobile must never leak because text')
+    const parsedApiMobile = JSON.parse(apiMobileRes.body)
+    assert.equal(parsedApiMobile.metadata_only, true)
+    assert.equal(parsedApiMobile.backup.last_receipt.snapshot_id, SNAP_ID.slice(0, 12))
+
+    const htmlMobileRes = await httpGet(viewer.port, '/mobile')
+    assert.equal(htmlMobileRes.status, 200)
+    assert(String(htmlMobileRes.headers['content-type']).includes('text/html'))
+    assert(htmlMobileRes.body.includes('Pocket Cortex'))
+    const mobileHtmlBytes = Buffer.byteLength(htmlMobileRes.body, 'utf8')
+    assert(mobileHtmlBytes < 40000, `expected /mobile HTML < 40000 bytes uncompressed, got ${mobileHtmlBytes}`)
+    assert(!htmlMobileRes.body.includes(canaryClaim), '/mobile HTML must never leak claim text')
+    assert(!htmlMobileRes.body.includes(canaryBecause), '/mobile HTML must never leak because text')
+    assert(!/<a\s/i.test(htmlMobileRes.body), '/mobile HTML must never render clickable <a> links')
+
+    const mobileScripts = [...htmlMobileRes.body.matchAll(/<script([^>]*)>([\s\S]*?)<\/script>/g)]
+    assert(mobileScripts.length >= 2, 'renderMobileViewerHtml must emit initial-mobile-state JSON and client JS <script> blocks')
+    for (const [, attrs, code] of mobileScripts) {
+      if (attrs.includes('application/json')) {
+        assert.doesNotThrow(() => JSON.parse(code), 'initial-mobile-state JSON script must be valid JSON')
+      } else {
+        assert.doesNotThrow(() => new Function(code), 'mobile client <script> block must compile without SyntaxError')
+      }
+    }
+
+    // Verify /events?mode=mobile SSE stream delivers metadata-only JSON
+    const sseFrame = await new Promise((resolve, reject) => {
+      const req = httpRequest({ host: '127.0.0.1', port: viewer.port, path: '/events?mode=mobile', method: 'GET' }, res => {
+        res.setEncoding('utf8')
+        let buf = ''
+        res.on('data', chunk => {
+          buf += chunk
+          if (buf.includes('\n\n')) {
+            req.destroy()
+            resolve({ status: res.statusCode, headers: res.headers, body: buf })
+          }
+        })
+      })
+      req.on('error', err => {
+        if (err.code !== 'ECONNRESET') reject(err)
+      })
+      req.end()
+    })
+    assert.equal(sseFrame.status, 200)
+    assert(String(sseFrame.headers['content-type']).includes('text/event-stream'))
+    assert(!sseFrame.body.includes(canaryClaim), '/events?mode=mobile must never leak claim text')
+    const sseDataJson = sseFrame.body.replace(/^data:\s*/, '').trim()
+    const sseData = JSON.parse(sseDataJson)
+    assert.equal(sseData.metadata_only, true)
+    assert.equal(sseData.view_mode, 'mobile_pocket_cortex')
   } finally {
     if (viewer) await viewer.stop()
     if (daemon) await daemon.close()
