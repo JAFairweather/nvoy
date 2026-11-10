@@ -1562,6 +1562,38 @@ await test('PR #354 regressions: cached event immutability, pre-curation elapsed
     const sDeep = await viewer.pollOnce({ forceFull: false })
     assert.equal(sDeep.connected, true, 'viewer must stay connected when polling a 12000-deep extra claim')
     assert.equal(sDeep.records.length, 2)
+
+    // 5. Verify rendered client <script> parses cleanly without SyntaxError and preserves regex escapes
+    const renderedHtml = renderViewerHtml(sDeep)
+    const scriptBlocks = [...renderedHtml.matchAll(/<script([^>]*)>([\s\S]*?)<\/script>/g)]
+    assert(scriptBlocks.length >= 2, 'renderViewerHtml must emit initial-state JSON and client JS <script> blocks')
+    for (const [, attrs, code] of scriptBlocks) {
+      if (attrs.includes('application/json')) {
+        assert.doesNotThrow(() => JSON.parse(code), 'initial-state JSON script must be valid JSON')
+      } else {
+        assert.doesNotThrow(() => new Function(code), 'client <script> block must compile without SyntaxError')
+        assert(code.includes('.replace(/\\b(?:https?|file):\\/\\/\\S+/gi'), 'client <script> must preserve escaped URL regex')
+      }
+    }
+
+    // 6. Verify unreadable/corrupt curator-state.json does not fail viewer pollOnce() or wipe records
+    const brokenStatePath = join(tmp, 'broken-curator-state.json')
+    writeFileSync(brokenStatePath, '{not-valid-json\n', { mode: 0o600 })
+    process.env.HIVE_MEMORY_CURATOR_STATE_FILE = brokenStatePath
+    try {
+      const sBroken = await viewer.pollOnce({ forceFull: false })
+      assert.equal(sBroken.connected, true, 'viewer must stay connected when curator-state.json is unreadable or corrupt')
+      assert.equal(sBroken.error, null)
+      assert.equal(sBroken.records.length, 2, 'viewer must preserve records when curator-state.json fails to read')
+      assert.equal(sBroken.curator_state.state_file_present, false)
+      assert(
+        typeof sBroken.curator_state.state_file_error === 'string' &&
+          sBroken.curator_state.state_file_error.includes('curator state file'),
+        'curator_state.state_file_error must record the non-fatal state file error'
+      )
+    } finally {
+      delete process.env.HIVE_MEMORY_CURATOR_STATE_FILE
+    }
   } finally {
     if (viewer) await viewer.stop()
     if (daemon) await daemon.close()
