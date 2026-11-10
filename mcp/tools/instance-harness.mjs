@@ -24,7 +24,7 @@ import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest
 import { readClientConfig } from './channel_client.mjs'
 import { runCodexHarness } from './codex_harness.mjs'
 import { herdrAgentName, herdrClient, herdrSession } from './harness_herdr.mjs'
-import { channelProcessUp, classifyPane, claudeArgs, ensureInstructions, hasPriorSession, mcpConfig, seedClaudeJson, seedSettings, serverName } from './harness_session.mjs'
+import { channelProcessUp, classifyPane, claudeArgs, ensureInstructions, hasPriorSession, LOCAL_DREAM_VERIFY, mcpConfig, seedClaudeJson, seedSettings, serverName } from './harness_session.mjs'
 
 const die = message => { console.error(`instance-harness: ${message}`); process.exit(1) }
 const log = message => console.log(`instance-harness: ${message}`)
@@ -82,9 +82,10 @@ mkdirSync(privateDir, { recursive: true, mode: 0o700 })
 mkdirSync(resolve(home, '.claude'), { recursive: true, mode: 0o700 })
 writePrivate(resolve(home, '.claude.json'), JSON.stringify(seedClaudeJson(readJson(resolve(home, '.claude.json')), workdir), null, 2))
 const settingsPath = resolve(home, '.claude', 'settings.json')
-const settings = seedSettings(readJson(settingsPath), server, { recall: Boolean(manifest.recall) })
+const dreamVerify = manifest.id === 'curator' && existsSync(LOCAL_DREAM_VERIFY)
+const settings = seedSettings(readJson(settingsPath), server, { recall: Boolean(manifest.recall), dreamVerify })
 writePrivate(settingsPath, JSON.stringify(settings, null, 2))
-const sessionMcp = mcpConfig({ manifest, root, remote })
+const sessionMcp = mcpConfig({ manifest, root, remote, dreamVerify })
 writePrivate(mcpConfigPath, JSON.stringify(sessionMcp, null, 2))
 ensureInstructions(resolve(workdir, 'CLAUDE.md'), manifest)
 // The channel lock lives on the runtime volume, so it outlives the container whose channel wrote it.

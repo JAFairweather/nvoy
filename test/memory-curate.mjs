@@ -42,7 +42,7 @@ import {
   loadFrozenQuestions,
   projectHistoryRecords,
 } from '../mcp/tools/memory-dream-eval.mjs'
-import { formatDreamBuzzPost, verifyAndAssembleDreamRecord } from '../mcp/tools/memory-dream-verify.mjs'
+import { formatDreamBuzzPost, handleDreamVerifyMcpMessage, parseDreamVerifyFlags, verifyAndAssembleDreamRecord } from '../mcp/tools/memory-dream-verify.mjs'
 
 const SNAP_ID = 'd'.repeat(64)
 const GLOBAL_CH = 'a8186b53-537d-46ad-a7e7-b6486c58970e'
@@ -1585,6 +1585,69 @@ await test('runCuratorCycle does not advance cursor or ledger when writeDreamPac
     assert.equal(readConsolidationLedger(consLedgerPath).length, 1, 'ledger append is idempotent by cycle/write_seq on crash recovery')
   } finally {
     if (daemon) await daemon.close()
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+await test('memory-dream-verify.mjs --mcp serves local stdio JSON-RPC for memory_dream_verify against host packets', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'nvoy-dream-mcp-'))
+  try {
+    assert.equal(parseDreamVerifyFlags(['--mcp']).mcp, true)
+    const packetPath = join(tmp, 'dream-1418.json')
+    const changeId = 'a'.repeat(64)
+    writeFileSync(packetPath, JSON.stringify({
+      id: 'dream-1418',
+      at: '2026-11-10T06:23:53.000Z',
+      ledger_ref: 'b'.repeat(64),
+      changes: [
+        { kind: 'promotion', claim_event_id: changeId, summary: 'The watchtower keepers sealed the inner gate.' },
+      ],
+    }, null, 2) + '\n', { mode: 0o640 })
+
+    const initRes = handleDreamVerifyMcpMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }, { packetDir: tmp })
+    assert.equal(initRes.result.serverInfo.name, 'hive-dream')
+
+    const listRes = handleDreamVerifyMcpMessage({ jsonrpc: '2.0', id: 2, method: 'tools/list' }, { packetDir: tmp })
+    assert.equal(listRes.result.tools.length, 1)
+    assert.equal(listRes.result.tools[0].name, 'memory_dream_verify')
+
+    const callOk = handleDreamVerifyMcpMessage({
+      jsonrpc: '2.0',
+      id: 3,
+      method: 'tools/call',
+      params: {
+        name: 'memory_dream_verify',
+        arguments: {
+          packet_path: packetPath,
+          title: 'The Lantern at the Inner Gate',
+          dream: 'A quiet wind crossed the courtyard while the keepers carried one bronze lantern to the inner gate and turned the heavy key until the bolt slid home.',
+          referenced_change_ids: [changeId],
+        },
+      },
+    }, { packetDir: tmp })
+    assert.equal(Boolean(callOk.result.isError), false)
+    const parsedOk = JSON.parse(callOk.result.content[0].text)
+    assert.equal(parsedOk.ok, true)
+    assert.equal(parsedOk.record.id, 'dream-1418')
+    assert(parsedOk.buzz_post.startsWith('🌙 The Lantern at the Inner Gate'))
+
+    const callBad = handleDreamVerifyMcpMessage({
+      jsonrpc: '2.0',
+      id: 4,
+      method: 'tools/call',
+      params: {
+        name: 'memory_dream_verify',
+        arguments: {
+          packet_path: join(tmp, 'dream-9999.json'),
+          title: 'Missing Packet',
+          dream: 'The gate stood empty.',
+          referenced_change_ids: [changeId],
+        },
+      },
+    }, { packetDir: tmp })
+    assert.equal(callBad.result.isError, true)
+    assert.equal(JSON.parse(callBad.result.content[0].text).code, 'NVOY_DREAM_PACKET_UNREADABLE')
+  } finally {
     rmSync(tmp, { recursive: true, force: true })
   }
 })
