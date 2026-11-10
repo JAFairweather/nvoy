@@ -34,6 +34,7 @@ import {
   readConsolidationLedger,
   readCuratorStateFile,
   runCuratorCycle,
+  weaveDreamStory,
   writeDreamPacket,
 } from '../mcp/tools/memory-curate.mjs'
 import {
@@ -42,7 +43,7 @@ import {
   loadFrozenQuestions,
   projectHistoryRecords,
 } from '../mcp/tools/memory-dream-eval.mjs'
-import { formatDreamBuzzPost, verifyAndAssembleDreamRecord } from '../mcp/tools/memory-dream-verify.mjs'
+import { formatDreamBuzzPost, handleDreamVerifyMcpMessage, parseDreamVerifyFlags, verifyAndAssembleDreamRecord } from '../mcp/tools/memory-dream-verify.mjs'
 
 const SNAP_ID = 'd'.repeat(64)
 const GLOBAL_CH = 'a8186b53-537d-46ad-a7e7-b6486c58970e'
@@ -1323,6 +1324,24 @@ await test('writeDreamPacket writes 0640 global-scope packets, strips @mentions/
     const seedRes = verifyAndAssembleDreamRecord({ packet: pkt, draft: pkt.story_seed })
     assert.equal(seedRes.ok, true, 'story_seed must pass verifyAndAssembleDreamRecord directly')
 
+    // Multiple same-kind changes in buildDreamPacket / weaveDreamStory must produce distinct scenes without repeated passages or broken sentence fragments
+    const multiChanges = [
+      { change_id: 'c1'.repeat(32), kind: 'distillation', claim_event_id: 'c1'.repeat(32), topic: 'hive-memory', summary: 'DONE: PR 356 deployed on herd-cloud by mydude' },
+      { change_id: 'c2'.repeat(32), kind: 'distillation', claim_event_id: 'c2'.repeat(32), topic: 'herd-infra', summary: 'MERGED: PR 103 in herd-infra for socket group access' },
+      { change_id: 'c3'.repeat(32), kind: 'distillation', claim_event_id: 'c3'.repeat(32), topic: 'nvoy', summary: 'FIXED: viewer page render and sqlite fts query' },
+      { change_id: 'c4'.repeat(32), kind: 'distillation', claim_event_id: 'c4'.repeat(32), topic: 'buzz', summary: 'SHIPPED: channel reply and post envelope check' },
+    ]
+    const multiSeed = weaveDreamStory({ changes: multiChanges })
+    const multiSentences = multiSeed.dream.split(/(?<=\.)\s+/).filter(Boolean)
+    assert.equal(multiSentences.length, 6, '4 changes + opening + closing should produce 6 sentences')
+    assert.equal(new Set(multiSentences).size, multiSentences.length, 'each sentence in story_seed must be unique without repeated passages')
+    assert(!/\b(?:by mydude|in for|and to|on by)\b/i.test(multiSeed.dream), 'story_seed must not contain garbled sentence fragments stripped from technical prose')
+    const multiVerify = verifyAndAssembleDreamRecord({
+      packet: { ...pkt, changes: multiChanges },
+      draft: multiSeed,
+    })
+    assert.equal(multiVerify.ok, true, `multi-change story_seed must pass verifyAndAssembleDreamRecord: ${(multiVerify.errors || []).join('; ')}`)
+
     const paths = writeDreamPacket({ packetDir, packet: pkt })
     assert.equal(statSync(paths.cyclePath).mode & 0o777, 0o640, 'dream-<write_seq>.json must be mode 0640')
     assert.equal(statSync(paths.latestPath).mode & 0o777, 0o640, 'latest.json must be mode 0640')
@@ -1585,6 +1604,69 @@ await test('runCuratorCycle does not advance cursor or ledger when writeDreamPac
     assert.equal(readConsolidationLedger(consLedgerPath).length, 1, 'ledger append is idempotent by cycle/write_seq on crash recovery')
   } finally {
     if (daemon) await daemon.close()
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+await test('memory-dream-verify.mjs --mcp serves local stdio JSON-RPC for memory_dream_verify against host packets', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'nvoy-dream-mcp-'))
+  try {
+    assert.equal(parseDreamVerifyFlags(['--mcp']).mcp, true)
+    const packetPath = join(tmp, 'dream-1418.json')
+    const changeId = 'a'.repeat(64)
+    writeFileSync(packetPath, JSON.stringify({
+      id: 'dream-1418',
+      at: '2026-11-10T06:23:53.000Z',
+      ledger_ref: 'b'.repeat(64),
+      changes: [
+        { kind: 'promotion', claim_event_id: changeId, summary: 'The watchtower keepers sealed the inner gate.' },
+      ],
+    }, null, 2) + '\n', { mode: 0o640 })
+
+    const initRes = handleDreamVerifyMcpMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }, { packetDir: tmp })
+    assert.equal(initRes.result.serverInfo.name, 'hive-dream')
+
+    const listRes = handleDreamVerifyMcpMessage({ jsonrpc: '2.0', id: 2, method: 'tools/list' }, { packetDir: tmp })
+    assert.equal(listRes.result.tools.length, 1)
+    assert.equal(listRes.result.tools[0].name, 'memory_dream_verify')
+
+    const callOk = handleDreamVerifyMcpMessage({
+      jsonrpc: '2.0',
+      id: 3,
+      method: 'tools/call',
+      params: {
+        name: 'memory_dream_verify',
+        arguments: {
+          packet_path: packetPath,
+          title: 'The Lantern at the Inner Gate',
+          dream: 'A quiet wind crossed the courtyard while the keepers carried one bronze lantern to the inner gate and turned the heavy key until the bolt slid home.',
+          referenced_change_ids: [changeId],
+        },
+      },
+    }, { packetDir: tmp })
+    assert.equal(Boolean(callOk.result.isError), false)
+    const parsedOk = JSON.parse(callOk.result.content[0].text)
+    assert.equal(parsedOk.ok, true)
+    assert.equal(parsedOk.record.id, 'dream-1418')
+    assert(parsedOk.buzz_post.startsWith('🌙 The Lantern at the Inner Gate'))
+
+    const callBad = handleDreamVerifyMcpMessage({
+      jsonrpc: '2.0',
+      id: 4,
+      method: 'tools/call',
+      params: {
+        name: 'memory_dream_verify',
+        arguments: {
+          packet_path: join(tmp, 'dream-9999.json'),
+          title: 'Missing Packet',
+          dream: 'The gate stood empty.',
+          referenced_change_ids: [changeId],
+        },
+      },
+    }, { packetDir: tmp })
+    assert.equal(callBad.result.isError, true)
+    assert.equal(JSON.parse(callBad.result.content[0].text).code, 'NVOY_DREAM_PACKET_UNREADABLE')
+  } finally {
     rmSync(tmp, { recursive: true, force: true })
   }
 })

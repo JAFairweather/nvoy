@@ -293,15 +293,77 @@ export function runDreamVerifyTool(args = {}, { packetDir } = {}) {
   }
 }
 
+export function handleDreamVerifyMcpMessage(message, { packetDir } = {}) {
+  if (!message || typeof message !== 'object' || Array.isArray(message) || message.jsonrpc !== '2.0') {
+    return { jsonrpc: '2.0', id: message?.id ?? null, error: { code: -32600, message: 'Invalid Request' } }
+  }
+  if (message.id === undefined || message.id === null) return null
+  const { id, method, params } = message
+  const reply = result => ({ jsonrpc: '2.0', id, result })
+
+  if (method === 'initialize') {
+    return reply({
+      protocolVersion: params?.protocolVersion || '2024-11-05',
+      capabilities: { tools: {} },
+      serverInfo: { name: 'hive-dream', version: '0.1.0' },
+      instructions:
+        'Local Merkle Dreaming structural verifier on herd-cloud. Call memory_dream_verify with packet_path, title, dream, and referenced_change_ids.',
+    })
+  }
+  if (method === 'ping') return reply({})
+  if (method === 'tools/list') return reply({ tools: [dreamVerifyToolSpec()] })
+  if (method !== 'tools/call') {
+    return { jsonrpc: '2.0', id, error: { code: -32601, message: `Method not found: ${String(method || '')}` } }
+  }
+
+  const toolName = params?.name
+  if (toolName !== 'memory_dream_verify') {
+    return { jsonrpc: '2.0', id, error: { code: -32601, message: `Unknown tool: ${String(toolName || '')}` } }
+  }
+  const args = params?.arguments && typeof params.arguments === 'object' && !Array.isArray(params.arguments) ? params.arguments : {}
+  const { ok, error } = runDreamVerifyTool(args, { packetDir })
+  const payload = error || ok
+  return reply({
+    content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
+    ...(error ? { isError: true } : {}),
+  })
+}
+
+export function startDreamVerifyMcpStdio({ input = process.stdin, output = process.stdout, packetDir } = {}) {
+  let buf = ''
+  input.setEncoding('utf8')
+  input.on('data', chunk => {
+    buf += chunk
+    while (buf.includes('\n')) {
+      const idx = buf.indexOf('\n')
+      const line = buf.slice(0, idx).trim()
+      buf = buf.slice(idx + 1)
+      if (!line) continue
+      let msg
+      try {
+        msg = JSON.parse(line)
+      } catch {
+        output.write(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }) + '\n')
+        continue
+      }
+      const res = handleDreamVerifyMcpMessage(msg, { packetDir })
+      if (res) output.write(JSON.stringify(res) + '\n')
+    }
+  })
+}
+
 export function parseDreamVerifyFlags(argv = []) {
   let packetPath = null
   let draftPath = null
   let outPath = null
   let formatBuzz = false
+  let mcp = false
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
-    if (arg === '--packet' && argv[i + 1]) {
+    if (arg === '--mcp') {
+      mcp = true
+    } else if (arg === '--packet' && argv[i + 1]) {
       packetPath = argv[++i]
     } else if (arg === '--draft' && argv[i + 1]) {
       draftPath = argv[++i]
@@ -313,10 +375,13 @@ export function parseDreamVerifyFlags(argv = []) {
       throw new Error(`unknown argument: ${arg}`)
     }
   }
-  if (!packetPath || !draftPath) {
-    throw new Error('usage: memory-dream-verify.mjs --packet <packet.json> --draft <draft.json> [--out <out.json>] [--format-buzz]')
+  if (mcp) {
+    return { mcp: true, packetPath: null, draftPath: null, outPath: null, formatBuzz: false }
   }
-  return { packetPath, draftPath, outPath, formatBuzz }
+  if (!packetPath || !draftPath) {
+    throw new Error('usage: memory-dream-verify.mjs (--mcp | --packet <packet.json> --draft <draft.json> [--out <out.json>] [--format-buzz])')
+  }
+  return { mcp: false, packetPath, draftPath, outPath, formatBuzz }
 }
 
 function main() {
@@ -326,6 +391,11 @@ function main() {
   } catch (err) {
     console.error(`memory-dream-verify: ${err.message}`)
     process.exit(1)
+  }
+
+  if (flags.mcp) {
+    startDreamVerifyMcpStdio()
+    return
   }
 
   let packet

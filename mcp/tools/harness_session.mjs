@@ -13,17 +13,28 @@ export const serverName = manifest => `nvoy-${manifest.id}`
 export const RECALL_SERVER = 'hive-memory'
 export const RECALL_TOOLS = ['memory_wake', 'memory_query']
 
+// On herd-cloud, agent-curator's Nvoy channel runs over SSH on nave.pub, whereas Merkle Dreaming cycle packets land
+// locally in /var/lib/hive-memory-curator/packets/ (readable via curator-packet-reader). Mounting memory-dream-verify.mjs
+// as a local stdio MCP server lets agent-curator verify drafts against the host packet without shell access.
+export const DREAM_VERIFY_SERVER = 'hive-dream'
+export const DREAM_VERIFY_TOOLS = ['memory_dream_verify']
+export const LOCAL_DREAM_VERIFY = '/opt/hive-memory/nvoy/mcp/tools/memory-dream-verify.mjs'
+
 // The channel runs as the session's own MCP child, under the same worker UID that the SSH forced
 // command would use, so it keeps exactly the queue permissions that path has. Off the fleet it is
 // that SSH forced command, reached with the same entry claude-channel-doctor renders for a client.
-export function mcpConfig({ manifest, root, remote = null }) {
+export function mcpConfig({ manifest, root, remote = null, dreamVerify = null }) {
   const recall = manifest.recall ? { [RECALL_SERVER]: recallServerEntry(manifest.recall) } : {}
-  if (remote) return { mcpServers: { [serverName(manifest)]: sshChannelEntry(remote), ...recall } }
+  const verifyScript = typeof dreamVerify === 'string'
+    ? dreamVerify
+    : (dreamVerify === true || (dreamVerify === null && manifest.id === 'curator' && existsSync(LOCAL_DREAM_VERIFY)) ? LOCAL_DREAM_VERIFY : null)
+  const dream = verifyScript ? { [DREAM_VERIFY_SERVER]: { command: 'node', args: [verifyScript, '--mcp'] } } : {}
+  if (remote) return { mcpServers: { [serverName(manifest)]: sshChannelEntry(remote), ...recall, ...dream } }
   return { mcpServers: { [serverName(manifest)]: {
     command: 'node',
     args: ['/srv/nvoy/mcp/tools/claude-channel.mjs', '--instance', manifest.id],
     env: { NVOY_INSTANCE_ROOT: root },
-  }, ...recall } }
+  }, ...recall, ...dream } }
 }
 
 // ~/.claude.json belongs to Claude Code, which rewrites it; only the first-run and folder-trust
@@ -40,11 +51,15 @@ export function seedClaudeJson(existing, workdir) {
 // Nobody is at the keyboard, so a permission prompt would stall the session for good. The channel's
 // tools are allowed; anything else is refused rather than asked about, unless the operator has
 // chosen another mode or added rules in this persistent file.
-export function seedSettings(existing, server, { recall = false } = {}) {
+export function seedSettings(existing, server, { recall = false, dreamVerify = false } = {}) {
   const out = existing && typeof existing === 'object' && !Array.isArray(existing) ? { ...existing } : {}
   const permissions = out.permissions && typeof out.permissions === 'object' ? { ...out.permissions } : {}
   const allow = Array.isArray(permissions.allow) ? [...permissions.allow] : []
-  const rules = [`mcp__${server}`, ...(recall ? RECALL_TOOLS.map(tool => `mcp__${RECALL_SERVER}__${tool}`) : [])]
+  const rules = [
+    `mcp__${server}`,
+    ...(recall ? RECALL_TOOLS.map(tool => `mcp__${RECALL_SERVER}__${tool}`) : []),
+    ...(dreamVerify ? DREAM_VERIFY_TOOLS.map(tool => `mcp__${DREAM_VERIFY_SERVER}__${tool}`) : []),
+  ]
   for (const rule of rules) if (!allow.includes(rule)) allow.push(rule)
   permissions.allow = allow
   if (!permissions.defaultMode) permissions.defaultMode = 'dontAsk'

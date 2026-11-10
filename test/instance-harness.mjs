@@ -114,6 +114,11 @@ ok('without a recall block the session mounts only its channel', Object.keys(mcp
 const recallAllow = seedSettings({}, 'nvoy-mc-test', { recall: true }).permissions.allow
 ok('recall allows the two read tools by name, never the whole server', JSON.stringify(recallAllow) === '["mcp__nvoy-mc-test","mcp__hive-memory__memory_wake","mcp__hive-memory__memory_query"]' &&
   JSON.stringify(seedSettings({ permissions: { allow: recallAllow } }, 'nvoy-mc-test', { recall: true }).permissions.allow) === JSON.stringify(recallAllow))
+const dreamMcp = mcpConfig({ manifest: { id: 'curator' }, root: '', remote: channelRemote, dreamVerify: '/opt/hive-memory/nvoy/mcp/tools/memory-dream-verify.mjs' }).mcpServers
+ok('dreamVerify mounts local hive-dream stdio MCP beside the remote channel for curator', Object.keys(dreamMcp).join() === 'nvoy-curator,hive-dream' &&
+  JSON.stringify(dreamMcp['hive-dream']) === JSON.stringify({ command: 'node', args: ['/opt/hive-memory/nvoy/mcp/tools/memory-dream-verify.mjs', '--mcp'] }))
+const dreamAllow = seedSettings({}, 'nvoy-curator', { dreamVerify: true }).permissions.allow
+ok('dreamVerify allows mcp__hive-dream__memory_dream_verify by name', JSON.stringify(dreamAllow) === '["mcp__nvoy-curator","mcp__hive-dream__memory_dream_verify"]')
 const recaller = { id: 'mc-test', buzz: { channels: [channel] }, mayRemember: { remote: true }, recall: reader }
 const both = instructionsUpdate(null, recaller)
 ok('a reader\'s instructions carry the recall rule once, after the memory rule', both.split(RECALL_RULE_MARKER).length === 2 && both.indexOf(MEMORY_RULE_MARKER) < both.indexOf(RECALL_RULE_MARKER) &&

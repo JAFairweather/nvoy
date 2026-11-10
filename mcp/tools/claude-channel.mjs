@@ -17,7 +17,7 @@ import { requestWorkingStatus } from './buzz_status.mjs'
 import { MENTION_SCHEMA, capabilityHash, capabilityInstructions, capabilitySummary, mentionView, notMentioned, postToolSpec, queuePost, resolveReplyMention } from './agent_post.mjs'
 import { profileToolSpec, profileStatusToolSpec, queueProfile, profileStatus, waitProfile } from './agent_profile.mjs'
 import { memoryToolSpec, queueMemory } from './agent_memory.mjs'
-import { dreamVerifyToolSpec, runDreamVerifyTool } from './memory-dream-verify.mjs'
+import { DEFAULT_CURATOR_PACKET_DIR, dreamVerifyToolSpec, runDreamVerifyTool } from './memory-dream-verify.mjs'
 import { claimPidLock } from './pid_lock.mjs'
 import { credentialIn, withheld } from './outbound_secrets.mjs'
 
@@ -177,6 +177,8 @@ if (baseline) {
   process.exit(0)
 }
 
+const hasLocalCuratorPackets = () => existsSync(process.env.HIVE_MEMORY_CURATOR_PACKET_DIR || DEFAULT_CURATOR_PACKET_DIR)
+
 const mcp = new Server(
   { name: `nvoy-${manifest.id}`, version: '0.1.0' },
   {
@@ -191,7 +193,7 @@ const mcp = new Server(
       'To start a new conversation, call nvoy_channel_post; it is refused unless this identity\'s manifest allows posting.',
       'To update your public profile, call nvoy_profile_set; it is refused unless this identity\'s manifest allows profile changes.',
       'To record or withdraw a room memory claim under your own key, call memory_claim or memory_withdraw; they are refused unless this identity\'s manifest allows memory writes.',
-      ...(manifest.id === 'curator' ? ['To structurally verify a Merkle Dreaming narrative against its packet in /var/lib/hive-memory-curator/packets, call memory_dream_verify.'] : []),
+      ...(manifest.id === 'curator' && hasLocalCuratorPackets() ? ['To structurally verify a Merkle Dreaming narrative against its packet in /var/lib/hive-memory-curator/packets, call memory_dream_verify.'] : []),
       capabilityInstructions(view()),
     ].join(' '),
   },
@@ -222,7 +224,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [
   profileStatusToolSpec(),
   memoryToolSpec(manifest, 'claim'),
   memoryToolSpec(manifest, 'withdraw'),
-  ...(manifest.id === 'curator' ? [dreamVerifyToolSpec()] : []),
+  ...(manifest.id === 'curator' && hasLocalCuratorPackets() ? [dreamVerifyToolSpec()] : []),
 ] }))
 
 mcp.setRequestHandler(CallToolRequestSchema, async request => {
