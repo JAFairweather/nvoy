@@ -40,7 +40,7 @@ const DEFAULT_POLL_MS = 3000
 const MAX_EVENT_LOG = 60
 export const CORPUS_CACHE_TTL_MS = 300_000
 // One version for the page and the live snapshot: the page reloads whenever they differ.
-const VIEWER_VERSION = '2026-11-09-v16'
+const VIEWER_VERSION = '2026-11-10-v17'
 const ACTIVITY_KINDS = new Set(['wake', 'query', 'lookup', 'submit', 'refused'])
 
 export function escapeHtml(value) {
@@ -3403,10 +3403,10 @@ export function renderViewerHtml(initialState) {
       function clientWorkSubject(rec) {
         var slug = slugOf(rec).toLowerCase();
         var claim = String((rec && rec.claim) || '').toLowerCase();
-        var m = (slug + ' ' + claim).match(/\b(?:pr|issue|w|step)[-#_\s]?(\d+)\b/);
+        var m = (slug + ' ' + claim).match(/\\b(?:pr|issue|w|step)[-#_\\s]?(\\d+)\\b/);
         if (m) return 'work-' + m[1];
         var stripped = slug
-          .replace(/-(?:owner|status|review|approved|merged|deployed|live|done|fixed|wip|handoff|check|verified|complete|blocked|waiting|plan|v\d+)$/g, '')
+          .replace(/-(?:owner|status|review|approved|merged|deployed|live|done|fixed|wip|handoff|check|verified|complete|blocked|waiting|plan|v\\d+)$/g, '')
           .replace(/^(?:curated|decision)-/g, '');
         var parts = stripped.split('-').filter(Boolean);
         return parts.slice(0, 3).join('-') || stripped || 'general';
@@ -3684,20 +3684,20 @@ export function renderViewerHtml(initialState) {
         ];
         function cleanJourneyPhrase(rawStr, fallback) {
           var s = String(rawStr || '')
-            .replace(/\s*\[(?:Curated|Distilled)[^\]]*\]\s*$/i, '')
-            .replace(/^(?:DONE|ACTIVE|MERGED|DEPLOYED|SHIPPED|FIXED|RESOLVED|OPEN|WIP|BLOCKED)\s*[:.-]*\s*/i, '')
-            .replace(/\b(?:https?|file):\/\/\S+/gi, '')
+            .replace(/\\s*\\[(?:Curated|Distilled)[^\\]]*\\]\\s*$/i, '')
+            .replace(/^(?:DONE|ACTIVE|MERGED|DEPLOYED|SHIPPED|FIXED|RESOLVED|OPEN|WIP|BLOCKED)\\s*[:.-]*\\s*/i, '')
+            .replace(/\\b(?:https?|file):\\/\\/\\S+/gi, '')
             .replace(/@[a-zA-Z0-9_-]+/g, '')
-            .replace(/\b(?:PR|pull request|issue|commit|seq|sequence|version|port|phase|stage|gate|step)\s*#?\d+[a-zA-Z0-9._-]*\b/gi, '')
-            .replace(/\b[a-zA-Z_-]*\d+[a-zA-Z0-9_.-]*\b/g, '')
-            .replace(/\d+/g, '')
-            .replace(/[_/\\|+:=]+/g, ' ')
-            .replace(/[^a-zA-Z\s,'-]+/g, ' ')
-            .replace(/\s+/g, ' ')
+            .replace(/\\b(?:PR|pull request|issue|commit|seq|sequence|version|port|phase|stage|gate|step)\\s*#?\\d+[a-zA-Z0-9._-]*\\b/gi, '')
+            .replace(/\\b[a-zA-Z_-]*\\d+[a-zA-Z0-9_.-]*\\b/g, '')
+            .replace(/\\d+/g, '')
+            .replace(/[_/\\\\|+:=]+/g, ' ')
+            .replace(/[^a-zA-Z\\s,'-]+/g, ' ')
+            .replace(/\\s+/g, ' ')
             .trim()
-            .replace(/^[,.'\s-]+|[,.'\s-]+$/g, '');
+            .replace(/^[,.'\\s-]+|[,.'\\s-]+$/g, '');
           if (!s || s.length < 4) return fallback || 'the shifting threshold';
-          return s.split(/\s+/).slice(0, 9).join(' ').toLowerCase();
+          return s.split(/\\s+/).slice(0, 9).join(' ').toLowerCase();
         }
         var journeyWaypoints = [
           {
@@ -3711,7 +3711,7 @@ export function renderViewerHtml(initialState) {
         ];
         clusters.slice(0, 5).forEach(function (cl, idx) {
           var topId = (cl.topic && cl.topic.id) ? cl.topic.id : (cl.target && cl.target.rec ? topicOf(cl.target.rec) : 'hive-memory');
-          var rLabel = journeyRealms[topId] || ('the Nocturnal Gallery of ' + String(topId).replace(/\d+/g, ''));
+          var rLabel = journeyRealms[topId] || ('the Nocturnal Gallery of ' + String(topId).replace(/\\d+/g, ''));
           var trav = journeyTravelers[idx % journeyTravelers.length];
           var rawTxt = cl.target && cl.target.rec ? (cl.target.rec.claim || slugOf(cl.target.rec)) : '';
           var phrase = cleanJourneyPhrase(rawTxt, 'the old watch-stone');
@@ -3724,7 +3724,7 @@ export function renderViewerHtml(initialState) {
             zoom: 1.32,
             realm: rLabel,
             travelers: trav,
-            caption: cap.replace(/\d+/g, '')
+            caption: cap.replace(/\\d+/g, '')
           });
         });
         journeyWaypoints.push({
@@ -4610,32 +4610,32 @@ export function renderViewerHtml(initialState) {
           ];
           function sanitizeInspectorJourneyPhrase(rawStr) {
             var cleaned = String(rawStr || '')
-              .replace(/\s*\[(?:Curated|Distilled)[^\]]*\]\s*$/i, '')
-              .replace(/^(?:DONE|ACTIVE|MERGED|DEPLOYED|SHIPPED|FIXED|RESOLVED|OPEN|WIP|BLOCKED)\s*[:.-]*\s*/i, '')
-              .replace(/\b(?:https?|file):\/\/\S+/gi, '')
+              .replace(/\\s*\\[(?:Curated|Distilled)[^\\]]*\\]\\s*$/i, '')
+              .replace(/^(?:DONE|ACTIVE|MERGED|DEPLOYED|SHIPPED|FIXED|RESOLVED|OPEN|WIP|BLOCKED)\\s*[:.-]*\\s*/i, '')
+              .replace(/\\b(?:https?|file):\\/\\/\\S+/gi, '')
               .replace(/@[a-zA-Z0-9_-]+/g, '')
-              .replace(/\b(?:PR|pull request|issue|commit|seq|sequence|version|port|phase|stage|gate|step)\s*#?\d+[a-zA-Z0-9._-]*\b/gi, '')
-              .replace(/\b[a-zA-Z_-]*\d+[a-zA-Z0-9_.-]*\b/g, '')
-              .replace(/\d+/g, '')
-              .replace(/[_/\\|+:=]+/g, ' ')
-              .replace(/[^a-zA-Z\s,'-]+/g, ' ')
-              .replace(/\s+/g, ' ')
+              .replace(/\\b(?:PR|pull request|issue|commit|seq|sequence|version|port|phase|stage|gate|step)\\s*#?\\d+[a-zA-Z0-9._-]*\\b/gi, '')
+              .replace(/\\b[a-zA-Z_-]*\\d+[a-zA-Z0-9_.-]*\\b/g, '')
+              .replace(/\\d+/g, '')
+              .replace(/[_/\\\\|+:=]+/g, ' ')
+              .replace(/[^a-zA-Z\\s,'-]+/g, ' ')
+              .replace(/\\s+/g, ' ')
               .trim()
-              .replace(/^[,.'\s-]+|[,.'\s-]+$/g, '');
+              .replace(/^[,.'\\s-]+|[,.'\\s-]+$/g, '');
             if (!cleaned || cleaned.length < 4) return 'the shifting threshold';
-            return cleaned.split(/\s+/).slice(0, 10).join(' ').toLowerCase();
+            return cleaned.split(/\\s+/).slice(0, 10).join(' ').toLowerCase();
           }
           var dreamClusters = Array.isArray(latestCuratorState && latestCuratorState.clusters) ? latestCuratorState.clusters : [];
           var dreamEigens = Array.isArray(latestCuratorState && latestCuratorState.topic_eigenvectors) ? latestCuratorState.topic_eigenvectors : [];
           var topRealmTopic = (dreamClusters[0] && dreamClusters[0].topic) || (dreamEigens[0] && dreamEigens[0].canonical_topic) || 'hive-memory';
-          var topRealmLabel = realmNames[topRealmTopic] || ('the Nocturnal Gallery of ' + String(topRealmTopic).replace(/\d+/g, ''));
-          var dreamTitleText = ('🌙 The Night Journey Through ' + topRealmLabel.replace(/^the\s+/i, '')).replace(/\d+/g, '');
+          var topRealmLabel = realmNames[topRealmTopic] || ('the Nocturnal Gallery of ' + String(topRealmTopic).replace(/\\d+/g, ''));
+          var dreamTitleText = ('🌙 The Night Journey Through ' + topRealmLabel.replace(/^the\\s+/i, '')).replace(/\\d+/g, '');
           var dreamParagraphs = [
             'Before moonset, Curator lit a brass storm-lantern at the threshold of ' + topRealmLabel +
             ', and Biggy, My Dude, Dead Rabbit, Neil, and Kerouac set out together along the narrow mist-hung causeway.'
           ];
           dreamClusters.slice(0, 4).forEach(function (cl, idx) {
-            var rName = realmNames[cl.topic] || ('the gallery of ' + String(cl.topic || 'the hive').replace(/\d+/g, ''));
+            var rName = realmNames[cl.topic] || ('the gallery of ' + String(cl.topic || 'the hive').replace(/\\d+/g, ''));
             var pair = inspectorTravelers[idx % inspectorTravelers.length];
             var phrase = sanitizeInspectorJourneyPhrase(cl.claim_preview || cl.claim || cl.slug || '');
             if (cl.stage === 'promotion' || cl.retention === 'decision') {
@@ -6850,14 +6850,20 @@ export async function startMemoryViewer({
       const agentRoster = healthResult.roster
       const storeState = wake?.store_state || firstQuery?.store_state || { state: 'UNKNOWN', write_seq: null, current_claims: null, last_backup_age_sec: null, unbacked_writes: null }
       const activeStateFile = resolveCuratorStatePath({ stateFile, socketPath })
-      const persistedCurator = readCuratorStateFile(activeStateFile)
+      let persistedCurator = null
+      let curatorStateReadError = null
+      try {
+        persistedCurator = readCuratorStateFile(activeStateFile)
+      } catch (stateErr) {
+        curatorStateReadError = String(stateErr?.message || stateErr)
+      }
       const lastCuratedAt = Number(persistedCurator?.last_curated_at || 0)
       const lastCuratedWriteSeq = Number(persistedCurator?.last_curated_write_seq || 0)
       const dreamIntervalSec = Number(persistedCurator?.dream_interval_sec || DEFAULT_DREAM_INTERVAL_SEC)
       const writeDeltaThreshold = Number(persistedCurator?.write_delta_threshold || DEFAULT_WRITE_DELTA_THRESHOLD)
       const topicPressureThreshold = Number(persistedCurator?.topic_pressure_threshold || DEFAULT_TOPIC_PRESSURE_THRESHOLD)
       const latestActivitySeq = recentActivity.length ? recentActivity[recentActivity.length - 1].seq : 0
-      const derivedKey = `${storeState.write_seq ?? ''}:${storeState.current_claims ?? ''}:${latestActivitySeq}:${lastCuratedWriteSeq}:${lastCuratedAt}:${persistedCurator?.last_ran_at || 0}:${storeState.unbacked_writes ?? ''}:${(storeState.last_backup_age_sec ?? 0) > 3600 ? 1 : 0}:${Math.floor(nowSec / 15)}`
+      const derivedKey = `${storeState.write_seq ?? ''}:${storeState.current_claims ?? ''}:${latestActivitySeq}:${lastCuratedWriteSeq}:${lastCuratedAt}:${persistedCurator?.last_ran_at || 0}:${curatorStateReadError || ''}:${storeState.unbacked_writes ?? ''}:${(storeState.last_backup_age_sec ?? 0) > 3600 ? 1 : 0}:${Math.floor(nowSec / 15)}`
 
       let coherence
       let curatorState
@@ -6927,6 +6933,7 @@ export async function startMemoryViewer({
         curatorState = {
           state_file: activeStateFile,
           state_file_present: Boolean(persistedCurator),
+          state_file_error: curatorStateReadError,
           last_curated_at: lastCuratedAt || null,
           last_curated_write_seq: lastCuratedWriteSeq,
           last_ran_at: persistedCurator?.last_ran_at || null,
