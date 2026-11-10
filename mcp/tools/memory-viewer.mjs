@@ -38,8 +38,9 @@ import {
 
 const DEFAULT_POLL_MS = 3000
 const MAX_EVENT_LOG = 60
+export const CORPUS_CACHE_TTL_MS = 300_000
 // One version for the page and the live snapshot: the page reloads whenever they differ.
-const VIEWER_VERSION = '2026-11-09-v15'
+const VIEWER_VERSION = '2026-11-09-v16'
 const ACTIVITY_KINDS = new Set(['wake', 'query', 'lookup', 'submit', 'refused'])
 
 export function escapeHtml(value) {
@@ -1592,35 +1593,37 @@ export function diffViewerSnapshots(prev, next, nowSec = Math.floor(Date.now() /
     )
   }
 
-  const prevMap = new Map()
-  for (const r of prev.records || []) {
-    prevMap.set(`${r.author_pubkey}:${r.d}`, r)
-  }
-  const nextMap = new Map()
-  for (const r of next.records || []) {
-    nextMap.set(`${r.author_pubkey}:${r.d}`, r)
-  }
-
-  for (const [key, r] of nextMap.entries()) {
-    const old = prevMap.get(key)
-    if (!old) {
-      push('claim-added', `+ [${r.scope}] ${r.d} by ${r.author_pubkey.slice(0, 12)}… (${r.event_id.slice(0, 10)}…)`)
-    } else if (old.event_id !== r.event_id) {
-      push(
-        'claim-updated',
-        `~ [${r.scope}] ${r.d} updated (${old.event_id.slice(0, 8)}… -> ${r.event_id.slice(0, 8)}…)`
-      )
-    } else if (old.verification !== r.verification || old.conflict !== r.conflict) {
-      push(
-        'claim-status',
-        `! [${r.scope}] ${r.d} verification=${r.verification} conflict=${r.conflict}`
-      )
+  if (prev.records !== next.records) {
+    const prevMap = new Map()
+    for (const r of prev.records || []) {
+      prevMap.set(`${r.author_pubkey}:${r.d}`, r)
     }
-  }
+    const nextMap = new Map()
+    for (const r of next.records || []) {
+      nextMap.set(`${r.author_pubkey}:${r.d}`, r)
+    }
 
-  for (const [key, old] of prevMap.entries()) {
-    if (!nextMap.has(key)) {
-      push('claim-removed', `- [${old.scope}] ${old.d} (${old.event_id.slice(0, 10)}…) removed/withdrawn/expired`)
+    for (const [key, r] of nextMap.entries()) {
+      const old = prevMap.get(key)
+      if (!old) {
+        push('claim-added', `+ [${r.scope}] ${r.d} by ${r.author_pubkey.slice(0, 12)}… (${r.event_id.slice(0, 10)}…)`)
+      } else if (old.event_id !== r.event_id) {
+        push(
+          'claim-updated',
+          `~ [${r.scope}] ${r.d} updated (${old.event_id.slice(0, 8)}… -> ${r.event_id.slice(0, 8)}…)`
+        )
+      } else if (old.verification !== r.verification || old.conflict !== r.conflict) {
+        push(
+          'claim-status',
+          `! [${r.scope}] ${r.d} verification=${r.verification} conflict=${r.conflict}`
+        )
+      }
+    }
+
+    for (const [key, old] of prevMap.entries()) {
+      if (!nextMap.has(key)) {
+        push('claim-removed', `- [${old.scope}] ${old.d} (${old.event_id.slice(0, 10)}…) removed/withdrawn/expired`)
+      }
     }
   }
 
@@ -1779,6 +1782,7 @@ export function createSingleSocketMcpClient(socketPath) {
   let connected = false
   let initialized = false
   let serverName = null
+  let connectionGeneration = 0
   let nextId = 1
   const pending = new Map()
   let connectPromise = null
@@ -1804,7 +1808,7 @@ export function createSingleSocketMcpClient(socketPath) {
     }
   }
 
-  function sendRaw(obj, timeoutMs = 5000) {
+  function sendRaw(obj, timeoutMs = 15000) {
     return new Promise((resolveReq, rejectReq) => {
       if (!socket || !connected) {
         rejectReq(new Error('viewer socket is not connected'))
@@ -1834,7 +1838,7 @@ export function createSingleSocketMcpClient(socketPath) {
           connected = true
           resolveConn()
         })
-        sock.once('error', err => {
+        sock.on('error', err => {
           if (!settled) {
             settled = true
             rejectConn(err)
@@ -1848,6 +1852,9 @@ export function createSingleSocketMcpClient(socketPath) {
           disconnect()
         })
         const rl = createInterface({ input: sock, crlfDelay: Infinity })
+        rl.on('error', () => {
+          /* handled by sock error listener */
+        })
         rl.on('line', line => {
           if (!line.trim()) return
           let msg
@@ -1879,6 +1886,7 @@ export function createSingleSocketMcpClient(socketPath) {
         socket.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} }) + '\n')
       }
       initialized = true
+      connectionGeneration += 1
     })().finally(() => {
       connectPromise = null
     })
@@ -1889,11 +1897,23 @@ export function createSingleSocketMcpClient(socketPath) {
     if (name !== 'memory_wake' && name !== 'memory_query') {
       throw new Error(`refusing non-read tool in memory-viewer: ${name}`)
     }
+    const hadOpenSocket = Boolean(connected && initialized && socket)
     await ensureConnected()
-    const res = await sendRaw({
-      method: 'tools/call',
-      params: { name, arguments: args },
-    })
+    let res
+    try {
+      res = await sendRaw({
+        method: 'tools/call',
+        params: { name, arguments: args },
+      })
+    } catch (err) {
+      if (!hadOpenSocket) throw err
+      disconnect()
+      await ensureConnected()
+      res = await sendRaw({
+        method: 'tools/call',
+        params: { name, arguments: args },
+      })
+    }
     if (res?.isError) {
       throw new Error(res?.content?.[0]?.text || `tool ${name} returned error`)
     }
@@ -1904,6 +1924,7 @@ export function createSingleSocketMcpClient(socketPath) {
   return {
     callReadTool,
     getServerName: () => serverName,
+    getConnectionGeneration: () => connectionGeneration,
     close: disconnect,
   }
 }
@@ -6678,14 +6699,32 @@ export async function startMemoryViewer({
     try {
       const wake = await client.callReadTool('memory_wake', {})
       const wakeSeq = wake?.store_state?.write_seq
+      const wakeCurrentClaims = wake?.store_state?.current_claims ?? null
+      const wakeReader = String(wake?.reader || '')
+      const wakeReaderPubkey = String(wake?.reader_pubkey || '')
+      const wakeConnGen = typeof client.getConnectionGeneration === 'function' ? client.getConnectionGeneration() : 0
+      const wakeScopeSig = JSON.stringify([
+        wakeReader,
+        wakeReaderPubkey,
+        wakeConnGen,
+        wake?.counts || null,
+        wake?.topic_directory || null,
+      ])
       const canReuseCorpus =
         !forceFull &&
         cachedCorpus !== null &&
         Number.isSafeInteger(wakeSeq) &&
         wakeSeq > 0 &&
         wakeSeq === cachedCorpus.writeSeq &&
+        wakeCurrentClaims !== null &&
+        wakeCurrentClaims === cachedCorpus.currentClaims &&
+        wakeReader !== '' &&
+        wakeReader === cachedCorpus.reader &&
+        wakeReaderPubkey === cachedCorpus.readerPubkey &&
+        wakeConnGen === cachedCorpus.connGen &&
+        wakeScopeSig === cachedCorpus.scopeSig &&
         wake?.store_state?.state === 'READY' &&
-        nowMs - cachedCorpus.atMs < 15_000
+        nowMs - cachedCorpus.atMs < CORPUS_CACHE_TTL_MS
 
       let records
       let historyRecords
@@ -6777,6 +6816,11 @@ export async function startMemoryViewer({
         )
         cachedCorpus = {
           writeSeq: wakeSeq ?? firstQuery?.store_state?.write_seq ?? null,
+          currentClaims: wakeCurrentClaims ?? firstQuery?.store_state?.current_claims ?? null,
+          reader: wakeReader,
+          readerPubkey: wakeReaderPubkey,
+          connGen: wakeConnGen,
+          scopeSig: wakeScopeSig,
           atMs: nowMs,
           records,
           historyRecords,
@@ -6788,6 +6832,7 @@ export async function startMemoryViewer({
           consolidatedSources,
           constellation,
           topicPages,
+          derived: null,
         }
       }
 
@@ -6804,15 +6849,6 @@ export async function startMemoryViewer({
       })
       const agentRoster = healthResult.roster
       const storeState = wake?.store_state || firstQuery?.store_state || { state: 'UNKNOWN', write_seq: null, current_claims: null, last_backup_age_sec: null, unbacked_writes: null }
-      const coherence = computeCoherence({
-        records,
-        history_records: historyRecords,
-        agent_roster: agentRoster,
-        recent_activity: recentActivity,
-        store_state: storeState,
-        now_sec: nowSec,
-        history_complete: historyComplete,
-      })
       const activeStateFile = resolveCuratorStatePath({ stateFile, socketPath })
       const persistedCurator = readCuratorStateFile(activeStateFile)
       const lastCuratedAt = Number(persistedCurator?.last_curated_at || 0)
@@ -6820,88 +6856,132 @@ export async function startMemoryViewer({
       const dreamIntervalSec = Number(persistedCurator?.dream_interval_sec || DEFAULT_DREAM_INTERVAL_SEC)
       const writeDeltaThreshold = Number(persistedCurator?.write_delta_threshold || DEFAULT_WRITE_DELTA_THRESHOLD)
       const topicPressureThreshold = Number(persistedCurator?.topic_pressure_threshold || DEFAULT_TOPIC_PRESSURE_THRESHOLD)
-      const triggerEval = evaluateDreamTriggers({
-        records,
-        storeState,
-        recentActivity,
-        coherence,
-        lastCuratedAt,
-        lastCuratedWriteSeq,
-        nowSec,
-        dreamIntervalSec,
-        writeDeltaThreshold,
-        topicPressureThreshold,
-      })
-      const hasPersistedEigens =
-        lastCuratedAt > 0 &&
-        Array.isArray(persistedCurator?.topic_eigenvectors) &&
-        persistedCurator.topic_eigenvectors.length > 0 &&
-        !persistedCurator.topic_eigenvectors.some(e => e?.simulated || e?.persisted === false)
-      const hasPersistedReorgs =
-        lastCuratedAt > 0 &&
-        Array.isArray(persistedCurator?.topic_reorganizations) &&
-        persistedCurator.topic_reorganizations.length > 0 &&
-        !persistedCurator.topic_reorganizations.some(r => r?.simulated || r?.persisted === false)
-      const topicEigenvectors = hasPersistedEigens
-        ? persistedCurator.topic_eigenvectors.map(e => ({ ...e, persisted: true, simulated: false }))
-        : spectral.eigenvectors.map(e => ({ ...e, persisted: false, simulated: true }))
-      const topicReorganizations = hasPersistedReorgs
-        ? persistedCurator.topic_reorganizations.map(r => ({ ...r, persisted: true, simulated: false }))
-        : spectral.reorganizations.map(r => ({ ...r, persisted: false, simulated: true }))
-      const curatorState = {
-        state_file: activeStateFile,
-        state_file_present: Boolean(persistedCurator),
-        last_curated_at: lastCuratedAt || null,
-        last_curated_write_seq: lastCuratedWriteSeq,
-        last_ran_at: persistedCurator?.last_ran_at || null,
-        last_submitted_count: persistedCurator?.last_submitted_count ?? 0,
-        dream_interval_sec: dreamIntervalSec,
-        write_delta_threshold: writeDeltaThreshold,
-        topic_pressure_threshold: topicPressureThreshold,
-        elapsed_sec: triggerEval.elapsed_sec,
-        write_delta: triggerEval.write_delta,
-        should_run: triggerEval.shouldRun,
-        triggers: triggerEval.triggers,
-        reasons: triggerEval.reasons,
-        hot_scope_topics: triggerEval.hot_scope_topics,
-        conflicted_keys: triggerEval.conflicted_keys,
-        stale_count: triggerEval.stale_count,
-        refusal_count_15m: triggerEval.refusal_count_15m,
-        coherence_score: triggerEval.coherence_score,
-        topic_eigenvectors: topicEigenvectors,
-        topic_reorganizations: topicReorganizations,
-        consolidation_ledger: Array.isArray(persistedCurator?.consolidation_ledger) ? persistedCurator.consolidation_ledger : [],
-        planned_clusters: [...previewPlan.promotions, ...previewPlan.distillations].slice(0, 60).map(c => ({
-          stage: c.stage,
-          scope: c.scope,
-          topic: c.topic,
-          slug: c.slug,
-          subject: c.subject,
-          source_event_ids: c.source_event_ids,
-          author_count: c.author_count,
-          merkle_sources: c.merkle_sources,
-        })),
-        planned_summary: {
-          promotions: previewPlan.promotions.length,
-          distillations: previewPlan.distillations.length,
-          solidifications: previewPlan.solidifications.length,
-          nightmares: previewPlan.nightmares.length,
-        },
+      const latestActivitySeq = recentActivity.length ? recentActivity[recentActivity.length - 1].seq : 0
+      const derivedKey = `${storeState.write_seq ?? ''}:${storeState.current_claims ?? ''}:${latestActivitySeq}:${lastCuratedWriteSeq}:${lastCuratedAt}:${persistedCurator?.last_ran_at || 0}:${storeState.unbacked_writes ?? ''}:${(storeState.last_backup_age_sec ?? 0) > 3600 ? 1 : 0}:${Math.floor(nowSec / 15)}`
+
+      let coherence
+      let curatorState
+      let efficacy
+      if (canReuseCorpus && cachedCorpus?.derived && cachedCorpus.derived.key === derivedKey) {
+        coherence = cachedCorpus.derived.coherence
+        const triggerEval = evaluateDreamTriggers({
+          records,
+          storeState,
+          recentActivity,
+          coherence,
+          lastCuratedAt,
+          lastCuratedWriteSeq,
+          nowSec,
+          dreamIntervalSec,
+          writeDeltaThreshold,
+          topicPressureThreshold,
+        })
+        curatorState = {
+          ...cachedCorpus.derived.curatorState,
+          elapsed_sec: triggerEval.elapsed_sec,
+          write_delta: triggerEval.write_delta,
+          should_run: triggerEval.shouldRun,
+          triggers: triggerEval.triggers,
+          reasons: triggerEval.reasons,
+          refusal_count_15m: triggerEval.refusal_count_15m,
+        }
+        efficacy = cachedCorpus.derived.efficacy
+      } else {
+        coherence = computeCoherence({
+          records,
+          history_records: historyRecords,
+          agent_roster: agentRoster,
+          recent_activity: recentActivity,
+          store_state: storeState,
+          now_sec: nowSec,
+          history_complete: historyComplete,
+        })
+        const triggerEval = evaluateDreamTriggers({
+          records,
+          storeState,
+          recentActivity,
+          coherence,
+          lastCuratedAt,
+          lastCuratedWriteSeq,
+          nowSec,
+          dreamIntervalSec,
+          writeDeltaThreshold,
+          topicPressureThreshold,
+        })
+        const hasPersistedEigens =
+          lastCuratedAt > 0 &&
+          Array.isArray(persistedCurator?.topic_eigenvectors) &&
+          persistedCurator.topic_eigenvectors.length > 0 &&
+          !persistedCurator.topic_eigenvectors.some(e => e?.simulated || e?.persisted === false)
+        const hasPersistedReorgs =
+          lastCuratedAt > 0 &&
+          Array.isArray(persistedCurator?.topic_reorganizations) &&
+          persistedCurator.topic_reorganizations.length > 0 &&
+          !persistedCurator.topic_reorganizations.some(r => r?.simulated || r?.persisted === false)
+        const topicEigenvectors = hasPersistedEigens
+          ? persistedCurator.topic_eigenvectors.map(e => ({ ...e, persisted: true, simulated: false }))
+          : spectral.eigenvectors.map(e => ({ ...e, persisted: false, simulated: true }))
+        const topicReorganizations = hasPersistedReorgs
+          ? persistedCurator.topic_reorganizations.map(r => ({ ...r, persisted: true, simulated: false }))
+          : spectral.reorganizations.map(r => ({ ...r, persisted: false, simulated: true }))
+        curatorState = {
+          state_file: activeStateFile,
+          state_file_present: Boolean(persistedCurator),
+          last_curated_at: lastCuratedAt || null,
+          last_curated_write_seq: lastCuratedWriteSeq,
+          last_ran_at: persistedCurator?.last_ran_at || null,
+          last_submitted_count: persistedCurator?.last_submitted_count ?? 0,
+          dream_interval_sec: dreamIntervalSec,
+          write_delta_threshold: writeDeltaThreshold,
+          topic_pressure_threshold: topicPressureThreshold,
+          elapsed_sec: triggerEval.elapsed_sec,
+          write_delta: triggerEval.write_delta,
+          should_run: triggerEval.shouldRun,
+          triggers: triggerEval.triggers,
+          reasons: triggerEval.reasons,
+          hot_scope_topics: triggerEval.hot_scope_topics,
+          conflicted_keys: triggerEval.conflicted_keys,
+          stale_count: triggerEval.stale_count,
+          refusal_count_15m: triggerEval.refusal_count_15m,
+          coherence_score: triggerEval.coherence_score,
+          topic_eigenvectors: topicEigenvectors,
+          topic_reorganizations: topicReorganizations,
+          consolidation_ledger: Array.isArray(persistedCurator?.consolidation_ledger) ? persistedCurator.consolidation_ledger : [],
+          planned_clusters: [...previewPlan.promotions, ...previewPlan.distillations].slice(0, 60).map(c => ({
+            stage: c.stage,
+            scope: c.scope,
+            topic: c.topic,
+            slug: c.slug,
+            subject: c.subject,
+            source_event_ids: c.source_event_ids,
+            author_count: c.author_count,
+            merkle_sources: c.merkle_sources,
+          })),
+          planned_summary: {
+            promotions: previewPlan.promotions.length,
+            distillations: previewPlan.distillations.length,
+            solidifications: previewPlan.solidifications.length,
+            nightmares: previewPlan.nightmares.length,
+          },
+        }
+        curatorState.display_mode = resolveDreamDisplayMode({
+          records,
+          curator_state: curatorState,
+          consolidated_sources: consolidatedSources,
+        })
+        efficacy = computeSynapticEfficacy({
+          records,
+          history_records: historyRecords,
+          agent_roster: agentRoster,
+          recent_activity: recentActivity,
+          coherence,
+          curator_state: curatorState,
+          now_sec: nowSec,
+        })
+        if (cachedCorpus) {
+          cachedCorpus.derived = { key: derivedKey, coherence, curatorState, efficacy }
+        }
       }
-      curatorState.display_mode = resolveDreamDisplayMode({
-        records,
-        curator_state: curatorState,
-        consolidated_sources: consolidatedSources,
-      })
-      const efficacy = computeSynapticEfficacy({
-        records,
-        history_records: historyRecords,
-        agent_roster: agentRoster,
-        recent_activity: recentActivity,
-        coherence,
-        curator_state: curatorState,
-        now_sec: nowSec,
-      })
       const queryAnswer = firstQuery?.answer === 'unknown'
         ? 'unknown'
         : (records.length > 0 ? 'found' : String(firstQuery?.answer || 'unknown'))

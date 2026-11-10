@@ -1317,7 +1317,10 @@ export class HiveMemoryStore {
     const consolidated = this.#consolidatedBy(nowSec, { excludeCuratorIds: excluded })
     const rows = this.db.prepare(`SELECT * FROM events WHERE ${where.join(' AND ')}`).all(...params)
       .filter(r => (!excluded || !excluded.has(r.id)) && canRead(readerPubkey, r, this.config) && (!wantTopic || topicOf(r) === wantTopic))
-      .map(r => ({ row: r, verdict: verdictOf(r, nowSec, staleFiles, consolidated), body: JSON.parse(JSON.parse(r.raw_json).content) }))
+      .map(r => {
+        const parsed = parseEventRaw(r)
+        return { row: r, verdict: verdictOf(r, nowSec, staleFiles, consolidated, parsed.body), body: parsed.body }
+      })
       .filter(x => includeHistory || x.verdict.verification === 'accepted')
     const byFactKey = new Map()
     for (const { row, verdict, body } of rows) {
@@ -1466,7 +1469,10 @@ export class HiveMemoryStore {
     const consolidated = this.#consolidatedBy(nowSec, { excludeCuratorIds: excluded })
     const items = this.#activeRows(readerPubkey, nowSec)
       .filter(r => (!excluded || !excluded.has(r.id)) && (r.scope_type !== 'room' || !cleanRoom || r.room_id === cleanRoom))
-      .map(r => ({ row: r, verdict: verdictOf(r, nowSec, staleFiles, consolidated), body: JSON.parse(JSON.parse(r.raw_json).content) }))
+      .map(r => {
+        const parsed = parseEventRaw(r)
+        return { row: r, verdict: verdictOf(r, nowSec, staleFiles, consolidated, parsed.body), body: parsed.body }
+      })
     const consolidatedHidden = items.filter(x => x.verdict.verification === 'consolidated').length
     const factKeyClaims = new Map()
     for (const { row, body, verdict } of items) {
@@ -1597,9 +1603,7 @@ export class HiveMemoryStore {
     }
 
     const recordsForConstellation = activeRows.map(r => {
-      const body = JSON.parse(JSON.parse(r.raw_json).content)
-      const tags = JSON.parse(r.raw_json).tags || []
-      const supersedes = tags.filter(t => Array.isArray(t) && t[0] === 'supersedes' && typeof t[1] === 'string').map(t => t[1])
+      const { body, supersedes } = parseEventRaw(r)
       return {
         event_id: r.id,
         d: r.d,
@@ -1609,10 +1613,10 @@ export class HiveMemoryStore {
         created_at: r.created_at,
         as_of_git: r.as_of_git,
         as_of_evt: r.as_of_evt,
-        supersedes,
+        supersedes: [...supersedes],
         claim: body.claim,
         because: body.because,
-        evidence: body.evidence || [],
+        evidence: Array.isArray(body.evidence) ? [...body.evidence] : [],
       }
     })
     const constellation = buildConstellationLinks(recordsForConstellation)
@@ -1679,8 +1683,8 @@ export class HiveMemoryStore {
     const activeRecords = []
     const factKeyClaims = new Map()
     for (const r of allReadableRows) {
-      const verdict = verdictOf(r, nowSec, staleFiles, consolidated)
-      const body = JSON.parse(JSON.parse(r.raw_json).content)
+      const { body } = parseEventRaw(r)
+      const verdict = verdictOf(r, nowSec, staleFiles, consolidated, body)
       if (verdict.verification === 'accepted' && r.is_current) {
         if (!factKeyClaims.has(r.d)) factKeyClaims.set(r.d, new Set())
         factKeyClaims.get(r.d).add(body.claim)
@@ -1738,11 +1742,45 @@ export class HiveMemoryStore {
 const topicOf = row => normalizeMemoryTopic(row.topic) ?? row.topic
 const preview = (text, n) => { const t = String(text ?? '').replace(/\s+/g, ' ').trim(); return t.length > n ? `${t.slice(0, n - 1)}…` : t }
 
-function verdictOf(row, nowSec, staleFiles, consolidated = new Map()) {
+const PARSED_EVENT_CACHE = new Map()
+const MAX_PARSED_EVENT_CACHE = 8192
+
+function parseEventRaw(row) {
+  const id = row?.id
+  if (id && PARSED_EVENT_CACHE.has(id)) {
+    const hit = PARSED_EVENT_CACHE.get(id)
+    if (hit.raw === row.raw_json) return hit
+  }
+  const ev = JSON.parse(row.raw_json)
+  const rawBody = JSON.parse(ev.content)
+  const body = Object.freeze({
+    claim: typeof rawBody?.claim === 'string' ? rawBody.claim : '',
+    because: typeof rawBody?.because === 'string' ? rawBody.because : null,
+    evidence: Object.freeze(Array.isArray(rawBody?.evidence) ? rawBody.evidence.map(String) : []),
+  })
+  const tags = Object.freeze(
+    Array.isArray(ev.tags) ? ev.tags.map(t => (Array.isArray(t) ? Object.freeze([...t]) : t)) : []
+  )
+  const supersedes = Object.freeze(
+    tags.filter(t => Array.isArray(t) && t[0] === 'supersedes' && typeof t[1] === 'string').map(t => t[1])
+  )
+  const merkleSources = tags.find(t => Array.isArray(t) && t[0] === 'merkle_sources' && typeof t[1] === 'string')?.[1] || null
+  const entry = Object.freeze({ raw: row.raw_json, body, tags, supersedes, merkleSources })
+  if (id) {
+    if (PARSED_EVENT_CACHE.size >= MAX_PARSED_EVENT_CACHE) {
+      const oldest = PARSED_EVENT_CACHE.keys().next().value
+      if (oldest !== undefined) PARSED_EVENT_CACHE.delete(oldest)
+    }
+    PARSED_EVENT_CACHE.set(id, entry)
+  }
+  return entry
+}
+
+function verdictOf(row, nowSec, staleFiles, consolidated = new Map(), parsedBody = null) {
   const rank = row.scope_type === 'hive:canon' ? 2 : row.scope_type === 'hive:ops' || row.scope_type === 'room' ? 3 : null
   let staleWarning = null
-  if (row.as_of_git) {
-    const evidence = JSON.parse(JSON.parse(row.raw_json).content).evidence || []
+  if (row.as_of_git && staleFiles && staleFiles.size > 0) {
+    const evidence = (parsedBody || parseEventRaw(row).body).evidence || []
     if (evidence.some(ref => staleFiles.has(ref) || staleFiles.has(`${row.as_of_git}:${ref}`))) staleWarning = `[STALE: evidence file changed since ${row.as_of_git}]`
   }
   const verification = row.status === 'withdrawn' ? 'withdrawn' : !row.is_current ? 'superseded'
@@ -1752,8 +1790,7 @@ function verdictOf(row, nowSec, staleFiles, consolidated = new Map()) {
 
 // Gate 6 discovery card: enough to choose what to open, without because, evidence or as_of. Still data only.
 function indexCard({ row, verdict, body }, names, conflict) {
-  const tags = JSON.parse(row.raw_json).tags || []
-  const merkleSources = tags.find(t => Array.isArray(t) && t[0] === 'merkle_sources' && typeof t[1] === 'string')?.[1] || null
+  const { merkleSources } = parseEventRaw(row)
   return {
     record_type: 'memory-index-card',
     authority: null,
@@ -1777,9 +1814,7 @@ function indexCard({ row, verdict, body }, names, conflict) {
 
 // Data-only envelope: memory records never carry authority and are never trusted instructions.
 function envelope({ row, verdict, body }) {
-  const tags = JSON.parse(row.raw_json).tags || []
-  const supersedes = tags.filter(t => Array.isArray(t) && t[0] === 'supersedes' && typeof t[1] === 'string').map(t => t[1])
-  const merkleSources = tags.find(t => Array.isArray(t) && t[0] === 'merkle_sources' && typeof t[1] === 'string')?.[1] || null
+  const { supersedes, merkleSources } = parseEventRaw(row)
   return {
     record_type: 'memory-claim',
     authority: null,
@@ -1797,13 +1832,13 @@ function envelope({ row, verdict, body }) {
     retention: row.retention,
     claim: body.claim,
     because: body.because,
-    evidence: body.evidence || [],
+    evidence: Array.isArray(body.evidence) ? body.evidence.map(String) : [],
     as_of_git: row.as_of_git,
     as_of_evt: row.as_of_evt,
     created_at: row.created_at,
     expires_at: row.exp,
     stale_warning: verdict.staleWarning,
-    ...(supersedes.length ? { supersedes } : {}),
+    ...(supersedes.length ? { supersedes: [...supersedes] } : {}),
     ...(merkleSources ? { merkle_sources: merkleSources } : {}),
     ...(verdict.consolidatedBy ? { consolidated_by: verdict.consolidatedBy } : {}),
   }

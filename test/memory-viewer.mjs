@@ -8,12 +8,13 @@ import { join } from 'node:path'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
 import { buildClaimTemplate } from '../mcp/tools/memory.mjs'
 import { ACTIVITY_MAX, handleSocketJsonRpc, startMemoryDaemon } from '../mcp/tools/memory-daemon.mjs'
-import { initEmptyStore, recordVerifiedBackup } from '../mcp/tools/hive_memory_store.mjs'
+import { HiveMemoryStore, initEmptyStore, recordVerifiedBackup } from '../mcp/tools/hive_memory_store.mjs'
 import {
   computeAgentHealth,
   computeCoherence,
   computeDreamingTelemetry,
   computeSynapticEfficacy,
+  CORPUS_CACHE_TTL_MS,
   diffViewerSnapshots,
   readWatchStatus,
   watchAlert,
@@ -1191,6 +1192,10 @@ await test('pollOnce coalesces concurrent polls and reuses cached corpus on unch
     const sCached = await viewer.pollOnce({ forceFull: false })
     assert.equal(sCached.poll_seq, seq0 + 2)
     assert.equal(sCached.store_state.write_seq, 1)
+    assert(CORPUS_CACHE_TTL_MS >= 300_000, 'CORPUS_CACHE_TTL_MS must be at least 5 minutes to prevent 15s full-history rescan throttling')
+    assert.equal(sCached.records, s1.records, 'unchanged write_seq must reuse cached records array')
+    assert.equal(sCached.coherence, s1.coherence, 'unchanged write_seq and activity tail must reuse cached coherence')
+    assert.equal(sCached.efficacy, s1.efficacy, 'unchanged write_seq and activity tail must reuse cached synaptic efficacy')
 
     const root1 = await httpGet(viewer.port, '/')
     const root2 = await httpGet(viewer.port, '/')
@@ -1324,6 +1329,242 @@ await test('Entity-Link Constellation Graph & Above/Below-the-Line Topic Pages i
   } finally {
     if (viewer) await viewer.stop()
     await daemon.close()
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+await test('PR #354 regressions: cached event immutability, pre-curation elapsed_sec, and reader isolation across rebind', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'viewer-pr354-'))
+  const dbPath = join(tmp, 'memory.sqlite')
+  const ledgerPath = join(tmp, 'accepted-ledger.jsonl')
+  const receiptPath = join(tmp, 'last-verified-backup.json')
+  const dbPath2 = join(tmp, 'memory2.sqlite')
+  const ledgerPath2 = join(tmp, 'accepted-ledger2.jsonl')
+  const receiptPath2 = join(tmp, 'last-verified-backup2.json')
+  const socketDir = join(tmp, 'sockets')
+  const ownerSk = generateSecretKey()
+  const ownerPk = getPublicKey(ownerSk)
+  const viewerSkA = generateSecretKey()
+  const viewerPkA = getPublicKey(viewerSkA)
+  const viewerSkB = generateSecretKey()
+  const viewerPkB = getPublicKey(viewerSkB)
+  const globalRoom = 'a8186b53-537d-46ad-a7e7-b6486c58970e'
+  const privateRoom = 'b9297c64-648e-57be-b8f8-c7597d69081f'
+  const nowSec = Math.floor(Date.now() / 1000)
+
+  initEmptyStore({ dbPath, ledgerPath })
+  recordVerifiedBackup({ receiptPath, snapshotId: SNAP_ID, writeSeq: 1, at: nowSec - 3600 })
+  initEmptyStore({ dbPath: dbPath2, ledgerPath: ledgerPath2 })
+  recordVerifiedBackup({ receiptPath: receiptPath2, snapshotId: SNAP_ID, writeSeq: 1, at: nowSec - 3600 })
+
+  const baseConfig = readerPk => ({
+    memoryGlobalChannelId: globalRoom,
+    ownerPubkey: ownerPk,
+    maxUnbackedSec: 7200,
+    globalWriters: [ownerPk],
+    canonWriters: [ownerPk],
+    readers: { viewer: readerPk },
+    writers: { james: { pubkey: ownerPk, perHour: 30 } },
+    rooms: {
+      [globalRoom]: { members: [ownerPk, viewerPkA, viewerPkB], writers: [ownerPk] },
+      [privateRoom]: { members: [ownerPk, viewerPkA], writers: [ownerPk] },
+    },
+  })
+
+  let daemon = await startMemoryDaemon({
+    dbPath,
+    ledgerPath,
+    receiptPath,
+    config: baseConfig(viewerPkA),
+    readers: 'viewer',
+    writers: 'james',
+    socketDir,
+    log: () => {},
+  })
+
+  const globalEv = finalizeEvent(
+    buildClaimTemplate({
+      pubkey: ownerPk,
+      scope: `room:${globalRoom}`,
+      slug: 'shared-global-claim',
+      memoryGlobalChannelId: globalRoom,
+      topic: 'hive-memory',
+      claim: 'Shared global claim visible to both readers.',
+      because: 'PR 354 regression test',
+      evidence: ['nvoy@e2cd9ebe:mcp/tools/memory-viewer.mjs'],
+      asOfGit: 'e2cd9ebea92579c98cda558d003270941ba50d97',
+      ttlSec: 86400 * 14,
+      nowSec: nowSec - 3600,
+    }),
+    ownerSk
+  )
+  const privateEv = finalizeEvent(
+    buildClaimTemplate({
+      pubkey: ownerPk,
+      scope: `room:${privateRoom}`,
+      slug: 'private-room-claim',
+      memoryGlobalChannelId: globalRoom,
+      topic: 'hive-memory',
+      claim: 'Private room claim visible only to reader A.',
+      because: 'PR 354 reader isolation test',
+      evidence: ['nvoy@e2cd9ebe:mcp/tools/hive_memory_store.mjs'],
+      asOfGit: 'e2cd9ebea92579c98cda558d003270941ba50d97',
+      ttlSec: 86400 * 14,
+      nowSec: nowSec - 3500,
+    }),
+    ownerSk
+  )
+
+  daemon.store.submit({ writer: 'james', event: globalEv, expectedPriorId: null, nowSec: nowSec - 3600 })
+  daemon.store.submit({ writer: 'james', event: privateEv, expectedPriorId: null, nowSec: nowSec - 3500 })
+
+  // 1. Verify PARSED_EVENT_CACHE immutability across same-store and cross-store queries
+  const q1 = daemon.store.query({ readerPubkey: viewerPkA, format: 'full', nowSec })
+  assert.equal(q1.records.length, 2)
+  const rec0 = q1.records.find(r => r.event_id === globalEv.id)
+  assert(rec0)
+  rec0.evidence.push('injected.mjs')
+  rec0.claim = 'mutated claim text'
+
+  const q2 = daemon.store.query({
+    readerPubkey: viewerPkA,
+    format: 'full',
+    staleFiles: new Set(['injected.mjs']),
+    nowSec,
+  })
+  const rec0After = q2.records.find(r => r.event_id === globalEv.id)
+  assert.deepEqual(rec0After.evidence, ['nvoy@e2cd9ebe:mcp/tools/memory-viewer.mjs'], 'mutating returned evidence array must not pollute PARSED_EVENT_CACHE')
+  assert.equal(rec0After.claim, 'Shared global claim visible to both readers.')
+  assert.equal(rec0After.stale_warning, null, 'mutated evidence array must not trigger false stale_warning on subsequent query')
+
+  const daemon2 = await startMemoryDaemon({
+    dbPath: dbPath2,
+    ledgerPath: ledgerPath2,
+    receiptPath: receiptPath2,
+    config: baseConfig(viewerPkA),
+    readers: 'viewer',
+    writers: 'james',
+    socketDir: join(tmp, 'sockets2'),
+    log: () => {},
+  })
+  try {
+    daemon2.store.submit({ writer: 'james', event: globalEv, expectedPriorId: null, nowSec: nowSec - 3600 })
+    const qCross = daemon2.store.query({
+      readerPubkey: viewerPkA,
+      format: 'full',
+      staleFiles: new Set(['injected.mjs']),
+      nowSec,
+    })
+    assert.deepEqual(qCross.records[0].evidence, ['nvoy@e2cd9ebe:mcp/tools/memory-viewer.mjs'], 'cross-store instance sharing event ID must not see mutated evidence')
+    assert.equal(qCross.records[0].stale_warning, null, 'cross-store instance must not inherit false stale_warning')
+  } finally {
+    await daemon2.close()
+  }
+
+  let viewer = null
+  try {
+    viewer = await startMemoryViewer({
+      socketPath: join(socketDir, 'viewer.sock'),
+      host: '127.0.0.1',
+      port: 0,
+      pollMs: 60000,
+    })
+
+    // 2. Verify before-first-curation elapsed_sec stays non-null on cached poll
+    const s1 = viewer.getState()
+    assert.equal(s1.curator_state.last_curated_at, null)
+    assert(typeof s1.curator_state.elapsed_sec === 'number' && s1.curator_state.elapsed_sec >= 3600, `initial elapsed_sec before first curation must be >= 3600, got ${s1.curator_state.elapsed_sec}`)
+    assert.equal(s1.reader_pubkey, viewerPkA)
+    assert.equal(s1.records.length, 2, 'reader A should see both global and private room claims')
+
+    const sCached = await viewer.pollOnce({ forceFull: false })
+    assert(typeof sCached.curator_state.elapsed_sec === 'number' && sCached.curator_state.elapsed_sec >= s1.curator_state.elapsed_sec, `cached poll elapsed_sec before first curation must stay non-null and >= ${s1.curator_state.elapsed_sec}, got ${sCached.curator_state.elapsed_sec}`)
+
+    // 3. Verify reader isolation: rebind viewer.sock to reader B (with unchanged write_seq and current_claims)
+    await daemon.close()
+    daemon = null
+
+    // Trigger an error poll while daemon is down, then rebind to reader B
+    const sErr = await viewer.pollOnce({ forceFull: false })
+    assert.equal(sErr.connected, false)
+
+    daemon = await startMemoryDaemon({
+      dbPath,
+      ledgerPath,
+      receiptPath,
+      config: baseConfig(viewerPkB),
+      readers: 'viewer',
+      writers: 'james',
+      socketDir,
+      log: () => {},
+    })
+
+    const sReaderB = await viewer.pollOnce({ forceFull: false })
+    assert.equal(sReaderB.connected, true)
+    assert.equal(sReaderB.reader_pubkey, viewerPkB)
+    assert.equal(sReaderB.records.length, 1, 'reader B must not receive reader A cached private room claim after error + rebind')
+    assert.equal(sReaderB.records[0].event_id, globalEv.id)
+
+    // Also test direct rebind from reader A -> reader B without an intermediate failed poll
+    await daemon.close()
+    daemon = await startMemoryDaemon({
+      dbPath,
+      ledgerPath,
+      receiptPath,
+      config: baseConfig(viewerPkA),
+      readers: 'viewer',
+      writers: 'james',
+      socketDir,
+      log: () => {},
+    })
+    const sBackToA = await viewer.pollOnce({ forceFull: false })
+    assert.equal(sBackToA.reader_pubkey, viewerPkA)
+    assert.equal(sBackToA.records.length, 2, 'direct rebind back to reader A without intermediate error poll must reload reader A corpus')
+
+    await daemon.close()
+    daemon = await startMemoryDaemon({
+      dbPath,
+      ledgerPath,
+      receiptPath,
+      config: baseConfig(viewerPkB),
+      readers: 'viewer',
+      writers: 'james',
+      socketDir,
+      log: () => {},
+    })
+    const sDirectB = await viewer.pollOnce({ forceFull: false })
+    assert.equal(sDirectB.reader_pubkey, viewerPkB)
+    assert.equal(sDirectB.records.length, 1, 'direct rebind from reader A to reader B without intermediate error poll must not leak private room claim')
+
+    // 4. Verify 12,000-deep nested extra JSON in an accepted claim does not throw RangeError in parseEventRaw / store.query / viewer.pollOnce
+    const deepTmpl = buildClaimTemplate({
+      pubkey: ownerPk,
+      scope: `room:${globalRoom}`,
+      slug: 'deep-nested-extra-claim',
+      memoryGlobalChannelId: globalRoom,
+      topic: 'hive-memory',
+      claim: 'Claim with 12000-deep nested extra field.',
+      because: 'PR 354 depth regression test',
+      evidence: ['nvoy@e2cd9ebe:mcp/tools/hive_memory_store.mjs'],
+      asOfGit: 'e2cd9ebea92579c98cda558d003270941ba50d97',
+      ttlSec: 86400 * 14,
+      nowSec: nowSec - 3400,
+    })
+    deepTmpl.content = deepTmpl.content.replace(/\}$/, `,"extra":${'['.repeat(12000)}${']'.repeat(12000)}}`)
+    const deepEv = finalizeEvent(deepTmpl, ownerSk)
+    const submitDeep = daemon.store.submit({ writer: 'james', event: deepEv, expectedPriorId: null, nowSec: nowSec - 3400 })
+    assert.equal(submitDeep.accepted, true, '12000-deep extra claim should be accepted by store.submit')
+
+    const qDeep = daemon.store.query({ readerPubkey: viewerPkB, format: 'full', nowSec })
+    assert.equal(qDeep.records.length, 2, 'store.query must succeed without RangeError on 12000-deep extra field')
+    assert(qDeep.records.some(r => r.event_id === deepEv.id))
+
+    const sDeep = await viewer.pollOnce({ forceFull: false })
+    assert.equal(sDeep.connected, true, 'viewer must stay connected when polling a 12000-deep extra claim')
+    assert.equal(sDeep.records.length, 2)
+  } finally {
+    if (viewer) await viewer.stop()
+    if (daemon) await daemon.close()
     rmSync(tmp, { recursive: true, force: true })
   }
 })
