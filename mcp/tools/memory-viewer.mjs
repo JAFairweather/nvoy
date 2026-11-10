@@ -13,7 +13,7 @@
 //   5. The viewer's memory_wake also carries the daemon's metadata-only activity ring and agent roster, which
 //      drive the cortex canvas and live Merkle Dreaming & 3-Trigger Curation telemetry.
 
-import { readFileSync } from 'node:fs'
+import { readFileSync, realpathSync } from 'node:fs'
 import { createServer as createHttpServer } from 'node:http'
 import { createConnection } from 'node:net'
 import { isAbsolute, resolve } from 'node:path'
@@ -7254,6 +7254,15 @@ async function main() {
   }
 }
 
-if (process.argv[1] && resolve(fileURLToPath(import.meta.url)) === resolve(process.argv[1])) {
+function isEntrypoint() {
+  if (!process.argv[1]) return false
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))
+  } catch {
+    return resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))
+  }
+}
+
+if (isEntrypoint()) {
   main()
 }
