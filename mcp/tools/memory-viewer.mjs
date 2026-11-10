@@ -2389,6 +2389,7 @@ export function renderViewerHtml(initialState) {
           <span id="sse-badge" class="badge info">SSE: connecting</span>
           <span id="sync-badge" class="badge">${syncState}</span>
           <button id="view-toggle" class="btn" type="button">Raw cards</button>
+          <button id="pocket-view-btn" class="btn" type="button" style="border-color:rgba(56,189,248,0.45);color:#7dd3fc;">Pocket View</button>
         </div>
         <div class="mobile-kpi-strip" id="mobile-kpi-strip">
           <span class="mobile-kpi-pill" id="m-kpi-seq">seq: -</span>
@@ -6095,6 +6096,9 @@ export function renderViewerHtml(initialState) {
       el('view-toggle').addEventListener('click', function () {
         switchView(view === 'graph' ? 'cards' : 'graph');
       });
+      if (el('pocket-view-btn')) el('pocket-view-btn').addEventListener('click', function () {
+        window.location.href = '/mobile';
+      });
       if (el('dock-graph')) el('dock-graph').addEventListener('click', function () {
         if (view !== 'graph') switchView('graph');
         else setDrawer('none');
@@ -6607,6 +6611,2103 @@ export function renderViewerHtml(initialState) {
 </html>`
 }
 
+function sanitizeMobileAlertSummary(a = {}) {
+  const kind = String(a?.kind || 'alert')
+  const agent = a?.agent ? `@${String(a.agent)}` : 'agent'
+  const code = a?.code ? String(a.code) : ''
+  const slug = a?.d ? (String(a.d).split(':').slice(2).join(':') || String(a.d)) : ''
+  if (kind === 'write_without_recall') {
+    return `${agent} submitted ${slug || 'a claim'} without prior recall in active window`
+  }
+  if (kind === 'blind_seat') {
+    return `${agent} active seat has zero recall events in window`
+  }
+  if (kind === 'tool_failure' || kind === 'submit_refused') {
+    return `${agent} write refused${code ? ` (${code})` : ''}`
+  }
+  if (kind === 'conflict') {
+    return `Unresolved claim conflict${slug ? ` on ${slug}` : ''}`
+  }
+  if (kind === 'stale_canon' || kind === 'stale') {
+    return `Stale anchor detected${slug ? ` on ${slug}` : ''}`
+  }
+  return `${kind.replace(/_/g, ' ')}${agent !== 'agent' ? ` (${agent})` : ''}${code ? ` [${code}]` : ''}`
+}
+
+export function buildMobileState(state = {}, nowSec = undefined, extraHistoryRecords = undefined) {
+  const effectiveNow = Number.isFinite(nowSec)
+    ? Math.floor(nowSec)
+    : Number.isFinite(state?.polled_at)
+      ? Math.floor(state.polled_at)
+      : Math.floor(Date.now() / 1000)
+
+  const records = Array.isArray(state?.records) ? state.records.filter(r => r && typeof r === 'object') : []
+  const historyList = Array.isArray(extraHistoryRecords)
+    ? extraHistoryRecords
+    : Array.isArray(state?.history_records)
+      ? state.history_records
+      : []
+  const consolidatedMap =
+    state?.consolidated_sources && typeof state.consolidated_sources === 'object' ? state.consolidated_sources : {}
+  const consolidatedList = Object.values(consolidatedMap).filter(r => r && typeof r === 'object')
+  const recentActivity = Array.isArray(state?.recent_activity)
+    ? state.recent_activity.filter(a => a && typeof a === 'object')
+    : []
+  const roster = Array.isArray(state?.agent_roster) ? state.agent_roster.filter(a => a && typeof a === 'object') : []
+
+  const ss = state?.store_state && typeof state.store_state === 'object' ? state.store_state : {}
+  const writeSeq = Number.isSafeInteger(ss.write_seq) ? ss.write_seq : null
+  const currentClaims = Number.isSafeInteger(ss.current_claims) ? ss.current_claims : records.length
+  const ageSec = Number.isFinite(ss.last_backup_age_sec) ? Math.max(0, Math.floor(ss.last_backup_age_sec)) : null
+  const unbackedWrites = Number.isSafeInteger(ss.unbacked_writes) ? Math.max(0, ss.unbacked_writes) : null
+  const receiptAt = Number.isFinite(ss.last_backup_at)
+    ? Math.floor(ss.last_backup_at)
+    : ageSec !== null
+      ? Math.max(0, effectiveNow - ageSec)
+      : null
+  const receiptWriteSeq = Number.isSafeInteger(ss.last_backup_write_seq)
+    ? ss.last_backup_write_seq
+    : writeSeq !== null && unbackedWrites !== null
+      ? Math.max(0, writeSeq - unbackedWrites)
+      : null
+  const receiptSnapshotId =
+    typeof ss.last_backup_snapshot_id === 'string' && ss.last_backup_snapshot_id
+      ? ss.last_backup_snapshot_id.slice(0, 12)
+      : null
+
+  const watch = state?.watch && typeof state.watch === 'object' ? state.watch : watchView(effectiveNow)
+  const fenceWindowSec = 3600
+  const backupStatus =
+    ss.state !== 'READY'
+      ? 'not_ready'
+      : ageSec === null
+        ? 'missing_receipt'
+        : ageSec > fenceWindowSec
+          ? 'stale_fenced'
+          : (unbackedWrites ?? 0) > 0
+            ? 'dirty_open'
+            : 'verified_clean'
+  const backupFreshnessPct =
+    ageSec !== null ? Math.max(0, Math.min(100, Math.round((1 - ageSec / fenceWindowSec) * 100))) : 0
+
+  // --- New-Memory Velocity (strictly from timestamps & metadata) ---
+  const seenWriteEvents = new Map()
+  const addWriteRecord = r => {
+    const at = Number(r?.created_at)
+    if (!Number.isFinite(at) || at <= 0) return
+    const key = r.event_id ? String(r.event_id) : `${r.author_pubkey || ''}:${r.d || ''}:${at}`
+    if (!seenWriteEvents.has(key)) seenWriteEvents.set(key, at)
+  }
+  for (const r of historyList) addWriteRecord(r)
+  for (const r of records) addWriteRecord(r)
+  for (const r of consolidatedList) addWriteRecord(r)
+  for (const a of recentActivity) {
+    if (a.kind === 'submit' && a.accepted !== false && Number.isFinite(a.at) && a.at > 0) {
+      const key = a.event_id ? String(a.event_id) : `act:${a.seq || a.at}:${a.actor || ''}:${a.d || ''}`
+      if (!seenWriteEvents.has(key)) seenWriteEvents.set(key, Number(a.at))
+    }
+  }
+  const writeTimestamps = [...seenWriteEvents.values()].sort((a, b) => a - b)
+  let writes1h = 0
+  let writes6h = 0
+  let writes24h = 0
+  const sparkline12h = new Array(12).fill(0)
+  for (const ts of writeTimestamps) {
+    const age = effectiveNow - ts
+    if (age < -60) continue
+    if (age <= 3600) writes1h += 1
+    if (age <= 21600) writes6h += 1
+    if (age <= 86400) writes24h += 1
+    if (age >= 0 && age < 43200) {
+      const bucketIdx = 11 - Math.min(11, Math.floor(age / 3600))
+      sparkline12h[bucketIdx] += 1
+    }
+  }
+  const lastWriteAt = writeTimestamps.length > 0 ? writeTimestamps[writeTimestamps.length - 1] : null
+  const refusals15m = recentActivity.filter(
+    a => a.kind === 'submit' && a.accepted === false && Number.isFinite(a.at) && effectiveNow - a.at <= 900
+  ).length
+
+  // --- Recall Velocity (from recent_activity + agent_roster + efficacy) ---
+  const recallEvents = recentActivity.filter(
+    a => (a.kind === 'wake' || a.kind === 'query') && String(a.actor || '') !== 'viewer'
+  )
+  let recalls5m = 0
+  let recalls15m = 0
+  let recalls1h = 0
+  let wakesWindow = 0
+  let queriesWindow = 0
+  const sparkline60m = new Array(12).fill(0)
+  let lastRecallAt = null
+  for (const a of recallEvents) {
+    const ts = Number(a.at)
+    if (a.kind === 'wake') wakesWindow += 1
+    if (a.kind === 'query') queriesWindow += 1
+    if (!Number.isFinite(ts) || ts <= 0) continue
+    if (lastRecallAt === null || ts > lastRecallAt) lastRecallAt = ts
+    const age = effectiveNow - ts
+    if (age < -60) continue
+    if (age <= 300) recalls5m += 1
+    if (age <= 900) recalls15m += 1
+    if (age <= 3600) recalls1h += 1
+    if (age >= 0 && age < 3600) {
+      const bucketIdx = 11 - Math.min(11, Math.floor(age / 300))
+      sparkline60m[bucketIdx] += 1
+    }
+  }
+  const rosterReads5m = roster.reduce((sum, a) => sum + (Number(a.reads_5m) || 0), 0)
+  if (rosterReads5m > recalls5m) recalls5m = rosterReads5m
+  if (recalls5m > recalls15m) recalls15m = recalls5m
+  if (recalls15m > recalls1h) recalls1h = recalls15m
+  for (const a of roster) {
+    const lr = Number(a.last_recall_at)
+    if (Number.isFinite(lr) && lr > 0 && (lastRecallAt === null || lr > lastRecallAt)) {
+      lastRecallAt = lr
+    }
+  }
+
+  const coh =
+    state?.coherence && typeof state.coherence === 'object'
+      ? state.coherence
+      : computeCoherence({
+          records,
+          history_records: historyList,
+          agent_roster: roster,
+          recent_activity: recentActivity,
+          store_state: ss,
+          now_sec: effectiveNow,
+        })
+  const cs = state?.curator_state && typeof state.curator_state === 'object' ? state.curator_state : {}
+  const eff =
+    state?.efficacy && typeof state.efficacy === 'object'
+      ? state.efficacy
+      : computeSynapticEfficacy({
+          records,
+          history_records: historyList,
+          agent_roster: roster,
+          recent_activity: recentActivity,
+          coherence: coh,
+          curator_state: cs,
+          now_sec: effectiveNow,
+        })
+  const dreamTel = computeDreamingTelemetry(records, {
+    ...cs,
+    consolidated_sources: consolidatedMap,
+  })
+
+  // --- Per-author active claim counts (by pubkey and id) ---
+  const activeClaimsByPubkey = new Map()
+  for (const r of records) {
+    if (r.author_pubkey) {
+      const pk = String(r.author_pubkey)
+      activeClaimsByPubkey.set(pk, (activeClaimsByPubkey.get(pk) || 0) + 1)
+    }
+  }
+
+  const fencedSet = new Set(Array.isArray(watch?.fenced) ? watch.fenced.map(String) : [])
+  const healthOrder = { error: 0, active: 1, warm: 2, stale: 3 }
+  const agentList = roster
+    .map(a => {
+      const id = String(a.id || 'unknown')
+      const pk = String(a.pubkey || '')
+      const lastWriteSlug = a.last_write_key
+        ? String(a.last_write_key).split(':').slice(2).join(':') || String(a.last_write_key)
+        : null
+      return {
+        id,
+        pubkey_prefix: pk ? pk.slice(0, 12) : null,
+        is_writer: Boolean(a.is_writer),
+        is_reader: Boolean(a.is_reader),
+        fenced: fencedSet.has(id),
+        health: String(a.health || 'stale'),
+        compliance_status: String(a.compliance_status || 'compliant'),
+        coherence_score: Number.isFinite(a.coherence_score) ? a.coherence_score : 100,
+        reads_5m: Number(a.reads_5m || 0),
+        writes_5m: Number(a.writes_5m || 0),
+        queries_5m: Number(a.queries_5m || 0),
+        hits_5m: Number(a.hits_5m || 0),
+        refusals_15m: Number(a.refusals_15m || 0),
+        active_claims: pk ? activeClaimsByPubkey.get(pk) || 0 : 0,
+        last_recall_at: Number.isFinite(a.last_recall_at) && a.last_recall_at > 0 ? a.last_recall_at : null,
+        last_write_at: Number.isFinite(a.last_write_at) && a.last_write_at > 0 ? a.last_write_at : null,
+        last_write_slug: lastWriteSlug,
+      }
+    })
+    .sort((a, b) => {
+      const ha = healthOrder[a.health] ?? 9
+      const hb = healthOrder[b.health] ?? 9
+      if (ha !== hb) return ha - hb
+      const actA = Math.max(a.last_recall_at || 0, a.last_write_at || 0)
+      const actB = Math.max(b.last_recall_at || 0, b.last_write_at || 0)
+      if (actA !== actB) return actB - actA
+      return a.id.localeCompare(b.id)
+    })
+
+  // --- Dream consolidation metadata ledger ---
+  const rawLedger = Array.isArray(cs.consolidation_ledger) ? cs.consolidation_ledger : []
+  const recentConsolidations = (
+    rawLedger.length > 0
+      ? rawLedger.slice(-8).reverse()
+      : records
+          .filter(r => typeof r.merkle_sources === 'string' && r.merkle_sources.length > 0)
+          .sort((a, b) => (b.created_at || 0) - (a.created_at || 0))
+          .slice(0, 8)
+          .map(r => ({
+            at: r.created_at || null,
+            stage: r.scope === 'hive:canon' ? 'stage3_canon' : r.expires_at == null ? 'stage2_distill' : 'stage1_promote',
+            scope: r.scope || null,
+            topic: r.topic || 'general',
+            slug: String(r.d || '').split(':').slice(2).join(':') || String(r.d || ''),
+            source_count: Array.isArray(r.supersedes) ? r.supersedes.length : 0,
+            merkle_sources: r.merkle_sources,
+            event_id: r.event_id,
+          }))
+  ).map(entry => ({
+    at: Number.isFinite(entry?.at) ? entry.at : null,
+    stage: String(entry?.stage || 'consolidated'),
+    scope: String(entry?.scope || ''),
+    topic: String(entry?.topic || 'general'),
+    slug: String(entry?.slug || entry?.d || '').split(':').pop() || 'synthesis',
+    source_count: Number(entry?.source_count || (Array.isArray(entry?.source_event_ids) ? entry.source_event_ids.length : 0)),
+    merkle_sources: typeof entry?.merkle_sources === 'string' ? entry.merkle_sources.slice(0, 12) : null,
+    event_id: typeof entry?.event_id === 'string' ? entry.event_id.slice(0, 12) : null,
+  }))
+
+  const eigenvectors = (Array.isArray(cs.topic_eigenvectors) ? cs.topic_eigenvectors : []).slice(0, 6).map((e, i) => ({
+    rank: Number(e?.rank || i + 1),
+    label: String(e?.label || e?.primary_topic || `axis-${i + 1}`),
+    primary_topic: String(e?.primary_topic || 'general'),
+    eigenvalue: Number.isFinite(e?.eigenvalue) ? Math.round(e.eigenvalue * 100) / 100 : 0,
+    variance_pct: Number.isFinite(e?.variance_pct) ? Math.round(e.variance_pct * 10) / 10 : 0,
+    claim_count: Number(e?.claim_count || 0),
+    persisted: Boolean(e?.persisted && !e?.simulated),
+  }))
+
+  // --- Metadata-only Alerts ---
+  const alerts = []
+  if (!state.connected) {
+    alerts.push({
+      severity: 'critical',
+      kind: 'socket_disconnected',
+      code: 'VIEWER_SOCKET_DISCONNECTED',
+      agent: null,
+      at: effectiveNow,
+      summary: 'Viewer socket is disconnected from hive-memory daemon',
+    })
+  }
+  if (ss.state && ss.state !== 'READY' && state.connected) {
+    alerts.push({
+      severity: 'critical',
+      kind: 'store_not_ready',
+      code: String(ss.state),
+      agent: null,
+      at: effectiveNow,
+      summary: `Store state is ${ss.state} (writes fenced until READY)`,
+    })
+  }
+  if (watch?.alert) {
+    alerts.push({
+      severity: watch.saving === 'OFF' ? 'critical' : 'warn',
+      kind: 'watch_fence',
+      code: watch.saving === 'OFF' ? 'SAVING_OFF' : 'SAVING_WARN',
+      agent: null,
+      at: watch.checked_at || effectiveNow,
+      summary: String(watch.alert),
+    })
+  }
+  if (backupStatus === 'stale_fenced' || backupStatus === 'missing_receipt') {
+    alerts.push({
+      severity: 'critical',
+      kind: 'backup_fence',
+      code: 'HIVE_MEMORY_BACKUP_STALE_WRITES_FENCED',
+      agent: null,
+      at: effectiveNow,
+      summary:
+        backupStatus === 'missing_receipt'
+          ? 'No verified backup receipt found; writes fenced'
+          : `Last verified backup is ${ageSec}s old (> ${fenceWindowSec}s fence window)`,
+    })
+  }
+  const rawDriftAlerts = Array.isArray(coh?.epistemic_drift?.alerts) ? coh.epistemic_drift.alerts : []
+  for (const a of rawDriftAlerts.slice(0, 12)) {
+    alerts.push({
+      severity: a?.severity === 'critical' || a?.severity === 'error' ? 'critical' : 'warn',
+      kind: String(a?.kind || 'epistemic_drift'),
+      code: a?.code ? String(a.code) : null,
+      agent: a?.agent ? String(a.agent) : null,
+      at: Number.isFinite(a?.at) ? a.at : effectiveNow,
+      summary: sanitizeMobileAlertSummary(a),
+    })
+  }
+
+  // --- Topic counts (metadata only) ---
+  const topicPagesObj = state?.topic_pages && typeof state.topic_pages === 'object' ? state.topic_pages : {}
+  const topicsFromPages = Object.values(topicPagesObj)
+    .filter(p => p && typeof p === 'object' && p.topic)
+    .map(p => ({
+      topic: String(p.topic),
+      above_the_line: Number(p.counts?.above_the_line || 0),
+      below_the_line: Number(p.counts?.below_the_line || 0),
+      canon: Number(p.counts?.canon || 0),
+      decisions: Number(p.counts?.class_b_decisions || 0),
+      merkle: Number(p.counts?.curated_syntheses || 0),
+      folded: Number(p.counts?.folded_lineage || 0),
+      total: Number(p.counts?.above_the_line || 0) + Number(p.counts?.below_the_line || 0),
+    }))
+    .sort((a, b) => b.total - a.total || a.topic.localeCompare(b.topic))
+
+  let topics = topicsFromPages.slice(0, 12)
+  if (topics.length === 0 && records.length > 0) {
+    const byTopic = new Map()
+    for (const r of records) {
+      const t = String(r.topic || 'general')
+      const entry = byTopic.get(t) || {
+        topic: t,
+        above_the_line: 0,
+        below_the_line: 0,
+        canon: 0,
+        decisions: 0,
+        merkle: 0,
+        folded: 0,
+        total: 0,
+      }
+      entry.total += 1
+      if (r.scope === 'hive:canon') {
+        entry.canon += 1
+        entry.above_the_line += 1
+      } else if (typeof r.merkle_sources === 'string' && r.merkle_sources.length > 0) {
+        entry.merkle += 1
+        entry.above_the_line += 1
+      } else if (r.expires_at === null || r.expires_at === undefined) {
+        entry.decisions += 1
+        entry.above_the_line += 1
+      } else {
+        entry.below_the_line += 1
+      }
+      byTopic.set(t, entry)
+    }
+    topics = [...byTopic.values()].sort((a, b) => b.total - a.total || a.topic.localeCompare(b.topic)).slice(0, 12)
+  }
+
+  // --- Recent synaptic pulses (metadata only) ---
+  const recentPulses = recentActivity
+    .slice(-15)
+    .reverse()
+    .map(a => ({
+      seq: Number(a.seq || 0),
+      at: Number.isFinite(a.at) ? a.at : null,
+      kind: String(a.kind || 'activity'),
+      actor: String(a.actor || 'unknown'),
+      scope: a.scope ? String(a.scope) : null,
+      slug: a.d ? String(a.d).split(':').slice(2).join(':') || String(a.d) : null,
+      accepted: a.accepted !== undefined ? Boolean(a.accepted) : null,
+      code: a.code ? String(a.code) : null,
+      count: Number.isFinite(a.count) ? a.count : null,
+      hits: Number.isFinite(a.hits) ? a.hits : null,
+    }))
+
+  const sc = state?.scope_counts && typeof state.scope_counts === 'object' ? state.scope_counts : {}
+  const ah = state?.agent_health && typeof state.agent_health === 'object' ? state.agent_health : {}
+  const synapticEfficiency = {
+    score: Number.isFinite(eff?.score) ? eff.score : 0,
+    axes: {
+      breadth: Number(eff?.axes?.breadth ?? 0),
+      precision: Number(eff?.axes?.precision ?? 0),
+      velocity: Number(eff?.axes?.velocity ?? 0),
+      reuse: Number(eff?.axes?.reuse ?? 0),
+    },
+    distribution: {
+      recall_coverage_pct: Number(eff?.distribution?.recall_coverage_pct ?? 0),
+      recalling_agents_count: Number(eff?.distribution?.recalling_agents_count ?? 0),
+      active_agents_count: Number(eff?.distribution?.active_agents_count ?? 0),
+      cross_agent_topic_reach_pct: Number(eff?.distribution?.cross_agent_topic_reach_pct ?? 0),
+      multi_reader_topics: Number(eff?.distribution?.multi_reader_topics ?? 0),
+      active_topics_count: Number(eff?.distribution?.active_topics_count ?? 0),
+    },
+    retrieval: {
+      query_hit_rate_pct: Number(eff?.retrieval?.query_hit_rate_pct ?? 0),
+      queries_matched: Number(eff?.retrieval?.queries_matched ?? 0),
+      queries_total: Number(eff?.retrieval?.queries_total ?? 0),
+      wakes_total: Number(eff?.retrieval?.wakes_total ?? 0),
+      read_before_write_pct: Number(eff?.retrieval?.read_before_write_pct ?? 0),
+      recall_grounded_writes: Number(eff?.retrieval?.recall_grounded_writes ?? 0),
+      total_writes_window: Number(eff?.retrieval?.total_writes_window ?? 0),
+    },
+    handoff: {
+      median_handoff_min: eff?.handoff?.median_handoff_min ?? null,
+      handoff_events_count: Number(eff?.handoff?.handoff_events_count ?? 0),
+      fast_handoffs_count: Number(eff?.handoff?.fast_handoffs_count ?? 0),
+    },
+    reuse: {
+      state_compression_pct: Number(eff?.reuse?.state_compression_pct ?? 0),
+      durable_claims: Number(eff?.reuse?.durable_claims ?? 0),
+      raw_class_a_claims: Number(eff?.reuse?.raw_class_a_claims ?? 0),
+      corroborated_topic_pct: Number(eff?.reuse?.corroborated_topic_pct ?? 0),
+      multi_author_topics: Number(eff?.reuse?.multi_author_topics ?? 0),
+      total_topics: Number(eff?.reuse?.total_topics ?? 0),
+    },
+  }
+
+  const hasCriticalAlert = alerts.some(a => a.severity === 'critical')
+  const healthy = Boolean(
+    state.connected &&
+      ss.state === 'READY' &&
+      watch?.saving !== 'OFF' &&
+      backupStatus !== 'stale_fenced' &&
+      backupStatus !== 'missing_receipt' &&
+      !hasCriticalAlert
+  )
+
+  return {
+    viewer_version: state?.viewer_version || VIEWER_VERSION,
+    view_mode: 'mobile_pocket_cortex',
+    metadata_only: true,
+    authority: null,
+    trustedInstruction: false,
+    connected: Boolean(state?.connected),
+    error: state?.error ? String(state.error) : null,
+    server_name: String(state?.server_name || 'hive-memory-viewer'),
+    reader: String(state?.reader || 'viewer'),
+    polled_at: effectiveNow,
+    poll_seq: Number.isSafeInteger(state?.poll_seq) ? state.poll_seq : 0,
+    store_state: {
+      state: String(ss.state || 'CONNECTING'),
+      write_seq: writeSeq,
+      current_claims: currentClaims,
+      last_backup_age_sec: ageSec,
+      unbacked_writes: unbackedWrites,
+      last_backup_at: receiptAt,
+      last_backup_write_seq: receiptWriteSeq,
+      last_backup_snapshot_id: receiptSnapshotId,
+    },
+    backup: {
+      status: backupStatus,
+      age_sec: ageSec,
+      fence_window_sec: fenceWindowSec,
+      freshness_pct: backupFreshnessPct,
+      unbacked_writes: unbackedWrites,
+      last_receipt: {
+        at: receiptAt,
+        write_seq: receiptWriteSeq,
+        snapshot_id: receiptSnapshotId,
+      },
+      watch: {
+        saving: String(watch?.saving || 'unknown'),
+        fenced: Array.isArray(watch?.fenced) ? watch.fenced.map(String) : [],
+        checked_at: watch?.checked_at || null,
+        stale: Boolean(watch?.stale),
+        alert: watch?.alert ? String(watch.alert) : null,
+      },
+    },
+    velocities: {
+      new_memory: {
+        writes_1h: writes1h,
+        writes_6h: writes6h,
+        writes_24h: writes24h,
+        rate_per_hour_1h: writes1h,
+        rate_per_hour_6h: Math.round((writes6h / 6) * 10) / 10,
+        rate_per_hour_24h: Math.round((writes24h / 24) * 10) / 10,
+        sparkline_12h: sparkline12h,
+        last_write_at: lastWriteAt,
+        last_write_age_sec: lastWriteAt !== null ? Math.max(0, effectiveNow - lastWriteAt) : null,
+        refusals_15m: refusals15m,
+        write_seq: writeSeq,
+      },
+      recall: {
+        recalls_5m: recalls5m,
+        recalls_15m: recalls15m,
+        recalls_1h: recalls1h,
+        wakes_window: wakesWindow,
+        queries_window: queriesWindow,
+        rate_per_min_5m: Math.round((recalls5m / 5) * 10) / 10,
+        rate_per_hour_1h: recalls1h,
+        query_hit_rate_pct: synapticEfficiency.retrieval.query_hit_rate_pct,
+        recall_coverage_pct: synapticEfficiency.distribution.recall_coverage_pct,
+        recalling_agents: synapticEfficiency.distribution.recalling_agents_count,
+        active_agents: synapticEfficiency.distribution.active_agents_count,
+        sparkline_60m: sparkline60m,
+        last_recall_at: lastRecallAt,
+        last_recall_age_sec: lastRecallAt !== null ? Math.max(0, effectiveNow - lastRecallAt) : null,
+      },
+    },
+    coherence: {
+      score: Number(coh?.score ?? 0),
+      core_memory_score: Number(coh?.core_memory_score ?? 0),
+      periphery_coherence_score: Number(coh?.periphery_coherence_score ?? 0),
+      inception_score: Number(coh?.inception_score ?? 0),
+      inception_at: coh?.inception_at ?? null,
+      delta_since_inception: Number(coh?.delta_since_inception ?? 0),
+      axes: {
+        alignment: Number(coh?.axes?.alignment ?? 0),
+        grounding: Number(coh?.axes?.grounding ?? 0),
+        convergence: Number(coh?.axes?.convergence ?? 0),
+        coupling: Number(coh?.axes?.coupling ?? 0),
+        consolidation: Number(coh?.axes?.consolidation ?? 0),
+      },
+      counts: {
+        active_claims: Number(coh?.active_claims ?? records.length),
+        consolidated_claims: Number(coh?.consolidated_claims ?? Object.keys(consolidatedMap).length),
+        superseded_events: Number(coh?.superseded_events ?? 0),
+        withdrawn_events: Number(coh?.withdrawn_events ?? 0),
+        expired_events: Number(coh?.expired_events ?? 0),
+        conflict_claims: Number(coh?.conflict_claims ?? 0),
+        stale_claims: Number(coh?.stale_claims ?? 0),
+        grounded_claims: Number(coh?.grounded_claims ?? 0),
+        shared_artifacts: Number(coh?.shared_artifacts ?? 0),
+      },
+      drift_status: String(coh?.epistemic_drift?.status || 'aligned'),
+      history: (Array.isArray(coh?.history) ? coh.history : []).slice(-24).map(h => ({
+        at: Number(h?.at || 0),
+        score: Number(h?.score || 0),
+        claims: Number(h?.claims || 0),
+        events: Number(h?.events || 0),
+      })),
+    },
+    synaptic_efficiency: synapticEfficiency,
+    efficacy: synapticEfficiency,
+    dreams: {
+      mode: dreamTel.display_mode.mode,
+      mode_label: dreamTel.display_mode.label,
+      persisted_curation: Boolean(dreamTel.display_mode.persisted_curation),
+      last_curated_at: cs.last_curated_at || null,
+      last_curated_write_seq: Number(cs.last_curated_write_seq || 0),
+      last_ran_at: cs.last_ran_at || null,
+      last_submitted_count: Number(cs.last_submitted_count || 0),
+      elapsed_sec: Number.isFinite(cs.elapsed_sec) ? cs.elapsed_sec : null,
+      dream_interval_sec: Number(cs.dream_interval_sec || DEFAULT_DREAM_INTERVAL_SEC),
+      write_delta: Number(cs.write_delta || 0),
+      write_delta_threshold: Number(cs.write_delta_threshold || DEFAULT_WRITE_DELTA_THRESHOLD),
+      topic_pressure_threshold: Number(cs.topic_pressure_threshold || DEFAULT_TOPIC_PRESSURE_THRESHOLD),
+      should_run: Boolean(cs.should_run),
+      triggers: {
+        circadian_dream: Boolean(cs.triggers?.circadian_dream),
+        synaptic_volume: Boolean(cs.triggers?.synaptic_volume),
+        nightmare_interrupt: Boolean(cs.triggers?.nightmare_interrupt),
+      },
+      counts: {
+        merkle_syntheses: Number(dreamTel.merkleCount || 0),
+        consolidated_sources: Object.keys(consolidatedMap).length,
+        class_b_decisions: Number(dreamTel.classBCount || 0),
+        workflow_claims: Number(dreamTel.wfCount || 0),
+        short_ttl_workflow: Number(dreamTel.shortTtlCount || 0),
+        nightmares: Number(dreamTel.nightmareCount || 0),
+        wake_savings_pct: Number(dreamTel.wakeSavings || 0),
+        index_savings_pct: Number(dreamTel.indexSavings || 0),
+      },
+      planned_summary: {
+        promotions: Number(cs.planned_summary?.promotions || 0),
+        distillations: Number(cs.planned_summary?.distillations || 0),
+        solidifications: Number(cs.planned_summary?.solidifications || 0),
+        nightmares: Number(cs.planned_summary?.nightmares || 0),
+      },
+      recent_consolidations: recentConsolidations,
+      eigenvectors,
+    },
+    agents: {
+      summary: {
+        active_5m: Number(ah.active_5m ?? agentList.filter(a => a.health === 'active').length),
+        warm_20m: Number(ah.warm_20m ?? agentList.filter(a => a.health === 'warm').length),
+        stale: Number(ah.stale ?? agentList.filter(a => a.health === 'stale').length),
+        error: Number(ah.error ?? agentList.filter(a => a.health === 'error').length),
+        total: agentList.length,
+        window_sec: Number(ah.window_sec || ACTIVE_WINDOW_SEC),
+      },
+      roster: agentList,
+    },
+    alerts,
+    vitals: {
+      healthy,
+      scope_counts: {
+        canon: Number(sc.canon ?? 0),
+        ops: Number(sc.ops ?? 0),
+        rooms: Number(sc.rooms ?? 0),
+        self: Number(sc.self ?? 0),
+        unverified_total: Number(sc.unverified_total ?? 0),
+      },
+      entity_graph: {
+        total_edges: Number(state?.entity_graph_stats?.total_edges || 0),
+        link_count: Number(state?.entity_graph_stats?.link_count || 0),
+        top_entities: (Array.isArray(state?.entity_graph_stats?.top_entities)
+          ? state.entity_graph_stats.top_entities
+          : []
+        )
+          .slice(0, 8)
+          .map(e => ({
+            ref: String(e?.ref || ''),
+            count: Number(e?.count || 0),
+          })),
+      },
+      topics,
+      recent_pulses: recentPulses,
+    },
+  }
+}
+
+export function renderMobileViewerHtml(initialMobileState = {}) {
+  const mobileData =
+    initialMobileState && initialMobileState.view_mode === 'mobile_pocket_cortex'
+      ? initialMobileState
+      : buildMobileState(initialMobileState)
+  const escapedInitial = safeJsonForScript(mobileData)
+  const syncState = escapeHtml(mobileData.store_state?.state || 'CONNECTING')
+  const readerName = escapeHtml(mobileData.reader || 'viewer')
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=5, viewport-fit=cover">
+  <meta name="theme-color" content="#040711">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Pocket Cortex · Hive Memory Status</title>
+  <style>
+    :root {
+      --bg: #040711;
+      --card: rgba(11, 18, 35, 0.84);
+      --card-hi: rgba(17, 27, 50, 0.9);
+      --border: rgba(100, 138, 205, 0.24);
+      --border-hi: rgba(56, 189, 248, 0.48);
+      --text: #eef4ff;
+      --muted: #8ea2c4;
+      --ok: #22c55e;
+      --ok-bg: rgba(34, 197, 94, 0.14);
+      --warn: #f59e0b;
+      --warn-bg: rgba(245, 158, 11, 0.15);
+      --err: #ef4444;
+      --err-bg: rgba(239, 68, 68, 0.16);
+      --cyan: #38bdf8;
+      --emerald: #34d399;
+      --violet: #a78bfa;
+      --gold: #fbbf24;
+      --pink: #f472b6;
+      --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+      --font-mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background:
+        radial-gradient(circle at 18% 6%, rgba(56, 189, 248, 0.16), transparent 42%),
+        radial-gradient(circle at 84% 14%, rgba(167, 139, 250, 0.15), transparent 46%),
+        radial-gradient(circle at 50% 88%, rgba(52, 211, 153, 0.11), transparent 50%),
+        var(--bg);
+      background-attachment: fixed;
+      color: var(--text);
+      font-family: var(--font-sans);
+      font-variant-numeric: tabular-nums;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+    .shell {
+      max-width: 520px;
+      margin: 0 auto;
+      padding: max(12px, env(safe-area-inset-top)) 12px calc(86px + env(safe-area-inset-bottom)) 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .glass {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      box-shadow: 0 14px 36px rgba(0, 0, 0, 0.48), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+    }
+    .top-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 10px 13px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+    .orb {
+      width: 30px;
+      height: 30px;
+      border-radius: 999px;
+      flex-shrink: 0;
+      background: radial-gradient(circle at 32% 30%, #a5f3fc, #38bdf8 42%, #6366f1 78%, #090d1a 100%);
+      box-shadow: 0 0 18px rgba(56, 189, 248, 0.65);
+      animation: orbBeat 3.2s ease-in-out infinite;
+    }
+    @keyframes orbBeat {
+      0%, 100% { transform: scale(0.95); box-shadow: 0 0 14px rgba(56, 189, 248, 0.55); }
+      50% { transform: scale(1.06); box-shadow: 0 0 24px rgba(52, 211, 153, 0.85); }
+    }
+    .brand-title {
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .brand-sub {
+      font-size: 10.5px;
+      color: var(--muted);
+      font-family: var(--font-mono);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .top-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 9px;
+      border-radius: 999px;
+      font-size: 10.5px;
+      font-weight: 700;
+      font-family: var(--font-mono);
+      border: 1px solid var(--border);
+      background: rgba(15, 23, 42, 0.78);
+      color: var(--text);
+    }
+    .pill.ok { color: #86efac; border-color: rgba(34, 197, 94, 0.45); background: var(--ok-bg); }
+    .pill.warn { color: #fcd34d; border-color: rgba(245, 158, 11, 0.45); background: var(--warn-bg); }
+    .pill.err { color: #fca5a5; border-color: rgba(239, 68, 68, 0.5); background: var(--err-bg); }
+    .pill.info { color: #7dd3fc; border-color: rgba(56, 189, 248, 0.45); background: rgba(56, 189, 248, 0.13); }
+    .pill.violet { color: #ddd6fe; border-color: rgba(167, 139, 250, 0.45); background: rgba(167, 139, 250, 0.14); }
+    .btn-ghost {
+      appearance: none;
+      border: 1px solid rgba(125, 211, 252, 0.35);
+      background: rgba(15, 23, 42, 0.85);
+      color: #bae6fd;
+      border-radius: 999px;
+      padding: 5px 10px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .btn-ghost:active { transform: scale(0.97); }
+
+    /* Pocket Cortex Neural Canvas Card */
+    .cortex-hero {
+      position: relative;
+      overflow: hidden;
+      padding: 0;
+    }
+    #pocket-cortex {
+      display: block;
+      width: 100%;
+      height: 206px;
+      touch-action: manipulation;
+    }
+    .cortex-overlay-top {
+      position: absolute;
+      top: 10px;
+      left: 12px;
+      right: 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      pointer-events: none;
+    }
+    .cortex-overlay-bottom {
+      position: absolute;
+      bottom: 8px;
+      left: 12px;
+      right: 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 10.5px;
+      color: var(--muted);
+      font-family: var(--font-mono);
+      pointer-events: none;
+    }
+
+    /* Health & Alerts Banner */
+    .health-banner {
+      padding: 11px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+    .health-banner.healthy {
+      border-color: rgba(34, 197, 94, 0.42);
+      background: linear-gradient(135deg, rgba(6, 40, 28, 0.78), rgba(11, 18, 35, 0.88));
+    }
+    .health-banner.alerting {
+      border-color: rgba(245, 158, 11, 0.52);
+      background: linear-gradient(135deg, rgba(55, 28, 10, 0.82), rgba(11, 18, 35, 0.9));
+    }
+    .health-banner.critical {
+      border-color: rgba(239, 68, 68, 0.65);
+      background: linear-gradient(135deg, rgba(65, 14, 20, 0.86), rgba(11, 18, 35, 0.92));
+    }
+    .health-headline {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .alert-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .alert-item {
+      padding: 7px 10px;
+      border-radius: 10px;
+      font-size: 11.5px;
+      line-height: 1.35;
+      background: rgba(2, 6, 23, 0.66);
+      border-left: 3px solid var(--warn);
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 8px;
+    }
+    .alert-item.critical { border-left-color: var(--err); color: #fecaca; }
+    .alert-item.warn { border-left-color: var(--warn); color: #fde68a; }
+
+    /* 2x2 Vitals Grid */
+    .vitals-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .vital-card {
+      padding: 12px 13px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      position: relative;
+      overflow: hidden;
+    }
+    .vital-label {
+      font-size: 10.5px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .vital-val {
+      font-size: 25px;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      line-height: 1.1;
+    }
+    .vital-sub {
+      font-size: 11px;
+      color: var(--muted);
+      font-family: var(--font-mono);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .spark-svg {
+      width: 100%;
+      height: 30px;
+      margin-top: 4px;
+      overflow: visible;
+    }
+
+    /* Section Cards */
+    .section-card {
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 11px;
+    }
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .section-title {
+      font-size: 13.5px;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      margin: 0;
+    }
+    .sub-grid-2 {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .sub-grid-3 {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 7px;
+    }
+    .stat-box {
+      background: rgba(4, 9, 22, 0.62);
+      border: 1px solid rgba(100, 138, 205, 0.18);
+      border-radius: 12px;
+      padding: 8px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .stat-k {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+    }
+    .stat-v {
+      font-size: 15px;
+      font-weight: 700;
+      font-family: var(--font-mono);
+    }
+    .stat-s {
+      font-size: 10px;
+      color: var(--muted);
+      font-family: var(--font-mono);
+    }
+
+    /* Axis Progress Bars */
+    .axis-list {
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+    .axis-row {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    .axis-meta {
+      display: flex;
+      justify-content: space-between;
+      font-size: 11.5px;
+    }
+    .axis-name { color: #cbd5e1; font-weight: 500; }
+    .axis-score { font-family: var(--font-mono); font-weight: 700; }
+    .bar-track {
+      height: 6px;
+      width: 100%;
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.9);
+      overflow: hidden;
+      border: 1px solid rgba(148, 163, 184, 0.14);
+    }
+    .bar-fill {
+      height: 100%;
+      border-radius: 999px;
+      transition: width 0.35s ease;
+    }
+
+    /* Agent Usage List */
+    .filter-row {
+      display: flex;
+      gap: 6px;
+      overflow-x: auto;
+      padding-bottom: 2px;
+    }
+    .filter-btn {
+      appearance: none;
+      border: 1px solid var(--border);
+      background: rgba(15, 23, 42, 0.72);
+      color: var(--muted);
+      border-radius: 999px;
+      padding: 4px 10px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .filter-btn.active {
+      color: var(--text);
+      border-color: var(--cyan);
+      background: rgba(56, 189, 248, 0.18);
+    }
+    .agent-rows {
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+    .agent-card {
+      background: rgba(4, 9, 22, 0.66);
+      border: 1px solid rgba(100, 138, 205, 0.2);
+      border-radius: 13px;
+      padding: 9px 11px;
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+    .agent-card.highlight {
+      border-color: var(--cyan);
+      box-shadow: 0 0 16px rgba(56, 189, 248, 0.28);
+    }
+    .agent-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .agent-id {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      font-weight: 700;
+      font-size: 13px;
+    }
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 999px;
+      flex-shrink: 0;
+    }
+    .agent-metrics {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+      font-size: 10.5px;
+      color: var(--muted);
+      font-family: var(--font-mono);
+    }
+
+    /* Compact list items for Dream Ledger & Pulses */
+    .compact-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .compact-row {
+      background: rgba(4, 9, 22, 0.56);
+      border: 1px solid rgba(100, 138, 205, 0.16);
+      border-radius: 10px;
+      padding: 7px 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 11px;
+      font-family: var(--font-mono);
+    }
+    .compact-main {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* Sticky Bottom Navigation Bar */
+    .bottom-nav {
+      position: fixed;
+      left: 50%;
+      transform: translateX(-50%);
+      bottom: max(10px, env(safe-area-inset-bottom));
+      width: calc(100% - 20px);
+      max-width: 500px;
+      z-index: 50;
+      padding: 6px;
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 4px;
+      border-radius: 999px;
+      background: rgba(7, 12, 26, 0.92);
+      border: 1px solid rgba(125, 211, 252, 0.32);
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.72);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+    }
+    .nav-btn {
+      appearance: none;
+      border: none;
+      background: transparent;
+      color: var(--muted);
+      padding: 7px 4px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+      text-align: center;
+      white-space: nowrap;
+    }
+    .nav-btn.active {
+      background: rgba(56, 189, 248, 0.2);
+      color: #e0f2fe;
+      box-shadow: inset 0 0 0 1px rgba(56, 189, 248, 0.45);
+    }
+    .meta-footer {
+      text-align: center;
+      font-size: 10.5px;
+      color: var(--muted);
+      font-family: var(--font-mono);
+      padding: 6px 8px 12px 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="shell" id="top-sec">
+    <header class="glass top-bar">
+      <div class="brand">
+        <div class="orb" id="header-orb"></div>
+        <div style="min-width:0;">
+          <div class="brand-title">Pocket Cortex · Hive Memory</div>
+          <div class="brand-sub">reader: <span id="m-reader">${readerName}</span> · metadata-only · zero claim text</div>
+        </div>
+      </div>
+      <div class="top-actions">
+        <span id="m-sse-pill" class="pill info">LIVE</span>
+        <button id="m-desktop-btn" class="btn-ghost" type="button" title="Open full 3D Cortex Observatory">3D View</button>
+      </div>
+    </header>
+
+    <section class="glass cortex-hero" aria-label="Animated Pocket Cortex neural telemetry">
+      <canvas id="pocket-cortex" width="480" height="206"></canvas>
+      <div class="cortex-overlay-top">
+        <span id="m-store-pill" class="pill ok">${syncState}</span>
+        <span id="m-seq-pill" class="pill">seq #-</span>
+      </div>
+      <div class="cortex-overlay-bottom">
+        <span id="m-canvas-caption">Tap any orbiting agent ganglion to inspect</span>
+        <span id="m-poll-age">polled just now</span>
+      </div>
+    </section>
+
+    <section id="m-health-banner" class="glass health-banner healthy" role="status">
+      <div class="health-headline">
+        <span id="m-health-title">✓ Brain Healthy · Saving Open</span>
+        <span id="m-alert-count" class="pill ok">0 alerts</span>
+      </div>
+      <div id="m-alert-list" class="alert-list"></div>
+    </section>
+
+    <section class="vitals-grid" id="velocity-sec">
+      <div class="glass vital-card">
+        <div class="vital-label">
+          <span>New Memory</span>
+          <span id="v-write-badge" class="pill ok" style="padding:1px 6px;font-size:9.5px;">1h</span>
+        </div>
+        <div id="v-write-val" class="vital-val" style="color:var(--emerald);">0/hr</div>
+        <div id="v-write-sub" class="vital-sub">24h: 0 · last: -</div>
+        <svg id="svg-write-spark" class="spark-svg" viewBox="0 0 160 30" preserveAspectRatio="none"></svg>
+      </div>
+
+      <div class="glass vital-card">
+        <div class="vital-label">
+          <span>Recall Velocity</span>
+          <span id="v-recall-badge" class="pill info" style="padding:1px 6px;font-size:9.5px;">5m/1h</span>
+        </div>
+        <div id="v-recall-val" class="vital-val" style="color:var(--cyan);">0/hr</div>
+        <div id="v-recall-sub" class="vital-sub">5m: 0 · hit: 0%</div>
+        <svg id="svg-recall-spark" class="spark-svg" viewBox="0 0 160 30" preserveAspectRatio="none"></svg>
+      </div>
+
+      <div class="glass vital-card">
+        <div class="vital-label">
+          <span>Coherence 2.0</span>
+          <span id="v-coh-delta" class="pill ok" style="padding:1px 6px;font-size:9.5px;">+0%</span>
+        </div>
+        <div id="v-coh-val" class="vital-val" style="color:#6ee7b7;">0%</div>
+        <div id="v-coh-sub" class="vital-sub">core 0% · periph 0%</div>
+        <svg id="svg-coh-spark" class="spark-svg" viewBox="0 0 160 30" preserveAspectRatio="none"></svg>
+      </div>
+
+      <div class="glass vital-card">
+        <div class="vital-label">
+          <span>Synaptic Eff</span>
+          <span id="v-eff-badge" class="pill violet" style="padding:1px 6px;font-size:9.5px;">4-axis</span>
+        </div>
+        <div id="v-eff-val" class="vital-val" style="color:var(--violet);">0%</div>
+        <div id="v-eff-sub" class="vital-sub">R→W 0% · handoff -</div>
+        <svg id="svg-eff-spark" class="spark-svg" viewBox="0 0 160 30" preserveAspectRatio="none"></svg>
+      </div>
+    </section>
+
+    <section class="glass section-card">
+      <div class="section-head">
+        <h2 class="section-title" style="color:var(--cyan);">⚡ Synaptic Velocity &amp; Flow</h2>
+        <span id="flow-window-pill" class="pill info">12h / 60m</span>
+      </div>
+      <div class="sub-grid-3">
+        <div class="stat-box">
+          <span class="stat-k">Writes (1h / 6h)</span>
+          <span id="f-writes-1h6h" class="stat-v" style="color:var(--emerald);">0 / 0</span>
+          <span id="f-writes-24h" class="stat-s">24h: 0 (0/hr)</span>
+        </div>
+        <div class="stat-box">
+          <span class="stat-k">Recalls (5m / 1h)</span>
+          <span id="f-recalls-5m1h" class="stat-v" style="color:var(--cyan);">0 / 0</span>
+          <span id="f-recalls-wq" class="stat-s">0 wakes · 0 queries</span>
+        </div>
+        <div class="stat-box">
+          <span class="stat-k">Recall Reach</span>
+          <span id="f-coverage" class="stat-v" style="color:#93c5fd;">0%</span>
+          <span id="f-hit-rate" class="stat-s">query hit: 0%</span>
+        </div>
+      </div>
+      <div class="compact-list" id="m-pulse-list"></div>
+    </section>
+
+    <section class="glass section-card" id="health-sec">
+      <div class="section-head">
+        <h2 class="section-title" style="color:#6ee7b7;">🧭 Coherence &amp; Synaptic Efficiency</h2>
+        <span id="m-drift-pill" class="pill ok">aligned</span>
+      </div>
+      <div class="sub-grid-2">
+        <div class="stat-box">
+          <span class="stat-k">Core Canon + Class B</span>
+          <span id="c-core-score" class="stat-v" style="color:var(--gold);">0%</span>
+          <span id="c-grounded" class="stat-s">0 grounded · 0 shared refs</span>
+        </div>
+        <div class="stat-box">
+          <span class="stat-k">State Compression</span>
+          <span id="e-compress" class="stat-v" style="color:var(--violet);">0%</span>
+          <span id="e-durable" class="stat-s">0 durable / 0 status</span>
+        </div>
+      </div>
+      <div style="font-size:11px;font-weight:700;color:#6ee7b7;margin-top:2px;">5-Axis Hive Coherence</div>
+      <div class="axis-list" id="m-coh-axes"></div>
+      <div style="font-size:11px;font-weight:700;color:var(--cyan);margin-top:4px;">4-Axis Synaptic Efficiency</div>
+      <div class="axis-list" id="m-eff-axes"></div>
+    </section>
+
+    <section class="glass section-card" id="backup-sec">
+      <div class="section-head">
+        <h2 class="section-title" style="color:var(--gold);">🛡️ Backup State &amp; Write Fence</h2>
+        <span id="b-status-pill" class="pill ok">VERIFIED</span>
+      </div>
+      <div class="sub-grid-3">
+        <div class="stat-box">
+          <span class="stat-k">Backup Age</span>
+          <span id="b-age-val" class="stat-v">-</span>
+          <span id="b-fence-sub" class="stat-s">fence at 60m</span>
+        </div>
+        <div class="stat-box">
+          <span class="stat-k">Unbacked Writes</span>
+          <span id="b-unbacked-val" class="stat-v">0</span>
+          <span id="b-seq-sub" class="stat-s">head seq #-</span>
+        </div>
+        <div class="stat-box">
+          <span class="stat-k">Saving Gate</span>
+          <span id="b-saving-val" class="stat-v" style="color:var(--ok);">OPEN</span>
+          <span id="b-fenced-sub" class="stat-s">0 fenced seats</span>
+        </div>
+      </div>
+      <div class="axis-row">
+        <div class="axis-meta">
+          <span class="axis-name">Backup Window Freshness (3600s limit)</span>
+          <span id="b-fresh-pct" class="axis-score">100%</span>
+        </div>
+        <div class="bar-track">
+          <div id="b-fresh-bar" class="bar-fill" style="width:100%;background:linear-gradient(90deg,#22c55e,#38bdf8);"></div>
+        </div>
+      </div>
+      <div class="stat-box" style="background:rgba(2,6,23,0.72);">
+        <span class="stat-k">Last Verified Backup Receipt</span>
+        <span id="b-receipt-main" class="stat-v" style="font-size:13px;color:#fde68a;">receipt seq #- · -</span>
+        <span id="b-receipt-sub" class="stat-s">snapshot: -</span>
+      </div>
+    </section>
+
+    <section class="glass section-card" id="dream-sec">
+      <div class="section-head">
+        <h2 class="section-title" style="color:var(--violet);">🌙 Merkle Dream &amp; Curator</h2>
+        <span id="d-mode-pill" class="pill violet">OBSERVED</span>
+      </div>
+      <div class="sub-grid-3">
+        <div class="stat-box">
+          <span class="stat-k">Last Dream</span>
+          <span id="d-last-val" class="stat-v" style="color:#ddd6fe;">-</span>
+          <span id="d-last-seq" class="stat-s">curated seq #-</span>
+        </div>
+        <div class="stat-box">
+          <span class="stat-k">Merkle Syntheses</span>
+          <span id="d-merkle-val" class="stat-v" style="color:var(--violet);">0</span>
+          <span id="d-folded-sub" class="stat-s">0 sources folded</span>
+        </div>
+        <div class="stat-box">
+          <span class="stat-k">Wake Savings</span>
+          <span id="d-savings-val" class="stat-v" style="color:var(--emerald);">0%</span>
+          <span id="d-planned-sub" class="stat-s">0 planned next</span>
+        </div>
+      </div>
+      <div class="axis-list" id="d-trigger-bars"></div>
+      <div style="font-size:11px;font-weight:700;color:#c4b5fd;">Recent Dream Consolidations &amp; Eigen-Axes (Metadata Only)</div>
+      <div class="compact-list" id="d-ledger-list"></div>
+    </section>
+
+    <section class="glass section-card" id="agents-sec">
+      <div class="section-head">
+        <h2 class="section-title" style="color:#93c5fd;">🐝 Per-Agent Usage Status</h2>
+        <span id="a-summary-pill" class="pill info">0 active</span>
+      </div>
+      <div class="filter-row" id="a-filter-row">
+        <button class="filter-btn active" type="button" data-filter="all">All Seats</button>
+        <button class="filter-btn" type="button" data-filter="active">Active / Warm</button>
+        <button class="filter-btn" type="button" data-filter="writers">Writers</button>
+        <button class="filter-btn" type="button" data-filter="alerts">Drift / Fenced</button>
+      </div>
+      <div class="agent-rows" id="m-agent-list"></div>
+    </section>
+
+    <section class="glass section-card">
+      <div class="section-head">
+        <h2 class="section-title" style="color:var(--emerald);">📚 Memory Tiers &amp; Topic Pressure</h2>
+        <span id="t-total-pill" class="pill">0 claims</span>
+      </div>
+      <div class="sub-grid-3">
+        <div class="stat-box">
+          <span class="stat-k">Rank 2 Canon</span>
+          <span id="t-canon" class="stat-v" style="color:var(--gold);">0</span>
+          <span class="stat-s">James canon</span>
+        </div>
+        <div class="stat-box">
+          <span class="stat-k">Class B Durable</span>
+          <span id="t-decisions" class="stat-v" style="color:var(--violet);">0</span>
+          <span class="stat-s">ttl_sec: 0</span>
+        </div>
+        <div class="stat-box">
+          <span class="stat-k">Graph Edges</span>
+          <span id="t-edges" class="stat-v" style="color:var(--cyan);">0</span>
+          <span id="t-unverified" class="stat-s">0 unverified</span>
+        </div>
+      </div>
+      <div class="axis-list" id="m-topic-bars"></div>
+    </section>
+
+    <footer class="meta-footer">
+      Hive Memory Pocket Cortex · DATA ONLY (authority=null, trustedInstruction=false) · Metadata-Only Stream
+    </footer>
+  </div>
+
+  <nav class="bottom-nav" aria-label="Pocket Cortex section jump">
+    <button class="nav-btn active" type="button" data-jump="top-sec">Brain</button>
+    <button class="nav-btn" type="button" data-jump="velocity-sec">Velocity</button>
+    <button class="nav-btn" type="button" data-jump="health-sec">Coherence</button>
+    <button class="nav-btn" type="button" data-jump="dream-sec">Dream</button>
+    <button class="nav-btn" type="button" data-jump="agents-sec">Agents</button>
+  </nav>
+
+  <script id="initial-mobile-state" type="application/json">${escapedInitial}</script>
+  <script>
+    (function () {
+      'use strict';
+      var el = function (id) { return document.getElementById(id); };
+      var AGENT_META = {
+        james: { name: 'James', color: '#fbbf24' },
+        biggy: { name: 'Biggy', color: '#818cf8' },
+        rabidrabbit: { name: 'RabidRabbit', color: '#f59e0b' },
+        'dead-rabbit': { name: 'Dead Rabbit', color: '#f59e0b' },
+        mydude: { name: 'My Dude', color: '#10b981' },
+        neil: { name: 'Neil', color: '#38bdf8' },
+        'waggle-dev': { name: 'Waggle-Dev', color: '#fb923c' },
+        crystalclaude: { name: 'CrystalClaude', color: '#f472b6' },
+        'dj-codex': { name: 'DJ-Codex', color: '#34d399' },
+        djcodex: { name: 'DJ Codex', color: '#34d399' },
+        dennis: { name: 'Dennis', color: '#60a5fa' },
+        kerouac: { name: 'Kerouac', color: '#c084fc' },
+        grokdoggydog: { name: 'GrokDoggyDog', color: '#f87171' },
+        'pi-dog': { name: 'Pi-Dog', color: '#2dd4bf' },
+        lukedog: { name: 'LukeDog', color: '#a3e635' },
+        'mc-claude': { name: 'MC-Claude', color: '#e879f9' },
+        curator: { name: 'Curator', color: '#a78bfa' }
+      };
+      var FALLBACK_COLORS = ['#38bdf8', '#a78bfa', '#34d399', '#f472b6', '#fbbf24', '#60a5fa', '#fb923c'];
+
+      function agentInfo(id, idx) {
+        var key = String(id || '').toLowerCase();
+        if (AGENT_META[key]) return AGENT_META[key];
+        return { name: String(id || 'agent'), color: FALLBACK_COLORS[idx % FALLBACK_COLORS.length] };
+      }
+
+      function fmtDur(sec) {
+        if (sec === null || sec === undefined || !Number.isFinite(sec)) return '-';
+        var s = Math.max(0, Math.floor(sec));
+        if (s < 60) return s + 's';
+        if (s < 3600) return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+        if (s < 86400) return Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
+        return Math.floor(s / 86400) + 'd ' + Math.floor((s % 86400) / 3600) + 'h';
+      }
+
+      function fmtAgo(ts, nowSec) {
+        if (!ts || !Number.isFinite(ts)) return 'never';
+        return fmtDur(Math.max(0, nowSec - ts)) + ' ago';
+      }
+
+      function fmtUtcShort(ts) {
+        if (!ts || !Number.isFinite(ts)) return '-';
+        try {
+          var d = new Date(ts * 1000);
+          return d.toISOString().replace('T', ' ').slice(5, 19) + 'Z';
+        } catch (_) {
+          return '-';
+        }
+      }
+
+      function esc(str) {
+        return String(str == null ? '' : str)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;');
+      }
+
+      function drawSparkline(svgEl, values, strokeColor, fillColor) {
+        if (!svgEl) return;
+        var nums = Array.isArray(values) && values.length > 0 ? values.map(function (v) { return Number(v) || 0; }) : [0, 0];
+        if (nums.length === 1) nums = [nums[0], nums[0]];
+        var w = 160;
+        var h = 30;
+        var max = Math.max.apply(null, nums.concat([1]));
+        var min = Math.min.apply(null, nums.concat([0]));
+        var span = Math.max(1, max - min);
+        var pts = nums.map(function (v, i) {
+          var x = (i / (nums.length - 1)) * w;
+          var y = h - 3 - ((v - min) / span) * (h - 7);
+          return x.toFixed(1) + ',' + y.toFixed(1);
+        });
+        var poly = pts.join(' ');
+        var area = '0,' + h + ' ' + poly + ' ' + w + ',' + h;
+        svgEl.innerHTML =
+          '<polygon points="' + area + '" fill="' + fillColor + '"></polygon>' +
+          '<polyline points="' + poly + '" fill="none" stroke="' + strokeColor + '" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></polyline>';
+      }
+
+      function renderAxisBars(container, rows) {
+        if (!container) return;
+        container.innerHTML = rows.map(function (r) {
+          var pct = Math.max(0, Math.min(100, Math.round(Number(r.pct) || 0)));
+          return (
+            '<div class="axis-row">' +
+              '<div class="axis-meta">' +
+                '<span class="axis-name">' + esc(r.label) + '</span>' +
+                '<span class="axis-score" style="color:' + r.color + ';">' + esc(r.valText != null ? r.valText : (pct + '%')) + '</span>' +
+              '</div>' +
+              '<div class="bar-track">' +
+                '<div class="bar-fill" style="width:' + pct + '%;background:' + r.color + ';"></div>' +
+              '</div>' +
+            '</div>'
+          );
+        }).join('');
+      }
+
+      var currentData = null;
+      var agentFilter = 'all';
+      var selectedAgentId = null;
+
+      function renderAgentsList(data) {
+        var container = el('m-agent-list');
+        if (!container || !data || !data.agents) return;
+        var nowSec = data.polled_at || Math.floor(Date.now() / 1000);
+        var roster = Array.isArray(data.agents.roster) ? data.agents.roster : [];
+        var filtered = roster.filter(function (a) {
+          if (agentFilter === 'active') return a.health === 'active' || a.health === 'warm';
+          if (agentFilter === 'writers') return Boolean(a.is_writer);
+          if (agentFilter === 'alerts') {
+            return a.fenced || a.health === 'error' || (a.compliance_status && a.compliance_status !== 'compliant') || a.refusals_15m > 0;
+          }
+          return true;
+        });
+        if (filtered.length === 0) {
+          container.innerHTML = '<div class="stat-box"><span class="stat-s">No seats match filter (' + esc(agentFilter) + ').</span></div>';
+          return;
+        }
+        container.innerHTML = filtered.map(function (a, i) {
+          var info = agentInfo(a.id, i);
+          var hClass = a.health === 'active' ? 'ok' : a.health === 'warm' ? 'info' : a.health === 'error' ? 'err' : '';
+          var compBadge = '';
+          if (a.fenced) {
+            compBadge = '<span class="pill err">FENCED</span>';
+          } else if (a.compliance_status && a.compliance_status !== 'compliant') {
+            compBadge = '<span class="pill warn">' + esc(a.compliance_status.replace(/_/g, ' ')) + '</span>';
+          }
+          var hi = selectedAgentId && selectedAgentId === a.id ? ' highlight' : '';
+          return (
+            '<div class="agent-card' + hi + '" data-agent-id="' + esc(a.id) + '">' +
+              '<div class="agent-top">' +
+                '<div class="agent-id">' +
+                  '<span class="dot" style="background:' + info.color + ';box-shadow:0 0 8px ' + info.color + ';"></span>' +
+                  '<span>' + esc(info.name) + '</span>' +
+                  '<span style="font-size:10px;color:var(--muted);font-family:var(--font-mono);">@' + esc(a.id) + '</span>' +
+                '</div>' +
+                '<div style="display:flex;gap:4px;align-items:center;">' +
+                  compBadge +
+                  '<span class="pill ' + hClass + '">' + esc(a.health) + '</span>' +
+                '</div>' +
+              '</div>' +
+              '<div class="agent-metrics">' +
+                '<span>5m: <b>' + a.reads_5m + 'R / ' + a.writes_5m + 'W</b></span>' +
+                '<span>claims: <b>' + a.active_claims + '</b></span>' +
+                '<span>coh: <b>' + a.coherence_score + '%</b></span>' +
+                '<span>recall: ' + esc(fmtAgo(a.last_recall_at, nowSec)) + '</span>' +
+                '<span>write: ' + esc(fmtAgo(a.last_write_at, nowSec)) + (a.last_write_slug ? ' (' + esc(a.last_write_slug.slice(0, 22)) + ')' : '') + '</span>' +
+              '</div>' +
+            '</div>'
+          );
+        }).join('');
+      }
+
+      function renderMobile(data) {
+        if (!data || typeof data !== 'object') return;
+        currentData = data;
+        var nowSec = data.polled_at || Math.floor(Date.now() / 1000);
+        var ss = data.store_state || {};
+        var bk = data.backup || {};
+        var vel = data.velocities || {};
+        var nm = vel.new_memory || {};
+        var rc = vel.recall || {};
+        var coh = data.coherence || {};
+        var eff = data.synaptic_efficiency || data.efficacy || {};
+        var dr = data.dreams || {};
+        var ag = data.agents || {};
+        var vt = data.vitals || {};
+
+        if (el('m-reader')) el('m-reader').textContent = data.reader || 'viewer';
+        var stPill = el('m-store-pill');
+        if (stPill) {
+          stPill.textContent = ss.state || (data.connected ? 'READY' : 'OFFLINE');
+          stPill.className = 'pill ' + (ss.state === 'READY' && data.connected ? 'ok' : 'err');
+        }
+        if (el('m-seq-pill')) {
+          el('m-seq-pill').textContent = 'seq #' + (ss.write_seq ?? '-') + ' · ' + (ss.current_claims ?? 0) + ' claims';
+        }
+        if (el('m-poll-age')) {
+          el('m-poll-age').textContent = 'poll #' + (data.poll_seq || 0) + ' · ' + fmtUtcShort(nowSec);
+        }
+
+        // Health & Alerts Banner
+        var alerts = Array.isArray(data.alerts) ? data.alerts : [];
+        var banner = el('m-health-banner');
+        var hTitle = el('m-health-title');
+        var aCount = el('m-alert-count');
+        var aList = el('m-alert-list');
+        var hasCrit = alerts.some(function (a) { return a.severity === 'critical'; });
+        if (banner) {
+          banner.className = 'glass health-banner ' + (hasCrit ? 'critical' : alerts.length > 0 ? 'alerting' : 'healthy');
+        }
+        if (hTitle) {
+          hTitle.textContent = hasCrit
+            ? '⚠ Critical Memory Alert Active'
+            : alerts.length > 0
+              ? '⚡ Brain Active · ' + alerts.length + ' Advisory Notice' + (alerts.length === 1 ? '' : 's')
+              : '✓ Brain Healthy · Saving Open · Backup Verified';
+        }
+        if (aCount) {
+          aCount.textContent = alerts.length + (alerts.length === 1 ? ' alert' : ' alerts');
+          aCount.className = 'pill ' + (hasCrit ? 'err' : alerts.length > 0 ? 'warn' : 'ok');
+        }
+        if (aList) {
+          aList.innerHTML = alerts.slice(0, 6).map(function (a) {
+            return (
+              '<div class="alert-item ' + (a.severity === 'critical' ? 'critical' : 'warn') + '">' +
+                '<span>' + esc(a.summary) + '</span>' +
+                '<span style="font-family:var(--font-mono);font-size:10px;opacity:0.8;">' + esc(fmtAgo(a.at, nowSec)) + '</span>' +
+              '</div>'
+            );
+          }).join('');
+        }
+
+        // 2x2 Hero Vitals
+        if (el('v-write-val')) el('v-write-val').textContent = (nm.writes_1h || 0) + '/hr';
+        if (el('v-write-sub')) {
+          el('v-write-sub').textContent = '24h: ' + (nm.writes_24h || 0) + ' · last ' + fmtAgo(nm.last_write_at, nowSec);
+        }
+        drawSparkline(el('svg-write-spark'), nm.sparkline_12h || [0, 0], '#34d399', 'rgba(52, 211, 153, 0.18)');
+
+        if (el('v-recall-val')) el('v-recall-val').textContent = (rc.recalls_1h || 0) + '/hr';
+        if (el('v-recall-sub')) {
+          el('v-recall-sub').textContent = '5m: ' + (rc.recalls_5m || 0) + ' (' + (rc.rate_per_min_5m || 0) + '/m) · hit ' + Math.round(rc.query_hit_rate_pct || 0) + '%';
+        }
+        drawSparkline(el('svg-recall-spark'), rc.sparkline_60m || [0, 0], '#38bdf8', 'rgba(56, 189, 248, 0.18)');
+
+        var delta = Number(coh.delta_since_inception || 0);
+        if (el('v-coh-val')) el('v-coh-val').textContent = Math.round(coh.score || 0) + '%';
+        if (el('v-coh-delta')) {
+          el('v-coh-delta').textContent = (delta >= 0 ? '+' : '') + delta.toFixed(1) + '%';
+          el('v-coh-delta').className = 'pill ' + (delta >= 0 ? 'ok' : 'warn');
+        }
+        if (el('v-coh-sub')) {
+          el('v-coh-sub').textContent = 'core ' + Math.round(coh.core_memory_score || 0) + '% · periph ' + Math.round(coh.periphery_coherence_score || 0) + '%';
+        }
+        var cohPts = Array.isArray(coh.history) && coh.history.length > 0
+          ? coh.history.map(function (h) { return h.score; })
+          : [coh.inception_score || 0, coh.score || 0];
+        drawSparkline(el('svg-coh-spark'), cohPts, '#6ee7b7', 'rgba(110, 231, 183, 0.18)');
+
+        if (el('v-eff-val')) el('v-eff-val').textContent = Math.round(eff.score || 0) + '%';
+        var medH = eff.handoff && eff.handoff.median_handoff_min != null ? (eff.handoff.median_handoff_min + 'm') : '-';
+        if (el('v-eff-sub')) {
+          el('v-eff-sub').textContent = 'R→W ' + Math.round((eff.retrieval && eff.retrieval.read_before_write_pct) || 0) + '% · handoff ' + medH;
+        }
+        var effAxes = eff.axes || {};
+        drawSparkline(
+          el('svg-eff-spark'),
+          [effAxes.breadth || 0, effAxes.precision || 0, effAxes.velocity || 0, effAxes.reuse || 0, eff.score || 0],
+          '#a78bfa',
+          'rgba(167, 139, 250, 0.18)'
+        );
+
+        // Velocity & Flow details
+        if (el('f-writes-1h6h')) el('f-writes-1h6h').textContent = (nm.writes_1h || 0) + ' / ' + (nm.writes_6h || 0);
+        if (el('f-writes-24h')) el('f-writes-24h').textContent = '24h: ' + (nm.writes_24h || 0) + ' (' + (nm.rate_per_hour_24h || 0) + '/hr)';
+        if (el('f-recalls-5m1h')) el('f-recalls-5m1h').textContent = (rc.recalls_5m || 0) + ' / ' + (rc.recalls_1h || 0);
+        if (el('f-recalls-wq')) el('f-recalls-wq').textContent = (rc.wakes_window || 0) + ' wakes · ' + (rc.queries_window || 0) + ' queries';
+        if (el('f-coverage')) el('f-coverage').textContent = Math.round(rc.recall_coverage_pct || 0) + '%';
+        if (el('f-hit-rate')) el('f-hit-rate').textContent = 'query hit: ' + Math.round(rc.query_hit_rate_pct || 0) + '% (' + (rc.recalling_agents || 0) + '/' + (rc.active_agents || 0) + ' seats)';
+
+        var pulses = Array.isArray(vt.recent_pulses) ? vt.recent_pulses : [];
+        var pulseEl = el('m-pulse-list');
+        if (pulseEl) {
+          pulseEl.innerHTML = pulses.slice(0, 5).map(function (p) {
+            var badgeCls = p.kind === 'submit' ? (p.accepted === false ? 'err' : 'ok') : 'info';
+            var desc = p.kind === 'submit'
+              ? ('write ' + (p.slug || p.scope || ''))
+              : p.kind === 'query'
+                ? ('query (' + (p.hits ?? 0) + ' hits)')
+                : ('wake (' + (p.count ?? 0) + ' recs)');
+            return (
+              '<div class="compact-row">' +
+                '<span class="compact-main"><span class="pill ' + badgeCls + '" style="padding:1px 6px;margin-right:6px;">' + esc(p.kind) + '</span><b>@' + esc(p.actor) + '</b> · ' + esc(desc) + '</span>' +
+                '<span style="color:var(--muted);flex-shrink:0;">' + esc(fmtAgo(p.at, nowSec)) + '</span>' +
+              '</div>'
+            );
+          }).join('');
+        }
+
+        // Coherence & Synaptic Efficiency axes
+        if (el('m-drift-pill')) {
+          var ds = coh.drift_status || 'aligned';
+          el('m-drift-pill').textContent = ds.replace(/_/g, ' ');
+          el('m-drift-pill').className = 'pill ' + (ds === 'aligned' ? 'ok' : 'warn');
+        }
+        if (el('c-core-score')) el('c-core-score').textContent = Math.round(coh.core_memory_score || 0) + '%';
+        var cc = coh.counts || {};
+        if (el('c-grounded')) el('c-grounded').textContent = (cc.grounded_claims || 0) + ' grounded · ' + (cc.shared_artifacts || 0) + ' shared refs';
+        if (el('e-compress')) el('e-compress').textContent = Math.round((eff.reuse && eff.reuse.state_compression_pct) || 0) + '%';
+        if (el('e-durable')) el('e-durable').textContent = ((eff.reuse && eff.reuse.durable_claims) || 0) + ' durable / ' + ((eff.reuse && eff.reuse.raw_class_a_claims) || 0) + ' status';
+
+        var ca = coh.axes || {};
+        renderAxisBars(el('m-coh-axes'), [
+          { label: 'Canon Alignment', pct: ca.alignment, color: '#fbbf24' },
+          { label: 'Evidence Grounding', pct: ca.grounding, color: '#34d399' },
+          { label: 'Cross-Agent Convergence', pct: ca.convergence, color: '#38bdf8' },
+          { label: 'Recall-Before-Write Coupling', pct: ca.coupling, color: '#818cf8' },
+          { label: 'Lifecycle Hygiene', pct: ca.consolidation, color: '#a78bfa' }
+        ]);
+        renderAxisBars(el('m-eff-axes'), [
+          { label: 'Distribution Breadth (Recall Coverage)', pct: effAxes.breadth, color: '#38bdf8' },
+          { label: 'Retrieval Precision (Query Hit + R→W)', pct: effAxes.precision, color: '#34d399' },
+          { label: 'Cross-Agent Handoff Velocity', pct: effAxes.velocity, color: '#fbbf24' },
+          { label: 'State Compression & Corroboration', pct: effAxes.reuse, color: '#a78bfa' }
+        ]);
+
+        // Backup & Write-Fence Card
+        var bStatus = bk.status || 'verified_clean';
+        var bPill = el('b-status-pill');
+        if (bPill) {
+          bPill.textContent = bStatus.replace(/_/g, ' ').toUpperCase();
+          bPill.className = 'pill ' + (bStatus === 'verified_clean' ? 'ok' : bStatus === 'dirty_open' ? 'info' : 'err');
+        }
+        if (el('b-age-val')) el('b-age-val').textContent = bk.age_sec != null ? fmtDur(bk.age_sec) : 'none';
+        if (el('b-unbacked-val')) {
+          el('b-unbacked-val').textContent = String(bk.unbacked_writes ?? '-');
+          el('b-unbacked-val').style.color = (bk.unbacked_writes || 0) === 0 ? '#22c55e' : '#fbbf24';
+        }
+        if (el('b-seq-sub')) el('b-seq-sub').textContent = 'head seq #' + (ss.write_seq ?? '-');
+        var bw = bk.watch || {};
+        var sav = String(bw.saving || 'open').toUpperCase();
+        if (el('b-saving-val')) {
+          el('b-saving-val').textContent = sav;
+          el('b-saving-val').style.color = sav === 'OPEN' ? '#22c55e' : sav === 'OFF' ? '#ef4444' : '#f59e0b';
+        }
+        var fList = Array.isArray(bw.fenced) ? bw.fenced : [];
+        if (el('b-fenced-sub')) el('b-fenced-sub').textContent = fList.length ? ('fenced: ' + fList.join(', ')) : '0 fenced seats';
+        var freshPct = Number(bk.freshness_pct ?? 0);
+        if (el('b-fresh-pct')) el('b-fresh-pct').textContent = freshPct + '%';
+        if (el('b-fresh-bar')) {
+          el('b-fresh-bar').style.width = freshPct + '%';
+          el('b-fresh-bar').style.background = freshPct > 25 ? 'linear-gradient(90deg,#22c55e,#38bdf8)' : '#ef4444';
+        }
+        var rec = bk.last_receipt || {};
+        if (el('b-receipt-main')) {
+          el('b-receipt-main').textContent =
+            rec.write_seq != null
+              ? ('receipt seq #' + rec.write_seq + ' · ' + fmtUtcShort(rec.at) + ' (' + fmtAgo(rec.at, nowSec) + ')')
+              : 'No verified backup receipt recorded';
+        }
+        if (el('b-receipt-sub')) {
+          el('b-receipt-sub').textContent = 'snapshot: ' + (rec.snapshot_id ? rec.snapshot_id : 'verified via store_state');
+        }
+
+        // Dream & Curator Card
+        if (el('d-mode-pill')) {
+          el('d-mode-pill').textContent = dr.persisted_curation ? 'OBSERVED MERKLE' : 'PREVIEW MODE';
+          el('d-mode-pill').className = 'pill ' + (dr.persisted_curation ? 'ok' : 'violet');
+        }
+        if (el('d-last-val')) el('d-last-val').textContent = dr.last_curated_at ? fmtAgo(dr.last_curated_at, nowSec) : 'pending';
+        if (el('d-last-seq')) el('d-last-seq').textContent = 'curated seq #' + (dr.last_curated_write_seq || 0);
+        var dc = dr.counts || {};
+        if (el('d-merkle-val')) el('d-merkle-val').textContent = String(dc.merkle_syntheses || 0);
+        if (el('d-folded-sub')) el('d-folded-sub').textContent = (dc.consolidated_sources || 0) + ' sources folded';
+        if (el('d-savings-val')) el('d-savings-val').textContent = (dc.wake_savings_pct || 0) + '%';
+        var ps = dr.planned_summary || {};
+        var totalPlanned = (ps.promotions || 0) + (ps.distillations || 0) + (ps.solidifications || 0);
+        if (el('d-planned-sub')) el('d-planned-sub').textContent = totalPlanned + ' ready for next dream';
+
+        var elap = Number(dr.elapsed_sec || 0);
+        var dInt = Math.max(1, Number(dr.dream_interval_sec || 28800));
+        var wDelta = Number(dr.write_delta || 0);
+        var wThresh = Math.max(1, Number(dr.write_delta_threshold || 25));
+        renderAxisBars(el('d-trigger-bars'), [
+          {
+            label: 'Trigger 1 · Circadian Cycle (' + fmtDur(elap) + ' / ' + fmtDur(dInt) + ')',
+            pct: Math.min(100, Math.round((elap / dInt) * 100)),
+            valText: dr.triggers && dr.triggers.circadian_dream ? 'READY' : Math.min(100, Math.round((elap / dInt) * 100)) + '%',
+            color: dr.triggers && dr.triggers.circadian_dream ? '#22c55e' : '#38bdf8'
+          },
+          {
+            label: 'Trigger 2 · Synaptic Volume (' + wDelta + ' / ' + wThresh + ' writes)',
+            pct: Math.min(100, Math.round((wDelta / wThresh) * 100)),
+            valText: dr.triggers && dr.triggers.synaptic_volume ? 'READY' : (wDelta + '/' + wThresh),
+            color: dr.triggers && dr.triggers.synaptic_volume ? '#22c55e' : '#a78bfa'
+          },
+          {
+            label: 'Trigger 3 · Nightmare Interrupt (' + (dc.nightmares || 0) + ' conflicts/stale)',
+            pct: Math.min(100, (dc.nightmares || 0) * 25),
+            valText: dr.triggers && dr.triggers.nightmare_interrupt ? 'INTERRUPT' : '0 critical',
+            color: dr.triggers && dr.triggers.nightmare_interrupt ? '#ef4444' : '#34d399'
+          }
+        ]);
+
+        var dList = el('d-ledger-list');
+        if (dList) {
+          var cons = Array.isArray(dr.recent_consolidations) ? dr.recent_consolidations : [];
+          var eigs = Array.isArray(dr.eigenvectors) ? dr.eigenvectors : [];
+          var itemsHtml = cons.slice(0, 4).map(function (c) {
+            return (
+              '<div class="compact-row">' +
+                '<span class="compact-main"><span class="pill violet" style="padding:1px 6px;margin-right:6px;">#' + esc(c.topic) + '</span><b>' + esc(c.slug) + '</b> (' + c.source_count + ' folded · ' + esc(c.merkle_sources || '-') + ')</span>' +
+                '<span style="color:var(--muted);flex-shrink:0;">' + esc(fmtAgo(c.at, nowSec)) + '</span>' +
+              '</div>'
+            );
+          });
+          if (eigs.length > 0) {
+            itemsHtml.push(
+              '<div class="compact-row">' +
+                '<span class="compact-main"><span class="pill info" style="padding:1px 6px;margin-right:6px;">Eigen λ1</span><b>' + esc(eigs[0].label) + '</b> (' + eigs[0].variance_pct + '% var · ' + eigs[0].claim_count + ' claims)</span>' +
+                '<span style="color:var(--muted);flex-shrink:0;">' + (eigs[0].persisted ? 'persisted' : 'spectral') + '</span>' +
+              '</div>'
+            );
+          }
+          dList.innerHTML = itemsHtml.join('') || '<div class="stat-box"><span class="stat-s">No consolidations recorded yet.</span></div>';
+        }
+
+        // Per-Agent Usage
+        var aSum = ag.summary || {};
+        if (el('a-summary-pill')) {
+          el('a-summary-pill').textContent = (aSum.active_5m || 0) + ' active · ' + (aSum.warm_20m || 0) + ' warm / ' + (aSum.total || 0);
+        }
+        renderAgentsList(data);
+
+        // Tiers & Topic Pressure
+        var sc = vt.scope_counts || {};
+        if (el('t-total-pill')) el('t-total-pill').textContent = (ss.current_claims || 0) + ' active claims';
+        if (el('t-canon')) el('t-canon').textContent = String(sc.canon || 0);
+        if (el('t-decisions')) el('t-decisions').textContent = String(dc.class_b_decisions || 0);
+        if (el('t-edges')) el('t-edges').textContent = String((vt.entity_graph && vt.entity_graph.total_edges) || 0);
+        if (el('t-unverified')) el('t-unverified').textContent = (sc.unverified_total || 0) + ' unverified';
+
+        var topics = Array.isArray(vt.topics) ? vt.topics : [];
+        var maxTopic = Math.max.apply(null, topics.map(function (t) { return t.total || 0; }).concat([1]));
+        renderAxisBars(
+          el('m-topic-bars'),
+          topics.slice(0, 7).map(function (t) {
+            return {
+              label: '#' + t.topic + ' (' + t.above_the_line + ' durable · ' + t.below_the_line + ' status)',
+              pct: Math.round(((t.total || 0) / maxTopic) * 100),
+              valText: t.total + ' claims',
+              color: t.canon > 0 ? '#fbbf24' : t.merkle > 0 ? '#a78bfa' : '#38bdf8'
+            };
+          })
+        );
+      }
+
+      // --- Interactive 60fps Pocket Cortex Canvas ---
+      var canvas = el('pocket-cortex');
+      var ctx = canvas ? canvas.getContext('2d') : null;
+      var particles = [];
+      var nodePositions = [];
+      var animTick = 0;
+
+      function resizeCanvas() {
+        if (!canvas || !ctx) return;
+        var dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+        var rect = canvas.getBoundingClientRect();
+        var w = Math.max(300, Math.floor(rect.width));
+        var h = Math.max(180, Math.floor(rect.height));
+        if (canvas.width !== Math.floor(w * dpr) || canvas.height !== Math.floor(h * dpr)) {
+          canvas.width = Math.floor(w * dpr);
+          canvas.height = Math.floor(h * dpr);
+        }
+      }
+
+      function spawnParticle( rosterLen, isWrite ) {
+        if (rosterLen <= 0) return;
+        var idx = Math.floor(Math.random() * rosterLen);
+        particles.push({
+          idx: idx,
+          t: 0,
+          speed: 0.012 + Math.random() * 0.016,
+          isWrite: Boolean(isWrite),
+          color: isWrite ? '#34d399' : '#38bdf8'
+        });
+        if (particles.length > 36) particles.shift();
+      }
+
+      function drawPocketCortex() {
+        if (!canvas || !ctx) return;
+        resizeCanvas();
+        var dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+        var w = canvas.width / dpr;
+        var h = canvas.height / dpr;
+        ctx.save();
+        ctx.scale(dpr, dpr);
+        ctx.clearRect(0, 0, w, h);
+
+        animTick += 0.025;
+        var cx = w * 0.5;
+        var cy = h * 0.52;
+        var rx = Math.min(w * 0.39, 165);
+        var ry = Math.min(h * 0.35, 70);
+
+        var data = currentData || {};
+        var cohScore = (data.coherence && data.coherence.score) || 85;
+        var effScore = (data.synaptic_efficiency && data.synaptic_efficiency.score) || 80;
+        var roster = (data.agents && Array.isArray(data.agents.roster)) ? data.agents.roster : [];
+        var writes1h = (data.velocities && data.velocities.new_memory && data.velocities.new_memory.writes_1h) || 1;
+        var recalls5m = (data.velocities && data.velocities.recall && data.velocities.recall.recalls_5m) || 1;
+
+        if (Math.random() < Math.min(0.35, 0.04 + recalls5m * 0.015)) {
+          spawnParticle(roster.length, false);
+        }
+        if (Math.random() < Math.min(0.25, 0.02 + writes1h * 0.01)) {
+          spawnParticle(roster.length, true);
+        }
+
+        // Outer orbital rings
+        ctx.strokeStyle = 'rgba(99, 130, 190, 0.16)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+        ctx.stroke();
+
+        ctx.strokeStyle = 'rgba(167, 139, 250, 0.14)';
+        ctx.beginPath();
+        ctx.ellipse(cx, cy, rx * 0.62, ry * 0.62, 0, 0, Math.PI * 2);
+        ctx.stroke();
+
+        // Position agent ganglia around rim
+        nodePositions = [];
+        var count = Math.max(1, roster.length);
+        for (var i = 0; i < roster.length; i++) {
+          var a = roster[i];
+          var angle = -Math.PI / 2 + (i / count) * Math.PI * 2 + Math.sin(animTick * 0.35 + i) * 0.03;
+          var nx = cx + Math.cos(angle) * rx;
+          var ny = cy + Math.sin(angle) * ry;
+          var info = agentInfo(a.id, i);
+          nodePositions.push({ id: a.id, name: info.name, x: nx, y: ny, color: info.color, health: a.health });
+
+          // Synaptic filament from core to ganglion
+          ctx.strokeStyle = a.health === 'active'
+            ? 'rgba(56, 189, 248, 0.28)'
+            : a.health === 'warm'
+              ? 'rgba(148, 163, 184, 0.16)'
+              : 'rgba(71, 85, 105, 0.1)';
+          ctx.lineWidth = a.health === 'active' ? 1.4 : 0.9;
+          ctx.beginPath();
+          ctx.moveTo(cx, cy);
+          var ctrlX = (cx + nx) * 0.5 + Math.sin(angle) * 14;
+          var ctrlY = (cy + ny) * 0.5 - Math.cos(angle) * 10;
+          ctx.quadraticCurveTo(ctrlX, ctrlY, nx, ny);
+          ctx.stroke();
+        }
+
+        // Draw traveling synaptic particles
+        for (var pIdx = particles.length - 1; pIdx >= 0; pIdx--) {
+          var p = particles[pIdx];
+          p.t += p.speed;
+          if (p.t >= 1 || !nodePositions[p.idx]) {
+            particles.splice(pIdx, 1);
+            continue;
+          }
+          var target = nodePositions[p.idx];
+          var prog = p.isWrite ? (1 - p.t) : p.t;
+          var px = cx + (target.x - cx) * prog;
+          var py = cy + (target.y - cy) * prog;
+          ctx.fillStyle = p.color;
+          ctx.beginPath();
+          ctx.arc(px, py, 2.4, 0, Math.PI * 2);
+          ctx.fill();
+        }
+
+        // Central Cortex Core Orb
+        var pulseR = 22 + Math.sin(animTick * 2.1) * 2.5;
+        var grad = ctx.createRadialGradient(cx - 5, cy - 5, 2, cx, cy, pulseR * 1.9);
+        grad.addColorStop(0, 'rgba(165, 243, 252, 0.95)');
+        grad.addColorStop(0.4, 'rgba(56, 189, 248, 0.55)');
+        grad.addColorStop(0.75, 'rgba(167, 139, 250, 0.22)');
+        grad.addColorStop(1, 'rgba(4, 7, 17, 0)');
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.arc(cx, cy, pulseR * 1.9, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Coherence arc around core
+        ctx.strokeStyle = '#34d399';
+        ctx.lineWidth = 2.6;
+        ctx.beginPath();
+        ctx.arc(cx, cy, pulseR + 4, -Math.PI / 2, -Math.PI / 2 + (Math.PI * 2 * Math.min(100, cohScore)) / 100);
+        ctx.stroke();
+
+        // Synaptic Efficiency inner arc
+        ctx.strokeStyle = '#a78bfa';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(cx, cy, pulseR - 2, -Math.PI / 2, -Math.PI / 2 + (Math.PI * 2 * Math.min(100, effScore)) / 100);
+        ctx.stroke();
+
+        ctx.fillStyle = '#f8fafc';
+        ctx.font = '700 11px -apple-system, BlinkMacSystemFont, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(Math.round(cohScore) + '%', cx, cy);
+
+        // Draw agent ganglia nodes
+        for (var j = 0; j < nodePositions.length; j++) {
+          var n = nodePositions[j];
+          var isSel = selectedAgentId === n.id;
+          var r = isSel ? 7.5 : n.health === 'active' ? 6 : 4.5;
+          if (n.health === 'active' || isSel) {
+            ctx.fillStyle = n.color + '33';
+            ctx.beginPath();
+            ctx.arc(n.x, n.y, r + 4.5, 0, Math.PI * 2);
+            ctx.fill();
+          }
+          ctx.fillStyle = n.color;
+          ctx.beginPath();
+          ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+          ctx.fill();
+
+          ctx.fillStyle = isSel ? '#ffffff' : 'rgba(226, 232, 240, 0.86)';
+          ctx.font = (isSel ? '700 ' : '500 ') + '9.5px -apple-system, BlinkMacSystemFont, sans-serif';
+          ctx.textAlign = 'center';
+          var labelY = n.y < cy ? n.y - 10 : n.y + 12;
+          ctx.fillText(n.name.slice(0, 10), n.x, labelY);
+        }
+
+        ctx.restore();
+        requestAnimationFrame(drawPocketCortex);
+      }
+
+      if (canvas) {
+        canvas.addEventListener('click', function (ev) {
+          var rect = canvas.getBoundingClientRect();
+          var x = ev.clientX - rect.left;
+          var y = ev.clientY - rect.top;
+          var best = null;
+          var bestDist = 28;
+          for (var i = 0; i < nodePositions.length; i++) {
+            var n = nodePositions[i];
+            var d = Math.hypot(x - n.x, y - n.y);
+            if (d < bestDist) {
+              bestDist = d;
+              best = n;
+            }
+          }
+          if (best) {
+            selectedAgentId = best.id;
+            if (el('m-canvas-caption')) {
+              el('m-canvas-caption').textContent = 'Selected @' + best.id + ' (' + best.health + ')';
+            }
+            renderAgentsList(currentData);
+            var row = document.querySelector('[data-agent-id="' + best.id + '"]');
+            if (row && row.scrollIntoView) row.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+          }
+        });
+      }
+
+      // Filter buttons
+      var filterBtns = document.querySelectorAll('#a-filter-row .filter-btn');
+      for (var f = 0; f < filterBtns.length; f++) {
+        filterBtns[f].addEventListener('click', function () {
+          agentFilter = this.getAttribute('data-filter') || 'all';
+          for (var k = 0; k < filterBtns.length; k++) filterBtns[k].classList.remove('active');
+          this.classList.add('active');
+          renderAgentsList(currentData);
+        });
+      }
+
+      // Bottom navigation jump buttons
+      var navBtns = document.querySelectorAll('.bottom-nav .nav-btn');
+      for (var b = 0; b < navBtns.length; b++) {
+        navBtns[b].addEventListener('click', function () {
+          var targetId = this.getAttribute('data-jump');
+          for (var k = 0; k < navBtns.length; k++) navBtns[k].classList.remove('active');
+          this.classList.add('active');
+          var sec = el(targetId);
+          if (sec && sec.scrollIntoView) sec.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        });
+      }
+
+      if (el('m-desktop-btn')) {
+        el('m-desktop-btn').addEventListener('click', function () {
+          window.location.href = '/';
+        });
+      }
+
+      try {
+        var raw = el('initial-mobile-state').textContent;
+        if (raw) renderMobile(JSON.parse(raw));
+      } catch (_) {}
+      requestAnimationFrame(drawPocketCortex);
+
+      if (typeof EventSource !== 'undefined') {
+        var es = new EventSource('/events?mode=mobile');
+        var ssePill = el('m-sse-pill');
+        es.onopen = function () {
+          if (ssePill) {
+            ssePill.textContent = 'LIVE';
+            ssePill.className = 'pill ok';
+          }
+        };
+        es.onmessage = function (ev) {
+          try {
+            renderMobile(JSON.parse(ev.data));
+          } catch (_) {}
+        };
+        es.onerror = function () {
+          if (ssePill) {
+            ssePill.textContent = 'POLL';
+            ssePill.className = 'pill warn';
+          }
+        };
+      }
+    })();
+  </script>
+</body>
+</html>`
+}
+
 export async function startMemoryViewer({
   socketPath,
   stateFile = undefined,
@@ -6621,6 +8722,7 @@ export async function startMemoryViewer({
   const target = parseListenTarget({ host, port })
   const client = createSingleSocketMcpClient(socketPath)
   const sseClients = new Set()
+  const mobileSseClients = new Set()
   const eventLog = []
   const agentTelemetry = new Map()
   let pollSeq = 0
@@ -6677,15 +8779,32 @@ export async function startMemoryViewer({
   let cachedCorpus = null
   let cachedHtmlKey = null
   let cachedHtmlBuf = null
+  let cachedMobileHtmlKey = null
+  let cachedMobileHtmlBuf = null
+
+  function currentMobileSnapshot() {
+    return buildMobileState(currentState, currentState.polled_at ?? undefined, cachedCorpus?.historyRecords)
+  }
 
   function broadcastState() {
-    if (sseClients.size === 0) return
-    const payload = `data: ${JSON.stringify(currentState)}\n\n`
-    for (const res of sseClients) {
-      try {
-        res.write(payload)
-      } catch {
-        sseClients.delete(res)
+    if (sseClients.size > 0) {
+      const payload = `data: ${JSON.stringify(currentState)}\n\n`
+      for (const res of sseClients) {
+        try {
+          res.write(payload)
+        } catch {
+          sseClients.delete(res)
+        }
+      }
+    }
+    if (mobileSseClients.size > 0) {
+      const mobilePayload = `data: ${JSON.stringify(currentMobileSnapshot())}\n\n`
+      for (const res of mobileSseClients) {
+        try {
+          res.write(mobilePayload)
+        } catch {
+          mobileSseClients.delete(res)
+        }
       }
     }
   }
@@ -6848,7 +8967,13 @@ export async function startMemoryViewer({
         now_sec: nowSec,
       })
       const agentRoster = healthResult.roster
-      const storeState = wake?.store_state || firstQuery?.store_state || { state: 'UNKNOWN', write_seq: null, current_claims: null, last_backup_age_sec: null, unbacked_writes: null }
+      const rawStoreState = wake?.store_state || firstQuery?.store_state || { state: 'UNKNOWN', write_seq: null, current_claims: null, last_backup_age_sec: null, unbacked_writes: null }
+      const storeState = {
+        ...rawStoreState,
+        ...(firstQuery?.store_state?.last_backup_at !== undefined ? { last_backup_at: firstQuery.store_state.last_backup_at } : {}),
+        ...(firstQuery?.store_state?.last_backup_write_seq !== undefined ? { last_backup_write_seq: firstQuery.store_state.last_backup_write_seq } : {}),
+        ...(firstQuery?.store_state?.last_backup_snapshot_id !== undefined ? { last_backup_snapshot_id: firstQuery.store_state.last_backup_snapshot_id } : {}),
+      }
       const activeStateFile = resolveCuratorStatePath({ stateFile, socketPath })
       let persistedCurator = null
       let curatorStateReadError = null
@@ -7089,7 +9214,32 @@ export async function startMemoryViewer({
       return
     }
 
-    const urlPath = String(req.url || '/').split('?')[0]
+    const rawUrl = String(req.url || '/')
+    const qIdx = rawUrl.indexOf('?')
+    const urlPath = qIdx >= 0 ? rawUrl.slice(0, qIdx) : rawUrl
+    const queryStr = qIdx >= 0 ? rawUrl.slice(qIdx + 1) : ''
+    const isMobileEventsQuery = /(?:^|&)(?:mode=mobile|mobile=1)(?:&|$)/.test(queryStr)
+    const isMobileViewQuery = /(?:^|&)(?:view=mobile|mode=mobile|mobile=1)(?:&|$)/.test(queryStr)
+
+    if (urlPath === '/mobile/events' || (urlPath === '/events' && isMobileEventsQuery)) {
+      res.writeHead(200, {
+        ...securityHeaders,
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+      })
+      if (method === 'HEAD') {
+        res.end()
+        return
+      }
+      res.write(`data: ${JSON.stringify(currentMobileSnapshot())}\n\n`)
+      mobileSseClients.add(res)
+      req.on('close', () => {
+        mobileSseClients.delete(res)
+      })
+      return
+    }
+
     if (urlPath === '/events') {
       res.writeHead(200, {
         ...securityHeaders,
@@ -7106,6 +9256,17 @@ export async function startMemoryViewer({
       req.on('close', () => {
         sseClients.delete(res)
       })
+      return
+    }
+
+    if (urlPath === '/api/mobile' || urlPath === '/mobile.json') {
+      const body = JSON.stringify(currentMobileSnapshot(), null, 2) + '\n'
+      res.writeHead(200, {
+        ...securityHeaders,
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Length': Buffer.byteLength(body),
+      })
+      res.end(method === 'HEAD' ? undefined : body)
       return
     }
 
@@ -7175,8 +9336,29 @@ export async function startMemoryViewer({
       }
     }
 
+    const htmlKey = `${currentState.poll_seq ?? 0}:${currentState.connected}:${currentState.error || ''}:${currentState.store_state?.state || ''}:${currentState.store_state?.write_seq ?? ''}:${currentState.records?.length ?? 0}:${currentState.curator_state?.last_curated_write_seq ?? 0}:${currentState.event_log?.length ?? 0}`
+
+    if (
+      urlPath === '/mobile' ||
+      urlPath === '/mobile/' ||
+      urlPath === '/m' ||
+      urlPath === '/phone' ||
+      ((urlPath === '/' || urlPath === '/index.html') && isMobileViewQuery)
+    ) {
+      if (cachedMobileHtmlKey !== htmlKey || !cachedMobileHtmlBuf) {
+        cachedMobileHtmlBuf = Buffer.from(renderMobileViewerHtml(currentMobileSnapshot()), 'utf8')
+        cachedMobileHtmlKey = htmlKey
+      }
+      res.writeHead(200, {
+        ...securityHeaders,
+        'Content-Type': 'text/html; charset=utf-8',
+        'Content-Length': cachedMobileHtmlBuf.length,
+      })
+      res.end(method === 'HEAD' ? undefined : cachedMobileHtmlBuf)
+      return
+    }
+
     if (urlPath === '/' || urlPath === '/index.html') {
-      const htmlKey = `${currentState.poll_seq ?? 0}:${currentState.connected}:${currentState.error || ''}:${currentState.store_state?.state || ''}:${currentState.store_state?.write_seq ?? ''}:${currentState.records?.length ?? 0}:${currentState.curator_state?.last_curated_write_seq ?? 0}:${currentState.event_log?.length ?? 0}`
       if (cachedHtmlKey !== htmlKey || !cachedHtmlBuf) {
         cachedHtmlBuf = Buffer.from(renderViewerHtml(currentState), 'utf8')
         cachedHtmlKey = htmlKey
@@ -7210,6 +9392,7 @@ export async function startMemoryViewer({
     port: boundPort,
     pollOnce,
     getState: () => currentState,
+    getMobileState: () => currentMobileSnapshot(),
     async stop() {
       stopped = true
       clearTimeout(pollTimer)
@@ -7221,6 +9404,14 @@ export async function startMemoryViewer({
         }
       }
       sseClients.clear()
+      for (const res of mobileSseClients) {
+        try {
+          res.end()
+        } catch {
+          /* ignore */
+        }
+      }
+      mobileSseClients.clear()
       client.close()
       httpServer.closeIdleConnections?.()
       httpServer.closeAllConnections?.()
