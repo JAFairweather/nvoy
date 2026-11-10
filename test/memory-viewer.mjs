@@ -1626,9 +1626,89 @@ await test('PR #354 regressions: cached event immutability, pre-curation elapsed
     assert.equal(mobileState.metadata_only, true)
     assert.equal(mobileState.authority, null)
     assert.equal(mobileState.trustedInstruction, false)
-    assert(mobileState.velocities.new_memory.writes_1h >= 3, 'new_memory velocity 1h should count recent writes')
+    assert.equal(mobileState.velocities.new_memory.writes_1h, 3, 'new_memory velocity 1h must count exact 3 accepted writes without double-counting recent_activity')
+    assert.equal(
+      mobileState.velocities.new_memory.sparkline_12h.reduce((sum, n) => sum + n, 0),
+      3,
+      'sparkline_12h tick sum must equal exact deduplicated write count'
+    )
     assert.equal(mobileState.velocities.new_memory.sparkline_12h.length, 12)
     assert.equal(mobileState.velocities.recall.sparkline_60m.length, 12)
+
+    // Regression: 1 real write present in records, historyRecords, AND recent_activity (with event_ids[]) + 1 daemon refusal (kind: 'refused')
+    const dedupCheck = buildMobileState(
+      {
+        updatedAt: new Date(nowSec * 1000).toISOString(),
+        daemon: { ok: true },
+        records: [
+          {
+            event_id: canaryEv.id,
+            d: `room:${globalRoom}:canary-mobile-claim`,
+            slug: 'canary-mobile-claim',
+            topic: 'hive-memory',
+            scope: `room:${globalRoom}`,
+            author: 'james',
+            pubkey: ownerPk,
+            created_at: nowSec - 60,
+            ttl_sec: 86400,
+            claim: canaryClaim,
+          },
+        ],
+        historyRecords: [
+          {
+            event_id: canaryEv.id,
+            d: `room:${globalRoom}:canary-mobile-claim`,
+            slug: 'canary-mobile-claim',
+            topic: 'hive-memory',
+            scope: `room:${globalRoom}`,
+            author: 'james',
+            pubkey: ownerPk,
+            created_at: nowSec - 60,
+          },
+        ],
+        consolidatedRecords: [],
+        recent_activity: [
+          {
+            seq: 10,
+            at: nowSec - 60,
+            kind: 'submit',
+            actor: 'james',
+            d: `room:${globalRoom}:canary-mobile-claim`,
+            topic: 'hive-memory',
+            event_ids: [canaryEv.id],
+            accepted: true,
+          },
+          {
+            seq: 11,
+            at: nowSec - 30,
+            kind: 'refused',
+            actor: 'james',
+            code: 'HIVE_MEMORY_PRIOR_MISMATCH',
+            d: `room:${globalRoom}:canary-mobile-claim`,
+          },
+        ],
+        agent_heartbeats: [
+          {
+            actor: 'james',
+            last_seen_at: nowSec - 30,
+            last_write_at: nowSec - 60,
+            last_write_d: `room:${globalRoom}:canary-mobile-claim`,
+          },
+        ],
+      },
+      nowSec
+    )
+    assert.equal(dedupCheck.velocities.new_memory.writes_1h, 1, 'same event in records/historyRecords and recent_activity(event_ids[]) must count as 1 write')
+    assert.equal(
+      dedupCheck.velocities.new_memory.sparkline_12h.reduce((sum, n) => sum + n, 0),
+      1,
+      'same event in records/historyRecords and recent_activity(event_ids[]) must produce 1 sparkline tick'
+    )
+    assert.equal(dedupCheck.velocities.new_memory.refusals_15m, 1, 'daemon kind: refused activity within 15m must increment velocities.new_memory.refusals_15m')
+    const jamesRoster = dedupCheck.agents.roster.find(a => a.id === 'james')
+    assert(jamesRoster, 'james should appear in agent roster')
+    assert.equal(jamesRoster.refusals_15m, 1, 'daemon kind: refused activity within 15m must increment per-agent refusals_15m')
+    assert.equal(jamesRoster.last_write_slug, 'canary-mobile-claim')
     assert(typeof mobileState.coherence.score === 'number')
     assert(typeof mobileState.synaptic_efficiency.score === 'number')
     assert.equal(mobileState.backup.last_receipt.snapshot_id, SNAP_ID.slice(0, 12))
@@ -1658,6 +1738,8 @@ await test('PR #354 regressions: cached event immutability, pre-curation elapsed
     assert.equal(htmlMobileRes.status, 200)
     assert(String(htmlMobileRes.headers['content-type']).includes('text/html'))
     assert(htmlMobileRes.body.includes('Pocket Cortex'))
+    const mobileHtmlBytes = Buffer.byteLength(htmlMobileRes.body, 'utf8')
+    assert(mobileHtmlBytes < 40000, `expected /mobile HTML < 40000 bytes uncompressed, got ${mobileHtmlBytes}`)
     assert(!htmlMobileRes.body.includes(canaryClaim), '/mobile HTML must never leak claim text')
     assert(!htmlMobileRes.body.includes(canaryBecause), '/mobile HTML must never leak because text')
     assert(!/<a\s/i.test(htmlMobileRes.body), '/mobile HTML must never render clickable <a> links')

@@ -6646,14 +6646,23 @@ export function buildMobileState(state = {}, nowSec = undefined, extraHistoryRec
     ? extraHistoryRecords
     : Array.isArray(state?.history_records)
       ? state.history_records
-      : []
+      : Array.isArray(state?.historyRecords)
+        ? state.historyRecords
+        : []
   const consolidatedMap =
     state?.consolidated_sources && typeof state.consolidated_sources === 'object' ? state.consolidated_sources : {}
-  const consolidatedList = Object.values(consolidatedMap).filter(r => r && typeof r === 'object')
+  const consolidatedList = Array.isArray(state?.consolidatedRecords)
+    ? state.consolidatedRecords.filter(r => r && typeof r === 'object')
+    : Object.values(consolidatedMap).filter(r => r && typeof r === 'object')
   const recentActivity = Array.isArray(state?.recent_activity)
     ? state.recent_activity.filter(a => a && typeof a === 'object')
     : []
-  const roster = Array.isArray(state?.agent_roster) ? state.agent_roster.filter(a => a && typeof a === 'object') : []
+  const rawRoster = Array.isArray(state?.agent_roster)
+    ? state.agent_roster
+    : Array.isArray(state?.agent_heartbeats)
+      ? state.agent_heartbeats
+      : []
+  const roster = rawRoster.filter(a => a && typeof a === 'object').map(a => ({ ...a, id: a.id || a.actor || 'unknown' }))
 
   const ss = state?.store_state && typeof state.store_state === 'object' ? state.store_state : {}
   const writeSeq = Number.isSafeInteger(ss.write_seq) ? ss.write_seq : null
@@ -6690,21 +6699,39 @@ export function buildMobileState(state = {}, nowSec = undefined, extraHistoryRec
   const backupFreshnessPct =
     ageSec !== null ? Math.max(0, Math.min(100, Math.round((1 - ageSec / fenceWindowSec) * 100))) : 0
 
-  // --- New-Memory Velocity (strictly from timestamps & metadata) ---
+  // --- New-Memory Velocity (strictly from timestamps & metadata, deduplicated by signed event ID) ---
   const seenWriteEvents = new Map()
-  const addWriteRecord = r => {
-    const at = Number(r?.created_at)
-    if (!Number.isFinite(at) || at <= 0) return
-    const key = r.event_id ? String(r.event_id) : `${r.author_pubkey || ''}:${r.d || ''}:${at}`
-    if (!seenWriteEvents.has(key)) seenWriteEvents.set(key, at)
+  const seenWriteFactKeys = new Map()
+  const addWriteEvent = (id, dKey, at) => {
+    const ts = Number(at)
+    if (!Number.isFinite(ts) || ts <= 0) return
+    const cleanId = typeof id === 'string' && id.trim() ? id.trim() : null
+    const cleanD = typeof dKey === 'string' && dKey.trim() ? dKey.trim() : null
+    if (cleanId && seenWriteEvents.has(cleanId)) return
+    if (!cleanId && cleanD && seenWriteFactKeys.has(cleanD)) {
+      const priorTs = seenWriteFactKeys.get(cleanD)
+      if (Math.abs(priorTs - ts) <= 5) return
+    }
+    const mapKey = cleanId || (cleanD ? `d:${cleanD}:${ts}` : `ts:${ts}:${seenWriteEvents.size}`)
+    seenWriteEvents.set(mapKey, ts)
+    if (cleanD) seenWriteFactKeys.set(cleanD, ts)
   }
-  for (const r of historyList) addWriteRecord(r)
-  for (const r of records) addWriteRecord(r)
-  for (const r of consolidatedList) addWriteRecord(r)
+  for (const r of historyList) addWriteEvent(r?.event_id, r?.d, r?.created_at)
+  for (const r of records) addWriteEvent(r?.event_id, r?.d, r?.created_at)
+  for (const r of consolidatedList) addWriteEvent(r?.event_id, r?.d, r?.created_at)
   for (const a of recentActivity) {
     if (a.kind === 'submit' && a.accepted !== false && Number.isFinite(a.at) && a.at > 0) {
-      const key = a.event_id ? String(a.event_id) : `act:${a.seq || a.at}:${a.actor || ''}:${a.d || ''}`
-      if (!seenWriteEvents.has(key)) seenWriteEvents.set(key, Number(a.at))
+      const ids =
+        Array.isArray(a.event_ids) && a.event_ids.length > 0
+          ? a.event_ids.filter(id => typeof id === 'string' && id.trim()).map(id => id.trim())
+          : typeof a.event_id === 'string' && a.event_id.trim()
+            ? [a.event_id.trim()]
+            : []
+      if (ids.length > 0) {
+        for (const id of ids) addWriteEvent(id, a.d, a.at)
+      } else {
+        addWriteEvent(null, a.d, a.at)
+      }
     }
   }
   const writeTimestamps = [...seenWriteEvents.values()].sort((a, b) => a - b)
@@ -6724,9 +6751,10 @@ export function buildMobileState(state = {}, nowSec = undefined, extraHistoryRec
     }
   }
   const lastWriteAt = writeTimestamps.length > 0 ? writeTimestamps[writeTimestamps.length - 1] : null
-  const refusals15m = recentActivity.filter(
-    a => a.kind === 'submit' && a.accepted === false && Number.isFinite(a.at) && effectiveNow - a.at <= 900
-  ).length
+  const isRefusalActivity = a =>
+    Boolean(a && (a.kind === 'refused' || (a.kind === 'submit' && a.accepted === false)))
+  const isWithin15m = at => !Number.isFinite(at) || at <= 0 || (effectiveNow - at <= 900 && effectiveNow - at >= -60)
+  const refusals15m = recentActivity.filter(a => isRefusalActivity(a) && isWithin15m(Number(a.at))).length
 
   // --- Recall Velocity (from recent_activity + agent_roster + efficacy) ---
   const recallEvents = recentActivity.filter(
@@ -6810,9 +6838,13 @@ export function buildMobileState(state = {}, nowSec = undefined, extraHistoryRec
     .map(a => {
       const id = String(a.id || 'unknown')
       const pk = String(a.pubkey || '')
-      const lastWriteSlug = a.last_write_key
-        ? String(a.last_write_key).split(':').slice(2).join(':') || String(a.last_write_key)
+      const rawWriteKey = a.last_write_d || a.last_write_key || null
+      const lastWriteSlug = rawWriteKey
+        ? String(rawWriteKey).split(':').slice(2).join(':') || String(rawWriteKey)
         : null
+      const actorRefusals15m = recentActivity.filter(
+        act => isRefusalActivity(act) && String(act.actor || '') === id && isWithin15m(Number(act.at))
+      ).length
       return {
         id,
         pubkey_prefix: pk ? pk.slice(0, 12) : null,
@@ -6826,7 +6858,7 @@ export function buildMobileState(state = {}, nowSec = undefined, extraHistoryRec
         writes_5m: Number(a.writes_5m || 0),
         queries_5m: Number(a.queries_5m || 0),
         hits_5m: Number(a.hits_5m || 0),
-        refusals_15m: Number(a.refusals_15m || 0),
+        refusals_15m: Math.max(Number(a.refusals_15m || 0), actorRefusals15m),
         active_claims: pk ? activeClaimsByPubkey.get(pk) || 0 : 0,
         last_recall_at: Number.isFinite(a.last_recall_at) && a.last_recall_at > 0 ? a.last_recall_at : null,
         last_write_at: Number.isFinite(a.last_write_at) && a.last_write_at > 0 ? a.last_write_at : null,
@@ -7156,15 +7188,12 @@ export function buildMobileState(state = {}, nowSec = undefined, extraHistoryRec
         shared_artifacts: Number(coh?.shared_artifacts ?? 0),
       },
       drift_status: String(coh?.epistemic_drift?.status || 'aligned'),
-      history: (Array.isArray(coh?.history) ? coh.history : []).slice(-24).map(h => ({
+      history: (Array.isArray(coh?.history) ? coh.history : []).slice(-12).map(h => ({
         at: Number(h?.at || 0),
         score: Number(h?.score || 0),
-        claims: Number(h?.claims || 0),
-        events: Number(h?.events || 0),
       })),
     },
     synaptic_efficiency: synapticEfficiency,
-    efficacy: synapticEfficiency,
     dreams: {
       mode: dreamTel.display_mode.mode,
       mode_label: dreamTel.display_mode.label,
@@ -7255,1455 +7284,315 @@ export function renderMobileViewerHtml(initialMobileState = {}) {
   return `<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=5, viewport-fit=cover">
-  <meta name="theme-color" content="#040711">
-  <meta name="apple-mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <title>Pocket Cortex · Hive Memory Status</title>
-  <style>
-    :root {
-      --bg: #040711;
-      --card: rgba(11, 18, 35, 0.84);
-      --card-hi: rgba(17, 27, 50, 0.9);
-      --border: rgba(100, 138, 205, 0.24);
-      --border-hi: rgba(56, 189, 248, 0.48);
-      --text: #eef4ff;
-      --muted: #8ea2c4;
-      --ok: #22c55e;
-      --ok-bg: rgba(34, 197, 94, 0.14);
-      --warn: #f59e0b;
-      --warn-bg: rgba(245, 158, 11, 0.15);
-      --err: #ef4444;
-      --err-bg: rgba(239, 68, 68, 0.16);
-      --cyan: #38bdf8;
-      --emerald: #34d399;
-      --violet: #a78bfa;
-      --gold: #fbbf24;
-      --pink: #f472b6;
-      --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Segoe UI", Roboto, sans-serif;
-      --font-mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
-    }
-    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-    html, body {
-      margin: 0;
-      padding: 0;
-      background:
-        radial-gradient(circle at 18% 6%, rgba(56, 189, 248, 0.16), transparent 42%),
-        radial-gradient(circle at 84% 14%, rgba(167, 139, 250, 0.15), transparent 46%),
-        radial-gradient(circle at 50% 88%, rgba(52, 211, 153, 0.11), transparent 50%),
-        var(--bg);
-      background-attachment: fixed;
-      color: var(--text);
-      font-family: var(--font-sans);
-      font-variant-numeric: tabular-nums;
-      -webkit-font-smoothing: antialiased;
-      overflow-x: hidden;
-    }
-    .shell {
-      max-width: 520px;
-      margin: 0 auto;
-      padding: max(12px, env(safe-area-inset-top)) 12px calc(86px + env(safe-area-inset-bottom)) 12px;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-    }
-    .glass {
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 18px;
-      box-shadow: 0 14px 36px rgba(0, 0, 0, 0.48), inset 0 1px 0 rgba(255, 255, 255, 0.06);
-      backdrop-filter: blur(16px);
-      -webkit-backdrop-filter: blur(16px);
-    }
-    .top-bar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-      padding: 10px 13px;
-    }
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      min-width: 0;
-    }
-    .orb {
-      width: 30px;
-      height: 30px;
-      border-radius: 999px;
-      flex-shrink: 0;
-      background: radial-gradient(circle at 32% 30%, #a5f3fc, #38bdf8 42%, #6366f1 78%, #090d1a 100%);
-      box-shadow: 0 0 18px rgba(56, 189, 248, 0.65);
-      animation: orbBeat 3.2s ease-in-out infinite;
-    }
-    @keyframes orbBeat {
-      0%, 100% { transform: scale(0.95); box-shadow: 0 0 14px rgba(56, 189, 248, 0.55); }
-      50% { transform: scale(1.06); box-shadow: 0 0 24px rgba(52, 211, 153, 0.85); }
-    }
-    .brand-title {
-      font-size: 15px;
-      font-weight: 700;
-      letter-spacing: -0.01em;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .brand-sub {
-      font-size: 10.5px;
-      color: var(--muted);
-      font-family: var(--font-mono);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .top-actions {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      flex-shrink: 0;
-    }
-    .pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      padding: 3px 9px;
-      border-radius: 999px;
-      font-size: 10.5px;
-      font-weight: 700;
-      font-family: var(--font-mono);
-      border: 1px solid var(--border);
-      background: rgba(15, 23, 42, 0.78);
-      color: var(--text);
-    }
-    .pill.ok { color: #86efac; border-color: rgba(34, 197, 94, 0.45); background: var(--ok-bg); }
-    .pill.warn { color: #fcd34d; border-color: rgba(245, 158, 11, 0.45); background: var(--warn-bg); }
-    .pill.err { color: #fca5a5; border-color: rgba(239, 68, 68, 0.5); background: var(--err-bg); }
-    .pill.info { color: #7dd3fc; border-color: rgba(56, 189, 248, 0.45); background: rgba(56, 189, 248, 0.13); }
-    .pill.violet { color: #ddd6fe; border-color: rgba(167, 139, 250, 0.45); background: rgba(167, 139, 250, 0.14); }
-    .btn-ghost {
-      appearance: none;
-      border: 1px solid rgba(125, 211, 252, 0.35);
-      background: rgba(15, 23, 42, 0.85);
-      color: #bae6fd;
-      border-radius: 999px;
-      padding: 5px 10px;
-      font-size: 11px;
-      font-weight: 600;
-      cursor: pointer;
-    }
-    .btn-ghost:active { transform: scale(0.97); }
-
-    /* Pocket Cortex Neural Canvas Card */
-    .cortex-hero {
-      position: relative;
-      overflow: hidden;
-      padding: 0;
-    }
-    #pocket-cortex {
-      display: block;
-      width: 100%;
-      height: 206px;
-      touch-action: manipulation;
-    }
-    .cortex-overlay-top {
-      position: absolute;
-      top: 10px;
-      left: 12px;
-      right: 12px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      pointer-events: none;
-    }
-    .cortex-overlay-bottom {
-      position: absolute;
-      bottom: 8px;
-      left: 12px;
-      right: 12px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      font-size: 10.5px;
-      color: var(--muted);
-      font-family: var(--font-mono);
-      pointer-events: none;
-    }
-
-    /* Health & Alerts Banner */
-    .health-banner {
-      padding: 11px 14px;
-      display: flex;
-      flex-direction: column;
-      gap: 7px;
-    }
-    .health-banner.healthy {
-      border-color: rgba(34, 197, 94, 0.42);
-      background: linear-gradient(135deg, rgba(6, 40, 28, 0.78), rgba(11, 18, 35, 0.88));
-    }
-    .health-banner.alerting {
-      border-color: rgba(245, 158, 11, 0.52);
-      background: linear-gradient(135deg, rgba(55, 28, 10, 0.82), rgba(11, 18, 35, 0.9));
-    }
-    .health-banner.critical {
-      border-color: rgba(239, 68, 68, 0.65);
-      background: linear-gradient(135deg, rgba(65, 14, 20, 0.86), rgba(11, 18, 35, 0.92));
-    }
-    .health-headline {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-      font-size: 13px;
-      font-weight: 700;
-    }
-    .alert-list {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-    .alert-item {
-      padding: 7px 10px;
-      border-radius: 10px;
-      font-size: 11.5px;
-      line-height: 1.35;
-      background: rgba(2, 6, 23, 0.66);
-      border-left: 3px solid var(--warn);
-      display: flex;
-      justify-content: space-between;
-      align-items: baseline;
-      gap: 8px;
-    }
-    .alert-item.critical { border-left-color: var(--err); color: #fecaca; }
-    .alert-item.warn { border-left-color: var(--warn); color: #fde68a; }
-
-    /* 2x2 Vitals Grid */
-    .vitals-grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 10px;
-    }
-    .vital-card {
-      padding: 12px 13px;
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-      position: relative;
-      overflow: hidden;
-    }
-    .vital-label {
-      font-size: 10.5px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      color: var(--muted);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-    .vital-val {
-      font-size: 25px;
-      font-weight: 800;
-      letter-spacing: -0.02em;
-      line-height: 1.1;
-    }
-    .vital-sub {
-      font-size: 11px;
-      color: var(--muted);
-      font-family: var(--font-mono);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .spark-svg {
-      width: 100%;
-      height: 30px;
-      margin-top: 4px;
-      overflow: visible;
-    }
-
-    /* Section Cards */
-    .section-card {
-      padding: 14px;
-      display: flex;
-      flex-direction: column;
-      gap: 11px;
-    }
-    .section-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-    }
-    .section-title {
-      font-size: 13.5px;
-      font-weight: 700;
-      letter-spacing: 0.01em;
-      display: flex;
-      align-items: center;
-      gap: 7px;
-      margin: 0;
-    }
-    .sub-grid-2 {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 8px;
-    }
-    .sub-grid-3 {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 7px;
-    }
-    .stat-box {
-      background: rgba(4, 9, 22, 0.62);
-      border: 1px solid rgba(100, 138, 205, 0.18);
-      border-radius: 12px;
-      padding: 8px 10px;
-      display: flex;
-      flex-direction: column;
-      gap: 2px;
-    }
-    .stat-k {
-      font-size: 10px;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--muted);
-    }
-    .stat-v {
-      font-size: 15px;
-      font-weight: 700;
-      font-family: var(--font-mono);
-    }
-    .stat-s {
-      font-size: 10px;
-      color: var(--muted);
-      font-family: var(--font-mono);
-    }
-
-    /* Axis Progress Bars */
-    .axis-list {
-      display: flex;
-      flex-direction: column;
-      gap: 7px;
-    }
-    .axis-row {
-      display: flex;
-      flex-direction: column;
-      gap: 3px;
-    }
-    .axis-meta {
-      display: flex;
-      justify-content: space-between;
-      font-size: 11.5px;
-    }
-    .axis-name { color: #cbd5e1; font-weight: 500; }
-    .axis-score { font-family: var(--font-mono); font-weight: 700; }
-    .bar-track {
-      height: 6px;
-      width: 100%;
-      border-radius: 999px;
-      background: rgba(15, 23, 42, 0.9);
-      overflow: hidden;
-      border: 1px solid rgba(148, 163, 184, 0.14);
-    }
-    .bar-fill {
-      height: 100%;
-      border-radius: 999px;
-      transition: width 0.35s ease;
-    }
-
-    /* Agent Usage List */
-    .filter-row {
-      display: flex;
-      gap: 6px;
-      overflow-x: auto;
-      padding-bottom: 2px;
-    }
-    .filter-btn {
-      appearance: none;
-      border: 1px solid var(--border);
-      background: rgba(15, 23, 42, 0.72);
-      color: var(--muted);
-      border-radius: 999px;
-      padding: 4px 10px;
-      font-size: 11px;
-      font-weight: 600;
-      cursor: pointer;
-      white-space: nowrap;
-    }
-    .filter-btn.active {
-      color: var(--text);
-      border-color: var(--cyan);
-      background: rgba(56, 189, 248, 0.18);
-    }
-    .agent-rows {
-      display: flex;
-      flex-direction: column;
-      gap: 7px;
-    }
-    .agent-card {
-      background: rgba(4, 9, 22, 0.66);
-      border: 1px solid rgba(100, 138, 205, 0.2);
-      border-radius: 13px;
-      padding: 9px 11px;
-      display: flex;
-      flex-direction: column;
-      gap: 5px;
-    }
-    .agent-card.highlight {
-      border-color: var(--cyan);
-      box-shadow: 0 0 16px rgba(56, 189, 248, 0.28);
-    }
-    .agent-top {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-    }
-    .agent-id {
-      display: flex;
-      align-items: center;
-      gap: 7px;
-      font-weight: 700;
-      font-size: 13px;
-    }
-    .dot {
-      width: 9px;
-      height: 9px;
-      border-radius: 999px;
-      flex-shrink: 0;
-    }
-    .agent-metrics {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px 12px;
-      font-size: 10.5px;
-      color: var(--muted);
-      font-family: var(--font-mono);
-    }
-
-    /* Compact list items for Dream Ledger & Pulses */
-    .compact-list {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-    .compact-row {
-      background: rgba(4, 9, 22, 0.56);
-      border: 1px solid rgba(100, 138, 205, 0.16);
-      border-radius: 10px;
-      padding: 7px 10px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-      font-size: 11px;
-      font-family: var(--font-mono);
-    }
-    .compact-main {
-      min-width: 0;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-
-    /* Sticky Bottom Navigation Bar */
-    .bottom-nav {
-      position: fixed;
-      left: 50%;
-      transform: translateX(-50%);
-      bottom: max(10px, env(safe-area-inset-bottom));
-      width: calc(100% - 20px);
-      max-width: 500px;
-      z-index: 50;
-      padding: 6px;
-      display: grid;
-      grid-template-columns: repeat(5, minmax(0, 1fr));
-      gap: 4px;
-      border-radius: 999px;
-      background: rgba(7, 12, 26, 0.92);
-      border: 1px solid rgba(125, 211, 252, 0.32);
-      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.72);
-      backdrop-filter: blur(20px);
-      -webkit-backdrop-filter: blur(20px);
-    }
-    .nav-btn {
-      appearance: none;
-      border: none;
-      background: transparent;
-      color: var(--muted);
-      padding: 7px 4px;
-      border-radius: 999px;
-      font-size: 11px;
-      font-weight: 700;
-      cursor: pointer;
-      text-align: center;
-      white-space: nowrap;
-    }
-    .nav-btn.active {
-      background: rgba(56, 189, 248, 0.2);
-      color: #e0f2fe;
-      box-shadow: inset 0 0 0 1px rgba(56, 189, 248, 0.45);
-    }
-    .meta-footer {
-      text-align: center;
-      font-size: 10.5px;
-      color: var(--muted);
-      font-family: var(--font-mono);
-      padding: 6px 8px 12px 8px;
-    }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=5,viewport-fit=cover">
+<meta name="theme-color" content="#040711">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Pocket Cortex · Hive Memory Status</title>
+<style>
+:root{--bg:#040711;--card:rgba(11,18,35,0.86);--border:rgba(100,138,205,0.24);--text:#eef4ff;--muted:#8ea2c4;--ok:#22c55e;--warn:#f59e0b;--err:#ef4444;--cyan:#38bdf8;--emerald:#34d399;--violet:#a78bfa;--gold:#fbbf24;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;--mono:"SF Mono",ui-monospace,Menlo,monospace}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;padding:0;background:radial-gradient(circle at 18% 6%,rgba(56,189,248,0.16),transparent 42%),radial-gradient(circle at 84% 14%,rgba(167,139,250,0.15),transparent 46%),var(--bg);color:var(--text);font-family:var(--sans);font-variant-numeric:tabular-nums;overflow-x:hidden}
+.shell{max-width:520px;margin:0 auto;padding:12px 12px calc(84px + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:11px}
+.glass{background:var(--card);border:1px solid var(--border);border-radius:16px;box-shadow:0 12px 32px rgba(0,0,0,0.45);backdrop-filter:blur(14px)}
+.top-bar{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 13px}
+.brand{display:flex;align-items:center;gap:10px;min-width:0}
+.orb{width:28px;height:28px;border-radius:999px;flex-shrink:0;background:radial-gradient(circle at 32% 30%,#a5f3fc,#38bdf8 45%,#6366f1 80%);box-shadow:0 0 16px rgba(56,189,248,0.65)}
+.brand-title{font-size:15px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.brand-sub{font-size:10.5px;color:var(--muted);font-family:var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.top-actions{display:flex;align-items:center;gap:6px;flex-shrink:0}
+.pill{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;font-size:10.5px;font-weight:700;font-family:var(--mono);border:1px solid var(--border);background:rgba(15,23,42,0.8);color:var(--text)}
+.pill.ok{color:#86efac;border-color:rgba(34,197,94,0.45);background:rgba(34,197,94,0.14)}
+.pill.warn{color:#fcd34d;border-color:rgba(245,158,11,0.45);background:rgba(245,158,11,0.15)}
+.pill.err{color:#fca5a5;border-color:rgba(239,68,68,0.5);background:rgba(239,68,68,0.16)}
+.pill.info{color:#7dd3fc;border-color:rgba(56,189,248,0.45);background:rgba(56,189,248,0.13)}
+.pill.violet{color:#ddd6fe;border-color:rgba(167,139,250,0.45);background:rgba(167,139,250,0.14)}
+.btn-ghost{border:1px solid rgba(125,211,252,0.35);background:rgba(15,23,42,0.85);color:#bae6fd;border-radius:999px;padding:4px 10px;font-size:11px;font-weight:600;cursor:pointer}
+.cortex-hero{position:relative;overflow:hidden}
+#pocket-cortex{display:block;width:100%;height:196px;touch-action:manipulation}
+.ov-top,.ov-bot{position:absolute;left:12px;right:12px;display:flex;justify-content:space-between;align-items:center;pointer-events:none}
+.ov-top{top:10px}.ov-bot{bottom:8px;font-size:10.5px;color:var(--muted);font-family:var(--mono)}
+.health-banner{padding:10px 13px;display:flex;flex-direction:column;gap:6px}
+.health-banner.healthy{border-color:rgba(34,197,94,0.42)}
+.health-banner.alerting{border-color:rgba(245,158,11,0.52)}
+.health-banner.critical{border-color:rgba(239,68,68,0.65)}
+.health-headline,.section-head,.agent-top,.axis-meta{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.health-headline{font-size:13px;font-weight:700}
+.alert-list,.axis-list,.agent-rows,.compact-list{display:flex;flex-direction:column;gap:6px}
+.alert-item{padding:6px 9px;border-radius:9px;font-size:11px;background:rgba(2,6,23,0.66);border-left:3px solid var(--warn);display:flex;justify-content:space-between;gap:8px}
+.alert-item.critical{border-left-color:var(--err);color:#fecaca}
+.vitals-grid,.sub-grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
+.sub-grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}
+.vital-card{padding:11px 12px;display:flex;flex-direction:column;gap:3px}
+.vital-label{font-size:10px;font-weight:700;text-transform:uppercase;color:var(--muted);display:flex;justify-content:space-between}
+.vital-val{font-size:23px;font-weight:800;line-height:1.1}
+.vital-sub,.stat-s{font-size:10px;color:var(--muted);font-family:var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.spark-svg{width:100%;height:28px;margin-top:3px}
+.section-card{padding:13px;display:flex;flex-direction:column;gap:10px}
+.section-title{font-size:13px;font-weight:700;margin:0}
+.stat-box{background:rgba(4,9,22,0.62);border:1px solid rgba(100,138,205,0.18);border-radius:11px;padding:7px 9px;display:flex;flex-direction:column;gap:2px}
+.stat-k{font-size:9.5px;text-transform:uppercase;color:var(--muted)}
+.stat-v{font-size:14px;font-weight:700;font-family:var(--mono)}
+.axis-row{display:flex;flex-direction:column;gap:3px;font-size:11px}
+.bar-track{height:6px;border-radius:999px;background:rgba(15,23,42,0.9);overflow:hidden}
+.bar-fill{height:100%;border-radius:999px}
+.filter-row{display:flex;gap:6px;overflow-x:auto}
+.filter-btn{border:1px solid var(--border);background:rgba(15,23,42,0.72);color:var(--muted);border-radius:999px;padding:4px 10px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap}
+.filter-btn.active{color:var(--text);border-color:var(--cyan);background:rgba(56,189,248,0.18)}
+.agent-card{background:rgba(4,9,22,0.66);border:1px solid rgba(100,138,205,0.2);border-radius:12px;padding:8px 10px;display:flex;flex-direction:column;gap:4px}
+.agent-card.highlight{border-color:var(--cyan)}
+.agent-id{display:flex;align-items:center;gap:6px;font-weight:700;font-size:12.5px}
+.dot{width:8px;height:8px;border-radius:999px;flex-shrink:0}
+.agent-metrics{display:flex;flex-wrap:wrap;gap:6px 10px;font-size:10px;color:var(--muted);font-family:var(--mono)}
+.compact-row{background:rgba(4,9,22,0.56);border:1px solid rgba(100,138,205,0.16);border-radius:9px;padding:6px 9px;display:flex;justify-content:space-between;gap:8px;font-size:10.5px;font-family:var(--mono)}
+.compact-main{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bottom-nav{position:fixed;left:50%;transform:translateX(-50%);bottom:max(8px,env(safe-area-inset-bottom));width:calc(100% - 20px);max-width:500px;z-index:50;padding:5px;display:grid;grid-template-columns:repeat(5,1fr);gap:4px;border-radius:999px;background:rgba(7,12,26,0.94);border:1px solid rgba(125,211,252,0.3)}
+.nav-btn{border:none;background:transparent;color:var(--muted);padding:6px 4px;border-radius:999px;font-size:11px;font-weight:700;cursor:pointer}
+.nav-btn.active{background:rgba(56,189,248,0.2);color:#e0f2fe}
+.meta-footer{text-align:center;font-size:10px;color:var(--muted);font-family:var(--mono);padding:6px}
+</style>
 </head>
 <body>
-  <div class="shell" id="top-sec">
-    <header class="glass top-bar">
-      <div class="brand">
-        <div class="orb" id="header-orb"></div>
-        <div style="min-width:0;">
-          <div class="brand-title">Pocket Cortex · Hive Memory</div>
-          <div class="brand-sub">reader: <span id="m-reader">${readerName}</span> · metadata-only · zero claim text</div>
-        </div>
-      </div>
-      <div class="top-actions">
-        <span id="m-sse-pill" class="pill info">LIVE</span>
-        <button id="m-desktop-btn" class="btn-ghost" type="button" title="Open full 3D Cortex Observatory">3D View</button>
-      </div>
-    </header>
-
-    <section class="glass cortex-hero" aria-label="Animated Pocket Cortex neural telemetry">
-      <canvas id="pocket-cortex" width="480" height="206"></canvas>
-      <div class="cortex-overlay-top">
-        <span id="m-store-pill" class="pill ok">${syncState}</span>
-        <span id="m-seq-pill" class="pill">seq #-</span>
-      </div>
-      <div class="cortex-overlay-bottom">
-        <span id="m-canvas-caption">Tap any orbiting agent ganglion to inspect</span>
-        <span id="m-poll-age">polled just now</span>
-      </div>
-    </section>
-
-    <section id="m-health-banner" class="glass health-banner healthy" role="status">
-      <div class="health-headline">
-        <span id="m-health-title">✓ Brain Healthy · Saving Open</span>
-        <span id="m-alert-count" class="pill ok">0 alerts</span>
-      </div>
-      <div id="m-alert-list" class="alert-list"></div>
-    </section>
-
-    <section class="vitals-grid" id="velocity-sec">
-      <div class="glass vital-card">
-        <div class="vital-label">
-          <span>New Memory</span>
-          <span id="v-write-badge" class="pill ok" style="padding:1px 6px;font-size:9.5px;">1h</span>
-        </div>
-        <div id="v-write-val" class="vital-val" style="color:var(--emerald);">0/hr</div>
-        <div id="v-write-sub" class="vital-sub">24h: 0 · last: -</div>
-        <svg id="svg-write-spark" class="spark-svg" viewBox="0 0 160 30" preserveAspectRatio="none"></svg>
-      </div>
-
-      <div class="glass vital-card">
-        <div class="vital-label">
-          <span>Recall Velocity</span>
-          <span id="v-recall-badge" class="pill info" style="padding:1px 6px;font-size:9.5px;">5m/1h</span>
-        </div>
-        <div id="v-recall-val" class="vital-val" style="color:var(--cyan);">0/hr</div>
-        <div id="v-recall-sub" class="vital-sub">5m: 0 · hit: 0%</div>
-        <svg id="svg-recall-spark" class="spark-svg" viewBox="0 0 160 30" preserveAspectRatio="none"></svg>
-      </div>
-
-      <div class="glass vital-card">
-        <div class="vital-label">
-          <span>Coherence 2.0</span>
-          <span id="v-coh-delta" class="pill ok" style="padding:1px 6px;font-size:9.5px;">+0%</span>
-        </div>
-        <div id="v-coh-val" class="vital-val" style="color:#6ee7b7;">0%</div>
-        <div id="v-coh-sub" class="vital-sub">core 0% · periph 0%</div>
-        <svg id="svg-coh-spark" class="spark-svg" viewBox="0 0 160 30" preserveAspectRatio="none"></svg>
-      </div>
-
-      <div class="glass vital-card">
-        <div class="vital-label">
-          <span>Synaptic Eff</span>
-          <span id="v-eff-badge" class="pill violet" style="padding:1px 6px;font-size:9.5px;">4-axis</span>
-        </div>
-        <div id="v-eff-val" class="vital-val" style="color:var(--violet);">0%</div>
-        <div id="v-eff-sub" class="vital-sub">R→W 0% · handoff -</div>
-        <svg id="svg-eff-spark" class="spark-svg" viewBox="0 0 160 30" preserveAspectRatio="none"></svg>
-      </div>
-    </section>
-
-    <section class="glass section-card">
-      <div class="section-head">
-        <h2 class="section-title" style="color:var(--cyan);">⚡ Synaptic Velocity &amp; Flow</h2>
-        <span id="flow-window-pill" class="pill info">12h / 60m</span>
-      </div>
-      <div class="sub-grid-3">
-        <div class="stat-box">
-          <span class="stat-k">Writes (1h / 6h)</span>
-          <span id="f-writes-1h6h" class="stat-v" style="color:var(--emerald);">0 / 0</span>
-          <span id="f-writes-24h" class="stat-s">24h: 0 (0/hr)</span>
-        </div>
-        <div class="stat-box">
-          <span class="stat-k">Recalls (5m / 1h)</span>
-          <span id="f-recalls-5m1h" class="stat-v" style="color:var(--cyan);">0 / 0</span>
-          <span id="f-recalls-wq" class="stat-s">0 wakes · 0 queries</span>
-        </div>
-        <div class="stat-box">
-          <span class="stat-k">Recall Reach</span>
-          <span id="f-coverage" class="stat-v" style="color:#93c5fd;">0%</span>
-          <span id="f-hit-rate" class="stat-s">query hit: 0%</span>
-        </div>
-      </div>
-      <div class="compact-list" id="m-pulse-list"></div>
-    </section>
-
-    <section class="glass section-card" id="health-sec">
-      <div class="section-head">
-        <h2 class="section-title" style="color:#6ee7b7;">🧭 Coherence &amp; Synaptic Efficiency</h2>
-        <span id="m-drift-pill" class="pill ok">aligned</span>
-      </div>
-      <div class="sub-grid-2">
-        <div class="stat-box">
-          <span class="stat-k">Core Canon + Class B</span>
-          <span id="c-core-score" class="stat-v" style="color:var(--gold);">0%</span>
-          <span id="c-grounded" class="stat-s">0 grounded · 0 shared refs</span>
-        </div>
-        <div class="stat-box">
-          <span class="stat-k">State Compression</span>
-          <span id="e-compress" class="stat-v" style="color:var(--violet);">0%</span>
-          <span id="e-durable" class="stat-s">0 durable / 0 status</span>
-        </div>
-      </div>
-      <div style="font-size:11px;font-weight:700;color:#6ee7b7;margin-top:2px;">5-Axis Hive Coherence</div>
-      <div class="axis-list" id="m-coh-axes"></div>
-      <div style="font-size:11px;font-weight:700;color:var(--cyan);margin-top:4px;">4-Axis Synaptic Efficiency</div>
-      <div class="axis-list" id="m-eff-axes"></div>
-    </section>
-
-    <section class="glass section-card" id="backup-sec">
-      <div class="section-head">
-        <h2 class="section-title" style="color:var(--gold);">🛡️ Backup State &amp; Write Fence</h2>
-        <span id="b-status-pill" class="pill ok">VERIFIED</span>
-      </div>
-      <div class="sub-grid-3">
-        <div class="stat-box">
-          <span class="stat-k">Backup Age</span>
-          <span id="b-age-val" class="stat-v">-</span>
-          <span id="b-fence-sub" class="stat-s">fence at 60m</span>
-        </div>
-        <div class="stat-box">
-          <span class="stat-k">Unbacked Writes</span>
-          <span id="b-unbacked-val" class="stat-v">0</span>
-          <span id="b-seq-sub" class="stat-s">head seq #-</span>
-        </div>
-        <div class="stat-box">
-          <span class="stat-k">Saving Gate</span>
-          <span id="b-saving-val" class="stat-v" style="color:var(--ok);">OPEN</span>
-          <span id="b-fenced-sub" class="stat-s">0 fenced seats</span>
-        </div>
-      </div>
-      <div class="axis-row">
-        <div class="axis-meta">
-          <span class="axis-name">Backup Window Freshness (3600s limit)</span>
-          <span id="b-fresh-pct" class="axis-score">100%</span>
-        </div>
-        <div class="bar-track">
-          <div id="b-fresh-bar" class="bar-fill" style="width:100%;background:linear-gradient(90deg,#22c55e,#38bdf8);"></div>
-        </div>
-      </div>
-      <div class="stat-box" style="background:rgba(2,6,23,0.72);">
-        <span class="stat-k">Last Verified Backup Receipt</span>
-        <span id="b-receipt-main" class="stat-v" style="font-size:13px;color:#fde68a;">receipt seq #- · -</span>
-        <span id="b-receipt-sub" class="stat-s">snapshot: -</span>
-      </div>
-    </section>
-
-    <section class="glass section-card" id="dream-sec">
-      <div class="section-head">
-        <h2 class="section-title" style="color:var(--violet);">🌙 Merkle Dream &amp; Curator</h2>
-        <span id="d-mode-pill" class="pill violet">OBSERVED</span>
-      </div>
-      <div class="sub-grid-3">
-        <div class="stat-box">
-          <span class="stat-k">Last Dream</span>
-          <span id="d-last-val" class="stat-v" style="color:#ddd6fe;">-</span>
-          <span id="d-last-seq" class="stat-s">curated seq #-</span>
-        </div>
-        <div class="stat-box">
-          <span class="stat-k">Merkle Syntheses</span>
-          <span id="d-merkle-val" class="stat-v" style="color:var(--violet);">0</span>
-          <span id="d-folded-sub" class="stat-s">0 sources folded</span>
-        </div>
-        <div class="stat-box">
-          <span class="stat-k">Wake Savings</span>
-          <span id="d-savings-val" class="stat-v" style="color:var(--emerald);">0%</span>
-          <span id="d-planned-sub" class="stat-s">0 planned next</span>
-        </div>
-      </div>
-      <div class="axis-list" id="d-trigger-bars"></div>
-      <div style="font-size:11px;font-weight:700;color:#c4b5fd;">Recent Dream Consolidations &amp; Eigen-Axes (Metadata Only)</div>
-      <div class="compact-list" id="d-ledger-list"></div>
-    </section>
-
-    <section class="glass section-card" id="agents-sec">
-      <div class="section-head">
-        <h2 class="section-title" style="color:#93c5fd;">🐝 Per-Agent Usage Status</h2>
-        <span id="a-summary-pill" class="pill info">0 active</span>
-      </div>
-      <div class="filter-row" id="a-filter-row">
-        <button class="filter-btn active" type="button" data-filter="all">All Seats</button>
-        <button class="filter-btn" type="button" data-filter="active">Active / Warm</button>
-        <button class="filter-btn" type="button" data-filter="writers">Writers</button>
-        <button class="filter-btn" type="button" data-filter="alerts">Drift / Fenced</button>
-      </div>
-      <div class="agent-rows" id="m-agent-list"></div>
-    </section>
-
-    <section class="glass section-card">
-      <div class="section-head">
-        <h2 class="section-title" style="color:var(--emerald);">📚 Memory Tiers &amp; Topic Pressure</h2>
-        <span id="t-total-pill" class="pill">0 claims</span>
-      </div>
-      <div class="sub-grid-3">
-        <div class="stat-box">
-          <span class="stat-k">Rank 2 Canon</span>
-          <span id="t-canon" class="stat-v" style="color:var(--gold);">0</span>
-          <span class="stat-s">James canon</span>
-        </div>
-        <div class="stat-box">
-          <span class="stat-k">Class B Durable</span>
-          <span id="t-decisions" class="stat-v" style="color:var(--violet);">0</span>
-          <span class="stat-s">ttl_sec: 0</span>
-        </div>
-        <div class="stat-box">
-          <span class="stat-k">Graph Edges</span>
-          <span id="t-edges" class="stat-v" style="color:var(--cyan);">0</span>
-          <span id="t-unverified" class="stat-s">0 unverified</span>
-        </div>
-      </div>
-      <div class="axis-list" id="m-topic-bars"></div>
-    </section>
-
-    <footer class="meta-footer">
-      Hive Memory Pocket Cortex · DATA ONLY (authority=null, trustedInstruction=false) · Metadata-Only Stream
-    </footer>
-  </div>
-
-  <nav class="bottom-nav" aria-label="Pocket Cortex section jump">
-    <button class="nav-btn active" type="button" data-jump="top-sec">Brain</button>
-    <button class="nav-btn" type="button" data-jump="velocity-sec">Velocity</button>
-    <button class="nav-btn" type="button" data-jump="health-sec">Coherence</button>
-    <button class="nav-btn" type="button" data-jump="dream-sec">Dream</button>
-    <button class="nav-btn" type="button" data-jump="agents-sec">Agents</button>
-  </nav>
-
-  <script id="initial-mobile-state" type="application/json">${escapedInitial}</script>
-  <script>
-    (function () {
-      'use strict';
-      var el = function (id) { return document.getElementById(id); };
-      var AGENT_META = {
-        james: { name: 'James', color: '#fbbf24' },
-        biggy: { name: 'Biggy', color: '#818cf8' },
-        rabidrabbit: { name: 'RabidRabbit', color: '#f59e0b' },
-        'dead-rabbit': { name: 'Dead Rabbit', color: '#f59e0b' },
-        mydude: { name: 'My Dude', color: '#10b981' },
-        neil: { name: 'Neil', color: '#38bdf8' },
-        'waggle-dev': { name: 'Waggle-Dev', color: '#fb923c' },
-        crystalclaude: { name: 'CrystalClaude', color: '#f472b6' },
-        'dj-codex': { name: 'DJ-Codex', color: '#34d399' },
-        djcodex: { name: 'DJ Codex', color: '#34d399' },
-        dennis: { name: 'Dennis', color: '#60a5fa' },
-        kerouac: { name: 'Kerouac', color: '#c084fc' },
-        grokdoggydog: { name: 'GrokDoggyDog', color: '#f87171' },
-        'pi-dog': { name: 'Pi-Dog', color: '#2dd4bf' },
-        lukedog: { name: 'LukeDog', color: '#a3e635' },
-        'mc-claude': { name: 'MC-Claude', color: '#e879f9' },
-        curator: { name: 'Curator', color: '#a78bfa' }
-      };
-      var FALLBACK_COLORS = ['#38bdf8', '#a78bfa', '#34d399', '#f472b6', '#fbbf24', '#60a5fa', '#fb923c'];
-
-      function agentInfo(id, idx) {
-        var key = String(id || '').toLowerCase();
-        if (AGENT_META[key]) return AGENT_META[key];
-        return { name: String(id || 'agent'), color: FALLBACK_COLORS[idx % FALLBACK_COLORS.length] };
-      }
-
-      function fmtDur(sec) {
-        if (sec === null || sec === undefined || !Number.isFinite(sec)) return '-';
-        var s = Math.max(0, Math.floor(sec));
-        if (s < 60) return s + 's';
-        if (s < 3600) return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
-        if (s < 86400) return Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
-        return Math.floor(s / 86400) + 'd ' + Math.floor((s % 86400) / 3600) + 'h';
-      }
-
-      function fmtAgo(ts, nowSec) {
-        if (!ts || !Number.isFinite(ts)) return 'never';
-        return fmtDur(Math.max(0, nowSec - ts)) + ' ago';
-      }
-
-      function fmtUtcShort(ts) {
-        if (!ts || !Number.isFinite(ts)) return '-';
-        try {
-          var d = new Date(ts * 1000);
-          return d.toISOString().replace('T', ' ').slice(5, 19) + 'Z';
-        } catch (_) {
-          return '-';
-        }
-      }
-
-      function esc(str) {
-        return String(str == null ? '' : str)
-          .replace(/&/g, '&amp;')
-          .replace(/</g, '&lt;')
-          .replace(/>/g, '&gt;')
-          .replace(/"/g, '&quot;');
-      }
-
-      function drawSparkline(svgEl, values, strokeColor, fillColor) {
-        if (!svgEl) return;
-        var nums = Array.isArray(values) && values.length > 0 ? values.map(function (v) { return Number(v) || 0; }) : [0, 0];
-        if (nums.length === 1) nums = [nums[0], nums[0]];
-        var w = 160;
-        var h = 30;
-        var max = Math.max.apply(null, nums.concat([1]));
-        var min = Math.min.apply(null, nums.concat([0]));
-        var span = Math.max(1, max - min);
-        var pts = nums.map(function (v, i) {
-          var x = (i / (nums.length - 1)) * w;
-          var y = h - 3 - ((v - min) / span) * (h - 7);
-          return x.toFixed(1) + ',' + y.toFixed(1);
-        });
-        var poly = pts.join(' ');
-        var area = '0,' + h + ' ' + poly + ' ' + w + ',' + h;
-        svgEl.innerHTML =
-          '<polygon points="' + area + '" fill="' + fillColor + '"></polygon>' +
-          '<polyline points="' + poly + '" fill="none" stroke="' + strokeColor + '" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></polyline>';
-      }
-
-      function renderAxisBars(container, rows) {
-        if (!container) return;
-        container.innerHTML = rows.map(function (r) {
-          var pct = Math.max(0, Math.min(100, Math.round(Number(r.pct) || 0)));
-          return (
-            '<div class="axis-row">' +
-              '<div class="axis-meta">' +
-                '<span class="axis-name">' + esc(r.label) + '</span>' +
-                '<span class="axis-score" style="color:' + r.color + ';">' + esc(r.valText != null ? r.valText : (pct + '%')) + '</span>' +
-              '</div>' +
-              '<div class="bar-track">' +
-                '<div class="bar-fill" style="width:' + pct + '%;background:' + r.color + ';"></div>' +
-              '</div>' +
-            '</div>'
-          );
-        }).join('');
-      }
-
-      var currentData = null;
-      var agentFilter = 'all';
-      var selectedAgentId = null;
-
-      function renderAgentsList(data) {
-        var container = el('m-agent-list');
-        if (!container || !data || !data.agents) return;
-        var nowSec = data.polled_at || Math.floor(Date.now() / 1000);
-        var roster = Array.isArray(data.agents.roster) ? data.agents.roster : [];
-        var filtered = roster.filter(function (a) {
-          if (agentFilter === 'active') return a.health === 'active' || a.health === 'warm';
-          if (agentFilter === 'writers') return Boolean(a.is_writer);
-          if (agentFilter === 'alerts') {
-            return a.fenced || a.health === 'error' || (a.compliance_status && a.compliance_status !== 'compliant') || a.refusals_15m > 0;
-          }
-          return true;
-        });
-        if (filtered.length === 0) {
-          container.innerHTML = '<div class="stat-box"><span class="stat-s">No seats match filter (' + esc(agentFilter) + ').</span></div>';
-          return;
-        }
-        container.innerHTML = filtered.map(function (a, i) {
-          var info = agentInfo(a.id, i);
-          var hClass = a.health === 'active' ? 'ok' : a.health === 'warm' ? 'info' : a.health === 'error' ? 'err' : '';
-          var compBadge = '';
-          if (a.fenced) {
-            compBadge = '<span class="pill err">FENCED</span>';
-          } else if (a.compliance_status && a.compliance_status !== 'compliant') {
-            compBadge = '<span class="pill warn">' + esc(a.compliance_status.replace(/_/g, ' ')) + '</span>';
-          }
-          var hi = selectedAgentId && selectedAgentId === a.id ? ' highlight' : '';
-          return (
-            '<div class="agent-card' + hi + '" data-agent-id="' + esc(a.id) + '">' +
-              '<div class="agent-top">' +
-                '<div class="agent-id">' +
-                  '<span class="dot" style="background:' + info.color + ';box-shadow:0 0 8px ' + info.color + ';"></span>' +
-                  '<span>' + esc(info.name) + '</span>' +
-                  '<span style="font-size:10px;color:var(--muted);font-family:var(--font-mono);">@' + esc(a.id) + '</span>' +
-                '</div>' +
-                '<div style="display:flex;gap:4px;align-items:center;">' +
-                  compBadge +
-                  '<span class="pill ' + hClass + '">' + esc(a.health) + '</span>' +
-                '</div>' +
-              '</div>' +
-              '<div class="agent-metrics">' +
-                '<span>5m: <b>' + a.reads_5m + 'R / ' + a.writes_5m + 'W</b></span>' +
-                '<span>claims: <b>' + a.active_claims + '</b></span>' +
-                '<span>coh: <b>' + a.coherence_score + '%</b></span>' +
-                '<span>recall: ' + esc(fmtAgo(a.last_recall_at, nowSec)) + '</span>' +
-                '<span>write: ' + esc(fmtAgo(a.last_write_at, nowSec)) + (a.last_write_slug ? ' (' + esc(a.last_write_slug.slice(0, 22)) + ')' : '') + '</span>' +
-              '</div>' +
-            '</div>'
-          );
-        }).join('');
-      }
-
-      function renderMobile(data) {
-        if (!data || typeof data !== 'object') return;
-        currentData = data;
-        var nowSec = data.polled_at || Math.floor(Date.now() / 1000);
-        var ss = data.store_state || {};
-        var bk = data.backup || {};
-        var vel = data.velocities || {};
-        var nm = vel.new_memory || {};
-        var rc = vel.recall || {};
-        var coh = data.coherence || {};
-        var eff = data.synaptic_efficiency || data.efficacy || {};
-        var dr = data.dreams || {};
-        var ag = data.agents || {};
-        var vt = data.vitals || {};
-
-        if (el('m-reader')) el('m-reader').textContent = data.reader || 'viewer';
-        var stPill = el('m-store-pill');
-        if (stPill) {
-          stPill.textContent = ss.state || (data.connected ? 'READY' : 'OFFLINE');
-          stPill.className = 'pill ' + (ss.state === 'READY' && data.connected ? 'ok' : 'err');
-        }
-        if (el('m-seq-pill')) {
-          el('m-seq-pill').textContent = 'seq #' + (ss.write_seq ?? '-') + ' · ' + (ss.current_claims ?? 0) + ' claims';
-        }
-        if (el('m-poll-age')) {
-          el('m-poll-age').textContent = 'poll #' + (data.poll_seq || 0) + ' · ' + fmtUtcShort(nowSec);
-        }
-
-        // Health & Alerts Banner
-        var alerts = Array.isArray(data.alerts) ? data.alerts : [];
-        var banner = el('m-health-banner');
-        var hTitle = el('m-health-title');
-        var aCount = el('m-alert-count');
-        var aList = el('m-alert-list');
-        var hasCrit = alerts.some(function (a) { return a.severity === 'critical'; });
-        if (banner) {
-          banner.className = 'glass health-banner ' + (hasCrit ? 'critical' : alerts.length > 0 ? 'alerting' : 'healthy');
-        }
-        if (hTitle) {
-          hTitle.textContent = hasCrit
-            ? '⚠ Critical Memory Alert Active'
-            : alerts.length > 0
-              ? '⚡ Brain Active · ' + alerts.length + ' Advisory Notice' + (alerts.length === 1 ? '' : 's')
-              : '✓ Brain Healthy · Saving Open · Backup Verified';
-        }
-        if (aCount) {
-          aCount.textContent = alerts.length + (alerts.length === 1 ? ' alert' : ' alerts');
-          aCount.className = 'pill ' + (hasCrit ? 'err' : alerts.length > 0 ? 'warn' : 'ok');
-        }
-        if (aList) {
-          aList.innerHTML = alerts.slice(0, 6).map(function (a) {
-            return (
-              '<div class="alert-item ' + (a.severity === 'critical' ? 'critical' : 'warn') + '">' +
-                '<span>' + esc(a.summary) + '</span>' +
-                '<span style="font-family:var(--font-mono);font-size:10px;opacity:0.8;">' + esc(fmtAgo(a.at, nowSec)) + '</span>' +
-              '</div>'
-            );
-          }).join('');
-        }
-
-        // 2x2 Hero Vitals
-        if (el('v-write-val')) el('v-write-val').textContent = (nm.writes_1h || 0) + '/hr';
-        if (el('v-write-sub')) {
-          el('v-write-sub').textContent = '24h: ' + (nm.writes_24h || 0) + ' · last ' + fmtAgo(nm.last_write_at, nowSec);
-        }
-        drawSparkline(el('svg-write-spark'), nm.sparkline_12h || [0, 0], '#34d399', 'rgba(52, 211, 153, 0.18)');
-
-        if (el('v-recall-val')) el('v-recall-val').textContent = (rc.recalls_1h || 0) + '/hr';
-        if (el('v-recall-sub')) {
-          el('v-recall-sub').textContent = '5m: ' + (rc.recalls_5m || 0) + ' (' + (rc.rate_per_min_5m || 0) + '/m) · hit ' + Math.round(rc.query_hit_rate_pct || 0) + '%';
-        }
-        drawSparkline(el('svg-recall-spark'), rc.sparkline_60m || [0, 0], '#38bdf8', 'rgba(56, 189, 248, 0.18)');
-
-        var delta = Number(coh.delta_since_inception || 0);
-        if (el('v-coh-val')) el('v-coh-val').textContent = Math.round(coh.score || 0) + '%';
-        if (el('v-coh-delta')) {
-          el('v-coh-delta').textContent = (delta >= 0 ? '+' : '') + delta.toFixed(1) + '%';
-          el('v-coh-delta').className = 'pill ' + (delta >= 0 ? 'ok' : 'warn');
-        }
-        if (el('v-coh-sub')) {
-          el('v-coh-sub').textContent = 'core ' + Math.round(coh.core_memory_score || 0) + '% · periph ' + Math.round(coh.periphery_coherence_score || 0) + '%';
-        }
-        var cohPts = Array.isArray(coh.history) && coh.history.length > 0
-          ? coh.history.map(function (h) { return h.score; })
-          : [coh.inception_score || 0, coh.score || 0];
-        drawSparkline(el('svg-coh-spark'), cohPts, '#6ee7b7', 'rgba(110, 231, 183, 0.18)');
-
-        if (el('v-eff-val')) el('v-eff-val').textContent = Math.round(eff.score || 0) + '%';
-        var medH = eff.handoff && eff.handoff.median_handoff_min != null ? (eff.handoff.median_handoff_min + 'm') : '-';
-        if (el('v-eff-sub')) {
-          el('v-eff-sub').textContent = 'R→W ' + Math.round((eff.retrieval && eff.retrieval.read_before_write_pct) || 0) + '% · handoff ' + medH;
-        }
-        var effAxes = eff.axes || {};
-        drawSparkline(
-          el('svg-eff-spark'),
-          [effAxes.breadth || 0, effAxes.precision || 0, effAxes.velocity || 0, effAxes.reuse || 0, eff.score || 0],
-          '#a78bfa',
-          'rgba(167, 139, 250, 0.18)'
-        );
-
-        // Velocity & Flow details
-        if (el('f-writes-1h6h')) el('f-writes-1h6h').textContent = (nm.writes_1h || 0) + ' / ' + (nm.writes_6h || 0);
-        if (el('f-writes-24h')) el('f-writes-24h').textContent = '24h: ' + (nm.writes_24h || 0) + ' (' + (nm.rate_per_hour_24h || 0) + '/hr)';
-        if (el('f-recalls-5m1h')) el('f-recalls-5m1h').textContent = (rc.recalls_5m || 0) + ' / ' + (rc.recalls_1h || 0);
-        if (el('f-recalls-wq')) el('f-recalls-wq').textContent = (rc.wakes_window || 0) + ' wakes · ' + (rc.queries_window || 0) + ' queries';
-        if (el('f-coverage')) el('f-coverage').textContent = Math.round(rc.recall_coverage_pct || 0) + '%';
-        if (el('f-hit-rate')) el('f-hit-rate').textContent = 'query hit: ' + Math.round(rc.query_hit_rate_pct || 0) + '% (' + (rc.recalling_agents || 0) + '/' + (rc.active_agents || 0) + ' seats)';
-
-        var pulses = Array.isArray(vt.recent_pulses) ? vt.recent_pulses : [];
-        var pulseEl = el('m-pulse-list');
-        if (pulseEl) {
-          pulseEl.innerHTML = pulses.slice(0, 5).map(function (p) {
-            var badgeCls = p.kind === 'submit' ? (p.accepted === false ? 'err' : 'ok') : 'info';
-            var desc = p.kind === 'submit'
-              ? ('write ' + (p.slug || p.scope || ''))
-              : p.kind === 'query'
-                ? ('query (' + (p.hits ?? 0) + ' hits)')
-                : ('wake (' + (p.count ?? 0) + ' recs)');
-            return (
-              '<div class="compact-row">' +
-                '<span class="compact-main"><span class="pill ' + badgeCls + '" style="padding:1px 6px;margin-right:6px;">' + esc(p.kind) + '</span><b>@' + esc(p.actor) + '</b> · ' + esc(desc) + '</span>' +
-                '<span style="color:var(--muted);flex-shrink:0;">' + esc(fmtAgo(p.at, nowSec)) + '</span>' +
-              '</div>'
-            );
-          }).join('');
-        }
-
-        // Coherence & Synaptic Efficiency axes
-        if (el('m-drift-pill')) {
-          var ds = coh.drift_status || 'aligned';
-          el('m-drift-pill').textContent = ds.replace(/_/g, ' ');
-          el('m-drift-pill').className = 'pill ' + (ds === 'aligned' ? 'ok' : 'warn');
-        }
-        if (el('c-core-score')) el('c-core-score').textContent = Math.round(coh.core_memory_score || 0) + '%';
-        var cc = coh.counts || {};
-        if (el('c-grounded')) el('c-grounded').textContent = (cc.grounded_claims || 0) + ' grounded · ' + (cc.shared_artifacts || 0) + ' shared refs';
-        if (el('e-compress')) el('e-compress').textContent = Math.round((eff.reuse && eff.reuse.state_compression_pct) || 0) + '%';
-        if (el('e-durable')) el('e-durable').textContent = ((eff.reuse && eff.reuse.durable_claims) || 0) + ' durable / ' + ((eff.reuse && eff.reuse.raw_class_a_claims) || 0) + ' status';
-
-        var ca = coh.axes || {};
-        renderAxisBars(el('m-coh-axes'), [
-          { label: 'Canon Alignment', pct: ca.alignment, color: '#fbbf24' },
-          { label: 'Evidence Grounding', pct: ca.grounding, color: '#34d399' },
-          { label: 'Cross-Agent Convergence', pct: ca.convergence, color: '#38bdf8' },
-          { label: 'Recall-Before-Write Coupling', pct: ca.coupling, color: '#818cf8' },
-          { label: 'Lifecycle Hygiene', pct: ca.consolidation, color: '#a78bfa' }
-        ]);
-        renderAxisBars(el('m-eff-axes'), [
-          { label: 'Distribution Breadth (Recall Coverage)', pct: effAxes.breadth, color: '#38bdf8' },
-          { label: 'Retrieval Precision (Query Hit + R→W)', pct: effAxes.precision, color: '#34d399' },
-          { label: 'Cross-Agent Handoff Velocity', pct: effAxes.velocity, color: '#fbbf24' },
-          { label: 'State Compression & Corroboration', pct: effAxes.reuse, color: '#a78bfa' }
-        ]);
-
-        // Backup & Write-Fence Card
-        var bStatus = bk.status || 'verified_clean';
-        var bPill = el('b-status-pill');
-        if (bPill) {
-          bPill.textContent = bStatus.replace(/_/g, ' ').toUpperCase();
-          bPill.className = 'pill ' + (bStatus === 'verified_clean' ? 'ok' : bStatus === 'dirty_open' ? 'info' : 'err');
-        }
-        if (el('b-age-val')) el('b-age-val').textContent = bk.age_sec != null ? fmtDur(bk.age_sec) : 'none';
-        if (el('b-unbacked-val')) {
-          el('b-unbacked-val').textContent = String(bk.unbacked_writes ?? '-');
-          el('b-unbacked-val').style.color = (bk.unbacked_writes || 0) === 0 ? '#22c55e' : '#fbbf24';
-        }
-        if (el('b-seq-sub')) el('b-seq-sub').textContent = 'head seq #' + (ss.write_seq ?? '-');
-        var bw = bk.watch || {};
-        var sav = String(bw.saving || 'open').toUpperCase();
-        if (el('b-saving-val')) {
-          el('b-saving-val').textContent = sav;
-          el('b-saving-val').style.color = sav === 'OPEN' ? '#22c55e' : sav === 'OFF' ? '#ef4444' : '#f59e0b';
-        }
-        var fList = Array.isArray(bw.fenced) ? bw.fenced : [];
-        if (el('b-fenced-sub')) el('b-fenced-sub').textContent = fList.length ? ('fenced: ' + fList.join(', ')) : '0 fenced seats';
-        var freshPct = Number(bk.freshness_pct ?? 0);
-        if (el('b-fresh-pct')) el('b-fresh-pct').textContent = freshPct + '%';
-        if (el('b-fresh-bar')) {
-          el('b-fresh-bar').style.width = freshPct + '%';
-          el('b-fresh-bar').style.background = freshPct > 25 ? 'linear-gradient(90deg,#22c55e,#38bdf8)' : '#ef4444';
-        }
-        var rec = bk.last_receipt || {};
-        if (el('b-receipt-main')) {
-          el('b-receipt-main').textContent =
-            rec.write_seq != null
-              ? ('receipt seq #' + rec.write_seq + ' · ' + fmtUtcShort(rec.at) + ' (' + fmtAgo(rec.at, nowSec) + ')')
-              : 'No verified backup receipt recorded';
-        }
-        if (el('b-receipt-sub')) {
-          el('b-receipt-sub').textContent = 'snapshot: ' + (rec.snapshot_id ? rec.snapshot_id : 'verified via store_state');
-        }
-
-        // Dream & Curator Card
-        if (el('d-mode-pill')) {
-          el('d-mode-pill').textContent = dr.persisted_curation ? 'OBSERVED MERKLE' : 'PREVIEW MODE';
-          el('d-mode-pill').className = 'pill ' + (dr.persisted_curation ? 'ok' : 'violet');
-        }
-        if (el('d-last-val')) el('d-last-val').textContent = dr.last_curated_at ? fmtAgo(dr.last_curated_at, nowSec) : 'pending';
-        if (el('d-last-seq')) el('d-last-seq').textContent = 'curated seq #' + (dr.last_curated_write_seq || 0);
-        var dc = dr.counts || {};
-        if (el('d-merkle-val')) el('d-merkle-val').textContent = String(dc.merkle_syntheses || 0);
-        if (el('d-folded-sub')) el('d-folded-sub').textContent = (dc.consolidated_sources || 0) + ' sources folded';
-        if (el('d-savings-val')) el('d-savings-val').textContent = (dc.wake_savings_pct || 0) + '%';
-        var ps = dr.planned_summary || {};
-        var totalPlanned = (ps.promotions || 0) + (ps.distillations || 0) + (ps.solidifications || 0);
-        if (el('d-planned-sub')) el('d-planned-sub').textContent = totalPlanned + ' ready for next dream';
-
-        var elap = Number(dr.elapsed_sec || 0);
-        var dInt = Math.max(1, Number(dr.dream_interval_sec || 28800));
-        var wDelta = Number(dr.write_delta || 0);
-        var wThresh = Math.max(1, Number(dr.write_delta_threshold || 25));
-        renderAxisBars(el('d-trigger-bars'), [
-          {
-            label: 'Trigger 1 · Circadian Cycle (' + fmtDur(elap) + ' / ' + fmtDur(dInt) + ')',
-            pct: Math.min(100, Math.round((elap / dInt) * 100)),
-            valText: dr.triggers && dr.triggers.circadian_dream ? 'READY' : Math.min(100, Math.round((elap / dInt) * 100)) + '%',
-            color: dr.triggers && dr.triggers.circadian_dream ? '#22c55e' : '#38bdf8'
-          },
-          {
-            label: 'Trigger 2 · Synaptic Volume (' + wDelta + ' / ' + wThresh + ' writes)',
-            pct: Math.min(100, Math.round((wDelta / wThresh) * 100)),
-            valText: dr.triggers && dr.triggers.synaptic_volume ? 'READY' : (wDelta + '/' + wThresh),
-            color: dr.triggers && dr.triggers.synaptic_volume ? '#22c55e' : '#a78bfa'
-          },
-          {
-            label: 'Trigger 3 · Nightmare Interrupt (' + (dc.nightmares || 0) + ' conflicts/stale)',
-            pct: Math.min(100, (dc.nightmares || 0) * 25),
-            valText: dr.triggers && dr.triggers.nightmare_interrupt ? 'INTERRUPT' : '0 critical',
-            color: dr.triggers && dr.triggers.nightmare_interrupt ? '#ef4444' : '#34d399'
-          }
-        ]);
-
-        var dList = el('d-ledger-list');
-        if (dList) {
-          var cons = Array.isArray(dr.recent_consolidations) ? dr.recent_consolidations : [];
-          var eigs = Array.isArray(dr.eigenvectors) ? dr.eigenvectors : [];
-          var itemsHtml = cons.slice(0, 4).map(function (c) {
-            return (
-              '<div class="compact-row">' +
-                '<span class="compact-main"><span class="pill violet" style="padding:1px 6px;margin-right:6px;">#' + esc(c.topic) + '</span><b>' + esc(c.slug) + '</b> (' + c.source_count + ' folded · ' + esc(c.merkle_sources || '-') + ')</span>' +
-                '<span style="color:var(--muted);flex-shrink:0;">' + esc(fmtAgo(c.at, nowSec)) + '</span>' +
-              '</div>'
-            );
-          });
-          if (eigs.length > 0) {
-            itemsHtml.push(
-              '<div class="compact-row">' +
-                '<span class="compact-main"><span class="pill info" style="padding:1px 6px;margin-right:6px;">Eigen λ1</span><b>' + esc(eigs[0].label) + '</b> (' + eigs[0].variance_pct + '% var · ' + eigs[0].claim_count + ' claims)</span>' +
-                '<span style="color:var(--muted);flex-shrink:0;">' + (eigs[0].persisted ? 'persisted' : 'spectral') + '</span>' +
-              '</div>'
-            );
-          }
-          dList.innerHTML = itemsHtml.join('') || '<div class="stat-box"><span class="stat-s">No consolidations recorded yet.</span></div>';
-        }
-
-        // Per-Agent Usage
-        var aSum = ag.summary || {};
-        if (el('a-summary-pill')) {
-          el('a-summary-pill').textContent = (aSum.active_5m || 0) + ' active · ' + (aSum.warm_20m || 0) + ' warm / ' + (aSum.total || 0);
-        }
-        renderAgentsList(data);
-
-        // Tiers & Topic Pressure
-        var sc = vt.scope_counts || {};
-        if (el('t-total-pill')) el('t-total-pill').textContent = (ss.current_claims || 0) + ' active claims';
-        if (el('t-canon')) el('t-canon').textContent = String(sc.canon || 0);
-        if (el('t-decisions')) el('t-decisions').textContent = String(dc.class_b_decisions || 0);
-        if (el('t-edges')) el('t-edges').textContent = String((vt.entity_graph && vt.entity_graph.total_edges) || 0);
-        if (el('t-unverified')) el('t-unverified').textContent = (sc.unverified_total || 0) + ' unverified';
-
-        var topics = Array.isArray(vt.topics) ? vt.topics : [];
-        var maxTopic = Math.max.apply(null, topics.map(function (t) { return t.total || 0; }).concat([1]));
-        renderAxisBars(
-          el('m-topic-bars'),
-          topics.slice(0, 7).map(function (t) {
-            return {
-              label: '#' + t.topic + ' (' + t.above_the_line + ' durable · ' + t.below_the_line + ' status)',
-              pct: Math.round(((t.total || 0) / maxTopic) * 100),
-              valText: t.total + ' claims',
-              color: t.canon > 0 ? '#fbbf24' : t.merkle > 0 ? '#a78bfa' : '#38bdf8'
-            };
-          })
-        );
-      }
-
-      // --- Interactive 60fps Pocket Cortex Canvas ---
-      var canvas = el('pocket-cortex');
-      var ctx = canvas ? canvas.getContext('2d') : null;
-      var particles = [];
-      var nodePositions = [];
-      var animTick = 0;
-
-      function resizeCanvas() {
-        if (!canvas || !ctx) return;
-        var dpr = Math.min(window.devicePixelRatio || 1, 2.5);
-        var rect = canvas.getBoundingClientRect();
-        var w = Math.max(300, Math.floor(rect.width));
-        var h = Math.max(180, Math.floor(rect.height));
-        if (canvas.width !== Math.floor(w * dpr) || canvas.height !== Math.floor(h * dpr)) {
-          canvas.width = Math.floor(w * dpr);
-          canvas.height = Math.floor(h * dpr);
-        }
-      }
-
-      function spawnParticle( rosterLen, isWrite ) {
-        if (rosterLen <= 0) return;
-        var idx = Math.floor(Math.random() * rosterLen);
-        particles.push({
-          idx: idx,
-          t: 0,
-          speed: 0.012 + Math.random() * 0.016,
-          isWrite: Boolean(isWrite),
-          color: isWrite ? '#34d399' : '#38bdf8'
-        });
-        if (particles.length > 36) particles.shift();
-      }
-
-      function drawPocketCortex() {
-        if (!canvas || !ctx) return;
-        resizeCanvas();
-        var dpr = Math.min(window.devicePixelRatio || 1, 2.5);
-        var w = canvas.width / dpr;
-        var h = canvas.height / dpr;
-        ctx.save();
-        ctx.scale(dpr, dpr);
-        ctx.clearRect(0, 0, w, h);
-
-        animTick += 0.025;
-        var cx = w * 0.5;
-        var cy = h * 0.52;
-        var rx = Math.min(w * 0.39, 165);
-        var ry = Math.min(h * 0.35, 70);
-
-        var data = currentData || {};
-        var cohScore = (data.coherence && data.coherence.score) || 85;
-        var effScore = (data.synaptic_efficiency && data.synaptic_efficiency.score) || 80;
-        var roster = (data.agents && Array.isArray(data.agents.roster)) ? data.agents.roster : [];
-        var writes1h = (data.velocities && data.velocities.new_memory && data.velocities.new_memory.writes_1h) || 1;
-        var recalls5m = (data.velocities && data.velocities.recall && data.velocities.recall.recalls_5m) || 1;
-
-        if (Math.random() < Math.min(0.35, 0.04 + recalls5m * 0.015)) {
-          spawnParticle(roster.length, false);
-        }
-        if (Math.random() < Math.min(0.25, 0.02 + writes1h * 0.01)) {
-          spawnParticle(roster.length, true);
-        }
-
-        // Outer orbital rings
-        ctx.strokeStyle = 'rgba(99, 130, 190, 0.16)';
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
-        ctx.stroke();
-
-        ctx.strokeStyle = 'rgba(167, 139, 250, 0.14)';
-        ctx.beginPath();
-        ctx.ellipse(cx, cy, rx * 0.62, ry * 0.62, 0, 0, Math.PI * 2);
-        ctx.stroke();
-
-        // Position agent ganglia around rim
-        nodePositions = [];
-        var count = Math.max(1, roster.length);
-        for (var i = 0; i < roster.length; i++) {
-          var a = roster[i];
-          var angle = -Math.PI / 2 + (i / count) * Math.PI * 2 + Math.sin(animTick * 0.35 + i) * 0.03;
-          var nx = cx + Math.cos(angle) * rx;
-          var ny = cy + Math.sin(angle) * ry;
-          var info = agentInfo(a.id, i);
-          nodePositions.push({ id: a.id, name: info.name, x: nx, y: ny, color: info.color, health: a.health });
-
-          // Synaptic filament from core to ganglion
-          ctx.strokeStyle = a.health === 'active'
-            ? 'rgba(56, 189, 248, 0.28)'
-            : a.health === 'warm'
-              ? 'rgba(148, 163, 184, 0.16)'
-              : 'rgba(71, 85, 105, 0.1)';
-          ctx.lineWidth = a.health === 'active' ? 1.4 : 0.9;
-          ctx.beginPath();
-          ctx.moveTo(cx, cy);
-          var ctrlX = (cx + nx) * 0.5 + Math.sin(angle) * 14;
-          var ctrlY = (cy + ny) * 0.5 - Math.cos(angle) * 10;
-          ctx.quadraticCurveTo(ctrlX, ctrlY, nx, ny);
-          ctx.stroke();
-        }
-
-        // Draw traveling synaptic particles
-        for (var pIdx = particles.length - 1; pIdx >= 0; pIdx--) {
-          var p = particles[pIdx];
-          p.t += p.speed;
-          if (p.t >= 1 || !nodePositions[p.idx]) {
-            particles.splice(pIdx, 1);
-            continue;
-          }
-          var target = nodePositions[p.idx];
-          var prog = p.isWrite ? (1 - p.t) : p.t;
-          var px = cx + (target.x - cx) * prog;
-          var py = cy + (target.y - cy) * prog;
-          ctx.fillStyle = p.color;
-          ctx.beginPath();
-          ctx.arc(px, py, 2.4, 0, Math.PI * 2);
-          ctx.fill();
-        }
-
-        // Central Cortex Core Orb
-        var pulseR = 22 + Math.sin(animTick * 2.1) * 2.5;
-        var grad = ctx.createRadialGradient(cx - 5, cy - 5, 2, cx, cy, pulseR * 1.9);
-        grad.addColorStop(0, 'rgba(165, 243, 252, 0.95)');
-        grad.addColorStop(0.4, 'rgba(56, 189, 248, 0.55)');
-        grad.addColorStop(0.75, 'rgba(167, 139, 250, 0.22)');
-        grad.addColorStop(1, 'rgba(4, 7, 17, 0)');
-        ctx.fillStyle = grad;
-        ctx.beginPath();
-        ctx.arc(cx, cy, pulseR * 1.9, 0, Math.PI * 2);
-        ctx.fill();
-
-        // Coherence arc around core
-        ctx.strokeStyle = '#34d399';
-        ctx.lineWidth = 2.6;
-        ctx.beginPath();
-        ctx.arc(cx, cy, pulseR + 4, -Math.PI / 2, -Math.PI / 2 + (Math.PI * 2 * Math.min(100, cohScore)) / 100);
-        ctx.stroke();
-
-        // Synaptic Efficiency inner arc
-        ctx.strokeStyle = '#a78bfa';
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.arc(cx, cy, pulseR - 2, -Math.PI / 2, -Math.PI / 2 + (Math.PI * 2 * Math.min(100, effScore)) / 100);
-        ctx.stroke();
-
-        ctx.fillStyle = '#f8fafc';
-        ctx.font = '700 11px -apple-system, BlinkMacSystemFont, sans-serif';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(Math.round(cohScore) + '%', cx, cy);
-
-        // Draw agent ganglia nodes
-        for (var j = 0; j < nodePositions.length; j++) {
-          var n = nodePositions[j];
-          var isSel = selectedAgentId === n.id;
-          var r = isSel ? 7.5 : n.health === 'active' ? 6 : 4.5;
-          if (n.health === 'active' || isSel) {
-            ctx.fillStyle = n.color + '33';
-            ctx.beginPath();
-            ctx.arc(n.x, n.y, r + 4.5, 0, Math.PI * 2);
-            ctx.fill();
-          }
-          ctx.fillStyle = n.color;
-          ctx.beginPath();
-          ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
-          ctx.fill();
-
-          ctx.fillStyle = isSel ? '#ffffff' : 'rgba(226, 232, 240, 0.86)';
-          ctx.font = (isSel ? '700 ' : '500 ') + '9.5px -apple-system, BlinkMacSystemFont, sans-serif';
-          ctx.textAlign = 'center';
-          var labelY = n.y < cy ? n.y - 10 : n.y + 12;
-          ctx.fillText(n.name.slice(0, 10), n.x, labelY);
-        }
-
-        ctx.restore();
-        requestAnimationFrame(drawPocketCortex);
-      }
-
-      if (canvas) {
-        canvas.addEventListener('click', function (ev) {
-          var rect = canvas.getBoundingClientRect();
-          var x = ev.clientX - rect.left;
-          var y = ev.clientY - rect.top;
-          var best = null;
-          var bestDist = 28;
-          for (var i = 0; i < nodePositions.length; i++) {
-            var n = nodePositions[i];
-            var d = Math.hypot(x - n.x, y - n.y);
-            if (d < bestDist) {
-              bestDist = d;
-              best = n;
-            }
-          }
-          if (best) {
-            selectedAgentId = best.id;
-            if (el('m-canvas-caption')) {
-              el('m-canvas-caption').textContent = 'Selected @' + best.id + ' (' + best.health + ')';
-            }
-            renderAgentsList(currentData);
-            var row = document.querySelector('[data-agent-id="' + best.id + '"]');
-            if (row && row.scrollIntoView) row.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-          }
-        });
-      }
-
-      // Filter buttons
-      var filterBtns = document.querySelectorAll('#a-filter-row .filter-btn');
-      for (var f = 0; f < filterBtns.length; f++) {
-        filterBtns[f].addEventListener('click', function () {
-          agentFilter = this.getAttribute('data-filter') || 'all';
-          for (var k = 0; k < filterBtns.length; k++) filterBtns[k].classList.remove('active');
-          this.classList.add('active');
-          renderAgentsList(currentData);
-        });
-      }
-
-      // Bottom navigation jump buttons
-      var navBtns = document.querySelectorAll('.bottom-nav .nav-btn');
-      for (var b = 0; b < navBtns.length; b++) {
-        navBtns[b].addEventListener('click', function () {
-          var targetId = this.getAttribute('data-jump');
-          for (var k = 0; k < navBtns.length; k++) navBtns[k].classList.remove('active');
-          this.classList.add('active');
-          var sec = el(targetId);
-          if (sec && sec.scrollIntoView) sec.scrollIntoView({ behavior: 'smooth', block: 'start' });
-        });
-      }
-
-      if (el('m-desktop-btn')) {
-        el('m-desktop-btn').addEventListener('click', function () {
-          window.location.href = '/';
-        });
-      }
-
-      try {
-        var raw = el('initial-mobile-state').textContent;
-        if (raw) renderMobile(JSON.parse(raw));
-      } catch (_) {}
-      requestAnimationFrame(drawPocketCortex);
-
-      if (typeof EventSource !== 'undefined') {
-        var es = new EventSource('/events?mode=mobile');
-        var ssePill = el('m-sse-pill');
-        es.onopen = function () {
-          if (ssePill) {
-            ssePill.textContent = 'LIVE';
-            ssePill.className = 'pill ok';
-          }
-        };
-        es.onmessage = function (ev) {
-          try {
-            renderMobile(JSON.parse(ev.data));
-          } catch (_) {}
-        };
-        es.onerror = function () {
-          if (ssePill) {
-            ssePill.textContent = 'POLL';
-            ssePill.className = 'pill warn';
-          }
-        };
-      }
-    })();
-  </script>
+<div class="shell" id="top-sec">
+<header class="glass top-bar">
+<div class="brand"><div class="orb"></div><div style="min-width:0"><div class="brand-title">Pocket Cortex · Hive Memory</div><div class="brand-sub">reader: <span id="m-reader">${readerName}</span> · metadata-only</div></div></div>
+<div class="top-actions"><span id="m-sse-pill" class="pill info">LIVE</span><button id="m-desktop-btn" class="btn-ghost" type="button">3D View</button></div>
+</header>
+<section class="glass cortex-hero">
+<canvas id="pocket-cortex" width="480" height="196"></canvas>
+<div class="ov-top"><span id="m-store-pill" class="pill ok">${syncState}</span><span id="m-seq-pill" class="pill">seq #-</span></div>
+<div class="ov-bot"><span id="m-canvas-caption">Tap any agent node to inspect</span><span id="m-poll-age">polled just now</span></div>
+</section>
+<section id="m-health-banner" class="glass health-banner healthy">
+<div class="health-headline"><span id="m-health-title">✓ Brain Healthy · Saving Open</span><span id="m-alert-count" class="pill ok">0 alerts</span></div>
+<div id="m-alert-list" class="alert-list"></div>
+</section>
+<section class="vitals-grid" id="velocity-sec">
+<div class="glass vital-card"><div class="vital-label"><span>New Memory</span><span class="pill ok">1h</span></div><div id="v-write-val" class="vital-val" style="color:var(--emerald)">0/hr</div><div id="v-write-sub" class="vital-sub">24h: 0</div><svg id="svg-write-spark" class="spark-svg" viewBox="0 0 160 28" preserveAspectRatio="none"></svg></div>
+<div class="glass vital-card"><div class="vital-label"><span>Recall Velocity</span><span class="pill info">5m/1h</span></div><div id="v-recall-val" class="vital-val" style="color:var(--cyan)">0/hr</div><div id="v-recall-sub" class="vital-sub">5m: 0</div><svg id="svg-recall-spark" class="spark-svg" viewBox="0 0 160 28" preserveAspectRatio="none"></svg></div>
+<div class="glass vital-card"><div class="vital-label"><span>Coherence 2.0</span><span id="v-coh-delta" class="pill ok">+0%</span></div><div id="v-coh-val" class="vital-val" style="color:#6ee7b7">0%</div><div id="v-coh-sub" class="vital-sub">core 0%</div><svg id="svg-coh-spark" class="spark-svg" viewBox="0 0 160 28" preserveAspectRatio="none"></svg></div>
+<div class="glass vital-card"><div class="vital-label"><span>Synaptic Eff</span><span class="pill violet">4-axis</span></div><div id="v-eff-val" class="vital-val" style="color:var(--violet)">0%</div><div id="v-eff-sub" class="vital-sub">R→W 0%</div><svg id="svg-eff-spark" class="spark-svg" viewBox="0 0 160 28" preserveAspectRatio="none"></svg></div>
+</section>
+<section class="glass section-card">
+<div class="section-head"><h2 class="section-title" style="color:var(--cyan)">⚡ Synaptic Velocity &amp; Flow</h2><span class="pill info">12h / 60m</span></div>
+<div class="sub-grid-3">
+<div class="stat-box"><span class="stat-k">Writes (1h/6h)</span><span id="f-writes-1h6h" class="stat-v" style="color:var(--emerald)">0 / 0</span><span id="f-writes-24h" class="stat-s">24h: 0</span></div>
+<div class="stat-box"><span class="stat-k">Recalls (5m/1h)</span><span id="f-recalls-5m1h" class="stat-v" style="color:var(--cyan)">0 / 0</span><span id="f-recalls-wq" class="stat-s">0 wakes</span></div>
+<div class="stat-box"><span class="stat-k">Recall Reach</span><span id="f-coverage" class="stat-v" style="color:#93c5fd">0%</span><span id="f-hit-rate" class="stat-s">hit: 0%</span></div>
+</div>
+<div class="compact-list" id="m-pulse-list"></div>
+</section>
+<section class="glass section-card" id="health-sec">
+<div class="section-head"><h2 class="section-title" style="color:#6ee7b7">🧭 Coherence &amp; Synaptic Efficiency</h2><span id="m-drift-pill" class="pill ok">aligned</span></div>
+<div class="sub-grid-2">
+<div class="stat-box"><span class="stat-k">Core Canon + Class B</span><span id="c-core-score" class="stat-v" style="color:var(--gold)">0%</span><span id="c-grounded" class="stat-s">0 grounded</span></div>
+<div class="stat-box"><span class="stat-k">State Compression</span><span id="e-compress" class="stat-v" style="color:var(--violet)">0%</span><span id="e-durable" class="stat-s">0 durable</span></div>
+</div>
+<div class="axis-list" id="m-coh-axes"></div>
+<div class="axis-list" id="m-eff-axes"></div>
+</section>
+<section class="glass section-card" id="backup-sec">
+<div class="section-head"><h2 class="section-title" style="color:var(--gold)">🛡️ Backup State &amp; Write Fence</h2><span id="b-status-pill" class="pill ok">VERIFIED</span></div>
+<div class="sub-grid-3">
+<div class="stat-box"><span class="stat-k">Backup Age</span><span id="b-age-val" class="stat-v">-</span><span class="stat-s">fence 60m</span></div>
+<div class="stat-box"><span class="stat-k">Unbacked</span><span id="b-unbacked-val" class="stat-v">0</span><span id="b-seq-sub" class="stat-s">seq #-</span></div>
+<div class="stat-box"><span class="stat-k">Saving Gate</span><span id="b-saving-val" class="stat-v" style="color:var(--ok)">OPEN</span><span id="b-fenced-sub" class="stat-s">0 fenced</span></div>
+</div>
+<div class="axis-row"><div class="axis-meta"><span>Backup Window Freshness</span><span id="b-fresh-pct">100%</span></div><div class="bar-track"><div id="b-fresh-bar" class="bar-fill" style="width:100%;background:#22c55e"></div></div></div>
+<div class="stat-box"><span class="stat-k">Last Verified Backup Receipt</span><span id="b-receipt-main" class="stat-v" style="font-size:12.5px;color:#fde68a">receipt seq #-</span><span id="b-receipt-sub" class="stat-s">snapshot: -</span></div>
+</section>
+<section class="glass section-card" id="dream-sec">
+<div class="section-head"><h2 class="section-title" style="color:var(--violet)">🌙 Merkle Dream &amp; Curator</h2><span id="d-mode-pill" class="pill violet">OBSERVED</span></div>
+<div class="sub-grid-3">
+<div class="stat-box"><span class="stat-k">Last Dream</span><span id="d-last-val" class="stat-v">-</span><span id="d-last-seq" class="stat-s">seq #-</span></div>
+<div class="stat-box"><span class="stat-k">Syntheses</span><span id="d-merkle-val" class="stat-v" style="color:var(--violet)">0</span><span id="d-folded-sub" class="stat-s">0 folded</span></div>
+<div class="stat-box"><span class="stat-k">Wake Savings</span><span id="d-savings-val" class="stat-v" style="color:var(--emerald)">0%</span><span id="d-planned-sub" class="stat-s">0 planned</span></div>
+</div>
+<div class="axis-list" id="d-trigger-bars"></div>
+<div class="compact-list" id="d-ledger-list"></div>
+</section>
+<section class="glass section-card" id="agents-sec">
+<div class="section-head"><h2 class="section-title" style="color:#93c5fd">🐝 Per-Agent Usage Status</h2><span id="a-summary-pill" class="pill info">0 active</span></div>
+<div class="filter-row" id="a-filter-row">
+<button class="filter-btn active" type="button" data-filter="all">All Seats</button>
+<button class="filter-btn" type="button" data-filter="active">Active / Warm</button>
+<button class="filter-btn" type="button" data-filter="writers">Writers</button>
+<button class="filter-btn" type="button" data-filter="alerts">Drift / Fenced</button>
+</div>
+<div class="agent-rows" id="m-agent-list"></div>
+</section>
+<section class="glass section-card">
+<div class="section-head"><h2 class="section-title" style="color:var(--emerald)">📚 Memory Tiers &amp; Topics</h2><span id="t-total-pill" class="pill">0 claims</span></div>
+<div class="sub-grid-3">
+<div class="stat-box"><span class="stat-k">Rank 2 Canon</span><span id="t-canon" class="stat-v" style="color:var(--gold)">0</span><span class="stat-s">James canon</span></div>
+<div class="stat-box"><span class="stat-k">Class B Durable</span><span id="t-decisions" class="stat-v" style="color:var(--violet)">0</span><span class="stat-s">ttl: 0</span></div>
+<div class="stat-box"><span class="stat-k">Graph Edges</span><span id="t-edges" class="stat-v" style="color:var(--cyan)">0</span><span id="t-unverified" class="stat-s">0 unverified</span></div>
+</div>
+<div class="axis-list" id="m-topic-bars"></div>
+</section>
+<footer class="meta-footer">Hive Memory Pocket Cortex · DATA ONLY (authority=null, trustedInstruction=false)</footer>
+</div>
+<nav class="bottom-nav">
+<button class="nav-btn active" type="button" data-jump="top-sec">Brain</button>
+<button class="nav-btn" type="button" data-jump="velocity-sec">Velocity</button>
+<button class="nav-btn" type="button" data-jump="health-sec">Coherence</button>
+<button class="nav-btn" type="button" data-jump="dream-sec">Dream</button>
+<button class="nav-btn" type="button" data-jump="agents-sec">Agents</button>
+</nav>
+<script id="initial-mobile-state" type="application/json">${escapedInitial}</script>
+<script>
+(function(){
+'use strict';
+var el=function(id){return document.getElementById(id);};
+var txt=function(id,v){var n=el(id);if(n)n.textContent=v;};
+var cls=function(id,c){var n=el(id);if(n)n.className=c;};
+var AM={james:['James','#fbbf24'],biggy:['Biggy','#818cf8'],rabidrabbit:['RabidRabbit','#f59e0b'],'dead-rabbit':['Dead Rabbit','#f59e0b'],mydude:['My Dude','#10b981'],neil:['Neil','#38bdf8'],'waggle-dev':['Waggle-Dev','#fb923c'],crystalclaude:['CrystalClaude','#f472b6'],'dj-codex':['DJ-Codex','#34d399'],dennis:['Dennis','#60a5fa'],kerouac:['Kerouac','#c084fc'],grokdoggydog:['GrokDoggyDog','#f87171'],'pi-dog':['Pi-Dog','#2dd4bf'],lukedog:['LukeDog','#a3e635'],'mc-claude':['MC-Claude','#e879f9'],curator:['Curator','#a78bfa']};
+var FB=['#38bdf8','#a78bfa','#34d399','#f472b6','#fbbf24','#60a5fa','#fb923c'];
+function aInfo(id,i){var m=AM[String(id||'').toLowerCase()];return m?{name:m[0],color:m[1]}:{name:String(id||'agent'),color:FB[i%FB.length]};}
+function fmtDur(sec){if(sec==null||!Number.isFinite(sec))return '-';var s=Math.max(0,Math.floor(sec));return s<60?s+'s':s<3600?Math.floor(s/60)+'m '+(s%60)+'s':s<86400?Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m':Math.floor(s/86400)+'d';}
+function fmtAgo(ts,now){return (!ts||!Number.isFinite(ts))?'never':fmtDur(Math.max(0,now-ts))+' ago';}
+function fmtUtc(ts){if(!ts||!Number.isFinite(ts))return '-';try{return new Date(ts*1000).toISOString().replace('T',' ').slice(5,19)+'Z';}catch(_){return '-';}}
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function spark(id,vals,stroke,fill){
+var svg=el(id);if(!svg)return;
+var a=Array.isArray(vals)&&vals.length?vals.map(function(v){return Number(v)||0;}):[0,0];
+if(a.length===1)a=[a[0],a[0]];
+var w=160,h=28,max=Math.max.apply(null,a.concat([1])),min=Math.min.apply(null,a.concat([0])),sp=Math.max(1,max-min);
+var pts=a.map(function(v,i){return ((i/(a.length-1))*w).toFixed(1)+','+(h-3-((v-min)/sp)*(h-6)).toFixed(1);}).join(' ');
+svg.innerHTML='<polygon points="0,'+h+' '+pts+' '+w+','+h+'" fill="'+fill+'"></polygon><polyline points="'+pts+'" fill="none" stroke="'+stroke+'" stroke-width="2"></polyline>';
+}
+function bars(id,rows){
+var b=el(id);if(!b)return;
+b.innerHTML=rows.map(function(r){
+var p=Math.max(0,Math.min(100,Math.round(Number(r[1])||0)));
+return '<div class="axis-row"><div class="axis-meta"><span>'+esc(r[0])+'</span><span style="color:'+r[2]+';font-family:var(--mono);font-weight:700">'+esc(r[3]!=null?r[3]:p+'%')+'</span></div><div class="bar-track"><div class="bar-fill" style="width:'+p+'%;background:'+r[2]+'"></div></div></div>';
+}).join('');
+}
+var curData=null,aFilter='all',selAgent=null;
+function renderAgents(data){
+var b=el('m-agent-list');if(!b||!data||!data.agents)return;
+var now=data.polled_at||Math.floor(Date.now()/1000);
+var list=(data.agents.roster||[]).filter(function(a){
+return aFilter==='active'?(a.health==='active'||a.health==='warm'):aFilter==='writers'?Boolean(a.is_writer):aFilter==='alerts'?(a.fenced||a.health==='error'||(a.compliance_status&&a.compliance_status!=='compliant')||a.refusals_15m>0):true;
+});
+if(!list.length){b.innerHTML='<div class="stat-box"><span class="stat-s">No matching seats.</span></div>';return;}
+b.innerHTML=list.map(function(a,i){
+var inf=aInfo(a.id,i),hc=a.health==='active'?'ok':a.health==='warm'?'info':a.health==='error'?'err':'';
+var bdg=a.fenced?'<span class="pill err">FENCED</span>':(a.compliance_status&&a.compliance_status!=='compliant')?'<span class="pill warn">'+esc(a.compliance_status)+'</span>':'';
+return '<div class="agent-card'+(selAgent===a.id?' highlight':'')+'" data-agent-id="'+esc(a.id)+'"><div class="agent-top"><div class="agent-id"><span class="dot" style="background:'+inf.color+'"></span><span>'+esc(inf.name)+'</span><span style="font-size:10px;color:var(--muted)">@'+esc(a.id)+'</span></div><div>'+bdg+' <span class="pill '+hc+'">'+esc(a.health)+'</span></div></div><div class="agent-metrics"><span>5m: <b>'+a.reads_5m+'R/'+a.writes_5m+'W</b></span><span>claims: <b>'+a.active_claims+'</b></span><span>coh: <b>'+a.coherence_score+'%</b></span>'+(a.refusals_15m?'<span style="color:#fca5a5">refused: <b>'+a.refusals_15m+'</b></span>':'')+'<span>R: '+esc(fmtAgo(a.last_recall_at,now))+'</span><span>W: '+esc(fmtAgo(a.last_write_at,now))+(a.last_write_slug?' ('+esc(a.last_write_slug.slice(0,18))+')':'')+'</span></div></div>';
+}).join('');
+}
+function renderMobile(d){
+if(!d||typeof d!=='object')return;
+curData=d;
+var now=d.polled_at||Math.floor(Date.now()/1000),ss=d.store_state||{},bk=d.backup||{},vel=d.velocities||{},nm=vel.new_memory||{},rc=vel.recall||{},coh=d.coherence||{},eff=d.synaptic_efficiency||{},dr=d.dreams||{},ag=d.agents||{},vt=d.vitals||{};
+txt('m-reader',d.reader||'viewer');
+txt('m-store-pill',ss.state||(d.connected?'READY':'OFFLINE'));
+cls('m-store-pill','pill '+(ss.state==='READY'&&d.connected?'ok':'err'));
+txt('m-seq-pill','seq #'+(ss.write_seq??'-')+' · '+(ss.current_claims??0)+' claims');
+txt('m-poll-age','poll #'+(d.poll_seq||0)+' · '+fmtUtc(now));
+var al=d.alerts||[],crit=al.some(function(a){return a.severity==='critical';});
+cls('m-health-banner','glass health-banner '+(crit?'critical':al.length?'alerting':'healthy'));
+txt('m-health-title',crit?'⚠ Critical Memory Alert':al.length?'⚡ '+al.length+' Notice(s)':'✓ Brain Healthy · Saving Open');
+txt('m-alert-count',al.length+' alerts');cls('m-alert-count','pill '+(crit?'err':al.length?'warn':'ok'));
+if(el('m-alert-list'))el('m-alert-list').innerHTML=al.slice(0,5).map(function(a){return '<div class="alert-item '+(a.severity==='critical'?'critical':'')+'"><span>'+esc(a.summary)+'</span><span>'+esc(fmtAgo(a.at,now))+'</span></div>';}).join('');
+txt('v-write-val',(nm.writes_1h||0)+'/hr');txt('v-write-sub','24h: '+(nm.writes_24h||0)+' · last '+fmtAgo(nm.last_write_at,now));
+spark('svg-write-spark',nm.sparkline_12h,'#34d399','rgba(52,211,153,0.18)');
+txt('v-recall-val',(rc.recalls_1h||0)+'/hr');txt('v-recall-sub','5m: '+(rc.recalls_5m||0)+' · hit '+Math.round(rc.query_hit_rate_pct||0)+'%');
+spark('svg-recall-spark',rc.sparkline_60m,'#38bdf8','rgba(56,189,248,0.18)');
+var dl=Number(coh.delta_since_inception||0);
+txt('v-coh-val',Math.round(coh.score||0)+'%');txt('v-coh-delta',(dl>=0?'+':'')+dl.toFixed(1)+'%');cls('v-coh-delta','pill '+(dl>=0?'ok':'warn'));
+txt('v-coh-sub','core '+Math.round(coh.core_memory_score||0)+'% · periph '+Math.round(coh.periphery_coherence_score||0)+'%');
+spark('svg-coh-spark',(coh.history||[]).map(function(h){return h.score;}),'#6ee7b7','rgba(110,231,183,0.18)');
+var ea=eff.axes||{};
+txt('v-eff-val',Math.round(eff.score||0)+'%');txt('v-eff-sub','R→W '+Math.round((eff.retrieval&&eff.retrieval.read_before_write_pct)||0)+'%');
+spark('svg-eff-spark',[ea.breadth||0,ea.precision||0,ea.velocity||0,ea.reuse||0,eff.score||0],'#a78bfa','rgba(167,139,250,0.18)');
+txt('f-writes-1h6h',(nm.writes_1h||0)+' / '+(nm.writes_6h||0));txt('f-writes-24h','24h: '+(nm.writes_24h||0)+' · '+(nm.refusals_15m||0)+' refused');
+txt('f-recalls-5m1h',(rc.recalls_5m||0)+' / '+(rc.recalls_1h||0));txt('f-recalls-wq',(rc.wakes_window||0)+'W · '+(rc.queries_window||0)+'Q');
+txt('f-coverage',Math.round(rc.recall_coverage_pct||0)+'%');txt('f-hit-rate','hit '+Math.round(rc.query_hit_rate_pct||0)+'% ('+(rc.recalling_agents||0)+'/'+(rc.active_agents||0)+')');
+if(el('m-pulse-list'))el('m-pulse-list').innerHTML=(vt.recent_pulses||[]).slice(0,5).map(function(p){
+var pc=p.kind==='refused'?'err':p.kind==='submit'?(p.accepted===false?'err':'ok'):'info';
+var ds=p.kind==='refused'?'refused '+(p.code||''):p.kind==='submit'?'write '+(p.slug||''):p.kind==='query'?'query ('+(p.hits??0)+' hits)':'wake ('+(p.count??0)+')';
+return '<div class="compact-row"><span class="compact-main"><span class="pill '+pc+'">'+esc(p.kind)+'</span> <b>@'+esc(p.actor)+'</b> · '+esc(ds)+'</span><span>'+esc(fmtAgo(p.at,now))+'</span></div>';
+}).join('');
+var dst=coh.drift_status||'aligned';txt('m-drift-pill',dst.replace(/_/g,' '));cls('m-drift-pill','pill '+(dst==='aligned'?'ok':'warn'));
+var cc=coh.counts||{}, ca=coh.axes||{};
+txt('c-core-score',Math.round(coh.core_memory_score||0)+'%');txt('c-grounded',(cc.grounded_claims||0)+' grounded · '+(cc.shared_artifacts||0)+' refs');
+txt('e-compress',Math.round((eff.reuse&&eff.reuse.state_compression_pct)||0)+'%');txt('e-durable',((eff.reuse&&eff.reuse.durable_claims)||0)+' durable');
+bars('m-coh-axes',[['Canon Alignment',ca.alignment,'#fbbf24'],['Evidence Grounding',ca.grounding,'#34d399'],['Cross-Agent Convergence',ca.convergence,'#38bdf8'],['Recall-Before-Write',ca.coupling,'#818cf8'],['Lifecycle Hygiene',ca.consolidation,'#a78bfa']]);
+bars('m-eff-axes',[['Distribution Breadth',ea.breadth,'#38bdf8'],['Retrieval Precision',ea.precision,'#34d399'],['Handoff Velocity',ea.velocity,'#fbbf24'],['State Compression',ea.reuse,'#a78bfa']]);
+var bs=bk.status||'verified_clean';txt('b-status-pill',bs.replace(/_/g,' ').toUpperCase());cls('b-status-pill','pill '+(bs==='verified_clean'?'ok':bs==='dirty_open'?'info':'err'));
+txt('b-age-val',bk.age_sec!=null?fmtDur(bk.age_sec):'none');txt('b-unbacked-val',String(bk.unbacked_writes??'-'));txt('b-seq-sub','seq #'+(ss.write_seq??'-'));
+var bw=bk.watch||{},sv=String(bw.saving||'open').toUpperCase();txt('b-saving-val',sv);txt('b-fenced-sub',(bw.fenced||[]).length+' fenced');
+var fp=Number(bk.freshness_pct??0);txt('b-fresh-pct',fp+'%');if(el('b-fresh-bar'))el('b-fresh-bar').style.width=fp+'%';
+var rcpt=bk.last_receipt||{};txt('b-receipt-main',rcpt.write_seq!=null?'seq #'+rcpt.write_seq+' · '+fmtUtc(rcpt.at)+' ('+fmtAgo(rcpt.at,now)+')':'No receipt');
+txt('b-receipt-sub','snapshot: '+(rcpt.snapshot_id||'store_state'));
+txt('d-mode-pill',dr.persisted_curation?'OBSERVED':'PREVIEW');cls('d-mode-pill','pill '+(dr.persisted_curation?'ok':'violet'));
+var dc=dr.counts||{},ps=dr.planned_summary||{};
+txt('d-last-val',dr.last_curated_at?fmtAgo(dr.last_curated_at,now):'pending');txt('d-last-seq','seq #'+(dr.last_curated_write_seq||0));
+txt('d-merkle-val',String(dc.merkle_syntheses||0));txt('d-folded-sub',(dc.consolidated_sources||0)+' folded');
+txt('d-savings-val',(dc.wake_savings_pct||0)+'%');txt('d-planned-sub',((ps.promotions||0)+(ps.distillations||0)+(ps.solidifications||0))+' planned');
+var elp=Number(dr.elapsed_sec||0),dI=Math.max(1,Number(dr.dream_interval_sec||28800)),wD=Number(dr.write_delta||0),wT=Math.max(1,Number(dr.write_delta_threshold||25));
+bars('d-trigger-bars',[['Circadian ('+fmtDur(elp)+'/'+fmtDur(dI)+')',Math.min(100,Math.round(elp/dI*100)),'#38bdf8'],['Synaptic Volume ('+wD+'/'+wT+')',Math.min(100,Math.round(wD/wT*100)),'#a78bfa',wD+'/'+wT],['Nightmare Interrupts',Math.min(100,(dc.nightmares||0)*25),'#34d399',(dc.nightmares||0)+' active']]);
+if(el('d-ledger-list')){
+var rows=(dr.recent_consolidations||[]).slice(0,4).map(function(c){return '<div class="compact-row"><span class="compact-main"><span class="pill violet">#'+esc(c.topic)+'</span> <b>'+esc(c.slug)+'</b> ('+c.source_count+' folded)</span><span>'+esc(fmtAgo(c.at,now))+'</span></div>';});
+var eg=(dr.eigenvectors||[])[0];if(eg)rows.push('<div class="compact-row"><span class="compact-main"><span class="pill info">Eigen λ1</span> <b>'+esc(eg.label)+'</b> ('+eg.variance_pct+'% var)</span><span>'+(eg.persisted?'persisted':'spectral')+'</span></div>');
+el('d-ledger-list').innerHTML=rows.join('')||'<div class="stat-box"><span class="stat-s">No consolidations yet.</span></div>';
+}
+var as=ag.summary||{};txt('a-summary-pill',(as.active_5m||0)+' active · '+(as.warm_20m||0)+' warm / '+(as.total||0));
+renderAgents(d);
+var sc=vt.scope_counts||{};txt('t-total-pill',(ss.current_claims||0)+' claims');txt('t-canon',String(sc.canon||0));txt('t-decisions',String(dc.class_b_decisions||0));
+txt('t-edges',String((vt.entity_graph&&vt.entity_graph.total_edges)||0));txt('t-unverified',(sc.unverified_total||0)+' unverified');
+var tps=vt.topics||[],mT=Math.max.apply(null,tps.map(function(t){return t.total||0;}).concat([1]));
+bars('m-topic-bars',tps.slice(0,7).map(function(t){return ['#'+t.topic+' ('+t.above_the_line+' durable)',Math.round((t.total||0)/mT*100),t.canon>0?'#fbbf24':'#38bdf8',t.total+' claims'];}));
+}
+var cv=el('pocket-cortex'),ctx=cv?cv.getContext('2d'):null,pts=[],nodes=[],tick=0;
+function draw(){
+if(!cv||!ctx)return;
+var dpr=Math.min(window.devicePixelRatio||1,2),r=cv.getBoundingClientRect(),w=Math.max(300,Math.floor(r.width)),h=Math.max(180,Math.floor(r.height));
+if(cv.width!==w*dpr||cv.height!==h*dpr){cv.width=w*dpr;cv.height=h*dpr;}
+ctx.save();ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);tick+=0.025;
+var cx=w*0.5,cy=h*0.52,rx=Math.min(w*0.38,160),ry=Math.min(h*0.34,66),d=curData||{},cs=(d.coherence&&d.coherence.score)||85,roster=(d.agents&&d.agents.roster)||[];
+if(roster.length&&Math.random()<0.18){pts.push({i:Math.floor(Math.random()*roster.length),t:0,w:Math.random()<0.4});if(pts.length>28)pts.shift();}
+ctx.strokeStyle='rgba(99,130,190,0.18)';ctx.beginPath();ctx.ellipse(cx,cy,rx,ry,0,0,Math.PI*2);ctx.stroke();
+nodes=[];
+for(var i=0;i<roster.length;i++){
+var a=roster[i],ang=-Math.PI/2+(i/roster.length)*Math.PI*2+Math.sin(tick*0.3+i)*0.03,nx=cx+Math.cos(ang)*rx,ny=cy+Math.sin(ang)*ry,inf=aInfo(a.id,i);
+nodes.push({id:a.id,name:inf.name,x:nx,y:ny,color:inf.color,health:a.health});
+ctx.strokeStyle=a.health==='active'?'rgba(56,189,248,0.28)':'rgba(148,163,184,0.12)';ctx.beginPath();ctx.moveTo(cx,cy);ctx.lineTo(nx,ny);ctx.stroke();
+}
+for(var k=pts.length-1;k>=0;k--){
+var p=pts[k];p.t+=0.02;if(p.t>=1||!nodes[p.i]){pts.splice(k,1);continue;}
+var tg=nodes[p.i],pr=p.w?(1-p.t):p.t;ctx.fillStyle=p.w?'#34d399':'#38bdf8';ctx.beginPath();ctx.arc(cx+(tg.x-cx)*pr,cy+(tg.y-cy)*pr,2.3,0,Math.PI*2);ctx.fill();
+}
+ctx.fillStyle='rgba(56,189,248,0.25)';ctx.beginPath();ctx.arc(cx,cy,26,0,Math.PI*2);ctx.fill();
+ctx.strokeStyle='#34d399';ctx.lineWidth=2.5;ctx.beginPath();ctx.arc(cx,cy,24,-Math.PI/2,-Math.PI/2+(Math.PI*2*Math.min(100,cs))/100);ctx.stroke();
+ctx.fillStyle='#f8fafc';ctx.font='700 11px sans-serif';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(Math.round(cs)+'%',cx,cy);
+for(var j=0;j<nodes.length;j++){
+var n=nodes[j],sel=selAgent===n.id;ctx.fillStyle=n.color;ctx.beginPath();ctx.arc(n.x,n.y,sel?7:5,0,Math.PI*2);ctx.fill();
+ctx.fillStyle='#e2e8f0';ctx.font='9.5px sans-serif';ctx.fillText(n.name.slice(0,9),n.x,n.y<cy?n.y-9:n.y+11);
+}
+ctx.restore();requestAnimationFrame(draw);
+}
+if(cv)cv.addEventListener('click',function(ev){
+var r=cv.getBoundingClientRect(),x=ev.clientX-r.left,y=ev.clientY-r.top;
+for(var i=0;i<nodes.length;i++){var n=nodes[i];if(Math.hypot(x-n.x,y-n.y)<26){selAgent=n.id;txt('m-canvas-caption','Selected @'+n.id+' ('+n.health+')');renderAgents(curData);break;}}
+});
+var fb=document.querySelectorAll('#a-filter-row .filter-btn');
+for(var f=0;f<fb.length;f++)fb[f].addEventListener('click',function(){aFilter=this.getAttribute('data-filter')||'all';for(var k=0;k<fb.length;k++)fb[k].classList.remove('active');this.classList.add('active');renderAgents(curData);});
+var nb=document.querySelectorAll('.bottom-nav .nav-btn');
+for(var b=0;b<nb.length;b++)nb[b].addEventListener('click',function(){var s=el(this.getAttribute('data-jump'));for(var k=0;k<nb.length;k++)nb[k].classList.remove('active');this.classList.add('active');if(s&&s.scrollIntoView)s.scrollIntoView({behavior:'smooth'});});
+if(el('m-desktop-btn'))el('m-desktop-btn').addEventListener('click',function(){window.location.href='/';});
+try{var raw=el('initial-mobile-state').textContent;if(raw)renderMobile(JSON.parse(raw));}catch(_){}
+requestAnimationFrame(draw);
+if(typeof EventSource!=='undefined'){
+var es=new EventSource('/events?mode=mobile');
+es.onopen=function(){txt('m-sse-pill','LIVE');cls('m-sse-pill','pill ok');};
+es.onmessage=function(e){try{renderMobile(JSON.parse(e.data));}catch(_){}};
+es.onerror=function(){txt('m-sse-pill','POLL');cls('m-sse-pill','pill warn');};
+}
+})();
+</script>
 </body>
 </html>`
 }
