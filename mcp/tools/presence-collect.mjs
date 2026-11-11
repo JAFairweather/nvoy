@@ -15,6 +15,7 @@ import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { readManifest, instanceId } from './runtime_manifest.mjs'
 import { keyFingerprint, parsePrincipal, principalComment, verifyPrincipal } from './participant_unit.mjs'
+import { codexComment, verifyCodexPrincipal } from './principal_family.mjs'
 import { buildSnapshot } from './presence.mjs'
 
 // [{ pid, uid, cgroup, argv }] from a /proc tree. A process that vanishes mid-read is skipped.
@@ -36,13 +37,16 @@ export function readProcs(procRoot = '/proc') {
 // The fingerprint a TAGGED installed line binds, or '' (no line, an older line, or a line whose
 // fingerprint is not its own key's).
 export function installedFingerprint(keysText, manifest) {
-  const comment = principalComment(manifest)
-  const lines = String(keysText || '').split('\n').map(l => l.trim()).filter(l => { const p = parsePrincipal(l); return p && p.comment === comment })
-  if (lines.length !== 1) return ''
+  const all = String(keysText || '').split('\n').map(l => l.trim())
+  const carrying = comment => all.filter(l => { const p = parsePrincipal(l); return p && p.comment === comment })
+  const claude = carrying(principalComment(manifest)), codex = carrying(codexComment(manifest, 'channel'))
+  // An agent has one channel principal: the Claude one, or the Pi/Codex one. Both, or two of either, is
+  // ambiguous and supports no claim.
+  if (claude.length + codex.length !== 1) return ''
   // The whole line must verify against the manifest: restrict intact, the exact docker exec as the
   // worker uid:gid into the adapter, this instance, and the line's own key fingerprint. A line whose
   // command was swapped but still ends in a fingerprint supports no claim.
-  const verified = verifyPrincipal(manifest, lines[0])
+  const verified = claude.length ? verifyPrincipal(manifest, claude[0]) : verifyCodexPrincipal(manifest, 'channel', codex[0])
   return verified?.ok && verified.fingerprint === 'bound' ? keyFingerprint(verified.parsed.keyBody) : ''
 }
 

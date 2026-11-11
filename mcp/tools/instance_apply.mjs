@@ -28,9 +28,9 @@
 //
 // It never reads credential contents. The public key is a public key; it is printed by path only.
 
-import { createHash } from 'node:crypto'
-import { appendFileSync, closeSync, existsSync, fsyncSync, linkSync, lstatSync, openSync, readdirSync, readFileSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
-import { join } from 'node:path'
+import { createHash, randomBytes } from 'node:crypto'
+import { appendFileSync, closeSync, existsSync, fchmodSync, fchownSync, fsyncSync, linkSync, lstatSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
+import { basename, dirname, join } from 'node:path'
 import { parsePrincipal, principalComment, principalLine } from './participant_unit.mjs'
 import { codexComment, codexManifestRefusal, codexPrincipalPlan, distinctKeys } from './principal_family.mjs'
 import { NUMERIC_FIELDS, parseBlockRecord, recordedClashes } from './identity_allocation.mjs'
@@ -94,6 +94,32 @@ export function planPrincipals(text, manifest, { family = 'claude', publicKey, f
 }
 export const principalCommentOf = (manifest, family, role) => family === 'codex' ? codexComment(manifest, role) : principalComment(manifest)
 
+// Replace a shared file's contents in one step, as an upgrade of authorized_keys must: other agents' lines live in
+// the same file, so an interrupted write may never leave it truncated. The new text goes to an exclusive temp file
+// beside the real file (a symlinked path is resolved, so the link survives), takes the original's mode and owner,
+// is synced, and is renamed over the original only if the original still holds exactly the text it was planned from.
+export function replaceFileAtomic(path, expected, text, { hooks = {} } = {}) {
+  const real = realpathSync(path), st = statSync(real)
+  const tmp = join(dirname(real), `.${basename(real)}.nvoy-${process.pid}-${randomBytes(6).toString('hex')}`)
+  const fd = openSync(tmp, 'wx', 0o600)
+  try {
+    try {
+      writeSync(fd, text)
+      fchownSync(fd, st.uid, st.gid)
+      fchmodSync(fd, st.mode & 0o7777)
+      fsyncSync(fd)
+    } finally { closeSync(fd) }
+    hooks.beforeRename?.(tmp)
+    if (readFileSync(real, 'utf8') !== expected) throw new Error(`${path} changed while replacing it`)
+    renameSync(tmp, real)
+  } catch (error) {
+    try { unlinkSync(tmp) } catch {}
+    throw error
+  }
+  const dir = openSync(dirname(real), 'r')
+  try { fsyncSync(dir) } catch {} finally { closeSync(dir) }
+}
+
 // Seat the planned principals, then check them as the operator would. Shared by a fresh apply and by the repair of an
 // install that stopped after the manifest went in. `done(state, ok, detail)` reports each state as it is observed.
 export function seatPrincipals({ manifest, keysPath, publicKey, feedKey = null, family = 'claude', run, done, when = 'the deploy' }) {
@@ -107,8 +133,16 @@ export function seatPrincipals({ manifest, keysPath, publicKey, feedKey = null, 
       if (plan.action === 'append') {
         const text = readFileSync(keysPath, 'utf8')
         appendFileSync(keysPath, `${text && !text.endsWith('\n') ? '\n' : ''}${plan.line}\n`)
+      } else if (plan.action === 'upgrade') {
+        // Replace exactly the one older line for this key (planned from this same read) with the line that
+        // names its fingerprint. Nothing else in the file moves.
+        const text = readFileSync(keysPath, 'utf8'), lines = text.split('\n')
+        const at = lines.map(l => l.trim()).indexOf(plan.old)
+        if (at < 0 || lines.map(l => l.trim()).lastIndexOf(plan.old) !== at) throw new Error('the older channel line changed while upgrading it')
+        lines[at] = plan.line
+        replaceFileAtomic(keysPath, text, lines.join('\n'))
       }
-      seated.push(`${plan.role} ${plan.action === 'append' ? 'appended' : 'already present'}`)
+      seated.push(`${plan.role} ${plan.action === 'append' ? 'appended' : plan.action === 'upgrade' ? 'upgraded to name its key fingerprint' : 'already present'}`)
     }
   } catch (error) {
     // Partial seat: say which lines are in. A re-run plans again, finds them present and appends only the rest.
@@ -140,7 +174,7 @@ export function repairInstalled({ manifest, root, stateDir, keysPath, publicKey,
   const plan = planPrincipals(readFileSync(keysPath, 'utf8'), manifest, { family, publicKey, feedKey })
   if (plan.error) return done('principal planned', false, plan.error)
   done('principal planned', true, plan.plans.every(p => p.action === 'present') ? 'already present, unchanged'
-    : `will append ${plan.plans.filter(p => p.action === 'append').map(p => principalCommentOf(manifest, family, p.role)).join(' and ')}`)
+    : `will ${plan.plans.filter(p => p.action !== 'present').map(p => `${p.action === 'upgrade' ? 'upgrade' : 'append'} ${principalCommentOf(manifest, family, p.role)}`).join(' and ')}`)
   const deployed = readJson(join(stateDir, 'DEPLOYED_MANIFESTS.json'))
   if (!existsSync(target) || deployed?.[manifest.id] !== digestOf(readFileSync(target)) || !existsSync(compose))
     return { ...done('deployed', null, 'the runner has not recorded the installed manifest and its compose file yet; nothing was seated'), inconclusive: true }
@@ -208,7 +242,7 @@ export async function applyStaged({ manifest, stagedPath, root, stateDir, keysPa
   const plan = planPrincipals(readFileSync(keysPath, 'utf8'), manifest, { family, publicKey, feedKey })
   if (plan.error) return done('principal planned', false, plan.error)
   done('principal planned', true, plan.plans.every(p => p.action === 'present') ? 'already present, unchanged'
-    : `will append ${plan.plans.filter(p => p.action === 'append').map(p => principalCommentOf(manifest, family, p.role)).join(' and ')}`)
+    : `will ${plan.plans.filter(p => p.action !== 'present').map(p => `${p.action === 'upgrade' ? 'upgrade' : 'append'} ${principalCommentOf(manifest, family, p.role)}`).join(' and ')}`)
 
   // 2. Reserve the block in the record, as the record is now, before anything can run as it.
   const reserved = reserveBlock(ledgerPath, manifest, now)

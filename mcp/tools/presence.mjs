@@ -19,6 +19,7 @@
 //     `connected: true` can never follow a newer disconnect.
 
 import { channelArgv } from './participant_unit.mjs'
+import { codexArgv } from './principal_family.mjs'
 
 export const PRESENCE_KIND = 30078
 export const PRESENCE_D = 'nvoy-channel-presence'
@@ -44,10 +45,14 @@ const sameArgv = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]
 // names ('' for an older, untagged session).
 export function parseChannelArgv(argv, manifest) {
   if (!Array.isArray(argv) || argv.some(v => typeof v !== 'string')) return null
-  const base = channelArgv(manifest)
-  if (sameArgv(argv, base)) return { fp: '' }
-  if (argv.length === base.length + 2 && sameArgv(argv.slice(0, base.length), base) && argv[base.length] === '--key-fp' && FP.test(argv[base.length + 1])) {
-    return { fp: argv[base.length + 1] }
+  // The Claude channel, or the Pi/Codex channel program (principal_family.mjs): an agent has exactly one
+  // channel principal, so whichever of the two exact argvs it runs is its channel. The feed program is
+  // never a channel session.
+  for (const base of [channelArgv(manifest), codexArgv(manifest, 'channel')]) {
+    if (sameArgv(argv, base)) return { fp: '' }
+    if (argv.length === base.length + 2 && sameArgv(argv.slice(0, base.length), base) && argv[base.length] === '--key-fp' && FP.test(argv[base.length + 1])) {
+      return { fp: argv[base.length + 1] }
+    }
   }
   return null
 }
