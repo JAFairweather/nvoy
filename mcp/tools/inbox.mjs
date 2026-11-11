@@ -191,7 +191,7 @@ await Promise.all(RELAYS.map(url => new Promise(res => {
           // cannot be reached from here. Mark the read partial, then step below that timestamp so the
           // older wraps are still collected within the page bound.
           if (!walkCapped.includes(url)) walkCapped.push(url)
-          if (page + 1 < MAX_PAGES) {
+          if (page + 1 < MAX_PAGES && oldestThisPage > fuzzFloor) {
             const until = oldestThisPage - 1
             ws.send(JSON.stringify(['CLOSE', `in${page}`]))
             page++

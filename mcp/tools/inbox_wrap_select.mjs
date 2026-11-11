@@ -139,11 +139,17 @@ export function walkStop({
     // short page. A FULL page that brought nothing new is different: more wraps share that one
     // timestamp than a page holds, the relay keeps returning the same ones, and the rest cannot be
     // reached. That is a partial read, not a finished one.
-    return pageLimit > 0 && eventsThisPage >= pageLimit && Number.isFinite(oldestThisPage) && oldestThisPage > fuzzFloor
+    return pageLimit > 0 && eventsThisPage >= pageLimit && Number.isFinite(oldestThisPage) && oldestThisPage >= fuzzFloor
       ? 'stalled' : 'exhausted'
   }
   if (!Number.isFinite(oldestThisPage)) return 'exhausted'
-  if (oldestThisPage <= fuzzFloor) return 'floor'
+  if (oldestThisPage <= fuzzFloor) {
+    // The query is inclusive (`since: fuzzFloor`), and a wrap exactly AT the floor can still carry an
+    // in-window rumor. A full page whose oldest sits on the floor may hide more wraps with that
+    // timestamp past the page limit, and nothing older exists to step to, so it is not proven done.
+    // Strictly below the floor (a relay ignoring `since`) or a short page is a finished walk.
+    return pageLimit > 0 && eventsThisPage >= pageLimit && oldestThisPage === fuzzFloor ? 'stalled' : 'floor'
+  }
   // Still progressing, still inside the window, and the loop bound is what ends it: there may be
   // in-window wraps on the next page, so this is a partial read, not a finished one.
   if (page + 1 >= maxPages) return 'capped'

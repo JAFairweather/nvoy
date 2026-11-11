@@ -192,6 +192,18 @@ t('a full page that brought nothing new is STALLED, a short one is exhausted', (
   assert.equal(shouldPaginate({ ...base, eventsThisPage: 2 }), false)
 })
 
+t('a full page of ties exactly at the inclusive floor is stalled, not finished (My Dude, PR 362)', () => {
+  const floor = since - NIP59_FUZZ_SEC
+  // The exact call from the review: one fresh event, page limit 1, oldest on the floor.
+  assert.equal(walkStop({ freshThisPage: 1, eventsThisPage: 1, pageLimit: 1, oldestThisPage: floor, fuzzFloor: floor }), 'stalled')
+  // Negative controls: a short page at the floor, and a page strictly below it, are finished.
+  assert.equal(walkStop({ freshThisPage: 1, eventsThisPage: 1, pageLimit: 2, oldestThisPage: floor, fuzzFloor: floor }), 'floor')
+  assert.equal(walkStop({ freshThisPage: 1, eventsThisPage: 1, pageLimit: 1, oldestThisPage: floor - 1, fuzzFloor: floor }), 'floor')
+  // The repeat page at the floor (nothing fresh, full) is the same ambiguity.
+  assert.equal(walkStop({ freshThisPage: 0, eventsThisPage: 2, pageLimit: 2, page: 1, maxPages: 6, oldestThisPage: floor, fuzzFloor: floor }), 'stalled')
+  assert.equal(walkStop({ freshThisPage: 0, eventsThisPage: 1, pageLimit: 2, page: 1, maxPages: 6, oldestThisPage: floor, fuzzFloor: floor }), 'exhausted')
+})
+
 t('a page that returned no events at all does not paginate on an infinite floor', () => {
   assert.equal(shouldPaginate({ freshThisPage: 5, page: 0, maxPages: 6, oldestThisPage: Infinity, fuzzFloor: 0 }), false)
 })
