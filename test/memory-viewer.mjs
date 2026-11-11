@@ -2403,22 +2403,32 @@ await test('durable SQLite activity_rollups survive >80 ring overflow & daemon r
             `coarse straddling bucket must report observed_coverage_pct < 100 (got ${coarseStraddleTrends.window_24h.observed_coverage_pct})`
           )
 
-          // 8. Regression: Rollup write failures must be durably persisted and keep the window incomplete across store/daemon restart
-          // Record an earlier rollup 2 days ago so the 24h window would otherwise be 'complete'
+          // 8. Regression: Real SQLite write failure (where BOTH activity_rollups AND activity_rollup_gaps in SQLite fail to write)
+          // and gap read failure must fail closed and keep the window incomplete across store/daemon restart.
+          // Record an earlier rollup 2 days ago so the 24h window would otherwise be 'complete'.
           oldStore.recordActivityRollup({ at: midHourNow - 2 * daySec, actor: 'biggy', kind: 'query', count: 2 })
-          oldStore.hooks = {
-            beforeRollupWrite: () => {
-              throw new Error('SIMULATED_SQLITE_ROLLUP_FAILURE')
-            },
-          }
-          const okWrite = oldStore.recordActivityRollup({ at: midHourNow - 60, actor: 'neil', kind: 'query', count: 3 })
-          assert.equal(okWrite, false, 'simulated rollup write failure must return false')
-          const failedRollups = oldStore.activityRollups({ sinceSec: 0, nowSec: midHourNow })
-          assert.equal(failedRollups.write_failures, 1, 'activityRollups must report write_failures = 1')
-          assert.equal(failedRollups.failure_gaps.length, 1, 'activityRollups must persist a coverage gap row')
 
-          // Close the store and open a brand-new HiveMemoryStore instance on the same SQLite DB (simulating daemon restart)
+          // Install real SQLite triggers that abort writes to BOTH activity_rollups AND activity_rollup_gaps (simulating read-only/full DB),
+          // and also fail the sidecar write on a second attempt to verify both the sidecar fallback and the SQLite session-sentinel fallback.
+          oldStore.db.exec(`
+            CREATE TRIGGER abort_rollup_insert BEFORE INSERT ON activity_rollups
+            BEGIN SELECT RAISE(ABORT, 'SQLITE_FULL_OR_READONLY'); END;
+            CREATE TRIGGER abort_rollup_update BEFORE UPDATE ON activity_rollups
+            BEGIN SELECT RAISE(ABORT, 'SQLITE_FULL_OR_READONLY'); END;
+            CREATE TRIGGER abort_gap_insert BEFORE INSERT ON activity_rollup_gaps
+            BEGIN SELECT RAISE(ABORT, 'SQLITE_FULL_OR_READONLY'); END;
+            CREATE TRIGGER abort_gap_update BEFORE UPDATE ON activity_rollup_gaps
+            BEGIN SELECT RAISE(ABORT, 'SQLITE_FULL_OR_READONLY'); END;
+          `)
+          const okWrite = oldStore.recordActivityRollup({ at: midHourNow - 60, actor: 'neil', kind: 'query', count: 3 })
+          assert.equal(okWrite, false, 'SQLite rollup write failure must return false')
+          assert.equal(oldStore.unpersistedRollupGap, true, 'SQLite gap write failure must set unpersistedRollupGap = true')
+
+          // Also verify that even if the sidecar file is deleted (simulating total disk/FS write failure where neither SQLite nor sidecar could write the gap),
+          // the uncleared session sentinel (hour_bucket = -1) in SQLite still keeps the window incomplete after restart!
+          rmSync(`${oldDbPath}.rollup-gaps.json`, { force: true })
           oldStore.close()
+
           const restartedStore = new HiveMemoryStore({
             dbPath: oldDbPath,
             ledgerPath: oldLedgerPath,
@@ -2429,9 +2439,16 @@ await test('durable SQLite activity_rollups survive >80 ring overflow & daemon r
           restartedStore.start()
           try {
             const postRestartRollups = restartedStore.activityRollups({ sinceSec: 0, nowSec: midHourNow })
-            assert.equal(postRestartRollups.write_failures, 1, 'write_failures must survive store/daemon restart')
-            assert.equal(postRestartRollups.first_failure_at, midHourNow - 60, 'first_failure_at must survive store/daemon restart')
-            assert.equal(postRestartRollups.failure_gaps.length, 1, 'failure_gaps must survive store/daemon restart')
+            assert.equal(
+              postRestartRollups.write_failures,
+              1,
+              'write_failures must survive restart even when both SQLite gap write and sidecar write failed'
+            )
+            assert.equal(
+              postRestartRollups.failure_gaps.length,
+              1,
+              'failure_gaps must be synthesized from uncleared session sentinel across restart'
+            )
 
             const failureTrends = computeMemoryTrends({
               records: [evDay2A],
@@ -2443,19 +2460,57 @@ await test('durable SQLite activity_rollups survive >80 ring overflow & daemon r
             assert.equal(
               failureTrends.window_24h.recall_incomplete,
               true,
-              'rollup write failure must keep window_24h.recall_incomplete = true after daemon restart'
+              'total rollup+gap write failure must keep window_24h.recall_incomplete = true after daemon restart'
             )
             assert.equal(
               failureTrends.window_24h.recall_coverage,
               'partial',
-              'rollup write failure must keep window_24h.recall_coverage = partial (never complete) after daemon restart'
+              'total rollup+gap write failure must keep window_24h.recall_coverage = partial (never complete) after daemon restart'
             )
             assert(
               failureTrends.window_24h.observed_coverage_pct < 100,
-              `window with persisted rollup failure gap must report observed_coverage_pct < 100 (got ${failureTrends.window_24h.observed_coverage_pct})`
+              `window with unpersisted rollup failure gap must report observed_coverage_pct < 100 (got ${failureTrends.window_24h.observed_coverage_pct})`
             )
             assert.equal(failureTrends.window_24h.rollup_write_failures, 1)
             assert.equal(failureTrends.recall_telemetry.write_failures, 1)
+
+            // 8b. Regression: Gap read failure (corrupt sidecar or unreadable gap table) must fail closed (read_error: true, partial coverage)
+            // even when earlier rollups exist and no in-memory failure is recorded on a fresh store instance.
+            restartedStore.db.exec(`
+              DROP TRIGGER abort_rollup_insert;
+              DROP TRIGGER abort_rollup_update;
+              DROP TRIGGER abort_gap_insert;
+              DROP TRIGGER abort_gap_update;
+            `)
+            restartedStore.db.prepare('DELETE FROM activity_rollup_gaps').run()
+            restartedStore.unpersistedRollupGap = false
+            restartedStore.priorUncleanRollupSession = null
+            restartedStore.rollupWriteFailures = 0
+            writeFileSync(`${oldDbPath}.rollup-gaps.json`, '{corrupt-json-gap-file')
+
+            const readErrRollups = restartedStore.activityRollups({ sinceSec: 0, nowSec: midHourNow })
+            assert.equal(readErrRollups.read_error, true, 'corrupt/unreadable gap store must set read_error = true')
+            assert.equal(readErrRollups.gap_read_error, true, 'corrupt/unreadable gap store must set gap_read_error = true')
+            assert(readErrRollups.rollups.length > 0, 'earlier rollups are still present')
+
+            const readErrTrends = computeMemoryTrends({
+              records: [evDay2A],
+              history_records: [evDay2A],
+              recent_activity: [],
+              activity_rollups: readErrRollups,
+              now_sec: midHourNow,
+            })
+            assert.equal(
+              readErrTrends.window_24h.recall_coverage,
+              'partial',
+              'unreadable gap store must fail closed (recall_coverage = partial, never complete)'
+            )
+            assert.equal(readErrTrends.window_24h.recall_incomplete, true)
+            assert.equal(readErrTrends.window_24h.rollup_read_error, true)
+            assert(
+              readErrTrends.window_24h.observed_coverage_pct < 100,
+              `unreadable gap store must report observed_coverage_pct < 100 (got ${readErrTrends.window_24h.observed_coverage_pct})`
+            )
           } finally {
             restartedStore.close()
           }

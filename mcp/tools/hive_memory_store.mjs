@@ -855,6 +855,12 @@ export class HiveMemoryStore {
     this.firstRollupFailureAt = null
     this.lastRollupFailureAt = null
     this.lastRollupFailureError = null
+    this.unpersistedRollupGap = false
+    this.rollupGapWriteError = null
+    this.rollupGapReadError = null
+    this.priorUncleanRollupSession = null
+    this.sessionSentinelActive = false
+    this.isFirstReconcile = true
   }
 
   start() {
@@ -864,8 +870,16 @@ export class HiveMemoryStore {
   }
 
   close() {
-    try { this.db?.close() } catch { /* already closed */ }
+    if (this.db) {
+      if (!this.unpersistedRollupGap) {
+        try {
+          this.db.prepare('DELETE FROM activity_rollup_gaps WHERE hour_bucket = -1').run()
+        } catch { /* ignore if table absent or db closed */ }
+      }
+      try { this.db.close() } catch { /* already closed */ }
+    }
     this.db = null
+    this.sessionSentinelActive = false
     this.lockHandle?.release()
     this.lockHandle = null
   }
@@ -1198,6 +1212,12 @@ export class HiveMemoryStore {
     return this.db.prepare('SELECT count(*) AS n FROM writer_rate_log WHERE pubkey = ? AND accepted_at > ?').get(pubkey, nowSec - 3600).n
   }
 
+  #rollupGapsSidecarPath() {
+    return typeof this.dbPath === 'string' && this.dbPath && this.dbPath !== ':memory:'
+      ? `${this.dbPath}.rollup-gaps.json`
+      : null
+  }
+
   #recordRollupFailure(ts, errMsg) {
     const cleanErr = String(errMsg || 'ROLLUP_WRITE_ERROR').slice(0, 200)
     const hourBucket = Math.floor(ts / 3600) * 3600
@@ -1207,6 +1227,7 @@ export class HiveMemoryStore {
     this.lastRollupFailureError = cleanErr
     const writeGapToDb = db => {
       ensureDerivedSchema(db)
+      this.hooks?.beforeRollupGapWrite?.({ hourBucket, ts, error: cleanErr })
       db.prepare(`
         INSERT INTO activity_rollup_gaps (hour_bucket, failures, first_failure_at, last_failure_at, last_error)
         VALUES (?, 1, ?, ?, ?)
@@ -1217,62 +1238,180 @@ export class HiveMemoryStore {
           last_error = excluded.last_error
       `).run(hourBucket, ts, ts, cleanErr)
     }
+    let dbGapSaved = false
+    let dbGapErr = null
     try {
       if (this.db) {
         writeGapToDb(this.db)
+        dbGapSaved = true
       } else if (this.dbPath && dbFileState(this.dbPath) === 'present') {
         const gapDb = openDb(this.dbPath)
-        try { writeGapToDb(gapDb) } finally { gapDb.close() }
+        try {
+          writeGapToDb(gapDb)
+          dbGapSaved = true
+        } finally {
+          gapDb.close()
+        }
       }
-    } catch { /* in-memory fallback retained if SQLite file is inaccessible */ }
-  }
+    } catch (err) {
+      dbGapErr = err?.code || err?.message || 'ROLLUP_GAP_SQLITE_WRITE_ERROR'
+    }
 
-  #loadPersistedRollupGaps(minBucket = 0) {
-    if (!this.db) return []
-    try {
-      ensureDerivedSchema(this.db)
-      const allGaps = this.db.prepare(`
-        SELECT hour_bucket, failures, first_failure_at, last_failure_at, last_error
-        FROM activity_rollup_gaps
-        ORDER BY hour_bucket ASC
-      `).all()
-      if (allGaps.length > 0) {
-        let totalFailures = 0
-        let minFirst = null
-        let maxLast = null
-        let lastErr = null
-        for (const g of allGaps) {
-          const f = Number(g.failures || 0)
-          const fAt = Number(g.first_failure_at)
-          const lAt = Number(g.last_failure_at)
-          totalFailures += f
-          if (Number.isSafeInteger(fAt)) minFirst = minFirst === null ? fAt : Math.min(minFirst, fAt)
-          if (Number.isSafeInteger(lAt) && (maxLast === null || lAt >= maxLast)) {
-            maxLast = lAt
-            if (g.last_error) lastErr = String(g.last_error)
+    let sidecarGapSaved = false
+    let sidecarGapErr = null
+    const sidecarPath = this.#rollupGapsSidecarPath()
+    if (sidecarPath) {
+      try {
+        this.hooks?.beforeRollupGapSidecarWrite?.({ hourBucket, ts, error: cleanErr })
+        let existing = { gaps: {} }
+        if (existsSync(sidecarPath)) {
+          try {
+            const parsed = JSON.parse(readFileSync(sidecarPath, 'utf8'))
+            if (isObj(parsed) && isObj(parsed.gaps)) existing = parsed
+          } catch {
+            existing = { gaps: {} }
           }
         }
-        this.rollupWriteFailures = Math.max(this.rollupWriteFailures || 0, totalFailures)
-        if (minFirst !== null) {
-          this.firstRollupFailureAt = this.firstRollupFailureAt === null ? minFirst : Math.min(this.firstRollupFailureAt, minFirst)
+        const key = String(hourBucket)
+        const prev = isObj(existing.gaps[key]) ? existing.gaps[key] : null
+        existing.gaps[key] = {
+          hour_bucket: hourBucket,
+          failures: (Number(prev?.failures) || 0) + 1,
+          first_failure_at: Number.isSafeInteger(prev?.first_failure_at) ? Math.min(prev.first_failure_at, ts) : ts,
+          last_failure_at: Number.isSafeInteger(prev?.last_failure_at) ? Math.max(prev.last_failure_at, ts) : ts,
+          last_error: cleanErr,
         }
-        if (maxLast !== null) {
-          this.lastRollupFailureAt = this.lastRollupFailureAt === null ? maxLast : Math.max(this.lastRollupFailureAt, maxLast)
-        }
-        if (!this.lastRollupFailureError && lastErr) this.lastRollupFailureError = lastErr
+        writeFileSync(sidecarPath, JSON.stringify(existing), { mode: 0o600 })
+        sidecarGapSaved = true
+      } catch (err) {
+        sidecarGapErr = err?.code || err?.message || 'ROLLUP_GAP_SIDECAR_WRITE_ERROR'
       }
-      return allGaps
-        .filter(g => Number(g.hour_bucket) >= minBucket)
-        .map(g => ({
-          hour_bucket: Number(g.hour_bucket),
-          failures: Number(g.failures || 0),
-          first_failure_at: Number(g.first_failure_at),
-          last_failure_at: Number(g.last_failure_at),
-          last_error: g.last_error ? String(g.last_error) : null,
-        }))
-    } catch {
-      return []
     }
+
+    if (!dbGapSaved) {
+      // Leave the active session sentinel (hour_bucket = -1) in SQLite on close() so restart detects the unpersisted gap even if both writes failed.
+      this.unpersistedRollupGap = true
+      if (!sidecarGapSaved) {
+        this.rollupGapWriteError = dbGapErr || sidecarGapErr || 'ROLLUP_GAP_WRITE_FAILED'
+        this.log(`hive-memory: activity_rollup_gaps write failed (failing closed): ${this.rollupGapWriteError}`)
+      }
+    }
+  }
+
+  #loadPersistedRollupGaps(minBucket = 0, nowSec = nowSecDefault()) {
+    if (!this.db) throw new Error('ROLLUP_GAP_DB_NOT_OPEN')
+    this.hooks?.beforeRollupGapRead?.()
+    const rawDbGaps = this.db.prepare(`
+      SELECT hour_bucket, failures, first_failure_at, last_failure_at, last_error
+      FROM activity_rollup_gaps
+      ORDER BY hour_bucket ASC
+    `).all()
+
+    const byBucket = new Map()
+    const mergeGap = g => {
+      const hb = Number(g.hour_bucket)
+      if (!Number.isFinite(hb) || hb < 0) return
+      const f = Math.max(1, Number(g.failures || 1))
+      const fAt = Number.isSafeInteger(Number(g.first_failure_at)) ? Number(g.first_failure_at) : hb
+      const lAt = Number.isSafeInteger(Number(g.last_failure_at)) ? Number(g.last_failure_at) : hb
+      const errStr = g.last_error ? String(g.last_error) : null
+      const prev = byBucket.get(hb)
+      if (!prev) {
+        byBucket.set(hb, {
+          hour_bucket: hb,
+          failures: f,
+          first_failure_at: fAt,
+          last_failure_at: lAt,
+          last_error: errStr,
+        })
+      } else {
+        prev.failures = Math.max(prev.failures, f)
+        prev.first_failure_at = Math.min(prev.first_failure_at, fAt)
+        if (lAt >= prev.last_failure_at) {
+          prev.last_failure_at = lAt
+          if (errStr) prev.last_error = errStr
+        }
+      }
+    }
+
+    let uncleanSentinelRow = null
+    for (const g of rawDbGaps) {
+      if (Number(g.hour_bucket) === -2) {
+        uncleanSentinelRow = g
+      } else if (Number(g.hour_bucket) >= 0) {
+        mergeGap(g)
+      }
+    }
+
+    const sidecarPath = this.#rollupGapsSidecarPath()
+    if (sidecarPath && existsSync(sidecarPath)) {
+      const rawSidecar = JSON.parse(readFileSync(sidecarPath, 'utf8'))
+      if (!isObj(rawSidecar) || !isObj(rawSidecar.gaps)) {
+        throw new Error('CORRUPT_ROLLUP_GAPS_SIDECAR')
+      }
+      for (const g of Object.values(rawSidecar.gaps)) {
+        if (isObj(g)) mergeGap(g)
+      }
+    }
+
+    const uncleanSession =
+      this.priorUncleanRollupSession ||
+      (uncleanSentinelRow
+        ? {
+            first_at: Number(uncleanSentinelRow.first_failure_at || nowSec),
+            last_at: Number(uncleanSentinelRow.last_failure_at || nowSec),
+            failures: Number(uncleanSentinelRow.failures || 1),
+            error: uncleanSentinelRow.last_error || 'UNPERSISTED_ROLLUP_GAP_ON_RESTART',
+          }
+        : null)
+    if (uncleanSession && byBucket.size === 0) {
+      const hb = Math.floor(nowSec / 3600) * 3600
+      mergeGap({
+        hour_bucket: hb,
+        failures: Math.max(1, Number(uncleanSession.failures || 1)),
+        first_failure_at: Math.min(Number(uncleanSession.first_at || nowSec), nowSec),
+        last_failure_at: Math.max(Number(uncleanSession.last_at || nowSec), nowSec),
+        last_error: uncleanSession.error || 'UNPERSISTED_ROLLUP_GAP_ON_RESTART',
+      })
+    }
+
+    if (this.unpersistedRollupGap && this.rollupWriteFailures > 0) {
+      const ts = this.lastRollupFailureAt ?? nowSec
+      const hb = Math.floor(ts / 3600) * 3600
+      mergeGap({
+        hour_bucket: hb,
+        failures: this.rollupWriteFailures,
+        first_failure_at: this.firstRollupFailureAt ?? ts,
+        last_failure_at: ts,
+        last_error: this.lastRollupFailureError || this.rollupGapWriteError || 'UNPERSISTED_ROLLUP_GAP',
+      })
+    }
+
+    const allGaps = [...byBucket.values()].sort((a, b) => a.hour_bucket - b.hour_bucket)
+    if (allGaps.length > 0) {
+      let totalFailures = 0
+      let minFirst = null
+      let maxLast = null
+      let lastErr = null
+      for (const g of allGaps) {
+        totalFailures += g.failures
+        minFirst = minFirst === null ? g.first_failure_at : Math.min(minFirst, g.first_failure_at)
+        if (maxLast === null || g.last_failure_at >= maxLast) {
+          maxLast = g.last_failure_at
+          if (g.last_error) lastErr = g.last_error
+        }
+      }
+      this.rollupWriteFailures = Math.max(this.rollupWriteFailures || 0, totalFailures)
+      if (minFirst !== null) {
+        this.firstRollupFailureAt = this.firstRollupFailureAt === null ? minFirst : Math.min(this.firstRollupFailureAt, minFirst)
+      }
+      if (maxLast !== null) {
+        this.lastRollupFailureAt = this.lastRollupFailureAt === null ? maxLast : Math.max(this.lastRollupFailureAt, maxLast)
+      }
+      if (!this.lastRollupFailureError && lastErr) this.lastRollupFailureError = lastErr
+    }
+
+    return allGaps.filter(g => g.hour_bucket >= minBucket)
   }
 
   // Durable hourly activity rollups (metadata-only: hour_bucket, actor, kind, calls, hits, records_returned, samples_json).
@@ -1332,7 +1471,6 @@ export class HiveMemoryStore {
     try {
       this.#ensureDerivedTables()
       const minBucket = Math.max(0, Math.floor(Number(sinceSec || 0) / 3600) * 3600)
-      const failureGaps = this.#loadPersistedRollupGaps(minBucket)
       const rows = this.db.prepare(`
         SELECT hour_bucket, actor, kind, calls, hits, records_returned, first_at, last_at, samples_json
         FROM activity_rollups
@@ -1344,6 +1482,20 @@ export class HiveMemoryStore {
         FROM activity_rollups
       `).get()
       const meta = this.db.prepare('SELECT initialized_at FROM store_meta WHERE singleton = 1').get()
+
+      let failureGaps = []
+      let gapReadError = false
+      let gapErrorMsg = null
+      try {
+        failureGaps = this.#loadPersistedRollupGaps(minBucket, nowSec)
+      } catch (gapErr) {
+        gapReadError = true
+        gapErrorMsg = gapErr?.code || gapErr?.message || 'ROLLUP_GAP_READ_ERROR'
+      }
+      if (this.rollupGapWriteError) {
+        gapErrorMsg ??= this.rollupGapWriteError
+      }
+
       return {
         rollups: rows.map(r => {
           let samples = []
@@ -1370,12 +1522,14 @@ export class HiveMemoryStore {
         total_calls: Number(bounds?.total_calls || 0),
         total_hits: Number(bounds?.total_hits || 0),
         store_initialized_at: Number.isSafeInteger(meta?.initialized_at) ? Number(meta.initialized_at) : null,
-        write_failures: this.rollupWriteFailures || 0,
-        first_failure_at: this.firstRollupFailureAt ?? null,
-        last_failure_at: this.lastRollupFailureAt ?? null,
-        last_failure_error: this.lastRollupFailureError ?? null,
+        write_failures: gapReadError ? Math.max(1, this.rollupWriteFailures || 0) : (this.rollupWriteFailures || 0),
+        first_failure_at: this.firstRollupFailureAt ?? (gapReadError ? 0 : null),
+        last_failure_at: this.lastRollupFailureAt ?? (gapReadError ? nowSec : null),
+        last_failure_error: gapErrorMsg ?? this.lastRollupFailureError ?? null,
         failure_gaps: failureGaps,
-        read_error: false,
+        gap_read_error: gapReadError,
+        gap_write_error: Boolean(this.rollupGapWriteError),
+        read_error: gapReadError,
         as_of: nowSec,
       }
     } catch (err) {
@@ -1386,11 +1540,12 @@ export class HiveMemoryStore {
         total_calls: 0,
         total_hits: 0,
         store_initialized_at: null,
-        write_failures: this.rollupWriteFailures || 0,
-        first_failure_at: this.firstRollupFailureAt ?? null,
-        last_failure_at: this.lastRollupFailureAt ?? null,
+        write_failures: Math.max(1, this.rollupWriteFailures || 0),
+        first_failure_at: this.firstRollupFailureAt ?? 0,
+        last_failure_at: this.lastRollupFailureAt ?? nowSec,
         last_failure_error: err?.code || err?.message || 'ROLLUP_READ_ERROR',
         failure_gaps: [],
+        gap_read_error: true,
         read_error: true,
         as_of: nowSec,
       }
@@ -1413,7 +1568,54 @@ export class HiveMemoryStore {
   #ensureDerivedTables() {
     if (!this.db) return
     ensureDerivedSchema(this.db)
-    this.#loadPersistedRollupGaps(0)
+    if (this.isFirstReconcile) {
+      this.isFirstReconcile = false
+      try {
+        const leftover = this.db.prepare('SELECT * FROM activity_rollup_gaps WHERE hour_bucket = -1').get()
+        if (leftover) {
+          const fAt = Number.isSafeInteger(leftover.first_failure_at) ? Number(leftover.first_failure_at) : nowSecDefault()
+          const lAt = Number.isSafeInteger(leftover.last_failure_at) ? Number(leftover.last_failure_at) : fAt
+          this.priorUncleanRollupSession = {
+            first_at: fAt,
+            last_at: lAt,
+            failures: Math.max(1, Number(leftover.failures || 1)),
+            error:
+              leftover.last_error && leftover.last_error !== 'ACTIVE_SESSION'
+                ? String(leftover.last_error)
+                : 'UNPERSISTED_ROLLUP_GAP_ON_RESTART',
+          }
+          try {
+            this.db.prepare(`
+              INSERT INTO activity_rollup_gaps (hour_bucket, failures, first_failure_at, last_failure_at, last_error)
+              VALUES (-2, 1, ?, ?, ?)
+              ON CONFLICT(hour_bucket) DO UPDATE SET
+                failures = failures + 1,
+                first_failure_at = MIN(first_failure_at, excluded.first_failure_at),
+                last_failure_at = MAX(last_failure_at, excluded.last_failure_at),
+                last_error = excluded.last_error
+            `).run(fAt, lAt, this.priorUncleanRollupSession.error)
+          } catch { /* retained in this.priorUncleanRollupSession */ }
+        }
+      } catch (err) {
+        this.rollupGapReadError = err?.code || err?.message || 'ROLLUP_GAP_READ_ERROR'
+      }
+    }
+    if (!this.sessionSentinelActive && !this.unpersistedRollupGap) {
+      try {
+        const nowTs = nowSecDefault()
+        this.db.prepare(`
+          INSERT OR REPLACE INTO activity_rollup_gaps (hour_bucket, failures, first_failure_at, last_failure_at, last_error)
+          VALUES (-1, 0, ?, ?, 'ACTIVE_SESSION')
+        `).run(nowTs, nowTs)
+        this.sessionSentinelActive = true
+      } catch { /* if db is read-only at startup, first rollup write will record failure */ }
+    }
+    try {
+      this.#loadPersistedRollupGaps(0)
+      this.rollupGapReadError = null
+    } catch (err) {
+      this.rollupGapReadError = err?.code || err?.message || 'ROLLUP_GAP_READ_ERROR'
+    }
     const totalEvents = this.db.prepare('SELECT count(*) AS n FROM events').get().n
     const indexedFts = this.db.prepare('SELECT count(*) AS n FROM events_fts').get().n
     if (indexedFts >= totalEvents) return

@@ -1582,7 +1582,9 @@ export function computeMemoryTrends({
     Number(rawRollupsObj?.write_failures || 0),
     Number(activity_ring?.rollup_write_failures || 0)
   )
-  const rollupReadError = Boolean(rawRollupsObj?.read_error)
+  const rollupReadError = Boolean(
+    rawRollupsObj?.read_error || rawRollupsObj?.gap_read_error || rawRollupsObj?.gap_write_error
+  )
   const firstFailureAt = rawRollupsObj?.first_failure_at ?? activity_ring?.first_rollup_failure_at ?? null
   const lastFailureAt = rawRollupsObj?.last_failure_at ?? activity_ring?.last_rollup_failure_at ?? null
   const failureGaps = Array.isArray(rawRollupsObj?.failure_gaps)
@@ -2135,6 +2137,7 @@ export function computeMemoryTrends({
       recall_source: w24.recall_source,
       partial_edge_bucket: Boolean(w24.partial_edge_bucket),
       rollup_write_failures: Number(w24.rollup_write_failures || 0),
+      rollup_read_error: Boolean(w24.rollup_read_error),
       conflicts_raised: w24.conflicts_raised,
       conflicts_resolved: w24.conflicts_resolved,
       active_writers: w24.active_writers,
@@ -2165,6 +2168,7 @@ export function computeMemoryTrends({
       recall_source: w7d.recall_source,
       partial_edge_bucket: Boolean(w7d.partial_edge_bucket),
       rollup_write_failures: Number(w7d.rollup_write_failures || 0),
+      rollup_read_error: Boolean(w7d.rollup_read_error),
       conflicts_raised: w7d.conflicts_raised,
       conflicts_resolved: w7d.conflicts_resolved,
       active_writers: w7d.active_writers,
