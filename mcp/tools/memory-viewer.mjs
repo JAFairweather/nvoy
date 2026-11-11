@@ -1585,6 +1585,9 @@ export function computeMemoryTrends({
   const rollupReadError = Boolean(rawRollupsObj?.read_error)
   const firstFailureAt = rawRollupsObj?.first_failure_at ?? activity_ring?.first_rollup_failure_at ?? null
   const lastFailureAt = rawRollupsObj?.last_failure_at ?? activity_ring?.last_rollup_failure_at ?? null
+  const failureGaps = Array.isArray(rawRollupsObj?.failure_gaps)
+    ? rawRollupsObj.failure_gaps.filter(g => g && Number.isFinite(Number(g.hour_bucket)))
+    : []
 
   let telemetryCoverageStartAt = null
   if (hasRollupsStore) {
@@ -1635,6 +1638,7 @@ export function computeMemoryTrends({
   }
 
   function evaluateTrendWindow(startSec, endSec) {
+    const spanSec = Math.max(1, endSec - startSec)
     const winEvents = annotated.filter(x => x.at >= startSec && x.at <= endSec)
     const winWrites = winEvents.filter(x => !x.isWithdrawn)
     const winAct = activityWithTs.filter(a => a.at >= startSec && a.at <= endSec)
@@ -1674,10 +1678,12 @@ export function computeMemoryTrends({
     }
 
     let rollupRecallHits = 0
+    let rollupRecallHitsMax = 0
     let rollupQueries = 0
     let rollupQueryHits = 0
     let hasPartialEdgeBucket = false
     let partialEdgeHits = 0
+    const unverifiedIntervals = []
     for (const r of winRollups) {
       if (r.actor === 'viewer') continue
       const bStart = Number(r.hour_bucket)
@@ -1704,12 +1710,15 @@ export function computeMemoryTrends({
 
       if (!isPartialEdge) {
         if (r.kind === 'wake') {
-          rollupRecallHits += hits > 0 ? hits : calls
+          const hVal = hits > 0 ? hits : calls
+          rollupRecallHits += hVal
+          rollupRecallHitsMax += hVal
           if (r.actor) recallingActors.add(String(r.actor))
         } else if (r.kind === 'query') {
           rollupQueries += calls
           rollupQueryHits += hits
           rollupRecallHits += hits
+          rollupRecallHitsMax += hits
           if (r.actor) recallingActors.add(String(r.actor))
         }
         continue
@@ -1718,6 +1727,7 @@ export function computeMemoryTrends({
       hasPartialEdgeBucket = true
       const rawBucketHits = r.kind === 'wake' ? (hits > 0 ? hits : calls) : (r.kind === 'query' ? hits : 0)
       partialEdgeHits += rawBucketHits
+      unverifiedIntervals.push([Math.max(startSec, bStart), Math.min(endSec, bEnd + 1)])
 
       const samples = Array.isArray(r.samples)
         ? r.samples.filter(s => Array.isArray(s) && Number.isFinite(Number(s[0])))
@@ -1726,43 +1736,71 @@ export function computeMemoryTrends({
         const inWin = samples.filter(s => Number(s[0]) >= startSec && Number(s[0]) <= endSec)
         const inWinCalls = inWin.length
         const inWinHits = inWin.reduce((acc, s) => acc + (Number(s[1]) > 0 ? Number(s[1]) : 0), 0)
-        if (r.kind === 'wake' && inWinCalls > 0) {
-          rollupRecallHits += inWinHits > 0 ? inWinHits : inWinCalls
-          if (r.actor) recallingActors.add(String(r.actor))
-        } else if (r.kind === 'query' && inWinCalls > 0) {
+        const sampledBucketHits = samples.reduce((acc, s) => acc + (Number(s[1]) > 0 ? Number(s[1]) : 0), 0)
+        const unsampledHits = Math.max(0, rawBucketHits - sampledBucketHits)
+        if (r.kind === 'wake') {
+          const confirmed = inWinCalls > 0 ? (inWinHits > 0 ? inWinHits : inWinCalls) : 0
+          rollupRecallHits += confirmed
+          rollupRecallHitsMax += confirmed + unsampledHits
+          if (inWinCalls > 0 && r.actor) recallingActors.add(String(r.actor))
+        } else if (r.kind === 'query') {
           rollupQueries += inWinCalls
           rollupQueryHits += inWinHits
           rollupRecallHits += inWinHits
-          if (r.actor) recallingActors.add(String(r.actor))
+          rollupRecallHitsMax += inWinHits + unsampledHits
+          if (inWinCalls > 0 && r.actor) recallingActors.add(String(r.actor))
         }
       } else {
-        const span = Math.max(1, lAt - fAt)
-        const overlapStart = Math.max(fAt, startSec)
-        const overlapEnd = Math.min(lAt, endSec)
-        const overlapRatio = Math.max(0, Math.min(1, (overlapEnd - overlapStart) / span))
-        const outOfWindowEventsMin = (fAt < startSec ? 1 : 0) + (lAt > endSec ? 1 : 0)
-        const maxInWinCalls = Math.max(0, calls - outOfWindowEventsMin)
-        const maxInWinHits = Math.max(0, rawBucketHits - Math.min(rawBucketHits, outOfWindowEventsMin))
-        const estCalls = Math.min(maxInWinCalls, Math.floor(calls * overlapRatio))
-        const estHits = Math.min(maxInWinHits, Math.floor(rawBucketHits * overlapRatio))
-        if (r.kind === 'wake' && estCalls > 0) {
-          rollupRecallHits += estHits > 0 ? estHits : estCalls
-          if (r.actor) recallingActors.add(String(r.actor))
-        } else if (r.kind === 'query' && estCalls > 0) {
-          rollupQueries += estCalls
-          rollupQueryHits += estHits
-          rollupRecallHits += estHits
-          if (r.actor) recallingActors.add(String(r.actor))
+        // Legacy coarse edge bucket without per-event samples:
+        // Never estimate from time overlap. Count only the provable mathematical lower bound in recall_hits,
+        // treat interior unsampled hits as unknown, and report the exact [min, max] bound/range.
+        const hasExplicitBounds = Number.isFinite(r.first_at) && Number.isFinite(r.last_at)
+        const minCallsInWin =
+          hasExplicitBounds && calls >= 1
+            ? (fAt >= startSec && fAt <= endSec ? 1 : 0) +
+              (calls >= 2 && lAt !== fAt && lAt >= startSec && lAt <= endSec ? 1 : 0)
+            : 0
+        const minCallsOutWin =
+          hasExplicitBounds && calls >= 1
+            ? (fAt < startSec || fAt > endSec ? 1 : 0) +
+              (calls >= 2 && lAt !== fAt && (lAt < startSec || lAt > endSec) ? 1 : 0)
+            : 0
+        const maxCallsInWin = Math.max(minCallsInWin, calls - minCallsOutWin)
+        const nonHits = Math.max(0, calls - rawBucketHits)
+        const minHitsInWin = Math.max(0, minCallsInWin - nonHits)
+        const maxHitsInWin = Math.max(minHitsInWin, Math.min(rawBucketHits, maxCallsInWin))
+        if (r.kind === 'wake') {
+          rollupRecallHits += minHitsInWin
+          rollupRecallHitsMax += maxHitsInWin
+          if (minCallsInWin > 0 && r.actor) recallingActors.add(String(r.actor))
+        } else if (r.kind === 'query') {
+          rollupQueries += minCallsInWin
+          rollupQueryHits += minHitsInWin
+          rollupRecallHits += minHitsInWin
+          rollupRecallHitsMax += maxHitsInWin
+          if (minCallsInWin > 0 && r.actor) recallingActors.add(String(r.actor))
         }
       }
     }
 
+    const overlappingGaps = failureGaps.filter(g => {
+      const hb = Number(g.hour_bucket)
+      const gStart = Number.isFinite(g.first_failure_at) ? Number(g.first_failure_at) : hb
+      const gEnd = Number.isFinite(g.last_failure_at) ? Number(g.last_failure_at) : hb + 3599
+      return (gStart <= endSec && gEnd >= startSec) || (hb <= endSec && hb + 3599 >= startSec)
+    })
+    for (const g of overlappingGaps) {
+      const hb = Number(g.hour_bucket)
+      unverifiedIntervals.push([Math.max(startSec, hb), Math.min(endSec, hb + 3600)])
+    }
+
     const failureOverlapsWindow =
       rollupReadError ||
-      (rollupWriteFailures > 0 && (
-        (firstFailureAt === null && lastFailureAt === null) ||
-        ((firstFailureAt ?? lastFailureAt) <= endSec && (lastFailureAt ?? firstFailureAt) >= startSec)
-      ))
+      overlappingGaps.length > 0 ||
+      (failureGaps.length === 0 &&
+        rollupWriteFailures > 0 &&
+        ((firstFailureAt === null && lastFailureAt === null) ||
+          ((firstFailureAt ?? lastFailureAt) <= endSec && (lastFailureAt ?? firstFailureAt) >= startSec)))
     if (hasPartialEdgeBucket || failureOverlapsWindow) {
       covMeta.recall_incomplete = true
       if (covMeta.recall_coverage === 'complete') {
@@ -1773,8 +1811,43 @@ export function computeMemoryTrends({
         covMeta.partial_edge_hits = partialEdgeHits
       }
       if (failureOverlapsWindow) {
-        covMeta.rollup_write_failures = rollupWriteFailures
+        const gapFailures = overlappingGaps.reduce((s, g) => s + Number(g.failures || 1), 0)
+        covMeta.rollup_write_failures = Math.max(gapFailures, rollupWriteFailures)
         if (rollupReadError) covMeta.rollup_read_error = true
+        if (overlappingGaps.length === 0 && firstFailureAt !== null) {
+          const fBucket = Math.floor(Number(firstFailureAt) / 3600) * 3600
+          unverifiedIntervals.push([Math.max(startSec, fBucket), Math.min(endSec, fBucket + 3600)])
+        }
+      }
+      if (covMeta.recall_coverage !== 'unobserved') {
+        const coveredStart =
+          telemetryCoverageStartAt !== null
+            ? Math.max(startSec, Math.min(endSec, telemetryCoverageStartAt))
+            : startSec
+        const baseCoveredSec = Math.max(0, endSec - coveredStart)
+        const clipped = unverifiedIntervals
+          .map(([a, b]) => [Math.max(coveredStart, a), Math.min(endSec, b)])
+          .filter(([a, b]) => b > a)
+          .sort((x, y) => x[0] - y[0])
+        let unverifiedSec = 0
+        let curStart = null
+        let curEnd = null
+        for (const [a, b] of clipped) {
+          if (curStart === null) {
+            curStart = a
+            curEnd = b
+          } else if (a <= curEnd) {
+            curEnd = Math.max(curEnd, b)
+          } else {
+            unverifiedSec += curEnd - curStart
+            curStart = a
+            curEnd = b
+          }
+        }
+        if (curStart !== null) unverifiedSec += curEnd - curStart
+        const verifiedSec = Math.max(0, baseCoveredSec - unverifiedSec)
+        const rawPct = Math.round(Math.max(0, Math.min(100, (verifiedSec / spanSec) * 100)) * 10) / 10
+        covMeta.observed_coverage_pct = Math.min(99.9, rawPct)
       }
     }
 
@@ -1794,6 +1867,8 @@ export function computeMemoryTrends({
     }
 
     const busRecallHits = Math.max(rollupRecallHits, ringRecallHits)
+    const busRecallHitsMax = Math.max(busRecallHits, rollupRecallHitsMax)
+    const unknownRecallHits = Math.max(0, busRecallHitsMax - busRecallHits)
     const winQueries = Math.max(rollupQueries, ringQueries)
     const winQueryHits = Math.max(rollupQueryHits, ringQueryHits)
     const groundedWrites = winWrites.filter(x => x.hasEvtAnchor || x.supersedesCount > 0 || x.hasMerkle).length
@@ -1807,6 +1882,10 @@ export function computeMemoryTrends({
         efficacy_axes: { breadth: 0, precision: 0, velocity: 0, reuse: 0 },
         new_claims: 0,
         recall_hits: 0,
+        recall_hits_min: 0,
+        recall_hits_max: 0,
+        recall_hits_range: [0, 0],
+        unknown_recall_hits: 0,
         grounded_writes: 0,
         conflicts_raised: 0,
         conflicts_resolved: 0,
@@ -1939,6 +2018,10 @@ export function computeMemoryTrends({
       efficacy_axes: { breadth, precision, velocity, reuse },
       new_claims: newClaims,
       recall_hits: recallHits,
+      recall_hits_min: recallHits,
+      recall_hits_max: busRecallHitsMax,
+      recall_hits_range: [recallHits, busRecallHitsMax],
+      unknown_recall_hits: unknownRecallHits,
       grounded_writes: groundedWrites,
       conflicts_raised: conflictsRaised,
       conflicts_resolved: conflictsResolved,
@@ -1974,6 +2057,10 @@ export function computeMemoryTrends({
       synaptic_efficiency_score: m.efficacy_score,
       new_claims: m.new_claims,
       recall_hits: m.recall_hits,
+      recall_hits_min: m.recall_hits_min,
+      recall_hits_max: m.recall_hits_max,
+      recall_hits_range: m.recall_hits_range,
+      unknown_recall_hits: m.unknown_recall_hits,
       grounded_writes: m.grounded_writes,
       conflicts_raised: m.conflicts_raised,
       conflicts_resolved: m.conflicts_resolved,
@@ -2036,6 +2123,10 @@ export function computeMemoryTrends({
       synaptic_efficiency_axes: w24.efficacy_axes,
       new_claims: w24.new_claims,
       recall_hits: w24.recall_hits,
+      recall_hits_min: w24.recall_hits_min,
+      recall_hits_max: w24.recall_hits_max,
+      recall_hits_range: w24.recall_hits_range,
+      unknown_recall_hits: w24.unknown_recall_hits,
       grounded_writes: w24.grounded_writes,
       recall_coverage: w24.recall_coverage,
       recall_incomplete: w24.recall_incomplete,
@@ -2061,6 +2152,10 @@ export function computeMemoryTrends({
       new_claims: w7d.new_claims,
       claims_per_day: Math.round((w7d.new_claims / 7) * 10) / 10,
       recall_hits: w7d.recall_hits,
+      recall_hits_min: w7d.recall_hits_min,
+      recall_hits_max: w7d.recall_hits_max,
+      recall_hits_range: w7d.recall_hits_range,
+      unknown_recall_hits: w7d.unknown_recall_hits,
       grounded_writes: w7d.grounded_writes,
       recall_hits_per_day: Math.round((w7d.recall_hits / 7) * 10) / 10,
       recall_coverage: w7d.recall_coverage,

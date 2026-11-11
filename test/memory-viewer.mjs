@@ -2317,38 +2317,95 @@ await test('durable SQLite activity_rollups survive >80 ring overflow & daemon r
           )
           assert.equal(straddleTrends.window_24h.recall_incomplete, true)
           assert.equal(straddleTrends.window_24h.partial_edge_bucket, true)
+          assert(
+            straddleTrends.window_24h.observed_coverage_pct < 100,
+            `partial edge bucket must report observed_coverage_pct < 100 (got ${straddleTrends.window_24h.observed_coverage_pct})`
+          )
 
-          // Coarse hourly rollup row (without per-event samples) straddling 24h start must also not count all 5 hits or mark complete
+          // Coarse hourly rollup row (without per-event samples) straddling 24h start (12:30Z):
+          // With 5 hits, first at 12:10Z (start24h - 1200) and last at 12:45Z (start24h + 900),
+          // the same coarse row permits different true in-window counts:
+          // - History A: 4 hits before 12:30Z (12:10, 12:15, 12:20, 12:25) and 1 hit after 12:30Z (12:45) -> true in-window = 1
+          // - History B: 1 hit before 12:30Z (12:10) and 4 hits after 12:30Z (12:35, 12:40, 12:42, 12:45) -> true in-window = 4
+          // Sampled rows distinguish History A (1) vs History B (4), while the unsampled coarse row must report
+          // only the provable lower bound (1), expose the exact range [1, 4] and unknown_recall_hits = 3, and observed_coverage_pct < 100.
+          const historyASamples = [
+            [edgeBucket + 600, 1, 1],
+            [edgeBucket + 900, 1, 1],
+            [edgeBucket + 1200, 1, 1],
+            [edgeBucket + 1500, 1, 1],
+            [edgeBucket + 2700, 1, 1],
+          ]
+          const historyBSamples = [
+            [edgeBucket + 600, 1, 1],
+            [edgeBucket + 2100, 1, 1],
+            [edgeBucket + 2400, 1, 1],
+            [edgeBucket + 2520, 1, 1],
+            [edgeBucket + 2700, 1, 1],
+          ]
+          const sharedCoarseRow = {
+            hour_bucket: edgeBucket,
+            actor: 'biggy',
+            kind: 'query',
+            calls: 5,
+            hits: 5,
+            records_returned: 5,
+            first_at: edgeBucket + 600, // 12:10Z
+            last_at: edgeBucket + 2700, // 12:45Z
+          }
+          const trendsHistoryA = computeMemoryTrends({
+            records: [evDay2A],
+            history_records: [evDay2A],
+            recent_activity: [],
+            activity_rollups: {
+              coverage_start_at: edgeBucket + 600,
+              rollups: [{ ...sharedCoarseRow, samples: historyASamples }],
+            },
+            now_sec: midHourNow,
+          })
+          const trendsHistoryB = computeMemoryTrends({
+            records: [evDay2A],
+            history_records: [evDay2A],
+            recent_activity: [],
+            activity_rollups: {
+              coverage_start_at: edgeBucket + 600,
+              rollups: [{ ...sharedCoarseRow, samples: historyBSamples }],
+            },
+            now_sec: midHourNow,
+          })
+          assert.equal(trendsHistoryA.window_24h.recall_hits, 1, 'History A true in-window count is 1')
+          assert.equal(trendsHistoryB.window_24h.recall_hits, 4, 'History B true in-window count is 4')
+
           const coarseStraddleTrends = computeMemoryTrends({
             records: [evDay2A],
             history_records: [evDay2A],
             recent_activity: [],
             activity_rollups: {
-              coverage_start_at: start24h - 1200,
-              rollups: [
-                {
-                  hour_bucket: edgeBucket,
-                  actor: 'biggy',
-                  kind: 'query',
-                  calls: 5,
-                  hits: 5,
-                  records_returned: 5,
-                  first_at: start24h - 1200,
-                  last_at: start24h + 900,
-                },
-              ],
+              coverage_start_at: edgeBucket + 600,
+              rollups: [sharedCoarseRow],
             },
             now_sec: midHourNow,
           })
-          assert(
-            coarseStraddleTrends.window_24h.recall_hits < 5,
-            `coarse straddling bucket must not count all 5 hits (got ${coarseStraddleTrends.window_24h.recall_hits})`
+          assert.equal(
+            coarseStraddleTrends.window_24h.recall_hits,
+            1,
+            'unsampled coarse row must report only the provable lower bound (1), never over-estimating 2 when History A has only 1'
           )
+          assert.equal(coarseStraddleTrends.window_24h.recall_hits_min, trendsHistoryA.window_24h.recall_hits)
+          assert.equal(coarseStraddleTrends.window_24h.recall_hits_max, trendsHistoryB.window_24h.recall_hits)
+          assert.deepEqual(coarseStraddleTrends.window_24h.recall_hits_range, [1, 4])
+          assert.equal(coarseStraddleTrends.window_24h.unknown_recall_hits, 3)
           assert.equal(coarseStraddleTrends.window_24h.recall_coverage, 'partial')
           assert.equal(coarseStraddleTrends.window_24h.recall_incomplete, true)
           assert.equal(coarseStraddleTrends.window_24h.partial_edge_bucket, true)
+          assert(
+            coarseStraddleTrends.window_24h.observed_coverage_pct < 100,
+            `coarse straddling bucket must report observed_coverage_pct < 100 (got ${coarseStraddleTrends.window_24h.observed_coverage_pct})`
+          )
 
-          // 8. Regression: Rollup write failures must be surfaced and mark coverage incomplete
+          // 8. Regression: Rollup write failures must be durably persisted and keep the window incomplete across store/daemon restart
+          // Record an earlier rollup 2 days ago so the 24h window would otherwise be 'complete'
+          oldStore.recordActivityRollup({ at: midHourNow - 2 * daySec, actor: 'biggy', kind: 'query', count: 2 })
           oldStore.hooks = {
             beforeRollupWrite: () => {
               throw new Error('SIMULATED_SQLITE_ROLLUP_FAILURE')
@@ -2358,32 +2415,50 @@ await test('durable SQLite activity_rollups survive >80 ring overflow & daemon r
           assert.equal(okWrite, false, 'simulated rollup write failure must return false')
           const failedRollups = oldStore.activityRollups({ sinceSec: 0, nowSec: midHourNow })
           assert.equal(failedRollups.write_failures, 1, 'activityRollups must report write_failures = 1')
+          assert.equal(failedRollups.failure_gaps.length, 1, 'activityRollups must persist a coverage gap row')
 
-          const failureTrends = computeMemoryTrends({
-            records: [evDay2A],
-            history_records: [evDay2A],
-            recent_activity: [],
-            activity_rollups: {
-              ...failedRollups,
-              coverage_start_at: midHourNow - 10 * daySec,
-              rollups: [
-                {
-                  hour_bucket: Math.floor((midHourNow - 7200) / 3600) * 3600,
-                  actor: 'biggy',
-                  kind: 'query',
-                  calls: 2,
-                  hits: 2,
-                  first_at: midHourNow - 7000,
-                  last_at: midHourNow - 6800,
-                },
-              ],
-            },
-            now_sec: midHourNow,
+          // Close the store and open a brand-new HiveMemoryStore instance on the same SQLite DB (simulating daemon restart)
+          oldStore.close()
+          const restartedStore = new HiveMemoryStore({
+            dbPath: oldDbPath,
+            ledgerPath: oldLedgerPath,
+            receiptPath: oldReceiptPath,
+            config: validateAndResolveConfig(config),
+            lock: false,
           })
-          assert.equal(failureTrends.window_24h.recall_incomplete, true, 'rollup write failure must mark window_24h.recall_incomplete = true')
-          assert.equal(failureTrends.window_24h.recall_coverage, 'partial', 'rollup write failure must downgrade coverage from complete to partial')
-          assert.equal(failureTrends.window_24h.rollup_write_failures, 1)
-          assert.equal(failureTrends.recall_telemetry.write_failures, 1)
+          restartedStore.start()
+          try {
+            const postRestartRollups = restartedStore.activityRollups({ sinceSec: 0, nowSec: midHourNow })
+            assert.equal(postRestartRollups.write_failures, 1, 'write_failures must survive store/daemon restart')
+            assert.equal(postRestartRollups.first_failure_at, midHourNow - 60, 'first_failure_at must survive store/daemon restart')
+            assert.equal(postRestartRollups.failure_gaps.length, 1, 'failure_gaps must survive store/daemon restart')
+
+            const failureTrends = computeMemoryTrends({
+              records: [evDay2A],
+              history_records: [evDay2A],
+              recent_activity: [],
+              activity_rollups: postRestartRollups,
+              now_sec: midHourNow,
+            })
+            assert.equal(
+              failureTrends.window_24h.recall_incomplete,
+              true,
+              'rollup write failure must keep window_24h.recall_incomplete = true after daemon restart'
+            )
+            assert.equal(
+              failureTrends.window_24h.recall_coverage,
+              'partial',
+              'rollup write failure must keep window_24h.recall_coverage = partial (never complete) after daemon restart'
+            )
+            assert(
+              failureTrends.window_24h.observed_coverage_pct < 100,
+              `window with persisted rollup failure gap must report observed_coverage_pct < 100 (got ${failureTrends.window_24h.observed_coverage_pct})`
+            )
+            assert.equal(failureTrends.window_24h.rollup_write_failures, 1)
+            assert.equal(failureTrends.recall_telemetry.write_failures, 1)
+          } finally {
+            restartedStore.close()
+          }
         } finally {
           oldStore.close()
         }

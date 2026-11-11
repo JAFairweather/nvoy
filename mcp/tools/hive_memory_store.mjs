@@ -107,6 +107,13 @@ CREATE TABLE IF NOT EXISTS activity_rollups (
   PRIMARY KEY (hour_bucket, actor, kind)
 );
 CREATE INDEX IF NOT EXISTS idx_activity_rollups_hour ON activity_rollups(hour_bucket);
+CREATE TABLE IF NOT EXISTS activity_rollup_gaps (
+  hour_bucket INTEGER PRIMARY KEY,
+  failures INTEGER NOT NULL DEFAULT 0,
+  first_failure_at INTEGER NOT NULL,
+  last_failure_at INTEGER NOT NULL,
+  last_error TEXT
+);
 `
 
 export class HiveMemoryError extends Error {
@@ -694,6 +701,13 @@ function ensureDerivedSchema(db) {
       PRIMARY KEY (hour_bucket, actor, kind)
     );
     CREATE INDEX IF NOT EXISTS idx_activity_rollups_hour ON activity_rollups(hour_bucket);
+    CREATE TABLE IF NOT EXISTS activity_rollup_gaps (
+      hour_bucket INTEGER PRIMARY KEY,
+      failures INTEGER NOT NULL DEFAULT 0,
+      first_failure_at INTEGER NOT NULL,
+      last_failure_at INTEGER NOT NULL,
+      last_error TEXT
+    );
   `)
   const rollupCols = db.prepare('PRAGMA table_info(activity_rollups)').all()
   if (!rollupCols.some(c => c.name === 'samples_json')) {
@@ -1184,6 +1198,83 @@ export class HiveMemoryStore {
     return this.db.prepare('SELECT count(*) AS n FROM writer_rate_log WHERE pubkey = ? AND accepted_at > ?').get(pubkey, nowSec - 3600).n
   }
 
+  #recordRollupFailure(ts, errMsg) {
+    const cleanErr = String(errMsg || 'ROLLUP_WRITE_ERROR').slice(0, 200)
+    const hourBucket = Math.floor(ts / 3600) * 3600
+    this.rollupWriteFailures += 1
+    this.firstRollupFailureAt = this.firstRollupFailureAt === null ? ts : Math.min(this.firstRollupFailureAt, ts)
+    this.lastRollupFailureAt = this.lastRollupFailureAt === null ? ts : Math.max(this.lastRollupFailureAt, ts)
+    this.lastRollupFailureError = cleanErr
+    const writeGapToDb = db => {
+      ensureDerivedSchema(db)
+      db.prepare(`
+        INSERT INTO activity_rollup_gaps (hour_bucket, failures, first_failure_at, last_failure_at, last_error)
+        VALUES (?, 1, ?, ?, ?)
+        ON CONFLICT(hour_bucket) DO UPDATE SET
+          failures = failures + 1,
+          first_failure_at = MIN(first_failure_at, excluded.first_failure_at),
+          last_failure_at = MAX(last_failure_at, excluded.last_failure_at),
+          last_error = excluded.last_error
+      `).run(hourBucket, ts, ts, cleanErr)
+    }
+    try {
+      if (this.db) {
+        writeGapToDb(this.db)
+      } else if (this.dbPath && dbFileState(this.dbPath) === 'present') {
+        const gapDb = openDb(this.dbPath)
+        try { writeGapToDb(gapDb) } finally { gapDb.close() }
+      }
+    } catch { /* in-memory fallback retained if SQLite file is inaccessible */ }
+  }
+
+  #loadPersistedRollupGaps(minBucket = 0) {
+    if (!this.db) return []
+    try {
+      ensureDerivedSchema(this.db)
+      const allGaps = this.db.prepare(`
+        SELECT hour_bucket, failures, first_failure_at, last_failure_at, last_error
+        FROM activity_rollup_gaps
+        ORDER BY hour_bucket ASC
+      `).all()
+      if (allGaps.length > 0) {
+        let totalFailures = 0
+        let minFirst = null
+        let maxLast = null
+        let lastErr = null
+        for (const g of allGaps) {
+          const f = Number(g.failures || 0)
+          const fAt = Number(g.first_failure_at)
+          const lAt = Number(g.last_failure_at)
+          totalFailures += f
+          if (Number.isSafeInteger(fAt)) minFirst = minFirst === null ? fAt : Math.min(minFirst, fAt)
+          if (Number.isSafeInteger(lAt) && (maxLast === null || lAt >= maxLast)) {
+            maxLast = lAt
+            if (g.last_error) lastErr = String(g.last_error)
+          }
+        }
+        this.rollupWriteFailures = Math.max(this.rollupWriteFailures || 0, totalFailures)
+        if (minFirst !== null) {
+          this.firstRollupFailureAt = this.firstRollupFailureAt === null ? minFirst : Math.min(this.firstRollupFailureAt, minFirst)
+        }
+        if (maxLast !== null) {
+          this.lastRollupFailureAt = this.lastRollupFailureAt === null ? maxLast : Math.max(this.lastRollupFailureAt, maxLast)
+        }
+        if (!this.lastRollupFailureError && lastErr) this.lastRollupFailureError = lastErr
+      }
+      return allGaps
+        .filter(g => Number(g.hour_bucket) >= minBucket)
+        .map(g => ({
+          hour_bucket: Number(g.hour_bucket),
+          failures: Number(g.failures || 0),
+          first_failure_at: Number(g.first_failure_at),
+          last_failure_at: Number(g.last_failure_at),
+          last_error: g.last_error ? String(g.last_error) : null,
+        }))
+    } catch {
+      return []
+    }
+  }
+
   // Durable hourly activity rollups (metadata-only: hour_bucket, actor, kind, calls, hits, records_returned, samples_json).
   // Survives in-memory ACTIVITY_MAX ring overflow (>80 events) and daemon restarts without altering the accepted-write ledger.
   recordActivityRollup({ at = nowSecDefault(), actor = '', kind = '', count = 0 } = {}) {
@@ -1192,10 +1283,7 @@ export class HiveMemoryStore {
     const cleanKind = String(kind || '').trim().slice(0, 32)
     if (!cleanActor || !cleanKind || cleanActor === 'viewer') return false
     if (!this.isReady().ready || !this.db) {
-      this.rollupWriteFailures += 1
-      this.firstRollupFailureAt ??= ts
-      this.lastRollupFailureAt = ts
-      this.lastRollupFailureError = `store-not-ready:${this.state}`
+      this.#recordRollupFailure(ts, `store-not-ready:${this.state}`)
       return false
     }
     const hourBucket = Math.floor(ts / 3600) * 3600
@@ -1217,10 +1305,7 @@ export class HiveMemoryStore {
       `).run(hourBucket, cleanActor, cleanKind, hitCall, retCount, ts, ts, ts, hitCall, retCount, ts, hitCall, retCount)
       return true
     } catch (err) {
-      this.rollupWriteFailures += 1
-      this.firstRollupFailureAt ??= ts
-      this.lastRollupFailureAt = ts
-      this.lastRollupFailureError = err?.code || err?.message || 'ROLLUP_WRITE_ERROR'
+      this.#recordRollupFailure(ts, err?.code || err?.message || 'ROLLUP_WRITE_ERROR')
       this.log(`hive-memory: activity_rollups write failed: ${this.lastRollupFailureError}`)
       return false
     }
@@ -1239,6 +1324,7 @@ export class HiveMemoryStore {
         first_failure_at: this.firstRollupFailureAt ?? null,
         last_failure_at: this.lastRollupFailureAt ?? null,
         last_failure_error: this.lastRollupFailureError ?? null,
+        failure_gaps: [],
         read_error: true,
         as_of: nowSec,
       }
@@ -1246,6 +1332,7 @@ export class HiveMemoryStore {
     try {
       this.#ensureDerivedTables()
       const minBucket = Math.max(0, Math.floor(Number(sinceSec || 0) / 3600) * 3600)
+      const failureGaps = this.#loadPersistedRollupGaps(minBucket)
       const rows = this.db.prepare(`
         SELECT hour_bucket, actor, kind, calls, hits, records_returned, first_at, last_at, samples_json
         FROM activity_rollups
@@ -1287,6 +1374,7 @@ export class HiveMemoryStore {
         first_failure_at: this.firstRollupFailureAt ?? null,
         last_failure_at: this.lastRollupFailureAt ?? null,
         last_failure_error: this.lastRollupFailureError ?? null,
+        failure_gaps: failureGaps,
         read_error: false,
         as_of: nowSec,
       }
@@ -1302,6 +1390,7 @@ export class HiveMemoryStore {
         first_failure_at: this.firstRollupFailureAt ?? null,
         last_failure_at: this.lastRollupFailureAt ?? null,
         last_failure_error: err?.code || err?.message || 'ROLLUP_READ_ERROR',
+        failure_gaps: [],
         read_error: true,
         as_of: nowSec,
       }
@@ -1324,6 +1413,7 @@ export class HiveMemoryStore {
   #ensureDerivedTables() {
     if (!this.db) return
     ensureDerivedSchema(this.db)
+    this.#loadPersistedRollupGaps(0)
     const totalEvents = this.db.prepare('SELECT count(*) AS n FROM events').get().n
     const indexedFts = this.db.prepare('SELECT count(*) AS n FROM events_fts').get().n
     if (indexedFts >= totalEvents) return
