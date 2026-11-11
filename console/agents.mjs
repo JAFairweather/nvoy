@@ -17,7 +17,7 @@ import {
   planProjectionPublish, registryButton, granteesOf, enrol,
 } from './registry.mjs'
 import { rotateProjection } from './registry-rotate.mjs'
-import { confirmReadBack, reverifyProjection, grantRead, revokeRead } from './registry-actions.mjs'
+import { confirmReadBack, reverifyProjection, grantRead, revokeRead, retrySave } from './registry-actions.mjs'
 
 // Copy an npub to the clipboard with visual feedback, degrading gracefully:
 // async clipboard API → execCommand → (both blocked) select nothing and just
@@ -115,6 +115,12 @@ const registryTerms = () => ({
   contact: nip19.npubEncode(state.me),
 })
 
+/** The Grant Index could not be saved after an action went out: show the save-only retry. */
+function flagUnsaved(unsaved) {
+  state.registryUnsaved = !!unsaved
+  const row = $('reg-save-row'); if (row) row.hidden = !unsaved
+}
+
 /** What the registry actions need from this page; the actions themselves live in registry-actions.mjs. */
 const actionCtx = () => ({
   relay: state.relay, signer: state.signer, me: state.me, index: state.index, relayHint: RELAYS[0],
@@ -199,7 +205,10 @@ function registryPanel() {
         </select>
         <button id="reg-grant"${grantable.length ? '' : ' disabled'}>Grant read</button>
       </div>
-      <div class="msg" id="reg-hmsg" style="margin-top:6px"></div>` : ''}
+      <div class="msg" id="reg-hmsg" style="margin-top:6px"></div>
+      <div class="actions" id="reg-save-row" style="margin-top:6px"${state.registryUnsaved ? '' : ' hidden'}>
+        <button id="reg-save" title="Saves the Grant Index again. Publishes nothing.">Retry saving the Grant Index</button>
+      </div>` : ''}
 
     <div class="msg" style="margin-top:12px">Publishing signs a 30440; republishing rotates its key and
       re-delivers to every holder above. <b>The projection is a copy and can be stale</b>, so it carries
@@ -343,11 +352,23 @@ function wireRegistryHolders() {
       msg.textContent = `granting read to ${agentName(pub)}…`
       const r = await grantRead(actionCtx(), pub, scopeId)
       msg.textContent = r.message
+      flagUnsaved(r.outcome === 'granted-unsaved')
       await refreshSaying('reg-hmsg', r.message, r.outcome !== 'granted-unsaved')
     } catch (err) {
       // grantRead reports its own failures; reaching here means something outside it threw.
       msg.textContent = `something went wrong around the grant: ${err.message}. Reload and check Who can read it before trying again.`
     } finally { grant.disabled = false }
+  }
+
+  const saveBtn = $('reg-save')
+  if (saveBtn) saveBtn.onclick = async () => {
+    saveBtn.disabled = true
+    try {
+      const r = await retrySave(actionCtx())
+      msg.textContent = r.message
+      flagUnsaved(!r.saved)
+      if (r.saved) await refreshSaying('reg-hmsg', r.message)
+    } finally { saveBtn.disabled = false }
   }
 
   for (const row of document.querySelectorAll('#agents .reg-holder')) {
@@ -362,6 +383,7 @@ function wireRegistryHolders() {
         const { payload } = buildProjection(state.index, { now: Math.floor(Date.now() / 1000) })
         const r = await revokeRead(actionCtx(), pub, scopeId, payload)
         msg.textContent = r.message
+        flagUnsaved(r.saved === false)
         await refreshSaying('reg-hmsg', r.message, r.saved !== false)
       } catch (err) {
         msg.textContent = `something went wrong around the revoke: ${err.message}. Reload and check Who can read it before trying again.`
