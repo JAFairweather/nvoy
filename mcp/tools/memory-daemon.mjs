@@ -95,12 +95,18 @@ const isCuratorReader = (binding, config) =>
 // (`activity_rollups`) so 24h and 7d recall totals survive ACTIVITY_MAX ring overflow and daemon restarts.
 function noteActivity(activity, binding, nowSec, { kind, count = null, refs = [], filter = null, accepted = null, code = null }, store = null) {
   if (isViewer(binding)) return
+  let rollupOk = true
   if (store && typeof store.recordActivityRollup === 'function') {
     const retCount = Number.isSafeInteger(count) ? count : (Array.isArray(refs) ? refs.length : 0)
-    store.recordActivityRollup({ at: nowSec, actor: binding.name, kind, count: retCount })
+    rollupOk = store.recordActivityRollup({ at: nowSec, actor: binding.name, kind, count: retCount })
   }
   if (!activity) return
   if (!Number.isSafeInteger(activity.started_at)) activity.started_at = nowSec
+  if (!rollupOk) {
+    activity.rollup_write_failures = (activity.rollup_write_failures || 0) + 1
+    activity.first_rollup_failure_at ??= nowSec
+    activity.last_rollup_failure_at = nowSec
+  }
   activity.seq += 1
   activity.events.push({ seq: activity.seq, at: nowSec, kind, actor: binding.name, count, refs, filter, accepted, code })
   if (activity.events.length > ACTIVITY_MAX) activity.events.shift()
@@ -243,6 +249,9 @@ export function handleSocketJsonRpc({ store, binding, message, nowSec, activity 
             overflowed: activity.seq > ACTIVITY_MAX,
             started_at: Number.isSafeInteger(activity.started_at) ? activity.started_at : nowSec,
             oldest_at: activity.events[0]?.at ?? null,
+            rollup_write_failures: Math.max(Number(activity.rollup_write_failures || 0), Number(store.rollupWriteFailures || 0)),
+            first_rollup_failure_at: activity.first_rollup_failure_at ?? store.firstRollupFailureAt ?? null,
+            last_rollup_failure_at: activity.last_rollup_failure_at ?? store.lastRollupFailureAt ?? null,
           },
           ...(typeof store.activityRollups === 'function'
             ? { activity_rollups: store.activityRollups({ sinceSec: Math.max(0, nowSec - 14 * 86400), nowSec }) }

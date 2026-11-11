@@ -103,6 +103,7 @@ CREATE TABLE IF NOT EXISTS activity_rollups (
   records_returned INTEGER NOT NULL DEFAULT 0,
   first_at INTEGER NOT NULL,
   last_at INTEGER NOT NULL,
+  samples_json TEXT NOT NULL DEFAULT '[]',
   PRIMARY KEY (hour_bucket, actor, kind)
 );
 CREATE INDEX IF NOT EXISTS idx_activity_rollups_hour ON activity_rollups(hour_bucket);
@@ -689,10 +690,15 @@ function ensureDerivedSchema(db) {
       records_returned INTEGER NOT NULL DEFAULT 0,
       first_at INTEGER NOT NULL,
       last_at INTEGER NOT NULL,
+      samples_json TEXT NOT NULL DEFAULT '[]',
       PRIMARY KEY (hour_bucket, actor, kind)
     );
     CREATE INDEX IF NOT EXISTS idx_activity_rollups_hour ON activity_rollups(hour_bucket);
   `)
+  const rollupCols = db.prepare('PRAGMA table_info(activity_rollups)').all()
+  if (!rollupCols.some(c => c.name === 'samples_json')) {
+    db.exec("ALTER TABLE activity_rollups ADD COLUMN samples_json TEXT NOT NULL DEFAULT '[]'")
+  }
 }
 
 function indexDerivedEvent(db, { id, d, topic, asOfGit, asOfEvt, supersedes = [], claim = '', because = '', evidence = [] }) {
@@ -831,6 +837,10 @@ export class HiveMemoryStore {
     this.ledgerMaxSeq = 0
     this.purgedIds = new Set()
     this.lockHandle = null
+    this.rollupWriteFailures = 0
+    this.firstRollupFailureAt = null
+    this.lastRollupFailureAt = null
+    this.lastRollupFailureError = null
   }
 
   start() {
@@ -1174,44 +1184,70 @@ export class HiveMemoryStore {
     return this.db.prepare('SELECT count(*) AS n FROM writer_rate_log WHERE pubkey = ? AND accepted_at > ?').get(pubkey, nowSec - 3600).n
   }
 
-  // Durable hourly activity rollups (metadata-only: hour_bucket, actor, kind, calls, hits, records_returned).
+  // Durable hourly activity rollups (metadata-only: hour_bucket, actor, kind, calls, hits, records_returned, samples_json).
   // Survives in-memory ACTIVITY_MAX ring overflow (>80 events) and daemon restarts without altering the accepted-write ledger.
   recordActivityRollup({ at = nowSecDefault(), actor = '', kind = '', count = 0 } = {}) {
-    if (!this.isReady().ready || !this.db) return false
     const ts = Number.isSafeInteger(at) && at > 0 ? at : nowSecDefault()
     const cleanActor = String(actor || '').trim().slice(0, 64)
     const cleanKind = String(kind || '').trim().slice(0, 32)
     if (!cleanActor || !cleanKind || cleanActor === 'viewer') return false
+    if (!this.isReady().ready || !this.db) {
+      this.rollupWriteFailures += 1
+      this.firstRollupFailureAt ??= ts
+      this.lastRollupFailureAt = ts
+      this.lastRollupFailureError = `store-not-ready:${this.state}`
+      return false
+    }
     const hourBucket = Math.floor(ts / 3600) * 3600
     const retCount = Number.isSafeInteger(count) && count > 0 ? count : 0
     const hitCall = (cleanKind === 'query' || cleanKind === 'wake') && retCount > 0 ? 1 : 0
     try {
       this.#ensureDerivedTables()
+      this.hooks?.beforeRollupWrite?.({ hourBucket, actor: cleanActor, kind: cleanKind, ts })
       this.db.prepare(`
-        INSERT INTO activity_rollups (hour_bucket, actor, kind, calls, hits, records_returned, first_at, last_at)
-        VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+        INSERT INTO activity_rollups (hour_bucket, actor, kind, calls, hits, records_returned, first_at, last_at, samples_json)
+        VALUES (?, ?, ?, 1, ?, ?, ?, ?, json_array(json_array(?, ?, ?)))
         ON CONFLICT(hour_bucket, actor, kind) DO UPDATE SET
           calls = calls + 1,
           hits = hits + excluded.hits,
           records_returned = records_returned + excluded.records_returned,
           first_at = MIN(first_at, excluded.first_at),
-          last_at = MAX(last_at, excluded.last_at)
-      `).run(hourBucket, cleanActor, cleanKind, hitCall, retCount, ts, ts)
+          last_at = MAX(last_at, excluded.last_at),
+          samples_json = json_insert(COALESCE(activity_rollups.samples_json, '[]'), '$[#]', json_array(?, ?, ?))
+      `).run(hourBucket, cleanActor, cleanKind, hitCall, retCount, ts, ts, ts, hitCall, retCount, ts, hitCall, retCount)
       return true
-    } catch {
+    } catch (err) {
+      this.rollupWriteFailures += 1
+      this.firstRollupFailureAt ??= ts
+      this.lastRollupFailureAt = ts
+      this.lastRollupFailureError = err?.code || err?.message || 'ROLLUP_WRITE_ERROR'
+      this.log(`hive-memory: activity_rollups write failed: ${this.lastRollupFailureError}`)
       return false
     }
   }
 
   activityRollups({ sinceSec = 0, nowSec = nowSecDefault() } = {}) {
     if (!this.isReady().ready || !this.db) {
-      return { rollups: [], coverage_start_at: null, min_hour_bucket: null, total_calls: 0, total_hits: 0, store_initialized_at: null }
+      return {
+        rollups: [],
+        coverage_start_at: null,
+        min_hour_bucket: null,
+        total_calls: 0,
+        total_hits: 0,
+        store_initialized_at: null,
+        write_failures: this.rollupWriteFailures || 0,
+        first_failure_at: this.firstRollupFailureAt ?? null,
+        last_failure_at: this.lastRollupFailureAt ?? null,
+        last_failure_error: this.lastRollupFailureError ?? null,
+        read_error: true,
+        as_of: nowSec,
+      }
     }
     try {
       this.#ensureDerivedTables()
       const minBucket = Math.max(0, Math.floor(Number(sinceSec || 0) / 3600) * 3600)
       const rows = this.db.prepare(`
-        SELECT hour_bucket, actor, kind, calls, hits, records_returned, first_at, last_at
+        SELECT hour_bucket, actor, kind, calls, hits, records_returned, first_at, last_at, samples_json
         FROM activity_rollups
         WHERE hour_bucket >= ?
         ORDER BY hour_bucket ASC, actor ASC, kind ASC
@@ -1222,25 +1258,53 @@ export class HiveMemoryStore {
       `).get()
       const meta = this.db.prepare('SELECT initialized_at FROM store_meta WHERE singleton = 1').get()
       return {
-        rollups: rows.map(r => ({
-          hour_bucket: Number(r.hour_bucket),
-          actor: String(r.actor),
-          kind: String(r.kind),
-          calls: Number(r.calls || 0),
-          hits: Number(r.hits || 0),
-          records_returned: Number(r.records_returned || 0),
-          first_at: Number(r.first_at || r.hour_bucket),
-          last_at: Number(r.last_at || r.hour_bucket),
-        })),
+        rollups: rows.map(r => {
+          let samples = []
+          try {
+            const parsed = JSON.parse(r.samples_json || '[]')
+            if (Array.isArray(parsed)) samples = parsed
+          } catch {
+            samples = []
+          }
+          return {
+            hour_bucket: Number(r.hour_bucket),
+            actor: String(r.actor),
+            kind: String(r.kind),
+            calls: Number(r.calls || 0),
+            hits: Number(r.hits || 0),
+            records_returned: Number(r.records_returned || 0),
+            first_at: Number(r.first_at || r.hour_bucket),
+            last_at: Number(r.last_at || r.hour_bucket),
+            samples,
+          }
+        }),
         coverage_start_at: Number.isSafeInteger(bounds?.min_first_at) ? Number(bounds.min_first_at) : null,
         min_hour_bucket: Number.isSafeInteger(bounds?.min_hour_bucket) ? Number(bounds.min_hour_bucket) : null,
         total_calls: Number(bounds?.total_calls || 0),
         total_hits: Number(bounds?.total_hits || 0),
         store_initialized_at: Number.isSafeInteger(meta?.initialized_at) ? Number(meta.initialized_at) : null,
+        write_failures: this.rollupWriteFailures || 0,
+        first_failure_at: this.firstRollupFailureAt ?? null,
+        last_failure_at: this.lastRollupFailureAt ?? null,
+        last_failure_error: this.lastRollupFailureError ?? null,
+        read_error: false,
         as_of: nowSec,
       }
-    } catch {
-      return { rollups: [], coverage_start_at: null, min_hour_bucket: null, total_calls: 0, total_hits: 0, store_initialized_at: null }
+    } catch (err) {
+      return {
+        rollups: [],
+        coverage_start_at: null,
+        min_hour_bucket: null,
+        total_calls: 0,
+        total_hits: 0,
+        store_initialized_at: null,
+        write_failures: this.rollupWriteFailures || 0,
+        first_failure_at: this.firstRollupFailureAt ?? null,
+        last_failure_at: this.lastRollupFailureAt ?? null,
+        last_failure_error: err?.code || err?.message || 'ROLLUP_READ_ERROR',
+        read_error: true,
+        as_of: nowSec,
+      }
     }
   }
 

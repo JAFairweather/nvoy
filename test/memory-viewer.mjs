@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
 import { buildClaimTemplate } from '../mcp/tools/memory.mjs'
 import { ACTIVITY_MAX, handleSocketJsonRpc, startMemoryDaemon } from '../mcp/tools/memory-daemon.mjs'
-import { HiveMemoryStore, initEmptyStore, recordVerifiedBackup } from '../mcp/tools/hive_memory_store.mjs'
+import { HiveMemoryStore, initEmptyStore, recordVerifiedBackup, validateAndResolveConfig } from '../mcp/tools/hive_memory_store.mjs'
 import {
   buildMobileState,
   computeAgentHealth,
@@ -2195,9 +2195,10 @@ await test('durable SQLite activity_rollups survive >80 ring overflow & daemon r
       assert.equal(tr.recall_telemetry.source, 'sqlite_rollups')
       assert.equal(tr.window_24h.recall_hits, 80, '24h recall_hits must preserve all 80 Today query hits across daemon restart')
       assert.equal(tr.window_7d.recall_hits, 95, '7d recall_hits must preserve all 95 (15 Day -2 + 80 Today) query hits across ring overflow and daemon restart')
-      assert.equal(tr.window_24h.recall_coverage, 'complete')
-      assert.equal(tr.window_7d.recall_coverage, 'complete')
-      assert.equal(tr.window_7d.recall_incomplete, false)
+      assert.equal(tr.window_24h.recall_coverage, 'complete', '24h window is complete because first rollup was on Day -2')
+      assert.equal(tr.window_24h.recall_incomplete, false)
+      assert.equal(tr.window_7d.recall_coverage, 'partial', '7d window must be partial because first observed rollup was on Day -2, not 7 days ago (store_initialized_at is ignored)')
+      assert.equal(tr.window_7d.recall_incomplete, true)
 
       // Event-time conflict reproducibility:
       // Even though the conflict on `room:...:gateway-route` is now resolved (so current-head conflict is false),
@@ -2225,6 +2226,170 @@ await test('durable SQLite activity_rollups survive >80 ring overflow & daemon r
       assert.equal(partialTrends.daily_series[4].recall_coverage, 'unobserved', 'Day -2 bucket prior to oldest retained ring event must be marked unobserved')
       assert.equal(partialTrends.daily_series[4].recall_incomplete, true, 'Day -2 bucket must set recall_incomplete: true')
       assert.equal(partialTrends.daily_series[6].recall_incomplete, true, 'Today bucket starting before oldest_at (todayAt + 500) must also be marked partial/incomplete')
+
+      // 6. Regression: Old store migrated with 0 activity_rollups must NEVER claim recall_coverage = complete from store_initialized_at
+      const oldStoreDir = mkdtempSync(join(tmpdir(), 'hive-memory-old-store-mig-'))
+      try {
+        const oldDbPath = join(oldStoreDir, 'old.sqlite')
+        const oldLedgerPath = join(oldStoreDir, 'old-ledger.jsonl')
+        const oldReceiptPath = join(oldStoreDir, 'old-receipt.json')
+        const oldInitAt = nowSec - 14 * daySec
+        initEmptyStore({ dbPath: oldDbPath, ledgerPath: oldLedgerPath, nowSec: oldInitAt })
+        recordVerifiedBackup({ receiptPath: oldReceiptPath, writeSeq: 1, snapshotId: SNAP_ID, at: oldInitAt, nowSec })
+        const oldStore = new HiveMemoryStore({
+          dbPath: oldDbPath,
+          ledgerPath: oldLedgerPath,
+          receiptPath: oldReceiptPath,
+          config: validateAndResolveConfig(config),
+          lock: false,
+        })
+        oldStore.start()
+        try {
+          const emptyRollups = oldStore.activityRollups({ sinceSec: 0, nowSec })
+          assert.equal(emptyRollups.rollups.length, 0)
+          assert.equal(emptyRollups.store_initialized_at, oldInitAt)
+          assert.equal(emptyRollups.coverage_start_at, null)
+
+          const oldStoreTrends = computeMemoryTrends({
+            records: [evDay2A],
+            history_records: [evDay2A],
+            recent_activity: [],
+            activity_rollups: emptyRollups,
+            now_sec: nowSec,
+          })
+          assert.equal(
+            oldStoreTrends.window_24h.recall_coverage,
+            'unobserved',
+            'old store with 0 activity_rollups must return window_24h.recall_coverage = unobserved, never complete'
+          )
+          assert.equal(oldStoreTrends.window_24h.recall_incomplete, true)
+          assert.equal(oldStoreTrends.window_7d.recall_coverage, 'unobserved')
+          assert.equal(oldStoreTrends.window_7d.recall_incomplete, true)
+
+          // Even after 1 rollup is recorded 10 minutes ago on the migrated store, 24h coverage is partial (not complete)
+          oldStore.recordActivityRollup({ at: nowSec - 600, actor: 'biggy', kind: 'query', count: 2 })
+          const postMigRollups = oldStore.activityRollups({ sinceSec: 0, nowSec })
+          const postMigTrends = computeMemoryTrends({
+            records: [evDay2A],
+            history_records: [evDay2A],
+            recent_activity: [],
+            activity_rollups: postMigRollups,
+            now_sec: nowSec,
+          })
+          assert.equal(postMigTrends.window_24h.recall_coverage, 'partial', '1st rollup 10m ago on old store must mark 24h coverage partial')
+          assert.equal(postMigTrends.window_24h.recall_incomplete, true)
+          assert.equal(postMigTrends.window_24h.recall_hits, 1)
+
+          // 7. Regression: Window cutting through an hour (partial edge bucket straddling 24h start)
+          const midHourNow = 1794400200 // 2026-11-11T12:30:00Z (cuts through 12:00..12:59Z)
+          const start24h = midHourNow - 86400 // 2026-11-10T12:30:00Z
+          const edgeBucket = Math.floor(start24h / 3600) * 3600 // 2026-11-10T12:00:00Z
+          // Record 5 query hits in the straddling hour: 2 before start24h (out-of-window) and 3 after start24h (in-window)
+          oldStore.recordActivityRollup({ at: start24h - 1200, actor: 'biggy', kind: 'query', count: 1 })
+          oldStore.recordActivityRollup({ at: start24h - 600, actor: 'biggy', kind: 'query', count: 1 })
+          oldStore.recordActivityRollup({ at: start24h + 300, actor: 'biggy', kind: 'query', count: 1 })
+          oldStore.recordActivityRollup({ at: start24h + 600, actor: 'biggy', kind: 'query', count: 1 })
+          oldStore.recordActivityRollup({ at: start24h + 900, actor: 'biggy', kind: 'query', count: 1 })
+
+          const straddleRollups = oldStore.activityRollups({ sinceSec: 0, nowSec: midHourNow })
+          const edgeRow = straddleRollups.rollups.find(r => r.hour_bucket === edgeBucket && r.actor === 'biggy' && r.kind === 'query')
+          assert.equal(edgeRow.hits, 5, 'hourly bucket itself holds all 5 hits across the full hour')
+
+          const straddleTrends = computeMemoryTrends({
+            records: [evDay2A],
+            history_records: [evDay2A],
+            recent_activity: [],
+            activity_rollups: {
+              ...straddleRollups,
+              rollups: [edgeRow],
+            },
+            now_sec: midHourNow,
+          })
+          assert.equal(
+            straddleTrends.window_24h.recall_hits,
+            3,
+            'window cutting through an hour must count only the 3 in-window query hits, never all 5'
+          )
+          assert.equal(
+            straddleTrends.window_24h.recall_coverage,
+            'partial',
+            'window cutting through a straddling hourly bucket must mark recall_coverage = partial, never complete'
+          )
+          assert.equal(straddleTrends.window_24h.recall_incomplete, true)
+          assert.equal(straddleTrends.window_24h.partial_edge_bucket, true)
+
+          // Coarse hourly rollup row (without per-event samples) straddling 24h start must also not count all 5 hits or mark complete
+          const coarseStraddleTrends = computeMemoryTrends({
+            records: [evDay2A],
+            history_records: [evDay2A],
+            recent_activity: [],
+            activity_rollups: {
+              coverage_start_at: start24h - 1200,
+              rollups: [
+                {
+                  hour_bucket: edgeBucket,
+                  actor: 'biggy',
+                  kind: 'query',
+                  calls: 5,
+                  hits: 5,
+                  records_returned: 5,
+                  first_at: start24h - 1200,
+                  last_at: start24h + 900,
+                },
+              ],
+            },
+            now_sec: midHourNow,
+          })
+          assert(
+            coarseStraddleTrends.window_24h.recall_hits < 5,
+            `coarse straddling bucket must not count all 5 hits (got ${coarseStraddleTrends.window_24h.recall_hits})`
+          )
+          assert.equal(coarseStraddleTrends.window_24h.recall_coverage, 'partial')
+          assert.equal(coarseStraddleTrends.window_24h.recall_incomplete, true)
+          assert.equal(coarseStraddleTrends.window_24h.partial_edge_bucket, true)
+
+          // 8. Regression: Rollup write failures must be surfaced and mark coverage incomplete
+          oldStore.hooks = {
+            beforeRollupWrite: () => {
+              throw new Error('SIMULATED_SQLITE_ROLLUP_FAILURE')
+            },
+          }
+          const okWrite = oldStore.recordActivityRollup({ at: midHourNow - 60, actor: 'neil', kind: 'query', count: 3 })
+          assert.equal(okWrite, false, 'simulated rollup write failure must return false')
+          const failedRollups = oldStore.activityRollups({ sinceSec: 0, nowSec: midHourNow })
+          assert.equal(failedRollups.write_failures, 1, 'activityRollups must report write_failures = 1')
+
+          const failureTrends = computeMemoryTrends({
+            records: [evDay2A],
+            history_records: [evDay2A],
+            recent_activity: [],
+            activity_rollups: {
+              ...failedRollups,
+              coverage_start_at: midHourNow - 10 * daySec,
+              rollups: [
+                {
+                  hour_bucket: Math.floor((midHourNow - 7200) / 3600) * 3600,
+                  actor: 'biggy',
+                  kind: 'query',
+                  calls: 2,
+                  hits: 2,
+                  first_at: midHourNow - 7000,
+                  last_at: midHourNow - 6800,
+                },
+              ],
+            },
+            now_sec: midHourNow,
+          })
+          assert.equal(failureTrends.window_24h.recall_incomplete, true, 'rollup write failure must mark window_24h.recall_incomplete = true')
+          assert.equal(failureTrends.window_24h.recall_coverage, 'partial', 'rollup write failure must downgrade coverage from complete to partial')
+          assert.equal(failureTrends.window_24h.rollup_write_failures, 1)
+          assert.equal(failureTrends.recall_telemetry.write_failures, 1)
+        } finally {
+          oldStore.close()
+        }
+      } finally {
+        rmSync(oldStoreDir, { recursive: true, force: true })
+      }
     } finally {
       await viewer.stop()
       await daemon.close()
