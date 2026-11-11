@@ -10,13 +10,14 @@ import { nip19 } from 'nostr-tools'
 import { saveGrantIndex, newScopeKey, publishScope, fetchScope, toIssuedEntry } from '../lib/nipxx.mjs'
 import { state, $, esc, short, fmtWhen, load, parsePub, agentsOf, agentName, openAgentPage, RELAYS } from './main.mjs'
 import { openDelegationInLedger } from './ledger.mjs'
-import { grantWithTerms, opaqueScopeId, sendRevocationNotice } from './nvoygrant.mjs'
-import { appendLedger, grantedEvent, rotatedEvent, revokedEvent } from './ledgerlog.mjs'
+import { opaqueScopeId } from './nvoygrant.mjs'
+import { appendLedger, rotatedEvent } from './ledgerlog.mjs'
 import {
   REGISTRY_SCOPE, REGISTRY_PROJECTION_FIELD, buildProjection, projectionChanged,
   planProjectionPublish, registryButton, granteesOf, enrol,
 } from './registry.mjs'
 import { rotateProjection } from './registry-rotate.mjs'
+import { confirmReadBack, reverifyProjection, grantRead, revokeRead } from './registry-actions.mjs'
 
 // Copy an npub to the clipboard with visual feedback, degrading gracefully:
 // async clipboard API → execCommand → (both blocked) select nothing and just
@@ -113,6 +114,27 @@ const registryTerms = () => ({
   redelegate: false,
   contact: nip19.npubEncode(state.me),
 })
+
+/** What the registry actions need from this page; the actions themselves live in registry-actions.mjs. */
+const actionCtx = () => ({
+  relay: state.relay, signer: state.signer, me: state.me, index: state.index, relayHint: RELAYS[0],
+  now: () => Math.floor(Date.now() / 1000), terms: registryTerms, name: agentName,
+  save: () => saveGrantIndex(state.relay, state.signer, state.index),
+})
+
+/**
+ * Re-render the panel and put `said` back. load() re-reads the index from the relay, so it is skipped
+ * while our copy is unsaved (`persisted === false`), and a load() that throws is reported as a refresh
+ * problem — never as the action having failed.
+ */
+async function refreshSaying(id, said, persisted = true) {
+  if (!persisted) return
+  try { await load() } catch (error) {
+    const el = $(id); if (el) el.textContent = `${said} (The panel could not refresh: ${error.message}. Reload to see the current state.)`
+    return
+  }
+  const el = $(id); if (el) el.textContent = said    // load() re-renders the panel
+}
 
 /** The issued entry for the projection scope, or null. The key lives here; nothing else holds it. */
 function registryIssued() {
@@ -215,22 +237,10 @@ function wireRegistryPanel() {
     let warn = ''
     try {
       if (plan.action === 'reverify') {
-        // Read-back only. Signs nothing, rotates nothing, re-grants no one.
         msg.textContent = 'checking the projection reads back…'
-        const issued = registryIssued()
-        const scopeKey = Uint8Array.from(atob(issued.key), c => c.charCodeAt(0))
-        const back = await fetchScope(state.relay, {
-          publisher: state.me, scopeId: plan.scopeId, generation: plan.generation, scopeKey,
-        })
-        if (back.status === 'ok') {
-          state.index[REGISTRY_PROJECTION_FIELD].verified = true
-          await saveGrantIndex(state.relay, state.signer, state.index)
-          msg.textContent = `v${plan.generation} reads back — verified. Nothing was signed.`
-        } else {
-          msg.textContent = `v${plan.generation} still does not read back (${back.status}). Nothing was signed; `
-            + 'check again once the relay has it.'
-        }
-        await load()
+        const r = await reverifyProjection(actionCtx(), plan)
+        msg.textContent = r.message
+        await refreshSaying('reg-msg', r.message, r.outcome !== 'verified-unsaved')
         return
       }
 
@@ -295,17 +305,18 @@ function wireRegistryPanel() {
 
       // Read-back, the house pattern: a relay acknowledgement is not evidence that anyone can read it.
       msg.textContent = 'verifying the projection reads back…'
-      const back = await fetchScope(state.relay, { publisher: state.me, scopeId, generation, scopeKey })
-      if (back.status === 'ok') {
-        state.index[REGISTRY_PROJECTION_FIELD].verified = true
-        await saveGrantIndex(state.relay, state.signer, state.index)
+      const back = await confirmReadBack(actionCtx(), { scopeId, generation, scopeKey })
+      if (back.readable && back.saved) {
         msg.textContent = `published v${generation} — ${payload.agents.length} agent(s), read back and verified.`
           + (plan.grantees.length ? '' : ' No runtime holds it yet — grant read below.') + warn
+      } else if (back.readable) {
+        warn = ' WARNING: it reads back, but the Grant Index could not be saved, so it is not recorded as verified — press Check read-back to retry the save.'
+        msg.textContent = `v${generation} is live and reads back.` + warn
       } else {
         msg.textContent = `the relay accepted v${generation} but it did not read back (${back.status}), `
           + 'so nothing is claimed as readable. Your scope key is recorded — use Check read-back.' + warn
       }
-      if (!warn) await load()
+      if (!warn) { const said = msg.textContent; await refreshSaying('reg-msg', said) }
     } catch (err) {
       msg.textContent = live
         ? `v${live} is live, but a later step failed: ${err.message}. Nothing was rolled back — press Check read-back to continue.`
@@ -325,26 +336,18 @@ function wireRegistryHolders() {
 
   if (grant) grant.onclick = async () => {
     const pub = $('reg-grantee')?.value
-    const issued = registryIssued()
     if (!pub) return
-    if (!issued) { msg.textContent = 'nothing changed: the projection scope is not in your issued list, so its key cannot be recovered.'; return }
+    const scopeId = state.index?.[REGISTRY_PROJECTION_FIELD]?.scopeId
     grant.disabled = true
     try {
-      const scopeKey = Uint8Array.from(atob(issued.key), c => c.charCodeAt(0))   // the SAME key — same value, no rotation
-      const terms = registryTerms()
-      msg.textContent = `granting read to ${agentName(pub)} (v${issued.v}, same value)…`
-      await grantWithTerms(state.relay, state.signer, pub, {
-        scopeId: issued.scope, generation: issued.v, scopeKey, scopeName: REGISTRY_SCOPE,
-        relayHint: RELAYS[0], terms,
-      })
-      issued.grantees = [...granteesOf(issued), pub]
-      state.index.nvoy_ledger = appendLedger(state.index, grantedEvent({
-        scope: issued.scope, agent: pub, v: issued.v, terms: { nvoy: 1, ...terms }, name: REGISTRY_SCOPE,
-      }))
-      await saveGrantIndex(state.relay, state.signer, state.index)
-      await load()
-    } catch (err) { msg.textContent = `nothing changed: ${err.message}` }
-    finally { grant.disabled = false }
+      msg.textContent = `granting read to ${agentName(pub)}…`
+      const r = await grantRead(actionCtx(), pub, scopeId)
+      msg.textContent = r.message
+      await refreshSaying('reg-hmsg', r.message, r.outcome !== 'granted-unsaved')
+    } catch (err) {
+      // grantRead reports its own failures; reaching here means something outside it threw.
+      msg.textContent = `something went wrong around the grant: ${err.message}. Reload and check Who can read it before trying again.`
+    } finally { grant.disabled = false }
   }
 
   for (const row of document.querySelectorAll('#agents .reg-holder')) {
@@ -352,53 +355,17 @@ function wireRegistryHolders() {
     const btn = row.querySelector('.reg-revoke')
     if (!btn) continue
     btn.onclick = async () => {
-      const issued = registryIssued()
-      if (!issued) { msg.textContent = 'nothing changed: the projection scope is not in your issued list.'; return }
+      const scopeId = state.index?.[REGISTRY_PROJECTION_FIELD]?.scopeId
       btn.disabled = true
       try {
-        // Revocation IS the rotation — the claim this panel's own header makes. Survivors are everyone
-        // else; the revoked runtime keeps whatever roster it already read and gets nothing after this.
-        const survivors = granteesOf(issued).filter(p => p !== pub)
-        const from = Number(issued.v)
-        msg.textContent = `rotating past ${agentName(pub)} and re-delivering to ${survivors.length} holder(s)…`
+        msg.textContent = `rotating past ${agentName(pub)} and re-delivering to the other holders…`
         const { payload } = buildProjection(state.index, { now: Math.floor(Date.now() / 1000) })
-        // The new key is recorded before any survivor is granted and before the optional notice, so
-        // neither a failed grant nor a failed courtesy notice can strand the generation that replaced
-        // the old one. The revoked runtime is never in the recorded holders, whatever else failed.
-        const rot = await rotateProjection({
-          relay: state.relay, signer: state.signer, index: state.index, scopeId: issued.scope,
-          scopeName: REGISTRY_SCOPE, from, payload, relayHint: RELAYS[0],
-          now: () => Math.floor(Date.now() / 1000),
-          survivors: survivors.map(p => ({ pub: p, terms: registryTerms() })),
-          save: () => saveGrantIndex(state.relay, state.signer, state.index),
-        })
-        let noticed = false
-        try {
-          await sendRevocationNotice(state.relay, state.signer, pub, {
-            scopeId: issued.scope, reason: 'the registry projection read was revoked',
-          })
-          noticed = true
-        } catch { /* a courtesy: the revocation itself is the rotation and is already recorded */ }
-        state.index.nvoy_ledger = appendLedger(state.index, revokedEvent({
-          scope: issued.scope, agent: pub, v: rot.generation,
-          reason: 'the registry projection read was revoked', notice: noticed ? true : null,
-        }))
-        // The rotation is out; a failure from here is about persisting it, never "nothing changed".
-        let persisted = rot.saved
-        try { await saveGrantIndex(state.relay, state.signer, state.index); persisted = true } catch { persisted = false }
-        msg.textContent = (rot.status === 'partial'
-          ? `${agentName(pub)} is revoked (v${rot.generation}), but only ${rot.regranted.length} of ${survivors.length} remaining holder(s) `
-            + `were re-delivered (${rot.reason}). Still waiting: ${rot.pending.map(agentName).join(', ')} — use Grant read.`
-          : `${agentName(pub)} is revoked (v${rot.generation}).` + (noticed ? '' : ' The courtesy notice could not be sent; the revocation stands.'))
-          + ' The new generation is unverified — press Check read-back.'
-          + (persisted ? '' : ` WARNING: v${rot.generation} is live but the Grant Index could not be saved — keep this page open and retry.`)
-        if (persisted) {      // load() re-reads the index from the relay: never while ours is unsaved
-          const said = msg.textContent
-          await load()
-          const fresh = $('reg-hmsg'); if (fresh) fresh.textContent = said   // load() re-renders the panel
-        }
-      } catch (err) { msg.textContent = `nothing changed: ${err.message}` }
-      finally { btn.disabled = false }
+        const r = await revokeRead(actionCtx(), pub, scopeId, payload)
+        msg.textContent = r.message
+        await refreshSaying('reg-hmsg', r.message, r.saved !== false)
+      } catch (err) {
+        msg.textContent = `something went wrong around the revoke: ${err.message}. Reload and check Who can read it before trying again.`
+      } finally { btn.disabled = false }
     }
   }
 }
