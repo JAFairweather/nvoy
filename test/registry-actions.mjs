@@ -14,7 +14,7 @@ import { localSigner, newScopeKey, publishScope, toIssuedEntry } from '../lib/ni
 import { Relay } from '../lib/relay.mjs'
 import { LocalRelay } from '../lib/liverelay.mjs'
 import { buildProjection, planProjectionPublish, REGISTRY_PROJECTION_FIELD, REGISTRY_SCOPE } from '../console/registry.mjs'
-import { confirmReadBack, reverifyProjection, grantRead, revokeRead } from '../console/registry-actions.mjs'
+import { confirmReadBack, reverifyProjection, grantRead, revokeRead, retrySave } from '../console/registry-actions.mjs'
 import { opaqueScopeId } from '../console/nvoygrant.mjs'
 
 let pass = 0, fail = 0
@@ -118,6 +118,26 @@ await t('Grant read whose SAVE fails after the gift wrap is out is NOT "nothing 
   assert.match(r.message, /do not grant again/)
   assert.deepEqual(index.issued[0].grantees, [H[0]], 'the in-memory index keeps the repair state')
   assert.equal(relay.wraps, 1)
+})
+
+await t('a save-only retry after an unsaved grant saves WITHOUT publishing another wrap (My Dude, PR 363)', async () => {
+  const relay = relayWith(), { index, scopeId } = await seed(relay, { holders: [], verified: true })
+  let saves = 0, failing = true
+  const ctx = ctxFor(relay, index, { save: async () => { saves++; if (failing) throw new Error('save failed') } })
+  const r = await grantRead(ctx, H[0], scopeId)
+  assert.equal(r.outcome, 'granted-unsaved')
+  assert.equal(relay.wraps, 1)
+  // The projection is verified and unchanged, so Check read-back is disabled: the only recovery is the save.
+  assert.equal(planFor(index).action, 'none')
+  const still = await retrySave(ctx)
+  assert.equal(still.outcome, 'still-unsaved')
+  assert.match(still.message, /Nothing was published/)
+  failing = false
+  const done = await retrySave(ctx)
+  assert.equal(done.outcome, 'saved')
+  assert.equal(relay.wraps, 1, 'no second gift wrap was published by either retry')
+  assert.deepEqual(index.issued[0].grantees, [H[0]], 'the holder recorded in memory is what was saved')
+  assert.ok(saves >= 3)
 })
 
 // ------------------------------------------------ Revoke
