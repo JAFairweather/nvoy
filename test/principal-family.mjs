@@ -98,6 +98,12 @@ check(!verifyCodexPrincipal(manifest, 'channel', channelLine.replace('restrict,'
   check(verify([feedLine]) !== 0, 'unit verify: only the feed principal fails')
   check(verify([claude, feedLine]) !== 0, 'unit verify: a Claude command in place of the channel principal fails')
   check(verify([channelLine, feedLine.replace('codex-channel-feed.mjs', 'codex-channel-mcp.mjs')]) !== 0, 'unit verify: the channel program on the feed key fails')
+  {
+    const keys = join(tmp, 'ak-hint'); writeFileSync(keys, feedLine + '\n')
+    const out = spawnSync(process.execPath, [join(tools, 'instance-unit.mjs'), 'verify', '--instance', 'hr', '--authorized-keys', keys, '--family', 'codex'],
+      { encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: root } })
+    check(/expected command: .*codex-channel-mcp\.mjs --instance hr --key-fp <SHA256/.test(out.stderr), 'unit verify: a missing channel principal is hinted with its --key-fp, as it is now seated')
+  }
 }
 
 // ── the apply sequence ───────────────────────────────────────────────────────────────────────────
@@ -261,6 +267,9 @@ const lines = path => readFileSync(path, 'utf8').split('\n').filter(Boolean)
   try { replaceFileAtomic(real, 'a\nB\n', 'half', { hooks: { beforeRename: () => { throw new Error('killed before rename') } } }) } catch (e) { threw = e.message }
   check(threw === 'killed before rename' && readFileSync(real, 'utf8') === 'a\nB\n', 'an interruption before the rename leaves the original whole')
   check(readdirSync(dir).sort().join() === 'authorized_keys,keys-link', 'and no temp file is left behind')
+  threw = ''
+  try { replaceFileAtomic(real, 'a\nB\n', 'z\n', { hooks: { rename: () => { throw Object.assign(new Error('busy'), { code: 'EBUSY' }) } } }) } catch (e) { threw = e.message }
+  check(/bind-mounted; mount its directory instead/.test(threw) && readFileSync(real, 'utf8') === 'a\nB\n' && readdirSync(dir).length === 2, 'a rename refused as busy says the file looks bind-mounted, and leaves the original and no temp')
 }
 
 if (!pass) { console.error('principal-family: FAILED'); process.exit(1) }

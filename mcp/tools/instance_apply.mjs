@@ -111,7 +111,11 @@ export function replaceFileAtomic(path, expected, text, { hooks = {} } = {}) {
     } finally { closeSync(fd) }
     hooks.beforeRename?.(tmp)
     if (readFileSync(real, 'utf8') !== expected) throw new Error(`${path} changed while replacing it`)
-    renameSync(tmp, real)
+    try { (hooks.rename || renameSync)(tmp, real) } catch (error) {
+      // A bind-mounted file cannot be renamed over (EBUSY/EXDEV); say so, since the fix is a mount, not a retry.
+      if (error.code === 'EBUSY' || error.code === 'EXDEV') error.message = `${path} cannot be replaced by rename (${error.code}): it looks bind-mounted; mount its directory instead, then run again`
+      throw error
+    }
   } catch (error) {
     try { unlinkSync(tmp) } catch {}
     throw error

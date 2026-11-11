@@ -164,7 +164,7 @@ if (flag('--family') === 'codex') {
       .filter(l => { const p = parsePrincipal(l); return p ? p.comment === want : l.includes(want) })
     if (lines.length !== 1) {
       console.error(`${TOOL}: FAIL — ${lines.length ? `${lines.length} principals carry` : 'no principal carries'} ${want} in ${keysPath}`)
-      console.error(`  expected command: ${codexForcedCommand(manifest, role)}`)
+      console.error(`  expected command: ${codexForcedCommand(manifest, role)}${role === 'channel' ? ' --key-fp <SHA256 fingerprint of the channel key>' : ''}`)
       all = false; continue
     }
     const result = verifyCodexPrincipal(manifest, role, lines[0])
