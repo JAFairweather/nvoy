@@ -44,78 +44,74 @@ const lockPath = join(stateDir, 'broker-daemon.lock')
 const LIVE = /already runs as pid/
 
 // The daemon drains forever once it holds the lock, so a start that GETS PAST the lock is observed
-// as "did not print the lock refusal" plus the lock now naming a different pid — not as a clean
-// exit, which would never come.
-function run () {
-  const r = spawnSync(process.execPath, [daemon, '--instance', ID], {
-    env: { ...process.env, NVOY_INSTANCE_ROOT: manifests, NVOY_BROKER_CREDENTIAL: credential },
-    encoding: 'utf8', timeout: 4000, killSignal: 'SIGKILL',
-  })
+// as "did not print the lock refusal" plus the lock now naming this start — not as a clean exit.
+// NVOY_LOCK_HOSTNAME stands in for "which container": each Compose broker container has a private PID
+// namespace over the shared state volume, so two of them can both be PID 1, and the real hostname is
+// one value on this machine.
+const envFor = (host, extra = {}) => ({
+  ...process.env, NVOY_INSTANCE_ROOT: manifests, NVOY_BROKER_CREDENTIAL: credential,
+  NVOY_BROKER_LOCK_TTL_MS: '1000', NVOY_LOCK_HOSTNAME: host, ...extra,
+})
+function run (host = 'container-b') {
+  const r = spawnSync(process.execPath, [daemon, '--instance', ID], { env: envFor(host), encoding: 'utf8', timeout: 4000, killSignal: 'SIGKILL' })
   return { err: (r.stderr || '') + (r.stdout || ''), status: r.status }
 }
+const startHolder = (host) => spawn(process.execPath, [daemon, '--instance', ID], { env: envFor(host), stdio: 'ignore' })
 const writeLock = body => writeFileSync(lockPath, typeof body === 'string' ? body : JSON.stringify(body), { mode: 0o600 })
 const clear = () => { if (existsSync(lockPath)) unlinkSync(lockPath) }
-// Never throw while reading the lock: under a disarmed-lock negative control there is no file, and
-// a test that CRASHES at the first failure hides every assertion after it. Fail, report, continue.
 const lockJson = () => { try { return JSON.parse(readFileSync(lockPath, 'utf8')) } catch { return null } }
+const waitFor = async (fn, ms = 4000) => { const end = Date.now() + ms; while (Date.now() < end) { if (fn()) return true; await new Promise(r => setTimeout(r, 50)) } return false }
+const v2 = (o = {}) => ({ version: 2, instance: ID, host: 'container-a', pid: 1, token: 'a'.repeat(32), started_at: Date.now(), ...o })
 
 // ---- the positive control, stated before any refusal ------------------------------------------
 clear()
-const clean = run()
+const clean = run('container-a')
 ok('with no lock present, the daemon starts and claims it', !LIVE.test(clean.err) && existsSync(lockPath))
 const claimed = lockJson()
-ok('the claimed lock records version, this instance, and a real pid',
-  claimed?.version === 1 && claimed?.instance === ID && Number.isInteger(claimed?.pid) && claimed?.pid > 0)
+ok('the claimed lock records version, this instance, a host, a real pid and a token',
+  claimed?.version === 2 && claimed?.instance === ID && claimed?.host === 'container-a' &&
+  Number.isInteger(claimed?.pid) && claimed?.pid > 0 && /^[0-9a-f]{32}$/.test(claimed?.token || ''))
 
-// ---- a live holder is refused, and refused LOUDLY ---------------------------------------------
-// The shared pid lock (pid_lock.mjs) only honours a holder that is demonstrably running THIS program
-// for THIS instance: the lock lives on a volume that outlives its container, so a recorded pid can
-// name an unrelated process in the next one (#217). So the live holder here is a real process whose
-// argv is `instance-broker-daemon.mjs --instance <id>` — a stand-in that just stays alive.
-const holder = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', 'instance-broker-daemon.mjs', '--instance', ID], { stdio: 'ignore' })
-await new Promise(r => setTimeout(r, 300))
-clear(); writeLock({ version: 1, instance: ID, pid: holder.pid, started_at: Date.now() })
-const dup = run()
-ok('refuses to start when a live daemon already holds the lock', LIVE.test(dup.err))
-ok('the refusal is loud — it names the holding pid and exits non-zero',
-  new RegExp(`already runs as pid ${holder.pid}`).test(dup.err) && dup.status !== 0)
-ok('PAIR: the live holder\'s lock is left intact, not stolen', lockJson()?.pid === holder.pid)
-holder.kill('SIGKILL')
+// ---- TWO CONTAINERS on one state volume (My Dude / Dennis, PR 364) -----------------------------
+// A real daemon in "container-a" holds the lock and keeps its lease fresh. A second daemon in
+// "container-b" must be refused — by the lease, not by anything PID-shaped, because a real second
+// container would have a private PID namespace in which nothing about the first is visible.
+clear()
+const holderA = startHolder('container-a')
+ok('a real daemon in container-a claims the lock', await waitFor(() => lockJson()?.host === 'container-a'))
+const holderPid = lockJson()?.pid, holderToken = lockJson()?.token
+const dup = run('container-b')
+ok('a second daemon in another container is refused while the first heartbeats', LIVE.test(dup.err) && dup.status !== 0)
+ok('the refusal is loud: it names the holder\'s pid and host', new RegExp(`pid ${holderPid} on container-a`).test(dup.err))
+ok('PAIR: the live holder\'s lock is left intact, not stolen', lockJson()?.token === holderToken)
+await new Promise(r => setTimeout(r, 1500))             // longer than the 1s lease: only the heartbeat keeps it alive
+const dup2 = run('container-b')
+ok('…and still refused after a full lease has passed, because the holder keeps beating', LIVE.test(dup2.err) && lockJson()?.token === holderToken)
+holderA.kill('SIGKILL')                                 // no clean release: the lock is left behind
+await new Promise(r => setTimeout(r, 1700))             // the heartbeat stops; the lease lapses
+const takeover = run('container-b')
+ok('PAIR: once the holder dies and its lease lapses, the other container starts', !LIVE.test(takeover.err) && lockJson()?.host === 'container-b')
 
-// A pid that is alive but is NOT this daemon — here, this test runner — is a stranger that inherited
-// the number in a new container, so the lock is stale and must be reclaimed rather than wedging the
-// identity. (The pair to the refusal above: same live pid, different program, opposite verdict.)
-clear(); writeLock({ version: 1, instance: ID, pid: process.pid, started_at: Date.now() })
-const stranger = run()
-ok('a live pid running something else is a stranger: the lock is reclaimed', !LIVE.test(stranger.err))
-ok('PAIR: the reclaimed lock no longer names the stranger', lockJson()?.pid !== process.pid)
+// ---- the same container restarting: its own previous lock is stale at once ---------------------
+clear(); writeLock(v2({ host: 'container-a', pid: 2 ** 30 }))
+const restart = run('container-a')
+ok('same container, previous pid gone: reclaimed immediately, no lease wait', !LIVE.test(restart.err) && lockJson()?.pid !== 2 ** 30)
 
-// ---- a stale lock is reclaimed rather than becoming its own outage ----------------------------
-// A pid that cannot exist: reclaiming must depend on liveness, not on the file being absent.
-clear(); writeLock({ version: 1, instance: ID, pid: 2 ** 30, started_at: Date.now() })
-const stale = run()
-ok('reclaims a lock whose recorded pid is gone (a killed process must not lock the identity out)',
-  !LIVE.test(stale.err))
-ok('PAIR: the reclaimed lock now names the new holder, not the dead pid',
-  Number.isInteger(lockJson()?.pid) && lockJson()?.pid !== 2 ** 30)
-
-// ---- malformed and foreign locks fail closed --------------------------------------------------
-for (const [label, body, want] of [
-  ['unparseable', 'not json at all', /cannot validate existing broker daemon lock/],
-  ['a lock naming another instance', { version: 1, instance: 'someone-else', pid: process.pid, started_at: 1 }, /does not bind this instance/],
-  ['a lock with no usable pid', { version: 1, instance: ID, pid: 'nope', started_at: 1 }, /does not bind this instance/],
-  ['a lock of an unknown version', { version: 99, instance: ID, pid: process.pid, started_at: 1 }, /does not bind this instance/],
+// ---- malformed locks fail closed ---------------------------------------------------------------
+for (const [name, body] of [
+  ['unparseable', 'this is not json'],
+  ['a lock naming another instance', v2({ instance: 'someone-else' })],
+  ['a lock with no usable pid', v2({ pid: 0 })],
+  ['a lock of an old or unknown version', { ...v2(), version: 1 }],
+  ['a lock with no token', (() => { const { token, ...rest } = v2(); return rest })()],
 ]) {
   clear(); writeLock(body)
-  const r = run()
-  ok(`fails closed on ${label}`, want.test(r.err))
+  const r = run('container-b')
+  ok(`fails closed on ${name}`, /cannot validate|does not bind/.test(r.err) && r.status !== 0)
 }
-
-// ---- and the pair: after all that, a clean start still works ----------------------------------
 clear()
-const again = run()
-ok('PAIR: with the malformed locks cleared, a legitimate daemon still starts',
-  !LIVE.test(again.err) && existsSync(lockPath))
+const again = run('container-b')
+ok('PAIR: with the malformed locks cleared, a legitimate daemon still starts', !LIVE.test(again.err) && lockJson()?.host === 'container-b')
 
 console.log(`\n${passed} passed, ${failed} failed`)
 process.exit(failed ? 1 : 0)
