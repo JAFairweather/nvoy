@@ -34,9 +34,11 @@ if (!raw) {
 let sk
 if (/^[0-9a-f]{64}$/i.test(raw.trim())) sk = Uint8Array.from(raw.trim().match(/../g), h => parseInt(h, 16))
 else {
-  const { type, data } = nip19.decode(raw.trim())
-  if (type !== 'nsec') { console.error('NVOY_TTL_NSEC: expected nsec1… or 64-char hex'); process.exit(1) }
-  sk = data
+  // Never let a decode error through: the bech32 decoder quotes its whole input, the key.
+  let decoded
+  try { decoded = nip19.decode(raw.trim()) } catch { decoded = null }
+  if (decoded?.type !== 'nsec') { console.error('NVOY_TTL_NSEC: expected nsec1… or 64-char hex'); process.exit(1) }
+  sk = decoded.data
 }
 
 const relays = (process.env.NVOY_RELAYS ?? 'wss://nos.lol,wss://relay.primal.net')

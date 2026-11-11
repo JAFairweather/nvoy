@@ -42,7 +42,7 @@ if (!process.argv.includes('--confirm')) { console.error('concord-link: DRY RUN 
 const credential = (path, label) => { try { return readFileSync(path, 'utf8').trim() } catch { die(`cannot read ${label}`) } }
 const uri = credential(process.env.NVOY_BUNKER_URI_FILE, 'Bunker URI credential')
 const client = credential(process.env.NVOY_NIP46_CLIENT_FILE, 'Bunker client credential')
-const signer = makeBunkerSigner(uri, client)
+const signer = makeBunkerSigner(uri, client, { clientSource: `Bunker client credential at ${process.env.NVOY_NIP46_CLIENT_FILE}` })
 const { wrap, rumor, group } = await buildJoin(bundle, signer)
 const accepted = (await Promise.all(bundle.relays.map(url => publish(url, wrap)))).filter(Boolean).length
 signer.close()

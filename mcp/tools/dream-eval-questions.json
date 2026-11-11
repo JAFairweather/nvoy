@@ -1,0 +1,264 @@
+{
+  "benchmark_version": "1.1.0",
+  "frozen_at": "2026-11-09T11:54:22Z",
+  "description": "Frozen 20-question settled-answer benchmark for Hive Memory Merkle Dreaming historical before/after evaluation, with explicit supporting_event_ids.",
+  "questions": [
+    {
+      "id": "q01",
+      "category": "canon",
+      "question": "Who approves PRs and architectural designs across Hive repositories before merge?",
+      "query": { "scope": "hive:canon", "text": "approves PRs" },
+      "supporting_event_ids": [
+        "2ab326884f3f01e37a7015bbb60c4be3fba45760d7cbe4a5174f4290ffb5ebb2"
+      ],
+      "expected_d_substrings": ["hive:canon:review-merge-deploy-authority"],
+      "expected_claim_tokens": ["My Dude approves PRs"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q02",
+      "category": "canon",
+      "question": "What are James's active Hive priorities in order?",
+      "query": { "scope": "hive:canon", "text": "active Hive priorities" },
+      "supporting_event_ids": [
+        "93e11f8b36ac39156afa91dd9dcd2ad61def02eadc2f57d75c202ce0bbac4413"
+      ],
+      "expected_d_substrings": ["hive:canon:active-hive-priorities"],
+      "expected_claim_tokens": ["Illustrated Primer", "Waggle Hive"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q03",
+      "category": "canon",
+      "question": "What is the target fleet topology and isolation rule for agents?",
+      "query": { "scope": "hive:canon", "text": "isolated from the others" },
+      "supporting_event_ids": [
+        "6cf7157a3cf9bda81dd1a20595157ce31810bc1d91a46a2071e5791249ea6d2d"
+      ],
+      "expected_d_substrings": ["hive:canon:fleet-topology-and-isolation"],
+      "expected_claim_tokens": ["own host user", "own keys"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q04",
+      "category": "canon",
+      "question": "Who are the delegated leads for research, sysops, and report authoring through My Dude?",
+      "query": { "scope": "hive:canon", "text": "Dennis for research" },
+      "supporting_event_ids": [
+        "23a30f4db189168ab66cb29e6eeaabfe37863c0d04e38d59ff61dd6145cec331"
+      ],
+      "expected_d_substrings": ["hive:canon:mydude-delegation-roles"],
+      "expected_claim_tokens": ["Dennis", "Neil", "Kerouac"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q05",
+      "category": "canon",
+      "question": "What must every agent with memory_claim save to Hive memory?",
+      "query": { "scope": "hive:canon", "text": "decisions, status changes and gotchas" },
+      "supporting_event_ids": [
+        "b632310b56a2ab0fdc5bbcf03b9bdb51277d90d7735abbb72f5a5e347efc7512"
+      ],
+      "expected_d_substrings": ["hive:canon:save-settled-work-to-memory"],
+      "expected_claim_tokens": ["decisions, status changes and gotchas"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q06",
+      "category": "decision",
+      "question": "What commit merged nvoy PR 339 (Merkle Dreaming & viewer v12) on herd-cloud?",
+      "query": { "topic": "nvoy", "text": "339" },
+      "supporting_event_ids": [
+        "ba0174a0f7b3ba3f6097806fdef6b21a44beffb4f9c77d911cf5330f2055d7b6",
+        "0d64ed0556f70c27e70c9731cd7e2e826b0ba07b3dc6d0360fb5516b9fc52bb5",
+        "2060e33c4ab8776e234f72776488776deb1f9f4f853b777ef6e592893d7c5b442"
+      ],
+      "expected_d_substrings": ["decision-nvoy-pr339", "nvoy-pr339-review", "nvoy-pr339-merkle-dreaming-owner"],
+      "expected_claim_tokens": ["cece698"],
+      "stale_claim_tokens": ["holds deployment of PR #339", "changes requested at head 8b1d"]
+    },
+    {
+      "id": "q07",
+      "category": "decision",
+      "question": "When did Merkle Dreaming deploy on herd-cloud via nvoy PR 339 and herd-infra PR 76?",
+      "query": { "topic": "hive-memory", "text": "339" },
+      "supporting_event_ids": [
+        "f791644968768306ac0ba01cd10933cbb3ae49a79d4ecc392aabd9b34a1b6f3d",
+        "af7caadd39d0527b5af6fc5306400c6f6e23c611592537cbce652e797c91ba40"
+      ],
+      "expected_d_substrings": ["decision-hive-memory-pr339", "hive-memory-dreaming-status"],
+      "expected_claim_tokens": ["cece698", "60f43f8"],
+      "stale_claim_tokens": ["remains changes-requested", "local npm test stopped"]
+    },
+    {
+      "id": "q08",
+      "category": "decision",
+      "question": "What commit merged herd-infra PR 76 (curator timer and service on herd-cloud)?",
+      "query": { "topic": "herd-infra", "text": "PR 76" },
+      "supporting_event_ids": [
+        "ddf6375720d7e0ebd1650ff2ffdf19ed52bb48594c14c351516058068f43e297",
+        "53a8c3c3ebf406de00bf44a8308d4dd7a40b511e96d15c00a9c8a4c5d9053fa5",
+        "34c044f1a4d52de2854714a9795ba893ece665d86b3e91c7a91a0d6703ebc4c0"
+      ],
+      "expected_d_substrings": ["decision-herd-infra-pr76", "herd-infra-pr76-review-status", "herd-infra-pr76-curator-timer-owner"],
+      "expected_claim_tokens": ["60f43f8"],
+      "stale_claim_tokens": ["no writer socket or signing key", "does not create agent-curator"]
+    },
+    {
+      "id": "q09",
+      "category": "decision",
+      "question": "Is the 'Check memory every turn' rule from herd-infra PR 74 live across agent rules?",
+      "query": { "topic": "herd-infra", "text": "Check memory every turn" },
+      "supporting_event_ids": [
+        "359db8c50ed61abff4ceaf4f86ce5d84329b0e5e95b42c8c5b83e984e0ee8b57",
+        "96a64cdbe2bb311a69fce278d4a7b671061677a7ed29c422c32dd5c92c80a13b"
+      ],
+      "expected_d_substrings": ["decision-herd-infra-pr74", "herd-infra-every-turn-rule-deployed"],
+      "expected_claim_tokens": ["6e53ea0"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q10",
+      "category": "decision",
+      "question": "How does LukeDog's view run on herd-cloud after herd-infra PR 69?",
+      "query": { "topic": "herd-infra", "text": "lukedog" },
+      "supporting_event_ids": [
+        "0396757149b5eaccafefebf29fc26daee6d8051387751d216628f4abc910a71d",
+        "f7a8a44fca9cd32ba64b7d8700c92b493664108ea48ead9e99d2969288ad693f"
+      ],
+      "expected_d_substrings": ["decision-herd-infra-pr69", "herd-infra-lukedog-cloud-view"],
+      "expected_claim_tokens": ["openclaw-view"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q11",
+      "category": "decision",
+      "question": "How does Claude Code reach herd-cloud agents after herd-infra PR 44?",
+      "query": { "topic": "herd-infra", "text": "native installer" },
+      "supporting_event_ids": [
+        "32484ff0bbf5c432b14e5f721f01fbd42bfc139fef9e39158ca61c66e05a373d",
+        "66b7a41f16d58a05bbef3bc4fff80ad60093d5c2e793a84543640246a935e891"
+      ],
+      "expected_d_substrings": ["decision-herd-infra-pr44", "pr44"],
+      "expected_claim_tokens": ["install-agent-tools"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q12",
+      "category": "decision",
+      "question": "What is the status of nvoy PR 340 and live viewer HTTP 200 verification?",
+      "query": { "topic": "nvoy", "text": "340" },
+      "supporting_event_ids": [
+        "1eb035b1a00f0268e0b0d2ffbb6ab824a31e05d3fa3dd8f6be566f8f87967693",
+        "5d59933989cb14b709280be0b606d55250886c107d5bcccdb646eb2dc9f08cb5"
+      ],
+      "expected_d_substrings": ["decision-nvoy-pr340", "pr340"],
+      "expected_claim_tokens": ["0b2a3ef"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q13",
+      "category": "decision",
+      "question": "What commit merged nvoy PR 336 and deployed to herd-cloud:8795?",
+      "query": { "topic": "nvoy", "text": "336" },
+      "supporting_event_ids": [
+        "0639de4610cb2b1dbbb4dc912f5d9b17d57dfa749f349fc8f836c3a18ea0e0c0",
+        "c81de0db2b02fbc5c91f3160065a2e9a4c71f60baf4038f5cc26dd7b96545192"
+      ],
+      "expected_d_substrings": ["decision-nvoy-pr336", "pr336"],
+      "expected_claim_tokens": ["08417b2"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q14",
+      "category": "decision",
+      "question": "What commit merged nvoy PR 335 on herd-cloud?",
+      "query": { "topic": "hive-memory", "text": "335" },
+      "supporting_event_ids": [
+        "2dc7a59536b5735f4efa0d10219724cc2c6ff7b5f61e091346256757be65c684",
+        "fd67c8d7d8e28fd1a91d29ebc0e21a06eadf2353cffb91082e0cde955f681242"
+      ],
+      "expected_d_substrings": ["decision-hive-memory-pr335", "pr335"],
+      "expected_claim_tokens": ["58e731d"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q15",
+      "category": "decision",
+      "question": "What is the recommended publication boundary for exposing Cortex data to Buzz?",
+      "query": { "topic": "hive-memory", "text": "Cortex projection" },
+      "supporting_event_ids": [
+        "39dd7a360141d0d4306fa9c09efdfb41bf3a658d680facc33018ee6922554768",
+        "95f6907731e63261a114c9be32418c747fc5c5cbc11230ca57575a63e5ff6610"
+      ],
+      "expected_d_substrings": ["decision-hive-memory-buzz-cortex-publication-boundary", "cortex-publication-boundary"],
+      "expected_claim_tokens": ["allowlisted static public Cortex projection"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q16",
+      "category": "decision",
+      "question": "Did the R1 house-music stall watchdog (PR 110) resume a real stall on its first live test?",
+      "query": { "topic": "r1", "text": "house-music" },
+      "supporting_event_ids": [
+        "58068ef4f8244d3a1ecc40e34e510fedf31fd2d2669dbaba28f97599fdde4fad",
+        "4ea879619772d3c5ca5f53fa7b494cf16b4b5f5ccf9da2f6eb1a0f9851f0c528"
+      ],
+      "expected_d_substrings": ["decision-r1-pr110", "r1-music-watchdog-live-test"],
+      "expected_claim_tokens": ["resumed a real stall"],
+      "stale_claim_tokens": ["is NOT installed yet"]
+    },
+    {
+      "id": "q17",
+      "category": "distillation",
+      "question": "What PRs merged the R1 home screen and made it live on R1?",
+      "query": { "topic": "r1", "text": "home screen" },
+      "supporting_event_ids": [
+        "35b680e6386f2aa66cf1abe1483ddab47acbfedfda6fd1c1558aaa0c3a1c6769",
+        "c0a489055912428a3b3de3e396a31ed9d98d7e6d88ade3521af890f302e71ded"
+      ],
+      "expected_d_substrings": ["curated-r1-pr89", "r1-apps-folders-status"],
+      "expected_claim_tokens": ["2a608a4"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q18",
+      "category": "decision",
+      "question": "Did the first tablet run of Illustrated Primer letters (PR 99) pass?",
+      "query": { "topic": "illustrated-primer", "text": "99" },
+      "supporting_event_ids": [
+        "b05bef3942a62feca8d782e0e4ab84c942522aa3da338dcc83386bb804303432",
+        "cc7b575ca3b5ef9cfab43ba635da577a1830a350ba0eac9e8d23bc16002764c9"
+      ],
+      "expected_d_substrings": ["decision-illustrated-primer-pr99", "primer-letters-first-tablet-run"],
+      "expected_claim_tokens": ["first tablet run on 2026-11-08 passed"],
+      "stale_claim_tokens": ["My Dude requested changes on rabidrabbit PR 99"]
+    },
+    {
+      "id": "q19",
+      "category": "distillation",
+      "question": "Is nvoy PR 333 superseded by merged PR 344?",
+      "query": { "topic": "nvoy", "text": "333" },
+      "supporting_event_ids": [
+        "1a4b62d60c853ef161f272e87e80dd02a3cdb350fa5206cec6a5e4563618c1e0",
+        "609905674d05066fcaf128f93ddeec153b045488bcf561ecd19584169e47cc21"
+      ],
+      "expected_d_substrings": ["curated-nvoy-pr333", "nvoy-pr333-status"],
+      "expected_claim_tokens": ["not superseded by merged PR 344"],
+      "stale_claim_tokens": []
+    },
+    {
+      "id": "q20",
+      "category": "distillation",
+      "question": "What is the review status of waggle PR 734 (quorum warning)?",
+      "query": { "topic": "waggle", "text": "734" },
+      "supporting_event_ids": [
+        "283918b07e05892d2ade56a24c302353d0ea8fe37132f5c1b3f20d224b2b2841",
+        "a7bf871dba160cb5d046a4d682ad11024e61ef67476248d4e8d146339a64b9c0"
+      ],
+      "expected_d_substrings": ["curated-waggle-pr734", "waggle-pr734-mydude-review"],
+      "expected_claim_tokens": ["My Dude approves waggle PR 734"],
+      "stale_claim_tokens": ["found two quorum UI blockers"]
+    }
+  ]
+}

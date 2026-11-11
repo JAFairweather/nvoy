@@ -83,6 +83,26 @@ Encryption before approval does not author or publish an action. Signing the sea
 the gate sits immediately before `signEvent` and rechecks live grants immediately before opening it.
 Retry persists and republishes the identical signed wrap; it never signs a second seal.
 
+## Channel replies enacted on the live grant chain
+
+One class of reply does not wait for a Director tap: an answer, in a Buzz channel, to a message
+that was addressed to this identity in that channel and admitted on a live grant. The audience is
+the channel's membership, the identity is already admitted to it, and the grant chain that admitted
+the inbound message is rechecked live immediately before the signer opens. That chain is the
+authorization; there is no second act for a human to approve. Two routes qualify, and only these:
+
+| Route | Receipt | Chain rechecked live | What is frozen and signed | `enactment` |
+|---|---|---|---|---|
+| Channel carry | v2, `mode: channel-carry` | author's `task` grant + carrier's `task-relay` grant, same source event and channel | the kind-13 seal of a NIP-17 reply to the carrier, tagged with the receipt's channel | `channel-carry-direct` |
+| Native Buzz | v3, `mode: buzz-native` | author's own `task`/`task+act` grant, same grant id | the kind-9 reply itself: one `h` tag (the receipt's channel, which must be in the manifest's `buzz.channels`), `e` root/reply to the source event, `p` to its author | `buzz-native-direct` |
+
+The actuator, not its caller, decides which route applies: `--prepare` reports `approval_required:
+false` with action `nostr-private-reply` or `buzz-channel-reply`, and `--direct` refuses anything
+else. A public event is permanent and world-readable, so it always keeps its discrete approval.
+Every enacted record names exactly one of `approval_id` or `enactment`, never both and never
+neither. As with the seal, the native kind:9 is frozen before the signer opens, its event id is the
+fingerprint, and a retry republishes that identical event to the community relay.
+
 ## Direct MCP tools
 
 `nvoy_chat_post` and `nvoy_dm_send` become proposal tools by default. Their success response means

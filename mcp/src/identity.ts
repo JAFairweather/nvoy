@@ -52,12 +52,15 @@ export interface Identity {
 
 const HEX64 = /^[0-9a-f]{64}$/i
 
-function decodeNsec(raw: string): Uint8Array {
+/** `source` names the credential in the error. The bech32 decoder quotes its whole input in its
+ *  errors, so a malformed key would otherwise be logged verbatim; its error never escapes. */
+function decodeNsec(raw: string, source: string): Uint8Array {
   const s = raw.trim()
   if (HEX64.test(s)) return Uint8Array.from(Buffer.from(s, 'hex'))
-  const { type, data } = nip19.decode(s)
-  if (type !== 'nsec') throw new Error(`NVOY_NSEC: expected nsec1... or 64-char hex, got ${type}`)
-  return data as Uint8Array
+  let decoded: ReturnType<typeof nip19.decode> | undefined
+  try { decoded = nip19.decode(s) } catch { /* reported below, without the value */ }
+  if (decoded?.type !== 'nsec') throw new Error(`${source}: expected nsec1... or 64-char hex${decoded ? `, got ${decoded.type}` : ''}`)
+  return decoded.data
 }
 
 /**
@@ -124,7 +127,7 @@ function loadNip46ClientKey(env: NodeJS.ProcessEnv): Uint8Array {
   const raw = env.NVOY_NIP46_CLIENT_NSEC?.trim()
   const file = env.NVOY_NIP46_CLIENT_NSEC_FILE?.trim()
   if (raw && file) throw new Error('set only one of NVOY_NIP46_CLIENT_NSEC or NVOY_NIP46_CLIENT_NSEC_FILE')
-  return raw ? decodeNsec(raw) : file ? decodeNsec(readPrivateFile(file, 'NVOY_NIP46_CLIENT_NSEC')) : generateSecretKey()
+  return raw ? decodeNsec(raw, 'NVOY_NIP46_CLIENT_NSEC') : file ? decodeNsec(readPrivateFile(file, 'NVOY_NIP46_CLIENT_NSEC'), `NVOY_NIP46_CLIENT_NSEC_FILE ${file}`) : generateSecretKey()
 }
 
 function makeNip46(bunkerUri: string, env: NodeJS.ProcessEnv = process.env): { signer: Signer; pubkey: string } {
@@ -210,13 +213,14 @@ export function loadIdentity(
     secretKey = generateSecretKey()
     source = 'ephemeral'
   } else if (env.NVOY_NSEC) {
-    secretKey = decodeNsec(env.NVOY_NSEC)
+    secretKey = decodeNsec(env.NVOY_NSEC, 'NVOY_NSEC')
     source = 'env'
   } else if (env.NVOY_NCRYPTSEC_FILE) {
     const ncryptsec = readFileSync(env.NVOY_NCRYPTSEC_FILE, 'utf8').trim()
     const passphrase = env.NVOY_NCRYPTSEC_PASSPHRASE
     if (!passphrase) throw new Error('NVOY_NCRYPTSEC_FILE is set but NVOY_NCRYPTSEC_PASSPHRASE is not')
-    secretKey = nip49Decrypt(ncryptsec, passphrase)
+    try { secretKey = nip49Decrypt(ncryptsec, passphrase) }
+    catch { throw new Error(`NVOY_NCRYPTSEC_FILE ${env.NVOY_NCRYPTSEC_FILE}: not a valid ncryptsec, or the passphrase is wrong`) }
     source = 'ncryptsec'
   } else {
     throw new Error(

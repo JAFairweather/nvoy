@@ -38,7 +38,7 @@ const server = net.createServer(conn => {
   let data = ''
   conn.on('data', chunk => { data += chunk; if (!data.includes('\n')) return
     let packet; try { packet = JSON.parse(data.split('\n')[0]) } catch { conn.destroy(); return }
-    try { validateDesktopDelivery(packet, { instance: manifest.id, scopeSubject: manifest.pubkey, grantors: manifest.grantors, carriers: manifest.carriers }) } catch { conn.destroy(); return }
+    try { validateDesktopDelivery(packet, { instance: manifest.id, scopeSubject: manifest.pubkey, grantors: manifest.grantors, carriers: manifest.carriers, buzz: manifest.buzz }) } catch { conn.destroy(); return }
     try {
       if (!delivered.has(packet.envelope)) {
         // The worker may only read/traverse this adapter-owned directory. Atomically publish the
@@ -46,7 +46,7 @@ const server = net.createServer(conn => {
         const input = resolve(workerInputDir, `${packet.envelope}.json`), tmp = `${input}.${process.pid}.tmp`
         writeFileSync(tmp, JSON.stringify(packet.type === 'verified-notification'
           ? { envelope: packet.envelope, notification: packet.notification }
-          : { envelope: packet.envelope, authority: packet.authority || null, messages: packet.messages }), { mode: 0o640 })
+          : { envelope: packet.envelope, authority: packet.authority || null, messages: packet.messages, ...(packet.context ? { context: packet.context } : {}) }), { mode: 0o640 })
         renameSync(tmp, input); chownSync(input, -1, manifest.workerHandoffGid); chmodSync(input, 0o640)
         appendFileSync(queue, JSON.stringify(packet) + '\n', { mode: 0o640 }); chownSync(queue, -1, manifest.workerHandoffGid); chmodSync(queue, 0o640); delivered.add(packet.envelope)
       }

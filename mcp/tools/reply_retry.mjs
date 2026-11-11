@@ -14,6 +14,10 @@ const TERMINAL = [
   'admission receipt is missing',
   'admission receipt is not a live broker-bound sender capability',
   'admission receipt no longer has a live matching grant',
+  'reply refused: ',
+  // A Buzz reply is a frozen kind:9: once Buzz calls it invalid (its parent deleted, its timestamp
+  // stale), republishing the same event can never land it.
+  'Buzz rejected the frozen channel reply as invalid',
 ]
 
 export function isTerminalReplyFailure(stderr) {
@@ -47,7 +51,7 @@ export function loadReplyRequestDigests(paths, instance) {
     for (const line of readFileSync(path, 'utf8').split('\n')) {
       try {
         const request = JSON.parse(line)
-        const allowed = ['version', 'type', 'id', 'instance', 'receipt', 'content']
+        const allowed = ['version', 'type', 'id', 'instance', 'receipt', 'content', 'mention']
         if (!request || typeof request !== 'object' || Array.isArray(request) ||
             Object.keys(request).some(key => !allowed.includes(key)) || request.version !== 1 ||
             request.type !== 'reply-request' || request.instance !== instance || !ID.test(String(request.id || '')) ||
@@ -86,10 +90,18 @@ export function loadPublishedReplyIds(dir, requestDigests) {
   return ids
 }
 
+export function terminalReplyReason(stderr) {
+  const text = String(stderr || '')
+  return text.includes('withheld: ') ? 'withheld-credential' : text.includes('live matching grant') ? 'grant-no-longer-live'
+    : text.includes('over the may_post hourly cap') ? 'post-cap'
+    : text.includes('reply parent not found') ? 'parent-gone'
+    : text.includes('frozen channel reply as invalid') ? 'invalid-frozen-reply' : 'receipt-not-live'
+}
+
 export function recordTerminalReply(path, ids, id, stderr, at = Date.now()) {
   if (!ID.test(String(id || ''))) throw new Error('terminal reply id is invalid')
   if (ids.has(id)) return false
-  const reason = String(stderr || '').includes('live matching grant') ? 'grant-no-longer-live' : 'receipt-not-live'
+  const reason = terminalReplyReason(stderr)
   appendFileSync(path, JSON.stringify({ version: 1, type: 'terminal-reply', id, reason, at }) + '\n', { mode: 0o600 })
   ids.add(id)
   return true

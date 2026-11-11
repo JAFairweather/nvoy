@@ -29,10 +29,11 @@ import { spawn } from 'node:child_process'
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { resolve, dirname } from 'node:path'
-import { createHash } from 'node:crypto'
 import { decode, npubEncode } from 'nostr-tools/nip19'
-import { getPublicKey, verifyEvent, finalizeEvent, generateSecretKey } from 'nostr-tools/pure'
+import { getPublicKey, finalizeEvent, generateSecretKey } from 'nostr-tools/pure'
 import * as nip44 from 'nostr-tools/nip44'
+import { secretKey } from './secret_key.mjs'
+import { foldGrants } from './grant_fold.mjs'
 
 const arg = (n, d) => { const i = process.argv.indexOf(n); return i === -1 ? d : process.argv[i + 1] }
 const DRY = process.argv.includes('--dry-run')
@@ -49,7 +50,8 @@ const COOLDOWN = Number(arg('--cooldown', 90)) * 1000   // never wake more often
 const SETTLE = 4000                                      // coalesce a burst into one wake
 
 const raw = process.env.NVOY_NSEC || (() => { console.error('wake-watcher: set NVOY_NSEC'); process.exit(1) })()
-const sk = raw.startsWith('nsec1') ? decode(raw).data : Uint8Array.from(Buffer.from(raw, 'hex'))
+let sk
+try { sk = secretKey(raw, 'NVOY_NSEC') } catch (error) { console.error(`wake-watcher: ${error.message}`); process.exit(1) }
 const ME = getPublicKey(sk)
 
 // --notify <npub|hex> (or WAKE_NOTIFY): who to tell, out of band, that a wake happened.
@@ -64,8 +66,13 @@ if (arg('--notify', process.env.WAKE_NOTIFY || '') && !NOTIFY) {
   console.error('wake-watcher: --notify is not a valid npub or 64-hex key — refusing to start rather than run with delivery silently off')
   process.exit(1)
 }
-const GRANTORS = String(process.env.GRANTORS || '4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b287ea84d')
+// Whose grants count. No default: a hardcoded owner key would make every deployment trust it.
+const GRANTORS = String(process.env.GRANTORS || '')
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+if (!GRANTORS.length) {
+  console.error('wake-watcher: set GRANTORS (comma-separated hex) — refusing to start with no one able to grant')
+  process.exit(1)
+}
 
 const RELAYS = (process.env.NVOY_RELAYS?.split(',') || [
   'wss://nos.lol', 'wss://relay.primal.net', 'wss://relay.ditto.pub',
@@ -109,34 +116,31 @@ const say = (m) => {
   try { mkdirSync(dirname(LOG), { recursive: true }); appendFileSync(LOG, line + '\n') } catch { /* */ }
 }
 
-// --- policy: who may cause a wake. Re-read continuously from the live grant stream. -----------
-const scopeHash = (subject, salt) => createHash('sha256').update(Buffer.concat([
-  Buffer.from('waggle/da-scope/v1'), Buffer.from([0]), Buffer.from(String(subject)), Buffer.from(salt || '', 'hex'),
-])).digest('hex')
-const permitted = new Map()   // sender -> grant id
-const grantById = new Map()
+// --- policy: who may cause a wake. Re-read continuously from the live grant stream, through the
+// broker's own fold (grant_fold.mjs), so a sender wakes this agent exactly when the broker would admit
+// it: a revoked or expired grant wakes nothing, and a voice wakes it under its shadow grant.
+const grantEvents = new Map()
+let permitted = new Set()   // senders holding a live task or task+act grant
+let foldedAt = 0
+
+function refold() {
+  const { live } = foldGrants([...grantEvents.values()], { me: ME, grantors: GRANTORS })
+  const next = new Set([...live].filter(([, caps]) => caps.has('task') || caps.has('task+act')).map(([pk]) => pk))
+  for (const pk of next) if (!permitted.has(pk)) say(`grant seen — ${npubEncode(pk).slice(0, 12)}… may wake me`)
+  for (const pk of permitted) if (!next.has(pk)) say(`grant ended — ${npubEncode(pk).slice(0, 12)}… can no longer wake me`)
+  permitted = next
+  foldedAt = Date.now()
+}
 
 function applyGrantEvent(ev) {
   if (!GRANTORS.includes(String(ev.pubkey || '').toLowerCase())) return
-  let ok = false; try { ok = verifyEvent(ev) } catch { ok = false }
-  if (!ok) return
-  if (ev.kind === 441) {
-    for (const t of ev.tags || []) if (t[0] === 'e') {
-      for (const [pk, gid] of permitted) if (gid === t[1]) { permitted.delete(pk); say(`grant revoked — ${npubEncode(pk).slice(0, 12)}… can no longer wake me`) }
-    }
-    return
-  }
-  if (ev.kind !== 440 || grantById.has(ev.id)) return
-  const grantee = (ev.tags || []).find(t => t[0] === 'p')?.[1]
-  const scope = (ev.tags || []).find(t => t[0] === 'da-scope')
-  const cap = (ev.tags || []).find(t => t[0] === 'da-cap')?.[1]
-  if (!grantee || !scope || !cap) return
-  if (scope[1] !== scopeHash(ME, scope[2] || '')) return
-  if (cap !== 'task' && cap !== 'task+act') return
-  grantById.set(ev.id, grantee)
-  if (!permitted.has(grantee)) say(`grant seen — ${npubEncode(grantee).slice(0, 12)}… may wake me (${cap})`)
-  permitted.set(grantee, ev.id)
+  if (![440, 441].includes(ev.kind) || grantEvents.has(ev.id)) return
+  grantEvents.set(ev.id, ev)
+  refold()
 }
+
+// A NIP-40 expiry passes without any new event, so a fold older than a minute is redone before use.
+const mayWake = sender => { if (Date.now() - foldedAt > 60000) refold(); return permitted.has(sender) }
 
 // --- policy readiness, globally ------------------------------------------------------------
 // A grant may exist on one relay and not another — the policy is the UNION, so "policy is
@@ -288,7 +292,7 @@ function connect(url) {
       if (seal.kind === 13) sender = seal.pubkey
     } catch { return }                        // not addressed to me in a form I can open
     if (!sender || sender === ME) return      // my own outbound copies land here too
-    if (!permitted.has(sender)) { say(`ignored — ${npubEncode(sender).slice(0, 12)}… holds no grant, so it cannot make me run`); return }
+    if (!mayWake(sender)) { say(`ignored — ${npubEncode(sender).slice(0, 12)}… holds no grant, so it cannot make me run`); return }
     nudge(`mail from ${npubEncode(sender).slice(0, 12)}…`)
   }
 

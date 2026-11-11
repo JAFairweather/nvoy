@@ -1,10 +1,13 @@
 [Unit]
-Description=Nvoy runtime deploy — poll for a verified release every three minutes
+Description=Nvoy runtime deploy — check for a verified release every thirty seconds
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=3min
-RandomizedDelaySec=45s
+# The tick is cheap: `git ls-remote` against main, and a GitHub lookup only while main has moved
+# past the deployed commit. Manifest edits don't wait for it; nvoy-runtime-deploy.path starts them.
+OnUnitActiveSec=30s
+RandomizedDelaySec=5s
+AccuracySec=1s
 Persistent=true
 
 [Install]

@@ -9,7 +9,7 @@ import net from 'node:net'
 import { createHash } from 'node:crypto'
 import { generateSecretKey, getPublicKey, finalizeEvent } from 'nostr-tools/pure'
 import * as nip19 from 'nostr-tools/nip19'
-import { isTerminalReplyFailure, loadPublishedReplyIds, loadReplyRequestDigests, loadTerminalReplyIds, recordTerminalReply } from '../mcp/tools/reply_retry.mjs'
+import { isTerminalReplyFailure, loadPublishedReplyIds, loadReplyRequestDigests, loadTerminalReplyIds, recordTerminalReply, terminalReplyReason } from '../mcp/tools/reply_retry.mjs'
 import { claimChannelSource, completeChannelSource, channelSourceClaims } from '../mcp/tools/channel_source_dedup.mjs'
 import { validateAdmittedTask } from '../mcp/tools/admitted_task.mjs'
 
@@ -156,7 +156,7 @@ const claudeManifest = { ...manifest, id: 'claude-channel', pubkey: 'c'.repeat(6
 writeFileSync(join(manifestRoot, 'claude-channel.json'), JSON.stringify(claudeManifest))
 const forcedClaudeKey = spawnSync(process.execPath, ['mcp/tools/instance-claude-channel-authorized-key.mjs', '--instance', 'claude-channel', '--public-key-file', desktopPublicKey, '--container', 'nvoy-claude-channel-adapter-1'], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
 ok('the Claude channel installer fixes a restricted worker-UID/GID MCP command distinct from the adapter', forcedClaudeKey.status === 0 &&
-  forcedClaudeKey.stdout.startsWith(`restrict,command="/usr/bin/docker exec -i --user ${manifest.worker_uid}:${manifest.worker_handoff_gid} nvoy-claude-channel-adapter-1 /usr/local/bin/node /srv/nvoy/mcp/tools/claude-channel.mjs --instance claude-channel" ssh-ed25519 `) &&
+  forcedClaudeKey.stdout.startsWith(`restrict,command="/usr/bin/docker exec -i --user ${manifest.worker_uid}:${manifest.worker_handoff_gid} nvoy-claude-channel-adapter-1 /usr/local/bin/node /srv/nvoy/mcp/tools/claude-channel.mjs --instance claude-channel --key-fp SHA256:`) &&
   !forcedClaudeKey.stdout.includes(`--user ${manifest.adapter_uid}:`) && !/permitopen|environment=|pty/.test(forcedClaudeKey.stdout))
 writeFileSync(join(manifestRoot, 'bad-desktop.json'), JSON.stringify({ ...manifest, id: 'bad-desktop', pubkey: '4'.repeat(64), state_dir: join(root, 'state-bad-desktop'), runtime_dir: join(root, 'run-bad-desktop'), spool_dir: join(root, 'spool-bad-desktop'), worker_image: '', worker_runner: '', worker_credential_ref: '', delivery_mode: 'codex_app_server' }))
 const badDesktop = cli('describe', '--instance', 'bad-desktop')
@@ -184,6 +184,16 @@ ok('Compose renderer rejects mutable image tags', taggedImage.status !== 0 && /c
 const servicePart = name => (rendered.stdout.match(new RegExp(`\\n  ${name}:[\\s\\S]*?(?=\\n  [a-z][a-z_]*:|\\nsecrets:|$)`)) || [''])[0]
 const initPart = servicePart('init'), brokerPart = servicePart('broker'), watcherPart = servicePart('watcher')
 const adapterPart = servicePart('adapter'), workerPart = servicePart('worker')
+// A service's groups are the primary GID in `user:` plus every `group_add:` entry, parsed rather
+// than substring-matched: the section also carries the random mkdtemp path, and a runner GID such
+// as 20 can occur inside it. Any `group_add` not in single-line flow form is refused, not skipped.
+const serviceGroups = part => {
+  const user = part.match(/^ {4}user: "\d+:(\d+)"$/m), adds = part.match(/^ {4}group_add:.*$/gm) || []
+  const lists = adds.map(line => line.match(/^ {4}group_add: \[(.*)\]$/))
+  if (!user || lists.some(m => !m)) return null
+  return [user[1], ...lists.flatMap(m => m[1].split(',').map(g => g.trim().replace(/^"(.*)"$/, '$1')).filter(Boolean))].map(Number)
+}
+const sameGroups = (part, groups) => JSON.stringify(serviceGroups(part)) === JSON.stringify(groups)
 ok('the root-only initializer copies sources into distinct role-owned volumes; worker gets only provider and broker only Bunker credentials', initPart.includes('nvoy_bunker_uri') && initPart.includes('nvoy_bunker_client') && initPart.includes('nvoy_worker_provider') && initPart.includes('broker_credentials') && initPart.includes('worker_credentials') && workerPart.includes('worker_credentials') && workerPart.includes('HOME: /tmp') && !workerPart.includes('broker_credentials') && !workerPart.includes('nvoy_bunker_uri') && !workerPart.includes('nvoy_bunker_client') && brokerPart.includes('broker_credentials') && !brokerPart.includes('worker_credentials') && !brokerPart.includes('nvoy_worker_provider') && !watcherPart.includes('credentials') && !adapterPart.includes('credentials'))
 
 const watcherSource = readFileSync('mcp/tools/instance-runtime.mjs', 'utf8')
@@ -193,7 +203,7 @@ ok('watcher writes the pending marker before advancing seen state, with millisec
 ok('a fresh identity can baseline existing backdated NIP-17 wraps without delivering them', /command === 'baseline'/.test(watcherSource) && /--baseline-existing/.test(watcherSource) && /m\[0\] === 'EOSE'/.test(wakeSource) && /baseline\(m\[2\]\.id\)/.test(wakeSource) && /baseline complete/.test(wakeSource))
 ok('the NIP-59 baseline cannot silently truncate at 5,000 ids', /SEEN_CAP = 100_000/.test(wakeSource) && /baseline exceeds/.test(wakeSource) && !/seen\.size > 5000/.test(wakeSource))
 ok('watcher markers and adapter socket are group-limited to the matching broker', /chmodSync\(p, 0o660\)/.test(wakeSource) && /manifest\.brokerAdapterGid/.test(readFileSync('mcp/tools/instance-adapter.mjs', 'utf8')) && /chmodSync\(socket, 0o660\)/.test(readFileSync('mcp/tools/instance-adapter.mjs', 'utf8')))
-ok('the worker has no adapter-socket group but has a separate read-only handoff group', manifest.broker_adapter_gid !== manifest.worker_handoff_gid && rendered.stdout.includes('group_add: ["' + manifest.worker_handoff_gid + '"]') && !workerPart.includes(String(manifest.broker_adapter_gid)))
+ok('the worker has no adapter-socket group but has a separate read-only handoff group', manifest.broker_adapter_gid !== manifest.worker_handoff_gid && sameGroups(adapterPart, [manifest.broker_adapter_gid, manifest.worker_handoff_gid]) && sameGroups(workerPart, [manifest.worker_handoff_gid]))
 const claudeChannelSource = readFileSync('mcp/tools/claude-channel.mjs', 'utf8')
 const runtimeInitSource = readFileSync('mcp/tools/instance-runtime-init.mjs', 'utf8')
 ok('the native Claude channel consumes as worker UID with read-only admission and separate writable state/reply paths',
@@ -221,7 +231,11 @@ ok('watcher cooldown coalesces notifications but never skips durable queueing', 
 const brokerSource = readFileSync('mcp/tools/instance-broker.mjs', 'utf8')
 ok('an unverifiable live policy requeues the opaque marker instead of consuming it as a denial', /if \(!report\.policyUsable\)[\s\S]*renameSync\(markerPath, pendingMarker\)[\s\S]*process\.exit\(75\)/.test(brokerSource) && !/!report\.policyUsable \|\|/.test(brokerSource))
 ok('broker atomically claims the exact pending marker before decrypting', /renameSync\(pendingMarker, markerPath\)/.test(brokerSource) && /--envelope', envelope/.test(brokerSource))
-ok('a broker claims a per-state exclusive lock before decrypting', /openSync\(lockPath, 'wx'/.test(brokerSource) && /process\.kill\(prior\.pid, 0\)/.test(brokerSource))
+const lockSource = readFileSync('mcp/tools/broker_lock.mjs', 'utf8')
+const nativeBrokerSource = readFileSync('mcp/tools/instance-broker-native.mjs', 'utf8')
+ok('a broker claims a per-state exclusive lock before decrypting', /openSync\(lockPath, 'wx'/.test(lockSource) && /process\.kill\(prior\.pid, 0\)/.test(lockSource) &&
+  /claimBrokerLock\(manifest, die\)[\s\S]*renameSync\(pendingMarker, markerPath\)/.test(brokerSource) &&
+  /claimBrokerLock\(manifest, die\)[\s\S]*renameSync\(pendingMarker, markerPath\)/.test(nativeBrokerSource))
 ok('the broker records an identity-bound, expiry-limited admission receipt before any keyless worker can request a reply', /broker: manifest\.pubkey, envelope/.test(brokerSource) && /sender: String\(admission\.from\)/.test(brokerSource) && /grant_id: String\(admission\.grant_id\)/.test(brokerSource) && /expires_at: Date\.now\(\) \+ 5 \* 60 \* 1000/.test(brokerSource))
 ok('the broker carries its verified task authority into Desktop delivery instead of downgrading it to generic data',
   /type: 'scoped-instruction'/.test(brokerSource) && /scope_subject: manifest\.pubkey/.test(brokerSource) &&
@@ -233,13 +247,28 @@ ok('the Desktop adapter gives each admitted envelope a stable app-server user-me
   /clientUserMessageId: userMessageId\(task\)/.test(codexDesktopSource) &&
   /clientUserMessageId/.test(codexTransportSource))
 const daemonSource = readFileSync('mcp/tools/instance-broker-daemon.mjs', 'utf8')
-ok('the broker daemon rate-limits retries after transient policy failures', /retryAfter\.get\(item\.envelope\)/.test(daemonSource) && /Date\.now\(\) \+ 5000/.test(daemonSource))
+ok('the broker daemon rate-limits retries after transient policy failures', /retryAfter\.get\(key\)/.test(daemonSource) && /const key = `\$\{item\.native \? 'buzz:' : ''\}\$\{item\.envelope\}`/.test(daemonSource) && /Date\.now\(\) \+ 5000/.test(daemonSource))
 ok('broker restart requeues only interrupted inflight markers and prioritizes the newest opaque observation', /\.inflight/.test(daemonSource) && /\.pending/.test(daemonSource) && /marker\.observed_at/.test(daemonSource) && /b\.observed - a\.observed/.test(daemonSource) && /setInterval\(drain, 1000\)/.test(daemonSource))
 mkdirSync(manifest.state_dir, { recursive: true })
 const terminalReplies = join(manifest.state_dir, 'terminal-replies.jsonl')
 const terminalIds = loadTerminalReplyIds(terminalReplies)
 const expiredRequest = 'a'.repeat(32)
 ok('a missing or stale admission receipt is terminal, rather than a relay-query retry loop', isTerminalReplyFailure('instance-broker-reply: admission receipt is missing') && isTerminalReplyFailure('instance-broker-reply: admission receipt is not a live broker-bound sender capability') && recordTerminalReply(terminalReplies, terminalIds, expiredRequest, 'admission receipt is not a live broker-bound sender capability', 1) && terminalIds.has(expiredRequest) && !recordTerminalReply(terminalReplies, terminalIds, expiredRequest, 'admission receipt is not a live broker-bound sender capability', 2) && loadTerminalReplyIds(terminalReplies).has(expiredRequest) && !readFileSync(terminalReplies, 'utf8').includes('must not be signed'))
+// 10-26: a DJ Codex reply that mentioned Pi Dog hit the 4-an-hour cap and was logged as receipt-not-live.
+const capped = 'instance-broker-reply: reply refused: over the may_post hourly cap (4/4 in the last hour)'
+ok('a reply refused by the may_post hourly cap is named as such', isTerminalReplyFailure(capped) && terminalReplyReason(capped) === 'post-cap')
+// 10-23: two LukeDog replies to deleted mentions were refused this way every ~9s, with no end.
+const parentGone = 'instance-broker-reply: Buzz refused the reply: invalid: reply parent not found\ninstance-broker-reply: Buzz rejected the frozen channel reply as invalid; no retry can change it'
+const staleReply = 'instance-broker-reply: Buzz refused the reply: invalid: event timestamp too far from server time\ninstance-broker-reply: Buzz rejected the frozen channel reply as invalid; no retry can change it'
+ok('a frozen Buzz reply rejected as invalid is terminal, while a merely unaccepted one stays retryable',
+  isTerminalReplyFailure(parentGone) && terminalReplyReason(parentGone) === 'parent-gone' &&
+  isTerminalReplyFailure(staleReply) && terminalReplyReason(staleReply) === 'invalid-frozen-reply' &&
+  !isTerminalReplyFailure('instance-broker-reply: Buzz refused the reply: rate-limited: slow down\ninstance-broker-reply: the Buzz relay did not accept the persisted channel reply; it remains retryable') &&
+  !isTerminalReplyFailure('instance-broker-reply: the Buzz relay did not accept the persisted channel reply; it remains retryable'))
+const replyActuator = readFileSync('mcp/tools/instance-broker-reply.mjs', 'utf8')
+ok('only an invalid verdict on a reply stamped no later than now is made terminal, so a future-stamped one can still land',
+  /\/\^invalid:\/\.test\(/.test(replyActuator) && /record\.event\.created_at <= Math\.floor\(Date\.now\(\) \/ 1000\)/.test(replyActuator) &&
+  /die\('Buzz rejected the frozen channel reply as invalid/.test(replyActuator))
 ok('the broker daemon invokes only the mechanically bounded prepare mode and has no approval input',
   /awaiting discrete approval/.test(daemonSource) && /instance-broker-reply\.mjs/.test(daemonSource) &&
   /'--prepare'/.test(daemonSource) && !/'--approval'/.test(daemonSource))

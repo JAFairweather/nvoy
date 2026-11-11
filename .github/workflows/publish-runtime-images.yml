@@ -67,6 +67,7 @@ jobs:
         with:
           context: .
           file: ${{ matrix.file }}
+          build-args: NVOY_RELEASE_SHA=${{ github.sha }}
           push: true
           # Docker repository components must be lower-case; GitHub preserves the
           # owner display casing in github.repository_owner (JAFairweather).

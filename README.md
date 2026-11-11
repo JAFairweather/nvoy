@@ -38,6 +38,9 @@ each participant gets its own watcher, Bunker-backed broker, keyless adapter, MC
 fixed model-session binding. See
 [`docs/AGENT_RUNTIME_HANDOFF.md`](docs/AGENT_RUNTIME_HANDOFF.md) for the successor runbook and
 [`docs/NOSTR_AGENT_ARCHITECTURE.md`](docs/NOSTR_AGENT_ARCHITECTURE.md) for the canonical design.
+The fleet host holds those tools only; the harness (Claude Code, Codex or another) runs on any box
+and reaches them over one restricted SSH command — see
+[`docs/HARNESS_PLACEMENT.md`](docs/HARNESS_PLACEMENT.md).
 
 ## The nvoy terms extension
 

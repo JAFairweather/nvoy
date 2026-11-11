@@ -1,0 +1,566 @@
+// Hosted Claude Code and Codex harnesses: the manifest block that turns it on, the Compose service it renders,
+// the files that let one persistent session start unattended, and the supervisor's refusals.
+// Claude Code is not driven here; a fake `codex app-server` drives the Codex supervisor, and a fake
+// tmux that only logs the session it is asked for drives the portable (--remote) Claude supervisor,
+// and a fake herdr that runs what it is typed drives its herdr form.
+// The first live session is the operator's check.
+import { symlinkSync, lstatSync, appendFileSync, chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
+import { spawn, spawnSync } from 'node:child_process'
+import { sshChannelEntry } from '../mcp/tools/channel_client.mjs'
+import { fakeHerdr } from './fake-herdr.mjs'
+import { CODEX_CHANNEL_TOOLS, channelProcessUp, classifyPane, claudeArgs, codexConfigToml, codexTurnText, defaultInstructions, ensureInstructions, hasPriorSession, instructionsUpdate, MEMORY_FAILURE_RULE_MARKER, memoryFailureRule, MEMORY_RULE_MARKER, mcpConfig, RECALL_RULE_MARKER, TURN_RULE_MARKER, pendingEnvelopes, seedClaudeJson, seedSettings, serverName } from '../mcp/tools/harness_session.mjs'
+
+let fails = 0
+const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); if (!value) fails++ }
+const root = mkdtempSync(join(tmpdir(), 'nvoy-hns-'))
+const brokerAdapterGid = process.getgid()
+const workerHandoffGid = process.getgroups().find(g => g !== brokerAdapterGid)
+if (!Number.isInteger(workerHandoffGid)) throw new Error('test runner needs a second supplementary group')
+const channel = 'a8186b53-537d-46ad-a7e7-b6486c58970e'
+const base = id => ({ version: 1, id, pubkey: 'c'.repeat(64),
+  state_dir: join(root, `state-${id}`), runtime_dir: join(root, `run-${id}`), spool_dir: join(root, `spool-${id}`),
+  bunker_uri_ref: `/etc/nvoy/credentials/${id}.bunker`, bunker_client_ref: `/etc/nvoy/credentials/${id}.client`,
+  broker_adapter_gid: brokerAdapterGid, worker_handoff_gid: workerHandoffGid, watcher_uid: 41021, broker_uid: 41022, adapter_uid: 41023, worker_uid: 41024,
+  grantors: ['4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b287ea84d'],
+  relays: ['wss://nos.lol'], worker_enabled: false, delivery_mode: 'notify_only',
+  buzz: { relay: 'wss://nave.communities.buzz.xyz', channels: [channel] } })
+const harness = { runner: 'claude', credential_ref: '/etc/nvoy/credentials/mc-test.claude-oauth' }
+const image = 'registry.example/nvoy@sha256:' + 'e'.repeat(64)
+const workerImage = 'registry.example/nvoy-worker@sha256:' + 'a'.repeat(64)
+
+// Each case gets its own manifest root: every production command preflights the whole root, and
+// one refused neighbour would fail the rest.
+function run(tool, manifest, args = [], env = {}) {
+  const dir = mkdtempSync(join(root, 'instances-'))
+  writeFileSync(join(dir, `${manifest.id}.json`), JSON.stringify(manifest))
+  return spawnSync(process.execPath, [`mcp/tools/${tool}`, '--instance', manifest.id, ...args],
+    { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: dir, ...env } })
+}
+
+// Manifest
+const parse = manifest => spawnSync(process.execPath, ['--input-type=module', '-e',
+  `import { readManifest } from './mcp/tools/runtime_manifest.mjs'; try { console.log(JSON.stringify(readManifest(process.env.R, process.env.I).harness)) } catch (e) { console.error(e.message); process.exit(1) }`],
+  { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, R: (() => { const d = mkdtempSync(join(root, 'm-')); writeFileSync(join(d, `${manifest.id}.json`), JSON.stringify(manifest)); return d })(), I: manifest.id } })
+const accepted = parse({ ...base('mc-test'), harness })
+ok('a local-broker, worker-disabled notify_only manifest accepts a Claude harness', accepted.status === 0 && JSON.parse(accepted.stdout).credentialRef === harness.credential_ref)
+ok('a manifest without a harness block has none', parse(base('mc-test')).stdout.trim() === 'null')
+ok('a harness may name the Codex runner', JSON.parse(parse({ ...base('mc-test'), harness: { ...harness, runner: 'codex' } }).stdout).runner === 'codex')
+ok('a harness must name the Claude or Codex runner', parse({ ...base('mc-test'), harness: { ...harness, runner: 'gemini' } }).status !== 0 &&
+  parse({ ...base('mc-test'), harness: { ...harness, runner: '' } }).status !== 0)
+ok('a harness credential reference must be absolute', parse({ ...base('mc-test'), harness: { ...harness, credential_ref: 'claude-oauth' } }).status !== 0)
+ok('a harness credential cannot be one of the Nostr credentials', /must not name a Nostr credential/.test(parse({ ...base('mc-test'), harness: { ...harness, credential_ref: '/etc/nvoy/credentials/mc-test.bunker' } }).stderr))
+ok('a harness cannot sit beside a headless model worker', parse({ ...base('mc-test'), harness, delivery_mode: 'headless', worker_enabled: true,
+  worker_image: workerImage, worker_runner: 'claude', worker_credential_ref: '/etc/nvoy/credentials/mc-test.provider' }).status !== 0)
+ok('a harness may name its model', JSON.parse(parse({ ...base('mc-test'), harness: { ...harness, model: 'claude-opus-5-5' } }).stdout).model === 'claude-opus-5-5')
+ok('a harness model cannot smuggle a flag or a shell word', parse({ ...base('mc-test'), harness: { ...harness, model: '--dangerously-skip-permissions' } }).status !== 0 &&
+  parse({ ...base('mc-test'), harness: { ...harness, model: 'opus; rm -rf /' } }).status !== 0)
+ok('a harness cannot serve a Codex app-server queue', parse({ ...base('mc-test'), harness, delivery_mode: 'codex_app_server', codex_thread_id: '0199a213-81c0-7800-8aa1-bbab2a035a53', codex_transport: 'spawn' }).status !== 0)
+
+// Compose
+const rendered = run('render-instance-compose.mjs', { ...base('mc-test'), harness }, ['--image', image, '--worker-image', workerImage])
+const out = rendered.stdout
+const harnessPart = (out.match(/\n  harness:[\s\S]*?(?=\n  [a-z][a-z_]*:|\nsecrets:|$)/) || [''])[0]
+const initPart = (out.match(/\n  init:[\s\S]*?(?=\n  [a-z][a-z_]*:|\nsecrets:|$)/) || [''])[0]
+ok('a harness manifest renders a harness service on the release worker image', rendered.status === 0 && harnessPart.includes(`image: ${JSON.stringify(workerImage)}`))
+ok('the harness runs as the worker UID with the handoff group, read-only and without capabilities', harnessPart.includes('user: "41024:' + workerHandoffGid + '"') &&
+  /read_only: true/.test(harnessPart) && /cap_drop: \[ALL\]/.test(harnessPart) && /no-new-privileges:true/.test(harnessPart))
+ok('the harness mounts the adapter runtime queue, its read-only login copy and a persistent home, and nothing keyed',
+  harnessPart.includes('source: adapter_runtime') && /source: harness_credentials\n\s+target: \/run\/nvoy-harness-credentials\n\s+read_only: true/.test(harnessPart) &&
+  harnessPart.includes('source: harness_home') && !/broker_credentials|bunker|nsec|state_dir|STATE_DIR|spool/i.test(harnessPart))
+ok('only the root initializer receives the Claude login secret, from the manifest reference', /nvoy_harness_credential:\n\s+file: "\/etc\/nvoy\/credentials\/mc-test\.claude-oauth"/.test(out) &&
+  initPart.includes('source: nvoy_harness_credential') && !/secrets:/.test(harnessPart))
+ok('the rendered harness file keeps no template markers or unresolved variables', !/@harness-|\$\{/.test(out))
+ok('a notify_only manifest without a harness renders no harness, harness volume or login secret', (() => {
+  const plain = run('render-instance-compose.mjs', base('mc-test'), ['--image', image])
+  return plain.status === 0 && !/harness/i.test(plain.stdout)
+})())
+ok('a harness render refuses to guess its image without the release worker digest', /requires --worker-image/.test(run('render-instance-compose.mjs', { ...base('mc-test'), harness }, ['--image', image]).stderr))
+ok('a worker image override is still refused where there is neither a worker nor a harness', /worker-disabled/.test(run('render-instance-compose.mjs', base('mc-test'), ['--image', image, '--worker-image', workerImage]).stderr))
+
+// Session files
+const manifest = { id: 'mc-test', pubkey: 'c'.repeat(64), buzz: { channels: [channel] } }
+ok('the channel server is named for the instance', serverName(manifest) === 'nvoy-mc-test')
+const config = mcpConfig({ manifest, root: '/etc/nvoy/instances' })
+const entry = config.mcpServers['nvoy-mc-test']
+ok('the session starts the keyless channel as its own MCP child for this instance only', Object.keys(config.mcpServers).length === 1 &&
+  entry.command === 'node' && JSON.stringify(entry.args) === JSON.stringify(['/srv/nvoy/mcp/tools/claude-channel.mjs', '--instance', 'mc-test']) &&
+  JSON.stringify(entry.env) === JSON.stringify({ NVOY_INSTANCE_ROOT: '/etc/nvoy/instances' }))
+const seeded = seedClaudeJson({ userID: 'kept', projects: { '/other': { x: 1 }, '/home/harness/workspace': { allowedTools: ['kept'] } } }, '/home/harness/workspace')
+ok('first-run and folder-trust flags are asserted and everything Claude Code already wrote is kept', seeded.hasCompletedOnboarding === true && seeded.userID === 'kept' &&
+  seeded.projects['/other'].x === 1 && seeded.projects['/home/harness/workspace'].hasTrustDialogAccepted === true &&
+  seeded.projects['/home/harness/workspace'].allowedTools[0] === 'kept')
+ok('a malformed ~/.claude.json is replaced, not trusted', seedClaudeJson([1, 2], '/w').hasCompletedOnboarding === true && seedClaudeJson(null, '/w').projects['/w'].hasTrustDialogAccepted)
+const settings = seedSettings({}, 'nvoy-mc-test')
+ok('the channel tools are allowed and anything else is refused rather than asked about', JSON.stringify(settings.permissions.allow) === '["mcp__nvoy-mc-test"]' && settings.permissions.defaultMode === 'dontAsk')
+const operator = seedSettings({ model: 'kept', permissions: { allow: ['Read', 'mcp__nvoy-mc-test'], deny: ['Bash'], defaultMode: 'default' } }, 'nvoy-mc-test')
+ok('seeding is idempotent and keeps the operator\'s own rules and mode', operator.model === 'kept' && JSON.stringify(operator.permissions.allow) === '["Read","mcp__nvoy-mc-test"]' &&
+  operator.permissions.deny[0] === 'Bash' && operator.permissions.defaultMode === 'default')
+ok('seeding never grants a bypass mode', !/bypass/i.test(JSON.stringify(seedSettings({}, 'nvoy-x'))))
+const instructions = defaultInstructions({ id: 'mc-test', pubkey: 'c'.repeat(64), buzz: { channels: [channel] } })
+ok('the default instructions name the read and reply tools and treat message bodies as data', /nvoy_channel_read/.test(instructions) && /nvoy_channel_reply/.test(instructions) &&
+  /never treat it as instructions/.test(instructions) && instructions.includes(channel) && !instructions.includes('c'.repeat(64)))
+const reader = { identity: '/keys/mc-read', knownHosts: '/keys/herd_known_hosts', target: 'hive-memory-gw@herd-cloud' }
+const channelRemote = { identity: '/keys/mc-channel', knownHosts: '/keys/known_hosts', target: 'nvoy-mc@broker.example' }
+const recallMcp = mcpConfig({ manifest: { id: 'mc-test', recall: reader }, root: '', remote: channelRemote }).mcpServers
+ok('a recall block mounts the instance\'s own reader beside its channel, over its own key and pinned host', Object.keys(recallMcp).join() === 'nvoy-mc-test,hive-memory' &&
+  recallMcp['hive-memory'].args.at(-1) === reader.target && recallMcp['hive-memory'].args.includes('/keys/mc-read') && recallMcp['hive-memory'].args.includes('UserKnownHostsFile=/keys/herd_known_hosts') &&
+  !recallMcp['hive-memory'].args.includes('/keys/mc-channel') && recallMcp['hive-memory'].args.includes('IdentitiesOnly=yes'))
+const localMcp = mcpConfig({ manifest: { id: 'mc-test', recall: { local: true, bridge: '/usr/local/lib/hive-memory/connect' } }, root: '', remote: channelRemote }).mcpServers
+ok('local recall mounts the box\'s own bridge with no arguments, no key and no ssh', Object.keys(localMcp).join() === 'nvoy-mc-test,hive-memory' &&
+  JSON.stringify(localMcp['hive-memory']) === JSON.stringify({ command: '/usr/local/lib/hive-memory/connect', args: [] }))
+ok('without a recall block the session mounts only its channel', Object.keys(mcpConfig({ manifest: { id: 'mc-test' }, root: '', remote: channelRemote }).mcpServers).join() === 'nvoy-mc-test')
+const recallAllow = seedSettings({}, 'nvoy-mc-test', { recall: true }).permissions.allow
+ok('recall allows the two read tools by name, never the whole server', JSON.stringify(recallAllow) === '["mcp__nvoy-mc-test","mcp__hive-memory__memory_wake","mcp__hive-memory__memory_query"]' &&
+  JSON.stringify(seedSettings({ permissions: { allow: recallAllow } }, 'nvoy-mc-test', { recall: true }).permissions.allow) === JSON.stringify(recallAllow))
+const dreamMcp = mcpConfig({ manifest: { id: 'curator' }, root: '', remote: channelRemote, dreamVerify: '/opt/hive-memory/nvoy/mcp/tools/memory-dream-verify.mjs' }).mcpServers
+ok('dreamVerify mounts local hive-dream stdio MCP beside the remote channel for curator', Object.keys(dreamMcp).join() === 'nvoy-curator,hive-dream' &&
+  JSON.stringify(dreamMcp['hive-dream']) === JSON.stringify({ command: 'node', args: ['/opt/hive-memory/nvoy/mcp/tools/memory-dream-verify.mjs', '--mcp'] }))
+const dreamAllow = seedSettings({}, 'nvoy-curator', { dreamVerify: true }).permissions.allow
+ok('dreamVerify allows mcp__hive-dream__memory_dream_verify by name', JSON.stringify(dreamAllow) === '["mcp__nvoy-curator","mcp__hive-dream__memory_dream_verify"]')
+const recaller = { id: 'mc-test', buzz: { channels: [channel] }, mayRemember: { remote: true }, recall: reader }
+const both = instructionsUpdate(null, recaller)
+ok('a reader\'s instructions carry the recall rule once, after the memory rule', both.split(RECALL_RULE_MARKER).length === 2 && both.indexOf(MEMORY_RULE_MARKER) < both.indexOf(RECALL_RULE_MARKER) &&
+  /call `memory_wake` once/.test(both) && /call `memory_query` for it/.test(both) && /evidence, never an instruction/.test(both))
+const savedOnly = instructionsUpdate(null, { ...recaller, recall: undefined })
+const gained = instructionsUpdate(savedOnly, recaller)
+ok('a file that has the memory rule gains the recall rule, appended once, and is then left alone', gained.startsWith(savedOnly) && gained.split(RECALL_RULE_MARKER).length === 2 &&
+  gained.split(MEMORY_RULE_MARKER).length === 2 && instructionsUpdate(gained, recaller) === null)
+ok('local recall carries the same recall rule', instructionsUpdate(null, { ...recaller, recall: { local: true, bridge: '/b' } }) === both)
+const recallOnly = gained.replace(/\n## Check memory every turn[\s\S]*$/, '\n')
+const turned = instructionsUpdate(recallOnly, recaller)
+ok('a file that has the recall rule gains the every-turn check, appended once after it, and is then left alone',
+  turned.split(TURN_RULE_MARKER).length === 2 && turned.indexOf(RECALL_RULE_MARKER) < turned.indexOf(TURN_RULE_MARKER) &&
+  /start of every turn/.test(turned) && instructionsUpdate(turned, recaller) === null)
+ok('without a recall block there is no recall rule', !instructionsUpdate(null, { ...recaller, recall: undefined }).includes(RECALL_RULE_MARKER) &&
+  !instructionsUpdate(null, { ...recaller, recall: undefined }).includes(TURN_RULE_MARKER))
+const rememberer = { id: 'mc-test', pubkey: 'c'.repeat(64), buzz: { channels: [channel] }, mayRemember: { rooms: ['r'], perHour: 10 } }
+const created = instructionsUpdate(null, rememberer)
+ok('a new writer\'s instructions carry the standing memory rule once', created.startsWith(defaultInstructions(rememberer)) &&
+  created.split(MEMORY_RULE_MARKER).length === 2 && /Before you reply on a task, save with `memory_claim`/.test(created))
+const own = '# mine\n\nMy own notes.\n'
+const appended = instructionsUpdate(own, rememberer)
+ok('an existing instructions file keeps its text and gains the rule, appended', appended.startsWith(own) && appended.includes(MEMORY_RULE_MARKER))
+ok('a file that already has the rule is left alone, so an edit to it survives', instructionsUpdate(appended.replace('14 days', '7 days'), rememberer) === null)
+ok('an agent without memory gets no rule, and an existing file is left alone', instructionsUpdate(null, { id: 'x', buzz: {} }) === defaultInstructions({ id: 'x', buzz: {} }) &&
+  !instructionsUpdate(null, { id: 'x', buzz: {} }).includes(MEMORY_RULE_MARKER) && instructionsUpdate(own, { id: 'x', buzz: {} }) === null)
+ok('the rule never asks the agent to read memory it has no tool for', !/memory_query|memory_wake/.test(created))
+{
+  // An agent set up before the failure rule existed has the memory and recall rules only; it gains the new one.
+  const before = both.slice(0, both.indexOf(MEMORY_FAILURE_RULE_MARKER)).replace(/\n*$/, '\n')
+  const after = instructionsUpdate(before, recaller)
+  ok('an existing reader and writer gains the failure rule once, and is then left alone', !before.includes(MEMORY_FAILURE_RULE_MARKER) &&
+    after.startsWith(before) && after.split(MEMORY_FAILURE_RULE_MARKER).length === 2 && instructionsUpdate(after, recaller) === null &&
+    /post in #waggle-test straight away/.test(after))
+  ok('a reader without saving still gets the failure rule', instructionsUpdate(null, { ...recaller, mayRemember: undefined }).includes(MEMORY_FAILURE_RULE_MARKER))
+  ok('a writer gets the failure rule', created.includes(MEMORY_FAILURE_RULE_MARKER))
+  ok('the failure rule mentions Neil by his exact Buzz display name', memoryFailureRule({ mayRemember: true }).includes('mention @Neil:') && !memoryFailureRule({ mayRemember: true }).includes('@neil'))
+  ok('an agent without memory gets no failure rule', !instructionsUpdate(null, { id: 'x', buzz: {} }).includes(MEMORY_FAILURE_RULE_MARKER))
+}
+{
+  const dir = join(root, 'instructions'), path = join(dir, 'CLAUDE.md')
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(path, own)
+  const writes = [ensureInstructions(path, rememberer), ensureInstructions(path, rememberer)]
+  ok('a harness restart appends the rule to an existing file exactly once, privately', writes.join() === 'true,false' &&
+    readFileSync(path, 'utf8').split(MEMORY_RULE_MARKER).length === 2 && readFileSync(path, 'utf8').startsWith(own) && (statSync(path).mode & 0o777) === 0o600)
+  const fresh = join(dir, 'AGENTS.md')
+  ok('a missing instructions file is created with the defaults and the rule', ensureInstructions(fresh, rememberer) && readFileSync(fresh, 'utf8') === instructionsUpdate(null, rememberer))
+  const outside = join(root, 'outside.md'), linked = join(dir, 'linked'), link = join(linked, 'CLAUDE.md')
+  mkdirSync(linked, { recursive: true })
+  writeFileSync(outside, own, { mode: 0o644 }); symlinkSync(outside, link)
+  ok('a symlinked instructions file is left alone, and its target is never written or chmodded', !ensureInstructions(link, rememberer) &&
+    readFileSync(outside, 'utf8') === own && (statSync(outside).mode & 0o777) === 0o644 && lstatSync(link).isSymbolicLink())
+  const dangling = join(dir, 'dangling'); mkdirSync(dangling, { recursive: true }); symlinkSync(join(root, 'nowhere.md'), join(dangling, 'CLAUDE.md'))
+  ok('a dangling symlink is not followed to create its target', !ensureInstructions(join(dangling, 'CLAUDE.md'), rememberer) && !existsSync(join(root, 'nowhere.md')))
+  const piped = join(dir, 'piped'), fifo = join(piped, 'AGENTS.md'); mkdirSync(piped, { recursive: true })
+  const made = spawnSync('mkfifo', [fifo]).status === 0
+  const probe = spawnSync(process.execPath, ['--input-type=module', '-e',
+    `import { ensureInstructions } from ${JSON.stringify(resolve('mcp/tools/harness_session.mjs'))}; process.stdout.write(String(ensureInstructions(${JSON.stringify(fifo)}, ${JSON.stringify(rememberer)})))`],
+  { timeout: 5000, encoding: 'utf8' })
+  ok('a FIFO instructions file is left alone without waiting for a writer', made && probe.status === 0 && probe.stdout === 'false' && lstatSync(fifo).isFIFO())
+}
+const fresh = claudeArgs({ server: 'nvoy-mc-test', mcpConfigPath: '/home/harness/.nvoy-harness/mcp.json', resume: false })
+ok('the session loads exactly its own channel server and no ambient MCP configuration', JSON.stringify(fresh) === JSON.stringify(['--dangerously-load-development-channels', 'server:nvoy-mc-test', '--mcp-config', '/home/harness/.nvoy-harness/mcp.json', '--strict-mcp-config']))
+ok('a chosen model is passed as --model, and none is passed by default', JSON.stringify(claudeArgs({ server: 's', mcpConfigPath: '/m', resume: false, model: 'opus' }).slice(-2)) === '["--model","opus"]' && !fresh.includes('--model'))
+ok('the settings\' mode is passed as --permission-mode, so a resume cannot restore an older one', JSON.stringify(claudeArgs({ server: 's', mcpConfigPath: '/m', resume: true, permissionMode: 'auto' }).slice(-3)) === '["--permission-mode","auto","--continue"]' && !fresh.includes('--permission-mode'))
+ok('a restart resumes the same conversation', claudeArgs({ server: 's', mcpConfigPath: '/m', resume: true }).at(-1) === '--continue')
+ok('the command line never carries a permission bypass', !/skip-permissions|bypass/.test(JSON.stringify(fresh)))
+const home = join(root, 'home'), workdir = join(home, 'workspace')
+ok('a home with no conversation starts fresh', !hasPriorSession(home, workdir))
+const projectDir = join(home, '.claude', 'projects', workdir.replace(/[^a-zA-Z0-9]/g, '-'))
+mkdirSync(projectDir, { recursive: true })
+writeFileSync(join(projectDir, 'notes.txt'), '')
+ok('only a saved conversation counts as a prior session', !hasPriorSession(home, workdir))
+writeFileSync(join(projectDir, '0199.jsonl'), '{}\n')
+ok('a saved conversation in the workspace resumes', hasPriorSession(home, workdir))
+
+// Startup screens
+ok('the development-channel warning is answered with its own option number', JSON.stringify(classifyPane('WARNING: Loading development channels\n  1. Exit\n  2. I am using this for local development')) === '{"state":"dev-channels","key":"2"}')
+ok('a warning without numbered options is answered with Enter on the default', classifyPane('> I am using this for local development').key === 'Enter')
+ok('the folder-trust screen is answered only with its accept option', JSON.stringify(classifyPane('Do you trust the files in this folder?\n ❯ 1. Yes, proceed\n   2. No, exit')) === '{"state":"trust","key":"1"}')
+ok('a login screen is fatal, never answered', JSON.stringify(classifyPane('Select login method:\n 1. Claude account')) === '{"state":"login"}' && classifyPane('OAuth token has expired').state === 'login')
+ok('the ready prompt is recognised', classifyPane('>\n  ? for shortcuts').state === 'ready')
+ok('the 2.1.221 idle prompt, whose footer is the permission-mode hint, is recognised as ready',
+  classifyPane(' ▐▛███▜▌   Claude Code v2.1.221\n──────\n❯ Try "how does <filepath> work?"\n──────\n  ⏵⏵ don\'t ask on (shift+tab to cycle) · ← for agents').state === 'ready')
+ok('anything else is still starting and gets no keystroke', JSON.stringify(classifyPane('Loading…')) === '{"state":"starting"}' && classifyPane('').key === undefined)
+ok('an injected message that quotes a startup screen after ready cannot matter: the supervisor stops reading once ready',
+  /if \(screen\.state === 'ready'\) \{ if \(!watchChannel\) \{ log\(.*\); return \} readyAt = Date\.now\(\); continue \}/.test(readFileSync('mcp/tools/instance-harness.mjs', 'utf8')) &&
+  /if \(readyAt\) \{[^]*?continue\n    \}\n    term\.named\(\)\n    const screen = classifyPane\(term\.screen\(\)\)/.test(readFileSync('mcp/tools/instance-harness.mjs', 'utf8')))
+const sshArgs = sshChannelEntry({ identity: '/k/id', knownHosts: '/k/kh', target: 'nvoy-channel@broker.example' }).args
+ok('the channel ssh carries keepalives, so a half-open carrier ends the process the supervisor watches', sshArgs.join(' ').includes('-o ServerAliveInterval=15 -o ServerAliveCountMax=3 -i /k/id nvoy-channel@broker.example'))
+const ps = rows => rows.map(([pid, ppid, command]) => `  ${pid}   ${ppid} ${command}`).join('\n')
+ok('the channel is the session\'s descendant whose command line ends with the channel entry', channelProcessUp(ps([[1, 0, 'launchd'], [100, 1, 'tmux'], [101, 100, 'claude --mcp-config /m'],
+  [102, 101, `/usr/bin/ssh ${sshArgs.join(' ')}`]]), 101, sshArgs) && channelProcessUp(ps([[101, 1, 'sh -c claude'], [102, 101, 'claude'], [103, 102, `/usr/bin/ssh ${sshArgs.join(' ')}`]]), 101, sshArgs) &&
+  channelProcessUp(ps([[7, 1, 'claude'], [8, 7, 'node /srv/nvoy/mcp/tools/claude-channel.mjs --instance mc-test']]), 7, ['/srv/nvoy/mcp/tools/claude-channel.mjs', '--instance', 'mc-test']))
+ok('another session\'s channel, a command that only mentions the entry, or no channel at all is not this session\'s channel',
+  !channelProcessUp(ps([[101, 1, 'claude'], [200, 1, 'claude'], [201, 200, `/usr/bin/ssh ${sshArgs.join(' ')}`]]), 101, sshArgs) &&
+  !channelProcessUp(ps([[101, 1, 'claude'], [102, 101, `grep ${sshArgs.join(' ')} x`]]), 101, sshArgs) && !channelProcessUp(ps([[101, 1, 'claude']]), 101, sshArgs) && !channelProcessUp('', 101, sshArgs))
+
+// Supervisor
+const noHarness = run('instance-harness.mjs', base('mc-test'), [], { HOME: join(root, 'h1') })
+ok('the supervisor refuses a manifest without a harness block', noHarness.status !== 0 && /no harness block/.test(noHarness.stderr))
+const wrongUid = run('instance-harness.mjs', { ...base('mc-test'), harness }, [], { HOME: join(root, 'h2') })
+ok('the supervisor refuses to run under any UID but the manifest-bound worker', wrongUid.status !== 0 && /worker user/.test(wrongUid.stderr))
+const supervisor = readFileSync('mcp/tools/instance-harness.mjs', 'utf8')
+ok('a fresh harness clears the channel lock its previous container left, before any session starts',
+  supervisor.indexOf("rmSync(resolve(manifest.runtimeDir, 'claude-channel-state', 'channel.lock'), { force: true })") > -1 &&
+  supervisor.indexOf("rmSync(resolve(manifest.runtimeDir, 'claude-channel-state', 'channel.lock')") < supervisor.indexOf("'new-session'"))
+ok('the login token reaches the session only through the tmux environment or the Codex supervisor, never an argv or a log', /CLAUDE_CODE_OAUTH_TOKEN: token/.test(supervisor) &&
+  (() => {
+    const uses = supervisor.split('\n').filter(line => /\btoken\b/.test(line) && !/^\s*\/\/|let token|token = readFileSync|!token/.test(line))
+    return uses.length === 2 && uses[0].includes('credential: token') && uses[1].includes('CLAUDE_CODE_OAUTH_TOKEN: token')
+  })())
+const codexSupervisor = readFileSync('mcp/tools/codex_harness.mjs', 'utf8')
+ok('the Codex supervisor hands the API key only to the app-server environment', (() => {
+  const uses = codexSupervisor.split('\n').filter(line => /\bcredential\b/.test(line) && !/^\s*\/\//.test(line))
+  return uses.length === 2 && /runCodexHarness\(\{[^}]*credential,/.test(uses[0]) && uses[1].includes('OPENAI_API_KEY: credential')
+})())
+ok('the supervisor writes the session files owner-only', /writeFileSync\(path, value, \{ mode: 0o600 \}\); chmodSync\(path, 0o600\)/.test(supervisor))
+const init = readFileSync('mcp/tools/instance-runtime-init.mjs', 'utf8')
+ok('the initializer copies the login to a worker-owned file, drops the pre-Codex copy, and refuses a stray login source', /provisionSecret\(sources\.harnessCredential, `\$\{harnessCredDir\}\/credential`, m\.workerUid, m\.workerUid/.test(init) &&
+  /a runtime without a harness refuses a harness credential source/.test(init) && /rmSync\(`\$\{harnessCredDir\}\/claude-oauth-token`, \{ force: true \}\)/.test(init))
+ok('the worker image carries tmux for the session terminal', /apt-get install -y --no-install-recommends ca-certificates tmux/.test(readFileSync('deploy/nvoy-worker.Dockerfile', 'utf8')))
+const runner = readFileSync('deploy/runtime-deploy-runner.py', 'utf8')
+ok('the fleet reconciler renders a harness with the release worker image and expects its service running', /"harness": raw\.get\("harness"\) is not None/.test(runner) &&
+  /instance\["worker"\] or instance\["harness"\]/.test(runner) && /"harness"/.test(runner.slice(runner.indexOf('def verify_running'))))
+
+// Codex session files
+const codexManifest = { id: 'dj-test', pubkey: 'c'.repeat(64), buzz: { channels: [channel] } }
+const toml = codexConfigToml({ manifest: codexManifest, root: '/etc/nvoy/instances' })
+ok('the Codex config loads exactly the keyless Codex channel tools for this instance', (toml.match(/^\[mcp_servers\.[^.\]]+\]$/gm) || []).length === 1 &&
+  toml.includes('[mcp_servers.nvoy-dj-test]') && toml.includes('args = ["/srv/nvoy/mcp/tools/codex-channel-mcp.mjs", "--instance", "dj-test"]') &&
+  toml.includes('env = { NVOY_INSTANCE_ROOT = "/etc/nvoy/instances" }'))
+ok('the Codex config reads the API key from the environment and never asks for an approval', /^model_provider = "nvoy-openai-api"$/m.test(toml) &&
+  /^env_key = "OPENAI_API_KEY"$/m.test(toml) && /^requires_openai_auth = false$/m.test(toml) && /^approval_policy = "never"$/m.test(toml) &&
+  /^sandbox_mode = "read-only"$/m.test(toml) && !/danger|full-access|sk-/i.test(toml))
+ok('each keyless channel tool, and only those, is pre-approved so Codex never elicits one',
+  CODEX_CHANNEL_TOOLS.join() === 'nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply,nvoy_channel_post,nvoy_profile_set,nvoy_profile_status,memory_claim,memory_withdraw' &&
+  CODEX_CHANNEL_TOOLS.every(tool => toml.includes(`[mcp_servers.nvoy-dj-test.tools.${tool}]\napproval_mode = "approve"\n`)) &&
+  (toml.match(/^approval_mode = /gm) || []).length === 8 && (toml.match(/^\[mcp_servers\.nvoy-dj-test\.tools\./gm) || []).length === 8)
+ok('a Codex model is set only when chosen', !/^model = /m.test(toml) && /^model = "gpt-5\.5"$/m.test(codexConfigToml({ manifest: codexManifest, root: '/r', model: 'gpt-5.5' })))
+const turn = codexTurnText({ envelope: 'd'.repeat(64), type: 'admitted-task' })
+ok('an injected turn carries only the envelope marker and how to read and answer it', turn.includes('d'.repeat(64)) && /nvoy_channel_read/.test(turn) &&
+  /nvoy_channel_reply/.test(turn) && turn.endsWith(`NVOY_ENVELOPE_ID=${'d'.repeat(64)}`))
+ok('an injected task asks for the work itself, not only an answer', /do the\nwork end to end/.test(turn) && /what you did/.test(turn))
+const queue = [JSON.stringify({ envelope: '1'.repeat(64), type: 'admitted-task', body: 'ignored' }), 'not json', JSON.stringify({ envelope: 'XYZ' }),
+  JSON.stringify({ envelope: '2'.repeat(64), type: 'verified-notification' }), JSON.stringify({ envelope: '1'.repeat(64), type: 'admitted-task' }),
+  JSON.stringify({ envelope: '3'.repeat(64), type: 'something-else' })].join('\n')
+ok('pending envelopes are well formed, oldest first, each once, and never repeat a delivered one',
+  JSON.stringify(pendingEnvelopes(queue, ['2'.repeat(64)])) === JSON.stringify([{ envelope: '1'.repeat(64), type: 'admitted-task' }, { envelope: '3'.repeat(64), type: 'admitted-task' }]) &&
+  pendingEnvelopes('', []).length === 0)
+
+// Codex supervisor, against a fake `codex app-server` that logs what it is sent
+const fakeBin = join(root, 'fake-bin')
+mkdirSync(fakeBin)
+writeFileSync(join(fakeBin, 'codex'), `#!/usr/bin/env node
+const { appendFileSync, existsSync } = require('node:fs')
+const log = row => appendFileSync(process.env.CODEX_HOME + '/fake.jsonl', JSON.stringify(row) + '\\n')
+if (process.argv[2] !== 'app-server') process.exit(2)
+log({ start: true, keyed: process.env.OPENAI_API_KEY === 'sk-test-fake', env: Object.keys(process.env).sort() })
+const send = m => process.stdout.write(JSON.stringify(m) + '\\n')
+let turns = 0, buffer = ''
+process.stdin.on('end', () => process.exit(0))
+process.stdin.on('data', data => {
+  buffer += data
+  let at
+  while ((at = buffer.indexOf('\\n')) >= 0) {
+    const m = JSON.parse(buffer.slice(0, at)); buffer = buffer.slice(at + 1)
+    log(m)
+    if (m.method === 'initialize') send({ id: m.id, result: { userAgent: 'fake' } })
+    const unsaved = existsSync(process.env.CODEX_HOME + '/unsaved')
+    if (m.method === 'thread/start') send({ id: m.id, result: { thread: { id: unsaved ? '0199a213-81c0-7800-8aa1-cccccccccccc' : '0199a213-81c0-7800-8aa1-bbab2a035a53' } } })
+    if (m.method === 'thread/resume') send(unsaved ? { id: m.id, error: { code: -32600, message: 'no rollout found for thread id ' + m.params.threadId } } : { id: m.id, result: { thread: { id: m.params.threadId } } })
+    if (m.method === 'turn/start') {
+      const id = 'turn-' + ++turns
+      send({ id: m.id, result: { turn: { id } } })
+      send({ id: 'srv-' + turns, method: 'item/tool/requestUserInput', params: {} })
+      setTimeout(() => send({ method: 'turn/completed', params: { threadId: m.params.threadId, turn: { id, status: 'completed', items: [] } } }), 20)
+    }
+  }
+})
+`)
+chmodSync(join(fakeBin, 'codex'), 0o755)
+const codexHarness = { runner: 'codex', credential_ref: '/etc/nvoy/credentials/dj-test.openai' }
+const djRoot = mkdtempSync(join(root, 'instances-'))
+const djManifest = { ...base('dj-test'), worker_uid: process.getuid(), harness: codexHarness }
+writeFileSync(join(djRoot, 'dj-test.json'), JSON.stringify(djManifest))
+mkdirSync(djManifest.runtime_dir, { recursive: true })
+const djQueue = join(djManifest.runtime_dir, 'admitted-tasks.jsonl')
+const envelope = n => String(n).repeat(64)
+writeFileSync(djQueue, JSON.stringify({ envelope: envelope(1), type: 'admitted-task' }) + '\n')
+writeFileSync(join(root, 'dj-cred'), 'sk-test-fake\n')
+const djHome = join(root, 'dj-home')
+const fakeLog = () => { try { return readFileSync(join(djHome, '.codex', 'fake.jsonl'), 'utf8').split('\n').filter(Boolean).map(JSON.parse) } catch { return [] } }
+const wait = ms => new Promise(done => setTimeout(done, ms))
+async function waitFor(test, ms = 10000) { const end = Date.now() + ms; while (Date.now() < end) { if (test()) return true; await wait(25) } return false }
+function startCodex() {
+  const child = spawn(process.execPath, ['mcp/tools/instance-harness.mjs', '--instance', 'dj-test'], { cwd: resolve('.'), env: { ...process.env,
+    NVOY_INSTANCE_ROOT: djRoot, HOME: djHome, NVOY_HARNESS_CREDENTIAL_FILE: join(root, 'dj-cred'), HARNESS_POLL_MS: '25', PATH: `${fakeBin}:${process.env.PATH}` } })
+  const run = { child, out: '' }
+  child.stdout.on('data', d => { run.out += d }); child.stderr.on('data', d => { run.out += d })
+  run.exited = new Promise(done => child.on('exit', done))
+  return run
+}
+const turnStarts = () => fakeLog().filter(m => m.method === 'turn/start')
+const first = startCodex()
+const firstReady = await waitFor(() => /session ready/.test(first.out))
+ok('the Codex supervisor starts a thread in the workspace, baselining what the queue already held', firstReady && /baselined 1 admitted/.test(first.out) &&
+  fakeLog().some(m => m.method === 'thread/start' && m.params.cwd === join(djHome, 'workspace')))
+appendFileSync(djQueue, JSON.stringify({ envelope: envelope(2), type: 'admitted-task' }) + '\n' + JSON.stringify({ envelope: envelope(3), type: 'verified-notification' }) + '\n')
+await waitFor(() => turnStarts().length >= 2 && /turn for 333333333333 ended: completed/.test(first.out))
+const injected = turnStarts()
+ok('each new admitted envelope is injected once, in order, as a turn on the same thread', injected.length === 2 &&
+  injected.every(m => m.params.threadId === '0199a213-81c0-7800-8aa1-bbab2a035a53') &&
+  injected[0].params.input[0].text === codexTurnText({ envelope: envelope(2), type: 'admitted-task' }) &&
+  injected[1].params.input[0].text === codexTurnText({ envelope: envelope(3), type: 'verified-notification' }) &&
+  injected[0].params.clientUserMessageId === `nvoy:${envelope(2)}` && !JSON.stringify(injected).includes(envelope(1)))
+ok('a request from Codex is declined, so nothing waits on a person', fakeLog().some(m => m.id === 'srv-1' && m.error && !m.result))
+const starts = fakeLog().filter(m => m.start)
+ok('the app-server gets the API key and a minimal environment', starts.length === 1 && starts[0].keyed &&
+  starts[0].env.filter(k => !/^(__CF|LC_|_$|SHLVL|PWD)/.test(k)).join(',') === 'CODEX_HOME,HOME,OPENAI_API_KEY,PATH')
+ok('the key reaches no log', !first.out.includes('sk-test-fake') && !readFileSync(join(djHome, '.nvoy-harness', 'delivered.jsonl'), 'utf8').includes('sk-test'))
+ok('the Codex config and instructions are written owner-only, and the instructions only when missing',
+  (statSync(join(djHome, '.codex', 'config.toml')).mode & 0o777) === 0o600 && existsSync(join(djHome, 'workspace', 'AGENTS.md')) &&
+  (statSync(join(djHome, '.nvoy-harness', 'codex-thread.json')).mode & 0o777) === 0o600)
+first.child.kill('SIGTERM'); await first.exited
+writeFileSync(join(djHome, 'workspace', 'AGENTS.md'), 'operator edit\n')
+const second = startCodex()
+await waitFor(() => /session ready/.test(second.out))
+appendFileSync(djQueue, JSON.stringify({ envelope: envelope(4), type: 'admitted-task' }) + '\n')
+await waitFor(() => turnStarts().length >= 3 && /turn for 444444444444 ended/.test(second.out))
+ok('a restart resumes the same thread and injects only what arrived since', /resumed the dj-test thread/.test(second.out) &&
+  fakeLog().some(m => m.method === 'thread/resume' && m.params.threadId === '0199a213-81c0-7800-8aa1-bbab2a035a53') &&
+  fakeLog().filter(m => m.method === 'thread/start').length === 1 && turnStarts().length === 3 && turnStarts()[2].params.input[0].text.includes(envelope(4)))
+ok('the operator\'s instructions survive a restart', readFileSync(join(djHome, 'workspace', 'AGENTS.md'), 'utf8') === 'operator edit\n')
+second.child.kill('SIGTERM'); await second.exited
+writeFileSync(join(djHome, '.codex', 'unsaved'), '')
+const third = startCodex()
+await waitFor(() => /session ready/.test(third.out))
+appendFileSync(djQueue, JSON.stringify({ envelope: envelope(5), type: 'admitted-task' }) + '\n')
+await waitFor(() => turnStarts().length >= 4 && /turn for 555555555555 ended/.test(third.out))
+ok('a stored thread Codex never saved is replaced by a new one, not retried forever', /never saved the stored dj-test thread; starting a new one/.test(third.out) &&
+  !/next start in/.test(third.out) && fakeLog().filter(m => m.method === 'thread/start').length === 2 &&
+  turnStarts()[3]?.params.threadId === '0199a213-81c0-7800-8aa1-cccccccccccc' &&
+  JSON.parse(readFileSync(join(djHome, '.nvoy-harness', 'codex-thread.json'), 'utf8')).thread_id === '0199a213-81c0-7800-8aa1-cccccccccccc')
+third.child.kill('SIGTERM'); await third.exited
+
+// Portable harness: the same Claude supervisor off the fleet, driven by a client config instead of a manifest
+const remoteDir = mkdtempSync(join(root, 'remote-'))
+const ownHome = join(remoteDir, 'own-home'), harnessHome = join(ownHome, '.nvoy-harness', 'mac-test')
+mkdirSync(ownHome, { mode: 0o700 })
+const secretFile = (path, value, mode = 0o600) => { writeFileSync(path, value, { mode }); chmodSync(path, mode); return path }
+const keyFile = secretFile(join(remoteDir, 'channel-key'), 'PRIVATE-KEY-MUST-NEVER-PRINT\n')
+const knownFile = secretFile(join(remoteDir, 'known_hosts'), 'broker.example ssh-ed25519 AAAAC3NzaTest\n', 0o644)
+const loginFile = secretFile(join(remoteDir, 'claude-login'), 'sk-ant-oat-fake-login\n')
+const looseKey = secretFile(join(remoteDir, 'loose-key'), 'PRIVATE-KEY-MUST-NEVER-PRINT\n', 0o640)
+const fakeClaude = secretFile(join(remoteDir, 'claude'), "#!/bin/sh\necho '2.1.230 (Claude Code)'\n", 0o700)
+const client = { instance: 'mac-test', ssh_target: 'nvoy-channel@broker.example', identity_file: keyFile, known_hosts_file: knownFile, credential_file: loginFile }
+const clientConfig = (value, mode = 0o600) => secretFile(join(mkdtempSync(join(remoteDir, 'cfg-')), 'client.json'), JSON.stringify(value), mode)
+// The fake session is a real process tree: tmux runs a fake claude, which reads its MCP config the
+// way Claude Code does and runs the channel entry's arguments under a fake ssh, unless
+// <harness home>/.fake/nochannel exists. The fake ssh ends at once while .fake/refuse exists (the
+// fleet refusing the channel), and when .fake/drop appears (the fleet recreating the adapter).
+const fakeSsh = join(remoteDir, 'fake-ssh.cjs'), fakeClaudeSession = join(remoteDir, 'fake-claude.cjs')
+writeFileSync(fakeSsh, `const { existsSync, rmSync } = require('node:fs')
+const ctl = process.env.HOME + '/.fake/'
+if (existsSync(ctl + 'refuse')) setTimeout(() => process.exit(255), 100)
+setInterval(() => { if (existsSync(ctl + 'drop')) { rmSync(ctl + 'drop', { force: true }); process.exit(255) } }, 25)
+`)
+writeFileSync(fakeClaudeSession, `const { existsSync, mkdirSync, readFileSync, writeFileSync } = require('node:fs')
+const args = process.argv.slice(2)
+const entry = Object.values(JSON.parse(readFileSync(args[args.indexOf('--mcp-config') + 1], 'utf8')).mcpServers)[0]
+const saved = process.env.HOME + '/.claude/projects/' + (process.env.HOME + '/workspace').replace(/[^a-zA-Z0-9]/g, '-')
+mkdirSync(saved, { recursive: true }); writeFileSync(saved + '/fake.jsonl', '{}\\n')
+if (existsSync(process.env.HOME + '/.fake/ignoreterm')) process.on('SIGTERM', () => {})
+if (!existsSync(process.env.HOME + '/.fake/nochannel')) require('node:child_process').spawn(process.execPath, [${JSON.stringify(fakeSsh)}, ...entry.args], { stdio: 'ignore' })
+setInterval(() => {}, 1000)
+`)
+writeFileSync(join(fakeBin, 'tmux'), `#!/usr/bin/env node
+const { appendFileSync, readFileSync, writeFileSync } = require('node:fs')
+const socket = process.argv[3]
+let rest = process.argv.slice(4)
+if (rest[0] === '-f') rest = rest.slice(2)
+const e = process.env
+const pid = (() => { try { return Number(readFileSync(socket + '.pid', 'utf8')) } catch { return 0 } })()
+const alive = () => { try { process.kill(pid, 0); return true } catch { return false } }
+if (rest[0] === 'new-session') {
+  appendFileSync(socket + '.log', JSON.stringify({ socket, args: rest, home: e.HOME, configDir: e.CLAUDE_CONFIG_DIR, root: e.NVOY_INSTANCE_ROOT, keyed: e.CLAUDE_CODE_OAUTH_TOKEN === 'sk-ant-oat-fake-login' }) + '\\n')
+  const session = require('node:child_process').spawn(process.execPath, [${JSON.stringify(fakeClaudeSession)}, ...rest.slice(rest.indexOf('claude') + 1)], { detached: true, stdio: 'ignore', env: e })
+  writeFileSync(socket + '.pid', String(session.pid)); session.unref()
+}
+if (rest[0] === 'kill-server' && pid) try { process.kill(-pid, 'SIGKILL') } catch {}
+if (rest[0] === 'display-message') { if (!pid) process.exit(1); console.log(rest.at(-1).includes('pane_pid') ? String(pid) : alive() ? '0 ' : '1 0') }
+if (rest[0] === 'capture-pane') console.log('  ? for shortcuts')
+`)
+chmodSync(join(fakeBin, 'tmux'), 0o755)
+const remoteEnv = { ...process.env, HOME: ownHome, CLAUDE_CONFIG_DIR: join(ownHome, '.claude'), PATH: `${fakeBin}:${process.env.PATH}`, HARNESS_POLL_MS: '25', HARNESS_WATCH_MS: '50',
+  HARNESS_CHANNEL_SETTLE_MS: '300', HARNESS_RETRY_MS: '100', HARNESS_TERMINAL: 'tmux', HARNESS_HERDR_BIN: '/nonexistent/herdr' }
+const refused = (value, pattern, mode) => {
+  const r = spawnSync(process.execPath, ['mcp/tools/instance-harness.mjs', '--instance', 'mac-test', '--remote', clientConfig(value, mode)], { cwd: resolve('.'), encoding: 'utf8', env: remoteEnv, timeout: 10000 })
+  return r.status === 1 && pattern.test(r.stderr) && !/PRIVATE-KEY|sk-ant-oat/.test(r.stdout + r.stderr)
+}
+ok('a portable config that names a Nostr key or Bunker credential is refused, by field or by value', refused({ ...client, nsec_file: '/x' }, /must not name a Nostr key or Bunker credential/) &&
+  refused({ ...client, bunker_uri_ref: '/etc/nvoy/credentials/mac-test.bunker' }, /must not name a Nostr key or Bunker credential/) &&
+  refused({ ...client, model: 'nsec1' + 'q'.repeat(58) }, /must not name a Nostr key or Bunker credential/) &&
+  refused({ ...client, home: 'bunker://' + 'b'.repeat(64) }, /must not name a Nostr key or Bunker credential/))
+ok('a portable config refuses relative paths', refused({ ...client, identity_file: 'channel-key' }, /SSH identity file path must be absolute/) &&
+  refused({ ...client, known_hosts_file: 'known_hosts' }, /known_hosts file path must be absolute/) &&
+  refused({ ...client, credential_file: 'claude-login' }, /credential file path must be absolute/) && refused({ ...client, home: 'harness' }, /home path must be absolute/))
+ok('a portable config refuses an SSH key or login that group or other can read', refused({ ...client, identity_file: looseKey }, /SSH identity file must not be accessible by group or other/) &&
+  refused({ ...client, credential_file: looseKey }, /credential file must not be accessible by group or other/))
+ok('a portable config refuses another instance, an unknown field, a writable config, and the owner\'s own home', refused({ ...client, instance: 'other-test' }, /different instance/) &&
+  refused({ ...client, extra: 1 }, /unknown field extra/) && refused(client, /client config must not be group\/world writable/, 0o666) &&
+  refused({ ...client, home: ownHome }, /never your home/) && refused({ ...client, ssh_target: '-oProxyCommand=x@h' }, /fixed user@host/))
+const doctor = spawnSync(process.execPath, ['mcp/tools/claude-channel-doctor.mjs', '--mode', 'client', '--server', 'nvoy-mac-test', '--claude', fakeClaude,
+  '--identity-file', keyFile, '--known-hosts-file', knownFile, '--ssh-target', client.ssh_target], { cwd: resolve('.'), encoding: 'utf8' })
+const doctorConfig = JSON.parse(doctor.stdout || '{}').mcpConfig
+const pureRemote = mcpConfig({ manifest: { id: 'mac-test' }, root, remote: { identity: doctorConfig?.mcpServers['nvoy-mac-test'].args.at(-2), knownHosts: resolve(knownFile), target: client.ssh_target } })
+ok('the portable channel entry is the doctor\'s client entry, from the one shared function', doctor.status === 0 && Object.keys(pureRemote.mcpServers).length === 1 &&
+  JSON.stringify(pureRemote.mcpServers['nvoy-mac-test']) === JSON.stringify(sshChannelEntry({ identity: doctorConfig.mcpServers['nvoy-mac-test'].args.at(-2), knownHosts: resolve(knownFile), target: client.ssh_target })))
+const fleetRoot = mkdtempSync(join(root, 'instances-'))
+writeFileSync(join(fleetRoot, 'mac-test.json'), JSON.stringify({ ...base('mac-test'), harness }))
+const localLock = join(root, 'run-mac-test', 'claude-channel-state', 'channel.lock')
+mkdirSync(join(root, 'run-mac-test', 'claude-channel-state'), { recursive: true })
+writeFileSync(localLock, '99999\n')
+const portable = spawn(process.execPath, ['mcp/tools/instance-harness.mjs', '--instance', 'mac-test', '--remote', clientConfig(client)],
+  { cwd: resolve('.'), env: { ...remoteEnv, NVOY_INSTANCE_ROOT: fleetRoot } })
+let portableOut = ''
+portable.stdout.on('data', d => { portableOut += d }); portable.stderr.on('data', d => { portableOut += d })
+const portableExited = new Promise(done => portable.on('exit', done))
+ok('the portable supervisor starts its session and sees it ready', await waitFor(() => /mac-test session ready/.test(portableOut)))
+await wait(200)
+const readText = path => { try { return readFileSync(path, 'utf8') } catch { return '' } }
+const written = readText(join(harnessHome, '.nvoy-harness', 'mcp.json'))
+const writtenEntry = (() => { try { return JSON.parse(written).mcpServers['nvoy-mac-test'] } catch { return {} } })()
+ok('the portable session\'s MCP config is exactly the doctor\'s client config for this instance', !!written && JSON.stringify(JSON.parse(written)) === JSON.stringify(doctorConfig))
+ok('the portable entry is the hardened ssh tunnel and carries no secret value', writtenEntry.command === '/usr/bin/ssh' &&
+  ['-F /dev/null', 'BatchMode=yes', 'IdentitiesOnly=yes', 'StrictHostKeyChecking=yes', 'GlobalKnownHostsFile=/dev/null', 'ClearAllForwardings=yes', `UserKnownHostsFile=${realpathSync(knownFile)}`, `-i ${realpathSync(keyFile)}`]
+    .every(flag => writtenEntry.args.join(' ').includes(flag)) && !/PRIVATE-KEY|sk-ant-oat/.test(written + portableOut))
+const sessions = readText(join(harnessHome, '.nvoy-harness', 'tmux.sock.log')).split('\n').filter(Boolean).map(JSON.parse)
+ok('the portable session runs on its own tmux socket inside the harness home, with the channel loaded', sessions.length === 1 &&
+  sessions[0].socket === join(harnessHome, '.nvoy-harness', 'tmux.sock') && sessions[0].args.includes('claude') && sessions[0].args.includes('server:nvoy-mac-test') &&
+  sessions[0].args.includes(join(harnessHome, '.nvoy-harness', 'mcp.json')) && !JSON.stringify(sessions[0].args).includes('sk-ant-oat'))
+ok('the portable session gets the harness home and the login, and neither the owner\'s CLAUDE_CONFIG_DIR nor a fleet root', sessions[0]?.home === harnessHome &&
+  sessions[0].keyed && sessions[0].configDir === undefined && sessions[0].root === undefined)
+ok('the portable harness seeds its own home and never touches the owner\'s ~/.claude or ~/.claude.json', !existsSync(join(ownHome, '.claude')) && !existsSync(join(ownHome, '.claude.json')) &&
+  (statSync(join(harnessHome, '.claude.json')).mode & 0o777) === 0o600 &&
+  JSON.parse(readText(join(harnessHome, '.claude', 'settings.json'))).permissions.allow.includes('mcp__nvoy-mac-test') &&
+  !/Nostr key/.test(readText(join(harnessHome, 'workspace', 'CLAUDE.md'))))
+ok('the portable harness leaves every local channel lock alone: the lock is the fleet\'s', readText(localLock) === '99999\n')
+ok('ready is declared only once the channel to the fleet has stayed up', /mac-test session ready; its channel to the fleet is up/.test(portableOut) &&
+  portableOut.indexOf('session ready') > portableOut.indexOf('starting the mac-test session'))
+const readies = () => (portableOut.match(/mac-test session ready/g) || []).length
+const fakeCtl = join(harnessHome, '.fake')
+mkdirSync(fakeCtl, { recursive: true })
+writeFileSync(join(fakeCtl, 'nochannel'), ''); writeFileSync(join(fakeCtl, 'drop'), '')
+ok('a channel that closes under a ready session (an adapter recreate) restarts the session', await waitFor(() => /the channel to the fleet closed; restarting the session to reconnect it/.test(portableOut)))
+ok('a session whose channel never starts is not declared ready, however ready its prompt looks',
+  await waitFor(() => /the session is ready but its channel to the fleet never started/.test(portableOut)) && readies() === 1)
+const refusals = () => (portableOut.match(/channel to the fleet (?:closed during startup|never started)/g) || []).length, refusedBefore = refusals()
+rmSync(join(fakeCtl, 'nochannel')); writeFileSync(join(fakeCtl, 'refuse'), '')
+ok('while the fleet refuses the channel (its lock still held), no session is declared ready and each retry backs off',
+  await waitFor(() => refusals() > refusedBefore) && readies() === 1 && /next start in/.test(portableOut.slice(portableOut.indexOf('restarting the session to reconnect'))))
+rmSync(join(fakeCtl, 'refuse'))
+const restarted = await waitFor(() => readies() === 2, 15000)
+const allSessions = readText(join(harnessHome, '.nvoy-harness', 'tmux.sock.log')).split('\n').filter(Boolean).map(JSON.parse)
+ok('once the fleet takes the channel again, the same conversation resumes and is ready', restarted && allSessions.length >= 3 &&
+  !allSessions[0].args.includes('--continue') && allSessions.slice(1).every(session => session.args.at(-1) === '--continue'))
+portable.kill('SIGTERM'); await portableExited
+
+// The herdr form, against a fake herdr (see fake-herdr.mjs).
+const herdrFake = fakeHerdr(remoteDir)
+// The session's claude logs what reached it, then is the same fake session as tmux runs.
+writeFileSync(join(fakeBin, 'claude'), `#!/usr/bin/env node
+const e = process.env
+require('node:fs').appendFileSync(e.HOME + '/claude.log', JSON.stringify({ pid: process.pid, args: process.argv.slice(2), home: e.HOME, configDir: e.CLAUDE_CONFIG_DIR, pane: e.HERDR_PANE_ID,
+  keyed: e.CLAUDE_CODE_OAUTH_TOKEN === 'sk-ant-oat-fake-login' }) + '\\n')
+require(${JSON.stringify(fakeClaudeSession)})
+`)
+chmodSync(join(fakeBin, 'claude'), 0o755)
+const herdrHome = join(ownHome, '.nvoy-harness', 'herdr-test')
+const herdrCalls = herdrFake.calls
+const claudeRuns = () => readText(join(herdrHome, 'claude.log')).split('\n').filter(Boolean).map(JSON.parse)
+const alive = pid => { try { process.kill(pid, 0); return true } catch { return false } }
+const herdrSupervisor = spawn(process.execPath, ['mcp/tools/instance-harness.mjs', '--instance', 'mac-test', '--remote', clientConfig({ ...client, home: herdrHome })],
+  { cwd: resolve('.'), env: { ...remoteEnv, HARNESS_TERMINAL: 'auto', HARNESS_HERDR_BIN: herdrFake.bin, HARNESS_LAUNCH_MS: '1500' } })
+let herdrOut = ''
+herdrSupervisor.stdout.on('data', d => { herdrOut += d }); herdrSupervisor.stderr.on('data', d => { herdrOut += d })
+const herdrExited = new Promise(done => herdrSupervisor.on('exit', done))
+ok('where herdr answers, the portable session runs in herdr and is seen ready', await waitFor(() => /the session runs in herdr/.test(herdrOut) && /mac-test session ready; its channel to the fleet is up/.test(herdrOut)))
+const herdrState1 = herdrFake.state()
+ok('the identity gets its own workspace, labelled with its name, and nothing in tmux', herdrState1.workspaces?.length === 1 && herdrState1.workspaces[0].label === 'mactest' &&
+  !existsSync(join(herdrHome, '.nvoy-harness', 'tmux.sock.log')))
+const launcher = join(herdrHome, '.nvoy-harness', 'session.sh')
+ok('the pane is sent only the owner-only launcher\'s path, and the launcher holds no login', herdrCalls().filter(c => c[1] === 'run').every(c => c[3] === `'${launcher}'; stty echo 2>/dev/null`) &&
+  (statSync(launcher).mode & 0o777) === 0o700 && !readText(launcher).includes('sk-ant-oat') && !JSON.stringify(herdrCalls()).includes('sk-ant-oat'))
+const run1 = claudeRuns()[0] || {}
+ok('claude runs in the pane with the harness home, the login, the channel, and none of the owner\'s environment', run1.home === herdrHome && run1.keyed && run1.configDir === undefined &&
+  run1.pane === 'w1:p1' && run1.args.includes('server:nvoy-mac-test') && !run1.args.includes('--continue'))
+ok('the launcher becomes the session, so the pane\'s foreground process is the agent itself', run1.pid === Number(readText(join(herdrHome, '.nvoy-harness', 'session.pid'))) &&
+  /\nexec 'claude' /.test(readText(launcher)))
+ok('herdr is asked to name the agent after the identity', await waitFor(() => herdrFake.state().panes['w1:p1']?.name === 'mactest'))
+process.kill(run1.pid, 'SIGKILL')
+ok('a session that exits restarts in the same pane, resuming, and is named again', await waitFor(() => claudeRuns().length === 2 && herdrFake.state().panes['w1:p1']?.name === 'mactest', 15000) &&
+  /session exited \(status gone\); restarting/.test(herdrOut) && claudeRuns()[1].pane === 'w1:p1' && claudeRuns()[1].args.at(-1) === '--continue' && herdrFake.state().workspaces.length === 1)
+const herdrCtl = join(herdrHome, '.fake')
+mkdirSync(herdrCtl, { recursive: true }); writeFileSync(join(herdrCtl, 'ignoreterm'), '')
+const readyCount = () => herdrOut.split('mac-test session ready; its channel to the fleet is up').length - 1
+const readyBefore = readyCount()
+process.kill(claudeRuns()[1].pid, 'SIGKILL')
+await waitFor(() => claudeRuns().length === 3 && readyCount() > readyBefore, 15000)
+const survivor = claudeRuns()[2]
+rmSync(join(herdrCtl, 'ignoreterm'))
+writeFileSync(join(herdrCtl, 'drop'), '')
+ok('a session whose channel dies is restarted, and one that outlives its launcher\'s SIGTERM is killed with its group before the next launch',
+  await waitFor(() => claudeRuns().length === 4 && /the channel to the fleet closed; restarting/.test(herdrOut), 15000) && !alive(survivor.pid))
+await waitFor(() => herdrFake.state().panes['w1:p1']?.name === 'mactest')
+herdrFake.set('w1:p1', { foreground: 'claude' })
+process.kill(claudeRuns()[3].pid, 'SIGKILL')
+ok('an agent left in the pane\'s foreground is never typed into: its workspace is closed and the session starts in a fresh one',
+  await waitFor(() => claudeRuns().length === 5, 15000) && /could not stop still runs in the mactest workspace; closing it/.test(herdrOut) &&
+  claudeRuns()[4].pane === 'w2:p1' && herdrFake.state().workspaces.map(w => `${w.workspace_id} ${w.label}`).join() === 'w2 mactest')
+await waitFor(() => herdrFake.state().panes['w2:p1']?.name === 'mactest')
+herdrFake.set('w2:p1', { wedged: true })
+process.kill(claudeRuns()[4].pid, 'SIGKILL')
+ok('a pane that never runs the launcher is closed, and the next start runs in a fresh workspace',
+  await waitFor(() => claudeRuns().length === 6, 15000) && /the mactest pane did not run the launcher; its workspace is closed/.test(herdrOut) &&
+  claudeRuns()[5].pane === 'w3:p1' && herdrFake.state().workspaces.map(w => `${w.workspace_id} ${w.label}`).join() === 'w3 mactest')
+const sessionPid = Number(readText(join(herdrHome, '.nvoy-harness', 'session.pid')))
+const lastRun = claudeRuns().at(-1)
+herdrSupervisor.kill('SIGTERM'); await herdrExited
+ok('stopping the supervisor stops the session it started in herdr', await waitFor(() => !alive(sessionPid) && !alive(lastRun.pid)))
+ok('nothing secret reaches the supervisor\'s output in herdr either', !/PRIVATE-KEY|sk-ant-oat/.test(herdrOut))
+const agentPlist = spawnSync(process.execPath, ['mcp/tools/install-harness-launchagent.mjs', '--runner', 'claude', '--instance', 'mac-test', '--config', clientConfig(client), '--print'],
+  { cwd: resolve('.'), encoding: 'utf8', env: { ...remoteEnv } })
+ok('the LaunchAgent runs the portable supervisor headless, in herdr, logging under the harness home, and carries no secret', agentPlist.status === 0 &&
+  agentPlist.stdout.includes('<string>pub.nave.nvoy.mac-test.harness</string>') && /instance-harness\.mjs<\/string><string>--instance<\/string><string>mac-test<\/string><string>--remote<\/string>/.test(agentPlist.stdout) &&
+  agentPlist.stdout.includes('<key>HARNESS_TERMINAL</key><string>herdr</string>') && agentPlist.stdout.includes('<key>KeepAlive</key><true/>') &&
+  agentPlist.stdout.includes(join(harnessHome, '.nvoy-harness', 'launchagent', 'stderr.log')) && !/PRIVATE-KEY|sk-ant-oat|nsec|bunker/i.test(agentPlist.stdout))
+ok('the LaunchAgent installer refuses a config the supervisor would refuse', spawnSync(process.execPath, ['mcp/tools/install-harness-launchagent.mjs', '--runner', 'claude', '--instance', 'mac-test',
+  '--config', clientConfig({ ...client, nsec_file: '/x' }), '--print'], { cwd: resolve('.'), encoding: 'utf8', env: remoteEnv }).status === 1)
+
+rmSync(root, { recursive: true, force: true })
+console.log(fails ? `\n${fails} FAILED` : '\nall passed')
+process.exit(fails ? 1 : 0)

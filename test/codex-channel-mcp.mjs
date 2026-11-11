@@ -22,7 +22,8 @@ const authority = { version: 2, type: 'scoped-instruction', sender: '6'.repeat(6
 const instruction = { type: 'admitted-task', instance: manifest.id, envelope: instructionEnvelope, received_at: Date.now(), authority,
   messages: [{ from: authority.sender, at: 1785880000, content: 'review says fix the invariant', event_id: authority.source_event, kind: 9 }] }
 const data = { type: 'admitted-task', instance: manifest.id, envelope: dataEnvelope, received_at: Date.now(), authority: null,
-  messages: [{ from: 'a'.repeat(64), at: 1785880001, content: 'authenticated review data', event_id: 'b'.repeat(64), kind: 9 }] }
+  messages: [{ from: 'a'.repeat(64), at: 1785880001, content: 'authenticated review data', event_id: 'b'.repeat(64), kind: 9 }],
+  context: { channel, fetched_at: 1785880002, messages: [{ from: 'a'.repeat(64), at: 1785879990, content: 'earlier in the room', event_id: 'd'.repeat(64) }] } }
 const notification = { type: 'verified-notification', instance: manifest.id, envelope: notificationEnvelope,
   notification: { version: 1, type: 'verified-channel-activity', source_author: 'd'.repeat(64), source_event: 'e'.repeat(64),
     source_channel: channel, carrier: manifest.task_carriers[0].pubkey, carrier_grant_id: 'f'.repeat(64),
@@ -34,8 +35,14 @@ const transport = new StdioClientTransport({ command: process.execPath, args: [r
 const client = new Client({ name: 'codex-channel-test', version: '0.1.0' })
 try {
   await client.connect(transport)
+  ok('the Codex instructions tell the agent what its manifest lets it do',
+    /What this identity may do, from its manifest:.*not post: nvoy_channel_post is refused.*stops at 3 hops.*This runtime is release/.test(client.getInstructions()))
   const tools = (await client.listTools()).tools.map(tool => tool.name)
-  ok('fixed Codex MCP exposes only bounded list, exact read, and receipt-bound reply', tools.join(',') === 'nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply')
+  ok('fixed Codex MCP exposes bounded channel and manifest-gated profile and memory tools', tools.join(',') === 'nvoy_channel_list,nvoy_channel_read,nvoy_channel_reply,nvoy_channel_post,nvoy_profile_set,nvoy_profile_status,memory_claim,memory_withdraw')
+  const remembered = await client.callTool({ name: 'memory_withdraw', arguments: { slug: 'x', because: 'x' } })
+  ok('without may_remember the Codex memory tool refuses', remembered.isError === true && /NVOY_MEMORY_NOT_PERMITTED/.test(remembered.content[0].text))
+  const post = await client.callTool({ name: 'nvoy_channel_post', arguments: { text: 'hello room' } })
+  ok('without may_post the Codex post tool refuses: this identity may only reply', post.isError === true && /may only reply/.test(post.content[0].text))
   const listed = JSON.parse((await client.callTool({ name: 'nvoy_channel_list', arguments: {} })).content[0].text)
   ok('list returns bounded metadata without sender or message content', listed.instance === manifest.id && listed.total === 3 &&
     listed.truncated === false && listed.records.length === 3 &&
@@ -43,6 +50,7 @@ try {
     !JSON.stringify(listed).includes('review says') && !JSON.stringify(listed).includes(authority.sender))
   const read = JSON.parse((await client.callTool({ name: 'nvoy_channel_read', arguments: { envelope: dataEnvelope } })).content[0].text)
   ok('exact read returns authenticated data without promoting it to instruction', read.authority === null && read.messages[0].content === data.messages[0].content)
+  ok('exact read also returns the channel context, still as data (#245)', read.authority === null && read.context?.messages?.[0]?.content === 'earlier in the room')
   const notice = JSON.parse((await client.callTool({ name: 'nvoy_channel_read', arguments: { envelope: notificationEnvelope } })).content[0].text)
   ok('exact read preserves content-free verified notification provenance without inventing messages',
     notice.authority === null && notice.notification.source_event === notification.notification.source_event && !('messages' in notice))
@@ -50,6 +58,11 @@ try {
   ok('read acknowledgement is durable and identity-local', after.records.find(row => row.envelope === dataEnvelope).read === true && readFileSync(join(runtime, 'codex-mcp-state', 'read.jsonl'), 'utf8').includes(dataEnvelope))
   const denied = await client.callTool({ name: 'nvoy_channel_reply', arguments: { envelope: dataEnvelope, text: 'no' } })
   ok('data-only feedback cannot acquire reply authority', denied.isError === true && readFileSync(join(runtime, 'reply-requests.jsonl'), 'utf8') === '')
+  const leakedKey = 's' + 'k-ant-api03-' + 'x9Kd2Lm4Np6Qr8St0Uv2Wx4Yz6Ab8Cd0Ef2Gh4Ij6Kl8'
+  const leak = await client.callTool({ name: 'nvoy_channel_reply', arguments: { envelope: instructionEnvelope, text: `the key is ${leakedKey}` } })
+  ok('a reply carrying a credential is withheld, naming the pattern and not the value, and nothing is queued',
+    leak.isError === true && JSON.parse(leak.content[0].text).code === 'NVOY_WITHHELD_CREDENTIAL' && leak.content[0].text.includes('(an Anthropic key)') &&
+    !leak.content[0].text.includes(leakedKey) && readFileSync(join(runtime, 'reply-requests.jsonl'), 'utf8') === '')
   const reply = JSON.parse((await client.callTool({ name: 'nvoy_channel_reply', arguments: { envelope: instructionEnvelope, text: 'fixed' } })).content[0].text)
   const queued = JSON.parse(readFileSync(join(runtime, 'reply-requests.jsonl'), 'utf8'))
   ok('instruction reply contains no recipient, channel, signer, or instance selection', reply.queued === true && queued.receipt === instructionEnvelope && queued.content === 'fixed' &&

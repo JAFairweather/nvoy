@@ -3,6 +3,8 @@ Description=Nvoy runtime deploy — pull latest verified immutable release
 After=network-online.target docker.service
 Wants=network-online.target
 Requires=docker.service
+# Both the timer and the path unit start it; bursts of manifest edits must never trip the start limit.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot

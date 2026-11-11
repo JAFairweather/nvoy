@@ -6,9 +6,11 @@
 // the same structural validation and duplicate-identity check.
 
 import { lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs'
-import { resolve, dirname, relative, sep } from 'node:path'
+import { resolve, dirname, isAbsolute, relative, sep } from 'node:path'
 import { decode } from 'nostr-tools/nip19'
 import { codexThreadId as validCodexThreadId, localControlSocket } from './codex_app_server.mjs'
+import { normalizeBuzzRelay } from './buzz_native.mjs'
+import { DEFAULT_LIMITS } from './agent_limits.mjs'
 
 const die = message => { throw new Error(message) }
 const hex = value => String(value || '').toLowerCase()
@@ -57,6 +59,27 @@ export function readManifest(root, requestedId) {
     return Object.freeze({ pubkey, channels: Object.freeze(channels) })
   })
   const relays = (Array.isArray(raw.relays) ? raw.relays : []).map(String).filter(v => /^wss:\/\//.test(v))
+  // Optional native Buzz participation: the community relay this identity is a member of, and the
+  // channels it listens and answers in. Absent means the identity has no native ears or mouth.
+  let buzz = null
+  if (raw.buzz != null) {
+    const channels = (Array.isArray(raw.buzz?.channels) ? raw.buzz.channels : []).map(value => String(value || '').toLowerCase())
+    let relay
+    try { relay = normalizeBuzzRelay(raw.buzz?.relay) } catch (e) { die(`buzz.relay: ${e.message}`) }
+    if (!channels.length || !channels.every(validChannel) || new Set(channels).size !== channels.length) die('buzz requires distinct channel UUIDs')
+    // Native status reactions (👀 seen, 💬 working) are on wherever the identity is a member; an
+    // owner may switch them off, but only with an explicit boolean.
+    const statusReactions = raw.buzz?.status_reactions ?? true
+    if (typeof statusReactions !== 'boolean') die('buzz.status_reactions must be true or false')
+    // The key the community relay signs its room member lists (kind 39002) with. Pinned here from
+    // trusted instance configuration, never learned from the relay (#321).
+    let relaySigner = null
+    if (raw.buzz?.relay_signer != null) {
+      try { relaySigner = toHex(raw.buzz.relay_signer) } catch { relaySigner = '' }
+      if (!valid(relaySigner)) die('buzz.relay_signer must be a pubkey')
+    }
+    buzz = Object.freeze({ relay, channels: Object.freeze(channels), statusReactions, relaySigner })
+  }
   if (!valid(pubkey) || !grantors.length || !grantors.every(valid) || !relays.length) die('manifest requires pubkey, grantors, and wss relays')
   if (new Set(carriers.map(entry => entry.pubkey)).size !== carriers.length) die('task_carrier pubkeys must be distinct')
   const approvalEndpoint = String(raw.approval_endpoint || raw.approvalEndpoint || '')
@@ -148,6 +171,136 @@ export function readManifest(root, requestedId) {
       die('macos_desktop requires the fixed Codex bundle, project/chat labels, and an absolute UI driver')
     }
   }
+  // A hosted harness is the agent's own coding-agent session (Claude Code, or one persistent Codex
+  // thread), kept open beside the stack: admitted envelopes are injected into it, and it replies
+  // through the broker. It is the model-side consumer of a notify_only queue, so it can never
+  // coexist with a headless worker.
+  let harness = null
+  if (raw.harness != null) {
+    const runner = String(raw.harness?.runner || ''), credentialRef = String(raw.harness?.credential_ref || raw.harness?.credentialRef || '')
+    if (!['claude', 'codex'].includes(runner) || !credentialRef.startsWith('/')) die('harness requires runner "claude" or "codex" and an absolute credential_ref')
+    if (brokerMode !== 'local' || deliveryMode !== 'notify_only' || workerEnabled) die('a harness requires a local-broker, worker-disabled notify_only manifest')
+    if ([keyRef, bunkerUriRef, bunkerClientRef].includes(credentialRef)) die('harness credential_ref must not name a Nostr credential')
+    const model = String(raw.harness?.model || '')
+    if (model && !/^[a-z0-9][a-z0-9.\-\[\]]{0,63}$/i.test(model)) die('harness model must be a model name or alias')
+    harness = Object.freeze({ runner, credentialRef, model })
+  }
+  // A wake webhook tells a harness hosted off the fleet (one that cannot hold an SSH stream) that an
+  // envelope is waiting. Its URL and auth headers are operator credentials, never Nostr ones, and
+  // only the envelope id crosses: the harness still reads the message over the channel key.
+  let wakeWebhook = null
+  if (raw.wake_webhook != null) {
+    const refs = ['url_ref', 'headers_ref'].map(name => String(raw.wake_webhook?.[name] || ''))
+    const underCredentials = ref => ref.startsWith('/etc/nvoy/credentials/') && resolve(ref) === ref && !/[\s\0]/.test(ref)
+    if (!refs.every(underCredentials)) die('wake_webhook requires url_ref and headers_ref as absolute paths under /etc/nvoy/credentials')
+    if (refs[0] === refs[1]) die('wake_webhook url_ref and headers_ref must be two files')
+    if (brokerMode !== 'local' || deliveryMode !== 'notify_only' || workerEnabled) die('a wake_webhook requires a local-broker, worker-disabled notify_only manifest')
+    if (refs.some(ref => [keyRef, bunkerUriRef, bunkerClientRef].includes(ref))) die('wake_webhook references must not name a Nostr credential')
+    if (harness && refs.includes(harness.credentialRef)) die('wake_webhook references must not name the harness credential')
+    wakeWebhook = Object.freeze({ urlRef: refs[0], headersRef: refs[1] })
+  }
+  // The channel door carries the channel MCP over HTTPS for a harness host that cannot reach SSH
+  // (channel-https-door.mjs). Its one credential is the SHA-256 of a bearer token, and it joins the
+  // named Docker network of the reverse proxy that terminates TLS, so it publishes no host port.
+  let channelDoor = null
+  if (raw.channel_door != null) {
+    const tokenHashRef = String(raw.channel_door?.token_hash_ref || '')
+    const network = String(raw.channel_door?.network || '')
+    if (!tokenHashRef.startsWith('/etc/nvoy/credentials/') || resolve(tokenHashRef) !== tokenHashRef || /[\s\0]/.test(tokenHashRef)) die('channel_door requires token_hash_ref as an absolute path under /etc/nvoy/credentials')
+    if (!/^[a-z0-9][a-z0-9_.-]{0,63}$/i.test(network)) die('channel_door requires network, the reverse proxy\'s Docker network name')
+    if (brokerMode !== 'local' || deliveryMode !== 'notify_only' || workerEnabled) die('a channel_door requires a local-broker, worker-disabled notify_only manifest')
+    if ([keyRef, bunkerUriRef, bunkerClientRef, harness?.credentialRef, wakeWebhook?.urlRef, wakeWebhook?.headersRef].includes(tokenHashRef)) die('channel_door token_hash_ref must not name another credential')
+    channelDoor = Object.freeze({ tokenHashRef, network })
+  }
+  // An identity may only reply unless its owner opts it in to starting conversations: which of its
+  // Buzz channels, how many posts an hour, and the closed list of keys it may p-tag. A mention entry
+  // is a key, or { name, pubkey } so the agent can name who it means.
+  let mayPost = null
+  if (raw.may_post != null) {
+    const block = raw.may_post
+    if (typeof block !== 'object' || Array.isArray(block) || Object.keys(block).some(k => !['channels', 'per_hour', 'mention', 'mention_rooms'].includes(k))) die('may_post takes only channels, per_hour, mention and mention_rooms')
+    if (!buzz) die('may_post requires a buzz block')
+    if (brokerMode !== 'local' || deliveryMode !== 'notify_only' || workerEnabled) die('may_post requires a local-broker, worker-disabled notify_only manifest')
+    const channels = (Array.isArray(block.channels) ? block.channels : []).map(value => String(value || '').toLowerCase())
+    if (!channels.length || !channels.every(validChannel) || new Set(channels).size !== channels.length) die('may_post.channels requires distinct channel UUIDs')
+    if (!channels.every(c => buzz.channels.includes(c))) die('may_post.channels must be a subset of buzz.channels')
+    if (!Number.isInteger(block.per_hour) || block.per_hour < 1 || block.per_hour > 30) die('may_post.per_hour must be an integer from 1 to 30')
+    if (block.mention != null && !Array.isArray(block.mention)) die('may_post.mention must be a list')
+    const mention = (block.mention || []).map(entry => {
+      const named = entry && typeof entry === 'object' && !Array.isArray(entry)
+      if (named && Object.keys(entry).some(k => !['name', 'pubkey'].includes(k))) die('a may_post.mention entry is a pubkey or { name, pubkey }')
+      let pk
+      try { pk = toHex(named ? entry.pubkey : entry) } catch { pk = '' }
+      const name = named ? String(entry.name || '') : ''
+      if (!valid(pk) || (named && !/^[a-z0-9][a-z0-9._-]{0,31}$/i.test(name))) die('a may_post.mention entry is a pubkey or { name, pubkey }')
+      return Object.freeze({ pubkey: pk, name: name || null })
+    })
+    if (new Set(mention.map(m => m.pubkey)).size !== mention.length) die('may_post.mention pubkeys must be distinct')
+    const names = mention.filter(m => m.name).map(m => m.name.toLowerCase())
+    if (new Set(names).size !== names.length) die('may_post.mention names must be distinct')
+    // Opt-in: the members of each may_post room become mentionable in that room (#321).
+    const mentionRooms = block.mention_rooms ?? false
+    if (typeof mentionRooms !== 'boolean') die('may_post.mention_rooms must be true or false')
+    if (mentionRooms && !buzz.relaySigner) die('may_post.mention_rooms requires buzz.relay_signer')
+    mayPost = Object.freeze({ channels: Object.freeze(channels), perHour: block.per_hour, mention: Object.freeze(mention), mentionRooms })
+  }
+  // Room-scoped Hive memory claims under the identity's own key (agent_memory.mjs), off until the
+  // owner names the rooms, an hourly cap and the writer transport to the private store. Every claim
+  // and withdrawal is a kind 30078 the broker signs and submits there: `submit` is either the local
+  // writer socket or the forced-command SSH bridge to it, never a relay.
+  let mayRemember = null
+  if (raw.may_remember != null) {
+    const block = raw.may_remember
+    if (typeof block !== 'object' || Array.isArray(block) || Object.keys(block).some(k => !['rooms', 'per_hour', 'submit'].includes(k))) die('may_remember takes only rooms, per_hour and submit')
+    const transport = block.submit
+    if (!transport || typeof transport !== 'object' || Array.isArray(transport) || Object.keys(transport).length !== 1 ||
+        !(typeof transport.socket === 'string' ? isAbsolute(transport.socket) && !transport.socket.includes('\0')
+          : Array.isArray(transport.command) && transport.command.length > 0 && transport.command.every(a => typeof a === 'string' && a.length > 0 && !a.includes('\0')) && isAbsolute(transport.command[0]))) {
+      die('may_remember.submit takes exactly one of socket (an absolute path) or command (an absolute executable and its arguments)')
+    }
+    if (!buzz) die('may_remember requires a buzz block')
+    if (brokerMode !== 'local' || deliveryMode !== 'notify_only' || workerEnabled) die('may_remember requires a local-broker, worker-disabled notify_only manifest')
+    const rooms = (Array.isArray(block.rooms) ? block.rooms : []).map(value => String(value || '').toLowerCase())
+    if (!rooms.length || !rooms.every(validChannel) || new Set(rooms).size !== rooms.length) die('may_remember.rooms requires distinct room UUIDs')
+    if (!rooms.every(r => buzz.channels.includes(r))) die('may_remember.rooms must be a subset of buzz.channels')
+    if (!Number.isInteger(block.per_hour) || block.per_hour < 1 || block.per_hour > 30) die('may_remember.per_hour must be an integer from 1 to 30')
+    const submit = transport.socket ? Object.freeze({ socket: transport.socket }) : Object.freeze({ command: Object.freeze([...transport.command]) })
+    mayRemember = Object.freeze({ rooms: Object.freeze(rooms), perHour: block.per_hour, submit })
+  }
+  let maySetProfile = null
+  if (raw.may_set_profile != null) {
+    const block = raw.may_set_profile
+    if (!block || typeof block !== 'object' || Array.isArray(block) ||
+        Object.keys(block).some(key => !['kind', 'pubkey', 'grant_id', 'per_day', 'picture_hosts'].includes(key))) die('may_set_profile has unknown fields')
+    if (!buzz) die('may_set_profile requires a buzz block')
+    if (brokerMode !== 'local' || deliveryMode !== 'notify_only' || workerEnabled) die('may_set_profile requires a local-broker, worker-disabled notify_only manifest')
+    const scopedPubkey = toHex(block.pubkey)
+    if (block.kind !== 0 || scopedPubkey !== pubkey) die('may_set_profile must scope kind 0 to the manifest pubkey')
+    if (!valid(String(block.grant_id || '').toLowerCase())) die('may_set_profile.grant_id must be a 64-hex identifier')
+    const perDay = block.per_day ?? 1
+    if (!Number.isInteger(perDay) || perDay < 1 || perDay > 24) die('may_set_profile.per_day must be an integer from 1 to 24')
+    const pictureHosts = block.picture_hosts ?? ['nave.pub']
+    if (!Array.isArray(pictureHosts) || !pictureHosts.length || !pictureHosts.every(host =>
+      typeof host === 'string' && /^[a-z0-9][a-z0-9.-]*[a-z0-9]$/.test(host) && !host.includes('..')) ||
+      new Set(pictureHosts).size !== pictureHosts.length) die('may_set_profile.picture_hosts requires distinct DNS hosts')
+    maySetProfile = Object.freeze({ kind: 0, pubkey, grantId: block.grant_id.toLowerCase(), perDay,
+      pictureHosts: Object.freeze([...pictureHosts]) })
+  }
+  // The agent card (agent_card.mjs): the broker publishes what this manifest allows, signed by the
+  // agent's own key. Off until the owner turns it on, since the agent's Bunker must allow kind 30078.
+  const agentCard = raw.agent_card ?? false
+  if (typeof agentCard !== 'boolean') die('agent_card must be true or false')
+  if (agentCard && (!buzz || brokerMode !== 'local')) die('agent_card requires a buzz block and a local broker')
+  // The brakes on agent-to-agent traffic (agent_limits.mjs). Always in force; the block only tunes them.
+  let agentLimits = DEFAULT_LIMITS
+  if (raw.agent_limits != null) {
+    const block = raw.agent_limits
+    if (typeof block !== 'object' || Array.isArray(block) || Object.keys(block).some(k => !['max_hops', 'per_sender_per_hour'].includes(k))) die('agent_limits takes only max_hops and per_sender_per_hour')
+    const maxHops = block.max_hops ?? DEFAULT_LIMITS.maxHops, perSenderPerHour = block.per_sender_per_hour ?? DEFAULT_LIMITS.perSenderPerHour
+    if (!Number.isInteger(maxHops) || maxHops < 1 || maxHops > 10) die('agent_limits.max_hops must be an integer from 1 to 10')
+    if (!Number.isInteger(perSenderPerHour) || perSenderPerHour < 1 || perSenderPerHour > 120) die('agent_limits.per_sender_per_hour must be an integer from 1 to 120')
+    agentLimits = Object.freeze({ maxHops, perSenderPerHour })
+  }
   if (brokerMode === 'remote') {
     if (!['codex_app_server', 'macos_desktop'].includes(deliveryMode) || codexTransport !== 'local_control_socket') die('a remote broker is valid only for an exact local Codex Desktop binding')
     if (!/^[a-z_][a-z0-9_-]{0,31}@[a-z0-9.-]+$/i.test(sshTarget) || !sshIdentityFile.startsWith('/') ||
@@ -155,8 +308,8 @@ export function readManifest(root, requestedId) {
       die('a remote broker manifest requires fixed ssh_target, absolute SSH files, and ssh_known_hosts_sha256')
     }
   }
-  return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, carriers: Object.freeze(carriers), relays, stateDir, runtimeDir, spoolDir,
-    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, adapterContainer, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath, codexAppBundleId, codexProjectLabel, codexChatLabel, codexUiDriver,
+  return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, carriers: Object.freeze(carriers), buzz, relays, stateDir, runtimeDir, spoolDir,
+    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, adapterContainer, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath, codexAppBundleId, codexProjectLabel, codexChatLabel, codexUiDriver, harness, wakeWebhook, channelDoor, mayPost, mayRemember, maySetProfile, agentLimits, agentCard,
     sshTarget, sshIdentityFile, sshKnownHostsFile, sshKnownHostsSha256, approvalEndpoint: approvalEndpoint.replace(/\/$/, '') })
 }
 

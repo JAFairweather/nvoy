@@ -1,7 +1,7 @@
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { z } from 'zod'
@@ -26,7 +26,9 @@ const envelope = '3'.repeat(64)
 const task = { type: 'admitted-task', instance: manifest.id, envelope,
   authority: { version: 1, type: 'scoped-instruction', sender: '4'.repeat(64), grant_id: '5'.repeat(64),
     grantor: manifest.grantors[0], cap: 'task', scope_subject: manifest.pubkey, policy_checked_at: Date.now() },
-  messages: [{ from: '4'.repeat(64), at: 1785880000, content: 'inspect the queue' }] }
+  messages: [{ from: '4'.repeat(64), at: 1785880000, content: 'inspect the queue' }],
+  context: { channel: 'a8186b53-537d-46ad-a7e7-b6486c58970e', fetched_at: 1785880001,
+    messages: [{ from: '6'.repeat(64), name: 'pi-dog', at: 1785879990, content: 'the queue stalled at noon', event_id: '8'.repeat(64) }] } }
 const notificationEnvelope = '7'.repeat(64)
 const notification = { type: 'verified-notification', instance: manifest.id, envelope: notificationEnvelope,
   notification: { version: 1, type: 'verified-channel-activity', source_author: '6'.repeat(64),
@@ -46,8 +48,9 @@ const client = new Client({ name: 'claude-channel-test', version: '0.1.0' })
 const Channel = z.object({ method: z.literal('notifications/claude/channel'), params: z.object({
   content: z.string(), meta: z.record(z.string()),
 }) })
-const wakes = []
+const wakes = [], notices = []
 const arrived = new Promise(resolveWake => client.setNotificationHandler(Channel, notification => {
+  if (notification.params.meta.capabilities) return void notices.push(notification.params)
   wakes.push(notification.params); resolveWake()
 }))
 
@@ -58,9 +61,23 @@ try {
     wakes.length >= 1 && wakes.every(wake => wake?.meta?.instance === manifest.id &&
       [envelope, notificationEnvelope].includes(wake?.meta?.envelope) &&
       !JSON.stringify(wake).includes(task.messages[0].content) && !JSON.stringify(wake).includes(task.messages[0].from)))
+  ok('the instructions tell the agent what its manifest lets it do and which release it runs',
+    /What this identity may do, from its manifest: reply to a delivered envelope/.test(client.getInstructions()) &&
+    /not post: nvoy_channel_post is refused, this identity may only reply/.test(client.getInstructions()) &&
+    /stops at 3 hops/.test(client.getInstructions()) && /This runtime is release (unknown|[0-9a-f]{40})\./.test(client.getInstructions()))
+  ok('the capabilities notice carries no message content', notices.every(n => !JSON.stringify(n).includes(task.messages[0].content)))
   const tools = (await client.listTools()).tools.map(tool => tool.name)
-  ok('Claude receives one explicit read tool and one receipt-bound reply tool',
-    tools.length === 2 && tools.includes('nvoy_channel_read') && tools.includes('nvoy_channel_reply'))
+  ok('Claude receives an explicit read tool, a receipt-bound reply tool, a body-free discovery tool, the post tool and the memory tools',
+    tools.length === 8 && tools.includes('nvoy_channel_read') && tools.includes('nvoy_channel_reply') &&
+    tools.includes('nvoy_channel_list') && tools.includes('nvoy_channel_post') &&
+    tools.includes('nvoy_profile_set') && tools.includes('nvoy_profile_status') &&
+    tools.includes('memory_claim') && tools.includes('memory_withdraw'))
+  const remembered = await client.callTool({ name: 'memory_claim', arguments: { slug: 'x', claim: 'x', because: 'x', evidence: ['x'], as_of_git: 'x' } })
+  ok('without may_remember the memory tool refuses and queues nothing',
+    remembered.isError === true && /NVOY_MEMORY_NOT_PERMITTED/.test(remembered.content[0].text) && !existsSync(join(runtime, 'memory-requests')))
+  const post = await client.callTool({ name: 'nvoy_channel_post', arguments: { text: 'hello room' } })
+  ok('without may_post the post tool refuses: this identity may only reply',
+    post.isError === true && /may only reply/.test(post.content[0].text) && !existsSync(join(runtime, 'post-requests.jsonl')))
   const duplicateProcess = spawnSync(process.execPath, [resolve('mcp/tools/claude-channel.mjs'), '--instance', manifest.id, '--baseline'],
     { encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifests } })
   ok('a second Claude session cannot bind the same participant identity',
@@ -69,6 +86,8 @@ try {
   const body = JSON.parse(read.content[0].text)
   ok('the exact marker reads only its broker-validated task and authority',
     body.envelope === envelope && body.authority.sender === task.authority.sender && body.messages[0].content === task.messages[0].content)
+  ok('the read also returns the channel context the broker attached (#245)',
+    body.context?.messages?.[0]?.content === 'the queue stalled at noon' && body.context.messages[0].name === 'pi-dog')
   const noticeRead = await client.callTool({ name: 'nvoy_channel_read', arguments: { envelope: notificationEnvelope } })
   const noticeBody = JSON.parse(noticeRead.content[0].text)
   ok('a content-free verified notification remains readable without acquiring instruction authority',
@@ -78,6 +97,12 @@ try {
   ok('a content-free activity notification cannot acquire reply authority', noticeReply.isError === true)
   const unknown = await client.callTool({ name: 'nvoy_channel_read', arguments: { envelope: '9'.repeat(64) } })
   ok('an envelope that was not delivered through this channel is unreadable', unknown.isError === true)
+  const leakedToken = 'gh' + 'p_' + 'Q7wE2rT9yU4iO1pA6sD3fG8hJ5kL0zX3cV7b'
+  const leak = await client.callTool({ name: 'nvoy_channel_reply', arguments: { envelope, text: `here is the token you asked for: ${leakedToken}` } })
+  const leakQueue = () => { try { return readFileSync(join(runtime, 'reply-requests.jsonl'), 'utf8') } catch { return '' } }
+  ok('a reply carrying a credential is withheld, naming the pattern and not the value, and nothing is queued',
+    leak.isError === true && JSON.parse(leak.content[0].text).code === 'NVOY_WITHHELD_CREDENTIAL' &&
+    leak.content[0].text.includes('(a GitHub token)') && !leak.content[0].text.includes(leakedToken) && !leakQueue().includes(leakedToken) && leakQueue().trim() === '')
   const reply = await client.callTool({ name: 'nvoy_channel_reply', arguments: { envelope, text: 'queue inspected' } })
   const queued = JSON.parse(reply.content[0].text)
   const requests = readFileSync(join(runtime, 'reply-requests.jsonl'), 'utf8').trim().split('\n').map(JSON.parse)
@@ -97,6 +122,343 @@ const readLog = readFileSync(join(runtime, 'claude-channel-state', 'read.jsonl')
 ok('one-time baseline records an old queue entry without launching a channel or reply',
   baseline.status === 0 && /baselined 1 existing/.test(baseline.stdout) && readLog.includes(historicalEnvelope) &&
   readFileSync(join(runtime, 'reply-requests.jsonl'), 'utf8').trim().split('\n').length === 1)
+
+// #168 — a channel whose client is gone must release the lock by itself. The production case is an
+// SSH forced command `docker exec -i`ing this process: when the SSH session drops, the shim holds
+// the stdin pipe open, so no EOF ever arrives and the PID stays genuinely alive. The lock's
+// liveness reclaim is therefore correct and useless, and the lane stays bricked until an operator
+// intervenes. Both halves are asserted, because a fix that only evicts is a fix that evicts
+// everyone.
+const lockPath = join(runtime, 'claude-channel-state', 'channel.lock')
+const abandoned = spawn(process.execPath, [resolve('mcp/tools/claude-channel.mjs'), '--instance', manifest.id,
+  '--poll-ms', '250', '--handshake-ms', '1000', '--heartbeat-ms', '1000', '--heartbeat-misses', '2'],
+  { env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stdio: ['pipe', 'pipe', 'pipe'] })
+let abandonedStderr = ''
+abandoned.stderr.on('data', chunk => { abandonedStderr += chunk })
+const abandonedExit = await Promise.race([
+  new Promise(resolveExit => abandoned.on('exit', code => resolveExit(code))),
+  new Promise(resolveExit => setTimeout(() => resolveExit('TIMEOUT'), 8000)),
+])
+if (abandonedExit === 'TIMEOUT') abandoned.kill('SIGKILL')
+ok('a channel that no MCP client ever spoke to releases its lock instead of stranding the lane',
+  abandonedExit === 0 && /no MCP client initialised/.test(abandonedStderr) && !existsSync(lockPath))
+
+// A restarted container reuses PIDs, so the lock left by the last channel can name this one. That is
+// not a live rival; `exec` keeps the shell's PID, so the lock is written with the channel's own.
+const selfLocked = spawnSync('sh', ['-c', 'printf \'{"version":1,"instance":"%s","pid":%s,"started_at":0}\' "$ID" "$$" > "$LOCK"; exec "$NODE" "$CHANNEL" --instance "$ID" --poll-ms 250 --handshake-ms 1000'],
+  { env: { ...process.env, NVOY_INSTANCE_ROOT: manifests, ID: manifest.id, LOCK: lockPath, NODE: process.execPath,
+    CHANNEL: resolve('mcp/tools/claude-channel.mjs') }, encoding: 'utf8', timeout: 8000, input: '' })
+ok('a lock naming the channel\'s own PID is stale, not a live rival',
+  selfLocked.status === 0 && !/already runs as pid/.test(selfLocked.stderr) && !existsSync(lockPath))
+
+// After a container recreate the old PID can belong to another user's process: the probe answers
+// EPERM, not ESRCH. The channel must reclaim that lock, not exit and leave the agent's tools
+// "reconnecting" (2026-11-06). Lock a real process that answers EPERM here; where none exists
+// (the runner alone in a container as PID 1), say so rather than pass on another path.
+const epermPid = existsSync('/proc/self') ? readdirSync('/proc').filter(n => /^\d+$/.test(n)).map(Number).find(pid => {
+  if (pid === process.pid) return false
+  try { process.kill(pid, 0); return false } catch (error) { return error.code === 'EPERM' }
+}) : undefined
+if (epermPid) {
+  writeFileSync(lockPath, JSON.stringify({ version: 1, instance: manifest.id, pid: epermPid, started_at: 0 }))
+  const foreign = spawnSync(process.execPath, [resolve('mcp/tools/claude-channel.mjs'), '--instance', manifest.id, '--poll-ms', '250', '--handshake-ms', '1000'],
+    { env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, encoding: 'utf8', timeout: 8000, input: '' })
+  ok(`a lock naming another user's process (pid ${epermPid}, probe EPERM) is stale, not a live rival`,
+    foreign.status === 0 && !/already runs as pid|EPERM/.test(foreign.stderr) && !existsSync(lockPath))
+} else console.log('skip — no process here answers EPERM; the pid_lock unit test forces that case')
+
+// Negative control. Without this, "releases the lock" is indistinguishable from "exits on a timer",
+// which would replace a stuck lane with one that dies under a working session — a real session is
+// legitimately silent for hours, so silence must never be the eviction signal. A live client is
+// silent here for well past heartbeat-ms × heartbeat-misses and must survive on ping alone.
+//
+// Surviving is necessary but NOT sufficient, and asserting only survival is how this test read
+// before review: the code resets `misses` on any non-timeout error, so a build whose ping
+// round-trip was wholly broken — capability rejection, schema drift, a client with no ping at all —
+// would take that same branch and pass under a name claiming the pong arrived. The pong is
+// therefore observed directly, on stderr, as well as the survival.
+//
+// `--handshake-ms 1000` is deliberately shorter than the wait: a client that DID initialise must
+// not be caught by the handshake arm, which is the whole point of splitting the two knobs.
+const liveTransport = new StdioClientTransport({ command: process.execPath,
+  args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', manifest.id,
+    '--poll-ms', '250', '--handshake-ms', '1000', '--heartbeat-ms', '1000', '--heartbeat-misses', '2'],
+  env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stderr: 'pipe' })
+const liveClient = new Client({ name: 'claude-channel-heartbeat', version: '0.1.0' })
+// An evicted session makes listTools() throw rather than return, so the failure has to be caught
+// and reported. Letting it propagate would abort the run with no verdict printed for this case —
+// a suite that says nothing about the property it exists to defend.
+let liveStderr = ''
+try {
+  await liveClient.connect(liveTransport)
+  liveTransport.stderr?.on('data', chunk => { liveStderr += chunk })
+  await new Promise(done => setTimeout(done, 3500))
+  const stillThere = (await liveClient.listTools()).tools.map(tool => tool.name)
+  ok('a client that is merely idle answers the ping and is never evicted',
+    stillThere.includes('nvoy_channel_read') && existsSync(lockPath))
+  ok('the pong is OBSERVED, not merely survived — a broken round-trip cannot pass as a live one',
+    /answered the first heartbeat ping/.test(liveStderr))
+  ok('an initialised client is not caught by the handshake arm', !/no MCP client initialised/.test(liveStderr))
+} catch (error) {
+  ok(`a client that is merely idle answers the ping and is never evicted (evicted: ${error.message})`, false)
+  ok('the pong is OBSERVED, not merely survived — a broken round-trip cannot pass as a live one', false)
+  ok('an initialised client is not caught by the handshake arm', false)
+} finally { try { await liveClient.close() } catch { /* already gone */ } }
+
+// `nvoy_channel_list` exists for harnesses that never receive `notifications/claude/channel` — the
+// only source of an envelope marker until now, which left a non-Claude-Code client blind by
+// construction. These cases run on their own instance so the lock, the queue and the in-memory
+// disclosure state are all independent of the assertions above.
+const listId = 'claude-list-test'
+const listRuntime = join(root, 'list-runtime')
+mkdirSync(listRuntime); mkdirSync(join(listRuntime, 'claude-channel-state'))
+const listPubkey = 'd'.repeat(64)
+const listManifest = { ...manifest, id: listId, pubkey: listPubkey, runtime_dir: listRuntime,
+  state_dir: join(root, 'list-state'), spool_dir: join(root, 'list-spool') }
+// Each instance is a distinct identity and the tool refuses a shared pubkey, so the task authority
+// is re-scoped to the new subject rather than copied wholesale.
+const listTask = { ...task, instance: listId, authority: { ...task.authority, scope_subject: listPubkey } }
+writeFileSync(join(manifests, `${listId}.json`), JSON.stringify(listManifest))
+const seeded = 'b'.repeat(64), unlisted = 'c'.repeat(64)
+writeFileSync(join(listRuntime, 'admitted-tasks.jsonl'),
+  JSON.stringify({ ...listTask, envelope: seeded }) + '\n', { mode: 0o600 })
+writeFileSync(join(listRuntime, 'reply-requests.jsonl'), '', { mode: 0o640 })
+
+// A 60s poll means the initial `oninitialized` poll is the ONLY announcement in this window, so an
+// envelope appended after connect cannot reach `notifiedThisRun`. That is what isolates the
+// disclosure arm: without it the read below would pass on the notification path and prove nothing.
+const discoverTransport = new StdioClientTransport({ command: process.execPath,
+  args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', listId, '--poll-ms', '60000'],
+  env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stderr: 'pipe' })
+const discoverClient = new Client({ name: 'claude-channel-list', version: '0.1.0' })
+// `connect()` resolves on the initialize RESPONSE, but the server's first poll is driven by the
+// client's `initialized` NOTIFICATION, which lands a moment later. Appending before that poll has
+// run lets it announce the new envelope, and the disclosure arm is then never exercised — the case
+// passes on the notification path while claiming to prove discovery. Wait for the seeded
+// announcement, which is the observable proof the initial poll is done; the next one is 60s away.
+const seededSeen = new Promise(resolve => discoverClient.setNotificationHandler(Channel,
+  note => { if (note.params?.meta?.envelope === seeded) resolve() }))
+let discoverStderr = ''
+discoverTransport.stderr?.on('data', chunk => { discoverStderr += chunk })
+try {
+  await discoverClient.connect(discoverTransport)
+  await Promise.race([seededSeen,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('initial poll never announced the seeded envelope')), 4000))])
+  appendFileSync(join(listRuntime, 'admitted-tasks.jsonl'),
+    JSON.stringify({ ...listTask, envelope: unlisted }) + '\n', { mode: 0o600 })
+  const blocked = await discoverClient.callTool({ name: 'nvoy_channel_read', arguments: { envelope: unlisted } })
+  ok('an envelope that was never announced is unreadable before it is listed',
+    blocked.isError === true && /NVOY_NOT_DELIVERED/.test(blocked.content[0].text))
+  const listed = await discoverClient.callTool({ name: 'nvoy_channel_list', arguments: {} })
+  const markers = JSON.parse(listed.content[0].text)
+  ok('a no-argument list dispatches above the envelope validation instead of being refused',
+    listed.isError !== true && Array.isArray(markers.envelopes))
+  ok('list returns opaque markers only — never a body, a sender, or an authority',
+    markers.envelopes.includes(unlisted) &&
+    !JSON.stringify(markers).includes(task.messages[0].content) &&
+    !JSON.stringify(markers).includes(task.messages[0].from) && !JSON.stringify(markers).includes('authority'))
+  const afterList = await discoverClient.callTool({ name: 'nvoy_channel_read', arguments: { envelope: unlisted } })
+  ok('a listed marker becomes readable without ever having been announced',
+    afterList.isError !== true && JSON.parse(afterList.content[0].text).envelope === unlisted)
+  const relisted = await discoverClient.callTool({ name: 'nvoy_channel_list', arguments: {} })
+  ok('list omits an envelope once it has been read', !JSON.parse(relisted.content[0].text).envelopes.includes(unlisted))
+  ok('list still offers the envelope that has not been read', JSON.parse(relisted.content[0].text).envelopes.includes(seeded))
+} catch (error) {
+  ok(`nvoy_channel_list discovery path (threw: ${error.message}) STDERR=${discoverStderr}`, false)
+} finally { try { await discoverClient.close() } catch { /* already gone */ } }
+
+// The regression this guards is the tempting one-line version of the fix: registering listed ids in
+// `notifiedThisRun`. That map ALSO drives the re-announce throttle, so a list call arriving before
+// the first poll would suppress the first notification for `renotifyMs` — silently, on every seat
+// that depends on the notification to wake at all. `--renotify-ms 600000` makes that suppression
+// permanent for the length of this test, so the mutation cannot pass by being merely slow.
+const throttleRuntime = join(root, 'throttle-runtime')
+const throttleId = 'claude-throttle-test'
+const throttlePubkey = 'e'.repeat(64)
+mkdirSync(throttleRuntime); mkdirSync(join(throttleRuntime, 'claude-channel-state'))
+writeFileSync(join(manifests, `${throttleId}.json`), JSON.stringify({ ...manifest, id: throttleId, pubkey: throttlePubkey, runtime_dir: throttleRuntime,
+  state_dir: join(root, 'throttle-state'), spool_dir: join(root, 'throttle-spool') }))
+const throttleTask = { ...task, instance: throttleId, authority: { ...task.authority, scope_subject: throttlePubkey } }
+writeFileSync(join(throttleRuntime, 'admitted-tasks.jsonl'), '', { mode: 0o600 })
+writeFileSync(join(throttleRuntime, 'reply-requests.jsonl'), '', { mode: 0o640 })
+const throttleTransport = new StdioClientTransport({ command: process.execPath,
+  args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', throttleId, '--poll-ms', '250', '--renotify-ms', '600000'],
+  env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stderr: 'pipe' })
+const throttleClient = new Client({ name: 'claude-channel-throttle', version: '0.1.0' })
+const announced = new Set()
+throttleClient.setNotificationHandler(Channel, note => { announced.add(note.params?.meta?.envelope) })
+try {
+  await throttleClient.connect(throttleTransport)
+  // The list call must land before the poll sees the new envelope, or the case cannot discriminate.
+  // A 250ms tick makes that overwhelmingly likely but not certain, so the precondition is asserted
+  // rather than assumed, and a lost race is retried on a fresh marker instead of scoring a pass.
+  let raced = true, subject = null
+  for (let attempt = 0; attempt < 5 && raced; attempt++) {
+    subject = `${attempt}`.repeat(64)
+    appendFileSync(join(throttleRuntime, 'admitted-tasks.jsonl'),
+      JSON.stringify({ ...throttleTask, envelope: subject }) + '\n', { mode: 0o600 })
+    await throttleClient.callTool({ name: 'nvoy_channel_list', arguments: {} })
+    raced = announced.has(subject)
+  }
+  ok('the throttle case reached its precondition — listed before the poll announced', !raced)
+  const deadline = Date.now() + 4000
+  while (!announced.has(subject) && Date.now() < deadline) await new Promise(done => setTimeout(done, 100))
+  ok('listing an envelope does not suppress its first notification to a client that wakes on them',
+    announced.has(subject))
+} catch (error) {
+  ok(`the throttle case reached its precondition — listed before the poll announced (threw: ${error.message})`, false)
+  ok('listing an envelope does not suppress its first notification to a client that wakes on them', false)
+} finally { try { await throttleClient.close() } catch { /* already gone */ } }
+
+// The `!task` arm of the read guard, which nothing above drives. Dropping it — the tempting
+// `if (!(read || notifiedThisRun.has(envelope) || listedThisRun.has(envelope)))` — passes the rest
+// of this suite, and the resulting failure is worse than a plain refusal: `read.jsonl` is
+// append-only while `tasks()` re-reads a queue that is trimmed and rotated, so the two genuinely
+// diverge; the guard would then admit an envelope with no record behind it and throw on
+// `task.type`, after the read append has already advanced the cursor. Seed exactly that divergence
+// — a read id with no queue entry — and require the refusal, not an exception.
+const trimId = 'claude-trim-test'
+const trimRuntime = join(root, 'trim-runtime')
+const trimPubkey = 'f'.repeat(64)
+mkdirSync(trimRuntime); mkdirSync(join(trimRuntime, 'claude-channel-state'))
+writeFileSync(join(manifests, `${trimId}.json`), JSON.stringify({ ...manifest, id: trimId, pubkey: trimPubkey,
+  runtime_dir: trimRuntime, state_dir: join(root, 'trim-state'), spool_dir: join(root, 'trim-spool') }))
+const trimmed = '1'.repeat(63) + '2'
+writeFileSync(join(trimRuntime, 'admitted-tasks.jsonl'), '', { mode: 0o600 })
+writeFileSync(join(trimRuntime, 'reply-requests.jsonl'), '', { mode: 0o640 })
+writeFileSync(join(trimRuntime, 'claude-channel-state', 'read.jsonl'),
+  JSON.stringify({ version: 1, instance: trimId, envelope: trimmed, read_at: Date.now() }) + '\n', { mode: 0o600 })
+const trimTransport = new StdioClientTransport({ command: process.execPath,
+  args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', trimId, '--poll-ms', '60000'],
+  env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stderr: 'pipe' })
+const trimClient = new Client({ name: 'claude-channel-trim', version: '0.1.0' })
+try {
+  await trimClient.connect(trimTransport)
+  const gone = await trimClient.callTool({ name: 'nvoy_channel_read', arguments: { envelope: trimmed } })
+  ok('an envelope read but no longer in the queue is refused, not dereferenced',
+    gone.isError === true && /NVOY_NOT_DELIVERED/.test(gone.content[0].text))
+  // The refusal has to be the guard's, not a dead session's: a server that crashed on the call
+  // above would fail the next one too, and the assertion would read as a pass for the wrong reason.
+  const alive = (await trimClient.listTools()).tools.map(tool => tool.name)
+  ok('the refusal left the session alive — the throw was prevented, not merely caught',
+    alive.includes('nvoy_channel_read') && alive.includes('nvoy_channel_list'))
+  const nonCuratorVerify = await trimClient.callTool({
+    name: 'memory_dream_verify',
+    arguments: {
+      packet_path: '/var/lib/hive-memory-curator/packets/dream-1142.json',
+      title: 'Test Dream',
+      dream: 'A short valid dream.',
+      referenced_change_ids: ['chg-1'],
+    },
+  })
+  ok('non-curator instance is refused memory_dream_verify (NVOY_DREAM_VERIFY_NOT_PERMITTED)',
+    nonCuratorVerify.isError === true && /NVOY_DREAM_VERIFY_NOT_PERMITTED/.test(nonCuratorVerify.content[0].text))
+} catch (error) {
+  ok(`an envelope read but no longer in the queue is refused, not dereferenced (threw: ${error.message})`, false)
+  ok('the refusal left the session alive — the throw was prevented, not merely caught', false)
+  ok('non-curator instance is refused memory_dream_verify (NVOY_DREAM_VERIFY_NOT_PERMITTED)', false)
+} finally { try { await trimClient.close() } catch { /* already gone */ } }
+
+// Curator instance exposes memory_dream_verify, enforces packet directory confinement, and returns checked dream record + buzz_post without shell access.
+const curatorRuntime = join(root, 'curator-runtime')
+const curatorPackets = join(root, 'curator-packets')
+mkdirSync(curatorRuntime); mkdirSync(join(curatorRuntime, 'claude-channel-state')); mkdirSync(curatorPackets)
+writeFileSync(join(manifests, 'curator.json'), JSON.stringify({
+  ...manifest,
+  id: 'curator',
+  pubkey: 'a'.repeat(64),
+  runtime_dir: curatorRuntime,
+  state_dir: join(root, 'curator-state'),
+  spool_dir: join(root, 'curator-spool'),
+}))
+writeFileSync(join(curatorRuntime, 'admitted-tasks.jsonl'), '', { mode: 0o600 })
+writeFileSync(join(curatorRuntime, 'reply-requests.jsonl'), '', { mode: 0o640 })
+const packetFile = join(curatorPackets, 'dream-1142.json')
+writeFileSync(packetFile, JSON.stringify({
+  id: 'dream-1142',
+  at: '2026-11-09T18:58:00.000Z',
+  ledger_ref: 'seq:1142',
+  changes: [
+    {
+      change_id: 'chg-1',
+      kind: 'distilled',
+      claim_event_id: 'a'.repeat(64),
+      summary: 'Consolidated three room status claims on nvoy viewer into a single checkpoint.',
+    },
+  ],
+}), { mode: 0o640 })
+const curatorTransport = new StdioClientTransport({
+  command: process.execPath,
+  args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', 'curator', '--poll-ms', '60000'],
+  env: { ...process.env, NVOY_INSTANCE_ROOT: manifests, HIVE_MEMORY_CURATOR_PACKET_DIR: curatorPackets },
+  stderr: 'pipe',
+})
+const curatorClient = new Client({ name: 'claude-channel-curator', version: '0.1.0' })
+try {
+  await curatorClient.connect(curatorTransport)
+  const curatorTools = (await curatorClient.listTools()).tools.map(t => t.name)
+  ok('curator instance exposes memory_dream_verify tool in listTools',
+    curatorTools.includes('memory_dream_verify'))
+  const outsidePath = await curatorClient.callTool({
+    name: 'memory_dream_verify',
+    arguments: {
+      packet_path: join(root, 'outside.json'),
+      title: 'Nightly Synthesis',
+      dream: 'Three scattered notes folded into one clear stone along the corridor.',
+      referenced_change_ids: ['chg-1'],
+    },
+  })
+  ok('memory_dream_verify refuses packet_path outside HIVE_MEMORY_CURATOR_PACKET_DIR',
+    outsidePath.isError === true && /NVOY_BAD_DREAM_PACKET/.test(outsidePath.content[0].text))
+  const validVerify = await curatorClient.callTool({
+    name: 'memory_dream_verify',
+    arguments: {
+      packet_path: packetFile,
+      title: 'Corridor of Folded Stones',
+      dream: 'Three scattered notes along the observatory wall folded quietly into a single carved keystone.',
+      referenced_change_ids: ['chg-1'],
+    },
+  })
+  const verifiedPayload = JSON.parse(validVerify.content[0].text)
+  ok('memory_dream_verify verifies draft against packet and returns checked record + buzz_post',
+    !validVerify.isError &&
+    verifiedPayload.ok === true &&
+    verifiedPayload.record?.id === 'dream-1142' &&
+    verifiedPayload.record?.checked === true &&
+    verifiedPayload.record?.validation === 'structural' &&
+    typeof verifiedPayload.buzz_post === 'string' &&
+    verifiedPayload.buzz_post.includes('Corridor of Folded Stones') &&
+    !verifiedPayload.buzz_post.includes('dream-1142') &&
+    !verifiedPayload.buzz_post.includes('Consolidated Changes') &&
+    !/\d/.test(verifiedPayload.buzz_post))
+} catch (error) {
+  ok(`curator instance exposes memory_dream_verify tool in listTools (threw: ${error.message})`, false)
+  ok('memory_dream_verify refuses packet_path outside HIVE_MEMORY_CURATOR_PACKET_DIR', false)
+  ok('memory_dream_verify verifies draft against packet and returns checked record + buzz_post', false)
+} finally { try { await curatorClient.close() } catch { /* already gone */ } }
+
+// When the packet directory is absent on the host (e.g. remote nave.pub channel), curator omits memory_dream_verify from listTools so local hive-dream is not shadowed.
+const remoteCuratorTransport = new StdioClientTransport({
+  command: process.execPath,
+  args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', 'curator', '--poll-ms', '60000'],
+  env: { ...process.env, NVOY_INSTANCE_ROOT: manifests, HIVE_MEMORY_CURATOR_PACKET_DIR: join(root, 'missing-packets') },
+  stderr: 'pipe',
+})
+const remoteCuratorClient = new Client({ name: 'claude-channel-curator-remote', version: '0.1.0' })
+try {
+  await remoteCuratorClient.connect(remoteCuratorTransport)
+  const remoteCuratorTools = (await remoteCuratorClient.listTools()).tools.map(t => t.name)
+  ok('curator instance omits memory_dream_verify in listTools when packet directory is absent on host',
+    !remoteCuratorTools.includes('memory_dream_verify'))
+} catch (error) {
+  ok(`curator instance omits memory_dream_verify in listTools when packet directory is absent on host (threw: ${error.message})`, false)
+} finally { try { await remoteCuratorClient.close() } catch { /* already gone */ } }
+
+// The shipped window bounds how long a restarted portable harness is refused: 30s × 4 is
+// ~2¼ min, where 60s × 10 was ten. The measured formula above is what makes the default a window.
+const channelSource = readFileSync('mcp/tools/claude-channel.mjs', 'utf8')
+ok('the shipped stale-lock window is 30s × 4 misses, about 2¼ minutes',
+  /flag\('--heartbeat-ms'\) \|\| 30000\)/.test(channelSource) && /flag\('--heartbeat-misses'\) \|\| 4\)/.test(channelSource))
 
 console.log(`\n${passed}/${passed + failed} passed`)
 process.exit(failed ? 1 : 0)

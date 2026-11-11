@@ -35,13 +35,15 @@ import WebSocket from 'ws'
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { resolve, dirname } from 'node:path'
-import { createHash } from 'node:crypto'
 import { decode, npubEncode } from 'nostr-tools/nip19'
-import { getPublicKey, verifyEvent } from 'nostr-tools/pure'
+import { getPublicKey } from 'nostr-tools/pure'
 import * as nip44 from 'nostr-tools/nip44'
 import { makeBunkerSigner } from './nip46-signer.mjs'
+import { secretKey } from './secret_key.mjs'
 import { partitionInvocations, verifiedChannelNotifications } from './invocation_policy.mjs'
 import { verifyInboxEnvelope } from './inbox_envelope.mjs'
+import { foldGrants } from './grant_fold.mjs'
+import { grantReadRelays } from './grant_relays.mjs'
 
 const arg = (n, d) => { const i = process.argv.indexOf(n); return i === -1 ? d : process.argv[i + 1] }
 const die = (m) => { console.error(`attention: ${m}`); process.exit(1) }
@@ -68,31 +70,28 @@ let ME, decrypt
 if (bunkerUri) {
   const clientNsec = clientFile || process.env.NVOY_NIP46_CLIENT_NSEC ||
     die('set NVOY_NIP46_CLIENT_NSEC_FILE (preferred) or NVOY_NIP46_CLIENT_NSEC for the Bunker connection')
-  const signer = makeBunkerSigner(bunkerUri, clientNsec)
+  const clientPath = process.env.NVOY_NIP46_CLIENT_NSEC_FILE || process.env.NVOY_NIP46_CLIENT_FILE
+  const signer = makeBunkerSigner(bunkerUri, clientNsec, { clientSource: clientFile ? `Bunker client credential at ${clientPath}` : 'NVOY_NIP46_CLIENT_NSEC' })
   ME = await signer.getPublicKey()
   decrypt = (peer, ciphertext) => signer.nip44Decrypt(peer, ciphertext)
 } else {
   const raw = credential(process.env.NVOY_NSEC_FILE, 'local identity credential') || process.env.NVOY_NSEC ||
     die('set NVOY_NSEC_FILE (preferred), NVOY_NSEC, or the Bunker credential-file pair')
-  const sk = raw.startsWith('nsec1') ? decode(raw).data : Uint8Array.from(Buffer.from(raw, 'hex'))
+  let sk
+  try { sk = secretKey(raw, process.env.NVOY_NSEC_FILE ? `local identity credential at ${process.env.NVOY_NSEC_FILE}` : 'NVOY_NSEC') } catch (error) { die(error.message) }
   ME = getPublicKey(sk)
   decrypt = async (peer, ciphertext) => nip44.decrypt(ciphertext, nip44.getConversationKey(sk, peer))
 }
 
 // Whose signature counts as policy. Not a default — an unset grantor list means nothing can be
 // authorised, which is the correct failure direction.
-const GRANTORS = String(process.env.GRANTORS || '4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b287ea84d')
+const GRANTORS = String(process.env.GRANTORS || '')
   .split(',').map(s => toHex(s.trim())).filter(Boolean)
+if (!GRANTORS.length) die('set GRANTORS (comma-separated npub or hex) — no grantor means nothing can be authorised')
 
-// Kind numbers and tag names mirror the bridge's admission tier so one vocabulary covers both.
+// Kind numbers mirror the bridge's admission tier so one vocabulary covers both. The scope check,
+// revocation, expiry and voices are grant_fold.mjs, shared with the wake watcher and the status page.
 const KIND = { grant: 440, revocation: 441 }
-const TAG = { scope: 'da-scope', cap: 'da-cap' }
-// The scope is a salted hash of the AGENT this grant is about, so a grant authorising someone to
-// task a different agent cannot be replayed against this one, and the agent id does not ride
-// publicly in the clear.
-const scopeHash = (agentHex, saltHex) => createHash('sha256').update(Buffer.concat([
-  Buffer.from('waggle/da-scope/v1'), Buffer.from([0]), Buffer.from(String(agentHex)), Buffer.from(saltHex || '', 'hex'),
-])).digest('hex')
 
 const RELAYS = (process.env.NVOY_RELAYS?.split(',') || [
   'wss://nos.lol', 'wss://relay.primal.net',
@@ -142,50 +141,23 @@ function query(url, filter, ms = 10000) {
 }
 
 // --- 1. Fetch policy: the grants, from the relays, verified here. -----------------------------
+// Grants are read from the shared grant set as well as this identity's relays (grant_relays.mjs).
 const grantEvents = new Map()
 let relaysAnswered = 0
-for (const url of RELAYS) {
+const relayAnswers = []
+for (const url of grantReadRelays(RELAYS, process.env.NVOY_GRANT_RELAYS)) {
   const { out, answered } = await query(url, { kinds: [KIND.grant, KIND.revocation], authors: GRANTORS, limit: 500 })
   if (answered) relaysAnswered++
+  relayAnswers.push({ relay: url, answered, events: out.length })
   for (const e of out) grantEvents.set(e.id, e)
 }
 
-// Grants first, then revocations — order matters, and a 441 must be able to kill a 440 seen
-// on a different relay in the same pass.
-// One identity may legitimately hold both `task` and the carrier-only `task-relay`. Keep grants
-// by capability rather than letting the newest one overwrite the other.
-const permitted = new Map() // sender hex -> Map(cap -> { grantId, grantor, cap })
-const putGrant = (pk, grant) => {
-  if (!permitted.has(pk)) permitted.set(pk, new Map())
-  permitted.get(pk).set(grant.cap, grant)
-}
-const dropGrant = grantId => {
-  for (const [pk, caps] of permitted) {
-    for (const [cap, grant] of caps) if (grant.grantId === grantId) caps.delete(cap)
-    if (!caps.size) permitted.delete(pk)
-  }
-}
+// One fold over the union, so a 441 on one relay kills a 440 seen on another in the same pass.
+// One identity may legitimately hold both `task` and the carrier-only `task-relay`, and a voice holds
+// its grantor's grants under its shadow grant (grant_fold.mjs).
+const { live: permitted, rejected, mentions } = foldGrants([...grantEvents.values()], { me: ME, grantors: GRANTORS })
 const taskGrant = pk => permitted.get(pk)?.get('task+act') || permitted.get(pk)?.get('task') || null
 const relayGrant = pk => permitted.get(pk)?.get('task-relay') || null
-const sorted = [...grantEvents.values()].sort((a, b) => (a.created_at || 0) - (b.created_at || 0))
-let rejected = 0
-for (const ev of sorted) {
-  if (!GRANTORS.includes(String(ev.pubkey || '').toLowerCase())) continue
-  let ok = false; try { ok = verifyEvent(ev) } catch { ok = false }
-  if (!ok) { rejected++; continue }
-  if (ev.kind === KIND.revocation) {
-    const target = (ev.tags || []).find(t => t[0] === 'e')?.[1]
-    dropGrant(target)
-    continue
-  }
-  const grantee = (ev.tags || []).find(t => t[0] === 'p')?.[1]
-  const scope = (ev.tags || []).find(t => t[0] === TAG.scope)
-  const cap = (ev.tags || []).find(t => t[0] === TAG.cap)?.[1]
-  if (!grantee || !scope || !cap) continue
-  if (scope[1] !== scopeHash(ME, scope[2] || '')) continue // authorises tasking some other agent
-  if (!['task', 'task+act', 'task-relay'].includes(cap)) continue
-  putGrant(String(grantee).toLowerCase(), { grantId: ev.id, grantor: ev.pubkey, cap })
-}
 
 const TASK_CARRIERS = (() => {
   let raw
@@ -200,6 +172,18 @@ const TASK_CARRIERS = (() => {
   }
   return out
 })()
+
+// Policy only: the live grants, and nothing from the inbox. A message heard natively on a Buzz
+// relay was signed by its author and never wrapped, so the broker needs only this answer — who
+// holds which live grant for this identity — and must not pay for, or be confused by, a 1059 read.
+// `mentions` is apart from `grants`: the keys this identity may mention, which task nothing.
+if (process.argv.includes('--policy-only')) {
+  console.log(JSON.stringify({ me: ME, policyUsable: relaysAnswered > 0, relaysAnswered, relays: relayAnswers,
+    grants: [...permitted.entries()].flatMap(([pk, caps]) => [...caps.values()].map(g =>
+      ({ pubkey: pk, cap: g.cap, grant_id: g.grantId, grantor: String(g.grantor).toLowerCase(), ...(g.shadow ? { shadow: true } : {}) }))),
+    mentions: mentions.map(g => ({ pubkey: g.pubkey, name: g.name, grant_id: g.grantId, grantor: g.grantor, created_at: g.created_at })) }))
+  process.exit(0)
+}
 
 // --- 2. Read the inbox. ----------------------------------------------------------------------
 const wraps = new Map()
@@ -261,7 +245,7 @@ if (process.argv.includes('--mark')) {
 }
 
 if (process.argv.includes('--json')) {
-  console.log(JSON.stringify({ me: ME, grantors: GRANTORS, relaysAnswered, policyUsable,
+  console.log(JSON.stringify({ me: ME, grantors: GRANTORS, relaysAnswered, relays: relayAnswers, policyUsable,
     permitted: [...permitted.entries()].map(([pk, caps]) => ({ pubkey: pk, caps: [...caps.keys()] })), rejectedGrants: rejected,
     actionable, admissions, notifications, dataOnly: dataOnly.map(m => ({ from: m.from, at: m.at })) }, null, 2))
   // JSON is a transport format, not a weakening of the scheduler contract. The instance
