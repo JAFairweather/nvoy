@@ -23,6 +23,7 @@ import {
   DEFAULT_DREAM_INTERVAL_SEC,
   DEFAULT_TOPIC_PRESSURE_THRESHOLD,
   DEFAULT_WRITE_DELTA_THRESHOLD,
+  computeEigenAxisProposals,
   computeTopicEigenvectors,
   defaultCuratorStatePath,
   evaluateDreamTriggers,
@@ -5779,6 +5780,31 @@ export function renderViewerHtml(initialState) {
             });
             box.appendChild(rWrap);
           }
+          var axisProposals = Array.isArray(latestCuratorState && latestCuratorState.eigen_axis_proposals) ? latestCuratorState.eigen_axis_proposals : [];
+          if (axisProposals.length > 0) {
+            var pTitle = makeDiv('inspect-kicker', 'Stage 0 · Eigen-Axis Proposals (Counterfactual · Awaiting James Approval)');
+            pTitle.style.marginTop = '6px';
+            box.appendChild(pTitle);
+            var pWrap = makeDiv('kv-list');
+            pWrap.style.marginTop = '2px';
+            axisProposals.slice(0, 8).forEach(function (ap) {
+              var kindTag = String(ap.kind || 'split').toUpperCase();
+              var metricTxt = ap.kind === 'retire'
+                ? ('0w/7d · ' + (ap.class_b_count || 0) + ' Class B')
+                : ('cos ' + Number(ap.mean_intra_cosine ?? ap.cosine_affinity ?? 0).toFixed(2));
+              var deltaTxt = ap.coherence_delta_label || ('+' + Number(ap.coherence_delta || 0).toFixed(1) + '%');
+              var slugsTxt = Array.isArray(ap.sample_slugs) && ap.sample_slugs.length > 0
+                ? ' · samples: ' + ap.sample_slugs.slice(0, 3).join(', ')
+                : '';
+              pWrap.appendChild(kvRow(
+                '[' + kindTag + '] #' + ap.from_topic + ' -> ' + (ap.proposed_topic || ap.to_topic || 'retire') + ' (' + ap.claim_count + ' claims)',
+                deltaTxt + ' counterfactual · ' + metricTxt + slugsTxt + ' [PENDING JAMES APPROVAL]',
+                ap.kind === 'split' ? '#a78bfa' : ap.kind === 'merge' ? '#38bdf8' : '#fbbf24',
+                true
+              ));
+            });
+            box.appendChild(pWrap);
+          }
         } else if (target.type === 'topic') {
           var tObj = target.data;
           var tId = tObj.id || 'general';
@@ -7930,6 +7956,50 @@ export function buildMobileState(state = {}, nowSec = undefined, extraHistoryRec
     persisted: Boolean(e?.persisted && !e?.simulated),
   }))
 
+  const rawAxisProposals = Array.isArray(cs.eigen_axis_proposals)
+    ? cs.eigen_axis_proposals
+    : Array.isArray(state?.eigen_axis_proposals)
+      ? state.eigen_axis_proposals
+      : records.length > 0
+        ? computeEigenAxisProposals(records, { nowSec: effectiveNow })
+        : []
+  const eigenAxisProposals = rawAxisProposals.slice(0, 12).map(p => ({
+    proposal_id: String(p?.proposal_id || ''),
+    kind: String(p?.kind || 'split'),
+    action_label: String(p?.action_label || 'Sub-Axis Proposal'),
+    from_topic: String(p?.from_topic || 'general'),
+    to_topic: p?.to_topic ? String(p.to_topic) : null,
+    proposed_topic: String(p?.proposed_topic || p?.to_topic || p?.from_topic || 'general'),
+    claim_count: Number(p?.claim_count || 0),
+    class_b_count: Number(p?.class_b_count || 0),
+    writes_7d: Number(p?.writes_7d || 0),
+    mean_intra_cosine: Number.isFinite(p?.mean_intra_cosine) ? Math.round(p.mean_intra_cosine * 1000) / 1000 : 0,
+    cosine_affinity: Number.isFinite(p?.cosine_affinity) ? Math.round(p.cosine_affinity * 1000) / 1000 : 0,
+    top_terms: (Array.isArray(p?.top_terms) ? p.top_terms : [])
+      .map(String)
+      .filter(t => t.length <= 24 && !/secret|canary/i.test(t))
+      .slice(0, 4),
+    sample_slugs: (Array.isArray(p?.sample_slugs)
+      ? p.sample_slugs
+      : Array.isArray(p?.sample_claims)
+        ? p.sample_claims.map(s => s?.slug).filter(Boolean)
+        : []
+    )
+      .slice(0, 4)
+      .map(String),
+    sample_claims: (Array.isArray(p?.sample_claims) ? p.sample_claims : []).slice(0, 4).map(s => ({
+      slug: String(s?.slug || ''),
+      d: s?.d ? String(s.d) : null,
+      author: String(s?.author || 'unknown'),
+      event_id: typeof s?.event_id === 'string' ? s.event_id.slice(0, 12) : null,
+    })),
+    coherence_delta: Number.isFinite(p?.coherence_delta) ? p.coherence_delta : 0,
+    coherence_delta_label: String(p?.coherence_delta_label || `+${Number(p?.coherence_delta || 0).toFixed(1)}%`),
+    counterfactual: true,
+    approval_required: true,
+    status: p?.status === 'approved' ? 'approved' : 'pending_james_approval',
+  }))
+
   // --- Metadata-only Alerts ---
   const alerts = []
   if (!state.connected) {
@@ -8253,7 +8323,9 @@ export function buildMobileState(state = {}, nowSec = undefined, extraHistoryRec
       },
       recent_consolidations: recentConsolidations,
       eigenvectors,
+      eigen_axis_proposals: eigenAxisProposals,
     },
+    eigen_axis_proposals: eigenAxisProposals,
     agents: {
       summary: {
         active_5m: Number(ah.active_5m ?? agentList.filter(a => a.health === 'active').length),
@@ -8399,6 +8471,14 @@ export function renderMobileViewerHtml(initialMobileState = {}) {
       planned_summary: mobileData.dreams?.planned_summary,
       recent_consolidations: (mobileData.dreams?.recent_consolidations || []).slice(0, 4),
       eigenvectors: (mobileData.dreams?.eigenvectors || []).slice(0, 1),
+      eigen_axis_proposals: (mobileData.dreams?.eigen_axis_proposals || []).slice(0, 4).map(p => ({
+        kind: p.kind,
+        from_topic: p.from_topic,
+        proposed_topic: p.proposed_topic,
+        claim_count: p.claim_count,
+        sample_slugs: (p.sample_slugs || []).slice(0, 2),
+        coherence_delta_label: p.coherence_delta_label,
+      })),
     },
     agents: {
       summary: mobileData.agents?.summary,
@@ -8565,6 +8645,7 @@ bars('d-trigger-bars',[['Circadian ('+fD(elp)+'/'+fD(dI)+')',Math.min(100,Math.r
 if(el('d-ledger-list')){
 var rw=(dr.recent_consolidations||[]).slice(0,4).map(function(c){return '<div class="cr"><span class="cm"><span class="pill violet">#'+esc(c.topic)+'</span> <b>'+esc(c.slug)+'</b> ('+c.source_count+' folded)</span><span>'+esc(fA(c.at,now))+'</span></div>';});
 var eg=(dr.eigenvectors||[])[0];if(eg)rw.push('<div class="cr"><span class="cm"><span class="pill info">Eigen λ1</span> <b>'+esc(eg.label)+'</b> ('+eg.variance_pct+'% var)</span><span>'+(eg.persisted?'persisted':'spectral')+'</span></div>');
+var eap=(dr.eigen_axis_proposals||[]).slice(0,5);for(var pi=0;pi<eap.length;pi++){var pr=eap[pi],pk=String(pr.kind||'split').toUpperCase(),pc=pr.kind==='split'?'violet':pr.kind==='merge'?'info':'warn',psl=(pr.sample_slugs||[]).slice(0,2).join(', ');rw.push('<div class="cr"><span class="cm"><span class="pill '+pc+'">'+esc(pk)+'</span> <b>#'+esc(pr.from_topic)+' → '+esc(pr.proposed_topic)+'</b> ('+pr.claim_count+'c'+(psl?' · '+esc(psl):'')+')</span><span class="pill ok" title="Counterfactual · Awaiting James approval">'+esc(pr.coherence_delta_label||('+'+Number(pr.coherence_delta||0).toFixed(1)+'%'))+' cf</span></div>');}
 el('d-ledger-list').innerHTML=rw.join('')||'<div class="stat-box"><small>No consolidations yet.</small></div>';
 }
 rAg(d);
@@ -8674,7 +8755,9 @@ export async function startMemoryViewer({
       stale_count: 0,
       refusal_count_15m: 0,
       coherence_score: null,
+      eigen_axis_proposals: [],
     },
+    eigen_axis_proposals: [],
     consolidated_sources: {},
     constellation_links: [],
     entity_graph_stats: { total_edges: 0, link_count: 0, top_entities: [] },
@@ -8818,7 +8901,7 @@ export async function startMemoryViewer({
         )
         historyRecords = [...byEventId.values()]
         historyComplete = cursor === null
-        spectral = computeTopicEigenvectors(records, { maxComponents: 7 })
+        spectral = computeTopicEigenvectors(records, { maxComponents: 7, nowSec })
         previewPlan = planMerkleDream({ records, nowSec })
         consolidatedSources = {}
         for (const r of records) {
@@ -8972,6 +9055,11 @@ export async function startMemoryViewer({
         const topicReorganizations = hasPersistedReorgs
           ? persistedCurator.topic_reorganizations.map(r => ({ ...r, persisted: true, simulated: false }))
           : spectral.reorganizations.map(r => ({ ...r, persisted: false, simulated: true }))
+        const eigenAxisProposals = Array.isArray(spectral.axis_proposals) && spectral.axis_proposals.length > 0
+          ? spectral.axis_proposals
+          : Array.isArray(persistedCurator?.eigen_axis_proposals)
+            ? persistedCurator.eigen_axis_proposals
+            : []
         curatorState = {
           state_file: activeStateFile,
           state_file_present: Boolean(persistedCurator),
@@ -8995,6 +9083,7 @@ export async function startMemoryViewer({
           coherence_score: triggerEval.coherence_score,
           topic_eigenvectors: topicEigenvectors,
           topic_reorganizations: topicReorganizations,
+          eigen_axis_proposals: eigenAxisProposals,
           consolidation_ledger: Array.isArray(persistedCurator?.consolidation_ledger) ? persistedCurator.consolidation_ledger : [],
           planned_clusters: [...previewPlan.promotions, ...previewPlan.distillations].slice(0, 60).map(c => ({
             stage: c.stage,
@@ -9108,6 +9197,7 @@ export async function startMemoryViewer({
         efficacy,
         trends,
         curator_state: curatorState,
+        eigen_axis_proposals: curatorState.eigen_axis_proposals || [],
         consolidated_sources: consolidatedSources,
         constellation_links: constellation?.links || [],
         entity_graph_stats: {

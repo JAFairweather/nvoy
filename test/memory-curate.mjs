@@ -28,6 +28,7 @@ import {
 import { startMemoryDaemon } from '../mcp/tools/memory-daemon.mjs'
 import {
   buildDreamPacket,
+  computeEigenAxisProposals,
   computeTopicEigenvectors,
   evaluateDreamTriggers,
   planMerkleDream,
@@ -947,6 +948,137 @@ await test('computeTopicEigenvectors extracts orthonormal eigen-axes and planMer
     false,
     'zero-overlap topic astro must not appear in reorganizations'
   )
+
+  // ── mem-eigen-axes: Intra-topic TF-IDF sub-axis clustering (>=25 claims), merge (cos >= 0.55), retire (0w/7d, <=3 Class B), counterfactual coherence_delta, no auto-refiling ──
+  const largeTopicCorpus = []
+  // 12 coherent systemd/watchdog claims in herd-infra
+  for (let i = 0; i < 12; i++) {
+    largeTopicCorpus.push({
+      event_id: `fa${String(i).padStart(2, '0')}`.padEnd(64, '0'),
+      pubkey: 'b'.repeat(64),
+      author: 'neil',
+      created_at: now - 3600 - i * 60,
+      expires_at: now + 86400 * 7,
+      scope: `room:${ROOM_ID}`,
+      topic: 'herd-infra',
+      d: `hive-memory:room:${ROOM_ID}:herd-infra-systemd-watchdog-${i}`,
+      claim: `Systemd service unit watchdog timer health check and slice memory threshold verified on host node ${i}.`,
+      because: 'Systemd watchdog slice health check.',
+      evidence: ['git:herd-infra@11111111:scripts/watchdog.sh'],
+      verification: 'accepted',
+      status: 'active',
+    })
+  }
+  // 10 coherent restic/backblaze backup claims in herd-infra
+  for (let i = 0; i < 10; i++) {
+    largeTopicCorpus.push({
+      event_id: `fb${String(i).padStart(2, '0')}`.padEnd(64, '0'),
+      pubkey: 'c'.repeat(64),
+      author: 'dead-rabbit',
+      created_at: now - 7200 - i * 60,
+      expires_at: now + 86400 * 7,
+      scope: `room:${ROOM_ID}`,
+      topic: 'herd-infra',
+      d: `hive-memory:room:${ROOM_ID}:herd-infra-restic-backup-${i}`,
+      claim: `Restic snapshot repository backup to Backblaze bucket verified with prune retention receipt ${i}.`,
+      because: 'Half-hourly restic backup to Backblaze B2.',
+      evidence: ['git:herd-infra@22222222:host/backup/restic.sh'],
+      verification: 'accepted',
+      status: 'active',
+    })
+  }
+  // 5 miscellaneous claims in herd-infra so total in herd-infra is 27 (>= 25)
+  for (let i = 0; i < 5; i++) {
+    largeTopicCorpus.push({
+      event_id: `fc${String(i).padStart(2, '0')}`.padEnd(64, '0'),
+      pubkey: 'a'.repeat(64),
+      author: 'biggy',
+      created_at: now - 9000 - i * 60,
+      expires_at: now + 86400 * 7,
+      scope: `room:${ROOM_ID}`,
+      topic: 'herd-infra',
+      d: `hive-memory:room:${ROOM_ID}:herd-infra-ssh-key-${i}`,
+      claim: `Authorized ssh key provisioning and known_hosts fingerprint check ${i}.`,
+      because: 'SSH key rotation.',
+      evidence: ['git:herd-infra@33333333:bin/put-keys'],
+      verification: 'accepted',
+      status: 'active',
+    })
+  }
+  // Overlapping topic (`r1-audio` overlapping with `r1`, cosine >= 0.55)
+  for (let i = 0; i < 4; i++) {
+    largeTopicCorpus.push({
+      event_id: `fd${String(i).padStart(2, '0')}`.padEnd(64, '0'),
+      pubkey: 'a'.repeat(64),
+      author: 'mc-claude',
+      created_at: now - 1800 - i * 60,
+      expires_at: now + 86400 * 7,
+      scope: `room:${ROOM_ID}`,
+      topic: i < 2 ? 'r1' : 'r1-audio',
+      d: `hive-memory:room:${ROOM_ID}:r1-voice-speak-socket-${i}`,
+      claim: 'Rabbit R1 voice speak socket streams spoken audio replies over r1-speak systemd socket.',
+      because: 'R1 voice speak socket verification.',
+      evidence: ['git:rabidrabbit@72540514:usr/local/lib/r1-herd/voice'],
+      verification: 'accepted',
+      status: 'active',
+    })
+  }
+  // Idle topic (`legacy-experiment`: 0 writes in 7d, <= 3 Class B claims)
+  largeTopicCorpus.push({
+    event_id: 'fe00'.padEnd(64, '0'),
+    pubkey: 'd'.repeat(64),
+    author: 'kerouac',
+    created_at: now - 10 * 86400,
+    expires_at: null,
+    retention: 'decision',
+    scope: `room:${ROOM_ID}`,
+    topic: 'legacy-experiment',
+    d: `hive-memory:room:${ROOM_ID}:legacy-experiment-note`,
+    claim: 'Early prototype layout notes from ten days ago.',
+    because: 'Historical note.',
+    evidence: [],
+    verification: 'accepted',
+    status: 'active',
+  })
+
+  const proposals = computeEigenAxisProposals(largeTopicCorpus, { nowSec: now })
+  const splitProposals = proposals.filter(p => p.kind === 'split' && p.from_topic === 'herd-infra')
+  assert(splitProposals.length >= 2, `expected >= 2 coherent sub-axis split proposals for herd-infra (27 claims), got ${splitProposals.length}`)
+  for (const sp of splitProposals) {
+    assert(sp.proposed_topic.startsWith('herd-infra-'), `sub-axis name must follow <topic>-<top-terms>, got ${sp.proposed_topic}`)
+    assert(sp.claim_count >= 8, `sub-axis cluster must have size >= 8, got ${sp.claim_count}`)
+    assert(sp.mean_intra_cosine >= 0.35, `sub-axis cluster must have mean_intra_cosine >= 0.35, got ${sp.mean_intra_cosine}`)
+    assert(Array.isArray(sp.sample_claims) && sp.sample_claims.length > 0, 'proposal must include sample_claims')
+    assert(Array.isArray(sp.sample_slugs) && sp.sample_slugs.length > 0, 'proposal must include sample_slugs')
+    assert(typeof sp.coherence_delta === 'number' && sp.coherence_delta > 0, 'proposal must report positive counterfactual coherence_delta')
+    assert(/^\+\d+\.\d%$/.test(sp.coherence_delta_label), `coherence_delta_label must be formatted +X.X%, got ${sp.coherence_delta_label}`)
+    assert.equal(sp.counterfactual, true)
+    assert.equal(sp.approval_required, true)
+    assert.equal(sp.status, 'pending_james_approval')
+  }
+
+  const mergeProposal = proposals.find(p => p.kind === 'merge' && p.from_topic === 'r1-audio' && p.to_topic === 'r1')
+  assert(mergeProposal, 'must propose merging overlapping topic r1-audio into r1 (cosine >= 0.55)')
+  assert(mergeProposal.cosine_affinity >= 0.55)
+  assert.equal(mergeProposal.counterfactual, true)
+  assert.equal(mergeProposal.status, 'pending_james_approval')
+
+  const retireProposal = proposals.find(p => p.kind === 'retire' && p.from_topic === 'legacy-experiment')
+  assert(retireProposal, 'must propose retiring idle topic legacy-experiment (0 writes in 7d, <= 3 Class B claims)')
+  assert.equal(retireProposal.writes_7d, 0)
+  assert(retireProposal.class_b_count <= 3)
+  assert.equal(retireProposal.counterfactual, true)
+  assert.equal(retireProposal.status, 'pending_james_approval')
+
+  // Verify planMerkleDream exposes eigen_axis_proposals and NEVER auto-refiles claims into unapproved sub-axes!
+  const largePlan = planMerkleDream({ records: largeTopicCorpus, nowSec: now })
+  assert(Array.isArray(largePlan.eigen_axis_proposals) && largePlan.eigen_axis_proposals.length >= 4)
+  for (const item of [...largePlan.promotions, ...largePlan.distillations]) {
+    assert(
+      !splitProposals.some(sp => sp.proposed_topic === item.topic),
+      `planMerkleDream must never re-file claims into unapproved sub-axis ${item.topic} before James approves`
+    )
+  }
 })
 
 // ── Test 7: Fail-closed malformed state cursors, initial temporal trigger, and incomplete-history write gate ──
