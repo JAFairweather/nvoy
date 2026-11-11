@@ -69,7 +69,7 @@ export async function grantRead(ctx, pub, scopeId) {
   }))
   try { await ctx.save() } catch (error) {
     return { outcome: 'granted-unsaved', saved: false, message: `${ctx.name(pub)} was granted read (v${issued.v}) — the grant is out — but the Grant Index could not be saved `
-      + `(${error.message}). Keep this page open and retry; do not grant again.` }
+      + `(${error.message}). Keep this page open and press Retry saving the Grant Index; do not grant again.` }
   }
   return { outcome: 'granted', saved: true, message: `${ctx.name(pub)} can now read v${issued.v}.` }
 }
@@ -106,6 +106,20 @@ export async function revokeRead(ctx, pub, scopeId, payload) {
   return {
     outcome: rot.status === 'partial' ? 'revoked-partial' : 'revoked', saved: persisted, rotation: rot,
     message: head + ' The new generation is unverified — press Check read-back.'
-      + (persisted ? '' : ` WARNING: v${rot.generation} is live but the Grant Index could not be saved — keep this page open and retry.`),
+      + (persisted ? '' : ` WARNING: v${rot.generation} is live but the Grant Index could not be saved — keep this page open and press Retry saving the Grant Index.`),
   }
+}
+
+/**
+ * Save-only recovery: persist the in-memory index again, publishing nothing. This is what "keep this
+ * page open and retry" points at after an action's irreversible step succeeded but its save failed
+ * (a grant whose gift wrap is out, a rotation that is live). The in-memory index already holds the
+ * repair state, so retrying the ACTION would publish a second wrap or rotate again; saving is the
+ * whole recovery.
+ */
+export async function retrySave(ctx) {
+  try { await ctx.save() } catch (error) {
+    return { outcome: 'still-unsaved', saved: false, message: `The Grant Index still could not be saved (${error.message}). Nothing was published; keep this page open and try again.` }
+  }
+  return { outcome: 'saved', saved: true, message: 'The Grant Index is saved. Nothing was published.' }
 }
