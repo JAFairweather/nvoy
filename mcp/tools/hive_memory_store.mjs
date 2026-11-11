@@ -94,6 +94,18 @@ CREATE TABLE IF NOT EXISTS writer_rate_log (
   accepted_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_writer_rate_pubkey_time ON writer_rate_log(pubkey, accepted_at);
+CREATE TABLE IF NOT EXISTS activity_rollups (
+  hour_bucket INTEGER NOT NULL,
+  actor TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  calls INTEGER NOT NULL DEFAULT 0,
+  hits INTEGER NOT NULL DEFAULT 0,
+  records_returned INTEGER NOT NULL DEFAULT 0,
+  first_at INTEGER NOT NULL,
+  last_at INTEGER NOT NULL,
+  PRIMARY KEY (hour_bucket, actor, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_activity_rollups_hour ON activity_rollups(hour_bucket);
 `
 
 export class HiveMemoryError extends Error {
@@ -668,6 +680,18 @@ function ensureDerivedSchema(db) {
       evidence,
       tokenize='porter unicode61'
     );
+    CREATE TABLE IF NOT EXISTS activity_rollups (
+      hour_bucket INTEGER NOT NULL,
+      actor TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      calls INTEGER NOT NULL DEFAULT 0,
+      hits INTEGER NOT NULL DEFAULT 0,
+      records_returned INTEGER NOT NULL DEFAULT 0,
+      first_at INTEGER NOT NULL,
+      last_at INTEGER NOT NULL,
+      PRIMARY KEY (hour_bucket, actor, kind)
+    );
+    CREATE INDEX IF NOT EXISTS idx_activity_rollups_hour ON activity_rollups(hour_bucket);
   `)
 }
 
@@ -1148,6 +1172,76 @@ export class HiveMemoryStore {
   writerRateCount(pubkey, nowSec = nowSecDefault()) {
     if (!this.isReady().ready) return null
     return this.db.prepare('SELECT count(*) AS n FROM writer_rate_log WHERE pubkey = ? AND accepted_at > ?').get(pubkey, nowSec - 3600).n
+  }
+
+  // Durable hourly activity rollups (metadata-only: hour_bucket, actor, kind, calls, hits, records_returned).
+  // Survives in-memory ACTIVITY_MAX ring overflow (>80 events) and daemon restarts without altering the accepted-write ledger.
+  recordActivityRollup({ at = nowSecDefault(), actor = '', kind = '', count = 0 } = {}) {
+    if (!this.isReady().ready || !this.db) return false
+    const ts = Number.isSafeInteger(at) && at > 0 ? at : nowSecDefault()
+    const cleanActor = String(actor || '').trim().slice(0, 64)
+    const cleanKind = String(kind || '').trim().slice(0, 32)
+    if (!cleanActor || !cleanKind || cleanActor === 'viewer') return false
+    const hourBucket = Math.floor(ts / 3600) * 3600
+    const retCount = Number.isSafeInteger(count) && count > 0 ? count : 0
+    const hitCall = (cleanKind === 'query' || cleanKind === 'wake') && retCount > 0 ? 1 : 0
+    try {
+      this.#ensureDerivedTables()
+      this.db.prepare(`
+        INSERT INTO activity_rollups (hour_bucket, actor, kind, calls, hits, records_returned, first_at, last_at)
+        VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+        ON CONFLICT(hour_bucket, actor, kind) DO UPDATE SET
+          calls = calls + 1,
+          hits = hits + excluded.hits,
+          records_returned = records_returned + excluded.records_returned,
+          first_at = MIN(first_at, excluded.first_at),
+          last_at = MAX(last_at, excluded.last_at)
+      `).run(hourBucket, cleanActor, cleanKind, hitCall, retCount, ts, ts)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  activityRollups({ sinceSec = 0, nowSec = nowSecDefault() } = {}) {
+    if (!this.isReady().ready || !this.db) {
+      return { rollups: [], coverage_start_at: null, min_hour_bucket: null, total_calls: 0, total_hits: 0, store_initialized_at: null }
+    }
+    try {
+      this.#ensureDerivedTables()
+      const minBucket = Math.max(0, Math.floor(Number(sinceSec || 0) / 3600) * 3600)
+      const rows = this.db.prepare(`
+        SELECT hour_bucket, actor, kind, calls, hits, records_returned, first_at, last_at
+        FROM activity_rollups
+        WHERE hour_bucket >= ?
+        ORDER BY hour_bucket ASC, actor ASC, kind ASC
+      `).all(minBucket)
+      const bounds = this.db.prepare(`
+        SELECT MIN(first_at) AS min_first_at, MIN(hour_bucket) AS min_hour_bucket, SUM(calls) AS total_calls, SUM(hits) AS total_hits
+        FROM activity_rollups
+      `).get()
+      const meta = this.db.prepare('SELECT initialized_at FROM store_meta WHERE singleton = 1').get()
+      return {
+        rollups: rows.map(r => ({
+          hour_bucket: Number(r.hour_bucket),
+          actor: String(r.actor),
+          kind: String(r.kind),
+          calls: Number(r.calls || 0),
+          hits: Number(r.hits || 0),
+          records_returned: Number(r.records_returned || 0),
+          first_at: Number(r.first_at || r.hour_bucket),
+          last_at: Number(r.last_at || r.hour_bucket),
+        })),
+        coverage_start_at: Number.isSafeInteger(bounds?.min_first_at) ? Number(bounds.min_first_at) : null,
+        min_hour_bucket: Number.isSafeInteger(bounds?.min_hour_bucket) ? Number(bounds.min_hour_bucket) : null,
+        total_calls: Number(bounds?.total_calls || 0),
+        total_hits: Number(bounds?.total_hits || 0),
+        store_initialized_at: Number.isSafeInteger(meta?.initialized_at) ? Number(meta.initialized_at) : null,
+        as_of: nowSec,
+      }
+    } catch {
+      return { rollups: [], coverage_start_at: null, min_hour_bucket: null, total_calls: 0, total_hits: 0, store_initialized_at: null }
+    }
   }
 
   #activeRows(readerPubkey, nowSec, where = '', params = []) {

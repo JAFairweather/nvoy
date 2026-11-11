@@ -40,7 +40,7 @@ const DEFAULT_POLL_MS = 3000
 const MAX_EVENT_LOG = 60
 export const CORPUS_CACHE_TTL_MS = 300_000
 // One version for the page and the live snapshot: the page reloads whenever they differ.
-const VIEWER_VERSION = '2026-11-10-v17'
+const VIEWER_VERSION = '2026-11-11-v18'
 const ACTIVITY_KINDS = new Set(['wake', 'query', 'lookup', 'submit', 'refused'])
 
 export function escapeHtml(value) {
@@ -1281,6 +1281,746 @@ export function computeSynapticEfficacy({
       after_wake_hook_breadth: afterWakeHookBreadth,
     },
     history,
+  }
+}
+
+export function computeMemoryTrends({
+  records = [],
+  history_records = null,
+  consolidated_records = null,
+  agent_roster = [],
+  recent_activity = [],
+  activity_rollups = null,
+  activity_ring = null,
+  store_state = {},
+  curator_state = null,
+  coherence = null,
+  efficacy = null,
+  now_sec = null,
+} = {}) {
+  const activeRecords = Array.isArray(records) ? records.filter(r => r && typeof r === 'object') : []
+  const historyList = Array.isArray(history_records) ? history_records.filter(r => r && typeof r === 'object') : []
+  const consolidatedList = Array.isArray(consolidated_records)
+    ? consolidated_records.filter(r => r && typeof r === 'object')
+    : []
+  const recentActivity = Array.isArray(recent_activity)
+    ? recent_activity.filter(a => a && typeof a === 'object')
+    : []
+  const rawRollupsObj =
+    activity_rollups && typeof activity_rollups === 'object' && !Array.isArray(activity_rollups)
+      ? activity_rollups
+      : Array.isArray(activity_rollups)
+        ? { rollups: activity_rollups }
+        : null
+  const rollupRows = Array.isArray(rawRollupsObj?.rollups)
+    ? rawRollupsObj.rollups.filter(r => r && typeof r === 'object' && Number.isFinite(r.hour_bucket))
+    : []
+  const hasRollupsStore = rawRollupsObj !== null
+  const rosterArr = Array.isArray(agent_roster) ? agent_roster.filter(a => a && typeof a === 'object') : []
+
+  const rosterByPk = new Map()
+  let writerSeats = 0
+  for (const a of rosterArr) {
+    const id = a.id || a.actor || null
+    if (a.pubkey && id) rosterByPk.set(String(a.pubkey), String(id))
+    if (a.is_writer && id !== 'viewer') writerSeats += 1
+  }
+  rosterByPk.set('4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b287ea84d', 'james')
+  const expectedWriters = writerSeats > 0 ? Math.min(14, writerSeats) : 12
+
+  // Deduplicate all signed events by event_id or (author, d, created_at)
+  const seenEvents = new Map()
+  const seenFactKeys = new Map()
+  const addPoolEvent = r => {
+    const ts = Number(r?.created_at)
+    if (!Number.isFinite(ts) || ts <= 0) return
+    const evId =
+      typeof r.event_id === 'string' && r.event_id.trim()
+        ? r.event_id.trim()
+        : typeof r.id === 'string' && r.id.trim()
+          ? r.id.trim()
+          : null
+    const dKey = typeof r.d === 'string' && r.d.trim() ? r.d.trim() : (typeof r.slug === 'string' ? r.slug.trim() : '')
+    const pk = typeof r.author_pubkey === 'string' && r.author_pubkey ? r.author_pubkey : (typeof r.pubkey === 'string' ? r.pubkey : '')
+    const author = rosterByPk.get(pk) || (typeof r.author === 'string' && r.author ? r.author : pk || 'unknown')
+    if (evId && seenEvents.has(evId)) {
+      const existing = seenEvents.get(evId)
+      if (!existing.claim && r.claim) seenEvents.set(evId, { ...existing, ...r, _ts: ts, _author: author, _d: dKey, _pk: pk })
+      return
+    }
+    if (!evId && dKey && seenFactKeys.has(`${author}:${dKey}`)) {
+      const priorTs = seenFactKeys.get(`${author}:${dKey}`)
+      if (Math.abs(priorTs - ts) <= 5) return
+    }
+    const key = evId || `k:${author}:${dKey}:${ts}:${seenEvents.size}`
+    seenEvents.set(key, { ...r, _ts: ts, _author: author, _d: dKey, _pk: pk })
+    if (dKey) seenFactKeys.set(`${author}:${dKey}`, ts)
+  }
+
+  for (const r of historyList) addPoolEvent(r)
+  for (const r of activeRecords) addPoolEvent(r)
+  for (const r of consolidatedList) addPoolEvent(r)
+  for (const a of recentActivity) {
+    if (a.kind === 'submit' && a.accepted !== false && Number.isFinite(a.at) && a.at > 0) {
+      const ids =
+        Array.isArray(a.event_ids) && a.event_ids.length > 0
+          ? a.event_ids.filter(id => typeof id === 'string' && id.trim()).map(id => id.trim())
+          : typeof a.event_id === 'string' && a.event_id.trim()
+            ? [a.event_id.trim()]
+            : []
+      if (ids.length > 0) {
+        for (const id of ids) {
+          addPoolEvent({
+            event_id: id,
+            d: a.d || '',
+            topic: a.topic || '',
+            scope: a.scope || '',
+            author: a.actor || 'unknown',
+            created_at: a.at,
+            verification: 'accepted',
+          })
+        }
+      } else {
+        addPoolEvent({
+          d: a.d || '',
+          topic: a.topic || '',
+          scope: a.scope || '',
+          author: a.actor || 'unknown',
+          created_at: a.at,
+          verification: 'accepted',
+        })
+      }
+    }
+  }
+
+  const chronological = [...seenEvents.values()].sort(
+    (a, b) => a._ts - b._ts || (String(a.event_id || '') < String(b.event_id || '') ? -1 : 1)
+  )
+
+  let effectiveNow
+  if (Number.isFinite(now_sec) && now_sec > 0) {
+    effectiveNow = Math.floor(now_sec)
+  } else if (chronological.length > 0) {
+    const maxTs = chronological[chronological.length - 1]._ts
+    effectiveNow = maxTs < 1_000_000_000 ? maxTs : Math.max(maxTs, Math.floor(Date.now() / 1000))
+  } else {
+    effectiveNow = Math.floor(Date.now() / 1000)
+  }
+
+  // Pre-annotate chronological events with strictly event-time lineage, conflict state machine, and recall-citation metadata
+  const priorByAuthorKey = new Map()
+  const headsByScopeKey = new Map()
+  const conflictedScopeKeys = new Set()
+  const eventToScopeKey = new Map()
+  const priorAuthorsBySubject = new Map()
+  const establishedTopics = new Map()
+  for (const ev of chronological) {
+    if (ev.topic) establishedTopics.set(ev.topic, (establishedTopics.get(ev.topic) || 0) + 1)
+  }
+
+  const annotated = chronological.map(ev => {
+    const evId = String(ev.event_id || ev.id || '')
+    const dStr = String(ev._d || ev.d || '')
+    const slug = dStr.split(':').pop() || dStr
+    const baseSlug = slug.replace(SLUG_STEP_SUFFIX_RE, '') || slug
+    const topic = String(ev.topic || (ev.scope === 'hive:canon' ? 'canon' : 'general'))
+    const scope = String(ev.scope || 'hive')
+    const author = String(ev._author || 'unknown')
+    const headKey = `${author}:${dStr}`
+    const scopeKey = `${scope}:${dStr}`
+    const subjectKey = `${scope}:${topic}:${baseSlug}`
+    if (evId) eventToScopeKey.set(evId, scopeKey)
+
+    const prevOnKey = priorByAuthorKey.get(headKey) || null
+    const prevSubjectAuthors = priorAuthorsBySubject.get(subjectKey) || new Set()
+    const hadOtherAuthorOnSubject = [...prevSubjectAuthors].some(a => a !== author)
+
+    const isWithdrawn = ev.status === 'withdrawn' || ev.verification === 'withdrawn' || Boolean(ev.withdrawn)
+    const supersedesList = Array.isArray(ev.supersedes) ? ev.supersedes.map(String) : []
+    const hasMerkle = typeof ev.merkle_sources === 'string' && ev.merkle_sources.length > 0
+    const isCanon = scope === 'hive:canon'
+    const isDurable = isCanon || ev.expires_at === null || ev.expires_at === undefined || ev.ttl_sec === 0 || hasMerkle
+    const refs = new Set()
+    const refBlob = [ev.as_of_git || '', ev.claim || '', ...(Array.isArray(ev.evidence) ? ev.evidence : [])].join(' ')
+    const rawMatches = refBlob.match(ARTIFACT_REF_RE) || []
+    for (const raw of rawMatches) {
+      refs.add(raw.replace(/\s+/g, '').toUpperCase())
+    }
+    if (typeof ev.as_of_git === 'string' && ev.as_of_git.length >= 7) {
+      refs.add(`GIT:${ev.as_of_git.slice(-40).slice(0, 8).toLowerCase()}`)
+    }
+    if (typeof ev.as_of_evt === 'string' && ev.as_of_evt.length >= 8) {
+      refs.add(`EVT:${ev.as_of_evt.slice(0, 12).toLowerCase()}`)
+    }
+    const hasGitOrEvtAnchor = Boolean(ev.as_of_git || ev.as_of_evt)
+    const evidenceCount = Array.isArray(ev.evidence) ? ev.evidence.length : (hasGitOrEvtAnchor ? 1 : 0)
+
+    // Strictly event-time conflict state machine across affected fact keys:
+    // Recomputes active heads per scope:d at ev._ts so conflicts_raised and conflicts_resolved
+    // are reproducible by event timestamp and never mutate when a conflict is later resolved.
+    const affectedScopeKeys = new Set([scopeKey])
+    for (const supId of supersedesList) {
+      const targetSk = eventToScopeKey.get(supId)
+      if (targetSk) affectedScopeKeys.add(targetSk)
+    }
+    for (const sk of affectedScopeKeys) {
+      const hMap = headsByScopeKey.get(sk)
+      if (!hMap) continue
+      for (const [auth, h] of hMap.entries()) {
+        if (h.expires_at !== null && h.expires_at !== undefined && h.expires_at <= ev._ts) {
+          hMap.delete(auth)
+        }
+      }
+      const distinctBefore = new Set([...hMap.values()].map(h => h.claim))
+      if (distinctBefore.size > 1) conflictedScopeKeys.add(sk)
+      else conflictedScopeKeys.delete(sk)
+    }
+
+    const ownHeadsBefore = headsByScopeKey.get(scopeKey) || new Map()
+    const ownClaimsBefore = new Set([...ownHeadsBefore.values()].map(h => h.claim))
+    const wasOwnConflicted = conflictedScopeKeys.has(scopeKey)
+    const anyAffectedWasConflicted = [...affectedScopeKeys].some(sk => conflictedScopeKeys.has(sk))
+
+    for (const supId of supersedesList) {
+      for (const sk of affectedScopeKeys) {
+        const hMap = headsByScopeKey.get(sk)
+        if (!hMap) continue
+        for (const [auth, h] of hMap.entries()) {
+          if (h.id === supId) hMap.delete(auth)
+        }
+      }
+    }
+
+    const ownHeadsAfter = headsByScopeKey.get(scopeKey) || new Map()
+    const claimStr = String(ev.claim || '')
+    if (isWithdrawn) {
+      ownHeadsAfter.delete(author)
+    } else {
+      const expiresAt =
+        ev.expires_at !== null && ev.expires_at !== undefined
+          ? Number(ev.expires_at)
+          : Number.isFinite(ev.ttl_sec) && Number(ev.ttl_sec) > 0
+            ? ev._ts + Number(ev.ttl_sec)
+            : null
+      ownHeadsAfter.set(author, { id: evId, author, claim: claimStr, expires_at: expiresAt })
+    }
+    headsByScopeKey.set(scopeKey, ownHeadsAfter)
+
+    const ownClaimsAfter = new Set([...ownHeadsAfter.values()].map(h => h.claim))
+    const isOwnNowConflicted = ownClaimsAfter.size > 1
+    let resolvedAnyAffected = false
+    for (const sk of affectedScopeKeys) {
+      const hMap = headsByScopeKey.get(sk) || new Map()
+      const distAfter = new Set([...hMap.values()].map(h => h.claim))
+      const wasConf = conflictedScopeKeys.has(sk)
+      const nowConf = distAfter.size > 1
+      if (wasConf && !nowConf) resolvedAnyAffected = true
+      if (nowConf) conflictedScopeKeys.add(sk)
+      else conflictedScopeKeys.delete(sk)
+    }
+
+    const conflictRaised =
+      !isWithdrawn && isOwnNowConflicted && (!wasOwnConflicted || !ownClaimsBefore.has(claimStr))
+    const conflictResolved = anyAffectedWasConflicted && resolvedAnyAffected
+
+    // Recall-grounded write: cites prior memory event (as_of_evt), supersedes prior claims, updates existing key, or joins another author's subject thread
+    const isRecallGrounded =
+      Boolean(ev.as_of_evt) ||
+      supersedesList.length > 0 ||
+      hasMerkle ||
+      Boolean(prevOnKey) ||
+      hadOtherAuthorOnSubject
+
+    if (isWithdrawn) {
+      priorByAuthorKey.delete(headKey)
+    } else {
+      priorByAuthorKey.set(headKey, ev)
+      const nextSet = new Set(prevSubjectAuthors)
+      nextSet.add(author)
+      priorAuthorsBySubject.set(subjectKey, nextSet)
+    }
+
+    return {
+      at: ev._ts,
+      author,
+      scope,
+      topic,
+      slug,
+      baseSlug,
+      subjectKey,
+      isWithdrawn,
+      isCanon,
+      isDurable,
+      hasMerkle,
+      hasEvtAnchor: Boolean(ev.as_of_evt),
+      supersedesCount: supersedesList.length,
+      hadPriorKey: Boolean(prevOnKey),
+      hadOtherAuthorOnSubject,
+      hasGitOrEvtAnchor,
+      evidenceCount,
+      refs,
+      conflictRaised,
+      conflictResolved,
+      isRecallGrounded,
+      isStepSprawl: !isDurable && SLUG_STEP_SUFFIX_RE.test(slug) && !prevOnKey && !hadOtherAuthorOnSubject,
+    }
+  })
+
+  const activityWithTs = recentActivity.filter(a => Number.isFinite(a.at) && a.at > 0 && String(a.actor || '') !== 'viewer')
+  const minActivityAt = activityWithTs.length > 0 ? Math.min(...activityWithTs.map(a => Number(a.at))) : Infinity
+
+  // Determine the earliest timestamp covered by recall telemetry (durable SQLite rollups or in-memory activity ring).
+  const minRollupFirstAt = Number.isFinite(rawRollupsObj?.coverage_start_at)
+    ? Number(rawRollupsObj.coverage_start_at)
+    : rollupRows.length > 0
+      ? Math.min(...rollupRows.map(r => (Number.isFinite(r.first_at) ? Number(r.first_at) : Number(r.hour_bucket))))
+      : null
+  const storeInitAt = Number.isFinite(rawRollupsObj?.store_initialized_at)
+    ? Number(rawRollupsObj.store_initialized_at)
+    : null
+  const earliestEventAt = chronological.length > 0 ? chronological[0]._ts : null
+  const ringOverflowed = Boolean(activity_ring?.overflowed) || recentActivity.length >= 80
+  const ringStartedAt = Number.isFinite(activity_ring?.started_at) ? Number(activity_ring.started_at) : null
+
+  let telemetryCoverageStartAt = null
+  if (hasRollupsStore) {
+    if (minRollupFirstAt !== null) {
+      if (storeInitAt !== null && (earliestEventAt === null || storeInitAt <= earliestEventAt)) {
+        telemetryCoverageStartAt = Math.min(minRollupFirstAt, storeInitAt)
+      } else {
+        telemetryCoverageStartAt = minRollupFirstAt
+      }
+    } else if (storeInitAt !== null && (earliestEventAt === null || storeInitAt <= earliestEventAt)) {
+      telemetryCoverageStartAt = storeInitAt
+    } else if (!ringOverflowed && ringStartedAt !== null) {
+      telemetryCoverageStartAt = ringStartedAt
+    }
+  } else if (ringOverflowed) {
+    telemetryCoverageStartAt = minActivityAt < Infinity ? minActivityAt : null
+  } else if (ringStartedAt !== null) {
+    telemetryCoverageStartAt = minActivityAt < Infinity ? Math.min(ringStartedAt, minActivityAt) : ringStartedAt
+  } else if (minActivityAt < Infinity) {
+    telemetryCoverageStartAt = minActivityAt
+  }
+  const effectiveCoverageBucketStart =
+    telemetryCoverageStartAt !== null ? Math.floor(telemetryCoverageStartAt / 3600) * 3600 : null
+
+  const clamp100 = v => Math.round(Math.max(0, Math.min(100, v)) * 10) / 10
+
+  function evaluateCoverageForRange(startSec, endSec) {
+    const spanSec = Math.max(1, endSec - startSec)
+    if (effectiveCoverageBucketStart === null) {
+      return {
+        recall_coverage: 'unobserved',
+        recall_incomplete: true,
+        observed_coverage_pct: 0,
+        coverage_start_at: null,
+        recall_source: hasRollupsStore ? 'sqlite_rollups' : 'activity_ring',
+      }
+    }
+    if (effectiveCoverageBucketStart <= startSec) {
+      return {
+        recall_coverage: 'complete',
+        recall_incomplete: false,
+        observed_coverage_pct: 100,
+        coverage_start_at: telemetryCoverageStartAt,
+        recall_source: hasRollupsStore ? 'sqlite_rollups' : 'activity_ring',
+      }
+    }
+    if (effectiveCoverageBucketStart > endSec) {
+      return {
+        recall_coverage: 'unobserved',
+        recall_incomplete: true,
+        observed_coverage_pct: 0,
+        coverage_start_at: telemetryCoverageStartAt,
+        recall_source: hasRollupsStore ? 'sqlite_rollups' : 'activity_ring',
+      }
+    }
+    const covPct = Math.round(Math.max(0, Math.min(100, ((endSec - effectiveCoverageBucketStart) / spanSec) * 100)) * 10) / 10
+    return {
+      recall_coverage: 'partial',
+      recall_incomplete: true,
+      observed_coverage_pct: covPct,
+      coverage_start_at: telemetryCoverageStartAt,
+      recall_source: hasRollupsStore ? 'sqlite_rollups' : 'activity_ring',
+    }
+  }
+
+  function evaluateTrendWindow(startSec, endSec) {
+    const winEvents = annotated.filter(x => x.at >= startSec && x.at <= endSec)
+    const winWrites = winEvents.filter(x => !x.isWithdrawn)
+    const winAct = activityWithTs.filter(a => a.at >= startSec && a.at <= endSec)
+    const winRollups = rollupRows.filter(r => {
+      const bStart = Number(r.hour_bucket)
+      const bEnd = bStart + 3599
+      const fAt = Number.isFinite(r.first_at) ? Number(r.first_at) : bStart
+      const lAt = Number.isFinite(r.last_at) ? Number(r.last_at) : bEnd
+      return bEnd >= startSec && bStart <= endSec && lAt >= startSec && fAt <= endSec
+    })
+    const covMeta = evaluateCoverageForRange(startSec, endSec)
+
+    const writerSet = new Set(winWrites.map(x => x.author))
+    for (const a of winAct) {
+      if (a.kind === 'submit' && a.accepted !== false && a.actor) writerSet.add(String(a.actor))
+    }
+    for (const r of winRollups) {
+      if (r.kind === 'submit' && r.actor && r.actor !== 'viewer') writerSet.add(String(r.actor))
+    }
+    const activeWriters = writerSet.size
+    const newClaims = winWrites.length
+
+    const conflictsRaised = winEvents.filter(x => x.conflictRaised).length
+    const conflictsResolved = winEvents.filter(x => x.conflictResolved).length
+
+    const winSubjAuthors = new Map()
+    for (const x of winWrites) {
+      const s = winSubjAuthors.get(x.subjectKey) || { authors: new Set(), superseded: 0, count: 0 }
+      s.authors.add(x.author)
+      s.count += 1
+      if (x.supersedesCount > 0 || x.hasMerkle) s.superseded += 1
+      winSubjAuthors.set(x.subjectKey, s)
+    }
+
+    // Recall hits in window from durable SQLite hourly rollups (surviving >80 ring overflow & restart) + activity ring
+    let ringRecallHits = 0
+    let ringQueries = 0
+    let ringQueryHits = 0
+    const recallingActors = new Set()
+    for (const a of winAct) {
+      if (a.kind === 'wake') {
+        const cnt = Number.isFinite(a.count) ? a.count : 1
+        if (cnt > 0) ringRecallHits += 1
+        if (a.actor) recallingActors.add(String(a.actor))
+      } else if (a.kind === 'query') {
+        ringQueries += 1
+        const hits = Number.isFinite(a.hits) ? a.hits : (Number.isFinite(a.count) ? a.count : 0)
+        if (hits > 0) {
+          ringRecallHits += 1
+          ringQueryHits += 1
+        }
+        if (a.actor) recallingActors.add(String(a.actor))
+      }
+    }
+
+    let rollupRecallHits = 0
+    let rollupQueries = 0
+    let rollupQueryHits = 0
+    for (const r of winRollups) {
+      if (r.actor === 'viewer') continue
+      const calls = Number(r.calls || 0)
+      const hits = Number(r.hits || 0)
+      if (r.kind === 'wake') {
+        rollupRecallHits += hits > 0 ? hits : calls
+        if (r.actor) recallingActors.add(String(r.actor))
+      } else if (r.kind === 'query') {
+        rollupQueries += calls
+        rollupQueryHits += hits
+        rollupRecallHits += hits
+        if (r.actor) recallingActors.add(String(r.actor))
+      }
+    }
+
+    const busRecallHits = Math.max(rollupRecallHits, ringRecallHits)
+    const winQueries = Math.max(rollupQueries, ringQueries)
+    const winQueryHits = Math.max(rollupQueryHits, ringQueryHits)
+    const groundedWrites = winWrites.filter(x => x.hasEvtAnchor || x.supersedesCount > 0 || x.hasMerkle).length
+    const recallHits = busRecallHits
+
+    if (newClaims === 0 && winAct.length === 0 && winRollups.length === 0) {
+      return {
+        coherence_score: 0,
+        coherence_axes: { alignment: 0, grounding: 0, convergence: 0, coupling: 0, consolidation: 0 },
+        efficacy_score: 0,
+        efficacy_axes: { breadth: 0, precision: 0, velocity: 0, reuse: 0 },
+        new_claims: 0,
+        recall_hits: 0,
+        grounded_writes: 0,
+        conflicts_raised: 0,
+        conflicts_resolved: 0,
+        active_writers: 0,
+        handoff_count: 0,
+        median_handoff_min: null,
+        ...covMeta,
+      }
+    }
+
+    // --- Windowed Coherence 2.0 (5 behavioral axes, avoiding gate-enforced saturation) ---
+    const nonCanonWrites = winWrites.filter(x => !x.isCanon)
+    const priorityAligned = nonCanonWrites.filter(x => CANON_PRIORITY_TOPICS.has(x.topic)).length
+    const priorityRatio = nonCanonWrites.length > 0 ? priorityAligned / nonCanonWrites.length : 1
+    const winTopicCounts = new Map()
+    for (const x of winWrites) winTopicCounts.set(x.topic, (winTopicCounts.get(x.topic) || 0) + 1)
+    const focusedWrites = winWrites.filter(x => (winTopicCounts.get(x.topic) || 0) >= 3 || x.isCanon).length
+    const focusRatio = newClaims > 0 ? focusedWrites / newClaims : 0
+    const writerPartRatio = Math.min(1, activeWriters / Math.max(2, expectedWriters * 0.75))
+    const alignment = clamp100(100 * (0.35 * priorityRatio + 0.35 * focusRatio + 0.30 * writerPartRatio))
+
+    const richEvWrites = winWrites.filter(x => x.evidenceCount >= 2).length
+    const richEvRatio = newClaims > 0 ? richEvWrites / newClaims : 0
+    const evtAnchoredWrites = winWrites.filter(x => x.hasEvtAnchor || x.supersedesCount > 0 || x.hasMerkle).length
+    const evtAnchoredRatio = newClaims > 0 ? Math.min(1, (evtAnchoredWrites / newClaims) * 2.2) : 0
+    const refAuthors = new Map()
+    for (const x of winWrites) {
+      for (const r of x.refs) {
+        const set = refAuthors.get(r) || new Set()
+        set.add(x.author)
+        refAuthors.set(r, set)
+      }
+    }
+    const crossAuthorRefWrites = winWrites.filter(
+      x => [...x.refs].some(r => (refAuthors.get(r)?.size || 0) >= 2) || x.hadOtherAuthorOnSubject
+    ).length
+    const crossRefRatio = newClaims > 0 ? Math.min(1, (crossAuthorRefWrites / newClaims) * 1.5) : 0
+    const grounding = clamp100(100 * (0.30 * richEvRatio + 0.30 * evtAnchoredRatio + 0.40 * crossRefRatio))
+
+    const topicAuthors = new Map()
+    for (const x of winWrites) {
+      const set = topicAuthors.get(x.topic) || new Set()
+      set.add(x.author)
+      topicAuthors.set(x.topic, set)
+    }
+    const activeTopicsCount = topicAuthors.size
+    const multiAuthorTopics = [...topicAuthors.values()].filter(s => s.size >= 2).length
+    const corroboratedTopicRatio = activeTopicsCount > 0 ? multiAuthorTopics / activeTopicsCount : 0
+    const multiAuthorSubjs = [...winSubjAuthors.values()].filter(s => s.authors.size >= 2).length
+    const subjectConvRatio = winSubjAuthors.size > 0 ? Math.min(1, (multiAuthorSubjs / winSubjAuthors.size) * 1.8) : 0
+    const conflictPenalty = newClaims > 0 ? Math.min(0.45, Math.max(0, conflictsRaised - conflictsResolved * 0.5) / newClaims) : 0
+    const convergence = clamp100(100 * (0.50 * corroboratedTopicRatio + 0.50 * subjectConvRatio) * (1 - conflictPenalty))
+
+    const coupledWrites = winWrites.filter(x => recallingActors.has(x.author) || x.isRecallGrounded).length
+    const coupledRatio = newClaims > 0 ? coupledWrites / newClaims : (recallingActors.size > 0 ? 1 : 0)
+    const effectiveRecalls = recallHits + groundedWrites
+    const recallWriteBalance = newClaims > 0 ? Math.min(1, (effectiveRecalls / newClaims) / 0.75) : (effectiveRecalls > 0 ? 1 : 0)
+    const coupling = clamp100(100 * (0.55 * coupledRatio + 0.45 * recallWriteBalance))
+
+    const durableOrCurated = winWrites.filter(x => x.isDurable || x.hasMerkle || x.supersedesCount > 0).length
+    const durableRatio = newClaims > 0 ? Math.min(1, (durableOrCurated / newClaims) * 1.6) : 0
+    const reusedOrFolded = winWrites.filter(x => x.hadPriorKey || x.supersedesCount > 0 || x.hasMerkle).length
+    const lifecycleRatio = newClaims > 0 ? Math.min(1, (reusedOrFolded / newClaims) * 1.8) : 0
+    const consolidation = clamp100(100 * (0.50 * durableRatio + 0.50 * lifecycleRatio))
+
+    const coherenceScore = clamp100(
+      0.25 * alignment +
+      0.20 * grounding +
+      0.25 * convergence +
+      0.15 * coupling +
+      0.15 * consolidation
+    )
+
+    // --- Windowed Synaptic Efficiency (4 behavioral axes) ---
+    const activeActorsSet = new Set([...writerSet, ...recallingActors])
+    const seatReachRatio = Math.min(1, activeActorsSet.size / Math.max(2, expectedWriters * 0.75))
+    const breadth = clamp100(100 * (0.50 * seatReachRatio + 0.50 * coupledRatio))
+
+    const queryHitRatio = winQueries > 0
+      ? winQueryHits / winQueries
+      : (newClaims > 0 ? Math.min(1, (recallHits / newClaims) * 0.95) : 0)
+    const sprawlCount = winWrites.filter(x => x.isStepSprawl).length
+    const signalCompressionRatio = newClaims > 0 ? Math.max(0.15, 1 - (sprawlCount / newClaims) * 0.85) : 0
+    const precision = clamp100(100 * (0.55 * queryHitRatio + 0.45 * signalCompressionRatio))
+
+    // Cross-agent handoffs inside the window
+    const bySubjChron = new Map()
+    for (const x of winWrites) {
+      const list = bySubjChron.get(x.subjectKey) || []
+      list.push(x)
+      bySubjChron.set(x.subjectKey, list)
+    }
+    const handoffMins = []
+    for (const list of bySubjChron.values()) {
+      for (let i = 1; i < list.length; i++) {
+        if (list[i].author !== list[i - 1].author) {
+          const dtMin = Math.max(0.5, (list[i].at - list[i - 1].at) / 60)
+          if (dtMin <= 720) handoffMins.push(dtMin)
+        }
+      }
+    }
+    handoffMins.sort((a, b) => a - b)
+    const handoffCount = handoffMins.length
+    const medianHandoffMin =
+      handoffCount > 0 ? Math.round(handoffMins[Math.floor(handoffCount / 2)] * 10) / 10 : null
+    const latencyScore =
+      medianHandoffMin === null
+        ? (multiAuthorTopics > 0 ? 52 : 24)
+        : medianHandoffMin <= 5
+          ? 98
+          : medianHandoffMin <= 15
+            ? 88
+            : medianHandoffMin <= 45
+              ? 76
+              : medianHandoffMin <= 120
+                ? 64
+                : 52
+    const handoffDensity = newClaims > 0 ? Math.min(1, handoffCount / Math.max(1, newClaims * 0.16)) : 0
+    const velocity = clamp100(0.60 * latencyScore + 0.40 * (handoffDensity * 100))
+
+    const nonSprawlRatio = newClaims > 0 ? 1 - sprawlCount / newClaims : 0
+    const reuse = clamp100(100 * (0.50 * corroboratedTopicRatio + 0.50 * nonSprawlRatio))
+
+    const efficacyScore = clamp100(0.30 * breadth + 0.25 * precision + 0.25 * velocity + 0.20 * reuse)
+
+    return {
+      coherence_score: coherenceScore,
+      coherence_axes: { alignment, grounding, convergence, coupling, consolidation },
+      efficacy_score: efficacyScore,
+      efficacy_axes: { breadth, precision, velocity, reuse },
+      new_claims: newClaims,
+      recall_hits: recallHits,
+      grounded_writes: groundedWrites,
+      conflicts_raised: conflictsRaised,
+      conflicts_resolved: conflictsResolved,
+      active_writers: activeWriters,
+      handoff_count: handoffCount,
+      median_handoff_min: medianHandoffMin,
+      ...covMeta,
+    }
+  }
+
+  const w24 = evaluateTrendWindow(effectiveNow - 86400, effectiveNow)
+  const w7d = evaluateTrendWindow(effectiveNow - 7 * 86400, effectiveNow)
+
+  // Build 7 UTC calendar days (plotted by date)
+  const todayUtcStart = Math.floor(effectiveNow / 86400) * 86400
+  const dailySeries = []
+  for (let dIdx = 6; dIdx >= 0; dIdx--) {
+    const dayStart = todayUtcStart - dIdx * 86400
+    const dayEnd = dIdx === 0 ? effectiveNow : dayStart + 86399
+    let isoDate
+    try {
+      isoDate = new Date(dayStart * 1000).toISOString().slice(0, 10)
+    } catch {
+      isoDate = `day-${6 - dIdx}`
+    }
+    const label = isoDate.length === 10 ? isoDate.slice(5) : isoDate
+    const m = evaluateTrendWindow(dayStart, dayEnd)
+    dailySeries.push({
+      date: isoDate,
+      label,
+      end_at: dayEnd,
+      coherence_score: m.coherence_score,
+      synaptic_efficiency_score: m.efficacy_score,
+      new_claims: m.new_claims,
+      recall_hits: m.recall_hits,
+      grounded_writes: m.grounded_writes,
+      conflicts_raised: m.conflicts_raised,
+      conflicts_resolved: m.conflicts_resolved,
+      active_writers: m.active_writers,
+      recall_coverage: m.recall_coverage,
+      recall_incomplete: m.recall_incomplete,
+      observed_coverage_pct: m.observed_coverage_pct,
+    })
+  }
+
+  // Build 6 x 4-hour rolling buckets over the last 24h
+  const hourly24hSeries = []
+  for (let bIdx = 5; bIdx >= 0; bIdx--) {
+    const bEnd = effectiveNow - bIdx * 14400
+    const bStart = bEnd - 14400 + (bIdx === 5 ? 0 : 1)
+    let label
+    try {
+      label = `${new Date(bEnd * 1000).toISOString().slice(11, 16)}Z`
+    } catch {
+      label = `-${bIdx * 4}h`
+    }
+    const m = evaluateTrendWindow(bStart, bEnd)
+    hourly24hSeries.push({
+      label,
+      coherence_score: m.coherence_score,
+      synaptic_efficiency_score: m.efficacy_score,
+      new_claims: m.new_claims,
+      recall_hits: m.recall_hits,
+      recall_coverage: m.recall_coverage,
+      recall_incomplete: m.recall_incomplete,
+      observed_coverage_pct: m.observed_coverage_pct,
+    })
+  }
+
+  const latestDay = dailySeries[dailySeries.length - 1]
+  const lifetimeCohScore = Number.isFinite(coherence?.score) ? Number(coherence.score) : 0
+  const lifetimeEffScore = Number.isFinite(efficacy?.score) ? Number(efficacy.score) : 0
+
+  return {
+    as_of: effectiveNow,
+    recall_telemetry: {
+      source: hasRollupsStore ? 'sqlite_rollups' : 'activity_ring',
+      coverage_start_at: telemetryCoverageStartAt,
+      ring_overflowed: ringOverflowed,
+      window_24h_coverage: w24.recall_coverage,
+      window_24h_incomplete: w24.recall_incomplete,
+      window_7d_coverage: w7d.recall_coverage,
+      window_7d_incomplete: w7d.recall_incomplete,
+      window_7d_coverage_pct: w7d.observed_coverage_pct,
+    },
+    window_24h: {
+      window: '24h',
+      start_at: effectiveNow - 86400,
+      end_at: effectiveNow,
+      coherence_score: w24.coherence_score,
+      coherence_axes: w24.coherence_axes,
+      synaptic_efficiency_score: w24.efficacy_score,
+      synaptic_efficiency_axes: w24.efficacy_axes,
+      new_claims: w24.new_claims,
+      recall_hits: w24.recall_hits,
+      grounded_writes: w24.grounded_writes,
+      recall_coverage: w24.recall_coverage,
+      recall_incomplete: w24.recall_incomplete,
+      observed_coverage_pct: w24.observed_coverage_pct,
+      coverage_start_at: w24.coverage_start_at,
+      recall_source: w24.recall_source,
+      conflicts_raised: w24.conflicts_raised,
+      conflicts_resolved: w24.conflicts_resolved,
+      active_writers: w24.active_writers,
+      handoff_count: w24.handoff_count,
+      median_handoff_min: w24.median_handoff_min,
+    },
+    window_7d: {
+      window: '7d',
+      start_at: effectiveNow - 7 * 86400,
+      end_at: effectiveNow,
+      coherence_score: w7d.coherence_score,
+      coherence_axes: w7d.coherence_axes,
+      synaptic_efficiency_score: w7d.efficacy_score,
+      synaptic_efficiency_axes: w7d.efficacy_axes,
+      new_claims: w7d.new_claims,
+      claims_per_day: Math.round((w7d.new_claims / 7) * 10) / 10,
+      recall_hits: w7d.recall_hits,
+      grounded_writes: w7d.grounded_writes,
+      recall_hits_per_day: Math.round((w7d.recall_hits / 7) * 10) / 10,
+      recall_coverage: w7d.recall_coverage,
+      recall_incomplete: w7d.recall_incomplete,
+      observed_coverage_pct: w7d.observed_coverage_pct,
+      coverage_start_at: w7d.coverage_start_at,
+      recall_source: w7d.recall_source,
+      conflicts_raised: w7d.conflicts_raised,
+      conflicts_resolved: w7d.conflicts_resolved,
+      active_writers: w7d.active_writers,
+      active_writers_per_day:
+        Math.round((dailySeries.reduce((s, d) => s + d.active_writers, 0) / 7) * 10) / 10,
+      handoff_count: w7d.handoff_count,
+      median_handoff_min: w7d.median_handoff_min,
+    },
+    lifetime: {
+      coherence_score: lifetimeCohScore,
+      synaptic_efficiency_score: lifetimeEffScore,
+      total_events: chronological.length,
+      active_claims: activeRecords.length,
+      inception_at: chronological[0]?._ts ?? null,
+    },
+    today_signals: {
+      date: latestDay.date,
+      label: latestDay.label,
+      new_claims: latestDay.new_claims,
+      recall_hits: latestDay.recall_hits,
+      grounded_writes: latestDay.grounded_writes,
+      recall_coverage: latestDay.recall_coverage,
+      recall_incomplete: latestDay.recall_incomplete,
+      observed_coverage_pct: latestDay.observed_coverage_pct,
+      conflicts_raised: latestDay.conflicts_raised,
+      conflicts_resolved: latestDay.conflicts_resolved,
+      active_writers: latestDay.active_writers,
+    },
+    daily_series: dailySeries,
+    hourly_24h_series: hourly24hSeries,
   }
 }
 
@@ -4225,15 +4965,23 @@ export function renderViewerHtml(initialState) {
           box.appendChild(akv);
         } else if (target.type === 'coherence') {
           var coh = target.data;
-          var delta = Number(coh.delta_since_inception || 0);
-          var deltaSign = delta >= 0 ? '+' : '';
+          var trC = latestTrends || {};
+          var w24C = trC.window_24h || coh.window_24h || null;
+          var w7dC = trC.window_7d || coh.window_7d || null;
+          var c24Score = w24C && typeof w24C.coherence_score === 'number'
+            ? w24C.coherence_score
+            : (w24C && typeof w24C.score === 'number' ? w24C.score : Number(coh.score || 0));
+          var c7dScore = w7dC && typeof w7dC.coherence_score === 'number'
+            ? w7dC.coherence_score
+            : (w7dC && typeof w7dC.score === 'number' ? w7dC.score : Number(coh.score || 0));
+          var cLifeScore = typeof coh.lifetime_score === 'number' ? coh.lifetime_score : Number(coh.score || 0);
           var ed = coh.epistemic_drift || null;
           var edStatus = ed && ed.status ? String(ed.status).toUpperCase() : 'ALIGNED';
           box.appendChild(inspectHeader(
-            'Hive Coherence 2.0',
-            coh.score.toFixed(1) + ' / 100',
-            deltaSign + delta.toFixed(1) + ' · ' + edStatus,
-            coh.score >= 72 && edStatus !== 'BLIND_SPOT' ? 'ok' : 'warn',
+            'Hive Coherence 2.0 · Rolling 24h / 7d Windows',
+            '24h: ' + c24Score.toFixed(1) + '% · 7d: ' + c7dScore.toFixed(1) + '%',
+            'life ' + cLifeScore.toFixed(1) + '% · ' + edStatus,
+            c24Score >= 65 && edStatus !== 'BLIND_SPOT' ? 'ok' : 'warn',
             '#6ee7b7',
             !selected && !hovered
           ));
@@ -4246,16 +4994,16 @@ export function renderViewerHtml(initialState) {
             swBtn.style.width = '100%';
             swBtn.style.borderColor = 'rgba(56, 189, 248, 0.55)';
             swBtn.style.color = '#7dd3fc';
-            var medH = latestEfficacy.velocity && latestEfficacy.velocity.median_handoff_min != null ? latestEfficacy.velocity.median_handoff_min + 'm handoff' : '4-axis';
-            swBtn.textContent = '⚡ Synaptic Efficacy: ' + Number(latestEfficacy.score || 0).toFixed(1) + '% (' + medH + ' · tap to inspect)';
+            var e24Val = latestEfficacy.window_24h && typeof latestEfficacy.window_24h.score === 'number' ? latestEfficacy.window_24h.score : Number(latestEfficacy.score || 0);
+            var e7dVal = latestEfficacy.window_7d && typeof latestEfficacy.window_7d.score === 'number' ? latestEfficacy.window_7d.score : Number(latestEfficacy.score || 0);
+            swBtn.textContent = '⚡ Synaptic Efficacy (24h: ' + e24Val.toFixed(1) + '% · 7d: ' + e7dVal.toFixed(1) + '% · life: ' + Number(latestEfficacy.score || 0).toFixed(1) + '% · tap)';
             swBtn.addEventListener('click', function () { openEfficacyInspector(); });
             swRow.appendChild(swBtn);
             box.appendChild(swRow);
           }
-          var hist = Array.isArray(coh.history) ? coh.history : [];
+          var hist = Array.isArray(coh.daily_history) && coh.daily_history.length ? coh.daily_history : (Array.isArray(coh.history) ? coh.history : []);
           if (hist.length > 0) {
-            var windowNote = coh.history_complete === false ? ' [TRUNCATED]' : ' (90d history)';
-            var sparkTitle = makeDiv('inspect-kicker', 'Coherence & Consolidation Trajectory' + windowNote);
+            var sparkTitle = makeDiv('inspect-kicker', 'Coherence & Consolidation Plotted by Date (7d Rolling Window)');
             sparkTitle.style.marginTop = '2px';
             box.appendChild(sparkTitle);
             var sparkCanvas = document.createElement('canvas');
@@ -4272,13 +5020,32 @@ export function renderViewerHtml(initialState) {
             box.appendChild(sparkCanvas);
             drawCoherenceGraphCanvas(sparkCanvas, coh, false);
           }
-          var axes = coh.axes || {};
+          if (trC && trC.window_24h && trC.window_7d) {
+            var sigTitle = makeDiv('inspect-kicker', 'Rolling Windows & Day-to-Day Signals (24h / 7d / Lifetime)');
+            sigTitle.style.marginTop = '4px';
+            box.appendChild(sigTitle);
+            var sigWrap = makeDiv('kv-list');
+            var sTD = trC.today_signals || {};
+            var s24 = trC.window_24h || {};
+            var s7D = trC.window_7d || {};
+            var e24S = typeof s24.synaptic_efficiency_score === 'number' ? s24.synaptic_efficiency_score : (latestEfficacy ? latestEfficacy.score : 0);
+            var e7dS = typeof s7D.synaptic_efficiency_score === 'number' ? s7D.synaptic_efficiency_score : (latestEfficacy ? latestEfficacy.score : 0);
+            var eLifeS = trC.lifetime ? trC.lifetime.synaptic_efficiency_score : (latestEfficacy ? latestEfficacy.score : 0);
+            sigWrap.appendChild(kvRow('Coherence (24h / 7d / lifetime)', '24h: ' + c24Score.toFixed(1) + '% · 7d: ' + c7dScore.toFixed(1) + '% (life ' + cLifeScore.toFixed(1) + '%)', '#34d399', true));
+            sigWrap.appendChild(kvRow('Synaptic Efficiency (24h / 7d / lifetime)', '24h: ' + Number(e24S).toFixed(1) + '% · 7d: ' + Number(e7dS).toFixed(1) + '% (life ' + Number(eLifeS).toFixed(1) + '%)', '#38bdf8', true));
+            sigWrap.appendChild(kvRow('New claims per day', 'today: ' + (sTD.new_claims ?? 0) + ' · 24h: ' + (s24.new_claims ?? 0) + ' · 7d: ' + (s7D.new_claims ?? 0) + ' (' + (s7D.claims_per_day ?? 0) + '/d avg)', '#6ee7b7', true));
+            sigWrap.appendChild(kvRow('Recall hits per day', 'today: ' + (sTD.recall_hits ?? 0) + ' · 24h: ' + (s24.recall_hits ?? 0) + ' · 7d: ' + (s7D.recall_hits ?? 0) + ' (' + (s7D.recall_hits_per_day ?? 0) + '/d avg)', '#38bdf8', true));
+            sigWrap.appendChild(kvRow('Conflicts raised / resolved', 'today: ' + (sTD.conflicts_raised ?? 0) + '↑ / ' + (sTD.conflicts_resolved ?? 0) + '✓ · 24h: ' + (s24.conflicts_raised ?? 0) + '↑/' + (s24.conflicts_resolved ?? 0) + '✓ · 7d: ' + (s7D.conflicts_raised ?? 0) + '↑/' + (s7D.conflicts_resolved ?? 0) + '✓', '#fbbf24', true));
+            sigWrap.appendChild(kvRow('Writers active per day', 'today: ' + (sTD.active_writers ?? 0) + ' · 24h: ' + (s24.active_writers ?? 0) + ' · 7d: ' + (s7D.active_writers ?? 0) + ' unique (' + (s7D.active_writers_per_day ?? 0) + '/d)', '#a78bfa', true));
+            box.appendChild(sigWrap);
+          }
+          var axes = (w24C && (w24C.coherence_axes || w24C.axes)) ? (w24C.coherence_axes || w24C.axes) : (coh.axes || {});
           var axisRows = [
-            ['Priority & Topic Alignment (25%)', axes.alignment || 0, '#38bdf8'],
-            ['Shared-Reality Grounding (20%)', axes.grounding || 0, '#34d399'],
-            ['Cross-Agent Convergence (25%)', axes.convergence || 0, '#a78bfa'],
-            ['Synaptic Coupling & Hygiene (15%)', axes.coupling || 0, '#fbbf24'],
-            ['Curation & Durability (15%)', axes.consolidation || 0, '#f472b6']
+            ['Priority & Topic Alignment (24h · 25%)', axes.alignment || 0, '#38bdf8'],
+            ['Shared-Reality Grounding (24h · 20%)', axes.grounding || 0, '#34d399'],
+            ['Cross-Agent Convergence (24h · 25%)', axes.convergence || 0, '#a78bfa'],
+            ['Synaptic Coupling & Hygiene (24h · 15%)', axes.coupling || 0, '#fbbf24'],
+            ['Curation & Durability (24h · 15%)', axes.consolidation || 0, '#f472b6']
           ];
           var axesWrap = makeDiv('kv-list');
           axisRows.forEach(function (item) {
@@ -4417,32 +5184,54 @@ export function renderViewerHtml(initialState) {
               box.appendChild(alWrap);
             }
           }
-          if (hist.length > 0) {
+          var dSeries = trC && Array.isArray(trC.daily_series) ? trC.daily_series : [];
+          if (dSeries.length > 0) {
+            var dTitle = makeDiv('inspect-kicker', 'Daily Trajectory by Date (7d UTC)');
+            dTitle.style.marginTop = '6px';
+            box.appendChild(dTitle);
+            var dList = makeDiv('kv-list');
+            dSeries.slice().reverse().forEach(function (dy, idx) {
+              var lbl = dy.date + ' (Coh ' + Number(dy.coherence_score || 0).toFixed(1) + '% · Eff ' + Number(dy.synaptic_efficiency_score || 0).toFixed(1) + '%)';
+              var dtl = '+' + dy.new_claims + ' claims · ' + dy.recall_hits + ' hits · ' + dy.conflicts_raised + '↑/' + dy.conflicts_resolved + '✓ conf · ' + dy.active_writers + ' writers';
+              dList.appendChild(kvRow(lbl, dtl, idx === 0 ? '#6ee7b7' : '#cbd5e1', true));
+            });
+            box.appendChild(dList);
+          } else if (hist.length > 0) {
             var hTitle = makeDiv('inspect-kicker', 'Historical Trajectory Checkpoints (' + hist.length + ')');
             hTitle.style.marginTop = '6px';
             box.appendChild(hTitle);
             var hList = makeDiv('kv-list');
             hist.forEach(function (pt, idx) {
-              var label = (idx === 0 ? 'Inception' : '#' + pt.claims) + ' (' + fmtTime(pt.at).slice(11, 16) + 'Z)';
+              var label = (pt.date || (idx === 0 ? 'Inception' : '#' + pt.claims)) + (pt.at ? ' (' + fmtTime(pt.at).slice(11, 16) + 'Z)' : '');
               var consTxt = pt.axes && typeof pt.axes.consolidation === 'number' ? ' · ' + pt.axes.consolidation.toFixed(0) + '% cons' : '';
-              var detail = pt.score.toFixed(1) + '% coh' + consTxt;
+              var detail = Number(pt.score || 0).toFixed(1) + '% coh' + consTxt;
               hList.appendChild(kvRow(label, detail, idx === hist.length - 1 ? '#6ee7b7' : null));
             });
             box.appendChild(hList);
           }
         } else if (target.type === 'efficacy') {
           var eff = target.data;
+          var trE = latestTrends || {};
+          var w24E = trE.window_24h || eff.window_24h || null;
+          var w7dE = trE.window_7d || eff.window_7d || null;
+          var e24Score = w24E && typeof w24E.synaptic_efficiency_score === 'number'
+            ? w24E.synaptic_efficiency_score
+            : (w24E && typeof w24E.score === 'number' ? w24E.score : Number(eff.score || 0));
+          var e7dScore = w7dE && typeof w7dE.synaptic_efficiency_score === 'number'
+            ? w7dE.synaptic_efficiency_score
+            : (w7dE && typeof w7dE.score === 'number' ? w7dE.score : Number(eff.score || 0));
+          var eLifeScore = typeof eff.lifetime_score === 'number' ? eff.lifetime_score : Number(eff.score || 0);
           var efVel = eff.velocity || {};
           var efRet = eff.retrieval || {};
           var efDist = eff.distribution || {};
           var efReuse = eff.reuse || {};
           var efProj = eff.projected || {};
-          var medBadge = (efVel.median_handoff_min != null ? efVel.median_handoff_min + 'm HANDOFF' : '4-AXIS') + ' · ' + Number(efRet.query_hit_rate_pct || 0).toFixed(0) + '% HIT';
+          var medBadge = 'life ' + eLifeScore.toFixed(1) + '% · ' + Number(efRet.query_hit_rate_pct || 0).toFixed(0) + '% HIT';
           box.appendChild(inspectHeader(
-            'Synaptic Efficacy · Information Distribution',
-            Number(eff.score || 0).toFixed(1) + ' / 100',
+            'Synaptic Efficacy · Rolling 24h / 7d Windows',
+            '24h: ' + e24Score.toFixed(1) + '% · 7d: ' + e7dScore.toFixed(1) + '%',
             medBadge,
-            eff.score >= 70 ? 'ok' : 'warn',
+            e24Score >= 65 ? 'ok' : 'warn',
             '#38bdf8'
           ));
           var backRow = makeDiv('inspect-actions');
@@ -4451,14 +5240,15 @@ export function renderViewerHtml(initialState) {
           backBtn.type = 'button';
           backBtn.className = 'btn sim';
           backBtn.style.width = '100%';
-          backBtn.textContent = '⇄ Switch to 5-Axis Hive Coherence 2.0 (' + (latestCoherence ? Number(latestCoherence.score || 0).toFixed(1) + '%' : '-') + ')';
+          var c24Back = latestCoherence && latestCoherence.window_24h ? latestCoherence.window_24h.score : (latestCoherence ? latestCoherence.score : 0);
+          backBtn.textContent = '⇄ Switch to 5-Axis Hive Coherence 2.0 (24h: ' + Number(c24Back || 0).toFixed(1) + '% · life: ' + (latestCoherence ? Number(latestCoherence.score || 0).toFixed(1) + '%' : '-') + ')';
           backBtn.addEventListener('click', function () { openCoherenceInspector(); });
           backRow.appendChild(backBtn);
           box.appendChild(backRow);
 
-          var efHist = Array.isArray(eff.history) ? eff.history : [];
+          var efHist = Array.isArray(eff.daily_history) && eff.daily_history.length ? eff.daily_history : (Array.isArray(eff.history) ? eff.history : []);
           if (efHist.length > 0) {
-            var efSparkTitle = makeDiv('inspect-kicker', 'Synaptic Efficacy & Handoff Velocity Trajectory (90d)');
+            var efSparkTitle = makeDiv('inspect-kicker', 'Synaptic Efficacy & Handoff Velocity Plotted by Date (7d Rolling Window)');
             efSparkTitle.style.marginTop = '2px';
             box.appendChild(efSparkTitle);
             var efCanvas = document.createElement('canvas');
@@ -4476,12 +5266,27 @@ export function renderViewerHtml(initialState) {
             drawEfficacyGraphCanvas(efCanvas, eff);
           }
 
-          var eAxes = eff.axes || {};
+          if (trE && trE.window_24h && trE.window_7d) {
+            var eSigTitle = makeDiv('inspect-kicker', 'Day-to-Day Signals (24h / 7d Rolling)');
+            eSigTitle.style.marginTop = '4px';
+            box.appendChild(eSigTitle);
+            var eSigWrap = makeDiv('kv-list');
+            var esTD = trE.today_signals || {};
+            var es24 = trE.window_24h || {};
+            var es7D = trE.window_7d || {};
+            eSigWrap.appendChild(kvRow('New claims per day', 'today: ' + (esTD.new_claims ?? 0) + ' · 24h: ' + (es24.new_claims ?? 0) + ' · 7d: ' + (es7D.new_claims ?? 0) + ' (' + (es7D.claims_per_day ?? 0) + '/d avg)', '#6ee7b7', true));
+            eSigWrap.appendChild(kvRow('Recall hits per day', 'today: ' + (esTD.recall_hits ?? 0) + ' · 24h: ' + (es24.recall_hits ?? 0) + ' · 7d: ' + (es7D.recall_hits ?? 0) + ' (' + (es7D.recall_hits_per_day ?? 0) + '/d avg)', '#38bdf8', true));
+            eSigWrap.appendChild(kvRow('Conflicts raised / resolved', 'today: ' + (esTD.conflicts_raised ?? 0) + '↑ / ' + (esTD.conflicts_resolved ?? 0) + '✓ · 24h: ' + (es24.conflicts_raised ?? 0) + '↑/' + (es24.conflicts_resolved ?? 0) + '✓ · 7d: ' + (es7D.conflicts_raised ?? 0) + '↑/' + (es7D.conflicts_resolved ?? 0) + '✓', '#fbbf24', true));
+            eSigWrap.appendChild(kvRow('Writers active per day', 'today: ' + (esTD.active_writers ?? 0) + ' · 24h: ' + (es24.active_writers ?? 0) + ' · 7d: ' + (es7D.active_writers ?? 0) + ' unique (' + (es7D.active_writers_per_day ?? 0) + '/d)', '#a78bfa', true));
+            box.appendChild(eSigWrap);
+          }
+
+          var eAxes = (w24E && (w24E.synaptic_efficiency_axes || w24E.axes)) ? (w24E.synaptic_efficiency_axes || w24E.axes) : (eff.axes || {});
           var eAxisRows = [
-            ['1. Distribution Breadth · Read-First (30%)', eAxes.breadth || 0, '#fbbf24'],
-            ['2. Retrieval Precision · Signal/Noise (25%)', eAxes.precision || 0, '#38bdf8'],
-            ['3. Cross-Agent Handoff Velocity (25%)', eAxes.velocity || 0, '#34d399'],
-            ['4. State Reuse vs. Slug Sprawl (20%)', eAxes.reuse || 0, '#a78bfa']
+            ['1. Distribution Breadth · Read-First (24h · 30%)', eAxes.breadth || 0, '#fbbf24'],
+            ['2. Retrieval Precision · Signal/Noise (24h · 25%)', eAxes.precision || 0, '#38bdf8'],
+            ['3. Cross-Agent Handoff Velocity (24h · 25%)', eAxes.velocity || 0, '#34d399'],
+            ['4. State Reuse vs. Slug Sprawl (24h · 20%)', eAxes.reuse || 0, '#a78bfa']
           ];
           var eAxesWrap = makeDiv('kv-list');
           eAxisRows.forEach(function (item) {
@@ -6167,6 +6972,7 @@ export function renderViewerHtml(initialState) {
 
       var latestCoherence = null;
       var latestEfficacy = null;
+      var latestTrends = null;
       var VIEWER_VERSION = '${VIEWER_VERSION}';
       function openCoherenceInspector() {
         if (!latestCoherence) return;
@@ -6195,7 +7001,8 @@ export function renderViewerHtml(initialState) {
 
       function drawEfficacyGraphCanvas(cv, eff) {
         if (!cv || !eff) return;
-        var hist = Array.isArray(eff.history) ? eff.history : [];
+        var hasDaily = Array.isArray(eff.daily_history) && eff.daily_history.length >= 2;
+        var hist = hasDaily ? eff.daily_history : (Array.isArray(eff.history) ? eff.history : []);
         if (!hist.length) return;
         var sctx = cv.getContext('2d');
         if (!sctx) return;
@@ -6205,14 +7012,14 @@ export function renderViewerHtml(initialState) {
         var padX = 42;
         var padTop = 40;
         var padBot = 26;
-        var proj = eff.projected || null;
+        var proj = !hasDaily && eff.projected ? eff.projected : null;
         var totalPts = proj && proj.after_wake_hook_score ? hist.length + 1 : hist.length;
         var xOf = function (idx) {
           return padX + (totalPts <= 1 ? (sw - padX - 20) / 2 : (idx / (totalPts - 1)) * (sw - padX - 24));
         };
         var yOf = function (val) {
-          var clamped = Math.max(20, Math.min(100, Number(val || 0)));
-          return sh - padBot - ((clamped - 20) / 80) * (sh - padTop - padBot);
+          var clamped = Math.max(0, Math.min(100, Number(val || 0)));
+          return sh - padBot - (clamped / 100) * (sh - padTop - padBot);
         };
         sctx.strokeStyle = 'rgba(148, 163, 184, 0.18)';
         sctx.lineWidth = 1;
@@ -6227,13 +7034,15 @@ export function renderViewerHtml(initialState) {
           sctx.stroke();
           sctx.fillText(lvl + '%', 4, gy + 4);
         });
-        // Dashed Amber curve: Cross-Agent Handoff Velocity
+        // Dashed Amber curve: Cross-Agent Handoff Velocity (or 7d reference)
         sctx.save();
         sctx.setLineDash([6, 4]);
         sctx.beginPath();
         hist.forEach(function (pt, idx) {
           var px = xOf(idx);
-          var velVal = pt.axes && typeof pt.axes.velocity === 'number' ? pt.axes.velocity : pt.score;
+          var velVal = pt.axes && typeof pt.axes.velocity === 'number'
+            ? pt.axes.velocity
+            : (typeof pt.coherence_score === 'number' ? pt.coherence_score : pt.score);
           var py = yOf(velVal);
           if (idx === 0) sctx.moveTo(px, py);
           else sctx.lineTo(px, py);
@@ -6242,7 +7051,7 @@ export function renderViewerHtml(initialState) {
         sctx.lineWidth = 2.4;
         sctx.stroke();
         sctx.restore();
-        // Solid Cyan curve: Overall Synaptic Efficacy
+        // Solid Cyan curve: Overall Synaptic Efficacy by Date
         sctx.beginPath();
         hist.forEach(function (pt, idx) {
           var px = xOf(idx);
@@ -6277,28 +7086,42 @@ export function renderViewerHtml(initialState) {
           sctx.fill();
         });
         sctx.font = '600 10.5px ui-monospace, SFMono-Regular, Menlo, monospace';
-        sctx.fillStyle = '#94a3b8';
-        sctx.textAlign = 'left';
-        sctx.fillText('Inception', padX, sh - 7);
-        if (hist.length > 2) {
-          var midIdx = Math.floor((hist.length - 1) / 2);
-          sctx.textAlign = 'center';
-          sctx.fillText('#' + hist[midIdx].claims, xOf(midIdx), sh - 7);
+        if (hasDaily) {
+          hist.forEach(function (pt, idx) {
+            sctx.fillStyle = idx === hist.length - 1 ? '#fbbf24' : '#94a3b8';
+            sctx.textAlign = idx === 0 ? 'left' : (idx === hist.length - 1 ? 'right' : 'center');
+            sctx.fillText(pt.label || pt.date || '', xOf(idx), sh - 7);
+          });
+        } else {
+          sctx.fillStyle = '#94a3b8';
+          sctx.textAlign = 'left';
+          sctx.fillText('Inception', padX, sh - 7);
+          if (hist.length > 2) {
+            var midIdx = Math.floor((hist.length - 1) / 2);
+            sctx.textAlign = 'center';
+            sctx.fillText('#' + hist[midIdx].claims, xOf(midIdx), sh - 7);
+          }
+          sctx.textAlign = 'right';
+          sctx.fillStyle = '#fbbf24';
+          sctx.fillText('Now #' + hist[hist.length - 1].claims, Math.min(xOf(hist.length - 1), sw - 78), sh - 7);
+          sctx.fillStyle = '#34d399';
+          sctx.fillText('+WakeHook', sw - 8, sh - 7);
         }
-        sctx.textAlign = 'right';
-        sctx.fillStyle = '#fbbf24';
-        sctx.fillText('Now #' + hist[hist.length - 1].claims, Math.min(xOf(hist.length - 1), sw - 78), sh - 7);
-        sctx.fillStyle = '#34d399';
-        sctx.fillText('+WakeHook', sw - 8, sh - 7);
         // 2-line legend
+        var e24L = eff.window_24h && typeof eff.window_24h.score === 'number' ? eff.window_24h.score : Number(eff.score || 0);
+        var e7dL = eff.window_7d && typeof eff.window_7d.score === 'number' ? eff.window_7d.score : Number(eff.score || 0);
+        var eLifeL = typeof eff.lifetime_score === 'number' ? eff.lifetime_score : Number(eff.score || 0);
         sctx.textAlign = 'left';
         sctx.font = '700 11.5px ui-monospace, SFMono-Regular, Menlo, monospace';
         sctx.fillStyle = '#38bdf8';
-        sctx.fillText('● Synaptic Efficacy: ' + Number(eff.score || 0).toFixed(1) + '%', 8, 15);
-        var velNow = eff.axes && typeof eff.axes.velocity === 'number' ? eff.axes.velocity.toFixed(1) : '-';
+        sctx.fillText('● Synaptic Eff 24h: ' + e24L.toFixed(1) + '% · 7d: ' + e7dL.toFixed(1) + '%', 8, 15);
         sctx.fillStyle = '#fbbf24';
-        sctx.fillText('--- Handoff Velocity: ' + velNow + '%', 250, 15);
-        if (proj && typeof proj.after_wake_hook_score === 'number') {
+        sctx.fillText('life: ' + eLifeL.toFixed(1) + '%', 350, 15);
+        if (hasDaily) {
+          var lastPt = hist[hist.length - 1] || {};
+          sctx.fillStyle = '#34d399';
+          sctx.fillText('◆ Today (' + (lastPt.date || '') + '): +' + (lastPt.claims ?? 0) + ' claims · ' + (lastPt.recall_hits ?? 0) + ' recall hits · ' + (lastPt.active_writers ?? 0) + ' writers', 8, 30);
+        } else if (proj && typeof proj.after_wake_hook_score === 'number') {
           sctx.fillStyle = '#34d399';
           sctx.fillText('◆ Post-@curator (' + Number(proj.after_curator_score || 0).toFixed(1) + '%) + Wake-Hook Projection: ' + proj.after_wake_hook_score.toFixed(1) + '%', 8, 30);
         }
@@ -6306,7 +7129,8 @@ export function renderViewerHtml(initialState) {
 
       function drawCoherenceGraphCanvas(cv, coh, isMini) {
         if (!cv || !coh) return;
-        var hist = Array.isArray(coh.history) ? coh.history : [];
+        var hasDaily = Array.isArray(coh.daily_history) && coh.daily_history.length >= 2;
+        var hist = hasDaily ? coh.daily_history : (Array.isArray(coh.history) ? coh.history : []);
         if (!hist.length) return;
         var sctx = cv.getContext('2d');
         if (!sctx) return;
@@ -6316,14 +7140,14 @@ export function renderViewerHtml(initialState) {
         var padX = isMini ? 6 : 42;
         var padTop = isMini ? 5 : 40;
         var padBot = isMini ? 5 : 26;
-        var proj = coh.projected_after_dream || null;
+        var proj = !hasDaily && coh.projected_after_dream ? coh.projected_after_dream : null;
         var totalPts = proj ? hist.length + 1 : hist.length;
         var xOf = function (idx) {
           return padX + (totalPts <= 1 ? (sw - padX - 20) / 2 : (idx / (totalPts - 1)) * (sw - padX - 24));
         };
         var yOf = function (val) {
-          var clamped = Math.max(20, Math.min(100, Number(val || 0)));
-          return sh - padBot - ((clamped - 20) / 80) * (sh - padTop - padBot);
+          var clamped = Math.max(0, Math.min(100, Number(val || 0)));
+          return sh - padBot - (clamped / 100) * (sh - padTop - padBot);
         };
         if (!isMini) {
           sctx.strokeStyle = 'rgba(148, 163, 184, 0.18)';
@@ -6340,13 +7164,15 @@ export function renderViewerHtml(initialState) {
             sctx.fillText(lvl + '%', 4, gy + 4);
           });
         }
-        // Pink dashed curve: Consolidation Axis over time
+        // Dashed curve: Synaptic Efficiency by Date (when daily_history is present) or Consolidation Axis
         sctx.save();
         sctx.setLineDash(isMini ? [3, 2] : [6, 4]);
         sctx.beginPath();
         hist.forEach(function (pt, idx) {
           var px = xOf(idx);
-          var consVal = pt.axes && typeof pt.axes.consolidation === 'number' ? pt.axes.consolidation : pt.score;
+          var consVal = typeof pt.synaptic_efficiency_score === 'number'
+            ? pt.synaptic_efficiency_score
+            : (pt.axes && typeof pt.axes.consolidation === 'number' ? pt.axes.consolidation : pt.score);
           var py = yOf(consVal);
           if (idx === 0) sctx.moveTo(px, py);
           else sctx.lineTo(px, py);
@@ -6354,11 +7180,11 @@ export function renderViewerHtml(initialState) {
         if (proj && typeof proj.consolidation === 'number') {
           sctx.lineTo(xOf(hist.length), yOf(proj.consolidation));
         }
-        sctx.strokeStyle = '#f472b6';
+        sctx.strokeStyle = hasDaily ? '#a78bfa' : '#f472b6';
         sctx.lineWidth = isMini ? 1.5 : 2.5;
         sctx.stroke();
         sctx.restore();
-        // Solid Emerald curve: Overall Hive Coherence over time
+        // Solid Emerald curve: Coherence by Date
         sctx.beginPath();
         hist.forEach(function (pt, idx) {
           var px = xOf(idx);
@@ -6388,58 +7214,51 @@ export function renderViewerHtml(initialState) {
             sctx.arc(px, py, 3.8, 0, Math.PI * 2);
             sctx.fillStyle = idx === hist.length - 1 ? '#fbbf24' : '#38bdf8';
             sctx.fill();
-            var consVal = pt.axes && typeof pt.axes.consolidation === 'number' ? pt.axes.consolidation : null;
-            if (consVal !== null && (idx === 0 || idx === hist.length - 1 || idx % 3 === 0)) {
+            var secVal = typeof pt.synaptic_efficiency_score === 'number'
+              ? pt.synaptic_efficiency_score
+              : (pt.axes && typeof pt.axes.consolidation === 'number' ? pt.axes.consolidation : null);
+            if (secVal !== null) {
               sctx.beginPath();
-              sctx.arc(px, yOf(consVal), 2.8, 0, Math.PI * 2);
-              sctx.fillStyle = '#f472b6';
+              sctx.arc(px, yOf(secVal), 2.8, 0, Math.PI * 2);
+              sctx.fillStyle = hasDaily ? '#a78bfa' : '#f472b6';
               sctx.fill();
             }
           });
-          if (proj && typeof proj.score === 'number') {
-            sctx.beginPath();
-            sctx.arc(xOf(hist.length), yOf(proj.score), 5, 0, Math.PI * 2);
-            sctx.fillStyle = '#a78bfa';
-            sctx.fill();
-            if (typeof proj.consolidation === 'number') {
-              sctx.beginPath();
-              sctx.arc(xOf(hist.length), yOf(proj.consolidation), 4.5, 0, Math.PI * 2);
-              sctx.fillStyle = '#f472b6';
-              sctx.fill();
-            }
-          }
-          // X-axis labels
+          // X-axis labels by Date
           sctx.font = '600 10.5px ui-monospace, SFMono-Regular, Menlo, monospace';
-          sctx.fillStyle = '#94a3b8';
-          sctx.textAlign = 'left';
-          sctx.fillText('Inception', padX, sh - 7);
-          if (hist.length > 2) {
-            var midIdx = Math.floor((hist.length - 1) / 2);
-            sctx.textAlign = 'center';
-            sctx.fillText('#' + hist[midIdx].claims, xOf(midIdx), sh - 7);
-          }
-          if (proj) {
-            sctx.textAlign = 'right';
-            sctx.fillStyle = '#fbbf24';
-            sctx.fillText('Now #' + hist[hist.length - 1].claims, Math.min(xOf(hist.length - 1), sw - 74), sh - 7);
-            sctx.fillStyle = '#c4b5fd';
-            sctx.fillText('+Curator', sw - 8, sh - 7);
+          if (hasDaily) {
+            hist.forEach(function (pt, idx) {
+              sctx.fillStyle = idx === hist.length - 1 ? '#fbbf24' : '#94a3b8';
+              sctx.textAlign = idx === 0 ? 'left' : (idx === hist.length - 1 ? 'right' : 'center');
+              sctx.fillText(pt.label || pt.date || '', xOf(idx), sh - 7);
+            });
           } else {
+            sctx.fillStyle = '#94a3b8';
+            sctx.textAlign = 'left';
+            sctx.fillText('Inception', padX, sh - 7);
+            if (hist.length > 2) {
+              var midIdx = Math.floor((hist.length - 1) / 2);
+              sctx.textAlign = 'center';
+              sctx.fillText('#' + hist[midIdx].claims, xOf(midIdx), sh - 7);
+            }
             sctx.textAlign = 'right';
             sctx.fillStyle = '#fbbf24';
             sctx.fillText('Now #' + hist[hist.length - 1].claims, sw - 8, sh - 7);
           }
           // 2-line clear legend at top
+          var c24L = coh.window_24h && typeof coh.window_24h.score === 'number' ? coh.window_24h.score : Number(coh.score || 0);
+          var c7dL = coh.window_7d && typeof coh.window_7d.score === 'number' ? coh.window_7d.score : Number(coh.score || 0);
+          var cLifeL = typeof coh.lifetime_score === 'number' ? coh.lifetime_score : Number(coh.score || 0);
           sctx.textAlign = 'left';
           sctx.font = '700 11.5px ui-monospace, SFMono-Regular, Menlo, monospace';
           sctx.fillStyle = '#34d399';
-          sctx.fillText('● Coherence: ' + Number(coh.score || 0).toFixed(1) + '%', 8, 15);
-          var consNow = coh.axes && typeof coh.axes.consolidation === 'number' ? coh.axes.consolidation.toFixed(1) : '-';
-          sctx.fillStyle = '#f472b6';
-          sctx.fillText('--- Consolidation: ' + consNow + '%', 230, 15);
-          if (proj && typeof proj.consolidation === 'number') {
+          sctx.fillText('● Coherence 24h: ' + c24L.toFixed(1) + '% · 7d: ' + c7dL.toFixed(1) + '%', 8, 15);
+          sctx.fillStyle = hasDaily ? '#a78bfa' : '#f472b6';
+          sctx.fillText('life: ' + cLifeL.toFixed(1) + '%', 350, 15);
+          if (hasDaily) {
+            var lastDay = hist[hist.length - 1] || {};
             sctx.fillStyle = '#c4b5fd';
-            sctx.fillText('◆ Post-@curator Projection: ' + proj.score.toFixed(1) + '% Coh · ' + proj.consolidation.toFixed(1) + '% Cons', 8, 30);
+            sctx.fillText('◆ Today (' + (lastDay.date || '') + '): +' + (lastDay.claims ?? 0) + ' claims · ' + (lastDay.recall_hits ?? 0) + ' recall hits · ' + (lastDay.conflicts_raised ?? 0) + '↑/' + (lastDay.conflicts_resolved ?? 0) + '✓ conf · ' + (lastDay.active_writers ?? 0) + ' writers', 8, 30);
           }
         }
       }
@@ -6449,21 +7268,23 @@ export function renderViewerHtml(initialState) {
         drawCoherenceGraphCanvas(el('hud-coherence-spark'), coh, true);
         drawCoherenceGraphCanvas(el('coherence-trajectory-canvas'), coh, false);
         drawCoherenceGraphCanvas(el('cards-coherence-canvas'), coh, false);
-        var axes = coh.axes || {};
-        var consNow = typeof axes.consolidation === 'number' ? axes.consolidation.toFixed(1) : '-';
+        var c24 = coh.window_24h && typeof coh.window_24h.score === 'number' ? coh.window_24h.score : Number(coh.score || 0);
+        var c7d = coh.window_7d && typeof coh.window_7d.score === 'number' ? coh.window_7d.score : Number(coh.score || 0);
+        var cLife = typeof coh.lifetime_score === 'number' ? coh.lifetime_score : Number(coh.score || 0);
         if (el('coh-graph-pill')) {
-          el('coh-graph-pill').textContent = Number(coh.score || 0).toFixed(1) + '% coh · ' + consNow + '% cons';
+          el('coh-graph-pill').textContent = '24h: ' + c24.toFixed(1) + '% · 7d: ' + c7d.toFixed(1) + '% (life ' + cLife.toFixed(1) + '%)';
         }
         if (el('cards-coherence-badge')) {
-          el('cards-coherence-badge').textContent = Number(coh.score || 0).toFixed(1) + '% Coherence · ' + consNow + '% Consolidation';
+          el('cards-coherence-badge').textContent = '24h: ' + c24.toFixed(1) + '% · 7d: ' + c7d.toFixed(1) + '% · life: ' + cLife.toFixed(1) + '%';
         }
         var miniWrap = el('coherence-axes-mini');
         if (miniWrap) {
           miniWrap.textContent = '';
-          var coreVal = typeof coh.core_memory_score === 'number' ? coh.core_memory_score : coh.score;
-          var periphVal = typeof coh.periphery_coherence_score === 'number' ? coh.periphery_coherence_score : coh.score;
-          miniWrap.appendChild(kvRow('Core Memory (Eyeball) vs Periphery (Ring)', Number(coreVal).toFixed(1) + '% core · ' + Number(periphVal).toFixed(1) + '% ring', '#6ee7b7'));
-          miniWrap.appendChild(kvRow('Curation & Durability Axis (74.8% Class A)', consNow + '%', '#f472b6'));
+          miniWrap.appendChild(kvRow('Rolling Coherence (24h / 7d / life)', c24.toFixed(1) + '% (24h) · ' + c7d.toFixed(1) + '% (7d) · life ' + cLife.toFixed(1) + '%', '#6ee7b7'));
+          if (latestTrends && latestTrends.window_24h) {
+            var s24 = latestTrends.window_24h;
+            miniWrap.appendChild(kvRow('24h Signals (Claims / Recalls / Writers)', '+' + (s24.new_claims ?? 0) + 'W · ' + (s24.recall_hits ?? 0) + 'R · ' + (s24.conflicts_raised ?? 0) + '↑/' + (s24.conflicts_resolved ?? 0) + '✓ · ' + (s24.active_writers ?? 0) + ' writers', '#38bdf8'));
+          }
           if (coh.projected_after_dream) {
             var pr = coh.projected_after_dream;
             miniWrap.appendChild(kvRow('Projected Post-@curator (' + (pr.staged_actions || 0) + ' Merkle clusters)', pr.score.toFixed(1) + '% coh · ' + pr.consolidation.toFixed(1) + '% cons', '#c4b5fd'));
@@ -6472,13 +7293,14 @@ export function renderViewerHtml(initialState) {
         var cardsBars = el('cards-coherence-bars');
         if (cardsBars) {
           cardsBars.textContent = '';
+          var axes = (coh.window_24h && coh.window_24h.axes) ? coh.window_24h.axes : (coh.axes || {});
           var rows = [
-            ['Overall Hive Coherence 2.0', coh.score || 0, '#34d399'],
-            ['Core Memory State (Eyeball / Elbow)', coh.core_memory_score || coh.score || 0, '#6ee7b7'],
-            ['Fleet Periphery Coherence (Outer Ring)', coh.periphery_coherence_score || 0, '#fbbf24'],
-            ['Curation & Durability Axis (Consolidation)', axes.consolidation || 0, '#f472b6'],
-            ['Cross-Agent Convergence (25%)', axes.convergence || 0, '#a78bfa'],
-            ['Synaptic Coupling & Hygiene (15%)', axes.coupling || 0, '#38bdf8']
+            ['Rolling 24h Coherence', c24, '#34d399'],
+            ['Rolling 7d Coherence', c7d, '#6ee7b7'],
+            ['Lifetime Coherence (small ref)', cLife, '#94a3b8'],
+            ['Curation & Durability Axis (24h)', axes.consolidation || 0, '#f472b6'],
+            ['Cross-Agent Convergence (24h)', axes.convergence || 0, '#a78bfa'],
+            ['Synaptic Coupling & Hygiene (24h)', axes.coupling || 0, '#38bdf8']
           ];
           rows.forEach(function (item) {
             cardsBars.appendChild(kvRow(item[0], Number(item[1]).toFixed(1) + '%', item[2]));
@@ -6497,6 +7319,7 @@ export function renderViewerHtml(initialState) {
         var st = s.store_state || {};
         latestStoreState = st;
         latestRecentActivity = Array.isArray(s.recent_activity) ? s.recent_activity : [];
+        if (s.trends && typeof s.trends === 'object') latestTrends = s.trends;
         if (s.curator_state && typeof s.curator_state === 'object') latestCuratorState = s.curator_state;
         if (s.consolidated_sources && typeof s.consolidated_sources === 'object') latestConsolidatedSources = s.consolidated_sources;
         if (Array.isArray(s.constellation_links)) latestConstellationLinks = s.constellation_links;
@@ -6537,26 +7360,23 @@ export function renderViewerHtml(initialState) {
         if (s.coherence && typeof s.coherence === 'object') {
           latestCoherence = s.coherence;
           if (selected && selected.type === 'coherence') selected.data = latestCoherence;
-          var cScore = Number(s.coherence.score || 0).toFixed(1);
-          var cDelta = Number(s.coherence.delta_since_inception || 0);
-          var cSign = cDelta >= 0 ? '+' : '';
-          var edSt = s.coherence.epistemic_drift && s.coherence.epistemic_drift.status ? String(s.coherence.epistemic_drift.status).toUpperCase() : '2.0';
-          if (el('coherence-val')) el('coherence-val').textContent = cScore + '%';
-          if (el('coherence-sub')) el('coherence-sub').textContent = cSign + cDelta.toFixed(1) + ' · ' + edSt + ' · tap';
-          if (el('m-kpi-coherence')) el('m-kpi-coherence').textContent = 'coh 2.0: ' + cScore + '% (' + edSt + ')';
+          var c24Val = s.coherence.window_24h && typeof s.coherence.window_24h.score === 'number' ? s.coherence.window_24h.score : Number(s.coherence.score || 0);
+          var c7dVal = s.coherence.window_7d && typeof s.coherence.window_7d.score === 'number' ? s.coherence.window_7d.score : Number(s.coherence.score || 0);
+          var cLifeVal = typeof s.coherence.lifetime_score === 'number' ? s.coherence.lifetime_score : Number(s.coherence.score || 0);
+          if (el('coherence-val')) el('coherence-val').textContent = c24Val.toFixed(1) + '%';
+          if (el('coherence-sub')) el('coherence-sub').textContent = '7d ' + c7dVal.toFixed(1) + '% · life ' + cLifeVal.toFixed(0) + '% · tap';
+          if (el('m-kpi-coherence')) el('m-kpi-coherence').textContent = 'coh 24h: ' + c24Val.toFixed(1) + '% (7d ' + c7dVal.toFixed(0) + '% · life ' + cLifeVal.toFixed(0) + '%)';
           renderCoherencePanels(s.coherence);
         }
         if (s.efficacy && typeof s.efficacy === 'object') {
           latestEfficacy = s.efficacy;
           if (selected && selected.type === 'efficacy') selected.data = latestEfficacy;
-          var eScore = Number(s.efficacy.score || 0).toFixed(1);
-          var eVel = s.efficacy.velocity || {};
-          var eRet = s.efficacy.retrieval || {};
-          var medTxt = eVel.median_handoff_min != null ? (eVel.median_handoff_min + 'm handoff') : '4-axis';
-          var hitTxt = Number(eRet.query_hit_rate_pct || 0).toFixed(0) + '% hit';
-          if (el('efficacy-val')) el('efficacy-val').textContent = eScore + '%';
-          if (el('efficacy-sub')) el('efficacy-sub').textContent = medTxt + ' · ' + hitTxt + ' · tap';
-          if (el('m-kpi-efficacy')) el('m-kpi-efficacy').textContent = 'eff: ' + eScore + '% (' + medTxt + ')';
+          var e24Val = s.efficacy.window_24h && typeof s.efficacy.window_24h.score === 'number' ? s.efficacy.window_24h.score : Number(s.efficacy.score || 0);
+          var e7dVal = s.efficacy.window_7d && typeof s.efficacy.window_7d.score === 'number' ? s.efficacy.window_7d.score : Number(s.efficacy.score || 0);
+          var eLifeVal = typeof s.efficacy.lifetime_score === 'number' ? s.efficacy.lifetime_score : Number(s.efficacy.score || 0);
+          if (el('efficacy-val')) el('efficacy-val').textContent = e24Val.toFixed(1) + '%';
+          if (el('efficacy-sub')) el('efficacy-sub').textContent = '7d ' + e7dVal.toFixed(1) + '% · life ' + eLifeVal.toFixed(0) + '% · tap';
+          if (el('m-kpi-efficacy')) el('m-kpi-efficacy').textContent = 'eff 24h: ' + e24Val.toFixed(1) + '% (7d ' + e7dVal.toFixed(0) + '% · life ' + eLifeVal.toFixed(0) + '%)';
         }
         if (s.curator_state && typeof s.curator_state === 'object') {
           var eigCount = Array.isArray(s.curator_state.topic_eigenvectors) ? s.curator_state.topic_eigenvectors.length : 0;
@@ -6822,6 +7642,23 @@ export function buildMobileState(state = {}, nowSec = undefined, extraHistoryRec
     ...cs,
     consolidated_sources: consolidatedMap,
   })
+  const trends =
+    state?.trends && typeof state.trends === 'object' && Array.isArray(state.trends.daily_series)
+      ? state.trends
+      : computeMemoryTrends({
+          records,
+          history_records: historyList,
+          consolidated_records: consolidatedList,
+          agent_roster: roster,
+          recent_activity: recentActivity,
+          activity_rollups: state?.activity_rollups || null,
+          activity_ring: state?.activity_ring || null,
+          store_state: ss,
+          curator_state: cs,
+          coherence: coh,
+          efficacy: eff,
+          now_sec: effectiveNow,
+        })
 
   // --- Per-author active claim counts (by pubkey and id) ---
   const activeClaimsByPubkey = new Map()
@@ -7042,6 +7879,9 @@ export function buildMobileState(state = {}, nowSec = undefined, extraHistoryRec
   const ah = state?.agent_health && typeof state.agent_health === 'object' ? state.agent_health : {}
   const synapticEfficiency = {
     score: Number.isFinite(eff?.score) ? eff.score : 0,
+    lifetime_score: Number.isFinite(eff?.score) ? eff.score : 0,
+    score_24h: Number(trends.window_24h.synaptic_efficiency_score || 0),
+    score_7d: Number(trends.window_7d.synaptic_efficiency_score || 0),
     axes: {
       breadth: Number(eff?.axes?.breadth ?? 0),
       precision: Number(eff?.axes?.precision ?? 0),
@@ -7164,6 +8004,9 @@ export function buildMobileState(state = {}, nowSec = undefined, extraHistoryRec
     },
     coherence: {
       score: Number(coh?.score ?? 0),
+      lifetime_score: Number(coh?.score ?? 0),
+      score_24h: Number(trends.window_24h.coherence_score || 0),
+      score_7d: Number(trends.window_7d.coherence_score || 0),
       core_memory_score: Number(coh?.core_memory_score ?? 0),
       periphery_coherence_score: Number(coh?.periphery_coherence_score ?? 0),
       inception_score: Number(coh?.inception_score ?? 0),
@@ -7194,6 +8037,7 @@ export function buildMobileState(state = {}, nowSec = undefined, extraHistoryRec
       })),
     },
     synaptic_efficiency: synapticEfficiency,
+    trends,
     dreams: {
       mode: dreamTel.display_mode.mode,
       mode_label: dreamTel.display_mode.label,
@@ -7277,324 +8121,285 @@ export function renderMobileViewerHtml(initialMobileState = {}) {
     initialMobileState && initialMobileState.view_mode === 'mobile_pocket_cortex'
       ? initialMobileState
       : buildMobileState(initialMobileState)
-  const escapedInitial = safeJsonForScript(mobileData)
+  const tr = mobileData.trends || {}
+  const initPayload = {
+    reader: mobileData.reader,
+    connected: mobileData.connected,
+    polled_at: mobileData.polled_at,
+    poll_seq: mobileData.poll_seq,
+    store_state: {
+      state: mobileData.store_state?.state,
+      write_seq: mobileData.store_state?.write_seq,
+      current_claims: mobileData.store_state?.current_claims,
+    },
+    backup: mobileData.backup,
+    velocities: mobileData.velocities,
+    coherence: {
+      score: mobileData.coherence?.score,
+      lifetime_score: mobileData.coherence?.lifetime_score,
+      drift_status: mobileData.coherence?.drift_status,
+      axes: mobileData.coherence?.axes,
+      counts: { grounded_claims: mobileData.coherence?.counts?.grounded_claims ?? 0 },
+    },
+    synaptic_efficiency: {
+      score: mobileData.synaptic_efficiency?.score,
+      lifetime_score: mobileData.synaptic_efficiency?.lifetime_score,
+      axes: mobileData.synaptic_efficiency?.axes,
+      reuse: { durable_claims: mobileData.synaptic_efficiency?.reuse?.durable_claims ?? 0 },
+    },
+    trends: {
+      window_24h: tr.window_24h,
+      window_7d: tr.window_7d,
+      lifetime: tr.lifetime,
+      today_signals: tr.today_signals,
+      daily_series: (Array.isArray(tr.daily_series) ? tr.daily_series : []).map(d => ({
+        label: d.label,
+        coherence_score: d.coherence_score,
+        synaptic_efficiency_score: d.synaptic_efficiency_score,
+        new_claims: d.new_claims,
+        recall_hits: d.recall_hits,
+        recall_incomplete: d.recall_incomplete,
+        conflicts_raised: d.conflicts_raised,
+        conflicts_resolved: d.conflicts_resolved,
+        active_writers: d.active_writers,
+      })),
+      hourly_24h_series: (Array.isArray(tr.hourly_24h_series) ? tr.hourly_24h_series : []).map(h => ({
+        label: h.label,
+        coherence_score: h.coherence_score,
+        synaptic_efficiency_score: h.synaptic_efficiency_score,
+      })),
+    },
+    dreams: {
+      persisted_curation: mobileData.dreams?.persisted_curation,
+      last_curated_at: mobileData.dreams?.last_curated_at,
+      last_curated_write_seq: mobileData.dreams?.last_curated_write_seq,
+      elapsed_sec: mobileData.dreams?.elapsed_sec,
+      dream_interval_sec: mobileData.dreams?.dream_interval_sec,
+      write_delta: mobileData.dreams?.write_delta,
+      write_delta_threshold: mobileData.dreams?.write_delta_threshold,
+      counts: mobileData.dreams?.counts,
+      planned_summary: mobileData.dreams?.planned_summary,
+      recent_consolidations: (mobileData.dreams?.recent_consolidations || []).slice(0, 4),
+      eigenvectors: (mobileData.dreams?.eigenvectors || []).slice(0, 1),
+    },
+    agents: {
+      summary: mobileData.agents?.summary,
+      roster: (mobileData.agents?.roster || []).map(a => ({
+        id: a.id,
+        is_writer: a.is_writer,
+        fenced: a.fenced,
+        health: a.health,
+        compliance_status: a.compliance_status,
+        coherence_score: a.coherence_score,
+        reads_5m: a.reads_5m,
+        writes_5m: a.writes_5m,
+        refusals_15m: a.refusals_15m,
+        active_claims: a.active_claims,
+        last_recall_at: a.last_recall_at,
+        last_write_at: a.last_write_at,
+        last_write_slug: a.last_write_slug,
+      })),
+    },
+    alerts: (mobileData.alerts || []).slice(0, 5),
+    vitals: {
+      scope_counts: mobileData.vitals?.scope_counts,
+      entity_graph: { total_edges: mobileData.vitals?.entity_graph?.total_edges || 0 },
+      topics: (mobileData.vitals?.topics || []).slice(0, 7),
+      recent_pulses: (mobileData.vitals?.recent_pulses || []).slice(0, 5),
+    },
+  }
+  const escapedInitial = safeJsonForScript(initPayload)
   const syncState = escapeHtml(mobileData.store_state?.state || 'CONNECTING')
   const readerName = escapeHtml(mobileData.reader || 'viewer')
 
   return `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=5,viewport-fit=cover">
-<meta name="theme-color" content="#040711">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<title>Pocket Cortex · Hive Memory Status</title>
-<style>
-:root{--bg:#040711;--card:rgba(11,18,35,0.86);--border:rgba(100,138,205,0.24);--text:#eef4ff;--muted:#8ea2c4;--ok:#22c55e;--warn:#f59e0b;--err:#ef4444;--cyan:#38bdf8;--emerald:#34d399;--violet:#a78bfa;--gold:#fbbf24;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;--mono:"SF Mono",ui-monospace,Menlo,monospace}
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=5,viewport-fit=cover"><meta name="theme-color" content="#040711"><title>Pocket Cortex · Hive Memory</title><style>
+:root{--bg:#040711;--card:rgba(11,18,35,.86);--bdr:rgba(100,138,205,.24);--txt:#eef4ff;--mut:#8ea2c4;--ok:#22c55e;--warn:#f59e0b;--err:#ef4444;--cyan:#38bdf8;--em:#34d399;--vio:#a78bfa;--gold:#fbbf24;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;--mono:"SF Mono",ui-monospace,Menlo,monospace}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html,body{margin:0;padding:0;background:radial-gradient(circle at 18% 6%,rgba(56,189,248,0.16),transparent 42%),radial-gradient(circle at 84% 14%,rgba(167,139,250,0.15),transparent 46%),var(--bg);color:var(--text);font-family:var(--sans);font-variant-numeric:tabular-nums;overflow-x:hidden}
-.shell{max-width:520px;margin:0 auto;padding:12px 12px calc(84px + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:11px}
-.glass{background:var(--card);border:1px solid var(--border);border-radius:16px;box-shadow:0 12px 32px rgba(0,0,0,0.45);backdrop-filter:blur(14px)}
-.top-bar{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 13px}
-.brand{display:flex;align-items:center;gap:10px;min-width:0}
-.orb{width:28px;height:28px;border-radius:999px;flex-shrink:0;background:radial-gradient(circle at 32% 30%,#a5f3fc,#38bdf8 45%,#6366f1 80%);box-shadow:0 0 16px rgba(56,189,248,0.65)}
-.brand-title{font-size:15px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.brand-sub{font-size:10.5px;color:var(--muted);font-family:var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.top-actions{display:flex;align-items:center;gap:6px;flex-shrink:0}
-.pill{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;font-size:10.5px;font-weight:700;font-family:var(--mono);border:1px solid var(--border);background:rgba(15,23,42,0.8);color:var(--text)}
-.pill.ok{color:#86efac;border-color:rgba(34,197,94,0.45);background:rgba(34,197,94,0.14)}
-.pill.warn{color:#fcd34d;border-color:rgba(245,158,11,0.45);background:rgba(245,158,11,0.15)}
-.pill.err{color:#fca5a5;border-color:rgba(239,68,68,0.5);background:rgba(239,68,68,0.16)}
-.pill.info{color:#7dd3fc;border-color:rgba(56,189,248,0.45);background:rgba(56,189,248,0.13)}
-.pill.violet{color:#ddd6fe;border-color:rgba(167,139,250,0.45);background:rgba(167,139,250,0.14)}
-.btn-ghost{border:1px solid rgba(125,211,252,0.35);background:rgba(15,23,42,0.85);color:#bae6fd;border-radius:999px;padding:4px 10px;font-size:11px;font-weight:600;cursor:pointer}
-.cortex-hero{position:relative;overflow:hidden}
-#pocket-cortex{display:block;width:100%;height:196px;touch-action:manipulation}
-.ov-top,.ov-bot{position:absolute;left:12px;right:12px;display:flex;justify-content:space-between;align-items:center;pointer-events:none}
-.ov-top{top:10px}.ov-bot{bottom:8px;font-size:10.5px;color:var(--muted);font-family:var(--mono)}
-.health-banner{padding:10px 13px;display:flex;flex-direction:column;gap:6px}
-.health-banner.healthy{border-color:rgba(34,197,94,0.42)}
-.health-banner.alerting{border-color:rgba(245,158,11,0.52)}
-.health-banner.critical{border-color:rgba(239,68,68,0.65)}
-.health-headline,.section-head,.agent-top,.axis-meta{display:flex;align-items:center;justify-content:space-between;gap:8px}
-.health-headline{font-size:13px;font-weight:700}
-.alert-list,.axis-list,.agent-rows,.compact-list{display:flex;flex-direction:column;gap:6px}
-.alert-item{padding:6px 9px;border-radius:9px;font-size:11px;background:rgba(2,6,23,0.66);border-left:3px solid var(--warn);display:flex;justify-content:space-between;gap:8px}
-.alert-item.critical{border-left-color:var(--err);color:#fecaca}
-.vitals-grid,.sub-grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
-.sub-grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}
-.vital-card{padding:11px 12px;display:flex;flex-direction:column;gap:3px}
-.vital-label{font-size:10px;font-weight:700;text-transform:uppercase;color:var(--muted);display:flex;justify-content:space-between}
-.vital-val{font-size:23px;font-weight:800;line-height:1.1}
-.vital-sub,.stat-s{font-size:10px;color:var(--muted);font-family:var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.spark-svg{width:100%;height:28px;margin-top:3px}
-.section-card{padding:13px;display:flex;flex-direction:column;gap:10px}
-.section-title{font-size:13px;font-weight:700;margin:0}
-.stat-box{background:rgba(4,9,22,0.62);border:1px solid rgba(100,138,205,0.18);border-radius:11px;padding:7px 9px;display:flex;flex-direction:column;gap:2px}
-.stat-k{font-size:9.5px;text-transform:uppercase;color:var(--muted)}
-.stat-v{font-size:14px;font-weight:700;font-family:var(--mono)}
-.axis-row{display:flex;flex-direction:column;gap:3px;font-size:11px}
-.bar-track{height:6px;border-radius:999px;background:rgba(15,23,42,0.9);overflow:hidden}
-.bar-fill{height:100%;border-radius:999px}
-.filter-row{display:flex;gap:6px;overflow-x:auto}
-.filter-btn{border:1px solid var(--border);background:rgba(15,23,42,0.72);color:var(--muted);border-radius:999px;padding:4px 10px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap}
-.filter-btn.active{color:var(--text);border-color:var(--cyan);background:rgba(56,189,248,0.18)}
-.agent-card{background:rgba(4,9,22,0.66);border:1px solid rgba(100,138,205,0.2);border-radius:12px;padding:8px 10px;display:flex;flex-direction:column;gap:4px}
-.agent-card.highlight{border-color:var(--cyan)}
-.agent-id{display:flex;align-items:center;gap:6px;font-weight:700;font-size:12.5px}
-.dot{width:8px;height:8px;border-radius:999px;flex-shrink:0}
-.agent-metrics{display:flex;flex-wrap:wrap;gap:6px 10px;font-size:10px;color:var(--muted);font-family:var(--mono)}
-.compact-row{background:rgba(4,9,22,0.56);border:1px solid rgba(100,138,205,0.16);border-radius:9px;padding:6px 9px;display:flex;justify-content:space-between;gap:8px;font-size:10.5px;font-family:var(--mono)}
-.compact-main{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.bottom-nav{position:fixed;left:50%;transform:translateX(-50%);bottom:max(8px,env(safe-area-inset-bottom));width:calc(100% - 20px);max-width:500px;z-index:50;padding:5px;display:grid;grid-template-columns:repeat(5,1fr);gap:4px;border-radius:999px;background:rgba(7,12,26,0.94);border:1px solid rgba(125,211,252,0.3)}
-.nav-btn{border:none;background:transparent;color:var(--muted);padding:6px 4px;border-radius:999px;font-size:11px;font-weight:700;cursor:pointer}
-.nav-btn.active{background:rgba(56,189,248,0.2);color:#e0f2fe}
-.meta-footer{text-align:center;font-size:10px;color:var(--muted);font-family:var(--mono);padding:6px}
-</style>
-</head>
-<body>
+html,body{margin:0;padding:0;background:radial-gradient(circle at 18% 6%,rgba(56,189,248,.16),transparent 42%),radial-gradient(circle at 84% 14%,rgba(167,139,250,.15),transparent 46%),var(--bg);color:var(--txt);font-family:var(--sans);font-variant-numeric:tabular-nums;overflow-x:hidden}
+.shell{max-width:520px;margin:0 auto;padding:12px 12px calc(84px + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:10px}
+.glass{background:var(--card);border:1px solid var(--bdr);border-radius:16px;box-shadow:0 12px 32px rgba(0,0,0,.45);backdrop-filter:blur(14px)}
+.row-sb,.top-bar,.ov-top,.ov-bot{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.top-bar{padding:10px 13px}.brand{display:flex;align-items:center;gap:10px;min-width:0}
+.orb{width:26px;height:26px;border-radius:99px;flex-shrink:0;background:radial-gradient(circle at 32% 30%,#a5f3fc,#38bdf8 45%,#6366f1 80%);box-shadow:0 0 14px rgba(56,189,248,.6)}
+.brand-title{font-size:15px;font-weight:700}.sub,.stat-box small{font-size:10px;color:var(--mut);font-family:var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pill{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:99px;font-size:10.5px;font-weight:700;font-family:var(--mono);border:1px solid var(--bdr);background:rgba(15,23,42,.8);color:var(--txt)}
+.pill.ok{color:#86efac;border-color:rgba(34,197,94,.45);background:rgba(34,197,94,.14)}.pill.warn{color:#fcd34d;border-color:rgba(245,158,11,.45);background:rgba(245,158,11,.15)}.pill.err{color:#fca5a5;border-color:rgba(239,68,68,.5);background:rgba(239,68,68,.16)}.pill.info{color:#7dd3fc;border-color:rgba(56,189,248,.45);background:rgba(56,189,248,.13)}.pill.violet{color:#ddd6fe;border-color:rgba(167,139,250,.45);background:rgba(167,139,250,.14)}
+.btn-g,.f-btn{border:1px solid var(--bdr);background:rgba(15,23,42,.8);color:var(--mut);border-radius:99px;padding:4px 10px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap}
+.btn-g{color:#bae6fd;border-color:rgba(125,211,252,.35)}.f-btn.active{color:var(--txt);border-color:var(--cyan);background:rgba(56,189,248,.18)}
+.hero{position:relative;overflow:hidden}#pocket-cortex{display:block;width:100%;height:186px;touch-action:manipulation}
+.ov-top,.ov-bot{position:absolute;left:12px;right:12px;pointer-events:none}.ov-top{top:10px}.ov-bot{bottom:8px;font-size:10.5px;color:var(--mut);font-family:var(--mono)}
+.hb{padding:10px 13px;display:flex;flex-direction:column;gap:6px;font-size:13px;font-weight:700}
+.hb.healthy{border-color:rgba(34,197,94,.42)}.hb.alerting{border-color:rgba(245,158,11,.52)}.hb.critical{border-color:rgba(239,68,68,.65)}
+.col{display:flex;flex-direction:column;gap:6px}.al-i{padding:6px 9px;border-radius:9px;font-size:11px;font-weight:400;background:rgba(2,6,23,.66);border-left:3px solid var(--warn);display:flex;justify-content:space-between;gap:8px}.al-i.critical{border-left-color:var(--err);color:#fecaca}
+.g2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.g3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}
+.vc{padding:10px 12px;display:flex;flex-direction:column;gap:3px}.vl{font-size:10px;font-weight:700;text-transform:uppercase;color:var(--mut);display:flex;justify-content:space-between}
+.vv{font-size:22px;font-weight:800;line-height:1.1}.spk{width:100%;height:26px;margin-top:2px}
+.sc{padding:12px;display:flex;flex-direction:column;gap:8px}.st{font-size:13px;font-weight:700;margin:0}
+.stat-box{background:rgba(4,9,22,.62);border:1px solid rgba(100,138,205,.18);border-radius:11px;padding:7px 9px;display:flex;flex-direction:column;gap:2px}
+.stat-box b{font-size:9.5px;text-transform:uppercase;color:var(--mut);font-weight:600}.stat-box strong{font-size:13px;font-weight:700;font-family:var(--mono)}
+.ax{display:flex;flex-direction:column;gap:3px;font-size:11px}.bt{height:6px;border-radius:99px;background:rgba(15,23,42,.9);overflow:hidden}.bf{height:100%;border-radius:99px}
+.frow{display:flex;gap:6px;overflow-x:auto}.ag-c{background:rgba(4,9,22,.66);border:1px solid rgba(100,138,205,.2);border-radius:12px;padding:8px 10px;display:flex;flex-direction:column;gap:4px}.ag-c.hi{border-color:var(--cyan)}.ag-id{display:flex;align-items:center;gap:6px;font-weight:700;font-size:12.5px}
+.dot{width:8px;height:8px;border-radius:99px;flex-shrink:0}.ag-m{display:flex;flex-wrap:wrap;gap:5px 9px;font-size:10px;color:var(--mut);font-family:var(--mono)}
+.cr{background:rgba(4,9,22,.56);border:1px solid rgba(100,138,205,.16);border-radius:9px;padding:6px 9px;display:flex;justify-content:space-between;gap:8px;font-size:10.5px;font-family:var(--mono)}.cm{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bnav{position:fixed;left:50%;transform:translateX(-50%);bottom:max(8px,env(safe-area-inset-bottom));width:calc(100% - 20px);max-width:500px;z-index:50;padding:5px;display:grid;grid-template-columns:repeat(5,1fr);gap:4px;border-radius:99px;background:rgba(7,12,26,.94);border:1px solid rgba(125,211,252,.3)}
+.nbtn{border:none;background:transparent;color:var(--mut);padding:6px 4px;border-radius:99px;font-size:11px;font-weight:700;cursor:pointer}.nbtn.active{background:rgba(56,189,248,.2);color:#e0f2fe}
+.foot{text-align:center;font-size:10px;color:var(--mut);font-family:var(--mono);padding:5px}
+</style></head><body>
 <div class="shell" id="top-sec">
-<header class="glass top-bar">
-<div class="brand"><div class="orb"></div><div style="min-width:0"><div class="brand-title">Pocket Cortex · Hive Memory</div><div class="brand-sub">reader: <span id="m-reader">${readerName}</span> · metadata-only</div></div></div>
-<div class="top-actions"><span id="m-sse-pill" class="pill info">LIVE</span><button id="m-desktop-btn" class="btn-ghost" type="button">3D View</button></div>
-</header>
-<section class="glass cortex-hero">
-<canvas id="pocket-cortex" width="480" height="196"></canvas>
-<div class="ov-top"><span id="m-store-pill" class="pill ok">${syncState}</span><span id="m-seq-pill" class="pill">seq #-</span></div>
-<div class="ov-bot"><span id="m-canvas-caption">Tap any agent node to inspect</span><span id="m-poll-age">polled just now</span></div>
+<header class="glass top-bar"><div class="brand"><div class="orb"></div><div style="min-width:0"><div class="brand-title">Pocket Cortex · Hive Memory</div><div class="sub">reader: <span id="m-reader">${readerName}</span> · metadata-only</div></div></div><div class="row-sb"><span id="m-sse-pill" class="pill info">LIVE</span><button id="m-desktop-btn" class="btn-g" type="button">3D View</button></div></header>
+<section class="glass hero"><canvas id="pocket-cortex" width="480" height="186"></canvas><div class="ov-top"><span id="m-store-pill" class="pill ok">${syncState}</span><span id="m-seq-pill" class="pill">seq #-</span></div><div class="ov-bot"><span id="m-canvas-caption">Tap any agent node to inspect</span><span id="m-poll-age">polled just now</span></div></section>
+<section id="m-health-banner" class="glass hb healthy"><div class="row-sb"><span id="m-health-title">✓ Brain Healthy · Saving Open</span><span id="m-alert-count" class="pill ok">0 alerts</span></div><div id="m-alert-list" class="col"></div></section>
+<section class="g2" id="velocity-sec">
+<div class="glass vc"><div class="vl"><span>New Memory</span><span class="pill ok">1h</span></div><div id="v-write-val" class="vv" style="color:var(--em)">0/hr</div><div id="v-write-sub" class="sub">24h: 0</div><svg id="svg-write-spark" class="spk" viewBox="0 0 160 28" preserveAspectRatio="none"></svg></div>
+<div class="glass vc"><div class="vl"><span>Recall Velocity</span><span class="pill info">5m/1h</span></div><div id="v-recall-val" class="vv" style="color:var(--cyan)">0/hr</div><div id="v-recall-sub" class="sub">5m: 0</div><svg id="svg-recall-spark" class="spk" viewBox="0 0 160 28" preserveAspectRatio="none"></svg></div>
+<div class="glass vc"><div class="vl"><span>Coherence (24h)</span><span id="v-coh-delta" class="pill ok">24h</span></div><div id="v-coh-val" class="vv" style="color:#6ee7b7">0%</div><div id="v-coh-sub" class="sub">7d: 0% · life: 0%</div><svg id="svg-coh-spark" class="spk" viewBox="0 0 160 28" preserveAspectRatio="none"></svg></div>
+<div class="glass vc"><div class="vl"><span>Synaptic Eff (24h)</span><span id="v-eff-delta" class="pill violet">24h</span></div><div id="v-eff-val" class="vv" style="color:var(--vio)">0%</div><div id="v-eff-sub" class="sub">7d: 0% · life: 0%</div><svg id="svg-eff-spark" class="spk" viewBox="0 0 160 28" preserveAspectRatio="none"></svg></div>
 </section>
-<section id="m-health-banner" class="glass health-banner healthy">
-<div class="health-headline"><span id="m-health-title">✓ Brain Healthy · Saving Open</span><span id="m-alert-count" class="pill ok">0 alerts</span></div>
-<div id="m-alert-list" class="alert-list"></div>
+<section class="glass sc"><div class="row-sb"><h2 class="st" style="color:var(--cyan)">⚡ Synaptic Velocity &amp; Flow</h2><span class="pill info">12h / 60m</span></div><div class="g3"><div class="stat-box"><b>Writes (1h/6h)</b><strong id="f-writes-1h6h" style="color:var(--em)">0 / 0</strong><small id="f-writes-24h">24h: 0</small></div><div class="stat-box"><b>Recalls (5m/1h)</b><strong id="f-recalls-5m1h" style="color:var(--cyan)">0 / 0</strong><small id="f-recalls-wq">0 wakes</small></div><div class="stat-box"><b>Recall Reach</b><strong id="f-coverage" style="color:#93c5fd">0%</strong><small id="f-hit-rate">hit: 0%</small></div></div><div class="col" id="m-pulse-list"></div></section>
+<section class="glass sc" id="health-sec">
+<div class="row-sb"><h2 class="st" style="color:#6ee7b7">🧭 Rolling 24h / 7d Trends &amp; Daily Signals</h2><span id="m-drift-pill" class="pill ok">aligned</span></div>
+<div class="row-sb"><div class="frow" id="w-filter-row"><button class="f-btn active" type="button" data-win="7d">7d by Date</button><button class="f-btn" type="button" data-win="24h">24h Rolling</button></div><span id="m-life-pill" class="pill" style="font-size:9.5px;color:var(--mut)">life: coh 0% · eff 0%</span></div>
+<svg id="svg-date-trends" viewBox="0 0 360 112" style="width:100%;height:112px;display:block;background:rgba(2,6,23,.72);border:1px solid rgba(100,138,205,.2);border-radius:11px"></svg>
+<div class="g2"><div class="stat-box"><b>New Claims / Day</b><strong id="s-claims-day" style="color:var(--em)">0</strong><small id="s-claims-sub">7d avg: 0/d</small></div><div class="stat-box"><b>Recall Hits / Day</b><strong id="s-recalls-day" style="color:var(--cyan)">0</strong><small id="s-recalls-sub">7d avg: 0/d</small></div><div class="stat-box"><b>Conflicts (Raised / Resolved)</b><strong id="s-conflicts-day" style="color:var(--gold)">0 / 0</strong><small id="s-conflicts-sub">7d: 0↑ / 0✓</small></div><div class="stat-box"><b>Writers Active / Day</b><strong id="s-writers-day" style="color:var(--vio)">0</strong><small id="s-writers-sub">7d: 0 unique</small></div></div>
+<div class="g2"><div class="stat-box"><b>Window Coherence</b><strong id="c-core-score" style="color:#6ee7b7">0%</strong><small id="c-grounded">0 grounded</small></div><div class="stat-box"><b>Window Synaptic Eff</b><strong id="e-compress" style="color:var(--vio)">0%</strong><small id="e-durable">0 durable</small></div></div>
+<div class="col" id="m-coh-axes"></div><div class="col" id="m-eff-axes"></div><div class="col" id="m-daily-trends-list"></div>
 </section>
-<section class="vitals-grid" id="velocity-sec">
-<div class="glass vital-card"><div class="vital-label"><span>New Memory</span><span class="pill ok">1h</span></div><div id="v-write-val" class="vital-val" style="color:var(--emerald)">0/hr</div><div id="v-write-sub" class="vital-sub">24h: 0</div><svg id="svg-write-spark" class="spark-svg" viewBox="0 0 160 28" preserveAspectRatio="none"></svg></div>
-<div class="glass vital-card"><div class="vital-label"><span>Recall Velocity</span><span class="pill info">5m/1h</span></div><div id="v-recall-val" class="vital-val" style="color:var(--cyan)">0/hr</div><div id="v-recall-sub" class="vital-sub">5m: 0</div><svg id="svg-recall-spark" class="spark-svg" viewBox="0 0 160 28" preserveAspectRatio="none"></svg></div>
-<div class="glass vital-card"><div class="vital-label"><span>Coherence 2.0</span><span id="v-coh-delta" class="pill ok">+0%</span></div><div id="v-coh-val" class="vital-val" style="color:#6ee7b7">0%</div><div id="v-coh-sub" class="vital-sub">core 0%</div><svg id="svg-coh-spark" class="spark-svg" viewBox="0 0 160 28" preserveAspectRatio="none"></svg></div>
-<div class="glass vital-card"><div class="vital-label"><span>Synaptic Eff</span><span class="pill violet">4-axis</span></div><div id="v-eff-val" class="vital-val" style="color:var(--violet)">0%</div><div id="v-eff-sub" class="vital-sub">R→W 0%</div><svg id="svg-eff-spark" class="spark-svg" viewBox="0 0 160 28" preserveAspectRatio="none"></svg></div>
-</section>
-<section class="glass section-card">
-<div class="section-head"><h2 class="section-title" style="color:var(--cyan)">⚡ Synaptic Velocity &amp; Flow</h2><span class="pill info">12h / 60m</span></div>
-<div class="sub-grid-3">
-<div class="stat-box"><span class="stat-k">Writes (1h/6h)</span><span id="f-writes-1h6h" class="stat-v" style="color:var(--emerald)">0 / 0</span><span id="f-writes-24h" class="stat-s">24h: 0</span></div>
-<div class="stat-box"><span class="stat-k">Recalls (5m/1h)</span><span id="f-recalls-5m1h" class="stat-v" style="color:var(--cyan)">0 / 0</span><span id="f-recalls-wq" class="stat-s">0 wakes</span></div>
-<div class="stat-box"><span class="stat-k">Recall Reach</span><span id="f-coverage" class="stat-v" style="color:#93c5fd">0%</span><span id="f-hit-rate" class="stat-s">hit: 0%</span></div>
+<section class="glass sc" id="backup-sec"><div class="row-sb"><h2 class="st" style="color:var(--gold)">🛡️ Backup State &amp; Write Fence</h2><span id="b-status-pill" class="pill ok">VERIFIED</span></div><div class="g3"><div class="stat-box"><b>Backup Age</b><strong id="b-age-val">-</strong><small>fence 60m</small></div><div class="stat-box"><b>Unbacked</b><strong id="b-unbacked-val">0</strong><small id="b-seq-sub">seq #-</small></div><div class="stat-box"><b>Saving Gate</b><strong id="b-saving-val" style="color:var(--ok)">OPEN</strong><small id="b-fenced-sub">0 fenced</small></div></div><div class="ax"><div class="row-sb"><span>Backup Window Freshness</span><span id="b-fresh-pct">100%</span></div><div class="bt"><div id="b-fresh-bar" class="bf" style="width:100%;background:#22c55e"></div></div></div><div class="stat-box"><b>Last Verified Backup Receipt</b><strong id="b-receipt-main" style="font-size:12px;color:#fde68a">receipt seq #-</strong><small id="b-receipt-sub">snapshot: -</small></div></section>
+<section class="glass sc" id="dream-sec"><div class="row-sb"><h2 class="st" style="color:var(--vio)">🌙 Merkle Dream &amp; Curator</h2><span id="d-mode-pill" class="pill violet">OBSERVED</span></div><div class="g3"><div class="stat-box"><b>Last Dream</b><strong id="d-last-val">-</strong><small id="d-last-seq">seq #-</small></div><div class="stat-box"><b>Syntheses</b><strong id="d-merkle-val" style="color:var(--vio)">0</strong><small id="d-folded-sub">0 folded</small></div><div class="stat-box"><b>Wake Savings</b><strong id="d-savings-val" style="color:var(--em)">0%</strong><small id="d-planned-sub">0 planned</small></div></div><div class="col" id="d-trigger-bars"></div><div class="col" id="d-ledger-list"></div></section>
+<section class="glass sc" id="agents-sec"><div class="row-sb"><h2 class="st" style="color:#93c5fd">🐝 Per-Agent Usage Status</h2><span id="a-summary-pill" class="pill info">0 active</span></div><div class="frow" id="a-filter-row"><button class="f-btn active" type="button" data-filter="all">All Seats</button><button class="f-btn" type="button" data-filter="active">Active / Warm</button><button class="f-btn" type="button" data-filter="writers">Writers</button><button class="f-btn" type="button" data-filter="alerts">Drift / Fenced</button></div><div class="col" id="m-agent-list"></div></section>
+<section class="glass sc"><div class="row-sb"><h2 class="st" style="color:var(--em)">📚 Memory Tiers &amp; Topics</h2><span id="t-total-pill" class="pill">0 claims</span></div><div class="g3"><div class="stat-box"><b>Rank 2 Canon</b><strong id="t-canon" style="color:var(--gold)">0</strong><small>James canon</small></div><div class="stat-box"><b>Class B Durable</b><strong id="t-decisions" style="color:var(--vio)">0</strong><small>ttl: 0</small></div><div class="stat-box"><b>Graph Edges</b><strong id="t-edges" style="color:var(--cyan)">0</strong><small id="t-unverified">0 unverified</small></div></div><div class="col" id="m-topic-bars"></div></section>
+<footer class="foot">Hive Memory Pocket Cortex · DATA ONLY (authority=null, trustedInstruction=false)</footer>
 </div>
-<div class="compact-list" id="m-pulse-list"></div>
-</section>
-<section class="glass section-card" id="health-sec">
-<div class="section-head"><h2 class="section-title" style="color:#6ee7b7">🧭 Coherence &amp; Synaptic Efficiency</h2><span id="m-drift-pill" class="pill ok">aligned</span></div>
-<div class="sub-grid-2">
-<div class="stat-box"><span class="stat-k">Core Canon + Class B</span><span id="c-core-score" class="stat-v" style="color:var(--gold)">0%</span><span id="c-grounded" class="stat-s">0 grounded</span></div>
-<div class="stat-box"><span class="stat-k">State Compression</span><span id="e-compress" class="stat-v" style="color:var(--violet)">0%</span><span id="e-durable" class="stat-s">0 durable</span></div>
-</div>
-<div class="axis-list" id="m-coh-axes"></div>
-<div class="axis-list" id="m-eff-axes"></div>
-</section>
-<section class="glass section-card" id="backup-sec">
-<div class="section-head"><h2 class="section-title" style="color:var(--gold)">🛡️ Backup State &amp; Write Fence</h2><span id="b-status-pill" class="pill ok">VERIFIED</span></div>
-<div class="sub-grid-3">
-<div class="stat-box"><span class="stat-k">Backup Age</span><span id="b-age-val" class="stat-v">-</span><span class="stat-s">fence 60m</span></div>
-<div class="stat-box"><span class="stat-k">Unbacked</span><span id="b-unbacked-val" class="stat-v">0</span><span id="b-seq-sub" class="stat-s">seq #-</span></div>
-<div class="stat-box"><span class="stat-k">Saving Gate</span><span id="b-saving-val" class="stat-v" style="color:var(--ok)">OPEN</span><span id="b-fenced-sub" class="stat-s">0 fenced</span></div>
-</div>
-<div class="axis-row"><div class="axis-meta"><span>Backup Window Freshness</span><span id="b-fresh-pct">100%</span></div><div class="bar-track"><div id="b-fresh-bar" class="bar-fill" style="width:100%;background:#22c55e"></div></div></div>
-<div class="stat-box"><span class="stat-k">Last Verified Backup Receipt</span><span id="b-receipt-main" class="stat-v" style="font-size:12.5px;color:#fde68a">receipt seq #-</span><span id="b-receipt-sub" class="stat-s">snapshot: -</span></div>
-</section>
-<section class="glass section-card" id="dream-sec">
-<div class="section-head"><h2 class="section-title" style="color:var(--violet)">🌙 Merkle Dream &amp; Curator</h2><span id="d-mode-pill" class="pill violet">OBSERVED</span></div>
-<div class="sub-grid-3">
-<div class="stat-box"><span class="stat-k">Last Dream</span><span id="d-last-val" class="stat-v">-</span><span id="d-last-seq" class="stat-s">seq #-</span></div>
-<div class="stat-box"><span class="stat-k">Syntheses</span><span id="d-merkle-val" class="stat-v" style="color:var(--violet)">0</span><span id="d-folded-sub" class="stat-s">0 folded</span></div>
-<div class="stat-box"><span class="stat-k">Wake Savings</span><span id="d-savings-val" class="stat-v" style="color:var(--emerald)">0%</span><span id="d-planned-sub" class="stat-s">0 planned</span></div>
-</div>
-<div class="axis-list" id="d-trigger-bars"></div>
-<div class="compact-list" id="d-ledger-list"></div>
-</section>
-<section class="glass section-card" id="agents-sec">
-<div class="section-head"><h2 class="section-title" style="color:#93c5fd">🐝 Per-Agent Usage Status</h2><span id="a-summary-pill" class="pill info">0 active</span></div>
-<div class="filter-row" id="a-filter-row">
-<button class="filter-btn active" type="button" data-filter="all">All Seats</button>
-<button class="filter-btn" type="button" data-filter="active">Active / Warm</button>
-<button class="filter-btn" type="button" data-filter="writers">Writers</button>
-<button class="filter-btn" type="button" data-filter="alerts">Drift / Fenced</button>
-</div>
-<div class="agent-rows" id="m-agent-list"></div>
-</section>
-<section class="glass section-card">
-<div class="section-head"><h2 class="section-title" style="color:var(--emerald)">📚 Memory Tiers &amp; Topics</h2><span id="t-total-pill" class="pill">0 claims</span></div>
-<div class="sub-grid-3">
-<div class="stat-box"><span class="stat-k">Rank 2 Canon</span><span id="t-canon" class="stat-v" style="color:var(--gold)">0</span><span class="stat-s">James canon</span></div>
-<div class="stat-box"><span class="stat-k">Class B Durable</span><span id="t-decisions" class="stat-v" style="color:var(--violet)">0</span><span class="stat-s">ttl: 0</span></div>
-<div class="stat-box"><span class="stat-k">Graph Edges</span><span id="t-edges" class="stat-v" style="color:var(--cyan)">0</span><span id="t-unverified" class="stat-s">0 unverified</span></div>
-</div>
-<div class="axis-list" id="m-topic-bars"></div>
-</section>
-<footer class="meta-footer">Hive Memory Pocket Cortex · DATA ONLY (authority=null, trustedInstruction=false)</footer>
-</div>
-<nav class="bottom-nav">
-<button class="nav-btn active" type="button" data-jump="top-sec">Brain</button>
-<button class="nav-btn" type="button" data-jump="velocity-sec">Velocity</button>
-<button class="nav-btn" type="button" data-jump="health-sec">Coherence</button>
-<button class="nav-btn" type="button" data-jump="dream-sec">Dream</button>
-<button class="nav-btn" type="button" data-jump="agents-sec">Agents</button>
-</nav>
+<nav class="bnav"><button class="nbtn active" type="button" data-jump="top-sec">Brain</button><button class="nbtn" type="button" data-jump="velocity-sec">Velocity</button><button class="nbtn" type="button" data-jump="health-sec">Coherence</button><button class="nbtn" type="button" data-jump="dream-sec">Dream</button><button class="nbtn" type="button" data-jump="agents-sec">Agents</button></nav>
 <script id="initial-mobile-state" type="application/json">${escapedInitial}</script>
 <script>
 (function(){
 'use strict';
-var el=function(id){return document.getElementById(id);};
-var txt=function(id,v){var n=el(id);if(n)n.textContent=v;};
-var cls=function(id,c){var n=el(id);if(n)n.className=c;};
+var el=function(i){return document.getElementById(i);},txt=function(i,v){var n=el(i);if(n)n.textContent=v;},cls=function(i,c){var n=el(i);if(n)n.className=c;};
 var AM={james:['James','#fbbf24'],biggy:['Biggy','#818cf8'],rabidrabbit:['RabidRabbit','#f59e0b'],'dead-rabbit':['Dead Rabbit','#f59e0b'],mydude:['My Dude','#10b981'],neil:['Neil','#38bdf8'],'waggle-dev':['Waggle-Dev','#fb923c'],crystalclaude:['CrystalClaude','#f472b6'],'dj-codex':['DJ-Codex','#34d399'],dennis:['Dennis','#60a5fa'],kerouac:['Kerouac','#c084fc'],grokdoggydog:['GrokDoggyDog','#f87171'],'pi-dog':['Pi-Dog','#2dd4bf'],lukedog:['LukeDog','#a3e635'],'mc-claude':['MC-Claude','#e879f9'],curator:['Curator','#a78bfa']};
 var FB=['#38bdf8','#a78bfa','#34d399','#f472b6','#fbbf24','#60a5fa','#fb923c'];
-function aInfo(id,i){var m=AM[String(id||'').toLowerCase()];return m?{name:m[0],color:m[1]}:{name:String(id||'agent'),color:FB[i%FB.length]};}
-function fmtDur(sec){if(sec==null||!Number.isFinite(sec))return '-';var s=Math.max(0,Math.floor(sec));return s<60?s+'s':s<3600?Math.floor(s/60)+'m '+(s%60)+'s':s<86400?Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m':Math.floor(s/86400)+'d';}
-function fmtAgo(ts,now){return (!ts||!Number.isFinite(ts))?'never':fmtDur(Math.max(0,now-ts))+' ago';}
-function fmtUtc(ts){if(!ts||!Number.isFinite(ts))return '-';try{return new Date(ts*1000).toISOString().replace('T',' ').slice(5,19)+'Z';}catch(_){return '-';}}
+function aI(id,i){var m=AM[String(id||'').toLowerCase()];return m?{n:m[0],c:m[1]}:{n:String(id||'agent'),c:FB[i%7]};}
+function fD(sec){if(sec==null||!Number.isFinite(sec))return '-';var s=Math.max(0,Math.floor(sec));return s<60?s+'s':s<3600?Math.floor(s/60)+'m '+(s%60)+'s':s<86400?Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m':Math.floor(s/86400)+'d';}
+function fA(t,n){return(!t||!Number.isFinite(t))?'never':fD(Math.max(0,n-t))+' ago';}
+function fU(t){if(!t||!Number.isFinite(t))return '-';try{return new Date(t*1000).toISOString().replace('T',' ').slice(5,19)+'Z';}catch(_){return '-';}}
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
-function spark(id,vals,stroke,fill){
-var svg=el(id);if(!svg)return;
-var a=Array.isArray(vals)&&vals.length?vals.map(function(v){return Number(v)||0;}):[0,0];
-if(a.length===1)a=[a[0],a[0]];
-var w=160,h=28,max=Math.max.apply(null,a.concat([1])),min=Math.min.apply(null,a.concat([0])),sp=Math.max(1,max-min);
-var pts=a.map(function(v,i){return ((i/(a.length-1))*w).toFixed(1)+','+(h-3-((v-min)/sp)*(h-6)).toFixed(1);}).join(' ');
-svg.innerHTML='<polygon points="0,'+h+' '+pts+' '+w+','+h+'" fill="'+fill+'"></polygon><polyline points="'+pts+'" fill="none" stroke="'+stroke+'" stroke-width="2"></polyline>';
+function spk(id,v,st,fl){
+var g=el(id);if(!g)return;
+var a=Array.isArray(v)&&v.length?v.map(function(x){return Number(x)||0;}):[0,0];if(a.length===1)a=[a[0],a[0]];
+var w=160,h=28,mx=Math.max.apply(null,a.concat([1])),mn=Math.min.apply(null,a.concat([0])),sp=Math.max(1,mx-mn);
+var p=a.map(function(x,i){return((i/(a.length-1))*w).toFixed(1)+','+(h-3-((x-mn)/sp)*(h-6)).toFixed(1);}).join(' ');
+g.innerHTML='<polygon points="0,'+h+' '+p+' '+w+','+h+'" fill="'+fl+'"/><polyline points="'+p+'" fill="none" stroke="'+st+'" stroke-width="2"/>';
 }
-function bars(id,rows){
+function bars(id,rs){
 var b=el(id);if(!b)return;
-b.innerHTML=rows.map(function(r){
-var p=Math.max(0,Math.min(100,Math.round(Number(r[1])||0)));
-return '<div class="axis-row"><div class="axis-meta"><span>'+esc(r[0])+'</span><span style="color:'+r[2]+';font-family:var(--mono);font-weight:700">'+esc(r[3]!=null?r[3]:p+'%')+'</span></div><div class="bar-track"><div class="bar-fill" style="width:'+p+'%;background:'+r[2]+'"></div></div></div>';
-}).join('');
+b.innerHTML=rs.map(function(r){var p=Math.max(0,Math.min(100,Math.round(Number(r[1])||0)));return '<div class="ax"><div class="row-sb"><span>'+esc(r[0])+'</span><span style="color:'+r[2]+';font-family:var(--mono);font-weight:700">'+esc(r[3]!=null?r[3]:p+'%')+'</span></div><div class="bt"><div class="bf" style="width:'+p+'%;background:'+r[2]+'"></div></div></div>';}).join('');
 }
-var curData=null,aFilter='all',selAgent=null;
-function renderAgents(data){
-var b=el('m-agent-list');if(!b||!data||!data.agents)return;
-var now=data.polled_at||Math.floor(Date.now()/1000);
-var list=(data.agents.roster||[]).filter(function(a){
-return aFilter==='active'?(a.health==='active'||a.health==='warm'):aFilter==='writers'?Boolean(a.is_writer):aFilter==='alerts'?(a.fenced||a.health==='error'||(a.compliance_status&&a.compliance_status!=='compliant')||a.refusals_15m>0):true;
-});
-if(!list.length){b.innerHTML='<div class="stat-box"><span class="stat-s">No matching seats.</span></div>';return;}
-b.innerHTML=list.map(function(a,i){
-var inf=aInfo(a.id,i),hc=a.health==='active'?'ok':a.health==='warm'?'info':a.health==='error'?'err':'';
-var bdg=a.fenced?'<span class="pill err">FENCED</span>':(a.compliance_status&&a.compliance_status!=='compliant')?'<span class="pill warn">'+esc(a.compliance_status)+'</span>':'';
-return '<div class="agent-card'+(selAgent===a.id?' highlight':'')+'" data-agent-id="'+esc(a.id)+'"><div class="agent-top"><div class="agent-id"><span class="dot" style="background:'+inf.color+'"></span><span>'+esc(inf.name)+'</span><span style="font-size:10px;color:var(--muted)">@'+esc(a.id)+'</span></div><div>'+bdg+' <span class="pill '+hc+'">'+esc(a.health)+'</span></div></div><div class="agent-metrics"><span>5m: <b>'+a.reads_5m+'R/'+a.writes_5m+'W</b></span><span>claims: <b>'+a.active_claims+'</b></span><span>coh: <b>'+a.coherence_score+'%</b></span>'+(a.refusals_15m?'<span style="color:#fca5a5">refused: <b>'+a.refusals_15m+'</b></span>':'')+'<span>R: '+esc(fmtAgo(a.last_recall_at,now))+'</span><span>W: '+esc(fmtAgo(a.last_write_at,now))+(a.last_write_slug?' ('+esc(a.last_write_slug.slice(0,18))+')':'')+'</span></div></div>';
-}).join('');
+var cur=null,aF='all',wM='7d',sAg=null;
+function dTr(tr){
+var g=el('svg-date-trends');if(!g||!tr)return;
+var pts=wM==='24h'?(tr.hourly_24h_series||[]):(tr.daily_series||[]);if(!pts.length)return;
+var w=360,px=28,pw=w-40,ph=72,n=pts.length;
+var xO=function(i){return(px+(n<=1?pw/2:(i/(n-1))*pw)).toFixed(1);},yO=function(v){return(92-(Math.max(0,Math.min(100,Number(v)||0))/100)*ph).toFixed(1);};
+var gr=[25,50,75,100].map(function(l){var y=yO(l);return '<line x1="'+px+'" y1="'+y+'" x2="350" y2="'+y+'" stroke="rgba(148,163,184,.16)"/><text x="4" y="'+(Number(y)+3)+'" fill="#94a3b8" font-size="8.5" font-family="monospace">'+l+'%</text>';}).join('');
+var cP=pts.map(function(p,i){return xO(i)+','+yO(p.coherence_score);}).join(' '),eP=pts.map(function(p,i){return xO(i)+','+yO(p.synaptic_efficiency_score);}).join(' ');
+var dt=pts.map(function(p,i){var x=xO(i);return '<circle cx="'+x+'" cy="'+yO(p.coherence_score)+'" r="2.8" fill="#34d399"/><circle cx="'+x+'" cy="'+yO(p.synaptic_efficiency_score)+'" r="2.5" fill="#a78bfa"/><text x="'+x+'" y="107" fill="#cbd5e1" font-size="8.5" font-family="monospace" text-anchor="middle">'+esc(p.label||p.date||'')+'</text>';}).join('');
+var aW=wM==='24h'?(tr.window_24h||{}):(tr.window_7d||{}),cV=Math.round(aW.coherence_score||0),eV=Math.round(aW.synaptic_efficiency_score||0);
+g.innerHTML=gr+'<polyline points="'+eP+'" fill="none" stroke="#a78bfa" stroke-width="2" stroke-dasharray="4 2"/><polyline points="'+cP+'" fill="none" stroke="#34d399" stroke-width="2.4"/>'+dt+'<text x="'+px+'" y="12" fill="#34d399" font-size="9" font-weight="700" font-family="monospace">● Coh ('+wM+'): '+cV+'%</text><text x="190" y="12" fill="#a78bfa" font-size="9" font-weight="700" font-family="monospace">● Synaptic Eff ('+wM+'): '+eV+'%</text>';
 }
-function renderMobile(d){
-if(!d||typeof d!=='object')return;
-curData=d;
-var now=d.polled_at||Math.floor(Date.now()/1000),ss=d.store_state||{},bk=d.backup||{},vel=d.velocities||{},nm=vel.new_memory||{},rc=vel.recall||{},coh=d.coherence||{},eff=d.synaptic_efficiency||{},dr=d.dreams||{},ag=d.agents||{},vt=d.vitals||{};
-txt('m-reader',d.reader||'viewer');
-txt('m-store-pill',ss.state||(d.connected?'READY':'OFFLINE'));
+function rAg(d){
+var b=el('m-agent-list');if(!b||!d||!d.agents)return;
+var now=d.polled_at||Math.floor(Date.now()/1000),ls=(d.agents.roster||[]).filter(function(a){return aF==='active'?(a.health==='active'||a.health==='warm'):aF==='writers'?Boolean(a.is_writer):aF==='alerts'?(a.fenced||a.health==='error'||(a.compliance_status&&a.compliance_status!=='compliant')||a.refusals_15m>0):true;});
+if(!ls.length){b.innerHTML='<div class="stat-box"><small>No matching seats.</small></div>';return;}
+b.innerHTML=ls.map(function(a,i){var inf=aI(a.id,i),hc=a.health==='active'?'ok':a.health==='warm'?'info':a.health==='error'?'err':'',bd=a.fenced?'<span class="pill err">FENCED</span>':(a.compliance_status&&a.compliance_status!=='compliant')?'<span class="pill warn">'+esc(a.compliance_status)+'</span>':'';return '<div class="ag-c'+(sAg===a.id?' hi':'')+'" data-agent-id="'+esc(a.id)+'"><div class="row-sb"><div class="ag-id"><span class="dot" style="background:'+inf.c+'"></span><span>'+esc(inf.n)+'</span><span style="font-size:10px;color:var(--mut)">@'+esc(a.id)+'</span></div><div>'+bd+' <span class="pill '+hc+'">'+esc(a.health)+'</span></div></div><div class="ag-m"><span>5m: <b>'+a.reads_5m+'R/'+a.writes_5m+'W</b></span><span>claims: <b>'+a.active_claims+'</b></span><span>coh: <b>'+a.coherence_score+'%</b></span>'+(a.refusals_15m?'<span style="color:#fca5a5">refused: <b>'+a.refusals_15m+'</b></span>':'')+'<span>R: '+esc(fA(a.last_recall_at,now))+'</span><span>W: '+esc(fA(a.last_write_at,now))+(a.last_write_slug?' ('+esc(a.last_write_slug.slice(0,18))+')':'')+'</span></div></div>';}).join('');
+}
+function rMob(d){
+if(!d||typeof d!=='object')return;cur=d;
+var now=d.polled_at||Math.floor(Date.now()/1000),ss=d.store_state||{},bk=d.backup||{},vel=d.velocities||{},nm=vel.new_memory||{},rc=vel.recall||{},coh=d.coherence||{},eff=d.synaptic_efficiency||{},tr=d.trends||{},dr=d.dreams||{},ag=d.agents||{},vt=d.vitals||{};
+var w24=tr.window_24h||{},w7=tr.window_7d||{},lf=tr.lifetime||{},td=tr.today_signals||{},ds=tr.daily_series||[];
+var c24=w24.coherence_score??coh.score_24h??coh.score??0,c7=w7.coherence_score??coh.score_7d??c24,cL=lf.coherence_score??coh.lifetime_score??coh.score??0;
+var e24=w24.synaptic_efficiency_score??eff.score_24h??eff.score??0,e7=w7.synaptic_efficiency_score??eff.score_7d??e24,eL=lf.synaptic_efficiency_score??eff.lifetime_score??eff.score??0;
+var al=d.alerts||[],crit=al.some(function(a){return a.severity==='critical';}),cD=c24-c7,eD=e24-e7;
+var dst=coh.drift_status||'aligned',aW=wM==='24h'?w24:w7,ca=aW.coherence_axes||coh.axes||{},ea=aW.synaptic_efficiency_axes||eff.axes||{},cc=coh.counts||{};
+var bs=bk.status||'verified_clean',bw=bk.watch||{},fp=Number(bk.freshness_pct??0),rcp=bk.last_receipt||{},dc=dr.counts||{},ps=dr.planned_summary||{},as=ag.summary||{},sc=vt.scope_counts||{};
+var mp={'m-reader':d.reader||'viewer','m-store-pill':ss.state||(d.connected?'READY':'OFFLINE'),'m-seq-pill':'seq #'+(ss.write_seq??'-')+' · '+(ss.current_claims??0)+' claims','m-poll-age':'poll #'+(d.poll_seq||0)+' · '+fU(now),'m-health-title':crit?'⚠ Critical Memory Alert':al.length?'⚡ '+al.length+' Notice(s)':'✓ Brain Healthy · Saving Open','m-alert-count':al.length+' alerts','v-write-val':(nm.writes_1h||0)+'/hr','v-write-sub':'24h: '+(nm.writes_24h||0)+' · last '+fA(nm.last_write_at,now),'v-recall-val':(rc.recalls_1h||0)+'/hr','v-recall-sub':'5m: '+(rc.recalls_5m||0)+' · hit '+Math.round(rc.query_hit_rate_pct||0)+'%','v-coh-val':Math.round(c24)+'%','v-coh-delta':(cD>=0?'+':'')+cD.toFixed(1)+'% vs 7d','v-coh-sub':'7d: '+Math.round(c7)+'% · life: '+Math.round(cL)+'%','v-eff-val':Math.round(e24)+'%','v-eff-delta':(eD>=0?'+':'')+eD.toFixed(1)+'% vs 7d','v-eff-sub':'7d: '+Math.round(e7)+'% · life: '+Math.round(eL)+'%','f-writes-1h6h':(nm.writes_1h||0)+' / '+(nm.writes_6h||0),'f-writes-24h':'24h: '+(nm.writes_24h||0)+' · '+(nm.refusals_15m||0)+' refused','f-recalls-5m1h':(rc.recalls_5m||0)+' / '+(rc.recalls_1h||0),'f-recalls-wq':(rc.wakes_window||0)+'W · '+(rc.queries_window||0)+'Q','f-coverage':Math.round(rc.recall_coverage_pct||0)+'%','f-hit-rate':'hit '+Math.round(rc.query_hit_rate_pct||0)+'% ('+(rc.recalling_agents||0)+'/'+(rc.active_agents||0)+')','m-drift-pill':dst.replace(/_/g,' '),'m-life-pill':'life: coh '+Math.round(cL)+'% · eff '+Math.round(eL)+'%','s-claims-day':(td.new_claims??w24.new_claims??0)+' today (24h: '+(w24.new_claims??0)+')','s-claims-sub':'7d: '+(w7.new_claims??0)+' ('+(w7.claims_per_day??0)+'/d avg)','s-recalls-day':(td.recall_hits??w24.recall_hits??0)+(td.recall_incomplete?'*':'')+' today (24h: '+(w24.recall_hits??0)+(w24.recall_incomplete?'*':'')+')','s-recalls-sub':'7d: '+(w7.recall_hits??0)+' ('+(w7.recall_hits_per_day??0)+'/d'+(w7.recall_incomplete?' · '+Math.round(w7.observed_coverage_pct||0)+'% cov':'')+')','s-conflicts-day':(td.conflicts_raised??0)+'↑ / '+(td.conflicts_resolved??0)+'✓ today','s-conflicts-sub':'24h: '+(w24.conflicts_raised??0)+'↑/'+(w24.conflicts_resolved??0)+'✓ · 7d: '+(w7.conflicts_raised??0)+'↑/'+(w7.conflicts_resolved??0)+'✓','s-writers-day':(td.active_writers??w24.active_writers??0)+' active today','s-writers-sub':'24h: '+(w24.active_writers??0)+' · 7d: '+(w7.active_writers??0)+' unique ('+(w7.active_writers_per_day??0)+'/d)','c-core-score':Math.round(aW.coherence_score??c24)+'% ('+wM+')','c-grounded':'life '+Math.round(cL)+'% · '+(cc.grounded_claims||0)+' grounded','e-compress':Math.round(aW.synaptic_efficiency_score??e24)+'% ('+wM+')','e-durable':'life '+Math.round(eL)+'% · '+((eff.reuse&&eff.reuse.durable_claims)||0)+' durable','b-status-pill':bs.replace(/_/g,' ').toUpperCase(),'b-age-val':bk.age_sec!=null?fD(bk.age_sec):'none','b-unbacked-val':String(bk.unbacked_writes??'-'),'b-seq-sub':'seq #'+(ss.write_seq??'-'),'b-saving-val':String(bw.saving||'open').toUpperCase(),'b-fenced-sub':(bw.fenced||[]).length+' fenced','b-fresh-pct':fp+'%','b-receipt-main':rcp.write_seq!=null?'seq #'+rcp.write_seq+' · '+fU(rcp.at)+' ('+fA(rcp.at,now)+')':'No receipt','b-receipt-sub':'snapshot: '+(rcp.snapshot_id||'store_state'),'d-mode-pill':dr.persisted_curation?'OBSERVED':'PREVIEW','d-last-val':dr.last_curated_at?fA(dr.last_curated_at,now):'pending','d-last-seq':'seq #'+(dr.last_curated_write_seq||0),'d-merkle-val':String(dc.merkle_syntheses||0),'d-folded-sub':(dc.consolidated_sources||0)+' folded','d-savings-val':(dc.wake_savings_pct||0)+'%','d-planned-sub':((ps.promotions||0)+(ps.distillations||0)+(ps.solidifications||0))+' planned','a-summary-pill':(as.active_5m||0)+' active · '+(as.warm_20m||0)+' warm / '+(as.total||0),'t-total-pill':(ss.current_claims||0)+' claims','t-canon':String(sc.canon||0),'t-decisions':String(dc.class_b_decisions||0),'t-edges':String((vt.entity_graph&&vt.entity_graph.total_edges)||0),'t-unverified':(sc.unverified_total||0)+' unverified'};
+for(var k in mp)txt(k,mp[k]);
 cls('m-store-pill','pill '+(ss.state==='READY'&&d.connected?'ok':'err'));
-txt('m-seq-pill','seq #'+(ss.write_seq??'-')+' · '+(ss.current_claims??0)+' claims');
-txt('m-poll-age','poll #'+(d.poll_seq||0)+' · '+fmtUtc(now));
-var al=d.alerts||[],crit=al.some(function(a){return a.severity==='critical';});
-cls('m-health-banner','glass health-banner '+(crit?'critical':al.length?'alerting':'healthy'));
-txt('m-health-title',crit?'⚠ Critical Memory Alert':al.length?'⚡ '+al.length+' Notice(s)':'✓ Brain Healthy · Saving Open');
-txt('m-alert-count',al.length+' alerts');cls('m-alert-count','pill '+(crit?'err':al.length?'warn':'ok'));
-if(el('m-alert-list'))el('m-alert-list').innerHTML=al.slice(0,5).map(function(a){return '<div class="alert-item '+(a.severity==='critical'?'critical':'')+'"><span>'+esc(a.summary)+'</span><span>'+esc(fmtAgo(a.at,now))+'</span></div>';}).join('');
-txt('v-write-val',(nm.writes_1h||0)+'/hr');txt('v-write-sub','24h: '+(nm.writes_24h||0)+' · last '+fmtAgo(nm.last_write_at,now));
-spark('svg-write-spark',nm.sparkline_12h,'#34d399','rgba(52,211,153,0.18)');
-txt('v-recall-val',(rc.recalls_1h||0)+'/hr');txt('v-recall-sub','5m: '+(rc.recalls_5m||0)+' · hit '+Math.round(rc.query_hit_rate_pct||0)+'%');
-spark('svg-recall-spark',rc.sparkline_60m,'#38bdf8','rgba(56,189,248,0.18)');
-var dl=Number(coh.delta_since_inception||0);
-txt('v-coh-val',Math.round(coh.score||0)+'%');txt('v-coh-delta',(dl>=0?'+':'')+dl.toFixed(1)+'%');cls('v-coh-delta','pill '+(dl>=0?'ok':'warn'));
-txt('v-coh-sub','core '+Math.round(coh.core_memory_score||0)+'% · periph '+Math.round(coh.periphery_coherence_score||0)+'%');
-spark('svg-coh-spark',(coh.history||[]).map(function(h){return h.score;}),'#6ee7b7','rgba(110,231,183,0.18)');
-var ea=eff.axes||{};
-txt('v-eff-val',Math.round(eff.score||0)+'%');txt('v-eff-sub','R→W '+Math.round((eff.retrieval&&eff.retrieval.read_before_write_pct)||0)+'%');
-spark('svg-eff-spark',[ea.breadth||0,ea.precision||0,ea.velocity||0,ea.reuse||0,eff.score||0],'#a78bfa','rgba(167,139,250,0.18)');
-txt('f-writes-1h6h',(nm.writes_1h||0)+' / '+(nm.writes_6h||0));txt('f-writes-24h','24h: '+(nm.writes_24h||0)+' · '+(nm.refusals_15m||0)+' refused');
-txt('f-recalls-5m1h',(rc.recalls_5m||0)+' / '+(rc.recalls_1h||0));txt('f-recalls-wq',(rc.wakes_window||0)+'W · '+(rc.queries_window||0)+'Q');
-txt('f-coverage',Math.round(rc.recall_coverage_pct||0)+'%');txt('f-hit-rate','hit '+Math.round(rc.query_hit_rate_pct||0)+'% ('+(rc.recalling_agents||0)+'/'+(rc.active_agents||0)+')');
-if(el('m-pulse-list'))el('m-pulse-list').innerHTML=(vt.recent_pulses||[]).slice(0,5).map(function(p){
-var pc=p.kind==='refused'?'err':p.kind==='submit'?(p.accepted===false?'err':'ok'):'info';
-var ds=p.kind==='refused'?'refused '+(p.code||''):p.kind==='submit'?'write '+(p.slug||''):p.kind==='query'?'query ('+(p.hits??0)+' hits)':'wake ('+(p.count??0)+')';
-return '<div class="compact-row"><span class="compact-main"><span class="pill '+pc+'">'+esc(p.kind)+'</span> <b>@'+esc(p.actor)+'</b> · '+esc(ds)+'</span><span>'+esc(fmtAgo(p.at,now))+'</span></div>';
-}).join('');
-var dst=coh.drift_status||'aligned';txt('m-drift-pill',dst.replace(/_/g,' '));cls('m-drift-pill','pill '+(dst==='aligned'?'ok':'warn'));
-var cc=coh.counts||{}, ca=coh.axes||{};
-txt('c-core-score',Math.round(coh.core_memory_score||0)+'%');txt('c-grounded',(cc.grounded_claims||0)+' grounded · '+(cc.shared_artifacts||0)+' refs');
-txt('e-compress',Math.round((eff.reuse&&eff.reuse.state_compression_pct)||0)+'%');txt('e-durable',((eff.reuse&&eff.reuse.durable_claims)||0)+' durable');
-bars('m-coh-axes',[['Canon Alignment',ca.alignment,'#fbbf24'],['Evidence Grounding',ca.grounding,'#34d399'],['Cross-Agent Convergence',ca.convergence,'#38bdf8'],['Recall-Before-Write',ca.coupling,'#818cf8'],['Lifecycle Hygiene',ca.consolidation,'#a78bfa']]);
-bars('m-eff-axes',[['Distribution Breadth',ea.breadth,'#38bdf8'],['Retrieval Precision',ea.precision,'#34d399'],['Handoff Velocity',ea.velocity,'#fbbf24'],['State Compression',ea.reuse,'#a78bfa']]);
-var bs=bk.status||'verified_clean';txt('b-status-pill',bs.replace(/_/g,' ').toUpperCase());cls('b-status-pill','pill '+(bs==='verified_clean'?'ok':bs==='dirty_open'?'info':'err'));
-txt('b-age-val',bk.age_sec!=null?fmtDur(bk.age_sec):'none');txt('b-unbacked-val',String(bk.unbacked_writes??'-'));txt('b-seq-sub','seq #'+(ss.write_seq??'-'));
-var bw=bk.watch||{},sv=String(bw.saving||'open').toUpperCase();txt('b-saving-val',sv);txt('b-fenced-sub',(bw.fenced||[]).length+' fenced');
-var fp=Number(bk.freshness_pct??0);txt('b-fresh-pct',fp+'%');if(el('b-fresh-bar'))el('b-fresh-bar').style.width=fp+'%';
-var rcpt=bk.last_receipt||{};txt('b-receipt-main',rcpt.write_seq!=null?'seq #'+rcpt.write_seq+' · '+fmtUtc(rcpt.at)+' ('+fmtAgo(rcpt.at,now)+')':'No receipt');
-txt('b-receipt-sub','snapshot: '+(rcpt.snapshot_id||'store_state'));
-txt('d-mode-pill',dr.persisted_curation?'OBSERVED':'PREVIEW');cls('d-mode-pill','pill '+(dr.persisted_curation?'ok':'violet'));
-var dc=dr.counts||{},ps=dr.planned_summary||{};
-txt('d-last-val',dr.last_curated_at?fmtAgo(dr.last_curated_at,now):'pending');txt('d-last-seq','seq #'+(dr.last_curated_write_seq||0));
-txt('d-merkle-val',String(dc.merkle_syntheses||0));txt('d-folded-sub',(dc.consolidated_sources||0)+' folded');
-txt('d-savings-val',(dc.wake_savings_pct||0)+'%');txt('d-planned-sub',((ps.promotions||0)+(ps.distillations||0)+(ps.solidifications||0))+' planned');
+cls('m-health-banner','glass hb '+(crit?'critical':al.length?'alerting':'healthy'));
+cls('m-alert-count','pill '+(crit?'err':al.length?'warn':'ok'));
+cls('v-coh-delta','pill '+(cD>=0?'ok':'warn'));
+cls('m-drift-pill','pill '+(dst==='aligned'?'ok':'warn'));
+cls('b-status-pill','pill '+(bs==='verified_clean'?'ok':bs==='dirty_open'?'info':'err'));
+cls('d-mode-pill','pill '+(dr.persisted_curation?'ok':'violet'));
+if(el('b-fresh-bar'))el('b-fresh-bar').style.width=fp+'%';
+if(el('m-alert-list'))el('m-alert-list').innerHTML=al.slice(0,5).map(function(a){return '<div class="al-i '+(a.severity==='critical'?'critical':'')+'"><span>'+esc(a.summary)+'</span><span>'+esc(fA(a.at,now))+'</span></div>';}).join('');
+spk('svg-write-spark',nm.sparkline_12h,'#34d399','rgba(52,211,153,.18)');
+spk('svg-recall-spark',rc.sparkline_60m,'#38bdf8','rgba(56,189,248,.18)');
+spk('svg-coh-spark',ds.length?ds.map(function(x){return x.coherence_score;}):(coh.history||[]).map(function(h){return h.score;}),'#6ee7b7','rgba(110,231,183,.18)');
+spk('svg-eff-spark',ds.length?ds.map(function(x){return x.synaptic_efficiency_score;}):[e7,e24],'#a78bfa','rgba(167,139,250,.18)');
+if(el('m-pulse-list'))el('m-pulse-list').innerHTML=(vt.recent_pulses||[]).slice(0,5).map(function(p){var pc=p.kind==='refused'?'err':p.kind==='submit'?(p.accepted===false?'err':'ok'):'info',dt=p.kind==='refused'?'refused '+(p.code||''):p.kind==='submit'?'write '+(p.slug||''):p.kind==='query'?'query ('+(p.hits??0)+' hits)':'wake ('+(p.count??0)+')';return '<div class="cr"><span class="cm"><span class="pill '+pc+'">'+esc(p.kind)+'</span> <b>@'+esc(p.actor)+'</b> · '+esc(dt)+'</span><span>'+esc(fA(p.at,now))+'</span></div>';}).join('');
+dTr(tr);
+bars('m-coh-axes',[['Canon & Priority Alignment ('+wM+')',ca.alignment,'#fbbf24'],['Evidence Grounding ('+wM+')',ca.grounding,'#34d399'],['Cross-Agent Convergence ('+wM+')',ca.convergence,'#38bdf8'],['Recall-Before-Write ('+wM+')',ca.coupling,'#818cf8'],['Lifecycle Hygiene ('+wM+')',ca.consolidation,'#a78bfa']]);
+bars('m-eff-axes',[['Distribution Breadth ('+wM+')',ea.breadth,'#38bdf8'],['Retrieval Precision ('+wM+')',ea.precision,'#34d399'],['Handoff Velocity ('+wM+')',ea.velocity,'#fbbf24'],['State Compression ('+wM+')',ea.reuse,'#a78bfa']]);
+if(el('m-daily-trends-list'))el('m-daily-trends-list').innerHTML=ds.slice().reverse().map(function(r){return '<div class="cr"><span class="cm"><span class="pill info">'+esc(r.label||r.date)+'</span> coh <b>'+Math.round(r.coherence_score)+'%</b> · eff <b>'+Math.round(r.synaptic_efficiency_score)+'%</b></span><span>+'+r.new_claims+'W · '+r.recall_hits+(r.recall_incomplete?'*':'')+'R · '+r.conflicts_raised+'↑/'+r.conflicts_resolved+'✓ · '+r.active_writers+'ag</span></div>';}).join('');
 var elp=Number(dr.elapsed_sec||0),dI=Math.max(1,Number(dr.dream_interval_sec||28800)),wD=Number(dr.write_delta||0),wT=Math.max(1,Number(dr.write_delta_threshold||25));
-bars('d-trigger-bars',[['Circadian ('+fmtDur(elp)+'/'+fmtDur(dI)+')',Math.min(100,Math.round(elp/dI*100)),'#38bdf8'],['Synaptic Volume ('+wD+'/'+wT+')',Math.min(100,Math.round(wD/wT*100)),'#a78bfa',wD+'/'+wT],['Nightmare Interrupts',Math.min(100,(dc.nightmares||0)*25),'#34d399',(dc.nightmares||0)+' active']]);
+bars('d-trigger-bars',[['Circadian ('+fD(elp)+'/'+fD(dI)+')',Math.min(100,Math.round(elp/dI*100)),'#38bdf8'],['Synaptic Volume ('+wD+'/'+wT+')',Math.min(100,Math.round(wD/wT*100)),'#a78bfa',wD+'/'+wT],['Nightmare Interrupts',Math.min(100,(dc.nightmares||0)*25),'#34d399',(dc.nightmares||0)+' active']]);
 if(el('d-ledger-list')){
-var rows=(dr.recent_consolidations||[]).slice(0,4).map(function(c){return '<div class="compact-row"><span class="compact-main"><span class="pill violet">#'+esc(c.topic)+'</span> <b>'+esc(c.slug)+'</b> ('+c.source_count+' folded)</span><span>'+esc(fmtAgo(c.at,now))+'</span></div>';});
-var eg=(dr.eigenvectors||[])[0];if(eg)rows.push('<div class="compact-row"><span class="compact-main"><span class="pill info">Eigen λ1</span> <b>'+esc(eg.label)+'</b> ('+eg.variance_pct+'% var)</span><span>'+(eg.persisted?'persisted':'spectral')+'</span></div>');
-el('d-ledger-list').innerHTML=rows.join('')||'<div class="stat-box"><span class="stat-s">No consolidations yet.</span></div>';
+var rw=(dr.recent_consolidations||[]).slice(0,4).map(function(c){return '<div class="cr"><span class="cm"><span class="pill violet">#'+esc(c.topic)+'</span> <b>'+esc(c.slug)+'</b> ('+c.source_count+' folded)</span><span>'+esc(fA(c.at,now))+'</span></div>';});
+var eg=(dr.eigenvectors||[])[0];if(eg)rw.push('<div class="cr"><span class="cm"><span class="pill info">Eigen λ1</span> <b>'+esc(eg.label)+'</b> ('+eg.variance_pct+'% var)</span><span>'+(eg.persisted?'persisted':'spectral')+'</span></div>');
+el('d-ledger-list').innerHTML=rw.join('')||'<div class="stat-box"><small>No consolidations yet.</small></div>';
 }
-var as=ag.summary||{};txt('a-summary-pill',(as.active_5m||0)+' active · '+(as.warm_20m||0)+' warm / '+(as.total||0));
-renderAgents(d);
-var sc=vt.scope_counts||{};txt('t-total-pill',(ss.current_claims||0)+' claims');txt('t-canon',String(sc.canon||0));txt('t-decisions',String(dc.class_b_decisions||0));
-txt('t-edges',String((vt.entity_graph&&vt.entity_graph.total_edges)||0));txt('t-unverified',(sc.unverified_total||0)+' unverified');
+rAg(d);
 var tps=vt.topics||[],mT=Math.max.apply(null,tps.map(function(t){return t.total||0;}).concat([1]));
-bars('m-topic-bars',tps.slice(0,7).map(function(t){return ['#'+t.topic+' ('+t.above_the_line+' durable)',Math.round((t.total||0)/mT*100),t.canon>0?'#fbbf24':'#38bdf8',t.total+' claims'];}));
+bars('m-topic-bars',tps.slice(0,7).map(function(t){return['#'+t.topic+' ('+t.above_the_line+' durable)',Math.round((t.total||0)/mT*100),t.canon>0?'#fbbf24':'#38bdf8',t.total+' claims'];}));
 }
-var cv=el('pocket-cortex'),ctx=cv?cv.getContext('2d'):null,pts=[],nodes=[],tick=0;
+var cv=el('pocket-cortex'),ctx=cv?cv.getContext('2d'):null,pts=[],nodes=[],tk=0;
 function draw(){
 if(!cv||!ctx)return;
 var dpr=Math.min(window.devicePixelRatio||1,2),r=cv.getBoundingClientRect(),w=Math.max(300,Math.floor(r.width)),h=Math.max(180,Math.floor(r.height));
 if(cv.width!==w*dpr||cv.height!==h*dpr){cv.width=w*dpr;cv.height=h*dpr;}
-ctx.save();ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);tick+=0.025;
-var cx=w*0.5,cy=h*0.52,rx=Math.min(w*0.38,160),ry=Math.min(h*0.34,66),d=curData||{},cs=(d.coherence&&d.coherence.score)||85,roster=(d.agents&&d.agents.roster)||[];
-if(roster.length&&Math.random()<0.18){pts.push({i:Math.floor(Math.random()*roster.length),t:0,w:Math.random()<0.4});if(pts.length>28)pts.shift();}
-ctx.strokeStyle='rgba(99,130,190,0.18)';ctx.beginPath();ctx.ellipse(cx,cy,rx,ry,0,0,Math.PI*2);ctx.stroke();
+ctx.save();ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);tk+=0.025;
+var cx=w*0.5,cy=h*0.52,rx=Math.min(w*0.38,160),ry=Math.min(h*0.34,66),d=cur||{},cs=(d.trends&&d.trends.window_24h&&d.trends.window_24h.coherence_score)||(d.coherence&&d.coherence.score)||85,rs=(d.agents&&d.agents.roster)||[];
+if(rs.length&&Math.random()<0.18){pts.push({i:Math.floor(Math.random()*rs.length),t:0,w:Math.random()<0.4});if(pts.length>28)pts.shift();}
+ctx.strokeStyle='rgba(99,130,190,.18)';ctx.beginPath();ctx.ellipse(cx,cy,rx,ry,0,0,Math.PI*2);ctx.stroke();
 nodes=[];
-for(var i=0;i<roster.length;i++){
-var a=roster[i],ang=-Math.PI/2+(i/roster.length)*Math.PI*2+Math.sin(tick*0.3+i)*0.03,nx=cx+Math.cos(ang)*rx,ny=cy+Math.sin(ang)*ry,inf=aInfo(a.id,i);
-nodes.push({id:a.id,name:inf.name,x:nx,y:ny,color:inf.color,health:a.health});
-ctx.strokeStyle=a.health==='active'?'rgba(56,189,248,0.28)':'rgba(148,163,184,0.12)';ctx.beginPath();ctx.moveTo(cx,cy);ctx.lineTo(nx,ny);ctx.stroke();
+for(var i=0;i<rs.length;i++){
+var a=rs[i],ang=-Math.PI/2+(i/rs.length)*Math.PI*2+Math.sin(tk*0.3+i)*0.03,nx=cx+Math.cos(ang)*rx,ny=cy+Math.sin(ang)*ry,inf=aI(a.id,i);
+nodes.push({id:a.id,n:inf.n,x:nx,y:ny,c:inf.c,h:a.health});
+ctx.strokeStyle=a.health==='active'?'rgba(56,189,248,.28)':'rgba(148,163,184,.12)';ctx.beginPath();ctx.moveTo(cx,cy);ctx.lineTo(nx,ny);ctx.stroke();
 }
 for(var k=pts.length-1;k>=0;k--){
 var p=pts[k];p.t+=0.02;if(p.t>=1||!nodes[p.i]){pts.splice(k,1);continue;}
 var tg=nodes[p.i],pr=p.w?(1-p.t):p.t;ctx.fillStyle=p.w?'#34d399':'#38bdf8';ctx.beginPath();ctx.arc(cx+(tg.x-cx)*pr,cy+(tg.y-cy)*pr,2.3,0,Math.PI*2);ctx.fill();
 }
-ctx.fillStyle='rgba(56,189,248,0.25)';ctx.beginPath();ctx.arc(cx,cy,26,0,Math.PI*2);ctx.fill();
+ctx.fillStyle='rgba(56,189,248,.25)';ctx.beginPath();ctx.arc(cx,cy,26,0,Math.PI*2);ctx.fill();
 ctx.strokeStyle='#34d399';ctx.lineWidth=2.5;ctx.beginPath();ctx.arc(cx,cy,24,-Math.PI/2,-Math.PI/2+(Math.PI*2*Math.min(100,cs))/100);ctx.stroke();
 ctx.fillStyle='#f8fafc';ctx.font='700 11px sans-serif';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(Math.round(cs)+'%',cx,cy);
 for(var j=0;j<nodes.length;j++){
-var n=nodes[j],sel=selAgent===n.id;ctx.fillStyle=n.color;ctx.beginPath();ctx.arc(n.x,n.y,sel?7:5,0,Math.PI*2);ctx.fill();
-ctx.fillStyle='#e2e8f0';ctx.font='9.5px sans-serif';ctx.fillText(n.name.slice(0,9),n.x,n.y<cy?n.y-9:n.y+11);
+var nd=nodes[j];ctx.fillStyle=nd.c;ctx.beginPath();ctx.arc(nd.x,nd.y,sAg===nd.id?7:5,0,Math.PI*2);ctx.fill();
+ctx.fillStyle='#e2e8f0';ctx.font='9.5px sans-serif';ctx.fillText(nd.n.slice(0,9),nd.x,nd.y<cy?nd.y-9:nd.y+11);
 }
 ctx.restore();requestAnimationFrame(draw);
 }
 if(cv)cv.addEventListener('click',function(ev){
 var r=cv.getBoundingClientRect(),x=ev.clientX-r.left,y=ev.clientY-r.top;
-for(var i=0;i<nodes.length;i++){var n=nodes[i];if(Math.hypot(x-n.x,y-n.y)<26){selAgent=n.id;txt('m-canvas-caption','Selected @'+n.id+' ('+n.health+')');renderAgents(curData);break;}}
+for(var i=0;i<nodes.length;i++){var n=nodes[i];if(Math.hypot(x-n.x,y-n.y)<26){sAg=n.id;txt('m-canvas-caption','Selected @'+n.id+' ('+n.h+')');rAg(cur);break;}}
 });
-var fb=document.querySelectorAll('#a-filter-row .filter-btn');
-for(var f=0;f<fb.length;f++)fb[f].addEventListener('click',function(){aFilter=this.getAttribute('data-filter')||'all';for(var k=0;k<fb.length;k++)fb[k].classList.remove('active');this.classList.add('active');renderAgents(curData);});
-var nb=document.querySelectorAll('.bottom-nav .nav-btn');
-for(var b=0;b<nb.length;b++)nb[b].addEventListener('click',function(){var s=el(this.getAttribute('data-jump'));for(var k=0;k<nb.length;k++)nb[k].classList.remove('active');this.classList.add('active');if(s&&s.scrollIntoView)s.scrollIntoView({behavior:'smooth'});});
+function bB(s,a,cb){var b=document.querySelectorAll(s);for(var i=0;i<b.length;i++)b[i].addEventListener('click',function(){for(var k=0;k<b.length;k++)b[k].classList.remove('active');this.classList.add('active');cb(this.getAttribute(a));});}
+bB('#w-filter-row .f-btn','data-win',function(v){wM=v||'7d';if(cur)rMob(cur);});
+bB('#a-filter-row .f-btn','data-filter',function(v){aF=v||'all';rAg(cur);});
+bB('.bnav .nbtn','data-jump',function(v){var s=el(v);if(s&&s.scrollIntoView)s.scrollIntoView({behavior:'smooth'});});
 if(el('m-desktop-btn'))el('m-desktop-btn').addEventListener('click',function(){window.location.href='/';});
-try{var raw=el('initial-mobile-state').textContent;if(raw)renderMobile(JSON.parse(raw));}catch(_){}
+try{var raw=el('initial-mobile-state').textContent;if(raw)rMob(JSON.parse(raw));}catch(_){}
 requestAnimationFrame(draw);
 if(typeof EventSource!=='undefined'){
 var es=new EventSource('/events?mode=mobile');
 es.onopen=function(){txt('m-sse-pill','LIVE');cls('m-sse-pill','pill ok');};
-es.onmessage=function(e){try{renderMobile(JSON.parse(e.data));}catch(_){}};
+es.onmessage=function(e){try{rMob(JSON.parse(e.data));}catch(_){}};
 es.onerror=function(){txt('m-sse-pill','POLL');cls('m-sse-pill','pill warn');};
 }
 })();
-</script>
-</body>
-</html>`
+</script></body></html>`
 }
 
 export async function startMemoryViewer({
@@ -7631,6 +8436,7 @@ export async function startMemoryViewer({
     scope_counts: { canon: 0, ops: 0, rooms: 0, self: 0, canon_unverified: 0, unverified_total: 0 },
     coherence: computeCoherence(),
     efficacy: computeSynapticEfficacy(),
+    trends: computeMemoryTrends(),
     curator_state: {
       state_file_present: false,
       last_curated_at: null,
@@ -7847,6 +8653,8 @@ export async function startMemoryViewer({
       const scopeCounts = computeScopeCounts(wake?.counts, records)
       const rawRoster = (Array.isArray(wake?.agent_roster) ? wake.agent_roster : []).map(sanitizeRosterEntry).filter(Boolean)
       const recentActivity = (Array.isArray(wake?.recent_activity) ? wake.recent_activity : []).map(sanitizeActivity).filter(Boolean)
+      const activityRollups = wake?.activity_rollups && typeof wake.activity_rollups === 'object' ? wake.activity_rollups : null
+      const activityRing = wake?.activity_ring && typeof wake.activity_ring === 'object' ? wake.activity_ring : null
       const healthResult = computeAgentHealth({
         agent_roster: rawRoster,
         recent_activity: recentActivity,
@@ -7882,6 +8690,7 @@ export async function startMemoryViewer({
       let coherence
       let curatorState
       let efficacy
+      let trends
       if (canReuseCorpus && cachedCorpus?.derived && cachedCorpus.derived.key === derivedKey) {
         coherence = cachedCorpus.derived.coherence
         const triggerEval = evaluateDreamTriggers({
@@ -7906,6 +8715,7 @@ export async function startMemoryViewer({
           refusal_count_15m: triggerEval.refusal_count_15m,
         }
         efficacy = cachedCorpus.derived.efficacy
+        trends = cachedCorpus.derived.trends
       } else {
         coherence = computeCoherence({
           records,
@@ -7999,8 +8809,64 @@ export async function startMemoryViewer({
           curator_state: curatorState,
           now_sec: nowSec,
         })
+        trends = computeMemoryTrends({
+          records,
+          history_records: historyRecords,
+          consolidated_records: Object.values(consolidatedSources || {}),
+          agent_roster: agentRoster,
+          recent_activity: recentActivity,
+          activity_rollups: activityRollups,
+          activity_ring: activityRing,
+          store_state: storeState,
+          curator_state: curatorState,
+          coherence,
+          efficacy,
+          now_sec: nowSec,
+        })
+        coherence.lifetime_score = coherence.score
+        coherence.window_24h = {
+          score: trends.window_24h.coherence_score,
+          axes: trends.window_24h.coherence_axes,
+        }
+        coherence.window_7d = {
+          score: trends.window_7d.coherence_score,
+          axes: trends.window_7d.coherence_axes,
+        }
+        coherence.daily_history = trends.daily_series.map(d => ({
+          date: d.date,
+          label: d.label,
+          at: d.end_at,
+          score: d.coherence_score,
+          synaptic_efficiency_score: d.synaptic_efficiency_score,
+          claims: d.new_claims,
+          recall_hits: d.recall_hits,
+          conflicts_raised: d.conflicts_raised,
+          conflicts_resolved: d.conflicts_resolved,
+          active_writers: d.active_writers,
+        }))
+        efficacy.lifetime_score = efficacy.score
+        efficacy.window_24h = {
+          score: trends.window_24h.synaptic_efficiency_score,
+          axes: trends.window_24h.synaptic_efficiency_axes,
+        }
+        efficacy.window_7d = {
+          score: trends.window_7d.synaptic_efficiency_score,
+          axes: trends.window_7d.synaptic_efficiency_axes,
+        }
+        efficacy.daily_history = trends.daily_series.map(d => ({
+          date: d.date,
+          label: d.label,
+          at: d.end_at,
+          score: d.synaptic_efficiency_score,
+          coherence_score: d.coherence_score,
+          claims: d.new_claims,
+          recall_hits: d.recall_hits,
+          conflicts_raised: d.conflicts_raised,
+          conflicts_resolved: d.conflicts_resolved,
+          active_writers: d.active_writers,
+        }))
         if (cachedCorpus) {
-          cachedCorpus.derived = { key: derivedKey, coherence, curatorState, efficacy }
+          cachedCorpus.derived = { key: derivedKey, coherence, curatorState, efficacy, trends }
         }
       }
       const queryAnswer = firstQuery?.answer === 'unknown'
@@ -8022,6 +8888,7 @@ export async function startMemoryViewer({
         scope_counts: scopeCounts,
         coherence,
         efficacy,
+        trends,
         curator_state: curatorState,
         consolidated_sources: consolidatedSources,
         constellation_links: constellation?.links || [],
@@ -8037,6 +8904,8 @@ export async function startMemoryViewer({
         records,
         agent_roster: agentRoster,
         recent_activity: recentActivity,
+        activity_rollups: activityRollups,
+        activity_ring: activityRing,
       }
     } catch (err) {
       cachedCorpus = null

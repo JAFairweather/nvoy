@@ -14,6 +14,7 @@ import {
   computeAgentHealth,
   computeCoherence,
   computeDreamingTelemetry,
+  computeMemoryTrends,
   computeSynapticEfficacy,
   CORPUS_CACHE_TTL_MS,
   diffViewerSnapshots,
@@ -1733,11 +1734,20 @@ await test('PR #354 regressions: cached event immutability, pre-curation elapsed
     const parsedApiMobile = JSON.parse(apiMobileRes.body)
     assert.equal(parsedApiMobile.metadata_only, true)
     assert.equal(parsedApiMobile.backup.last_receipt.snapshot_id, SNAP_ID.slice(0, 12))
+    assert(parsedApiMobile.trends && typeof parsedApiMobile.trends === 'object', '/api/mobile must include trends object')
+    assert.equal(parsedApiMobile.trends.window_24h.window, '24h')
+    assert.equal(parsedApiMobile.trends.window_7d.window, '7d')
+    assert.equal(parsedApiMobile.trends.daily_series.length, 7, 'daily_series must contain 7 calendar days')
+    assert.equal(parsedApiMobile.trends.hourly_24h_series.length, 6, 'hourly_24h_series must contain 6 4h buckets')
+    assert(typeof parsedApiMobile.trends.lifetime.coherence_score === 'number')
+    assert(typeof parsedApiMobile.trends.lifetime.synaptic_efficiency_score === 'number')
 
     const htmlMobileRes = await httpGet(viewer.port, '/mobile')
     assert.equal(htmlMobileRes.status, 200)
     assert(String(htmlMobileRes.headers['content-type']).includes('text/html'))
     assert(htmlMobileRes.body.includes('Pocket Cortex'))
+    assert(htmlMobileRes.body.includes('svg-date-trends'), '/mobile HTML must include date-plotted trend SVG')
+    assert(htmlMobileRes.body.includes('Rolling 24h / 7d Trends'), '/mobile HTML must include rolling 24h/7d trends section')
     const mobileHtmlBytes = Buffer.byteLength(htmlMobileRes.body, 'utf8')
     assert(mobileHtmlBytes < 40000, `expected /mobile HTML < 40000 bytes uncompressed, got ${mobileHtmlBytes}`)
     assert(!htmlMobileRes.body.includes(canaryClaim), '/mobile HTML must never leak claim text')
@@ -1783,6 +1793,444 @@ await test('PR #354 regressions: cached event immutability, pre-curation elapsed
     if (viewer) await viewer.stop()
     if (daemon) await daemon.close()
     rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+await test('computeMemoryTrends: scores rolling 24h and 7d windows by date and quantifies daily signals', () => {
+  const nowSec = 1794398400 // 2026-11-11T12:00:00Z
+  const daySec = 86400
+
+  // 200 older baseline claims from 14 days ago (simulating a large saturated lifetime corpus)
+  const oldClaims = Array.from({ length: 200 }, (_, i) => ({
+    id: `old-${i}`,
+    d: `room:waggle:nvoy-baseline-${i}`,
+    scope: 'room:waggle',
+    topic: 'nvoy',
+    author: i % 2 === 0 ? 'james' : 'mydude',
+    created_at: nowSec - 14 * daySec + i * 10,
+    claim: `Baseline claim ${i} on PR #100 and commit abcdef1234`,
+    evidence: ['PR #100', 'abcdef1234'],
+    as_of_git: 'abcdef1234',
+    as_of_evt: i > 0 ? `old-${i - 1}` : null,
+    supersedes: [],
+    withdrawn: false,
+    ttl_sec: 0,
+  }))
+
+  // Day -2 (2 days ago): 3 clean grounded claims by 2 authors (high coherence & efficiency)
+  const dayMinus2Start = Math.floor((nowSec - 2 * daySec) / daySec) * daySec + 3600
+  const dayMinus2Claims = [
+    {
+      id: 'd2-1',
+      d: 'hive:canon:nvoy-rule',
+      scope: 'hive:canon',
+      topic: 'nvoy',
+      author: 'james',
+      created_at: dayMinus2Start,
+      claim: 'Canon rule on PR #350 and mcp/tools/memory-viewer.mjs',
+      evidence: ['PR #350', 'mcp/tools/memory-viewer.mjs'],
+      as_of_git: '11223344',
+      as_of_evt: null,
+      supersedes: [],
+      withdrawn: false,
+      ttl_sec: 0,
+    },
+    {
+      id: 'd2-2',
+      d: 'room:waggle:nvoy-impl',
+      scope: 'room:waggle',
+      topic: 'nvoy',
+      author: 'biggy',
+      created_at: dayMinus2Start + 600,
+      claim: 'Implemented PR #350 in mcp/tools/memory-viewer.mjs',
+      evidence: ['PR #350', 'mcp/tools/memory-viewer.mjs'],
+      as_of_git: '11223344',
+      as_of_evt: 'd2-1',
+      supersedes: [],
+      withdrawn: false,
+      ttl_sec: 0,
+    },
+    {
+      id: 'd2-3',
+      d: 'room:waggle:nvoy-review',
+      scope: 'room:waggle',
+      topic: 'nvoy',
+      author: 'mydude',
+      created_at: dayMinus2Start + 1200,
+      claim: 'Reviewed PR #350 at 11223344',
+      evidence: ['PR #350', '11223344'],
+      as_of_git: '11223344',
+      as_of_evt: 'd2-2',
+      supersedes: [],
+      withdrawn: false,
+      ttl_sec: 0,
+    },
+  ]
+
+  // Today (within last 24h):
+  // - 2 conflicting claims on the same key by different authors (raises 1 conflict)
+  // - 1 resolution claim superseding the conflict (resolves 1 conflict, counts as recall hit)
+  // - 1 unanchored silo claim
+  const todayStart = Math.floor(nowSec / daySec) * daySec + 3600
+  const todayClaims = [
+    {
+      id: 'td-1',
+      d: 'room:waggle:deploy-state',
+      scope: 'room:waggle',
+      topic: 'herd-infra',
+      author: 'biggy',
+      created_at: todayStart,
+      claim: 'Service state is pending on PR #360',
+      evidence: ['PR #360'],
+      as_of_git: 'aabbccdd',
+      as_of_evt: null,
+      supersedes: [],
+      withdrawn: false,
+      ttl_sec: 86400,
+    },
+    {
+      id: 'td-2',
+      d: 'room:waggle:deploy-state',
+      scope: 'room:waggle',
+      topic: 'herd-infra',
+      author: 'neil',
+      created_at: todayStart + 300,
+      claim: 'Service state is active on PR #360',
+      evidence: ['PR #360'],
+      as_of_git: 'eeff0011',
+      as_of_evt: null,
+      supersedes: [],
+      withdrawn: false,
+      ttl_sec: 86400,
+    },
+    {
+      id: 'td-3',
+      d: 'room:waggle:deploy-state',
+      scope: 'room:waggle',
+      topic: 'herd-infra',
+      author: 'dead-rabbit',
+      created_at: todayStart + 900,
+      claim: 'Verified live deploy on PR #360 after superseding conflict',
+      evidence: ['PR #360', 'mcp/tools/memory-viewer.mjs'],
+      as_of_git: '99887766',
+      as_of_evt: 'td-2',
+      supersedes: ['td-1', 'td-2'],
+      withdrawn: false,
+      ttl_sec: 0,
+    },
+    {
+      id: 'td-4',
+      d: 'room:waggle:misc-unanchored',
+      scope: 'room:waggle',
+      topic: 'BadTopicName',
+      author: 'dennis',
+      created_at: todayStart + 1200,
+      claim: 'Unanchored note without git or event ref',
+      evidence: [],
+      as_of_git: null,
+      as_of_evt: null,
+      supersedes: [],
+      withdrawn: false,
+      ttl_sec: 3600,
+    },
+  ]
+
+  const allHistory = [...oldClaims, ...dayMinus2Claims, ...todayClaims]
+  const activeRecords = [...oldClaims, ...dayMinus2Claims, todayClaims[2], todayClaims[3]]
+  const lifetimeCoh = computeCoherence({ records: activeRecords, history_records: allHistory, now_sec: nowSec })
+  const lifetimeEff = computeSynapticEfficacy({
+    records: activeRecords,
+    history_records: allHistory,
+    agent_roster: [{ id: 'james' }, { id: 'biggy' }, { id: 'mydude' }, { id: 'neil' }, { id: 'dead-rabbit' }, { id: 'dennis' }],
+    now_sec: nowSec,
+  })
+
+  const trends = computeMemoryTrends({
+    records: activeRecords,
+    history_records: allHistory,
+    agent_roster: [{ id: 'james' }, { id: 'biggy' }, { id: 'mydude' }, { id: 'neil' }, { id: 'dead-rabbit' }, { id: 'dennis' }],
+    recent_activity: [
+      { kind: 'query', actor: 'biggy', hits: 3, at: todayStart + 100 },
+      { kind: 'query', actor: 'dead-rabbit', hits: 2, at: todayStart + 800 },
+    ],
+    coherence: lifetimeCoh,
+    efficacy: lifetimeEff,
+    now_sec: nowSec,
+  })
+
+  assert.equal(trends.daily_series.length, 7, 'must produce 7 daily_series points plotted by date')
+  assert.equal(trends.daily_series[6].date, '2026-11-11')
+  assert.equal(trends.daily_series[6].label, '11-11')
+  assert.equal(trends.daily_series[4].date, '2026-11-09')
+
+  // Verify day-to-day signals on today (2026-11-11) and 24h rolling window
+  assert.equal(trends.today_signals.new_claims, 4, 'today must record 4 new claims')
+  assert.equal(trends.today_signals.conflicts_raised, 1, 'today must record 1 conflict raised (td-2 vs td-1)')
+  assert.equal(trends.today_signals.conflicts_resolved, 1, 'today must record 1 conflict resolved (td-3 superseding td-1/td-2)')
+  assert.equal(trends.today_signals.active_writers, 4, 'today must record 4 active writers (biggy, neil, dead-rabbit, dennis)')
+  assert.equal(trends.today_signals.recall_hits, 2, 'today must count the 2 observed query recall hits')
+  assert.equal(trends.today_signals.grounded_writes, 1, 'today must count 1 recall-grounded write (td-3)')
+
+  // Verify 7d window aggregates across Day -2 + Today (3 + 4 = 7 claims)
+  assert.equal(trends.window_7d.new_claims, 7, '7d window must exclude the 200 14-day-old claims and count only the 7 claims in 7d')
+  assert.equal(trends.window_7d.claims_per_day, 1, '7 claims over 7 days = 1.0/day')
+  assert.equal(trends.window_7d.conflicts_raised, 1)
+  assert.equal(trends.window_7d.conflicts_resolved, 1)
+  assert.equal(trends.window_7d.active_writers, 6, '6 unique writers across the 7d window')
+
+  // Verify rolling scores differ between Day -2 (all clean/grounded/canon) and Today (mixed with conflict & unanchored claim)
+  const dayMinus2Pt = trends.daily_series[4]
+  const todayPt = trends.daily_series[6]
+  assert(
+    dayMinus2Pt.coherence_score > todayPt.coherence_score,
+    `expected clean Day -2 coherence (${dayMinus2Pt.coherence_score}) > conflicted/unanchored Today coherence (${todayPt.coherence_score})`
+  )
+  assert.notEqual(
+    trends.window_24h.coherence_score,
+    trends.lifetime.coherence_score,
+    '24h rolling coherence must reflect 24h claims rather than sitting locked to the 200-claim lifetime score'
+  )
+  assert.equal(trends.lifetime.coherence_score, lifetimeCoh.score, 'lifetime score must be preserved as a number')
+  assert.equal(trends.lifetime.synaptic_efficiency_score, lifetimeEff.score, 'lifetime synaptic efficiency score must be preserved')
+})
+
+await test('durable SQLite activity_rollups survive >80 ring overflow & daemon restart, mark incomplete buckets, and enforce event-time conflict dates', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hive-memory-trends-rollups-'))
+  try {
+    const dbPath = join(dir, 'memory.sqlite')
+    const ledgerPath = join(dir, 'accepted-ledger.jsonl')
+    const receiptPath = join(dir, 'last-verified-backup.json')
+    const sockDir = join(dir, 'sockets')
+
+    const ownerSk = generateSecretKey()
+    const ownerPk = getPublicKey(ownerSk)
+    const biggySk = generateSecretKey()
+    const biggyPk = getPublicKey(biggySk)
+    const neilSk = generateSecretKey()
+    const neilPk = getPublicKey(neilSk)
+    const globalRoom = 'a8186b53-537d-46ad-a7e7-b6486c58970e'
+    const nowSec = 1794398400 // 2026-11-11T12:00:00Z
+    const daySec = 86400
+    const dayMinus2At = Math.floor((nowSec - 2 * daySec) / daySec) * daySec + 3600
+    const todayAt = Math.floor(nowSec / daySec) * daySec + 3600
+
+    const config = {
+      memoryGlobalChannelId: globalRoom,
+      ownerPubkey: ownerPk,
+      maxUnbackedSec: 86400 * 30,
+      globalWriters: [ownerPk, biggyPk, neilPk],
+      canonWriters: [ownerPk],
+      readers: {
+        viewer: ownerPk,
+        biggy: biggyPk,
+        neil: neilPk,
+      },
+      writers: {
+        james: { pubkey: ownerPk, perHour: 200, allowSelf: true },
+        biggy: { pubkey: biggyPk, perHour: 200, allowSelf: true },
+        neil: { pubkey: neilPk, perHour: 200, allowSelf: true },
+      },
+      rooms: {
+        [globalRoom]: {
+          members: [ownerPk, biggyPk, neilPk],
+          writers: [ownerPk, biggyPk, neilPk],
+        },
+      },
+    }
+
+    initEmptyStore({ dbPath, ledgerPath, nowSec: nowSec - 7 * daySec })
+    recordVerifiedBackup({ receiptPath, writeSeq: 1, snapshotId: SNAP_ID, at: dayMinus2At - 60, nowSec })
+
+    let clockSec = dayMinus2At
+    let daemon = await startMemoryDaemon({
+      dbPath,
+      ledgerPath,
+      receiptPath,
+      config,
+      readers: ['viewer', 'biggy', 'neil'],
+      writers: ['james', 'biggy', 'neil'],
+      socketDir: sockDir,
+      now: () => clockSec,
+      log: () => {},
+    })
+
+    // 1. On Day -2: biggy and neil write conflicting claims on the same fact key
+    const evDay2A = finalizeEvent(
+      buildClaimTemplate({
+        pubkey: biggyPk,
+        scope: `room:${globalRoom}`,
+        slug: 'gateway-route',
+        topic: 'herd-infra',
+        claim: 'Gateway route points to upstream A on PR #401',
+        because: 'Day -2 initial route',
+        evidence: ['PR #401', 'mcp/tools/memory-daemon.mjs'],
+        asOfGit: '1111aaaa',
+        ttlSec: 0,
+        nowSec: dayMinus2At,
+        memoryGlobalChannelId: globalRoom,
+      }),
+      biggySk
+    )
+    const subA = daemon.store.submit({ writer: 'biggy', event: evDay2A, expectedPriorId: null, nowSec: dayMinus2At })
+    assert.equal(subA.accepted, true)
+
+    const evDay2B = finalizeEvent(
+      buildClaimTemplate({
+        pubkey: neilPk,
+        scope: `room:${globalRoom}`,
+        slug: 'gateway-route',
+        topic: 'herd-infra',
+        claim: 'Gateway route points to upstream B on PR #401',
+        because: 'Day -2 diverging route',
+        evidence: ['PR #401', 'mcp/tools/memory-daemon.mjs'],
+        asOfGit: '2222bbbb',
+        ttlSec: 0,
+        nowSec: dayMinus2At + 120,
+        memoryGlobalChannelId: globalRoom,
+      }),
+      neilSk
+    )
+    const subB = daemon.store.submit({ writer: 'neil', event: evDay2B, expectedPriorId: null, nowSec: dayMinus2At + 120 })
+    assert.equal(subB.accepted, true)
+    recordVerifiedBackup({ receiptPath, writeSeq: 3, snapshotId: SNAP_ID, at: todayAt - 60, nowSec })
+
+    // 2. On Today: james resolves the Day -2 conflict by superseding both evDay2A and evDay2B
+    const evTodayResolve = finalizeEvent(
+      buildClaimTemplate({
+        pubkey: ownerPk,
+        scope: `room:${globalRoom}`,
+        slug: 'gateway-route',
+        topic: 'herd-infra',
+        claim: 'Gateway route unified on upstream B on PR #401',
+        because: 'Resolved Day -2 divergence',
+        evidence: ['PR #401', 'mcp/tools/memory-daemon.mjs'],
+        asOfGit: '3333cccc',
+        asOfEvt: evDay2B.id,
+        supersedes: [evDay2A.id, evDay2B.id],
+        ttlSec: 0,
+        nowSec: todayAt,
+        memoryGlobalChannelId: globalRoom,
+      }),
+      ownerSk
+    )
+    const subRes = daemon.store.submit({ writer: 'james', event: evTodayResolve, expectedPriorId: null, nowSec: todayAt })
+    assert.equal(subRes.accepted, true)
+    recordVerifiedBackup({ receiptPath, writeSeq: 4, snapshotId: SNAP_ID, at: todayAt, nowSec })
+
+    // 3. Push 95 recall calls (> ACTIVITY_MAX = 80) across Day -2 (15 queries) and Today (80 queries)
+    const activityRing = { seq: 0, started_at: dayMinus2At, events: [] }
+    for (let i = 0; i < 15; i++) {
+      handleSocketJsonRpc({
+        store: daemon.store,
+        binding: { kind: 'reader', name: 'biggy' },
+        nowSec: dayMinus2At + 300 + i * 10,
+        activity: activityRing,
+        message: {
+          jsonrpc: '2.0',
+          id: i + 1,
+          method: 'tools/call',
+          params: { name: 'memory_query', arguments: { topic: 'herd-infra' } },
+        },
+      })
+    }
+    for (let i = 0; i < 80; i++) {
+      handleSocketJsonRpc({
+        store: daemon.store,
+        binding: { kind: 'reader', name: i % 2 === 0 ? 'biggy' : 'neil' },
+        nowSec: todayAt + 100 + i * 10,
+        activity: activityRing,
+        message: {
+          jsonrpc: '2.0',
+          id: 100 + i,
+          method: 'tools/call',
+          params: { name: 'memory_query', arguments: { topic: 'herd-infra' } },
+        },
+      })
+    }
+    assert.equal(activityRing.seq, 95, '95 total recall events were emitted')
+    assert.equal(activityRing.events.length, ACTIVITY_MAX, 'in-memory activity ring is capped at ACTIVITY_MAX (80)')
+
+    // Check viewer wake before restart (ring has overflowed at 80, losing the 15 Day -2 events from RAM)
+    const wakeBeforeRestartRes = handleSocketJsonRpc({
+      store: daemon.store,
+      binding: { kind: 'reader', name: 'viewer' },
+      nowSec,
+      activity: activityRing,
+      message: {
+        jsonrpc: '2.0',
+        id: 999,
+        method: 'tools/call',
+        params: { name: 'memory_wake', arguments: {} },
+      },
+    })
+    const wakeBeforeRestart = JSON.parse(wakeBeforeRestartRes.result.content[0].text)
+    assert.equal(wakeBeforeRestart.activity_ring.overflowed, true, 'activity_ring must report overflowed: true after >80 events')
+    assert.equal(wakeBeforeRestart.activity_rollups.total_hits, 95, 'SQLite activity_rollups must retain all 95 recall hits despite 80-event ring cap')
+
+    // 4. Restart the daemon on the same SQLite DB (in-memory activity ring is wiped to 0 events)
+    await daemon.close()
+    clockSec = nowSec
+    daemon = await startMemoryDaemon({
+      dbPath,
+      ledgerPath,
+      receiptPath,
+      config,
+      readers: ['viewer', 'biggy', 'neil'],
+      writers: ['james', 'biggy', 'neil'],
+      socketDir: sockDir,
+      now: () => clockSec,
+      log: () => {},
+    })
+
+    const viewer = await startMemoryViewer({
+      socketPath: join(sockDir, 'viewer.sock'),
+      host: '127.0.0.1',
+      port: 0,
+      pollMs: 60000,
+    })
+    try {
+      const mobileState = viewer.getMobileState()
+      const tr = mobileState.trends
+      assert.equal(mobileState.recent_activity?.length || 0, 0, 'fresh daemon has 0 in-memory recent_activity events')
+      assert.equal(tr.recall_telemetry.source, 'sqlite_rollups')
+      assert.equal(tr.window_24h.recall_hits, 80, '24h recall_hits must preserve all 80 Today query hits across daemon restart')
+      assert.equal(tr.window_7d.recall_hits, 95, '7d recall_hits must preserve all 95 (15 Day -2 + 80 Today) query hits across ring overflow and daemon restart')
+      assert.equal(tr.window_24h.recall_coverage, 'complete')
+      assert.equal(tr.window_7d.recall_coverage, 'complete')
+      assert.equal(tr.window_7d.recall_incomplete, false)
+
+      // Event-time conflict reproducibility:
+      // Even though the conflict on `room:...:gateway-route` is now resolved (so current-head conflict is false),
+      // Day -2 must still report conflicts_raised = 1, and Today must report conflicts_resolved = 1.
+      const dayMinus2Bucket = tr.daily_series[4]
+      const todayBucket = tr.daily_series[6]
+      assert.equal(dayMinus2Bucket.conflicts_raised, 1, 'Day -2 must reproducibly record conflicts_raised = 1 at event time')
+      assert.equal(dayMinus2Bucket.conflicts_resolved, 0, 'Day -2 must record conflicts_resolved = 0')
+      assert.equal(dayMinus2Bucket.recall_hits, 15, 'Day -2 must preserve its 15 recall hits even after 80-event ring overflow and restart')
+      assert.equal(todayBucket.conflicts_raised, 0, 'Today must record conflicts_raised = 0')
+      assert.equal(todayBucket.conflicts_resolved, 1, 'Today must reproducibly record conflicts_resolved = 1 at event time')
+      assert.equal(todayBucket.recall_hits, 80, 'Today must record 80 recall hits')
+
+      // 5. Verify explicit incomplete-bucket marking when telemetry coverage starts mid-window (e.g. ring overflow without SQLite rollups)
+      const partialTrends = computeMemoryTrends({
+        records: viewer.getState().records,
+        history_records: [evDay2A, evDay2B, evTodayResolve],
+        recent_activity: [{ kind: 'query', actor: 'biggy', count: 2, at: todayAt + 500 }],
+        activity_ring: { seq: 120, cap: 80, retained: 1, overflowed: true, started_at: dayMinus2At, oldest_at: todayAt + 500 },
+        activity_rollups: null,
+        now_sec: nowSec,
+      })
+      assert.equal(partialTrends.window_7d.recall_coverage, 'partial', '7d window must be marked partial when ring overflowed and no rollups cover earlier days')
+      assert.equal(partialTrends.window_7d.recall_incomplete, true, '7d window must set recall_incomplete: true')
+      assert.equal(partialTrends.daily_series[4].recall_coverage, 'unobserved', 'Day -2 bucket prior to oldest retained ring event must be marked unobserved')
+      assert.equal(partialTrends.daily_series[4].recall_incomplete, true, 'Day -2 bucket must set recall_incomplete: true')
+      assert.equal(partialTrends.daily_series[6].recall_incomplete, true, 'Today bucket starting before oldest_at (todayAt + 500) must also be marked partial/incomplete')
+    } finally {
+      await viewer.stop()
+      await daemon.close()
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
   }
 })
 
