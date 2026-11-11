@@ -17,7 +17,7 @@
 //        caller-verified git ancestry) orders one claim after the other.
 //      - Escalates ambiguous conflicts to `@james` and `@mydude` without guessing.
 
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs'
+import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs'
 import { createConnection } from 'node:net'
 import { dirname, join, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
@@ -32,6 +32,7 @@ import {
   parseFactKey,
 } from './memory.mjs'
 import { computeCoherence, createSingleSocketMcpClient } from './memory-viewer.mjs'
+import { makeBunkerSigner } from './nip46-signer.mjs'
 
 export function defaultCuratorStatePath(readerSocket) {
   if (!readerSocket || typeof readerSocket !== 'string') return null
@@ -1915,6 +1916,9 @@ export function parseCuratorFlags(argv = []) {
   let writerSocket = process.env.HIVE_MEMORY_WRITER_SOCKET || null
   let stateFile = process.env.HIVE_MEMORY_CURATOR_STATE_FILE || undefined
   let secretKeyFile = process.env.HIVE_MEMORY_CURATOR_SECRET_KEY_FILE || null
+  let bunkerUriFile = process.env.HIVE_MEMORY_CURATOR_BUNKER_URI_FILE || null
+  let bunkerClientFile = process.env.HIVE_MEMORY_CURATOR_BUNKER_CLIENT_FILE || null
+  let expectPubkey = process.env.HIVE_MEMORY_CURATOR_PUBKEY || null
   let memoryGlobalChannelId = process.env.HIVE_MEMORY_GLOBAL_CHANNEL_ID || 'a8186b53-537d-46ad-a7e7-b6486c58970e'
   let dreamIntervalSec = Number(process.env.HIVE_MEMORY_DREAM_INTERVAL_SEC || DEFAULT_DREAM_INTERVAL_SEC)
   let writeDeltaThreshold = Number(process.env.HIVE_MEMORY_WRITE_DELTA_THRESHOLD || DEFAULT_WRITE_DELTA_THRESHOLD)
@@ -1932,6 +1936,12 @@ export function parseCuratorFlags(argv = []) {
       stateFile = argv[++i]
     } else if (arg === '--secret-key-file' && argv[i + 1]) {
       secretKeyFile = argv[++i]
+    } else if (arg === '--bunker-uri-file' && argv[i + 1]) {
+      bunkerUriFile = argv[++i]
+    } else if (arg === '--bunker-client-file' && argv[i + 1]) {
+      bunkerClientFile = argv[++i]
+    } else if (arg === '--expect-pubkey' && argv[i + 1]) {
+      expectPubkey = argv[++i]
     } else if (arg === '--global-channel' && argv[i + 1]) {
       memoryGlobalChannelId = argv[++i]
     } else if (arg === '--dream-interval-sec' && argv[i + 1]) {
@@ -1954,6 +1964,9 @@ export function parseCuratorFlags(argv = []) {
     writerSocket,
     stateFile,
     secretKeyFile,
+    bunkerUriFile,
+    bunkerClientFile,
+    expectPubkey,
     memoryGlobalChannelId,
     dreamIntervalSec,
     writeDeltaThreshold,
@@ -1961,6 +1974,35 @@ export function parseCuratorFlags(argv = []) {
     force,
     dryRun,
   }
+}
+
+// The curator's signing key lives in James's Bunker (frontier A4, nvoy#375): the cycle signs through NIP-46 with
+// a pairing credential that can only ask, never sign. The two ref files are read once, must not be readable by
+// group or others, and the Bunker's key must be exactly the curator identity the store's config names, so a
+// mispaired Bunker signs nothing. A raw key file and Bunker refs together are refused: one signer, chosen plainly.
+const HEX64 = /^[0-9a-f]{64}$/
+function readPrivateRef(path, what) {
+  const st = lstatSync(path)
+  if (!st.isFile()) throw new Error(`${what} ${path} is not a regular file`)
+  if (st.mode & 0o077) throw new Error(`${what} ${path} is readable by group or others; make it 0600 or 0400`)
+  const text = readFileSync(path, 'utf8').trim()
+  if (!text) throw new Error(`${what} ${path} is empty`)
+  return text
+}
+export async function curatorSignerFromFlags(flags, { makeSigner = makeBunkerSigner } = {}) {
+  const wantsBunker = Boolean(flags.bunkerUriFile || flags.bunkerClientFile)
+  if (!wantsBunker) return null
+  if (flags.secretKeyFile) throw new Error('give either --secret-key-file or the Bunker refs, not both')
+  if (!flags.bunkerUriFile || !flags.bunkerClientFile) throw new Error('the Bunker needs both --bunker-uri-file and --bunker-client-file')
+  const expect = String(flags.expectPubkey || '').toLowerCase()
+  if (!HEX64.test(expect)) throw new Error('signing through the Bunker needs --expect-pubkey (the curator identity, 64 hex)')
+  const uri = readPrivateRef(flags.bunkerUriFile, 'Bunker URI file')
+  const client = readPrivateRef(flags.bunkerClientFile, 'Bunker client credential file')
+  const signer = makeSigner(uri, client, { clientSource: flags.bunkerClientFile })
+  let pubkey
+  try { pubkey = String(await signer.getPublicKey()).toLowerCase() } catch (err) { signer.close?.(); throw new Error(`the Bunker did not answer get_public_key: ${err.message || err}`) }
+  if (pubkey !== expect) { signer.close?.(); throw new Error(`the Bunker signs as ${pubkey.slice(0, 8)}…, not the curator ${expect.slice(0, 8)}…; nothing signed`) }
+  return { pubkey, signEvent: event => signer.signEvent(event), close: () => signer.close?.() }
 }
 
 async function main() {
@@ -1982,11 +2024,20 @@ async function main() {
     curatorSecretKey = Uint8Array.from(Buffer.from(rawHex, 'hex'))
   }
 
+  let curatorSigner = null
+  try {
+    curatorSigner = await curatorSignerFromFlags(flags)
+  } catch (err) {
+    console.error(`memory-curate: ${err.message || err}`)
+    process.exit(1)
+  }
+
   try {
     const result = await runCuratorCycle({
       readerSocket: flags.readerSocket,
       writerSocket: flags.writerSocket,
       curatorSecretKey,
+      curatorSigner,
       memoryGlobalChannelId: flags.memoryGlobalChannelId,
       stateFile: flags.stateFile,
       dreamIntervalSec: flags.dreamIntervalSec,
@@ -2010,11 +2061,13 @@ async function main() {
         refused_count: result.refused.length,
       })
     )
-    if (!result.ok) process.exit(1)
+    if (!result.ok) { curatorSigner?.close(); process.exit(1) }
   } catch (err) {
     console.error(`memory-curate: cycle failed: ${err.message || err}`)
+    curatorSigner?.close()
     process.exit(1)
   }
+  curatorSigner?.close()
 }
 
 function isEntrypoint() {
