@@ -120,7 +120,22 @@ export function planProjectionPublish(index, payload) {
       + 'so there is nothing a rotation could be ordered against. Nothing was signed.' }
   }
 
-  if (!projectionChanged(prev.payload, payload)) {
+  const unchanged = !projectionChanged(prev.payload, payload)
+  // An UNVERIFIED publish (the relay accepted it, no read-back) with an unchanged roster must not be a
+  // dead end: refusing here would leave the operator told to "publish again" with the button disabled.
+  // The retry is a read-back only. It signs nothing, rotates nothing and re-grants no one; it needs the
+  // issued entry only for the scope key and generation to read with.
+  if (unchanged && prev.verified === false) {
+    const entry = (Array.isArray(index?.issued) ? index.issued : []).find(e => e?.scope === scopeId)
+    const gen = Number(entry?.v)
+    if (!entry?.key || !Number.isFinite(gen) || gen < 1) {
+      return { action: 'blocked', why: `the projection scope ${scopeId} did not read back, and its issued entry has no `
+        + 'usable key and generation to check it with, so it cannot be re-verified. Nothing was signed.' }
+    }
+    return { action: 'reverify', scopeId, generation: gen,
+      why: 'the roster has not changed, but the last publish never read back. Checking again signs nothing.' }
+  }
+  if (unchanged) {
     return { action: 'none', why: 'the roster has not changed. Republishing rotates the scope key and '
       + 'costs every holder a re-delivery, so it is refused rather than done quietly.' }
   }
@@ -138,6 +153,19 @@ export function planProjectionPublish(index, payload) {
   }
 
   return { action: 'rotate', scopeId, from, to: from + 1, grantees: granteesOf(issued) }
+}
+
+/**
+ * What the publish button says and whether it may be pressed, decided from the plan so the click handler
+ * and the markup cannot disagree. An unverified publish must offer a way forward (a read-back only);
+ * a refused plan stays disabled and says why.
+ */
+export function registryButton(plan, published) {
+  if (plan?.action === 'reverify') return { label: 'Check read-back', disabled: false, title: plan.why }
+  if (plan?.action === 'none' || plan?.action === 'blocked') {
+    return { label: published ? 'Republish projection' : 'Publish projection', disabled: true, title: plan.why }
+  }
+  return { label: published ? 'Republish projection' : 'Publish projection', disabled: false, title: '' }
 }
 
 /**

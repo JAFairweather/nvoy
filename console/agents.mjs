@@ -10,12 +10,13 @@ import { nip19 } from 'nostr-tools'
 import { saveGrantIndex, newScopeKey, publishScope, fetchScope, toIssuedEntry } from '../lib/nipxx.mjs'
 import { state, $, esc, short, fmtWhen, load, parsePub, agentsOf, agentName, openAgentPage, RELAYS } from './main.mjs'
 import { openDelegationInLedger } from './ledger.mjs'
-import { grantWithTerms, rotateWithTerms, opaqueScopeId, sendRevocationNotice } from './nvoygrant.mjs'
+import { grantWithTerms, opaqueScopeId, sendRevocationNotice } from './nvoygrant.mjs'
 import { appendLedger, grantedEvent, rotatedEvent, revokedEvent } from './ledgerlog.mjs'
 import {
   REGISTRY_SCOPE, REGISTRY_PROJECTION_FIELD, buildProjection, projectionChanged,
-  planProjectionPublish, granteesOf, enrol,
+  planProjectionPublish, registryButton, granteesOf, enrol,
 } from './registry.mjs'
+import { rotateProjection } from './registry-rotate.mjs'
 
 // Copy an npub to the clipboard with visual feedback, degrading gracefully:
 // async clipboard API → execCommand → (both blocked) select nothing and just
@@ -124,6 +125,7 @@ function registryPanel() {
   const { payload, dropped } = buildProjection(state.index, { now: Math.floor(Date.now() / 1000) })
   const published = state.index?.[REGISTRY_PROJECTION_FIELD] || null
   const plan = planProjectionPublish(state.index, payload)
+  const button = registryButton(plan, published)
   const issued = registryIssued()
   const holders = granteesOf(issued)
   const when = published?.at ? fmtWhen(published.at) : null
@@ -147,15 +149,15 @@ function registryPanel() {
       ${published
         ? `<span class="chip" title="the generation a holder must be able to read">v${esc(String(issued?.v ?? published.generation ?? '?'))}</span>
            ${unverified
-             ? '<span class="chip warn" title="the relay accepted the 30440 but it did not read back, so no runtime is known to be able to read it. Publish again.">published, but not readable back</span>'
+             ? '<span class="chip warn" title="the relay accepted the 30440 but it did not read back, so no runtime is known to be able to read it. Use Check read-back.">published, but not readable back</span>'
              : plan.action === 'none'
                ? `<span class="chip">published ${esc(when || '')}</span>`
                : '<span class="chip warn">roster changed since publish</span>'}`
         : '<span class="chip warn">never published — no runtime can verify this roster</span>'}
     </div>
     <div class="actions" style="margin-top:10px">
-      <button class="primary" id="reg-publish"${plan.action === 'none' ? ` disabled title="${esc(plan.why)}"` : ''}>
-        ${published ? 'Republish projection' : 'Publish projection'}</button>
+      <button class="primary" id="reg-publish"${button.disabled ? ' disabled' : ''}${button.title ? ` title="${esc(button.title)}"` : ''}>
+        ${esc(button.label)}</button>
       <span class="msg" id="reg-msg"></span>
     </div>
 
@@ -210,6 +212,26 @@ function wireRegistryPanel() {
 
     btn.disabled = true
     try {
+      if (plan.action === 'reverify') {
+        // Read-back only. Signs nothing, rotates nothing, re-grants no one.
+        msg.textContent = 'checking the projection reads back…'
+        const issued = registryIssued()
+        const scopeKey = Uint8Array.from(atob(issued.key), c => c.charCodeAt(0))
+        const back = await fetchScope(state.relay, {
+          publisher: state.me, scopeId: plan.scopeId, generation: plan.generation, scopeKey,
+        })
+        if (back.status === 'ok') {
+          state.index[REGISTRY_PROJECTION_FIELD].verified = true
+          await saveGrantIndex(state.relay, state.signer, state.index)
+          msg.textContent = `v${plan.generation} reads back — verified. Nothing was signed.`
+        } else {
+          msg.textContent = `v${plan.generation} still does not read back (${back.status}). Nothing was signed; `
+            + 'check again once the relay has it.'
+        }
+        await load()
+        return
+      }
+
       let scopeId, generation, scopeKey
       if (plan.action === 'publish') {
         // Opaque, like every other scope in the estate: a semantic `d` tag would tell any relay that
@@ -223,25 +245,43 @@ function wireRegistryPanel() {
         msg.textContent = plan.grantees.length
           ? `rotating to v${plan.to} and re-delivering to ${plan.grantees.length} holder(s)…`
           : `rotating to v${plan.to}…`
-        const rot = await rotateWithTerms(state.relay, state.signer, {
-          scopeId, generation: plan.from, payload, scopeName: REGISTRY_SCOPE,
-          survivors: plan.grantees.map(pub => ({ pub, terms: registryTerms() })), relayHint: RELAYS[0],
+        // The new key is recorded BEFORE any survivor is granted, and a failure part-way is reported as
+        // what it is: a generation that is out, with some holders still waiting for it.
+        const rot = await rotateProjection({
+          relay: state.relay, signer: state.signer, index: state.index, scopeId, scopeName: REGISTRY_SCOPE,
+          from: plan.from, payload, relayHint: RELAYS[0], verified: false, now,
+          survivors: plan.grantees.map(pub => ({ pub, terms: registryTerms() })),
+          save: () => saveGrantIndex(state.relay, state.signer, state.index),
         })
+        state.index.nvoy_ledger = appendLedger(state.index,
+          rotatedEvent({ scope: scopeId, from_v: plan.from, to_v: rot.generation, survivors: rot.regranted }))
+        await saveGrantIndex(state.relay, state.signer, state.index)
+        if (rot.status === 'partial') {
+          const names = rot.pending.map(agentName).join(', ')
+          msg.textContent = `rotated to v${rot.generation}, but only ${rot.regranted.length} of ${plan.grantees.length} holder(s) `
+            + `were re-delivered (${rot.reason}). Still waiting for v${rot.generation}: ${names}. The key is recorded; `
+            + 'use Grant read below for each, then Check read-back.'
+            + (rot.saved ? '' : ' WARNING: the Grant Index could not be saved on the last try — do not reload before it saves.')
+          const said = msg.textContent
+          await load()
+          const fresh = $('reg-msg'); if (fresh) fresh.textContent = said   // load() re-renders the panel
+          return
+        }
         generation = rot.generation; scopeKey = rot.scopeKey
       }
 
-      msg.textContent = 'recording in your Grant Index…'
-      const others = (state.index.issued ?? []).filter(e => e?.scope !== scopeId)
-      state.index.issued = [...others,
-        toIssuedEntry({ scopeId, scopeName: REGISTRY_SCOPE, generation, scopeKey }, plan.grantees)]
-      state.index[REGISTRY_PROJECTION_FIELD] = {
-        scopeId, scopeName: REGISTRY_SCOPE, generation, at: now(), payload, verified: false,
+      if (plan.action === 'publish') {
+        // A first publish has no prior generation to strand, so recording after the publish is enough;
+        // a rotation was already recorded by rotateProjection, before its first grant.
+        msg.textContent = 'recording in your Grant Index…'
+        const others = (state.index.issued ?? []).filter(e => e?.scope !== scopeId)
+        state.index.issued = [...others,
+          toIssuedEntry({ scopeId, scopeName: REGISTRY_SCOPE, generation, scopeKey }, plan.grantees)]
+        state.index[REGISTRY_PROJECTION_FIELD] = {
+          scopeId, scopeName: REGISTRY_SCOPE, generation, at: now(), payload, verified: false,
+        }
+        await saveGrantIndex(state.relay, state.signer, state.index)
       }
-      if (plan.action === 'rotate') {
-        state.index.nvoy_ledger = appendLedger(state.index,
-          rotatedEvent({ scope: scopeId, from_v: plan.from, to_v: generation, survivors: plan.grantees }))
-      }
-      await saveGrantIndex(state.relay, state.signer, state.index)
 
       // Read-back, the house pattern: a relay acknowledgement is not evidence that anyone can read it.
       msg.textContent = 'verifying the projection reads back…'
@@ -253,7 +293,7 @@ function wireRegistryPanel() {
           + (plan.grantees.length ? '' : ' No runtime holds it yet — grant read below.')
       } else {
         msg.textContent = `the relay accepted v${generation} but it did not read back (${back.status}), `
-          + 'so nothing is claimed as readable. Your scope key is recorded — publish again.'
+          + 'so nothing is claimed as readable. Your scope key is recorded — use Check read-back.'
       }
       await load()
     } catch (err) {
@@ -310,24 +350,35 @@ function wireRegistryHolders() {
         const from = Number(issued.v)
         msg.textContent = `rotating past ${agentName(pub)} and re-delivering to ${survivors.length} holder(s)…`
         const { payload } = buildProjection(state.index, { now: Math.floor(Date.now() / 1000) })
-        const rot = await rotateWithTerms(state.relay, state.signer, {
-          scopeId: issued.scope, generation: from, payload, scopeName: REGISTRY_SCOPE,
-          survivors: survivors.map(p => ({ pub: p, terms: registryTerms() })), relayHint: RELAYS[0],
+        // The new key is recorded before any survivor is granted and before the optional notice, so
+        // neither a failed grant nor a failed courtesy notice can strand the generation that replaced
+        // the old one. The revoked runtime is never in the recorded holders, whatever else failed.
+        const rot = await rotateProjection({
+          relay: state.relay, signer: state.signer, index: state.index, scopeId: issued.scope,
+          scopeName: REGISTRY_SCOPE, from, payload, relayHint: RELAYS[0],
+          now: () => Math.floor(Date.now() / 1000),
+          survivors: survivors.map(p => ({ pub: p, terms: registryTerms() })),
+          save: () => saveGrantIndex(state.relay, state.signer, state.index),
         })
-        await sendRevocationNotice(state.relay, state.signer, pub, {
-          scopeId: issued.scope, reason: 'the registry projection read was revoked',
-        })
-        issued.v = rot.generation
-        issued.key = btoa(String.fromCharCode(...rot.scopeKey))
-        issued.grantees = survivors
-        const rec = state.index[REGISTRY_PROJECTION_FIELD]
-        if (rec) { rec.generation = rot.generation; rec.at = Math.floor(Date.now() / 1000); rec.payload = payload }
+        let noticed = false
+        try {
+          await sendRevocationNotice(state.relay, state.signer, pub, {
+            scopeId: issued.scope, reason: 'the registry projection read was revoked',
+          })
+          noticed = true
+        } catch { /* a courtesy: the revocation itself is the rotation and is already recorded */ }
         state.index.nvoy_ledger = appendLedger(state.index, revokedEvent({
           scope: issued.scope, agent: pub, v: rot.generation,
-          reason: 'the registry projection read was revoked', notice: null,
+          reason: 'the registry projection read was revoked', notice: noticed ? true : null,
         }))
         await saveGrantIndex(state.relay, state.signer, state.index)
+        msg.textContent = rot.status === 'partial'
+          ? `${agentName(pub)} is revoked (v${rot.generation}), but only ${rot.regranted.length} of ${survivors.length} remaining holder(s) `
+            + `were re-delivered (${rot.reason}). Still waiting: ${rot.pending.map(agentName).join(', ')} — use Grant read.`
+          : `${agentName(pub)} is revoked (v${rot.generation}).` + (noticed ? '' : ' The courtesy notice could not be sent; the revocation stands.')
+        const said = msg.textContent
         await load()
+        const fresh = $('reg-hmsg'); if (fresh) fresh.textContent = said   // load() re-renders the panel
       } catch (err) { msg.textContent = `nothing changed: ${err.message}` }
       finally { btn.disabled = false }
     }
