@@ -57,6 +57,7 @@ const INFRA = new Set([
   'agentread.mjs',          // manual E2E driver: takes an agent + scope, played by the browser E2E
   'agenttool.mjs',          // manual E2E driver: drives one MCP tool as a given agent
   'nvoygrant.mjs',          // a library that happens to live here, not a suite (see console/nvoygrant.mjs)
+  'fake-herdr.mjs',         // a fake herdr binary the harness suites drive, not a suite
 ])
 const files = [...wired].filter(f => !INFRA.has(f)).sort()
 ok('the test script names suites to check', files.length > 0)

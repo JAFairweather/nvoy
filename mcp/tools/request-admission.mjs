@@ -21,7 +21,8 @@
 //   node tools/request-admission.mjs --channel <uuid> --maintainer <npub|hex> --purpose "…"
 //   DRY_RUN=1 node tools/request-admission.mjs --purpose "…"     # mint + build, publish nothing
 //
-// Defaults: channel = #waggle-test, maintainer = James's npub (the grantor). Override via flags/env.
+// Defaults: channel = #waggle-test. The maintainer (the grantor) is required: --maintainer or
+// WAGGLE_MAINTAINER_NPUB.
 //
 // After it runs: the request lands in the maintainer's inbox (a sealed NIP-17 DM). The maintainer
 // approves by issuing the grant — `grant.mjs issue --to <this npub> --channel <uuid> --cap admit`
@@ -39,9 +40,9 @@ import WebSocket from 'ws'
 
 const flag = (n, d) => { const i = process.argv.indexOf(n); return i > -1 && process.argv[i + 1] ? process.argv[i + 1] : d }
 const CHANNEL = flag('--channel', process.env.RELAY_CHANNEL || 'a8186b53-537d-46ad-a7e7-b6486c58970e')
-const MAINT_RAW = flag('--maintainer', process.env.WAGGLE_MAINTAINER_NPUB ||
-  '4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b287ea84d')
+const MAINT_RAW = flag('--maintainer', process.env.WAGGLE_MAINTAINER_NPUB || '')
 const MAINT = MAINT_RAW.startsWith('npub1') ? nip19.decode(MAINT_RAW).data : MAINT_RAW.toLowerCase()
+if (!/^[0-9a-f]{64}$/.test(MAINT)) { console.error('request-admission: set --maintainer or WAGGLE_MAINTAINER_NPUB (npub or 64-hex) — there is no default grantor'); process.exit(1) }
 const PURPOSE = flag('--purpose', '(unspecified)')
 const EXISTING_KEY = flag('--key', null)
 const RELAYS = (process.env.RELAY_RELAYS || 'wss://nos.lol,wss://relay.primal.net')

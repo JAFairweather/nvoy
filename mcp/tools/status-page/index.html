@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#101412">
+<meta name="referrer" content="no-referrer">
+<title>waggle status</title>
+<style>
+  /* ─── The Nave design system — canonical tokens, with nvoy's teal accent ──────
+     VENDORED VERBATIM from console/index.html, which vendors nave.pub design/tokens.css. */
+  :root {
+    /* surfaces (dark = canonical) */
+    --ground: #0b0906; --panel: #14100a; --panel-2: #1b1409;
+    --line: #2a2317; --line-strong: #3a3020;
+    --field: #0d0a06;                      /* inputs / code wells, one notch below panel */
+    /* legacy aliases (older vendored copies referenced these) */
+    --ink: #0b0906; --bg: #0b0906;
+    /* text */
+    --text: #f4efe4; --dim: #9c927f; --faint: #6f6555;
+    /* the Nave brand (brass) — the through-line colour */
+    --gold: #c39a56; --gold-bright: #e2c079;
+    /* per-app accent — OVERRIDE these three per app; default = brass */
+    --accent: #c39a56; --accent-bright: #e2c079; --accent-ink: #0b0906;
+    /* semantics (both name sets kept; new = good/warn/critical) */
+    --good: #8fae6a; --warn: #d9a648; --critical: #c0705a;
+    --ok: #8fae6a; --danger: #c0705a;
+    /* diff highlight: authored-by-you (green) vs from-template (slate) */
+    --diff-user: #8fae6a;     --diff-user-bg: color-mix(in srgb, #8fae6a 14%, transparent);
+    --diff-template: #7f95ad; --diff-template-bg: color-mix(in srgb, #7f95ad 12%, transparent);
+    /* Alby sign-in (NIP-07) */
+    --alby: #ffdf6f; --alby-bright: #ffe98c; --alby-ink: #1c1400;
+    /* type */
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Roboto Mono", monospace;
+    --display: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+    --serif: var(--sans);   /* legacy alias — kept so old vendored refs stay sans */
+    /* radii */
+    --r-sm: 6px; --r-md: 10px; --r-pill: 999px; --radius: 6px;
+  }
+
+  /* Light theme — derived, warm-biased (never a dead grey). Brass darkens to hold
+     contrast as text/borders; use bright brass only for large fills or the seal. */
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --ground: #f5f0e4; --panel: #fffdf7; --panel-2: #ece4d2;
+      --line: #ddd2ba; --line-strong: #c8b89a; --field: #fffdf7;
+      --ink: #f5f0e4; --bg: #f5f0e4;
+      --text: #241d12; --dim: #6f6553; --faint: #8a7f66;
+      --accent: #8f6a2c; --accent-bright: #b0863c; --accent-ink: #fffdf7;
+      --good: #4f7a34; --warn: #9a6a12; --critical: #a2482f;
+      --ok: #4f7a34; --danger: #a2482f;
+      --diff-user: #4f7a34;     --diff-user-bg: #e9f0dd;
+      --diff-template: #48607a; --diff-template-bg: #e6ecf3;
+    }
+  }
+  :root[data-theme="light"] {
+    --ground: #f5f0e4; --panel: #fffdf7; --panel-2: #ece4d2;
+    --line: #ddd2ba; --line-strong: #c8b89a; --field: #fffdf7;
+    --ink: #f5f0e4; --bg: #f5f0e4;
+    --text: #241d12; --dim: #6f6553; --faint: #8a7f66;
+    --accent: #8f6a2c; --accent-bright: #b0863c; --accent-ink: #fffdf7;
+    --good: #4f7a34; --warn: #9a6a12; --critical: #a2482f;
+    --ok: #4f7a34; --danger: #a2482f;
+    --diff-user: #4f7a34;     --diff-user-bg: #e9f0dd;
+    --diff-template: #48607a; --diff-template-bg: #e6ecf3;
+  }
+  /* data-theme="dark" is the canonical :root block above; this selector just makes
+     the toggle authoritative when the OS pref is light. */
+  :root[data-theme="dark"] {
+    --ground: #0b0906; --panel: #14100a; --panel-2: #1b1409;
+    --line: #2a2317; --line-strong: #3a3020; --field: #0d0a06;
+    --ink: #0b0906; --bg: #0b0906;
+    --text: #f4efe4; --dim: #9c927f; --faint: #6f6555;
+    --accent: #c39a56; --accent-bright: #e2c079; --accent-ink: #0b0906;
+    --good: #8fae6a; --warn: #d9a648; --critical: #c0705a;
+    --ok: #8fae6a; --danger: #c0705a;
+    --diff-user: #8fae6a;     --diff-user-bg: color-mix(in srgb, #8fae6a 14%, transparent);
+    --diff-template: #7f95ad; --diff-template-bg: color-mix(in srgb, #7f95ad 12%, transparent);
+  }
+
+  /* ── nvoy's own accent, the only tokens design/tokens.css permits an app to override ──
+     Teal, per design/DESIGN.md's per-app table. Light needs a darker teal to hold contrast
+     as text and borders, the same way the hub's brass darkens. */
+  :root { --accent: #6fa8a0; --accent-bright: #8bc0b8; --accent-ink: #06140f; }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) { --accent: #2f6b63; --accent-bright: #3f8078; --accent-ink: #fffdf7; }
+  }
+  :root[data-theme="light"] { --accent: #2f6b63; --accent-bright: #3f8078; --accent-ink: #fffdf7; }
+  :root[data-theme="dark"]  { --accent: #6fa8a0; --accent-bright: #8bc0b8; --accent-ink: #06140f; }
+
+  /* status colours: the semantics tokens, and grey for "not measured" */
+  :root { --green: var(--good); --amber: var(--warn); --red: var(--critical); --grey: var(--faint); }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--ground); color: var(--text); font: 15px/1.5 var(--sans); }
+  main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; }
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; border-bottom: 1px solid var(--line); padding-bottom: 12px; }
+  .wordmark { font: 600 26px/1 var(--display); color: var(--accent); text-transform: none; letter-spacing: 0; }
+  header p { margin: 0; color: var(--dim); font-size: 13px; }
+  h2 { font: 600 12px/1 var(--mono); text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin: 28px 0 10px; }
+  h3 { margin: 0 0 8px; font-size: 16px; display: flex; align-items: center; gap: 8px; }
+  code { font-family: var(--mono); font-size: .9em; color: var(--dim); }
+  small { color: var(--dim); }
+  .dim { color: var(--dim); }
+  .age { margin: 16px 0 8px; padding: 14px 16px; border-radius: var(--r-md); font: 600 20px/1.3 var(--sans); border: 1px solid var(--line-strong); background: var(--panel); }
+  .age.green { color: var(--green); }
+  .age.red { color: var(--ground); background: var(--red); border-color: var(--red); }
+  .age small { font-weight: 400; color: inherit; opacity: .8; }
+  .banner { margin: 8px 0; padding: 12px 16px; border-radius: var(--r-md); border: 1px solid var(--red); color: var(--red); background: var(--panel); }
+  .overall { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font: 600 16px/1.4 var(--mono); padding: 8px 0; }
+  .dot { display: inline-block; flex: none; width: 10px; height: 10px; border-radius: 50%; background: var(--grey); margin-right: 8px; }
+  .dot.green { background: var(--green); } .dot.amber { background: var(--amber); } .dot.red { background: var(--red); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--grey); border-radius: var(--r-md); padding: 14px; min-width: 0; }
+  .card.green { border-left-color: var(--green); } .card.amber { border-left-color: var(--amber); } .card.red { border-left-color: var(--red); }
+  ul.checks { list-style: none; margin: 0; padding: 0; }
+  ul.checks li { display: grid; grid-template-columns: 18px 110px 1fr; align-items: baseline; gap: 4px; padding: 3px 0; font-size: 14px; }
+  ul.checks .label { font: 12px/1.4 var(--mono); color: var(--dim); }
+  ul.checks .reason { overflow-wrap: anywhere; }
+  .funnel { margin: 10px 0 0; font-size: 13px; color: var(--dim); }
+  .funnel b { color: var(--text); }
+  .scroll { overflow-x: auto; }
+  table.grid { border-collapse: collapse; width: 100%; font-size: 13px; background: var(--panel); }
+  table.grid th, table.grid td { border: 1px solid var(--line); padding: 8px; text-align: left; vertical-align: top; }
+  table.grid thead th { font: 12px/1.3 var(--mono); color: var(--dim); }
+  table.grid td small { display: block; margin-top: 2px; }
+  footer { margin-top: 36px; color: var(--faint); font-size: 12px; }
+  @media (max-width: 520px) { ul.checks li { grid-template-columns: 18px 1fr; } ul.checks .reason { grid-column: 2; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <span class="wordmark">waggle status</span>
+    <p>The nvoy fleet behind waggle, measured once a minute on the fleet host. Read-only.</p>
+  </header>
+  <div id="fetch"></div>
+  <div id="view"><div class="age red">loading…</div></div>
+  <footer>Green means the component did its job, not that its process is up. Grey means not measured.
+    Identities are shown by name and 8-hex prefix only.</footer>
+</main>
+<script type="module">
+  import { renderSnapshot } from './status-view.mjs'
+  const view = document.getElementById('view'), note = document.getElementById('fetch')
+  let last = null
+  const draw = () => { view.innerHTML = renderSnapshot(last) }
+  async function load() {
+    try {
+      const r = await fetch('status.json', { cache: 'no-store' })
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      last = await r.json()
+      note.innerHTML = ''
+    } catch (e) {
+      note.innerHTML = `<div class="banner red"><span class="dot red"></span>could not fetch status.json (${String(e.message).replace(/[<>&]/g, '')}); showing the last snapshot this page read</div>`
+    }
+    draw()
+  }
+  load()
+  setInterval(load, 30000)
+  setInterval(draw, 5000)
+</script>
+</body>
+</html>

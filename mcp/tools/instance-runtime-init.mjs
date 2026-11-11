@@ -4,7 +4,7 @@
 // credentials, copies them into separate role-owned volumes, and exits before watcher/broker/
 // adapter/worker start; each later role is non-root and gets only its own credential mount.
 
-import { mkdirSync, lstatSync, chownSync, chmodSync, statSync, openSync, closeSync, readFileSync, writeFileSync, renameSync } from 'node:fs'
+import { mkdirSync, lstatSync, chownSync, chmodSync, statSync, openSync, closeSync, readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 
 const die = m => { console.error(`instance-runtime-init: ${m}`); process.exit(1) }
@@ -20,7 +20,7 @@ function provision(path, uid, gid, mode, label) {
   try { const s = lstatSync(path); if (!s.isDirectory() || s.isSymbolicLink()) die(`${label} root is not a real directory`) }
   catch (e) { if (e.code === 'ENOENT') mkdirSync(path, { recursive: true, mode }); else throw e }
   chownSync(path, uid, gid); chmodSync(path, mode)
-  const s = statSync(path), actual = s.mode & 0o777
+  const s = statSync(path), actual = s.mode & 0o7777
   if (s.uid !== uid || s.gid !== gid || actual !== mode) die(`${label} root ownership/mode verification failed`)
 }
 provision(m.stateDir, m.brokerUid, m.brokerAdapterGid, 0o700, 'broker state')
@@ -42,6 +42,24 @@ if (m.workerEnabled || m.deliveryMode === 'notify_only') provisionFile(`${m.runt
 // The restricted Desktop SSH principal is the credential-free adapter UID, never the model
 // worker UID. Its separate queue is writable by that UID and readable by the broker group.
 provisionFile(`${m.runtimeDir}/desktop-reply-requests.jsonl`, m.adapterUid, m.brokerAdapterGid, 0o640, 'Desktop reply queue')
+// The channel reader's "started on envelope X" requests for the native 💬; broker-group readable.
+if (m.deliveryMode === 'notify_only' && m.buzz?.statusReactions) provisionFile(`${m.runtimeDir}/status-requests.jsonl`, m.workerUid, m.brokerAdapterGid, 0o640, 'status request queue')
+// nvoy_channel_post's requests, for an identity whose owner opted it in; broker-group readable.
+if (m.mayPost) provisionFile(`${m.runtimeDir}/post-requests.jsonl`, m.workerUid, m.brokerAdapterGid, 0o640, 'post request queue')
+// memory_claim and memory_withdraw requests, for an identity opted in by may_remember; broker-group readable.
+// One file per memory request: worker-created, broker-group-readable through the setgid bit, and
+// unlinked by the broker once the store answers. The rate log holds ids and times only.
+if (m.mayRemember) provision(`${m.runtimeDir}/memory-requests`, m.workerUid, m.brokerAdapterGid, 0o2770, 'memory request spool')
+if (m.mayRemember) provisionFile(`${m.runtimeDir}/memory-rate.jsonl`, m.workerUid, m.workerUid, 0o600, 'memory rate log')
+// The brokers' last reading of the live mention grants, for the keyless channel MCPs; worker-group readable.
+if (m.mayPost) provisionFile(`${m.runtimeDir}/mention-grants.json`, m.brokerUid, m.workerHandoffGid, 0o640, 'mention grant snapshot')
+// The broker's last reading of its rooms' members (#321), for the same readers; discovery only.
+if (m.mayPost?.mentionRooms) provisionFile(`${m.runtimeDir}/mention-rooms.json`, m.brokerUid, m.workerHandoffGid, 0o640, 'room member snapshot')
+if (m.maySetProfile) {
+  provisionFile(`${m.runtimeDir}/profile-requests.jsonl`, m.workerUid, m.brokerAdapterGid, 0o640, 'profile request queue')
+  provisionFile(`${m.runtimeDir}/profile-results.jsonl`, m.brokerUid, m.workerHandoffGid, 0o640, 'profile result log')
+  provision(`${m.runtimeDir}/profile-request-ids`, m.workerUid, m.workerUid, 0o700, 'profile request ID reservations')
+}
 if (m.workerEnabled) provisionFile(`${m.runtimeDir}/worker-consumed.jsonl`, m.workerUid, m.workerUid, 0o600, 'worker consumed queue')
 // Only the adapter can create these immutable per-envelope inputs; the worker gets group
 // traversal/read access but cannot replace an input belonging to a different envelope.
@@ -50,6 +68,8 @@ if (m.workerEnabled) provision(`${m.runtimeDir}/worker-input`, m.adapterUid, m.w
 // UID can traverse and group-read the adapter queue, but cannot write or replace that queue.
 if (m.deliveryMode === 'notify_only') provision(`${m.runtimeDir}/claude-channel-state`, m.workerUid, m.workerUid, 0o700, 'Claude channel state')
 if (m.deliveryMode === 'notify_only') provision(`${m.runtimeDir}/codex-mcp-state`, m.workerUid, m.workerUid, 0o700, 'Codex MCP state')
+// The wake notifier's own volume, mounted over this path: the one place it may write.
+if (m.wakeWebhook) provision(`${m.runtimeDir}/wake-webhook-state`, m.workerUid, m.workerUid, 0o700, 'wake webhook state')
 
 // Compose file-backed secrets are bind-mounted as root-readable files even when a service uses
 // a non-root UID. Keep those host sources root:root 0600, then make one role-owned copy in a
@@ -70,6 +90,10 @@ const sources = {
   bunkerUri: process.env.NVOY_BUNKER_URI_SOURCE || '',
   bunkerClient: process.env.NVOY_BUNKER_CLIENT_SOURCE || '',
   workerProvider: process.env.NVOY_WORKER_PROVIDER_SOURCE || '',
+  harnessCredential: process.env.NVOY_HARNESS_CREDENTIAL_SOURCE || '',
+  wakeWebhookUrl: process.env.NVOY_WAKE_WEBHOOK_URL_SOURCE || '',
+  wakeWebhookHeaders: process.env.NVOY_WAKE_WEBHOOK_HEADERS_SOURCE || '',
+  channelDoorTokenHash: process.env.NVOY_CHANNEL_DOOR_TOKEN_HASH_SOURCE || '',
 }
 const brokerSources = [sources.bunkerUri, sources.bunkerClient]
 if (brokerSources.some(Boolean)) {
@@ -86,5 +110,39 @@ if (m.workerEnabled) {
   provisionSecret(sources.workerProvider, `${workerCredDir}/provider`, m.workerUid, m.workerHandoffGid, 'worker provider')
 } else if (sources.workerProvider) {
   die('worker-disabled runtime refuses a provider credential source')
+}
+// The harness is the worker UID's interactive Claude Code session: a private login token and a
+// private, persistent home. Neither is shared with any other role.
+if (m.harness) {
+  if (!sources.harnessCredential) die('a harness runtime requires its model login credential source')
+  const harnessCredDir = '/run/nvoy-harness-credentials'
+  provision(harnessCredDir, 0, 0, 0o711, 'harness credential directory')
+  provisionSecret(sources.harnessCredential, `${harnessCredDir}/credential`, m.workerUid, m.workerUid, 'harness credential')
+  // The copy's name before it covered Codex keys; a leftover would be a stale login.
+  rmSync(`${harnessCredDir}/claude-oauth-token`, { force: true })
+  provision('/home/harness', m.workerUid, m.workerUid, 0o700, 'harness home')
+} else if (sources.harnessCredential) {
+  die('a runtime without a harness refuses a harness credential source')
+}
+// The wake notifier's webhook URL and auth headers: operator secrets for one outbound POST, copied
+// worker-owned into a volume only the notifier mounts.
+if (m.wakeWebhook) {
+  if (!sources.wakeWebhookUrl || !sources.wakeWebhookHeaders) die('a wake webhook runtime requires its URL and headers sources')
+  const webhookCredDir = '/run/nvoy-wake-webhook-credentials'
+  provision(webhookCredDir, 0, 0, 0o711, 'wake webhook credential directory')
+  provisionSecret(sources.wakeWebhookUrl, `${webhookCredDir}/url`, m.workerUid, m.workerUid, 'wake webhook URL')
+  provisionSecret(sources.wakeWebhookHeaders, `${webhookCredDir}/headers`, m.workerUid, m.workerUid, 'wake webhook headers')
+} else if (sources.wakeWebhookUrl || sources.wakeWebhookHeaders) {
+  die('a runtime without a wake webhook refuses webhook credential sources')
+}
+// The channel door's bearer-token hash, copied worker-owned into a volume only the door mounts. It
+// is a digest, not the token, but it is still the one thing that decides who may dial the channel.
+if (m.channelDoor) {
+  if (!sources.channelDoorTokenHash) die('a channel door runtime requires its token hash source')
+  const doorCredDir = '/run/nvoy-channel-door-credentials'
+  provision(doorCredDir, 0, 0, 0o711, 'channel door credential directory')
+  provisionSecret(sources.channelDoorTokenHash, `${doorCredDir}/token.sha256`, m.workerUid, m.workerUid, 'channel door token hash')
+} else if (sources.channelDoorTokenHash) {
+  die('a runtime without a channel door refuses a token hash source')
 }
 console.log(`instance-runtime-init: provisioned ${m.id}`)

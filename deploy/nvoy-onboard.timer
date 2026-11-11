@@ -1,0 +1,12 @@
+[Unit]
+Description=nvoy onboarding, phase B — look for signed add_agent requests every thirty seconds
+
+[Timer]
+OnBootSec=2min
+# Counted from the end of the last tick, so a tick that waits on a pairing is never overlapped.
+OnUnitInactiveSec=30s
+RandomizedDelaySec=5s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

@@ -11,6 +11,43 @@ export function replyRequestDigest(request) {
 }
 
 export function validateOutboundRecord(record, { requestId = '', requestDigest = '' } = {}) {
+  if (record?.version === 3) {
+    // A native Buzz channel reply: the frozen object is the kind:9 itself, and its id is the
+    // fingerprint. Enactment follows the same exactly-one rule as a wrapped reply.
+    const allowed = new Set(['version', 'request_digest', 'request_id', 'fingerprint', 'unsigned_event', 'event', 'approval_id', 'enactment', 'published', 'published_at', 'accepted'])
+    if (!record || typeof record !== 'object' || Array.isArray(record) || Object.keys(record).some(key => !allowed.has(key)) ||
+        !HEX32.test(String(record.request_id || '')) || !HEX64.test(String(record.request_digest || '')) ||
+        !HEX64.test(String(record.fingerprint || '')) || typeof record.published !== 'boolean' ||
+        (requestId && record.request_id !== requestId) || (requestDigest && record.request_digest !== requestDigest)) {
+      throw new Error('outbound proposal does not bind this request')
+    }
+    const ev = record.unsigned_event
+    const keys = ev && typeof ev === 'object' && !Array.isArray(ev) ? Object.keys(ev).sort() : []
+    const expected = ['content', 'created_at', 'kind', 'pubkey', 'tags']
+    const h = Array.isArray(ev?.tags) ? ev.tags.filter(t => t?.[0] === 'h') : []
+    if (!ev || keys.length !== expected.length || keys.some((key, index) => key !== expected[index]) ||
+        ev.kind !== 9 || !HEX64.test(String(ev.pubkey || '')) || !Number.isInteger(ev.created_at) ||
+        h.length !== 1 || typeof ev.content !== 'string' || getEventHash(ev) !== record.fingerprint) {
+      throw new Error('outbound proposal does not contain the exact frozen kind:9 channel reply')
+    }
+    if (record.event == null) {
+      if (record.approval_id != null || record.enactment != null || record.published) throw new Error('unsigned outbound proposal claims enactment')
+      return record
+    }
+    let validEvent = false
+    try { validEvent = record.event.id === record.fingerprint && verifyEvent(JSON.parse(JSON.stringify(record.event))) } catch { validEvent = false }
+    if (!validEvent) throw new Error('enacted outbound proposal lacks the signed frozen channel reply')
+    const directEnactment = record.enactment === 'buzz-native-direct'
+    if (record.enactment != null && !directEnactment) throw new Error('enacted outbound proposal names an unknown enactment path')
+    if (directEnactment === HEX64.test(String(record.approval_id || ''))) {
+      throw new Error('enacted outbound proposal lacks a valid approval or names two enactment paths')
+    }
+    if (record.published && (!Number.isInteger(record.accepted) || record.accepted < 1 ||
+        !Number.isFinite(Number(record.published_at)) || Number(record.published_at) <= 0)) {
+      throw new Error('published outbound record has no verified completion evidence')
+    }
+    return record
+  }
   if (record?.version === 2) {
     // `enactment` records WHICH actuator opened the signer. A public event is enacted by a signed
     // approval; a private channel-carry reply is enacted by the already-verified grant chain that

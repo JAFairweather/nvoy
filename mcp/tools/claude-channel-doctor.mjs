@@ -4,63 +4,17 @@
 // fixed broker-side manifest and renders the exact commands an owner must install deliberately.
 
 import { createHash } from 'node:crypto'
-import { lstatSync, readFileSync, realpathSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
-import { dirname, isAbsolute, parse } from 'node:path'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
+import { SSH_TARGET, fixedPath as sharedFixedPath, knownHostsFile as sharedKnownHostsFile, privateFile as sharedPrivateFile, sshChannelEntry } from './channel_client.mjs'
 
 const die = message => { console.error(`claude-channel-doctor: ${message}`); process.exit(1) }
 const flag = name => { const i = process.argv.indexOf(name); return i < 0 ? '' : process.argv[i + 1] || '' }
 const mode = flag('--mode')
 
-// `max = null` means the file is never READ by this tool, only stat-ed and exec'd, so there is
-// nothing to bound. See the Claude executable in client() (#186).
-//
-// The three conditions are refused separately. Collapsed into one string they cost an operator an
-// hour: the Claude binary is a regular non-symlink file that merely exceeded the cap, and the
-// message said "must be a bounded regular non-symlink file" — with `claude` on PATH genuinely
-// being an nvm symlink, so the most legible word in the refusal confirmed the wrong hypothesis.
-// The size case prints both numbers, because "too big" without them sends you to the wrong file.
-function regular(path, label, max = 256 * 1024) {
-  let st
-  try { st = lstatSync(path) } catch { die(`${label} is missing`) }
-  if (st.isSymbolicLink()) die(`${label} must not be a symlink`)
-  if (!st.isFile()) die(`${label} must be a regular file`)
-  if (max !== null && st.size > max) die(`${label} is ${st.size} bytes, above the ${max}-byte limit for a file this tool reads`)
-  return st
-}
-
-function fixedPath(path, label, max = 256 * 1024) {
-  if (!isAbsolute(path)) die(`${label} path must be absolute`)
-  let supplied
-  try { supplied = lstatSync(path) } catch { die(`${label} is missing`) }
-  if (supplied.isSymbolicLink()) die(`${label} must not be a symlink`)
-  let canonical
-  try { canonical = realpathSync(path) } catch { die(`${label} is missing`) }
-  const st = regular(canonical, label, max)
-  const allowedOwners = new Set([0, typeof process.getuid === 'function' ? process.getuid() : 0])
-  if (!allowedOwners.has(st.uid)) die(`${label} must be owned by root or the current user`)
-
-  let dir = dirname(canonical)
-  const root = parse(dir).root
-  for (;;) {
-    const parent = lstatSync(dir)
-    const stickyRootDirectory = parent.uid === 0 && (parent.mode & 0o1000) !== 0
-    if (!parent.isDirectory() || parent.isSymbolicLink() || !allowedOwners.has(parent.uid) ||
-        ((parent.mode & 0o022) !== 0 && !stickyRootDirectory)) {
-      die(`${label} must be beneath a non-replaceable root/current-user-owned directory chain`)
-    }
-    if (dir === root) break
-    dir = dirname(dir)
-  }
-  return { path: canonical, stat: st }
-}
-
-function privateFile(path, label) {
-  const { path: canonical, stat: st } = fixedPath(path, label)
-  if ((st.mode & 0o077) !== 0) die(`${label} must not be accessible by group or other (use mode 0600)`)
-  return canonical
-}
+const guard = check => (...args) => { try { return check(...args) } catch (error) { die(error.message) } }
+const fixedPath = guard(sharedFixedPath), privateFile = guard(sharedPrivateFile), knownHostsFile = guard(sharedKnownHostsFile)
 
 function safeName(value, label) {
   if (!/^[a-z0-9][a-z0-9._-]{1,63}$/i.test(value)) die(`${label} must be a short stable identifier`)
@@ -73,7 +27,7 @@ function client() {
   const knownHostsInput = flag('--known-hosts-file')
   const target = flag('--ssh-target')
   const server = safeName(flag('--server'), 'server name')
-  if (!identityInput || !knownHostsInput || !/^[a-z_][a-z0-9_-]{0,31}@[a-z0-9.-]+$/i.test(target)) {
+  if (!identityInput || !knownHostsInput || !SSH_TARGET.test(target)) {
     die('client usage: --mode client --server <name> --claude <path> --identity-file <path> --known-hosts-file <path> --ssh-target <user@host>')
   }
   // Unbounded, deliberately (#186). Every other `max` here guards a readFileSync; this one guarded
@@ -87,8 +41,7 @@ function client() {
   }
   const claude = claudeChecked.path
   const identity = privateFile(identityInput, 'SSH identity file')
-  const { path: knownHosts, stat: knownStat } = fixedPath(knownHostsInput, 'known_hosts file')
-  if ((knownStat.mode & 0o022) !== 0) die('known_hosts file must not be group/world writable')
+  const knownHosts = knownHostsFile(knownHostsInput)
   const versionRun = spawnSync(claude, ['--version'], { encoding: 'utf8', timeout: 10_000 })
   if (versionRun.status !== 0) die('Claude version check failed')
   const match = `${versionRun.stdout || ''} ${versionRun.stderr || ''}`.match(/(?:^|\s)(\d+)\.(\d+)\.(\d+)(?:\s|$)/)
@@ -97,9 +50,7 @@ function client() {
   if (version[0] < 2 || (version[0] === 2 && (version[1] < 1 || (version[1] === 1 && version[2] < 80)))) {
     die(`Claude Code ${version.join('.')} is too old; native Channels require 2.1.80 or newer`)
   }
-  const args = ['-F', '/dev/null', '-T', '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=yes',
-    '-o', `UserKnownHostsFile=${knownHosts}`, '-o', 'GlobalKnownHostsFile=/dev/null', '-o', 'ClearAllForwardings=yes', '-i', identity, target]
-  const config = { mcpServers: { [server]: { command: '/usr/bin/ssh', args } } }
+  const config = { mcpServers: { [server]: sshChannelEntry({ identity, knownHosts, target }) } }
   console.log(JSON.stringify({
     ok: true,
     mode: 'client',
