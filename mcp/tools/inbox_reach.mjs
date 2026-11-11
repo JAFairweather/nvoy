@@ -119,8 +119,8 @@ export function inboxVerdict({
   // wraps above the fuzz floor. The relay may hold in-window wraps on the next page, so "nothing
   // unopened" describes only what was fetched. Never a clean exit, whatever else came back.
   if (walkCapped.length) {
-    inconclusive.push(`the wrap query stopped at its page cap on ${walkCapped.length} relay(s) while older wraps were ` +
-      `still arriving inside the window, so the read is partial — ${walkCapped.join(', ')}`)
+    inconclusive.push(`the wrap query stopped at its page cap (or could not get past a full page of wraps sharing one timestamp) on ${walkCapped.length} relay(s) ` +
+      `while the window was not exhausted, so the read is partial — ${walkCapped.join(', ')}`)
   }
   if (reachedWraps.length && unreachable.length) {
     notes.push(`partial reach: ${reachedWraps.length}/${relayCount} relay(s) answered — ${unreachable.join('; ')}`)

@@ -184,6 +184,14 @@ t('walkStop names WHY a walk ended, and only the page cap is a partial read', ()
   assert.equal(walkStop({ ...walking, page: 5, freshThisPage: 0 }), 'exhausted')
 })
 
+t('a full page that brought nothing new is STALLED, a short one is exhausted', () => {
+  const base = { freshThisPage: 0, pageLimit: 2, page: 1, maxPages: 6, oldestThisPage: now, fuzzFloor: since - NIP59_FUZZ_SEC }
+  assert.equal(walkStop({ ...base, eventsThisPage: 2 }), 'stalled', 'more wraps share one timestamp than a page holds')
+  assert.equal(walkStop({ ...base, eventsThisPage: 1 }), 'exhausted', 'a short page that repeated the boundary is the end')
+  assert.equal(walkStop({ ...base, eventsThisPage: 2, oldestThisPage: since - NIP59_FUZZ_SEC - 1 }), 'exhausted', 'past the floor nothing is missed')
+  assert.equal(shouldPaginate({ ...base, eventsThisPage: 2 }), false)
+})
+
 t('a page that returned no events at all does not paginate on an infinite floor', () => {
   assert.equal(shouldPaginate({ freshThisPage: 5, page: 0, maxPages: 6, oldestThisPage: Infinity, fuzzFloor: 0 }), false)
 })

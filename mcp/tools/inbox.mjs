@@ -148,9 +148,10 @@ await Promise.all(RELAYS.map(url => new Promise(res => {
   // against the shared map would stop relay B's walk on the first page that relay A had already
   // covered, and B's later pages are exactly where a wrap only B holds would be.
   const seenHere = new Set()
-  let page = 0, freshThisPage = 0, oldestThisPage = Infinity
+  let page = 0, freshThisPage = 0, eventsThisPage = 0, oldestThisPage = Infinity
   const askWraps = (until) => {
     freshThisPage = 0
+    eventsThisPage = 0
     oldestThisPage = Infinity
     idle()
     ws.send(JSON.stringify(['REQ', `in${page}`, {
@@ -169,22 +170,37 @@ await Promise.all(RELAYS.map(url => new Promise(res => {
       const which = family(m[1])
       if (m[0] === 'EVENT' && which === 'in') {
         const event = m[2]
+        eventsThisPage++
         if (!seenHere.has(event.id)) { seenHere.add(event.id); freshThisPage++ }
         wraps.set(event.id, event)
         oldestThisPage = Math.min(oldestThisPage, Number(event.created_at) || Infinity)
       }
       if (m[0] === 'EVENT' && which === 'dm') dmRelayLists.set(m[2].id, m[2])
       if (m[0] === 'EOSE' && which === 'in' && pending.has('in')) {
-        const stop = walkStop({ freshThisPage, page, maxPages: MAX_PAGES, oldestThisPage, fuzzFloor })
+        const stop = walkStop({ freshThisPage, eventsThisPage, pageLimit: FETCH_PAGE, page, maxPages: MAX_PAGES, oldestThisPage, fuzzFloor })
         if (stop === 'more') {
-          const until = oldestThisPage - 1
+          // Inclusive: wraps sharing the oldest created_at may straddle the page limit, and `until - 1`
+          // would skip the ones that did not fit. Duplicates are dropped by id (seenHere).
+          const until = oldestThisPage
           ws.send(JSON.stringify(['CLOSE', `in${page}`]))
           page++
           return askWraps(until)
         }
+        if (stop === 'stalled') {
+          // More wraps share the oldest timestamp than one page holds, so the ones past the limit
+          // cannot be reached from here. Mark the read partial, then step below that timestamp so the
+          // older wraps are still collected within the page bound.
+          if (!walkCapped.includes(url)) walkCapped.push(url)
+          if (page + 1 < MAX_PAGES) {
+            const until = oldestThisPage - 1
+            ws.send(JSON.stringify(['CLOSE', `in${page}`]))
+            page++
+            return askWraps(until)
+          }
+        }
         pending.delete('in')
         reachedWraps.push(url)
-        if (stop === 'capped') walkCapped.push(url)
+        if (stop === 'capped' && !walkCapped.includes(url)) walkCapped.push(url)
       } else if (m[0] === 'EOSE' && which === 'dm' && pending.delete('dm')) {
         answered10050.push(url)
       }

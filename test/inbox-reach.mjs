@@ -235,6 +235,41 @@ const walkedOut = await runInbox({ ...pagerEnv, NVOY_INBOX_MAX_PAGES: '10' })
 ok('  …and the same relay walked to its end does NOT report a page cap', !/page cap/.test(walkedOut.stderr))
 pager.close()
 
+// Equal timestamps across a page boundary (My Dude, PR 362): the relay returns ties in id order and
+// honours an INCLUSIVE until, so a walk that asked below the oldest timestamp would never see the
+// tie that did not fit. Three wraps share one timestamp, page size 2.
+const tieAt = nowSec - 60
+const tied = Array.from({ length: 3 }, (_, i) => ({
+  id: String(i + 1).padStart(64, '0'), kind: 1059, created_at: tieAt, pubkey: 'e'.repeat(64),
+  content: 'x', sig: 'f'.repeat(128), tags: [['p', pk]],
+}))
+const served = []
+const tiePager = await new Promise(res => {
+  const server = new WebSocketServer({ port: 0, host: '127.0.0.1' })
+  server.on('connection', ws => ws.on('message', raw => {
+    const [type, sub, filter] = JSON.parse(raw.toString())
+    if (type !== 'REQ') return
+    const url = `ws://127.0.0.1:${server.address().port}`
+    const events = (filter.kinds || [])[0] === 10050
+      ? [finalizeEvent({ kind: 10050, created_at: nowSec, tags: [['relay', url]], content: '' }, sk)]
+      : tied.filter(w => (!filter.until || w.created_at <= filter.until) && (!filter.since || w.created_at >= filter.since))
+          .slice(0, filter.limit || 1000)
+    if ((filter.kinds || [])[0] !== 10050) served.push(events.map(e => e.id.slice(-1)).join(''))
+    for (const event of events) ws.send(JSON.stringify(['EVENT', sub, event]))
+    ws.send(JSON.stringify(['EOSE', sub]))
+  }))
+  server.on('listening', () => res(server))
+})
+const tieEnv = { NVOY_NSEC: nsec, NVOY_RELAYS: `ws://127.0.0.1:${tiePager.address().port}`, NVOY_INBOX_MAX_PAGES: '6' }
+// 3 ties, page 4: all fit with room to spare, the repeat page is short -> a finished walk. (A page
+// EXACTLY full of ties is ambiguous by construction and counts as stalled.)
+const fits = await runInbox({ ...tieEnv, NVOY_INBOX_FETCH_PAGE: '4' })
+ok('ties that fit in one page are a finished walk (no page-cap reason)', !/page cap/.test(fits.stderr))
+// 3 ties, page 2: the third can never be reached, and the read must say so.
+const overflow = await runInbox({ ...tieEnv, NVOY_INBOX_FETCH_PAGE: '2' })
+ok('more ties than a page holds exits 3 and says the read is partial', overflow.status === 3 && /page cap/.test(overflow.stderr))
+tiePager.close()
+
 // A relay that is not there at all. Port 1 refuses the connection immediately.
 const dead = await runInbox({ ...base, NVOY_RELAYS: 'ws://127.0.0.1:1' })
 ok('an unreachable relay exits 3', dead.status === 3)

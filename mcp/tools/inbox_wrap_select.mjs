@@ -131,9 +131,17 @@ export function selectWraps(wraps, { since, budget, fuzz = NIP59_FUZZ_SEC } = {}
  * exactly where a wrap only it holds would be.
  */
 export function walkStop({
-  freshThisPage = 0, page = 0, maxPages = 0, oldestThisPage = Infinity, fuzzFloor = 0,
+  freshThisPage = 0, eventsThisPage = 0, pageLimit = 0, page = 0, maxPages = 0, oldestThisPage = Infinity, fuzzFloor = 0,
 } = {}) {
-  if (freshThisPage <= 0) return 'exhausted'
+  if (freshThisPage <= 0) {
+    // Nothing new. Because the next page re-asks AT the oldest timestamp (inclusive, so a tie that
+    // straddled the last page limit is not skipped), an exhausted mailbox ends exactly here with a
+    // short page. A FULL page that brought nothing new is different: more wraps share that one
+    // timestamp than a page holds, the relay keeps returning the same ones, and the rest cannot be
+    // reached. That is a partial read, not a finished one.
+    return pageLimit > 0 && eventsThisPage >= pageLimit && Number.isFinite(oldestThisPage) && oldestThisPage > fuzzFloor
+      ? 'stalled' : 'exhausted'
+  }
   if (!Number.isFinite(oldestThisPage)) return 'exhausted'
   if (oldestThisPage <= fuzzFloor) return 'floor'
   // Still progressing, still inside the window, and the loop bound is what ends it: there may be
