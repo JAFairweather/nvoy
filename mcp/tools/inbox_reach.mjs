@@ -77,7 +77,7 @@ export function inboxVerdict({
   // the kind:10050, so an empty read is clean only if every relay the list advertises was among
   // those that answered the wrap query. A list pointing elsewhere, or naming no relay at all, means
   // this run looked in places mail was never sent to.
-  if (!total && answered10050.length && dmRelayLists) {
+  if (!total && dmRelayLists) {
     const answered = new Set(reachedWraps.map(normalizeRelay))
     const advertised = [...new Set(dmRelays.map(normalizeRelay).filter(Boolean))]
     if (!advertised.length) {
@@ -100,8 +100,14 @@ export function inboxVerdict({
   // `answered10050` gates both branches above, so when nobody answers that query the whole
   // reachability question was skipped — and said nothing, which is pass-by-silence one level up.
   // A note rather than exit 3: the doubt is about the check, not about the inbox.
-  if (reachedWraps.length && !answered10050.length) {
-    notes.push('no relay answered the kind:10050 query, so DM reachability was not checked')
+  // On an EMPTY read that is not a note. NIP-17 senders deliver only to the relays in the kind:10050,
+  // and with no list obtained from anywhere the delivery relays are unknown, so "nothing at the
+  // relays I asked" proves nothing about the relays that matter. With messages in hand the runtime
+  // evidently works, and it stays a note.
+  if (reachedWraps.length && !answered10050.length && !dmRelayLists) {
+    if (total) notes.push('no relay answered the kind:10050 query, so DM reachability was not checked')
+    else inconclusive.push('no relay answered the kind:10050 query, so the relays senders deliver to are unknown. ' +
+      'An empty read of the relays asked is not an empty inbox')
   }
 
   return { code: inconclusive.length ? 3 : 0, inconclusive, notes }

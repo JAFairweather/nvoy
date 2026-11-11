@@ -8,6 +8,7 @@ import { finalizeEvent, generateSecretKey, getEventHash, getPublicKey } from 'no
 import * as nip19 from 'nostr-tools/nip19'
 import * as nip44 from 'nostr-tools/nip44'
 import { advertisedRelays, inboxVerdict, isSignerFault, normalizeRelay } from '../mcp/tools/inbox_reach.mjs'
+import { WebSocketServer } from 'ws'
 import { startWsRelay } from './wsrelay.mjs'
 
 let pass = 0, fail = 0
@@ -116,10 +117,16 @@ ok('messages that arrived without a kind:10050 are a NOTE, not an alarm',
 
 // `answered10050` gates both 10050 branches, so nobody answering that query skipped the whole
 // reachability question silently — pass-by-silence inside the PR about pass-by-silence.
-const noAnswer = inboxVerdict({ ...healthy, answered10050: [] })
-ok('an unanswered kind:10050 query says so rather than skipping the question',
-  noAnswer.notes.some(n => /DM reachability was not checked/.test(n)))
-ok('  …as a note, not an alarm — the doubt is about the check, not the inbox', noAnswer.code === 0)
+const noAnswer = inboxVerdict({ ...healthy, answered10050: [], dmRelayLists: 0, dmRelays: [] })
+ok('an EMPTY read with no kind:10050 answer from anyone is inconclusive (Dennis, PR 361)',
+  noAnswer.code === 3 && /relays senders deliver to are unknown/.test(noAnswer.inconclusive[0]))
+const noAnswerButMail = inboxVerdict({ ...healthy, answered10050: [], dmRelayLists: 0, dmRelays: [], total: 2 })
+ok('  …but with messages in hand it stays a NOTE — the doubt is about the check, not the inbox',
+  noAnswerButMail.code === 0 && noAnswerButMail.notes.some(n => /DM reachability was not checked/.test(n)))
+// A list that arrived from a relay which never sent EOSE is still a list: judge it, do not skip it.
+ok('a list obtained without an EOSE is still checked against the relays that answered',
+  inboxVerdict({ ...healthy, answered10050: [], dmRelays: ['wss://other'] }).code === 3 &&
+  inboxVerdict({ ...healthy, answered10050: [], dmRelays: ['wss://a'] }).code === 0)
 ok('  …and it stays quiet when the query WAS answered', !clean.notes.some(n => /was not checked/.test(n)))
 
 const partial = inboxVerdict({ ...healthy, relayCount: 3, unreachable: ['wss://b — connection error'] })
@@ -172,6 +179,23 @@ relay.store.publish(finalizeEvent({ kind: 10050, created_at: Math.floor(Date.now
   tags: [['relay', relay.url]], content: '' }, sk))
 const backLive = await runInbox(base)
 ok('republishing a list that names the queried relay clears it', backLive.status === 0)
+
+// Dennis, PR 361: a relay that answers the wrap query and never answers the kind:10050 query. The
+// inbox is empty and the delivery relays are unknown, so the read must not exit 0. (Takes the 8s
+// idle timeout, because the dm subscription is simply never closed out.)
+const mute = await new Promise(res => {
+  const server = new WebSocketServer({ port: 0, host: '127.0.0.1' })
+  server.on('connection', ws => ws.on('message', raw => {
+    const [type, sub, filter] = JSON.parse(raw.toString())
+    if (type === 'REQ' && (filter.kinds || [])[0] === 1059) ws.send(JSON.stringify(['EOSE', sub]))
+  }))
+  server.on('listening', () => res(server))
+})
+const unanswered = await runInbox({ NVOY_NSEC: nsec, NVOY_RELAYS: `ws://127.0.0.1:${mute.address().port}` })
+ok('a live empty inbox whose kind:10050 query is never answered exits 3', unanswered.status === 3)
+ok('  …for that reason, and not by printing a bare "(none)" verdict',
+  /INCONCLUSIVE/.test(unanswered.stderr) && /kind:10050 query/.test(unanswered.stderr))
+mute.close()
 
 // A relay that is not there at all. Port 1 refuses the connection immediately.
 const dead = await runInbox({ ...base, NVOY_RELAYS: 'ws://127.0.0.1:1' })
