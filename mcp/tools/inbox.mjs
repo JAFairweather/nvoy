@@ -46,7 +46,7 @@ import { secretKey } from './secret_key.mjs'
 import { verifyChannelDataCarry } from './channel_task_carry.mjs'
 import { verifyInboxEnvelope } from './inbox_envelope.mjs'
 import { partitionInboxMessages } from './inbox_trust.mjs'
-import { inboxVerdict, isSignerFault } from './inbox_reach.mjs'
+import { advertisedRelays, inboxVerdict, isSignerFault } from './inbox_reach.mjs'
 
 const credential = (path, label) => {
   if (!path) return ''
@@ -217,7 +217,7 @@ console.log(U.length ? U.map(line).join('\n\n') : '  (none)')
 // turned into an alarm.
 const { code, inconclusive, notes } = inboxVerdict({
   signerRefusals, envelopesSeen: selectedWraps.length, opened, reachedWraps, relayCount: RELAYS.length,
-  unreachable, answered10050, dmRelayLists: dmRelayLists.size,
+  unreachable, answered10050, dmRelayLists: dmRelayLists.size, dmRelays: advertisedRelays(dmRelayLists.values()),
   total: V.length + TD.length + RC.length + CN.length + U.length,
 })
 

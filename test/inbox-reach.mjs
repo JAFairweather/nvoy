@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process'
 import { finalizeEvent, generateSecretKey, getEventHash, getPublicKey } from 'nostr-tools/pure'
 import * as nip19 from 'nostr-tools/nip19'
 import * as nip44 from 'nostr-tools/nip44'
-import { inboxVerdict, isSignerFault } from '../mcp/tools/inbox_reach.mjs'
+import { advertisedRelays, inboxVerdict, isSignerFault, normalizeRelay } from '../mcp/tools/inbox_reach.mjs'
 import { startWsRelay } from './wsrelay.mjs'
 
 let pass = 0, fail = 0
@@ -30,7 +30,7 @@ ok('the word bunker mid-message is NOT a signer fault', !isSignerFault('decrypt 
 ok('a missing reason is NOT a signer fault', !isSignerFault(undefined))
 
 // ---- the verdict, both directions --------------------------------------------------------------
-const healthy = { reachedWraps: ['wss://a'], relayCount: 1, answered10050: ['wss://a'], dmRelayLists: 1, total: 0 }
+const healthy = { reachedWraps: ['wss://a'], relayCount: 1, answered10050: ['wss://a'], dmRelayLists: 1, dmRelays: ['wss://a'], total: 0 }
 const clean = inboxVerdict(healthy)
 ok('a reachable identity with an empty inbox is a RESULT, not a doubt', clean.code === 0 && !clean.inconclusive.length)
 
@@ -66,6 +66,29 @@ const noList = inboxVerdict({ ...healthy, dmRelayLists: 0 })
 ok('an empty inbox with no kind:10050 is inconclusive', noList.code === 3)
 ok('  …and the reason distinguishes unreachable from empty',
   /nowhere to deliver to/.test(noList.inconclusive[0]) && /not an empty inbox/.test(noList.inconclusive[0]))
+// A list that exists but points elsewhere (My Dude, PR 361): NIP-17 senders publish only to the
+// advertised relays, so an empty read of a different relay says nothing about that mail.
+const elsewhere = inboxVerdict({ ...healthy, dmRelays: ['wss://other'] })
+ok('an empty inbox whose kind:10050 advertises only an unqueried relay is inconclusive',
+  elsewhere.code === 3 && /wss:\/\/other/.test(elsewhere.inconclusive[0]) && /did not query/.test(elsewhere.inconclusive[0]))
+const noTags = inboxVerdict({ ...healthy, dmRelays: [] })
+ok('an empty inbox whose kind:10050 names no relay is inconclusive',
+  noTags.code === 3 && /names no relay/.test(noTags.inconclusive[0]))
+ok('one advertised relay unqueried among several is still inconclusive',
+  inboxVerdict({ ...healthy, dmRelays: ['wss://a', 'wss://other'] }).code === 3)
+ok('an advertised relay that was queried but never answered is inconclusive',
+  inboxVerdict({ ...healthy, reachedWraps: ['wss://b'], relayCount: 2, dmRelays: ['wss://a'] }).code === 3)
+ok('every advertised relay answered: clean, case and a trailing slash notwithstanding',
+  inboxVerdict({ ...healthy, reachedWraps: ['wss://A.example/'], relayCount: 1, dmRelays: ['wss://a.example'] }).code === 0)
+ok('messages that arrived are not second-guessed by where the list points',
+  inboxVerdict({ ...healthy, dmRelays: ['wss://other'], total: 1 }).code === 0)
+ok('normalizeRelay folds case, whitespace and trailing slashes',
+  normalizeRelay(' WSS://Relay.X/// ') === 'wss://relay.x')
+ok('the NEWEST kind:10050 wins, and only relay tags count',
+  advertisedRelays([{ created_at: 1, tags: [['relay', 'wss://old']] },
+    { created_at: 2, tags: [['relay', 'wss://new'], ['p', 'x'], ['relay']] }]).join() === 'wss://new')
+ok('no kind:10050 yields no relays', advertisedRelays([]).length === 0)
+
 // Asserting the REASON, not just the code: these two failures need different actions from the
 // operator — publish a relay list, versus go and find out why the relays are down.
 ok('  …and it is not the same reason as an unreachable relay', noList.inconclusive[0] !== noRelay.inconclusive[0])
@@ -124,6 +147,21 @@ relay.store.publish(finalizeEvent({ kind: 10050, created_at: Math.floor(Date.now
 const reachable = await runInbox(base)
 ok('publishing a kind:10050 turns the same empty inbox into a clean exit 0', reachable.status === 0)
 ok('  …and says nothing about being inconclusive', !/INCONCLUSIVE/.test(reachable.stderr))
+
+// The same empty inbox, but the newest list now advertises a relay this run does not query.
+relay.store.publish(finalizeEvent({ kind: 10050, created_at: Math.floor(Date.now() / 1000) + 5,
+  tags: [['relay', 'ws://127.0.0.1:2']], content: '' }, sk))
+const elsewhereLive = await runInbox(base)
+ok('a live empty inbox whose list points at another relay exits 3', elsewhereLive.status === 3)
+ok('  …and names the unqueried relay', /127\.0\.0\.1:2/.test(elsewhereLive.stderr) && /did not query/.test(elsewhereLive.stderr))
+relay.store.publish(finalizeEvent({ kind: 10050, created_at: Math.floor(Date.now() / 1000) + 10,
+  tags: [], content: '' }, sk))
+const noTagsLive = await runInbox(base)
+ok('a live empty inbox whose newest list names no relay exits 3', noTagsLive.status === 3 && /names no relay/.test(noTagsLive.stderr))
+relay.store.publish(finalizeEvent({ kind: 10050, created_at: Math.floor(Date.now() / 1000) + 15,
+  tags: [['relay', relay.url]], content: '' }, sk))
+const backLive = await runInbox(base)
+ok('republishing a list that names the queried relay clears it', backLive.status === 0)
 
 // A relay that is not there at all. Port 1 refuses the connection immediately.
 const dead = await runInbox({ ...base, NVOY_RELAYS: 'ws://127.0.0.1:1' })

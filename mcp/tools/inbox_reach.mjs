@@ -13,11 +13,21 @@
 export const isSignerFault = reason =>
   /^bunker: /.test(String(reason ?? '')) || /^nip46 .*(timed out|closed)$/.test(String(reason ?? ''))
 
+// Relay URLs compare by scheme, host and path only: case, a trailing slash and whitespace are not
+// different relays.
+export const normalizeRelay = url => String(url ?? '').trim().toLowerCase().replace(/\/+$/, '')
+
+// The relay tags of the newest kind:10050 among those returned (replaceable: newest wins).
+export const advertisedRelays = events => {
+  const newest = [...events].sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))[0]
+  return (newest?.tags || []).filter(tag => tag[0] === 'relay' && tag[1]).map(tag => tag[1])
+}
+
 // Returns { code, inconclusive[], notes[] }. code is 0 or 3; the caller owns exit 1
 // (misconfiguration), which is decided long before anything here is known.
 export function inboxVerdict({
   signerRefusals = [], envelopesSeen = 0, opened = 0, reachedWraps = [], relayCount = 0,
-  unreachable = [], answered10050 = [], dmRelayLists = 0, total = 0,
+  unreachable = [], answered10050 = [], dmRelayLists = 0, dmRelays = [], total = 0,
 } = {}) {
   const inconclusive = [], notes = []
 
@@ -53,6 +63,24 @@ export function inboxVerdict({
   if (!total && answered10050.length && !dmRelayLists) {
     inconclusive.push('this identity publishes no kind:10050 DM relay list, so a sender has nowhere to deliver to. ' +
       'That is not an empty inbox, it is an unreachable one')
+  }
+  // A list that EXISTS is not yet evidence either. NIP-17 has senders publish only to the relays in
+  // the kind:10050, so an empty read is clean only if every relay the list advertises was among
+  // those that answered the wrap query. A list pointing elsewhere, or naming no relay at all, means
+  // this run looked in places mail was never sent to.
+  if (!total && answered10050.length && dmRelayLists) {
+    const answered = new Set(reachedWraps.map(normalizeRelay))
+    const advertised = [...new Set(dmRelays.map(normalizeRelay).filter(Boolean))]
+    if (!advertised.length) {
+      inconclusive.push('the kind:10050 DM relay list names no relay, so a sender has nowhere to deliver to. ' +
+        'That is not an empty inbox, it is an unreachable one')
+    } else {
+      const missed = advertised.filter(url => !answered.has(url))
+      if (missed.length) {
+        inconclusive.push(`the kind:10050 DM relay list advertises ${missed.length} relay(s) this run did not query and ` +
+          `get an answer from, so mail sent there was never looked for — ${missed.join(', ')}`)
+      }
+    }
   }
   if (reachedWraps.length && unreachable.length) {
     notes.push(`partial reach: ${reachedWraps.length}/${relayCount} relay(s) answered — ${unreachable.join('; ')}`)
