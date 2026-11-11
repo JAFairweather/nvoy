@@ -10,6 +10,7 @@ import { sshChannelEntry } from '../mcp/tools/channel_client.mjs'
 import { CODEX_CHANNEL_TOOLS, codexConfigToml, codexRules, codexTurnText } from '../mcp/tools/harness_session.mjs'
 import { attachCommand, codexApprovals, codexGrants, codexInstall, sshFeedArgs } from '../mcp/tools/codex_portable_harness.mjs'
 import { claimPidLock } from '../mcp/tools/pid_lock.mjs'
+import { keyFingerprint } from '../mcp/tools/participant_unit.mjs'
 import { fakeHerdr } from './fake-herdr.mjs'
 
 let fails = 0
@@ -111,8 +112,8 @@ const keyLine = (...extra) => spawnSync(process.execPath, ['mcp/tools/instance-c
 const feedLine = keyLine('--mode', 'feed'), channelLine = keyLine(), defaultLine = keyLine('--mode', 'channel')
 ok('--mode feed renders one restricted line fixing the worker, container, feed program and instance, under its own tag', feedLine.status === 0 &&
   feedLine.stdout === `restrict,command="/usr/bin/docker exec -i --user ${process.getuid()}:${workerHandoffGid} nvoy-cx-adapter /usr/local/bin/node /srv/nvoy/mcp/tools/codex-channel-feed.mjs --instance cx-test" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestOnly nvoy-codex-feed-cx-test\n`)
-ok('the channel line is unchanged, by default and as --mode channel', channelLine.stdout === defaultLine.stdout &&
-  channelLine.stdout.includes('/codex-channel-mcp.mjs --instance cx-test" ssh-ed25519') && channelLine.stdout.trim().endsWith(' nvoy-codex-channel-cx-test'))
+ok('the channel line is the same by default and as --mode channel, and names its own key fingerprint', channelLine.stdout === defaultLine.stdout &&
+  channelLine.stdout.includes(`/codex-channel-mcp.mjs --instance cx-test --key-fp ${keyFingerprint('AAAAC3NzaC1lZDI1NTE5AAAAITestOnly')}" ssh-ed25519`) && channelLine.stdout.trim().endsWith(' nvoy-codex-channel-cx-test'))
 ok('an unknown mode is refused', /--mode must be channel or feed/.test(keyLine('--mode', 'shell').stderr) && keyLine('--mode', 'shell').status !== 0)
 
 // Wake feed

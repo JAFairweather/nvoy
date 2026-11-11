@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
+import { keyFingerprint } from '../mcp/tools/participant_unit.mjs'
 
 let passed = 0, failed = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); value ? passed++ : failed++ }
@@ -94,7 +95,7 @@ writeFileSync(publicKey, 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestOnly codex-re
 const forced = spawnSync(process.execPath, [resolve('mcp/tools/instance-codex-channel-authorized-key.mjs'), '--instance', manifest.id,
   '--public-key-file', publicKey, '--container', 'nvoy-codex-read-adapter'], { encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifests } })
 ok('forced SSH principal fixes worker UID, container, executable, and instance with restrict', forced.status === 0 &&
-  forced.stdout.startsWith('restrict,command="/usr/bin/docker exec -i --user ') && forced.stdout.includes('/codex-channel-mcp.mjs --instance codex-read"') &&
+  forced.stdout.startsWith('restrict,command="/usr/bin/docker exec -i --user ') && forced.stdout.includes(`/codex-channel-mcp.mjs --instance codex-read --key-fp ${keyFingerprint('AAAAC3NzaC1lZDI1NTE5AAAAITestOnly')}"`) &&
   !/shell|pty|forward/i.test(forced.stdout))
 
 console.log(`\n${passed}/${passed + failed} passed`)
