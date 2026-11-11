@@ -82,8 +82,18 @@ ok('every advertised relay answered: clean, case and a trailing slash notwithsta
   inboxVerdict({ ...healthy, reachedWraps: ['wss://A.example/'], relayCount: 1, dmRelays: ['wss://a.example'] }).code === 0)
 ok('messages that arrived are not second-guessed by where the list points',
   inboxVerdict({ ...healthy, dmRelays: ['wss://other'], total: 1 }).code === 0)
-ok('normalizeRelay folds case, whitespace and trailing slashes',
-  normalizeRelay(' WSS://Relay.X/// ') === 'wss://relay.x')
+ok('normalizeRelay folds scheme and host case and the root slash, and nothing else',
+  normalizeRelay(' WSS://Relay.X/ ') === 'wss://relay.x' && normalizeRelay('wss://relay.x') === 'wss://relay.x')
+ok('  …but keeps path and query case, and a non-root trailing slash',
+  normalizeRelay('wss://relay.x/Inbox') === 'wss://relay.x/Inbox' && normalizeRelay('wss://relay.x/inbox/') === 'wss://relay.x/inbox/' &&
+  normalizeRelay('wss://relay.x/?Room=A') === 'wss://relay.x?Room=A')
+ok('a list advertising /inbox does not match a wrap answer from /Inbox (My Dude, PR 361)',
+  inboxVerdict({ ...healthy, reachedWraps: ['wss://relay.example/Inbox'], dmRelays: ['wss://relay.example/inbox'] }).code === 3)
+ok('  …nor a different query', inboxVerdict({ ...healthy, reachedWraps: ['wss://relay.example/?a=1'], dmRelays: ['wss://relay.example/?a=2'] }).code === 3)
+ok('  …while host case, the root slash and a default port are the same relay',
+  inboxVerdict({ ...healthy, reachedWraps: ['wss://Relay.Example/'], dmRelays: ['wss://relay.example:443'] }).code === 0)
+ok('a non-URL advertised entry cannot match a real relay',
+  inboxVerdict({ ...healthy, dmRelays: ['not a url'] }).code === 3)
 ok('the NEWEST kind:10050 wins, and only relay tags count',
   advertisedRelays([{ created_at: 1, tags: [['relay', 'wss://old']] },
     { created_at: 2, tags: [['relay', 'wss://new'], ['p', 'x'], ['relay']] }]).join() === 'wss://new')

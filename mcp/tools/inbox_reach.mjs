@@ -13,9 +13,18 @@
 export const isSignerFault = reason =>
   /^bunker: /.test(String(reason ?? '')) || /^nip46 .*(timed out|closed)$/.test(String(reason ?? ''))
 
-// Relay URLs compare by scheme, host and path only: case, a trailing slash and whitespace are not
-// different relays.
-export const normalizeRelay = url => String(url ?? '').trim().toLowerCase().replace(/\/+$/, '')
+// Relay URLs compare only on what URL syntax guarantees equal: scheme and host are case-insensitive
+// (and a default port is the same as none), and an empty path is the root. The path and query are
+// NOT — a server may route /Inbox and /inbox to different endpoints — so they are kept byte for
+// byte, and a trailing slash on a non-root path is a different path. Something that is not a URL
+// compares as itself, trimmed.
+export const normalizeRelay = url => {
+  const raw = String(url ?? '').trim()
+  try {
+    const u = new URL(raw)
+    return `${u.protocol}//${u.host}${u.pathname === '/' ? '' : u.pathname}${u.search}`
+  } catch { return raw }
+}
 
 // The relay tags of the newest kind:10050 among those returned (replaceable: newest wins).
 export const advertisedRelays = events => {
