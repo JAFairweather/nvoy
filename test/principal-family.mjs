@@ -72,6 +72,12 @@ check(codexPrincipalPlan('', manifest, 'feed', FEED).action === 'append' && code
 check(codexPrincipalPlan(codexPrincipalLine(manifest, 'feed', CHANNEL.keyType, CHANNEL.keyBody), manifest, 'feed', FEED).action === 'refuse', 'plan: a different key under the feed comment refuses')
 check(codexPrincipalPlan(`${feedLine}\n${feedLine}\n`, manifest, 'feed', FEED).action === 'refuse', 'plan: two feed lines refuse as ambiguous')
 check(verifyCodexPrincipal(manifest, 'channel', channelLine).ok && verifyCodexPrincipal(manifest, 'feed', feedLine).ok, 'verify: both exact lines pass')
+check(channelLine.includes(' --key-fp SHA256:') && !feedLine.includes('--key-fp'), 'only the channel line names its key fingerprint')
+check(verifyCodexPrincipal(manifest, 'channel', channelLine).fingerprint === 'bound', 'verify: the tagged channel line is bound to its key')
+check(verifyCodexPrincipal(manifest, 'channel', channelLine.replace(/ --key-fp [^"]+/, '')).fingerprint === 'untagged', 'verify: an older untagged channel line still verifies, as untagged')
+check(!verifyCodexPrincipal(manifest, 'channel', channelLine.replace(/--key-fp SHA256:\S{43}/, 'SHA256:' + 'A'.repeat(43)).replace('SHA256:' + 'A'.repeat(43), '--key-fp SHA256:' + 'A'.repeat(43))).ok, 'verify: a channel line naming another key fails')
+check(codexPrincipalPlan(channelLine.replace(/ --key-fp [^"]+/, ''), manifest, 'channel', CHANNEL).action === 'upgrade', 'plan: the same key seated untagged upgrades')
+check(codexPrincipalPlan(codexPrincipalLine(manifest, 'channel', FEED.keyType, FEED.keyBody).replace(/ --key-fp [^"]+/, ''), manifest, 'channel', CHANNEL).action === 'refuse', 'plan: a different key seated untagged still refuses')
 const claude = principalLine(manifest, CHANNEL.keyType, CHANNEL.keyBody)
 check(!verifyCodexPrincipal(manifest, 'channel', claude).ok, 'verify: the Claude command is not a channel principal for this family')
 check(!verifyCodexPrincipal(manifest, 'channel', feedLine.replace('nvoy-codex-feed-hr', 'nvoy-codex-channel-hr')).ok, 'verify: the feed program under the channel comment is refused')
@@ -188,6 +194,16 @@ const lines = path => readFileSync(path, 'utf8').split('\n').filter(Boolean)
     const calls = []
     return { keysPath, calls, go: () => repairInstalled({ manifest, root, stateDir: state, keysPath, publicKey: CHANNEL, family, feedKey,
       run: argv => { calls.push(argv); return argv[0] === 'verify' ? { status: verifyStatus, stdout: 'verified', stderr: verifyStatus ? 'FAIL' : '' } : { status: 0, stdout: 'baselined 3', stderr: '' } } }) }
+  }
+  {
+    // an agent seated before channel lines named their fingerprint: repair upgrades that one line in place
+    const untagged = channelLine.replace(/ --key-fp [^"]+/, '')
+    const other = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK0' + 'c'.repeat(40) + ' someone-else'
+    const { keysPath, go } = repairScenario({ keys: `${other}\n${untagged}\n${feedLine}\n` })
+    const r = go()
+    check(r.ok && lines(keysPath).join('\n') === `${other}\n${channelLine}\n${feedLine}`, `repair upgrades an untagged channel line in place, other lines untouched: ${states(r)}`)
+    check(/upgraded/.test(r.states.find(st => st.state === 'principal seated').detail), 'and says it upgraded')
+    check(go().ok && lines(keysPath).join('\n') === `${other}\n${channelLine}\n${feedLine}`, 'a second repair changes nothing')
   }
   {
     const { keysPath, calls, go } = repairScenario({ keys: `${channelLine}\n` })

@@ -17,6 +17,13 @@ const tagged = fp => proc([...base, '--key-fp', fp])
 const now = Date.UTC(2026, 10, 8, 21, 0, 0)
 
 // ---- argv: exact, complete ----
+
+// ---- the Pi/Codex channel program is a channel session too; its feed program is not ----
+const cbase = ['/usr/local/bin/node', '/srv/nvoy/mcp/tools/codex-channel-mcp.mjs', '--instance', 'curator']
+ok('a tagged Pi/Codex channel argv names its key', parseChannelArgv([...cbase, '--key-fp', FPA], m)?.fp === FPA)
+ok('an older Pi/Codex channel argv is accepted as untagged', parseChannelArgv(cbase, m)?.fp === '')
+ok('the Pi/Codex feed program is not a channel session', parseChannelArgv(['/usr/local/bin/node', '/srv/nvoy/mcp/tools/codex-channel-feed.mjs', '--instance', 'curator', '--key-fp', FPA], m) === null)
+ok('a Pi/Codex channel argv for another instance does not parse', parseChannelArgv(cbase.map(v => v === 'curator' ? 'other' : v), m) === null)
 ok('a tagged channel argv names its key', parseChannelArgv([...base, '--key-fp', FPA], m)?.fp === FPA)
 ok('an older argv is accepted as untagged', parseChannelArgv(base, m)?.fp === '')
 ok('another instance does not parse', parseChannelArgv(base.map(v => v === 'curator' ? 'other' : v), m) === null)
@@ -81,6 +88,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { readProcs, installedFingerprint, collect } from '../mcp/tools/presence-collect.mjs'
 import { principalLine } from '../mcp/tools/participant_unit.mjs'
+import { codexPrincipalLine } from '../mcp/tools/principal_family.mjs'
 
 const tmp = mkdtempSync(join(tmpdir(), 'presence-'))
 const fakeProc = join(tmp, 'proc'); mkdirSync(fakeProc)
@@ -105,6 +113,16 @@ ok('an older line yields no fingerprint, so presence stays unproven', installedF
 ok('a line whose command was swapped but still ends in the fingerprint yields none', installedFingerprint(line.replace(/command="[^"]*(?= --key-fp)/, 'command="/bin/echo') + '\n', man) === '')
 ok('a line with restrict stripped yields none', installedFingerprint(line.replace('restrict,', '') + '\n', man) === '')
 ok('two lines under one comment yield none (ambiguous)', installedFingerprint(line + '\n' + line + '\n', man) === '')
+{
+  const cline = codexPrincipalLine(man, 'channel', 'ssh-ed25519', body)
+  const feed = codexPrincipalLine(man, 'feed', 'ssh-ed25519', Buffer.alloc(51, 6).toString('base64'))
+  ok('a Pi/Codex channel line names its key fingerprint', cline.includes(` --key-fp ${keyFingerprint(body)}"`) && !feed.includes('--key-fp'))
+  ok('the installed Pi/Codex channel line yields its own key fingerprint', installedFingerprint(cline + '\n' + feed + '\n', man) === keyFingerprint(body))
+  ok('an older Pi/Codex channel line yields none', installedFingerprint(cline.replace(/ --key-fp [^"]+/, '') + '\n' + feed + '\n', man) === '')
+  ok('a Pi/Codex channel line naming another key yields none', installedFingerprint(cline.replace(keyFingerprint(body), FPB) + '\n', man) === '')
+  ok('a feed line alone yields none', installedFingerprint(feed + '\n', man) === '')
+  ok('a Claude and a Pi/Codex channel line together yield none (ambiguous)', installedFingerprint(line + '\n' + cline + '\n', man) === '')
+}
 
 const insts = join(tmp, 'instances'); mkdirSync(insts)
 const writeManifest = () => writeFileSync(join(insts, 'curator.json'), JSON.stringify({

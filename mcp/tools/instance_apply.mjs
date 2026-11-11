@@ -107,8 +107,16 @@ export function seatPrincipals({ manifest, keysPath, publicKey, feedKey = null, 
       if (plan.action === 'append') {
         const text = readFileSync(keysPath, 'utf8')
         appendFileSync(keysPath, `${text && !text.endsWith('\n') ? '\n' : ''}${plan.line}\n`)
+      } else if (plan.action === 'upgrade') {
+        // Replace exactly the one older line for this key (planned from this same read) with the line that
+        // names its fingerprint. Nothing else in the file moves.
+        const text = readFileSync(keysPath, 'utf8'), lines = text.split('\n')
+        const at = lines.map(l => l.trim()).indexOf(plan.old)
+        if (at < 0 || lines.map(l => l.trim()).lastIndexOf(plan.old) !== at) throw new Error('the older channel line changed while upgrading it')
+        lines[at] = plan.line
+        writeFileSync(keysPath, lines.join('\n'))
       }
-      seated.push(`${plan.role} ${plan.action === 'append' ? 'appended' : 'already present'}`)
+      seated.push(`${plan.role} ${plan.action === 'append' ? 'appended' : plan.action === 'upgrade' ? 'upgraded to name its key fingerprint' : 'already present'}`)
     }
   } catch (error) {
     // Partial seat: say which lines are in. A re-run plans again, finds them present and appends only the rest.
@@ -140,7 +148,7 @@ export function repairInstalled({ manifest, root, stateDir, keysPath, publicKey,
   const plan = planPrincipals(readFileSync(keysPath, 'utf8'), manifest, { family, publicKey, feedKey })
   if (plan.error) return done('principal planned', false, plan.error)
   done('principal planned', true, plan.plans.every(p => p.action === 'present') ? 'already present, unchanged'
-    : `will append ${plan.plans.filter(p => p.action === 'append').map(p => principalCommentOf(manifest, family, p.role)).join(' and ')}`)
+    : `will ${plan.plans.filter(p => p.action !== 'present').map(p => `${p.action === 'upgrade' ? 'upgrade' : 'append'} ${principalCommentOf(manifest, family, p.role)}`).join(' and ')}`)
   const deployed = readJson(join(stateDir, 'DEPLOYED_MANIFESTS.json'))
   if (!existsSync(target) || deployed?.[manifest.id] !== digestOf(readFileSync(target)) || !existsSync(compose))
     return { ...done('deployed', null, 'the runner has not recorded the installed manifest and its compose file yet; nothing was seated'), inconclusive: true }
@@ -208,7 +216,7 @@ export async function applyStaged({ manifest, stagedPath, root, stateDir, keysPa
   const plan = planPrincipals(readFileSync(keysPath, 'utf8'), manifest, { family, publicKey, feedKey })
   if (plan.error) return done('principal planned', false, plan.error)
   done('principal planned', true, plan.plans.every(p => p.action === 'present') ? 'already present, unchanged'
-    : `will append ${plan.plans.filter(p => p.action === 'append').map(p => principalCommentOf(manifest, family, p.role)).join(' and ')}`)
+    : `will ${plan.plans.filter(p => p.action !== 'present').map(p => `${p.action === 'upgrade' ? 'upgrade' : 'append'} ${principalCommentOf(manifest, family, p.role)}`).join(' and ')}`)
 
   // 2. Reserve the block in the record, as the record is now, before anything can run as it.
   const reserved = reserveBlock(ledgerPath, manifest, now)
