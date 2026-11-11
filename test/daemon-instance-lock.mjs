@@ -13,6 +13,7 @@
 //   node test/daemon-instance-lock.mjs
 
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, unlinkSync } from 'node:fs'
+import { generations } from '../mcp/tools/lease_lock.mjs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
@@ -57,19 +58,20 @@ function run (host = 'container-b') {
   return { err: (r.stderr || '') + (r.stdout || ''), status: r.status }
 }
 const startHolder = (host) => spawn(process.execPath, [daemon, '--instance', ID], { env: envFor(host), stdio: 'ignore' })
-const writeLock = body => writeFileSync(lockPath, typeof body === 'string' ? body : JSON.stringify(body), { mode: 0o600 })
-const clear = () => { if (existsSync(lockPath)) unlinkSync(lockPath) }
-const lockJson = () => { try { return JSON.parse(readFileSync(lockPath, 'utf8')) } catch { return null } }
+// The lock is generation files, <lock>.<n>; the current one is the highest.
+const writeLock = body => writeFileSync(`${lockPath}.1`, typeof body === 'string' ? body : JSON.stringify(body), { mode: 0o600 })
+const clear = () => { for (const g of generations(lockPath)) { try { unlinkSync(g.file) } catch {} } }
+const lockJson = () => { const all = generations(lockPath); try { return JSON.parse(readFileSync(all[all.length - 1].file, 'utf8')) } catch { return null } }
 const waitFor = async (fn, ms = 4000) => { const end = Date.now() + ms; while (Date.now() < end) { if (fn()) return true; await new Promise(r => setTimeout(r, 50)) } return false }
-const v2 = (o = {}) => ({ version: 2, instance: ID, host: 'container-a', pid: 1, token: 'a'.repeat(32), started_at: Date.now(), ...o })
+const v2 = (o = {}) => ({ version: 3, gen: 1, instance: ID, host: 'container-a', pid: 1, token: 'a'.repeat(32), started_at: Date.now(), ...o })
 
 // ---- the positive control, stated before any refusal ------------------------------------------
 clear()
 const clean = run('container-a')
-ok('with no lock present, the daemon starts and claims it', !LIVE.test(clean.err) && existsSync(lockPath))
+ok('with no lock present, the daemon starts and claims it', !LIVE.test(clean.err) && generations(lockPath).length > 0)
 const claimed = lockJson()
 ok('the claimed lock records version, this instance, a host, a real pid and a token',
-  claimed?.version === 2 && claimed?.instance === ID && claimed?.host === 'container-a' &&
+  claimed?.version === 3 && claimed?.gen === 1 && claimed?.instance === ID && claimed?.host === 'container-a' &&
   Number.isInteger(claimed?.pid) && claimed?.pid > 0 && /^[0-9a-f]{32}$/.test(claimed?.token || ''))
 
 // ---- TWO CONTAINERS on one state volume (My Dude / Dennis, PR 364) -----------------------------
@@ -102,7 +104,7 @@ for (const [name, body] of [
   ['unparseable', 'this is not json'],
   ['a lock naming another instance', v2({ instance: 'someone-else' })],
   ['a lock with no usable pid', v2({ pid: 0 })],
-  ['a lock of an old or unknown version', { ...v2(), version: 1 }],
+  ['a lock of an old or unknown version', { ...v2(), version: 2 }],
   ['a lock with no token', (() => { const { token, ...rest } = v2(); return rest })()],
 ]) {
   clear(); writeLock(body)
