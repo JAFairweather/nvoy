@@ -121,6 +121,58 @@ await t('malformed, foreign-instance, old-format and symlinked locks fail closed
   }
 })
 
+// My Dude, PR 364: the daemon blocks its main thread in spawnSync (90 s timeout). A main-loop heartbeat
+// would lapse under a LIVE holder and let another container take the lock. These run the holder in a
+// child that blocks its main thread past the lease, as a slow broker child does.
+const { spawn } = await import('node:child_process')
+const children = []
+process.on('exit', () => { for (const c of children) try { c.kill('SIGKILL') } catch {} })
+const holderChild = (path, host, blockMs, ttlMs = 1000) => {
+  const script = `
+    import { claimLeaseLock } from ${JSON.stringify(new URL('../mcp/tools/lease_lock.mjs', import.meta.url).href)}
+    claimLeaseLock(${JSON.stringify(path)}, 'i', 'daemon', { ttlMs: ${ttlMs}, host: ${JSON.stringify(host)}, pid: 1 })
+    console.log('claimed')
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ${blockMs})   // the main thread is blocked, like spawnSync
+    console.log('unblocked')
+    setInterval(() => {}, 1000)`
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: ['ignore', 'pipe', 'inherit'] })
+  children.push(child)
+  child.stdout.on('error', () => {})
+  let out = ''
+  child.stdout.on('data', d => { out += d })
+  return { child, out: () => out, claimed: () => new Promise(r => { const iv = setInterval(() => { if (out.includes('claimed')) { clearInterval(iv); r() } }, 20) }) }
+}
+
+await t('a holder whose main thread is BLOCKED past the lease still holds it: the heartbeat is on its own thread', async () => {
+  const p = fresh(), h = holderChild(p, 'container-a', 3500)
+  await h.claimed()
+  await new Promise(r => setTimeout(r, 2500))            // 2.5x the 1s lease, and the holder is still blocked
+  assert.ok(!h.out().includes('unblocked'), 'the holder is still inside its blocking call')
+  assert.throws(() => claimLeaseLock(p, 'i', 'daemon', opts({ host: 'container-b', pid: 1, ttlMs: 1000 })), /already runs as pid 1 on container-a/)
+  h.child.kill('SIGKILL')
+})
+
+await t('  …the pair: a holder that is really dead (killed, so no heartbeat) does lapse and can be taken over', async () => {
+  const p = fresh(), h = holderChild(p, 'container-a', 100)
+  await h.claimed()
+  h.child.kill('SIGKILL')
+  await new Promise(r => setTimeout(r, 1600))
+  const taker = claimLeaseLock(p, 'i', 'daemon', opts({ host: 'container-b', pid: 1, ttlMs: 1000 }))
+  assert.equal(body(p).host, 'container-b')
+  taker()
+})
+
+await t('a holder BLOCKED on the main thread whose lock is taken over is stopped by its heartbeat thread, not left as a second writer', async () => {
+  const p = fresh(), h = holderChild(p, 'container-a', 6000)
+  await h.claimed()
+  const exited = new Promise(r => h.child.on('exit', (code, signal) => r({ code, signal })))
+  writeFileSync(p, JSON.stringify({ version: 2, instance: 'i', host: 'container-b', pid: 1, token: 'b'.repeat(32), started_at: Date.now() }))
+  const result = await Promise.race([exited, new Promise(r => setTimeout(() => r('still running'), 4000))])
+  assert.notEqual(result, 'still running', 'the blocked holder was ended while its main thread was blocked')
+  assert.equal(result.signal, 'SIGTERM')
+  assert.equal(body(p).host, 'container-b', 'the new holder\'s lock is untouched')
+})
+
 await t('a lock that is a symlink is refused, not followed', async () => {
   const { symlinkSync } = await import('node:fs')
   const target = fresh(), link = fresh()
