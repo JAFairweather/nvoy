@@ -856,6 +856,9 @@ export class HiveMemoryStore {
     this.lastRollupFailureAt = null
     this.lastRollupFailureError = null
     this.unpersistedRollupGap = false
+    this.unpersistedRollupFailures = 0
+    this.firstUnpersistedFailureAt = null
+    this.lastUnpersistedFailureAt = null
     this.rollupGapWriteError = null
     this.rollupGapReadError = null
     this.priorUncleanRollupSession = null
@@ -1292,6 +1295,11 @@ export class HiveMemoryStore {
       // Leave the active session sentinel (hour_bucket = -1) in SQLite on close() so restart detects the unpersisted gap even if both writes failed.
       this.unpersistedRollupGap = true
       if (!sidecarGapSaved) {
+        this.unpersistedRollupFailures += 1
+        this.firstUnpersistedFailureAt =
+          this.firstUnpersistedFailureAt === null ? ts : Math.min(this.firstUnpersistedFailureAt, ts)
+        this.lastUnpersistedFailureAt =
+          this.lastUnpersistedFailureAt === null ? ts : Math.max(this.lastUnpersistedFailureAt, ts)
         this.rollupGapWriteError = dbGapErr || sidecarGapErr || 'ROLLUP_GAP_WRITE_FAILED'
         this.log(`hive-memory: activity_rollup_gaps write failed (failing closed): ${this.rollupGapWriteError}`)
       }
@@ -1364,7 +1372,7 @@ export class HiveMemoryStore {
             error: uncleanSentinelRow.last_error || 'UNPERSISTED_ROLLUP_GAP_ON_RESTART',
           }
         : null)
-    if (uncleanSession && byBucket.size === 0) {
+    if (uncleanSession) {
       const hb = Math.floor(nowSec / 3600) * 3600
       mergeGap({
         hour_bucket: hb,
@@ -1375,13 +1383,13 @@ export class HiveMemoryStore {
       })
     }
 
-    if (this.unpersistedRollupGap && this.rollupWriteFailures > 0) {
-      const ts = this.lastRollupFailureAt ?? nowSec
+    if (this.unpersistedRollupGap && this.unpersistedRollupFailures > 0) {
+      const ts = this.lastUnpersistedFailureAt ?? this.lastRollupFailureAt ?? nowSec
       const hb = Math.floor(ts / 3600) * 3600
       mergeGap({
         hour_bucket: hb,
-        failures: this.rollupWriteFailures,
-        first_failure_at: this.firstRollupFailureAt ?? ts,
+        failures: this.unpersistedRollupFailures,
+        first_failure_at: this.firstUnpersistedFailureAt ?? ts,
         last_failure_at: ts,
         last_error: this.lastRollupFailureError || this.rollupGapWriteError || 'UNPERSISTED_ROLLUP_GAP',
       })

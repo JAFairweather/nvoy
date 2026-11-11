@@ -2404,12 +2404,27 @@ await test('durable SQLite activity_rollups survive >80 ring overflow & daemon r
           )
 
           // 8. Regression: Real SQLite write failure (where BOTH activity_rollups AND activity_rollup_gaps in SQLite fail to write)
-          // and gap read failure must fail closed and keep the window incomplete across store/daemon restart.
-          // Record an earlier rollup 2 days ago so the 24h window would otherwise be 'complete'.
+          // and gap read failure must fail closed and keep the window incomplete across store/daemon restart,
+          // even when an unrelated older persisted gap already exists outside the 24h window!
+          // First, record an older persisted gap 3 days ago (outside window_24h) while SQLite and sidecar are writable,
+          // plus a successful rollup 2 days ago so the 24h window would otherwise be 'complete'.
+          oldStore.hooks = {
+            beforeRollupWrite: () => {
+              throw new Error('OLDER_TRANSIENT_ROLLUP_FAIL')
+            },
+          }
+          const okOldFail = oldStore.recordActivityRollup({
+            at: midHourNow - 3 * daySec,
+            actor: 'biggy',
+            kind: 'query',
+            count: 1,
+          })
+          assert.equal(okOldFail, false, 'older rollup write failure outside 24h window must return false')
+          oldStore.hooks = {}
           oldStore.recordActivityRollup({ at: midHourNow - 2 * daySec, actor: 'biggy', kind: 'query', count: 2 })
 
-          // Install real SQLite triggers that abort writes to BOTH activity_rollups AND activity_rollup_gaps (simulating read-only/full DB),
-          // and also fail the sidecar write on a second attempt to verify both the sidecar fallback and the SQLite session-sentinel fallback.
+          // Now install real SQLite triggers that abort writes to BOTH activity_rollups AND activity_rollup_gaps (simulating read-only/full DB),
+          // and fail the sidecar write for the new current-window failure so ONLY the 3-day-old gap is persisted in SQLite + sidecar.
           oldStore.db.exec(`
             CREATE TRIGGER abort_rollup_insert BEFORE INSERT ON activity_rollups
             BEGIN SELECT RAISE(ABORT, 'SQLITE_FULL_OR_READONLY'); END;
@@ -2420,13 +2435,15 @@ await test('durable SQLite activity_rollups survive >80 ring overflow & daemon r
             CREATE TRIGGER abort_gap_update BEFORE UPDATE ON activity_rollup_gaps
             BEGIN SELECT RAISE(ABORT, 'SQLITE_FULL_OR_READONLY'); END;
           `)
+          oldStore.hooks = {
+            beforeRollupGapSidecarWrite: () => {
+              throw new Error('ENOSPC_SIDECAR_WRITE_FAILED')
+            },
+          }
           const okWrite = oldStore.recordActivityRollup({ at: midHourNow - 60, actor: 'neil', kind: 'query', count: 3 })
           assert.equal(okWrite, false, 'SQLite rollup write failure must return false')
           assert.equal(oldStore.unpersistedRollupGap, true, 'SQLite gap write failure must set unpersistedRollupGap = true')
-
-          // Also verify that even if the sidecar file is deleted (simulating total disk/FS write failure where neither SQLite nor sidecar could write the gap),
-          // the uncleared session sentinel (hour_bucket = -1) in SQLite still keeps the window incomplete after restart!
-          rmSync(`${oldDbPath}.rollup-gaps.json`, { force: true })
+          assert.equal(oldStore.unpersistedRollupFailures, 1, 'both gap stores failing must increment unpersistedRollupFailures')
           oldStore.close()
 
           const restartedStore = new HiveMemoryStore({
@@ -2441,13 +2458,13 @@ await test('durable SQLite activity_rollups survive >80 ring overflow & daemon r
             const postRestartRollups = restartedStore.activityRollups({ sinceSec: 0, nowSec: midHourNow })
             assert.equal(
               postRestartRollups.write_failures,
-              1,
-              'write_failures must survive restart even when both SQLite gap write and sidecar write failed'
+              2,
+              'write_failures must include both the older persisted gap and the new unpersisted session gap across restart'
             )
             assert.equal(
               postRestartRollups.failure_gaps.length,
-              1,
-              'failure_gaps must be synthesized from uncleared session sentinel across restart'
+              2,
+              'failure_gaps must retain the older gap AND independently synthesize the current unclean-session gap across restart'
             )
 
             const failureTrends = computeMemoryTrends({
@@ -2460,19 +2477,19 @@ await test('durable SQLite activity_rollups survive >80 ring overflow & daemon r
             assert.equal(
               failureTrends.window_24h.recall_incomplete,
               true,
-              'total rollup+gap write failure must keep window_24h.recall_incomplete = true after daemon restart'
+              'total rollup+gap write failure must keep window_24h.recall_incomplete = true after daemon restart even when an older gap exists outside 24h'
             )
             assert.equal(
               failureTrends.window_24h.recall_coverage,
               'partial',
-              'total rollup+gap write failure must keep window_24h.recall_coverage = partial (never complete) after daemon restart'
+              'total rollup+gap write failure must keep window_24h.recall_coverage = partial (never complete) after daemon restart even when an older gap exists outside 24h'
             )
             assert(
               failureTrends.window_24h.observed_coverage_pct < 100,
               `window with unpersisted rollup failure gap must report observed_coverage_pct < 100 (got ${failureTrends.window_24h.observed_coverage_pct})`
             )
-            assert.equal(failureTrends.window_24h.rollup_write_failures, 1)
-            assert.equal(failureTrends.recall_telemetry.write_failures, 1)
+            assert(failureTrends.window_24h.rollup_write_failures >= 1)
+            assert.equal(failureTrends.recall_telemetry.write_failures, 2)
 
             // 8b. Regression: Gap read failure (corrupt sidecar or unreadable gap table) must fail closed (read_error: true, partial coverage)
             // even when earlier rollups exist and no in-memory failure is recorded on a fresh store instance.
@@ -2484,6 +2501,7 @@ await test('durable SQLite activity_rollups survive >80 ring overflow & daemon r
             `)
             restartedStore.db.prepare('DELETE FROM activity_rollup_gaps').run()
             restartedStore.unpersistedRollupGap = false
+            restartedStore.unpersistedRollupFailures = 0
             restartedStore.priorUncleanRollupSession = null
             restartedStore.rollupWriteFailures = 0
             writeFileSync(`${oldDbPath}.rollup-gaps.json`, '{corrupt-json-gap-file')
