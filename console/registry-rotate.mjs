@@ -17,8 +17,9 @@ const b64 = (bytes) => btoa(String.fromCharCode(...bytes))
 
 /**
  * Write the new generation and key into the index in place. `holders` are the runtimes KNOWN to hold
- * this generation. `verified` is set only when given: a rotation has not been read back, a revoke does
- * not claim either way.
+ * this generation. `verified` is set only when given; rotateProjection always gives it (false), because
+ * no rotation has been read back at the moment it is recorded — a stale `true` from the previous
+ * generation would claim readability nobody has checked.
  */
 export function recordRotation(index, { scopeId, scopeName, generation, scopeKey, holders, payload, at, verified }) {
   const entry = { scope: scopeId, scope_name: scopeName, v: generation, key: b64(scopeKey), grantees: [...holders] }
@@ -39,7 +40,7 @@ export function recordRotation(index, { scopeId, scopeName, generation, scopeKey
  * `save` persists the index; it is awaited BEFORE any grant so the key survives a grant failure, and
  * tried again at the end so a transient save failure on the first try is not the last word.
  */
-export async function rotateProjection({ relay, signer, index, scopeId, scopeName, from, payload, survivors, relayHint = '', save, now, verified }) {
+export async function rotateProjection({ relay, signer, index, scopeId, scopeName, from, payload, survivors, relayHint = '', save, now, verified = false }) {
   const keep = (rotation, holders) => recordRotation(index, {
     scopeId, scopeName, generation: rotation.generation, scopeKey: rotation.scopeKey, holders, payload, at: now(), verified,
   })
@@ -49,8 +50,12 @@ export async function rotateProjection({ relay, signer, index, scopeId, scopeNam
       onPublished: async (r) => { keep(r, []); await save() },
     })
     keep(out, survivors.map(s => s.pub))
-    await save()
-    return { status: 'complete', generation: out.generation, scopeKey: out.scopeKey, regranted: survivors.map(s => s.pub), pending: [] }
+    // The rotation is complete and out. A failing final save is a PERSISTENCE problem, not a failed
+    // rotation: it must not surface as an error ("nothing changed") for a generation that is live. The
+    // key was already saved before the first grant, so this only records who holds it.
+    let saved = true
+    try { await save() } catch { saved = false }
+    return { status: 'complete', generation: out.generation, scopeKey: out.scopeKey, regranted: survivors.map(s => s.pub), pending: [], saved }
   } catch (error) {
     const r = error.rotation
     if (!r) throw error                      // nothing was published: the old generation stands

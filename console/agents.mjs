@@ -211,6 +211,8 @@ function wireRegistryPanel() {
     if (plan.action === 'none' || plan.action === 'blocked') return stop(plan.why)
 
     btn.disabled = true
+    let live = null      // set once a new generation is out: after that, errors are never "nothing changed"
+    let warn = ''
     try {
       if (plan.action === 'reverify') {
         // Read-back only. Signs nothing, rotates nothing, re-grants no one.
@@ -240,6 +242,7 @@ function wireRegistryPanel() {
         scopeId = opaqueScopeId(); generation = 1; scopeKey = newScopeKey()
         msg.textContent = 'publishing the projection (30440)…'
         await publishScope(state.relay, state.signer, { scopeId, generation, scopeKey, payload })
+        live = generation
       } else {
         scopeId = plan.scopeId
         msg.textContent = plan.grantees.length
@@ -255,16 +258,23 @@ function wireRegistryPanel() {
         })
         state.index.nvoy_ledger = appendLedger(state.index,
           rotatedEvent({ scope: scopeId, from_v: plan.from, to_v: rot.generation, survivors: rot.regranted }))
-        await saveGrantIndex(state.relay, state.signer, state.index)
+        // The rotation is out. From here a failure is about PERSISTING it, and must never be worded as
+        // "nothing changed".
+        live = rot.generation
+        let persisted = rot.saved
+        try { await saveGrantIndex(state.relay, state.signer, state.index); persisted = true } catch { persisted = persisted && false }
+        if (!persisted) warn = ` WARNING: v${rot.generation} is live but the Grant Index could not be saved — keep this page open and press Check read-back to retry the save.`
         if (rot.status === 'partial') {
           const names = rot.pending.map(agentName).join(', ')
           msg.textContent = `rotated to v${rot.generation}, but only ${rot.regranted.length} of ${plan.grantees.length} holder(s) `
             + `were re-delivered (${rot.reason}). Still waiting for v${rot.generation}: ${names}. The key is recorded; `
             + 'use Grant read below for each, then Check read-back.'
-            + (rot.saved ? '' : ' WARNING: the Grant Index could not be saved on the last try — do not reload before it saves.')
-          const said = msg.textContent
-          await load()
-          const fresh = $('reg-msg'); if (fresh) fresh.textContent = said   // load() re-renders the panel
+            + warn
+          if (persisted) {      // load() re-reads the index from the relay: never while ours is unsaved
+            const said = msg.textContent
+            await load()
+            const fresh = $('reg-msg'); if (fresh) fresh.textContent = said   // load() re-renders the panel
+          }
           return
         }
         generation = rot.generation; scopeKey = rot.scopeKey
@@ -290,14 +300,16 @@ function wireRegistryPanel() {
         state.index[REGISTRY_PROJECTION_FIELD].verified = true
         await saveGrantIndex(state.relay, state.signer, state.index)
         msg.textContent = `published v${generation} — ${payload.agents.length} agent(s), read back and verified.`
-          + (plan.grantees.length ? '' : ' No runtime holds it yet — grant read below.')
+          + (plan.grantees.length ? '' : ' No runtime holds it yet — grant read below.') + warn
       } else {
         msg.textContent = `the relay accepted v${generation} but it did not read back (${back.status}), `
-          + 'so nothing is claimed as readable. Your scope key is recorded — use Check read-back.'
+          + 'so nothing is claimed as readable. Your scope key is recorded — use Check read-back.' + warn
       }
-      await load()
+      if (!warn) await load()
     } catch (err) {
-      stop(err.message)
+      msg.textContent = live
+        ? `v${live} is live, but a later step failed: ${err.message}. Nothing was rolled back — press Check read-back to continue.`
+        : `nothing changed: ${err.message}`
     } finally {
       btn.disabled = false
     }
@@ -371,14 +383,20 @@ function wireRegistryHolders() {
           scope: issued.scope, agent: pub, v: rot.generation,
           reason: 'the registry projection read was revoked', notice: noticed ? true : null,
         }))
-        await saveGrantIndex(state.relay, state.signer, state.index)
-        msg.textContent = rot.status === 'partial'
+        // The rotation is out; a failure from here is about persisting it, never "nothing changed".
+        let persisted = rot.saved
+        try { await saveGrantIndex(state.relay, state.signer, state.index); persisted = true } catch { persisted = false }
+        msg.textContent = (rot.status === 'partial'
           ? `${agentName(pub)} is revoked (v${rot.generation}), but only ${rot.regranted.length} of ${survivors.length} remaining holder(s) `
             + `were re-delivered (${rot.reason}). Still waiting: ${rot.pending.map(agentName).join(', ')} — use Grant read.`
-          : `${agentName(pub)} is revoked (v${rot.generation}).` + (noticed ? '' : ' The courtesy notice could not be sent; the revocation stands.')
-        const said = msg.textContent
-        await load()
-        const fresh = $('reg-hmsg'); if (fresh) fresh.textContent = said   // load() re-renders the panel
+          : `${agentName(pub)} is revoked (v${rot.generation}).` + (noticed ? '' : ' The courtesy notice could not be sent; the revocation stands.'))
+          + ' The new generation is unverified — press Check read-back.'
+          + (persisted ? '' : ` WARNING: v${rot.generation} is live but the Grant Index could not be saved — keep this page open and retry.`)
+        if (persisted) {      // load() re-reads the index from the relay: never while ours is unsaved
+          const said = msg.textContent
+          await load()
+          const fresh = $('reg-hmsg'); if (fresh) fresh.textContent = said   // load() re-renders the panel
+        }
       } catch (err) { msg.textContent = `nothing changed: ${err.message}` }
       finally { btn.disabled = false }
     }
