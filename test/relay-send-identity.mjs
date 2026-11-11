@@ -29,7 +29,7 @@ ok('success names the resolved signer identity', match.stderr.includes(`signing 
 ok('  …and says the identity was CHECKED when EXPECT_PUBKEY is set', /matches EXPECT_PUBKEY/.test(match.stderr))
 
 const unchecked = spawnSync(process.execPath, ['mcp/tools/relay-send.mjs'], {
-  encoding: 'utf8', input: 'unchecked identity', env: { ...process.env, NVOY_NSEC: nsec, DRY_RUN: '1', EXPECT_PUBKEY: '' },
+  encoding: 'utf8', input: 'unchecked identity', env: { ...process.env, WAGGLE_BRIDGE_PUBKEY: bridge, NVOY_NSEC: nsec, DRY_RUN: '1', EXPECT_PUBKEY: '' },
 })
 ok('with no EXPECT_PUBKEY the key is still named', unchecked.status === 0 && unchecked.stderr.includes(`signing as ${MINE}`))
 ok('  …and is marked NOT verified — naming a key is not the same as checking it',
@@ -57,7 +57,7 @@ const runLive = (env, input) => new Promise(res => {
 })
 
 const relay = await startWsRelay(0)
-const live = await runLive({ NVOY_NSEC: nsec, RELAY_RELAYS: relay.url }, 'cold read-back proof')
+const live = await runLive({ WAGGLE_BRIDGE_PUBKEY: bridge, NVOY_NSEC: nsec, RELAY_RELAYS: relay.url }, 'cold read-back proof')
 const printed = live.stdout.trim()
 ok('a real send exits 0 against a live relay', live.status === 0)
 ok('  …prints the FULL 64-hex event id on stdout, alone', /^[0-9a-f]{64}$/.test(printed))
