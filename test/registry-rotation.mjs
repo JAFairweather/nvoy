@@ -102,6 +102,42 @@ await t('a failing save is retried at the end and reported, not swallowed', asyn
   assert.ok(calls >= 2)
 })
 
+await t('a rotation clears a stale verified:true — the new generation has not been read back (My Dude, PR 363)', async () => {
+  const relay = flakyRelay(), ctx = await seed(relay)             // seeded record says verified: true at v1
+  assert.equal(ctx.index[REGISTRY_PROJECTION_FIELD].verified, true)
+  // A Revoke-style call: no `verified` argument at all.
+  const out = await rotate(relay, ctx, { save: async () => {} })
+  assert.equal(out.status, 'complete')
+  assert.equal(ctx.index[REGISTRY_PROJECTION_FIELD].generation, 2)
+  assert.equal(ctx.index[REGISTRY_PROJECTION_FIELD].verified, false, 'v2 must not inherit v1\'s verified:true')
+  // ...and that unverified record, with an unchanged roster, is exactly what Check read-back handles.
+  const plan = planProjectionPublish(ctx.index, ctx.index[REGISTRY_PROJECTION_FIELD].payload)
+  assert.equal(plan.action, 'reverify')
+  assert.equal(plan.generation, 2)
+})
+
+await t('  …and a partial rotation is unverified too', async () => {
+  const relay = flakyRelay(1), ctx = await seed(relay)
+  await rotate(relay, ctx, { save: async () => {} })
+  assert.equal(ctx.index[REGISTRY_PROJECTION_FIELD].verified, false)
+})
+
+await t('a FINAL save that fails does not turn a live rotation into an error', async () => {
+  const relay = flakyRelay(), ctx = await seed(relay)
+  let calls = 0
+  // Succeeds before the grants (the key is saved), then fails every later save.
+  const out = await rotate(relay, ctx, { save: async () => { if (++calls > 1) throw new Error('final save failed') } })
+  assert.equal(out.status, 'complete', 'v2 is out and every holder was re-granted')
+  assert.equal(out.saved, false, 'but the caller is told the index was not saved')
+  assert.equal(issuedOf(ctx).generation, 2)
+  assert.equal(issuedOf(ctx).grantees.length, H.length)
+})
+
+await t('  …and when the final save succeeds the outcome says so', async () => {
+  const relay = flakyRelay(), ctx = await seed(relay)
+  assert.equal((await rotate(relay, ctx, { save: async () => {} })).saved, true)
+})
+
 await t('nothing published: the error propagates and the index is untouched', async () => {
   const relay = flakyRelay(), ctx = await seed(relay)
   relay.publish = async () => { throw new Error('relay down') }
