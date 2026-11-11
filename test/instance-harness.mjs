@@ -10,7 +10,7 @@ import { join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { sshChannelEntry } from '../mcp/tools/channel_client.mjs'
 import { fakeHerdr } from './fake-herdr.mjs'
-import { CODEX_CHANNEL_TOOLS, channelProcessUp, classifyPane, claudeArgs, codexConfigToml, codexTurnText, defaultInstructions, ensureInstructions, hasPriorSession, instructionsUpdate, MEMORY_FAILURE_RULE_MARKER, memoryFailureRule, MEMORY_RULE_MARKER, mcpConfig, RECALL_RULE_MARKER, TURN_RULE_MARKER, pendingEnvelopes, seedClaudeJson, seedSettings, serverName } from '../mcp/tools/harness_session.mjs'
+import { CODEX_CHANNEL_TOOLS, channelProcessUp, classifyPane, claudeArgs, codexConfigToml, codexTurnText, defaultInstructions, ensureInstructions, hasPriorSession, instructionsUpdate, reconnectingEntry, RECONNECT_PROXY, channelState, MEMORY_FAILURE_RULE_MARKER, memoryFailureRule, MEMORY_RULE_MARKER, mcpConfig, RECALL_RULE_MARKER, TURN_RULE_MARKER, pendingEnvelopes, seedClaudeJson, seedSettings, serverName } from '../mcp/tools/harness_session.mjs'
 
 let fails = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); if (!value) fails++ }
@@ -110,6 +110,23 @@ ok('a recall block mounts the instance\'s own reader beside its channel, over it
 const localMcp = mcpConfig({ manifest: { id: 'mc-test', recall: { local: true, bridge: '/usr/local/lib/hive-memory/connect' } }, root: '', remote: channelRemote }).mcpServers
 ok('local recall mounts the box\'s own bridge with no arguments, no key and no ssh', Object.keys(localMcp).join() === 'nvoy-mc-test,hive-memory' &&
   JSON.stringify(localMcp['hive-memory']) === JSON.stringify({ command: '/usr/local/lib/hive-memory/connect', args: [] }))
+{
+  // A release recreates the adapter and ends the ssh; the session holds the channel through the reconnecting
+  // proxy, and the supervisor watches the proxy, so a dropped ssh is a reconnect, not a session restart.
+  const entry = mcpConfig({ manifest: { id: 'mc-test' }, root: '', remote: channelRemote }).mcpServers['nvoy-mc-test']
+  const ssh = sshChannelEntry(channelRemote)
+  ok('the remote channel runs under the reconnecting proxy, wrapping exactly the ssh entry', entry.command === process.execPath &&
+    entry.args[0] === RECONNECT_PROXY && RECONNECT_PROXY.endsWith('/mcp-reconnect.mjs') && entry.args[1] === '--' &&
+    JSON.stringify(entry.args.slice(2)) === JSON.stringify([ssh.command, ...ssh.args]))
+  const proxyLine = `${entry.command} ${entry.args.join(' ')}`, sshLine = `${ssh.command} ${ssh.args.join(' ')}`
+  const table = rows => rows.map(([pid, ppid, command]) => `${pid} ${ppid} ${command}`).join('\n')
+  const s1 = channelState(table([[101, 1, 'claude'], [102, 101, proxyLine], [103, 102, sshLine]]), 101)
+  const s2 = channelState(table([[101, 1, 'claude'], [102, 101, proxyLine]]), 101)
+  ok('the supervisor finds the session\'s proxy and names its live link by pid', s1.proxy && s1.link === '103' && s2.proxy && s2.link === '')
+  ok('a bare ssh, or a proxy outside the session, is not the channel', !channelState(table([[101, 1, 'claude'], [103, 101, sshLine]]), 101).proxy &&
+    !channelState(table([[101, 1, 'claude'], [200, 1, 'claude'], [201, 200, proxyLine]]), 101).proxy && !channelState('', 101).proxy &&
+    !channelState(table([[101, 1, 'claude'], [102, 101, `grep ${RECONNECT_PROXY} --`]]), 101).proxy)
+}
 ok('without a recall block the session mounts only its channel', Object.keys(mcpConfig({ manifest: { id: 'mc-test' }, root: '', remote: channelRemote }).mcpServers).join() === 'nvoy-mc-test')
 const recallAllow = seedSettings({}, 'nvoy-mc-test', { recall: true }).permissions.allow
 ok('recall allows the two read tools by name, never the whole server', JSON.stringify(recallAllow) === '["mcp__nvoy-mc-test","mcp__hive-memory__memory_wake","mcp__hive-memory__memory_query"]' &&
@@ -394,7 +411,11 @@ const entry = Object.values(JSON.parse(readFileSync(args[args.indexOf('--mcp-con
 const saved = process.env.HOME + '/.claude/projects/' + (process.env.HOME + '/workspace').replace(/[^a-zA-Z0-9]/g, '-')
 mkdirSync(saved, { recursive: true }); writeFileSync(saved + '/fake.jsonl', '{}\\n')
 if (existsSync(process.env.HOME + '/.fake/ignoreterm')) process.on('SIGTERM', () => {})
-if (!existsSync(process.env.HOME + '/.fake/nochannel')) require('node:child_process').spawn(process.execPath, [${JSON.stringify(fakeSsh)}, ...entry.args], { stdio: 'ignore' })
+// The entry is the reconnecting proxy over ssh; run the real proxy, with the fake ssh in ssh's place.
+const sep = entry.args.indexOf('--')
+if (!existsSync(process.env.HOME + '/.fake/nochannel')) require('node:child_process').spawn(entry.command,
+  [entry.args[0], '--max-backoff-ms', '200', '--', process.execPath, ${JSON.stringify(fakeSsh)}, ...entry.args.slice(sep + 1)],
+  { stdio: ['pipe', 'ignore', require('node:fs').openSync(process.env.HOME + '/proxy.log', 'a')] })
 setInterval(() => {}, 1000)
 `)
 writeFileSync(join(fakeBin, 'tmux'), `#!/usr/bin/env node
@@ -438,7 +459,7 @@ const doctor = spawnSync(process.execPath, ['mcp/tools/claude-channel-doctor.mjs
 const doctorConfig = JSON.parse(doctor.stdout || '{}').mcpConfig
 const pureRemote = mcpConfig({ manifest: { id: 'mac-test' }, root, remote: { identity: doctorConfig?.mcpServers['nvoy-mac-test'].args.at(-2), knownHosts: resolve(knownFile), target: client.ssh_target } })
 ok('the portable channel entry is the doctor\'s client entry, from the one shared function', doctor.status === 0 && Object.keys(pureRemote.mcpServers).length === 1 &&
-  JSON.stringify(pureRemote.mcpServers['nvoy-mac-test']) === JSON.stringify(sshChannelEntry({ identity: doctorConfig.mcpServers['nvoy-mac-test'].args.at(-2), knownHosts: resolve(knownFile), target: client.ssh_target })))
+  JSON.stringify(pureRemote.mcpServers['nvoy-mac-test']) === JSON.stringify(reconnectingEntry(sshChannelEntry({ identity: doctorConfig.mcpServers['nvoy-mac-test'].args.at(-2), knownHosts: resolve(knownFile), target: client.ssh_target }))))
 const fleetRoot = mkdtempSync(join(root, 'instances-'))
 writeFileSync(join(fleetRoot, 'mac-test.json'), JSON.stringify({ ...base('mac-test'), harness }))
 const localLock = join(root, 'run-mac-test', 'claude-channel-state', 'channel.lock')
@@ -454,8 +475,9 @@ await wait(200)
 const readText = path => { try { return readFileSync(path, 'utf8') } catch { return '' } }
 const written = readText(join(harnessHome, '.nvoy-harness', 'mcp.json'))
 const writtenEntry = (() => { try { return JSON.parse(written).mcpServers['nvoy-mac-test'] } catch { return {} } })()
-ok('the portable session\'s MCP config is exactly the doctor\'s client config for this instance', !!written && JSON.stringify(JSON.parse(written)) === JSON.stringify(doctorConfig))
-ok('the portable entry is the hardened ssh tunnel and carries no secret value', writtenEntry.command === '/usr/bin/ssh' &&
+ok('the portable session\'s MCP config is the doctor\'s client entry under the reconnecting proxy', !!written &&
+  JSON.stringify(JSON.parse(written)) === JSON.stringify({ mcpServers: { 'nvoy-mac-test': reconnectingEntry(doctorConfig.mcpServers['nvoy-mac-test']) } }))
+ok('the portable entry is the proxy over the hardened ssh tunnel and carries no secret value', writtenEntry.args?.[0] === RECONNECT_PROXY && writtenEntry.args[2] === '/usr/bin/ssh' &&
   ['-F /dev/null', 'BatchMode=yes', 'IdentitiesOnly=yes', 'StrictHostKeyChecking=yes', 'GlobalKnownHostsFile=/dev/null', 'ClearAllForwardings=yes', `UserKnownHostsFile=${realpathSync(knownFile)}`, `-i ${realpathSync(keyFile)}`]
     .every(flag => writtenEntry.args.join(' ').includes(flag)) && !/PRIVATE-KEY|sk-ant-oat/.test(written + portableOut))
 const sessions = readText(join(harnessHome, '.nvoy-harness', 'tmux.sock.log')).split('\n').filter(Boolean).map(JSON.parse)
@@ -474,14 +496,26 @@ ok('ready is declared only once the channel to the fleet has stayed up', /mac-te
 const readies = () => (portableOut.match(/mac-test session ready/g) || []).length
 const fakeCtl = join(harnessHome, '.fake')
 mkdirSync(fakeCtl, { recursive: true })
-writeFileSync(join(fakeCtl, 'nochannel'), ''); writeFileSync(join(fakeCtl, 'drop'), '')
-ok('a channel that closes under a ready session (an adapter recreate) restarts the session', await waitFor(() => /the channel to the fleet closed; restarting the session to reconnect it/.test(portableOut)))
+const proxiesOf = home => (spawnSync('ps', ['-A', '-ww', '-o', 'pid=,command='], { encoding: 'utf8' }).stdout || '').split('\n')
+  .map(line => line.trim().match(/^(\d+)\s+(.*)$/)).filter(m => m && m[2].includes(RECONNECT_PROXY) && m[2].includes(realpathSync(home))).map(m => Number(m[1]))
+// The proxy redials within a fraction of a second; its own log says the link ended and was started again.
+const proxyLog = () => readText(join(harnessHome, 'proxy.log'))
+const exitsBefore = (proxyLog().match(/server exited/g) || []).length
+writeFileSync(join(fakeCtl, 'drop'), '')
+const redialled = await waitFor(() => (proxyLog().match(/server exited \(255\); restarting/g) || []).length > exitsBefore)
+await wait(500)
+ok('a channel that drops under a ready session (an adapter recreate) is redialled by the proxy, and the session is not restarted',
+  redialled && readies() === 1 && !/restarting the session/.test(portableOut))
+if (!redialled || readies() !== 1) console.log(`  redialled ${redialled} readies ${readies()}\n${proxyLog()}\n${portableOut}`)
+writeFileSync(join(fakeCtl, 'nochannel'), '')
+for (const pid of proxiesOf(keyFile)) process.kill(pid, 'SIGKILL')
+ok('only the proxy itself going away restarts the session', await waitFor(() => /the channel proxy exited; restarting the session/.test(portableOut)))
 ok('a session whose channel never starts is not declared ready, however ready its prompt looks',
   await waitFor(() => /the session is ready but its channel to the fleet never started/.test(portableOut)) && readies() === 1)
 const refusals = () => (portableOut.match(/channel to the fleet (?:closed during startup|never started)/g) || []).length, refusedBefore = refusals()
 rmSync(join(fakeCtl, 'nochannel')); writeFileSync(join(fakeCtl, 'refuse'), '')
 ok('while the fleet refuses the channel (its lock still held), no session is declared ready and each retry backs off',
-  await waitFor(() => refusals() > refusedBefore) && readies() === 1 && /next start in/.test(portableOut.slice(portableOut.indexOf('restarting the session to reconnect'))))
+  await waitFor(() => refusals() > refusedBefore) && readies() === 1 && /next start in/.test(portableOut.slice(portableOut.indexOf('the channel proxy exited'))))
 rmSync(join(fakeCtl, 'refuse'))
 const restarted = await waitFor(() => readies() === 2, 15000)
 const allSessions = readText(join(harnessHome, '.nvoy-harness', 'tmux.sock.log')).split('\n').filter(Boolean).map(JSON.parse)
@@ -532,9 +566,9 @@ process.kill(claudeRuns()[1].pid, 'SIGKILL')
 await waitFor(() => claudeRuns().length === 3 && readyCount() > readyBefore, 15000)
 const survivor = claudeRuns()[2]
 rmSync(join(herdrCtl, 'ignoreterm'))
-writeFileSync(join(herdrCtl, 'drop'), '')
-ok('a session whose channel dies is restarted, and one that outlives its launcher\'s SIGTERM is killed with its group before the next launch',
-  await waitFor(() => claudeRuns().length === 4 && /the channel to the fleet closed; restarting/.test(herdrOut), 15000) && !alive(survivor.pid))
+for (const pid of proxiesOf(keyFile)) process.kill(pid, 'SIGKILL')
+ok('a session whose channel proxy dies is restarted, and one that outlives its launcher\'s SIGTERM is killed with its group before the next launch',
+  await waitFor(() => claudeRuns().length === 4 && /the channel proxy exited; restarting/.test(herdrOut), 15000) && !alive(survivor.pid))
 await waitFor(() => herdrFake.state().panes['w1:p1']?.name === 'mactest')
 herdrFake.set('w1:p1', { foreground: 'claude' })
 process.kill(claudeRuns()[3].pid, 'SIGKILL')
