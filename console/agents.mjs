@@ -275,8 +275,10 @@ function wireRegistryPanel() {
           survivors: plan.grantees.map(pub => ({ pub, terms: registryTerms() })),
           save: () => saveGrantIndex(state.relay, state.signer, state.index),
         })
-        state.index.nvoy_ledger = appendLedger(state.index,
-          rotatedEvent({ scope: scopeId, from_v: plan.from, to_v: rot.generation, survivors: rot.regranted }))
+        try {
+          state.index.nvoy_ledger = appendLedger(state.index,
+            rotatedEvent({ scope: scopeId, from_v: plan.from, to_v: rot.generation, survivors: rot.regranted }))
+        } catch (error) { warn += ` The Ledger row could not be written (${error.message}); the rotation itself went through.` }
         // The rotation is out. From here a failure is about PERSISTING it, and must never be worded as
         // "nothing changed".
         live = rot.generation

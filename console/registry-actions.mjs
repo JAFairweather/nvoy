@@ -13,6 +13,16 @@ import { appendLedger, grantedEvent, revokedEvent } from './ledgerlog.mjs'
 import { REGISTRY_PROJECTION_FIELD, REGISTRY_SCOPE, granteesOf } from './registry.mjs'
 import { rotateProjection } from './registry-rotate.mjs'
 
+/**
+ * Append a Ledger row without letting a Ledger failure escape. By the time the Ledger is written the
+ * irreversible step has happened, so a malformed or oversized log must degrade to a note, never to a
+ * throw that discards the in-memory repair state. Returns '' on success, or a sentence for the message.
+ */
+function ledgerRow(index, make) {
+  try { index.nvoy_ledger = appendLedger(index, make()); return '' }
+  catch (error) { return ` The Ledger row could not be written (${error.message}); the action itself went through.` }
+}
+
 const unb64 = (s) => Uint8Array.from(atob(s), c => c.charCodeAt(0))
 const issuedFor = (index, scopeId) => (index.issued ?? []).find(e => e?.scope === scopeId) ?? null
 
@@ -64,14 +74,14 @@ export async function grantRead(ctx, pub, scopeId) {
   }
   // The gift wrap is out: the runtime holds the grant whether or not our bookkeeping survives.
   issued.grantees = [...granteesOf(issued), pub]
-  ctx.index.nvoy_ledger = appendLedger(ctx.index, grantedEvent({
+  const ledgerNote = ledgerRow(ctx.index, () => grantedEvent({
     scope: issued.scope, agent: pub, v: issued.v, terms: { nvoy: 1, ...terms }, name: REGISTRY_SCOPE,
   }))
   try { await ctx.save() } catch (error) {
     return { outcome: 'granted-unsaved', saved: false, message: `${ctx.name(pub)} was granted read (v${issued.v}) — the grant is out — but the Grant Index could not be saved `
-      + `(${error.message}). Keep this page open and press Retry saving the Grant Index; do not grant again.` }
+      + `(${error.message}). Keep this page open and press Retry saving the Grant Index; do not grant again.` + ledgerNote }
   }
-  return { outcome: 'granted', saved: true, message: `${ctx.name(pub)} can now read v${issued.v}.` }
+  return { outcome: 'granted', saved: true, message: `${ctx.name(pub)} can now read v${issued.v}.` + ledgerNote }
 }
 
 /** Revoke a holder: rotate past them, re-grant the rest, courtesy notice last. */
@@ -94,7 +104,7 @@ export async function revokeRead(ctx, pub, scopeId, payload) {
     await sendRevocationNotice(ctx.relay, ctx.signer, pub, { scopeId: issued.scope, reason: 'the registry projection read was revoked' })
     noticed = true
   } catch { /* a courtesy: the revocation itself is the rotation and is already recorded */ }
-  ctx.index.nvoy_ledger = appendLedger(ctx.index, revokedEvent({
+  const ledgerNote = ledgerRow(ctx.index, () => revokedEvent({
     scope: issued.scope, agent: pub, v: rot.generation, reason: 'the registry projection read was revoked', notice: noticed ? true : null,
   }))
   let persisted = rot.saved
@@ -105,7 +115,7 @@ export async function revokeRead(ctx, pub, scopeId, payload) {
     : `${ctx.name(pub)} is revoked (v${rot.generation}).` + (noticed ? '' : ' The courtesy notice could not be sent; the revocation stands.')
   return {
     outcome: rot.status === 'partial' ? 'revoked-partial' : 'revoked', saved: persisted, rotation: rot,
-    message: head + ' The new generation is unverified — press Check read-back.'
+    message: head + ledgerNote + ' The new generation is unverified — press Check read-back.'
       + (persisted ? '' : ` WARNING: v${rot.generation} is live but the Grant Index could not be saved — keep this page open and press Retry saving the Grant Index.`),
   }
 }

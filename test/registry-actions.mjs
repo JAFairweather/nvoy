@@ -140,6 +140,39 @@ await t('a save-only retry after an unsaved grant saves WITHOUT publishing anoth
   assert.ok(saves >= 3)
 })
 
+// Dennis, PR 363: a malformed (non-array) Ledger made appendLedger throw AFTER the action was live.
+await t('a malformed Ledger does not turn a live Grant read into a throw: the holder is recorded, saved, and the note says so', async () => {
+  const relay = relayWith(), { index, scopeId } = await seed(relay, { holders: [] })
+  index.nvoy_ledger = { not: 'an array' }
+  let saved = 0
+  const r = await grantRead(ctxFor(relay, index, { save: async () => { saved++ } }), H[0], scopeId)
+  assert.equal(r.outcome, 'granted')
+  assert.match(r.message, /Ledger row could not be written/)
+  assert.deepEqual(index.issued[0].grantees, [H[0]])
+  assert.equal(saved, 1, 'the index was still saved')
+  assert.equal(relay.wraps, 1)
+})
+
+await t('  …and the same with the save failing too: still granted-unsaved, the repair state is kept, nothing throws', async () => {
+  const relay = relayWith(), { index, scopeId } = await seed(relay, { holders: [] })
+  index.nvoy_ledger = { corrupt: true }
+  const r = await grantRead(ctxFor(relay, index, { save: async () => { throw new Error('save failed') } }), H[0], scopeId)
+  assert.equal(r.outcome, 'granted-unsaved')
+  assert.match(r.message, /Ledger row could not be written/)
+  assert.deepEqual(index.issued[0].grantees, [H[0]])
+})
+
+await t('a malformed Ledger does not turn a live Revoke into a throw: v2 is recorded and the note says so', async () => {
+  const relay = relayWith(), { index, scopeId } = await seed(relay, { verified: true })
+  index.nvoy_ledger = { not: 'an array' }
+  const r = await revokeRead(ctxFor(relay, index), H[0], scopeId, payload)
+  assert.equal(r.outcome, 'revoked')
+  assert.match(r.message, /Ledger row could not be written/)
+  assert.equal(index.issued[0].v, 2)
+  assert.ok(!index.issued[0].grantees.includes(H[0]))
+  assert.equal(rec(index).verified, false)
+})
+
 // ------------------------------------------------ Revoke
 await t('a clean Revoke rotates, drops the revoked holder, and the new generation is unverified', async () => {
   const relay = relayWith(), { index, scopeId } = await seed(relay, { verified: true })
