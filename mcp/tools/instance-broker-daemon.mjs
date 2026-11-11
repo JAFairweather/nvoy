@@ -6,7 +6,7 @@
 
 import { appendFileSync, existsSync, readdirSync, renameSync, readFileSync, lstatSync, rmSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { claimPidLock } from './pid_lock.mjs'
+import { claimLeaseLock } from './lease_lock.mjs'
 import { spawn, spawnSync } from 'node:child_process'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { isTerminalReplyFailure, loadTerminalReplyIds, recordTerminalReply, terminalReplyReason } from './reply_retry.mjs'
@@ -33,15 +33,26 @@ if (!process.env.NVOY_BROKER_CREDENTIAL) die('broker credential path is unavaila
 // gone — a stale lock from a killed process must not become its own outage — and fail closed on a
 // malformed or foreign lock. This is the shape claude-channel.mjs already uses.
 const lockPath = resolve(manifest.stateDir, 'broker-daemon.lock')
-// The repo's shared pid lock (pid_lock.mjs): exclusive create, reclaim only when the recorded pid is
-// demonstrably gone, fail closed on a malformed or foreign lock or an EPERM holder, and treat a lock
-// naming this very process as stale (a new container reuses pids, #217). `program` makes a recorded
-// pid that now runs something else a stranger, so a lock outliving its container cannot wedge us.
+// A LEASE lock (lease_lock.mjs), not a pid lock. The broker's Compose service gives each container a
+// private PID namespace over a shared state volume, so two overlapping broker containers can both be
+// PID 1: a pid check would call the other's live lock "ours" and steal it, and /proc cannot see across
+// the boundary. The holder instead keeps touching the lock file; any container sees a fresh mtime. On
+// the same host (same hostname, same PID namespace) a dead holder is still reclaimed at once.
 //
 // Refusing is correct; refusing SILENTLY is the failure mode this exists to prevent, so the reason
-// goes to stderr and the exit status is non-zero.
+// goes to stderr and the exit status is non-zero. A holder that loses its lease stops (exit 70).
+//
+// NVOY_LOCK_HOSTNAME and NVOY_BROKER_LOCK_TTL_MS exist so a test can stand in for two containers on
+// one machine and shorten the lease; both are validated and neither widens what is accepted.
+const lockTtl = Number(process.env.NVOY_BROKER_LOCK_TTL_MS || 15000)
+if (!Number.isInteger(lockTtl) || lockTtl < 1000 || lockTtl > 300000) die('NVOY_BROKER_LOCK_TTL_MS must be 1000..300000')
 let releaseLock
-try { releaseLock = claimPidLock(lockPath, manifest.id, 'broker daemon', { program: 'instance-broker-daemon.mjs' }) } catch (error) { die(error.message) }
+try {
+  releaseLock = claimLeaseLock(lockPath, manifest.id, 'broker daemon', {
+    ttlMs: lockTtl, program: 'instance-broker-daemon.mjs',
+    ...(process.env.NVOY_LOCK_HOSTNAME ? { host: process.env.NVOY_LOCK_HOSTNAME } : {}),
+  })
+} catch (error) { die(error.message) }
 process.on('exit', () => releaseLock())
 
 // A proposal whose admission receipt has died can never be revived, so re-proposing it re-queries
