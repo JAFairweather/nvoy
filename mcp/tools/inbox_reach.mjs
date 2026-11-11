@@ -1,0 +1,114 @@
+// inbox_reach.mjs — decide whether an inbox read is a RESULT or merely a silence (#382).
+//
+// "No messages" and "I could not see whether there are messages" print identically and read
+// identically, and only one of them is good news. Everything here exists to keep them apart, as
+// a pure function so both directions can be asserted without a live signer or a live relay.
+
+// A wrap that is simply not addressed to this key fails inside nip44 with a decrypt error — that
+// is the normal case and says nothing. A NIP-46 signer failing is different: something was shown
+// to this run and it was not permitted, or not able, to look. Those come back in exactly three
+// shapes from nip46-signer.mjs — a remote refusal (`bunker: <error>`), a timeout, and a closed
+// signer. Matching the shape rather than "any error" is the whole point: broadening this to catch
+// everything would mark every foreign wrap as a refusal and make the tool cry wolf on every run.
+export const isSignerFault = reason =>
+  /^bunker: /.test(String(reason ?? '')) || /^nip46 .*(timed out|closed)$/.test(String(reason ?? ''))
+
+// Relay URLs compare only on what URL syntax guarantees equal: scheme and host are case-insensitive
+// (and a default port is the same as none), and an empty path is the root. The path and query are
+// NOT — a server may route /Inbox and /inbox to different endpoints — so they are kept byte for
+// byte, and a trailing slash on a non-root path is a different path. Something that is not a URL
+// compares as itself, trimmed.
+export const normalizeRelay = url => {
+  const raw = String(url ?? '').trim()
+  try {
+    const u = new URL(raw)
+    return `${u.protocol}//${u.host}${u.pathname === '/' ? '' : u.pathname}${u.search}`
+  } catch { return raw }
+}
+
+// The relay tags of the newest kind:10050 among those returned (replaceable: newest wins).
+export const advertisedRelays = events => {
+  const newest = [...events].sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))[0]
+  return (newest?.tags || []).filter(tag => tag[0] === 'relay' && tag[1]).map(tag => tag[1])
+}
+
+// Returns { code, inconclusive[], notes[] }. code is 0 or 3; the caller owns exit 1
+// (misconfiguration), which is decided long before anything here is known.
+export function inboxVerdict({
+  signerRefusals = [], envelopesSeen = 0, opened = 0, reachedWraps = [], relayCount = 0,
+  unreachable = [], answered10050 = [], dmRelayLists = 0, dmRelays = [], total = 0,
+} = {}) {
+  const inconclusive = [], notes = []
+
+  if (signerRefusals.length) {
+    inconclusive.push(`the signer refused or failed on ${signerRefusals.length} of ${envelopesSeen} envelope(s), ` +
+      `so an unknown number of messages were never opened — first: ${signerRefusals[0]}`)
+  }
+  // The classifier above matches three known shapes. There is a fourth it cannot match:
+  // nip46-signer.mjs rejects verbatim whatever `pool.publish` threw, and its `finalizeEvent` /
+  // `nip44.encrypt` calls sit outside that try, so an arbitrary "WebSocket is not open" rejects an
+  // RPC with no recognisable prefix. Every such failure was counted as somebody else's wrap and
+  // the run exited 0.
+  //
+  // This closes it without widening the classifier, because it does not read the error text at
+  // all. What makes it sound is the `#p` filter on the message query: everything counted here was
+  // ADDRESSED TO THIS KEY, so "all of it was unopenable" is a statement about this run, not about
+  // strangers' mail.
+  //
+  // Deliberate: an alarm, not a note, even though junk persistently p-tagged at the identity would
+  // fire it every run. Junk and an unrecognised signer fault are indistinguishable from here by
+  // construction, and that indistinguishability is precisely what exit 3 exists to report. If junk
+  // becomes chronic the remedy is to stop accepting it, not to stop saying so.
+  if (envelopesSeen && !opened && !signerRefusals.length) {
+    inconclusive.push(`${envelopesSeen} envelope(s) addressed to this key were read and none opened, ` +
+      'with no signer fault recognised — this is not an empty inbox')
+  }
+  if (!reachedWraps.length) {
+    inconclusive.push(`no relay answered the message query, so nothing was read — ${unreachable.join('; ') || 'no relays configured'}`)
+  }
+  // Only when the read came back empty. A kind:10050 is where a sender is told to deliver; without
+  // one, an empty inbox is not evidence of an empty inbox — it is an address nobody could reach.
+  // If messages DID arrive, the absent list is a curiosity, not a doubt, so it drops to a note.
+  if (!total && answered10050.length && !dmRelayLists) {
+    inconclusive.push('this identity publishes no kind:10050 DM relay list, so a sender has nowhere to deliver to. ' +
+      'That is not an empty inbox, it is an unreachable one')
+  }
+  // A list that EXISTS is not yet evidence either. NIP-17 has senders publish only to the relays in
+  // the kind:10050, so an empty read is clean only if every relay the list advertises was among
+  // those that answered the wrap query. A list pointing elsewhere, or naming no relay at all, means
+  // this run looked in places mail was never sent to.
+  if (!total && dmRelayLists) {
+    const answered = new Set(reachedWraps.map(normalizeRelay))
+    const advertised = [...new Set(dmRelays.map(normalizeRelay).filter(Boolean))]
+    if (!advertised.length) {
+      inconclusive.push('the kind:10050 DM relay list names no relay, so a sender has nowhere to deliver to. ' +
+        'That is not an empty inbox, it is an unreachable one')
+    } else {
+      const missed = advertised.filter(url => !answered.has(url))
+      if (missed.length) {
+        inconclusive.push(`the kind:10050 DM relay list advertises ${missed.length} relay(s) this run did not query and ` +
+          `get an answer from, so mail sent there was never looked for — ${missed.join(', ')}`)
+      }
+    }
+  }
+  if (reachedWraps.length && unreachable.length) {
+    notes.push(`partial reach: ${reachedWraps.length}/${relayCount} relay(s) answered — ${unreachable.join('; ')}`)
+  }
+  if (total && answered10050.length && !dmRelayLists) {
+    notes.push('no kind:10050 for this identity, yet messages arrived — senders are reaching you by some other route')
+  }
+  // `answered10050` gates both branches above, so when nobody answers that query the whole
+  // reachability question was skipped — and said nothing, which is pass-by-silence one level up.
+  // A note rather than exit 3: the doubt is about the check, not about the inbox.
+  // On an EMPTY read that is not a note. NIP-17 senders deliver only to the relays in the kind:10050,
+  // and with no list obtained from anywhere the delivery relays are unknown, so "nothing at the
+  // relays I asked" proves nothing about the relays that matter. With messages in hand the runtime
+  // evidently works, and it stays a note.
+  if (reachedWraps.length && !answered10050.length && !dmRelayLists) {
+    if (total) notes.push('no relay answered the kind:10050 query, so DM reachability was not checked')
+    else inconclusive.push('no relay answered the kind:10050 query, so the relays senders deliver to are unknown. ' +
+      'An empty read of the relays asked is not an empty inbox')
+  }
+
+  return { code: inconclusive.length ? 3 : 0, inconclusive, notes }
+}
