@@ -398,8 +398,10 @@ export function buildDreamPacket({
   ranAt = Math.floor(Date.now() / 1000),
   ledgerRef = null,
   coherenceScore = null,
-  previousCoherenceScore = null,
+  coherenceBefore = null,
+  coherenceAfter = null,
   historyRecords = [],
+  historyComplete = false,
   triggers = null,
   plan = null,
   submitted = [],
@@ -506,18 +508,20 @@ export function buildDreamPacket({
   }))
 
   const packetId = `dream-${writeSeqAfter}`
-  // These are changes since the preceding completed curation, scoped to the room whose
-  // packet is published. Viewer counters are lifetime totals and cannot describe a dream.
+  // Count the complete post-write history since the preceding completed curation.
+  // A missing post-write snapshot is unknown, never a measured zero.
   const windowStart = Number(lastCuratedAt || 0)
   const history = (Array.isArray(historyRecords) ? historyRecords : [])
     .filter(r => r && r.scope === allowedScope && Number.isFinite(r.created_at) && r.created_at <= ranAt)
-    .sort((a, b) => a.created_at - b.created_at || String(a.event_id || '').localeCompare(String(b.event_id || '')))
+    .sort((a, b) => a.created_at - b.created_at || String(b.event_id || '').localeCompare(String(a.event_id || '')))
   const inWindow = r => r.created_at > windowStart
-  const withdrawn = history.filter(r => inWindow(r) && (r.status === 'withdrawn' || r.verification === 'withdrawn')).length
-  const expired = history.filter(r => r.status !== 'withdrawn' && r.verification !== 'withdrawn' &&
+  const later = (next, r) => next.event_id !== r.event_id &&
+    (next.created_at > r.created_at || (next.created_at === r.created_at && String(next.event_id) < String(r.event_id)))
+  const withdrawn = historyComplete ? history.filter(r => inWindow(r) && (r.status === 'withdrawn' || r.verification === 'withdrawn')).length : null
+  const expired = historyComplete ? history.filter(r => r.status !== 'withdrawn' && r.verification !== 'withdrawn' &&
     Number.isFinite(r.expires_at) && r.expires_at > windowStart && r.expires_at <= ranAt &&
-    !history.some(next => next.author_pubkey === r.author_pubkey && next.d === r.d && next.created_at > r.created_at &&
-      next.created_at <= r.expires_at)).length
+    !history.some(next => next.author_pubkey === r.author_pubkey && next.d === r.d && later(next, r) &&
+      next.created_at <= r.expires_at)).length : null
   const heads = new Map()
   let superseded = 0
   for (const r of history) {
@@ -538,13 +542,14 @@ export function buildDreamPacket({
   ].filter(p => p.scope === allowedScope && submittedByD.has(p.template?.tags?.find(t => t[0] === 'd')?.[1] ||
     `${p.topic}:${p.scope}:${p.slug}`)).flatMap(p => Array.isArray(p.source_event_ids) ? p.source_event_ids : []))].length
   const merged = changes.filter(c => c.kind === 'promotion' || c.kind === 'distillation').length
-  const beforeScore = Number.isFinite(previousCoherenceScore) ? previousCoherenceScore : null
-  const afterScore = Number.isFinite(coherenceScore) ? coherenceScore : null
+  const beforeScore = Number.isFinite(coherenceBefore) ? coherenceBefore : null
+  const afterScore = Number.isFinite(coherenceAfter) ? coherenceAfter : null
   const stats = {
-    window_start: windowStart || null,
+    window_start: historyComplete ? windowStart || null : null,
+    window_end: historyComplete ? ranAt : null,
     claims_merged: merged,
-    claims_superseded: superseded,
-    retired: { withdrawn, expired, folded, total: withdrawn + expired + folded },
+    claims_superseded: historyComplete ? superseded : null,
+    retired: { withdrawn, expired, folded, total: historyComplete ? withdrawn + expired + folded : null },
     coherence: { before: beforeScore, after: afterScore,
       delta: beforeScore !== null && afterScore !== null ? Math.round((afterScore - beforeScore) * 10) / 10 : null },
   }
@@ -1589,6 +1594,44 @@ export function formatCuratorBriefing({
   return lines.join('\n')
 }
 
+async function readPostCycleSnapshot(reader, expectedWriteSeq, pageLimit, pageSize, nowSec) {
+  const start = await reader.callReadTool('memory_wake', {})
+  if (Number(start?.store_state?.write_seq) !== expectedWriteSeq) return null
+  const historyRecords = []
+  const records = []
+  let cursor = '0'
+  let pages = 0
+  while (cursor !== null && pages < pageLimit) {
+    const page = await reader.callReadTool('memory_query', {
+      limit: pageSize,
+      format: 'full',
+      include_history: true,
+      ...(cursor !== '0' ? { cursor } : {}),
+    })
+    for (const r of Array.isArray(page?.records) ? page.records : []) {
+      historyRecords.push(r)
+      if ((r.is_current === undefined || r.is_current === true) && r.status !== 'withdrawn' && r.verification === 'accepted') {
+        records.push(r)
+      }
+    }
+    cursor = typeof page?.next_cursor === 'string' && page.next_cursor ? page.next_cursor : null
+    pages += 1
+  }
+  if (cursor !== null) return null
+  const end = await reader.callReadTool('memory_wake', {})
+  if (Number(end?.store_state?.write_seq) !== expectedWriteSeq) return null
+  const coherence = computeCoherence({
+    records,
+    history_records: historyRecords,
+    agent_roster: Array.isArray(end?.agent_roster) ? end.agent_roster : [],
+    recent_activity: Array.isArray(end?.recent_activity) ? end.recent_activity : [],
+    store_state: end.store_state,
+    now_sec: nowSec,
+    history_complete: true,
+  })
+  return { historyRecords, coherenceScore: Number.isFinite(coherence?.score) ? coherence.score : null }
+}
+
 // Executes a full Curator Dream & Nightmare cycle over the daemon's reader and writer sockets.
 export async function runCuratorCycle({
   readerSocket,
@@ -1850,13 +1893,21 @@ export async function runCuratorCycle({
           })
 
       if (submitted.length > 0 && resolvedPacketDir) {
+        let postSnapshot = null
+        try {
+          postSnapshot = await readPostCycleSnapshot(reader, postWriteSeq, pageLimit, effectivePageSize, nowSec)
+        } catch {
+          // The packet still records known submitted changes; unknown counters remain null.
+        }
         dreamPacket = buildDreamPacket({
           lastCuratedWriteSeq: effectiveLastCuratedWriteSeq,
           lastCuratedAt: effectiveLastCuratedAt,
           writeSeqBefore: Number(storeState.write_seq || 0),
           writeSeqAfter: nextCuratedWriteSeq,
-          previousCoherenceScore: persisted?.coherence_score ?? null,
-          historyRecords,
+          coherenceBefore: triggerEval.coherence_score,
+          coherenceAfter: postSnapshot?.coherenceScore ?? null,
+          historyRecords: postSnapshot?.historyRecords || [],
+          historyComplete: Boolean(postSnapshot),
           ranAt: nowSec,
           ledgerRef: ledgerPath ? `${ledgerPath}#write_seq=${nextCuratedWriteSeq}` : null,
           coherenceScore: triggerEval.coherence_score,

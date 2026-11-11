@@ -1282,12 +1282,18 @@ await test('writeDreamPacket writes 0640 global-scope packets, strips @mentions/
       ranAt: 1794225262,
       ledgerRef: '/var/lib/hive-memory-curator/consolidation-ledger.jsonl#write_seq=1023',
       coherenceScore: 75.6,
-      previousCoherenceScore: 74.1,
+      coherenceBefore: 74.1,
+      coherenceAfter: 75.6,
+      historyComplete: true,
       historyRecords: [
         { scope: `room:${GLOBAL_CH}`, author_pubkey: 'a'.repeat(64), d: 'old', event_id: '01'.repeat(32), created_at: 1794224900, expires_at: null },
         { scope: `room:${GLOBAL_CH}`, author_pubkey: 'a'.repeat(64), d: 'old', event_id: '02'.repeat(32), created_at: 1794225100, expires_at: null },
         { scope: `room:${GLOBAL_CH}`, author_pubkey: 'b'.repeat(64), d: 'gone', event_id: '03'.repeat(32), created_at: 1794225200, status: 'withdrawn', expires_at: 1794225250 },
         { scope: `room:${GLOBAL_CH}`, author_pubkey: 'c'.repeat(64), d: 'aged', event_id: '04'.repeat(32), created_at: 1794224800, expires_at: 1794225200 },
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'e'.repeat(64), d: 'current', event_id: '03'.repeat(32), created_at: 1794224900, expires_at: null },
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'e'.repeat(64), d: 'current', event_id: claimIdGlobal, created_at: 1794225250, expires_at: null },
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'f'.repeat(64), d: 'same-second', event_id: 'ff'.repeat(32), created_at: 1794224800, expires_at: 1794225200 },
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'f'.repeat(64), d: 'same-second', event_id: '00'.repeat(32), created_at: 1794224800, expires_at: null },
         { scope: 'room:private-other-room', author_pubkey: 'd'.repeat(64), d: 'private', event_id: '05'.repeat(32), created_at: 1794225100, status: 'withdrawn', expires_at: 1794225200 },
       ],
       triggers: { reasons: ['synaptic_volume(delta=69>=20)'] },
@@ -1326,8 +1332,14 @@ await test('writeDreamPacket writes 0640 global-scope packets, strips @mentions/
     assert.equal(pkt.changes[0].claim_event_id, claimIdGlobal)
     assert.deepEqual(pkt.stats.retired, { withdrawn: 1, expired: 1, folded: 2, total: 4 })
     assert.equal(pkt.stats.claims_merged, 1)
-    assert.equal(pkt.stats.claims_superseded, 1)
+    assert.equal(pkt.stats.claims_superseded, 2, 'include this cycle\'s replacement in the post-write observation')
     assert.equal(pkt.stats.coherence.delta, 1.5)
+    const unknown = buildDreamPacket({ writeSeqAfter: 1023, ranAt: 1794225262, plan: {
+      promotions: [{ scope: `room:${GLOBAL_CH}`, topic: 'herd-infra', slug: 'unknown', claim: 'Known merge',
+        template: { tags: [['d', `herd-infra:room:${GLOBAL_CH}:unknown`]] } }], distillations: [] },
+      submitted: [{ id: claimIdGlobal, d: `herd-infra:room:${GLOBAL_CH}:unknown` }] })
+    assert.equal(unknown.stats.claims_superseded, null, 'incomplete history is unknown rather than measured zero')
+    assert.equal(unknown.stats.retired.total, null)
     assert(!pkt.changes[0].summary.includes('0d7ac776bf6e9cd0b5f6216ea2f59ac7932a9948'), 'raw 64-hex commit SHA must be sanitized in summary')
     assert(!pkt.changes[0].summary.includes('@mydude'), '@mention syntax must be stripped from packet summary')
     assert(!pkt.changes[0].summary.includes('https://'), 'raw URLs must be stripped from packet summary')
@@ -1376,9 +1388,10 @@ await test('writeDreamPacket writes 0640 global-scope packets, strips @mentions/
     assert.deepEqual(goodRes.record.changes[0], pkt.changes[0], 'verifier must copy each packet change verbatim including change_id, d, topic, and source_count')
     const buzzPost = formatDreamBuzzPost(goodRes.record)
     assert(!buzzPost.includes('@mydude') && !buzzPost.includes('https://'), 'formatted Buzz post must contain no @mentions or URLs')
-    assert(!buzzPost.includes('dream-1023') && !buzzPost.includes('Consolidated Changes') && !buzzPost.includes('validation'), 'formatted Buzz post must be journey-only without dream ID, validation metadata, or Consolidated Changes list')
+    assert(buzzPost.endsWith('Dream ID: dream-1023'), 'published dream must identify its exact packet for the Cyber Times')
+    assert(!buzzPost.includes('Consolidated Changes') && !buzzPost.includes('validation'), 'formatted Buzz post must omit validation metadata and Consolidated Changes list')
     const seedBuzzPost = formatDreamBuzzPost(seedRes.record)
-    assert(!/\d/.test(seedBuzzPost), 'formatted Buzz post from story_seed must contain zero statistics, sequence numbers, or counts')
+    assert(!/\d/.test(seedBuzzPost.split('\n\nDream ID: ')[0]), 'formatted dream story must contain zero statistics, sequence numbers, or counts')
 
     // Unsanitized packet summary with @mention or URL fails closed in verifier
     const dirtyPkt = {
@@ -1543,6 +1556,8 @@ await test('runCuratorCycle does not advance cursor or ledger when writeDreamPac
     const stagedState = readCuratorStateFile(stateFile)
     assert.equal(stagedState.last_curated_write_seq, 0, 'cursor must not advance when packet write fails')
     assert(stagedState.pending_dream_packet, 'pending_dream_packet must be staged in curator-state.json for retry recovery')
+    assert.notEqual(stagedState.pending_dream_packet.stats.claims_superseded, null, 'complete post-write history measures replacements')
+    assert.notEqual(stagedState.pending_dream_packet.stats.coherence.after, null, 'post-write coherence is measured before staging')
     const consLedgerPath = join(tmp, 'consolidation-ledger.jsonl')
     assert.equal(readConsolidationLedger(consLedgerPath).length, 0, 'consolidation ledger must not advance before packet write succeeds')
 
