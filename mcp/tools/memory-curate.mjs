@@ -392,11 +392,14 @@ export function weaveDreamStory({
 
 export function buildDreamPacket({
   lastCuratedWriteSeq = 0,
+  lastCuratedAt = 0,
   writeSeqBefore = 0,
   writeSeqAfter = 0,
   ranAt = Math.floor(Date.now() / 1000),
   ledgerRef = null,
   coherenceScore = null,
+  previousCoherenceScore = null,
+  historyRecords = [],
   triggers = null,
   plan = null,
   submitted = [],
@@ -503,6 +506,48 @@ export function buildDreamPacket({
   }))
 
   const packetId = `dream-${writeSeqAfter}`
+  // These are changes since the preceding completed curation, scoped to the room whose
+  // packet is published. Viewer counters are lifetime totals and cannot describe a dream.
+  const windowStart = Number(lastCuratedAt || 0)
+  const history = (Array.isArray(historyRecords) ? historyRecords : [])
+    .filter(r => r && r.scope === allowedScope && Number.isFinite(r.created_at) && r.created_at <= ranAt)
+    .sort((a, b) => a.created_at - b.created_at || String(a.event_id || '').localeCompare(String(b.event_id || '')))
+  const inWindow = r => r.created_at > windowStart
+  const withdrawn = history.filter(r => inWindow(r) && (r.status === 'withdrawn' || r.verification === 'withdrawn')).length
+  const expired = history.filter(r => r.status !== 'withdrawn' && r.verification !== 'withdrawn' &&
+    Number.isFinite(r.expires_at) && r.expires_at > windowStart && r.expires_at <= ranAt &&
+    !history.some(next => next.author_pubkey === r.author_pubkey && next.d === r.d && next.created_at > r.created_at &&
+      next.created_at <= r.expires_at)).length
+  const heads = new Map()
+  let superseded = 0
+  for (const r of history) {
+    const key = `${r.author_pubkey || ''}:${r.d || ''}`
+    if (r.status === 'withdrawn' || r.verification === 'withdrawn') {
+      heads.delete(key)
+    } else {
+      const prior = heads.get(key)
+      if (inWindow(r) && prior && (prior.expires_at === null || prior.expires_at === undefined || prior.expires_at > r.created_at)) {
+        superseded++
+      }
+      heads.set(key, r)
+    }
+  }
+  const folded = [...new Set([
+    ...(Array.isArray(plan?.promotions) ? plan.promotions : []),
+    ...(Array.isArray(plan?.distillations) ? plan.distillations : []),
+  ].filter(p => p.scope === allowedScope && submittedByD.has(p.template?.tags?.find(t => t[0] === 'd')?.[1] ||
+    `${p.topic}:${p.scope}:${p.slug}`)).flatMap(p => Array.isArray(p.source_event_ids) ? p.source_event_ids : []))].length
+  const merged = changes.filter(c => c.kind === 'promotion' || c.kind === 'distillation').length
+  const beforeScore = Number.isFinite(previousCoherenceScore) ? previousCoherenceScore : null
+  const afterScore = Number.isFinite(coherenceScore) ? coherenceScore : null
+  const stats = {
+    window_start: windowStart || null,
+    claims_merged: merged,
+    claims_superseded: superseded,
+    retired: { withdrawn, expired, folded, total: withdrawn + expired + folded },
+    coherence: { before: beforeScore, after: afterScore,
+      delta: beforeScore !== null && afterScore !== null ? Math.round((afterScore - beforeScore) * 10) / 10 : null },
+  }
   const storySeed = weaveDreamStory({
     id: packetId,
     changes,
@@ -526,6 +571,7 @@ export function buildDreamPacket({
     triggers: Array.isArray(triggers?.reasons) ? triggers.reasons : [],
     topic_eigenvectors: normalizedEigenvectors,
     story_seed: storySeed,
+    stats,
     changes,
   }
 }
@@ -1806,8 +1852,11 @@ export async function runCuratorCycle({
       if (submitted.length > 0 && resolvedPacketDir) {
         dreamPacket = buildDreamPacket({
           lastCuratedWriteSeq: effectiveLastCuratedWriteSeq,
+          lastCuratedAt: effectiveLastCuratedAt,
           writeSeqBefore: Number(storeState.write_seq || 0),
           writeSeqAfter: nextCuratedWriteSeq,
+          previousCoherenceScore: persisted?.coherence_score ?? null,
+          historyRecords,
           ranAt: nowSec,
           ledgerRef: ledgerPath ? `${ledgerPath}#write_seq=${nextCuratedWriteSeq}` : null,
           coherenceScore: triggerEval.coherence_score,

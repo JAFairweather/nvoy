@@ -1276,11 +1276,20 @@ await test('writeDreamPacket writes 0640 global-scope packets, strips @mentions/
     const claimIdPrivate = 'b2'.repeat(32)
 
     const pkt = buildDreamPacket({
+      lastCuratedAt: 1794225000,
       writeSeqBefore: 1000,
       writeSeqAfter: 1023,
       ranAt: 1794225262,
       ledgerRef: '/var/lib/hive-memory-curator/consolidation-ledger.jsonl#write_seq=1023',
       coherenceScore: 75.6,
+      previousCoherenceScore: 74.1,
+      historyRecords: [
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'a'.repeat(64), d: 'old', event_id: '01'.repeat(32), created_at: 1794224900, expires_at: null },
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'a'.repeat(64), d: 'old', event_id: '02'.repeat(32), created_at: 1794225100, expires_at: null },
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'b'.repeat(64), d: 'gone', event_id: '03'.repeat(32), created_at: 1794225200, status: 'withdrawn', expires_at: 1794225250 },
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'c'.repeat(64), d: 'aged', event_id: '04'.repeat(32), created_at: 1794224800, expires_at: 1794225200 },
+        { scope: 'room:private-other-room', author_pubkey: 'd'.repeat(64), d: 'private', event_id: '05'.repeat(32), created_at: 1794225100, status: 'withdrawn', expires_at: 1794225200 },
+      ],
       triggers: { reasons: ['synaptic_volume(delta=69>=20)'] },
       plan: {
         promotions: [
@@ -1315,6 +1324,10 @@ await test('writeDreamPacket writes 0640 global-scope packets, strips @mentions/
     assert.equal(pkt.id, 'dream-1023')
     assert.equal(pkt.changes.length, 1, 'non-global room claims must be strictly excluded from dream packet')
     assert.equal(pkt.changes[0].claim_event_id, claimIdGlobal)
+    assert.deepEqual(pkt.stats.retired, { withdrawn: 1, expired: 1, folded: 2, total: 4 })
+    assert.equal(pkt.stats.claims_merged, 1)
+    assert.equal(pkt.stats.claims_superseded, 1)
+    assert.equal(pkt.stats.coherence.delta, 1.5)
     assert(!pkt.changes[0].summary.includes('0d7ac776bf6e9cd0b5f6216ea2f59ac7932a9948'), 'raw 64-hex commit SHA must be sanitized in summary')
     assert(!pkt.changes[0].summary.includes('@mydude'), '@mention syntax must be stripped from packet summary')
     assert(!pkt.changes[0].summary.includes('https://'), 'raw URLs must be stripped from packet summary')
