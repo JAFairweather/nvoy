@@ -118,13 +118,20 @@ export function selectWraps(wraps, { since, budget, fuzz = NIP59_FUZZ_SEC } = {}
  *
  * A relay answers a capped query with its own newest-N by `created_at`, and for gift wraps that is
  * the fuzzed field, so one page is an arbitrary slice of the mailbox however large the limit. The
- * walk is `until = oldest seen - 1`, exactly as unwrapRumors does it (nvoy#9).
+ * walk asks for the next page at `until = oldest seen`, INCLUSIVE (unwrapRumors steps one below, nvoy#9;
+ * that would skip a wrap tied on `created_at` with the last one that fit on the page), and drops
+ * duplicates by id. A full page that brings nothing new, or a full page whose oldest sits exactly on the
+ * inclusive floor, means more wraps share one timestamp than a page holds: that is `stalled`, a partial
+ * read, never a finished one.
  *
- * Three independent stops, and each one is a different claim:
- *   - nothing fresh on this page — exhausted, or the relay is repeating itself
- *   - the page cap — a bound on a loop driven by remote input, which must always have one
- *   - past the fuzz floor — no wrap this old can carry an in-window rumor, so there is nothing
- *     left to find; this is the stop that normally fires, and the only one that is not a giving-up
+ * `walkStop` names why a walk ended, and only two of the answers are a finished walk:
+ *   - exhausted — a short page that brought nothing new: nothing is left
+ *   - floor — past the fuzz floor, so no wrap this old can carry an in-window rumor; the stop that
+ *     normally fires, and the only one that is not a giving-up
+ *   - capped — the page cap ended a walk that was still progressing above the floor (a bound on a loop
+ *     driven by remote input, which must always have one): PARTIAL
+ *   - stalled — a full page that brought nothing new, or a full page exactly on the inclusive floor:
+ *     PARTIAL (more wraps share one timestamp than a page holds)
  *
  * `freshThisPage` must be counted PER SOCKET. Judged against the shared cross-relay map, the first
  * page another relay had already covered would end this relay's walk, and its later pages are

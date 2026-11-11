@@ -40,9 +40,10 @@ export function herdrClient({ bin = process.env.HARNESS_HERDR_BIN || 'herdr', en
     available() { try { call(['workspace', 'list']); return true } catch { return false } },
     // The identity's workspace and its first pane, created when missing.
     //
-    // NEVER the pane this supervisor itself runs in. herd-infra's add-agent labels an agent's own pane
-    // after the agent (and only an nvoy-claude agent gets a `-harness` suffix), so for an nvoy-pi agent
-    // the workspace this lookup finds by label IS the supervisor's own. Adopting it as the agent's pane
+    // NEVER the pane this supervisor itself runs in. Until herd-infra#144 (11 Nov 2026) add-agent labelled
+    // an agent's own pane after the agent and gave only an nvoy-claude agent a `-harness` suffix, so for an
+    // nvoy-pi agent whose name is plain lowercase letters (crusty) the workspace this lookup finds by label
+    // WAS the supervisor's own. Agents made since carry the suffix; this guard covers the ones that predate it. Adopting it as the agent's pane
     // made start() send ctrl+c to itself (its SIGINT handler then stopped it) and type the launcher into
     // its own stdin, so the pi session never started and nothing was logged (crusty, 2026-11-11).
     pane({ label, cwd }) {
