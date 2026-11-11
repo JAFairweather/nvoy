@@ -21,6 +21,7 @@
 
 import { closeSync, lstatSync, openSync, readFileSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
+import { Worker } from 'node:worker_threads'
 import { hostname } from 'node:os'
 import { basename } from 'node:path'
 
@@ -37,7 +38,7 @@ function mayHold(pid, instance, program, procRoot) {
 export function claimLeaseLock(path, instance, holder, {
   ttlMs = 15000, beatMs = Math.max(250, Math.floor(ttlMs / 3)), host = hostname(), pid = process.pid,
   now = () => Date.now(), program = '', procRoot = '/proc', probe = p => process.kill(p, 0),
-  onLost = () => { console.error(`${holder} lock was taken over; stopping so there is never a second writer`); process.exit(70) },
+  onLost = null,
 } = {}) {
   if (!Number.isInteger(ttlMs) || ttlMs < 1000) throw new Error('lock ttl must be at least 1000 ms')
   const token = randomBytes(16).toString('hex')
@@ -86,10 +87,30 @@ export function claimLeaseLock(path, instance, holder, {
   }
 
   const mine = () => { try { return JSON.parse(readFileSync(path, 'utf8')).token === token } catch { return false } }
-  const timer = setInterval(() => {
-    if (!mine()) { clearInterval(timer); onLost(); return }
-    try { const t = new Date(); utimesSync(path, t, t) } catch { /* a missed beat is retried; a lapsed lease is what the others see */ }
-  }, beatMs)
-  timer.unref()
-  return () => { clearInterval(timer); try { if (mine()) unlinkSync(path) } catch {} }
+  // The beat runs on its own thread (lease_beat_worker.mjs): the daemon blocks its main thread in
+  // spawnSync for up to 90 s, and a main-loop timer would lapse the lease under a LIVE holder. With no
+  // custom onLost, the worker ends the whole process itself when the lock is found taken, because a
+  // blocked main thread cannot. A custom onLost (tests, embedding) is called from the main thread instead.
+  // execArgv is cleared: a worker inherits the parent's (an `--input-type` eval flag makes it refuse to load).
+  const worker = new Worker(new URL('./lease_beat_worker.mjs', import.meta.url), {
+    workerData: { path, token, beatMs, killOnLost: !onLost }, execArgv: [],
+  })
+  const lostHere = () => {
+    if (onLost) onLost()
+    else { console.error(`${holder} lock was taken over; stopping so there is never a second writer`); process.exit(70) }
+  }
+  worker.on('message', message => { if (message?.lost) lostHere() })
+  // A beat thread that cannot run must not leave the lease silently lapsing under a live holder: say so,
+  // and fall back to a main-loop beat (which is the weaker form this exists to improve on).
+  let fallback = null
+  worker.on('error', error => {
+    console.error(`${holder} lease heartbeat thread failed (${error.message}); falling back to the main loop`)
+    fallback = setInterval(() => {
+      if (!mine()) { clearInterval(fallback); lostHere(); return }
+      try { const t = new Date(); utimesSync(path, t, t) } catch {}
+    }, beatMs)
+    fallback.unref()
+  })
+  worker.unref()
+  return () => { clearInterval(fallback); try { worker.postMessage('stop') } catch {} ; worker.terminate().catch(() => {}); try { if (mine()) unlinkSync(path) } catch {} }
 }
