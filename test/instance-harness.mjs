@@ -437,7 +437,7 @@ if (rest[0] === 'capture-pane') console.log('  ? for shortcuts')
 `)
 chmodSync(join(fakeBin, 'tmux'), 0o755)
 const remoteEnv = { ...process.env, HOME: ownHome, CLAUDE_CONFIG_DIR: join(ownHome, '.claude'), PATH: `${fakeBin}:${process.env.PATH}`, HARNESS_POLL_MS: '25', HARNESS_WATCH_MS: '50',
-  HARNESS_CHANNEL_SETTLE_MS: '300', HARNESS_RETRY_MS: '100', HARNESS_TERMINAL: 'tmux', HARNESS_HERDR_BIN: '/nonexistent/herdr' }
+  HARNESS_CHANNEL_SETTLE_MS: '300', HARNESS_CHANNEL_DOWN_MS: '2000', HARNESS_RETRY_MS: '100', HARNESS_TERMINAL: 'tmux', HARNESS_HERDR_BIN: '/nonexistent/herdr' }
 const refused = (value, pattern, mode) => {
   const r = spawnSync(process.execPath, ['mcp/tools/instance-harness.mjs', '--instance', 'mac-test', '--remote', clientConfig(value, mode)], { cwd: resolve('.'), encoding: 'utf8', env: remoteEnv, timeout: 10000 })
   return r.status === 1 && pattern.test(r.stderr) && !/PRIVATE-KEY|sk-ant-oat/.test(r.stdout + r.stderr)
@@ -521,6 +521,13 @@ const restarted = await waitFor(() => readies() === 2, 15000)
 const allSessions = readText(join(harnessHome, '.nvoy-harness', 'tmux.sock.log')).split('\n').filter(Boolean).map(JSON.parse)
 ok('once the fleet takes the channel again, the same conversation resumes and is ready', restarted && allSessions.length >= 3 &&
   !allSessions[0].args.includes('--continue') && allSessions.slice(1).every(session => session.args.at(-1) === '--continue'))
+// After ready, a fleet that keeps refusing (every link dies at once) is not left looking up: once no link has
+// held for HARNESS_CHANNEL_DOWN_MS the session is restarted, as a lost channel always was.
+const downBefore = (portableOut.match(/has not held a link/g) || []).length
+writeFileSync(join(fakeCtl, 'refuse'), ''); writeFileSync(join(fakeCtl, 'drop'), '')
+ok('a ready session whose channel cannot hold a link past the bound is restarted',
+  await waitFor(() => (portableOut.match(/the channel to the fleet has not held a link for 2s; restarting the session/g) || []).length > downBefore, 15000))
+rmSync(join(fakeCtl, 'refuse'), { force: true }); rmSync(join(fakeCtl, 'drop'), { force: true })
 portable.kill('SIGTERM'); await portableExited
 
 // The herdr form, against a fake herdr (see fake-herdr.mjs).

@@ -72,6 +72,10 @@ const WATCH_MS = Number(process.env.HARNESS_WATCH_MS || 5000)
 const RETRY_MS = Number(process.env.HARNESS_RETRY_MS || 5000)
 const RETRY_MAX_MS = Number(process.env.HARNESS_RETRY_MAX_MS || 300000)
 const SETTLE_MS = Number(process.env.HARNESS_CHANNEL_SETTLE_MS || 10000)
+// A ready session whose proxy cannot hold a link for this long (a refused key, a lock the fleet still holds, an
+// adapter that stays down) is restarted as before, so a dead channel never looks up. A release's drop is a few
+// seconds and stays on the reconnect path.
+const DOWN_MS = Number(process.env.HARNESS_CHANNEL_DOWN_MS || 600000)
 const LAUNCH_MS = Number(process.env.HARNESS_LAUNCH_MS || 10000)
 
 function readJson(path) { try { return JSON.parse(readFileSync(path, 'utf8')) } catch { return {} } }
@@ -147,7 +151,9 @@ log(`the session runs in ${useHerdr ? 'herdr' : 'tmux'}`)
 // Off the fleet the channel is the reconnecting proxy (harness_session.mjs reconnectingEntry) with ssh under
 // it. A release or manifest change recreates the adapter and ends the ssh; the proxy dials again and the
 // session carries on. At startup the supervisor waits for the proxy's live link (so a refused key never looks
-// ready); after that it restarts the session only if the proxy itself is gone. The fleet form is left as it was.
+// ready); after that it restarts the session if the proxy itself is gone, or if no link has held for DOWN_MS.
+// The proxy swallows the replayed initialize response, so the session keeps the tool list it started with:
+// a release that adds or removes adapter tools needs a session restart to show them. The fleet form is left as it was.
 let watchChannel = !!remote
 function channelNow() {
   const pid = term.pid()
@@ -213,7 +219,7 @@ while (!stopping) {
   const startedAt = Date.now()
   try {
     await start()
-    let link = channelNow()?.link || ''
+    let link = channelNow()?.link || '', linkSince = Date.now(), heldAt = Date.now()
     while (!stopping) {
       await sleep(WATCH_MS)
       term.named()
@@ -224,8 +230,11 @@ while (!stopping) {
         if (now && !now.proxy) { log('the channel proxy exited; restarting the session'); break }
         if (now && now.link !== link) {
           log(!now.link ? 'the channel to the fleet dropped; the proxy is reconnecting it' : link ? 'the channel to the fleet was redialled' : 'the channel to the fleet is back')
-          link = now.link
+          link = now.link; linkSince = Date.now()
         }
+        // Held: the same link has stayed up for the settle time, as startup requires.
+        if (now && now.link && Date.now() - linkSince >= SETTLE_MS) heldAt = Date.now()
+        if (Date.now() - heldAt > DOWN_MS) { log(`the channel to the fleet has not held a link for ${Math.round(DOWN_MS / 1000)}s; restarting the session`); break }
       }
     }
     if (Date.now() - startedAt > RETRY_MAX_MS) delay = RETRY_MS
