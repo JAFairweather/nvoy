@@ -173,6 +173,47 @@ await t('a holder BLOCKED on the main thread whose lock is taken over is stopped
   assert.equal(body(p).host, 'container-b', 'the new holder\'s lock is untouched')
 })
 
+// Dennis, PR 364: reclaim read a stale lock and then unlinked its path, so a claimant that installed a
+// fresh lock in between had it deleted. Takeover is now serialised by a mutex and re-reads under it.
+const staleLock = (p, host = 'container-a') => {
+  writeFileSync(p, JSON.stringify({ version: 2, instance: 'i', host, pid: 1, token: 's'.repeat(32), started_at: 1 }), { mode: 0o600 })
+  age(p, 60000)
+}
+
+await t('a fresh lock installed between the stale read and the takeover is NOT deleted (Dennis, PR 364)', () => {
+  const p = fresh(); staleLock(p)
+  const fresh_ = JSON.stringify({ version: 2, instance: 'i', host: 'container-c', pid: 1, token: 'f'.repeat(32), started_at: Date.now() })
+  assert.throws(() => claimLeaseLock(p, 'i', 'daemon', opts({ host: 'container-b', pid: 1, hooks: { afterRead: () => { unlinkSync(p); writeFileSync(p, fresh_, { mode: 0o600 }) } } })), /already runs as pid 1 on container-c/)
+  assert.equal(body(p).token, 'f'.repeat(32), 'the live holder\'s lock survived')
+})
+
+await t('two claimants that both read the same stale lock: exactly one wins, the other is refused', () => {
+  const p = fresh(); staleLock(p)
+  let winner = null
+  const a = () => claimLeaseLock(p, 'i', 'daemon', opts({ host: 'container-a2', pid: 1, hooks: { afterRead: () => { winner = claimLeaseLock(p, 'i', 'daemon', opts({ host: 'container-b', pid: 1 })) } } }))
+  assert.throws(a, /already runs as pid 1 on container-b/)
+  assert.equal(body(p).host, 'container-b')
+  winner()
+})
+
+await t('  …the pair: one claimant alone still reclaims a stale lock, and leaves no mutex behind', () => {
+  const p = fresh(); staleLock(p)
+  const release = claimLeaseLock(p, 'i', 'daemon', opts({ host: 'container-b', pid: 1 }))
+  assert.equal(body(p).host, 'container-b')
+  assert.equal(existsSync(`${p}.reclaim`), false)
+  release()
+})
+
+await t('a reclaim in progress elsewhere is waited on, not raced; a mutex left by a dead claimant is cleared after the lease', () => {
+  const p = fresh(); staleLock(p)
+  writeFileSync(`${p}.reclaim`, '', { mode: 0o600 })
+  assert.throws(() => claimLeaseLock(p, 'i', 'daemon', opts({ host: 'container-b', pid: 1 })), /being reclaimed/)
+  age(`${p}.reclaim`, 60000)                              // the claimant that held it died long ago
+  const release = claimLeaseLock(p, 'i', 'daemon', opts({ host: 'container-b', pid: 1 }))
+  assert.equal(body(p).host, 'container-b')
+  release()
+})
+
 await t('a lock that is a symlink is refused, not followed', async () => {
   const { symlinkSync } = await import('node:fs')
   const target = fresh(), link = fresh()

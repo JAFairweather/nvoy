@@ -38,7 +38,7 @@ function mayHold(pid, instance, program, procRoot) {
 export function claimLeaseLock(path, instance, holder, {
   ttlMs = 15000, beatMs = Math.max(250, Math.floor(ttlMs / 3)), host = hostname(), pid = process.pid,
   now = () => Date.now(), program = '', procRoot = '/proc', probe = p => process.kill(p, 0),
-  onLost = null,
+  onLost = null, hooks = {},
 } = {}) {
   if (!Number.isInteger(ttlMs) || ttlMs < 1000) throw new Error('lock ttl must be at least 1000 ms')
   const token = randomBytes(16).toString('hex')
@@ -53,40 +53,67 @@ export function claimLeaseLock(path, instance, holder, {
     } catch (error) { if (error.code === 'EEXIST') return false; throw error }
   }
 
-  if (!create()) {
+  const mine = () => { try { return JSON.parse(readFileSync(path, 'utf8')).token === token } catch { return false } }
+  const held = () => mine()
+
+  // Decide whether the lock on disk is live. Returns 'absent' (nothing there), 'stale', or throws a
+  // refusal. Called twice during a takeover: once to decide to try, and again UNDER the reclaim mutex.
+  const judge = () => {
     let stat, prior
     try {
       stat = lstatSync(path)
       if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('lock is not a regular file')
       prior = JSON.parse(readFileSync(path, 'utf8'))
-    } catch (error) { throw new Error(`cannot validate existing ${holder} lock: ${error.message}`) }
+    } catch (error) {
+      if (error.code === 'ENOENT') return 'absent'
+      throw new Error(`cannot validate existing ${holder} lock: ${error.message}`)
+    }
     if (prior?.version !== VERSION || prior?.instance !== instance || !Number.isInteger(prior?.pid) || prior.pid < 1 ||
         typeof prior?.host !== 'string' || !prior.host || typeof prior?.token !== 'string') {
       throw new Error(`${holder} lock does not bind this instance`)
     }
     const age = now() - stat.mtimeMs
-    let live
     if (prior.host !== host) {
-      live = age < ttlMs
-      if (live) throw new Error(`${holder} already runs as pid ${prior.pid} on ${prior.host} (heartbeat ${Math.max(0, Math.round(age / 1000))}s ago)`)
-    } else if (prior.pid === pid) {
-      live = false                                   // a previous incarnation of this container
-    } else {
-      try {
-        probe(prior.pid)
-        live = mayHold(prior.pid, instance, program, procRoot)
-      } catch (error) {
-        if (error.code === 'ESRCH') live = false
-        else if (error.code === 'EPERM' && !mayHold(prior.pid, instance, program, procRoot)) live = false
-        else throw error
-      }
-      if (live) throw new Error(`${holder} already runs as pid ${prior.pid}`)
+      if (age < ttlMs) throw new Error(`${holder} already runs as pid ${prior.pid} on ${prior.host} (heartbeat ${Math.max(0, Math.round(age / 1000))}s ago)`)
+      return 'stale'
     }
-    unlinkSync(path)
-    if (!create()) throw new Error(`${holder} lock was claimed by another process while reclaiming it`)
+    if (prior.pid === pid) return 'stale'                       // a previous incarnation of this container
+    try {
+      probe(prior.pid)
+      if (mayHold(prior.pid, instance, program, procRoot)) throw new Error(`${holder} already runs as pid ${prior.pid}`)
+    } catch (error) {
+      if (error.code === 'ESRCH') return 'stale'
+      if (error.code === 'EPERM' && !mayHold(prior.pid, instance, program, procRoot)) return 'stale'
+      throw error
+    }
+    return 'stale'
   }
 
-  const mine = () => { try { return JSON.parse(readFileSync(path, 'utf8')).token === token } catch { return false } }
+  if (!create()) {
+    if (judge() === 'absent' && create()) { /* the lock vanished between our create and our read; we hold it now */ }
+    else if (!held()) {
+      hooks.afterRead?.()
+      // Taking a stale lock over is read-then-unlink, and between the two another claimant can install a
+      // fresh lock that the unlink would then delete. So takeovers are serialised by a short-lived mutex
+      // file, and the lock is read AGAIN under it: the second claimant to arrive sees the first's fresh
+      // lock and refuses, instead of overwriting it.
+      const mutex = `${path}.reclaim`
+      const take = () => { try { closeSync(openSync(mutex, 'wx', 0o600)); return true } catch (error) { if (error.code === 'EEXIST') return false; throw error } }
+      if (!take()) {
+        let age = 0
+        try { age = now() - lstatSync(mutex).mtimeMs } catch { /* gone: retry below */ }
+        if (age < ttlMs || (() => { try { unlinkSync(mutex) } catch {} return !take() })()) {
+          throw new Error(`${holder} lock is being reclaimed by another process; try again`)
+        }
+      }
+      try {
+        const again = judge()                                 // refuses if it is live now
+        if (again === 'stale') unlinkSync(path)
+        if (!create()) throw new Error(`${holder} lock was claimed by another process while reclaiming it`)
+      } finally { try { unlinkSync(mutex) } catch {} }
+    }
+  }
+
   // The beat runs on its own thread (lease_beat_worker.mjs): the daemon blocks its main thread in
   // spawnSync for up to 90 s, and a main-loop timer would lapse the lease under a LIVE holder. With no
   // custom onLost, the worker ends the whole process itself when the lock is found taken, because a
