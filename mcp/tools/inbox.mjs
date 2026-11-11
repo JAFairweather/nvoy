@@ -47,7 +47,7 @@ import { verifyChannelDataCarry } from './channel_task_carry.mjs'
 import { verifyInboxEnvelope } from './inbox_envelope.mjs'
 import { partitionInboxMessages } from './inbox_trust.mjs'
 import { advertisedRelays, inboxVerdict, isSignerFault } from './inbox_reach.mjs'
-import { selectWraps, shouldPaginate, describeUnopened, NIP59_FUZZ_SEC } from './inbox_wrap_select.mjs'
+import { selectWraps, walkStop, describeUnopened, NIP59_FUZZ_SEC } from './inbox_wrap_select.mjs'
 
 const credential = (path, label) => {
   if (!path) return ''
@@ -111,8 +111,14 @@ const RELAYS = (process.env.NVOY_RELAYS?.split(',') || [
 // failure nvoy#9 fixed in unwrapRumors. Fetching is cheap; only DECRYPTING costs a Bunker round
 // trip (#170), so the two budgets are now separate numbers. Pagination stops when a page brings
 // nothing new or drops below the fuzz floor, below which no wrap can carry an in-window rumor.
-const FETCH_PAGE = 200
-const MAX_PAGES = 6
+// The two knobs are overridable only so a test can reach the cap with a handful of events; both are
+// bounded, because this loop is driven by remote input.
+const boundedInt = (name, fallback, lo, hi) => {
+  const n = Number(process.env[name])
+  return Number.isInteger(n) && n >= lo && n <= hi ? n : fallback
+}
+const FETCH_PAGE = boundedInt('NVOY_INBOX_FETCH_PAGE', 200, 1, 500)
+const MAX_PAGES = boundedInt('NVOY_INBOX_MAX_PAGES', 6, 1, 20)
 const SOCKET_DEADLINE_MS = 20000
 const fuzzFloor = since - NIP59_FUZZ_SEC
 const wraps = new Map()
@@ -120,6 +126,7 @@ const dmRelayLists = new Map()
 const reachedWraps = []
 const answered10050 = []
 const unreachable = []
+const walkCapped = []
 await Promise.all(RELAYS.map(url => new Promise(res => {
   let ws
   try { ws = new WebSocket(url) } catch { unreachable.push(`${url} — could not open`); return res() }
@@ -168,7 +175,8 @@ await Promise.all(RELAYS.map(url => new Promise(res => {
       }
       if (m[0] === 'EVENT' && which === 'dm') dmRelayLists.set(m[2].id, m[2])
       if (m[0] === 'EOSE' && which === 'in' && pending.has('in')) {
-        if (shouldPaginate({ freshThisPage, page, maxPages: MAX_PAGES, oldestThisPage, fuzzFloor })) {
+        const stop = walkStop({ freshThisPage, page, maxPages: MAX_PAGES, oldestThisPage, fuzzFloor })
+        if (stop === 'more') {
           const until = oldestThisPage - 1
           ws.send(JSON.stringify(['CLOSE', `in${page}`]))
           page++
@@ -176,6 +184,7 @@ await Promise.all(RELAYS.map(url => new Promise(res => {
         }
         pending.delete('in')
         reachedWraps.push(url)
+        if (stop === 'capped') walkCapped.push(url)
       } else if (m[0] === 'EOSE' && which === 'dm' && pending.delete('dm')) {
         answered10050.push(url)
       }
@@ -272,7 +281,7 @@ const { code, inconclusive, notes } = inboxVerdict({
   signerRefusals, envelopesSeen: selectedWraps.length, opened, reachedWraps, relayCount: RELAYS.length,
   unreachable, answered10050, dmRelayLists: dmRelayLists.size, dmRelays: advertisedRelays(dmRelayLists.values()),
   total: V.length + TD.length + RC.length + CN.length + U.length,
-  unopened, unopenedByRank,
+  unopened, unopenedByRank, walkCapped,
 })
 
 // #195: how the budget was spent, every run and not only when something went wrong. The old

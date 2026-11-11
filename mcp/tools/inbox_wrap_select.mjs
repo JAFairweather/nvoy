@@ -130,14 +130,19 @@ export function selectWraps(wraps, { since, budget, fuzz = NIP59_FUZZ_SEC } = {}
  * page another relay had already covered would end this relay's walk, and its later pages are
  * exactly where a wrap only it holds would be.
  */
-export function shouldPaginate({
+export function walkStop({
   freshThisPage = 0, page = 0, maxPages = 0, oldestThisPage = Infinity, fuzzFloor = 0,
 } = {}) {
-  if (freshThisPage <= 0) return false
-  if (page + 1 >= maxPages) return false
-  if (!Number.isFinite(oldestThisPage)) return false
-  return oldestThisPage > fuzzFloor
+  if (freshThisPage <= 0) return 'exhausted'
+  if (!Number.isFinite(oldestThisPage)) return 'exhausted'
+  if (oldestThisPage <= fuzzFloor) return 'floor'
+  // Still progressing, still inside the window, and the loop bound is what ends it: there may be
+  // in-window wraps on the next page, so this is a partial read, not a finished one.
+  if (page + 1 >= maxPages) return 'capped'
+  return 'more'
 }
+
+export const shouldPaginate = args => walkStop(args) === 'more'
 
 /**
  * One line for the operator, or null when the budget covered everything.

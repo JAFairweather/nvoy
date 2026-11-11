@@ -37,7 +37,7 @@ export const advertisedRelays = events => {
 export function inboxVerdict({
   signerRefusals = [], envelopesSeen = 0, opened = 0, reachedWraps = [], relayCount = 0,
   unreachable = [], answered10050 = [], dmRelayLists = 0, dmRelays = [], total = 0,
-  unopened = 0, unopenedByRank = {},
+  unopened = 0, unopenedByRank = {}, walkCapped = [],
 } = {}) {
   const inconclusive = [], notes = []
 
@@ -114,6 +114,13 @@ export function inboxVerdict({
   }
   if (unopened && !missed) {
     notes.push(`${unopened} envelope(s) left unopened by --max-wraps, none of which can be inside the window`)
+  }
+  // #195, second half: the page walk ended on its loop bound while pages were still bringing in
+  // wraps above the fuzz floor. The relay may hold in-window wraps on the next page, so "nothing
+  // unopened" describes only what was fetched. Never a clean exit, whatever else came back.
+  if (walkCapped.length) {
+    inconclusive.push(`the wrap query stopped at its page cap on ${walkCapped.length} relay(s) while older wraps were ` +
+      `still arriving inside the window, so the read is partial — ${walkCapped.join(', ')}`)
   }
   if (reachedWraps.length && unreachable.length) {
     notes.push(`partial reach: ${reachedWraps.length}/${relayCount} relay(s) answered — ${unreachable.join('; ')}`)

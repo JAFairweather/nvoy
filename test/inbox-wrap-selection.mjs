@@ -17,7 +17,7 @@
 // Every alarm assertion is paired with a healthy run that does NOT raise it: a verdict that always
 // returns INCONCLUSIVE would pass a one-directional suite and be worthless.
 import assert from 'node:assert'
-import { selectWraps, rankWrap, shouldPaginate, describeUnopened, NIP59_FUZZ_SEC } from '../mcp/tools/inbox_wrap_select.mjs'
+import { selectWraps, rankWrap, shouldPaginate, walkStop, describeUnopened, NIP59_FUZZ_SEC } from '../mcp/tools/inbox_wrap_select.mjs'
 import { inboxVerdict } from '../mcp/tools/inbox_reach.mjs'
 
 const now = 1_755_000_000
@@ -170,6 +170,18 @@ t('pagination stops for three distinct reasons, each on its own', () => {
   // ...and the negative control for all three: the walking case above must still walk, or these
   // would pass against a function that simply never paginates.
   assert.equal(shouldPaginate(walking), true)
+})
+
+t('walkStop names WHY a walk ended, and only the page cap is a partial read', () => {
+  const walking = { freshThisPage: 200, page: 0, maxPages: 6, oldestThisPage: now, fuzzFloor: since - NIP59_FUZZ_SEC }
+  assert.equal(walkStop(walking), 'more')
+  assert.equal(walkStop({ ...walking, freshThisPage: 0 }), 'exhausted')
+  assert.equal(walkStop({ ...walking, oldestThisPage: since - NIP59_FUZZ_SEC - 1 }), 'floor')
+  assert.equal(walkStop({ ...walking, page: 5 }), 'capped', 'still progressing above the floor when the bound hit')
+  // At the cap but already past the floor is a FINISHED walk, not a truncated one: the alarm must
+  // not fire on mailboxes that simply reached the end on the last allowed page.
+  assert.equal(walkStop({ ...walking, page: 5, oldestThisPage: since - NIP59_FUZZ_SEC - 1 }), 'floor')
+  assert.equal(walkStop({ ...walking, page: 5, freshThisPage: 0 }), 'exhausted')
 })
 
 t('a page that returned no events at all does not paginate on an infinite floor', () => {
