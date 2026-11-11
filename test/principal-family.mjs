@@ -13,7 +13,7 @@
 //
 //   node test/principal-family.mjs
 
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, chmodSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, chmodSync, statSync, readdirSync, symlinkSync, lstatSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
@@ -21,7 +21,7 @@ import { fileURLToPath } from 'node:url'
 import { allocateIdentityBlock, buildParticipantManifest } from '../mcp/tools/identity_allocation.mjs'
 import { readManifest } from '../mcp/tools/runtime_manifest.mjs'
 import { principalLine } from '../mcp/tools/participant_unit.mjs'
-import { applyStaged, digestOf, repairInstalled } from '../mcp/tools/instance_apply.mjs'
+import { applyStaged, digestOf, repairInstalled, replaceFileAtomic } from '../mcp/tools/instance_apply.mjs'
 import { familyOf, keysFor, codexPrincipalLine, codexPrincipalPlan, verifyCodexPrincipal, codexForcedCommand, distinctKeys } from '../mcp/tools/principal_family.mjs'
 
 let pass = true
@@ -200,7 +200,13 @@ const lines = path => readFileSync(path, 'utf8').split('\n').filter(Boolean)
     const untagged = channelLine.replace(/ --key-fp [^"]+/, '')
     const other = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK0' + 'c'.repeat(40) + ' someone-else'
     const { keysPath, go } = repairScenario({ keys: `${other}\n${untagged}\n${feedLine}\n` })
+    chmodSync(keysPath, 0o640)
+    const before = statSync(keysPath)
     const r = go()
+    const after = statSync(keysPath)
+    check(after.ino !== before.ino && (after.mode & 0o7777) === 0o640 && after.uid === before.uid && after.gid === before.gid,
+      'the upgrade replaces the file by rename (a new inode), keeping its mode and owner')
+    check(readdirSync(dirname(keysPath)).every(f => !f.includes('.nvoy-')), 'and leaves no temp file behind')
     check(r.ok && lines(keysPath).join('\n') === `${other}\n${channelLine}\n${feedLine}`, `repair upgrades an untagged channel line in place, other lines untouched: ${states(r)}`)
     check(/upgraded/.test(r.states.find(st => st.state === 'principal seated').detail), 'and says it upgraded')
     check(go().ok && lines(keysPath).join('\n') === `${other}\n${channelLine}\n${feedLine}`, 'a second repair changes nothing')
@@ -239,6 +245,22 @@ const lines = path => readFileSync(path, 'utf8').split('\n').filter(Boolean)
     const r = go()
     check(r.ok && lines(keysPath)[0] === principalLine(manifest, CHANNEL.keyType, CHANNEL.keyBody) && calls.some(c => c[0] === 'baseline'), 'repair of a Claude-family agent seats its one line and baselines, as apply does')
   }
+}
+
+// ── replacing a shared authorized_keys: all or nothing ─────────────────────────────────────────────
+{
+  const dir = join(tmp, 'atomic'); mkdirSync(dir)
+  const real = join(dir, 'authorized_keys'), link = join(dir, 'keys-link')
+  writeFileSync(real, 'a\nb\n'); chmodSync(real, 0o600); symlinkSync(real, link)
+  replaceFileAtomic(link, 'a\nb\n', 'a\nB\n')
+  check(lstatSync(link).isSymbolicLink() && readFileSync(real, 'utf8') === 'a\nB\n' && (statSync(real).mode & 0o7777) === 0o600, 'a symlinked path: the target is replaced, the link and the mode survive')
+  let threw = ''
+  try { replaceFileAtomic(real, 'stale text', 'x\n') } catch (e) { threw = e.message }
+  check(/changed while replacing/.test(threw) && readFileSync(real, 'utf8') === 'a\nB\n', 'a file that changed since it was read is refused and left as it is')
+  threw = ''
+  try { replaceFileAtomic(real, 'a\nB\n', 'half', { hooks: { beforeRename: () => { throw new Error('killed before rename') } } }) } catch (e) { threw = e.message }
+  check(threw === 'killed before rename' && readFileSync(real, 'utf8') === 'a\nB\n', 'an interruption before the rename leaves the original whole')
+  check(readdirSync(dir).sort().join() === 'authorized_keys,keys-link', 'and no temp file is left behind')
 }
 
 if (!pass) { console.error('principal-family: FAILED'); process.exit(1) }

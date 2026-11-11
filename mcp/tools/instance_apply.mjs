@@ -28,9 +28,9 @@
 //
 // It never reads credential contents. The public key is a public key; it is printed by path only.
 
-import { createHash } from 'node:crypto'
-import { appendFileSync, closeSync, existsSync, fsyncSync, linkSync, lstatSync, openSync, readdirSync, readFileSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
-import { join } from 'node:path'
+import { createHash, randomBytes } from 'node:crypto'
+import { appendFileSync, closeSync, existsSync, fchmodSync, fchownSync, fsyncSync, linkSync, lstatSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
+import { basename, dirname, join } from 'node:path'
 import { parsePrincipal, principalComment, principalLine } from './participant_unit.mjs'
 import { codexComment, codexManifestRefusal, codexPrincipalPlan, distinctKeys } from './principal_family.mjs'
 import { NUMERIC_FIELDS, parseBlockRecord, recordedClashes } from './identity_allocation.mjs'
@@ -94,6 +94,32 @@ export function planPrincipals(text, manifest, { family = 'claude', publicKey, f
 }
 export const principalCommentOf = (manifest, family, role) => family === 'codex' ? codexComment(manifest, role) : principalComment(manifest)
 
+// Replace a shared file's contents in one step, as an upgrade of authorized_keys must: other agents' lines live in
+// the same file, so an interrupted write may never leave it truncated. The new text goes to an exclusive temp file
+// beside the real file (a symlinked path is resolved, so the link survives), takes the original's mode and owner,
+// is synced, and is renamed over the original only if the original still holds exactly the text it was planned from.
+export function replaceFileAtomic(path, expected, text, { hooks = {} } = {}) {
+  const real = realpathSync(path), st = statSync(real)
+  const tmp = join(dirname(real), `.${basename(real)}.nvoy-${process.pid}-${randomBytes(6).toString('hex')}`)
+  const fd = openSync(tmp, 'wx', 0o600)
+  try {
+    try {
+      writeSync(fd, text)
+      fchownSync(fd, st.uid, st.gid)
+      fchmodSync(fd, st.mode & 0o7777)
+      fsyncSync(fd)
+    } finally { closeSync(fd) }
+    hooks.beforeRename?.(tmp)
+    if (readFileSync(real, 'utf8') !== expected) throw new Error(`${path} changed while replacing it`)
+    renameSync(tmp, real)
+  } catch (error) {
+    try { unlinkSync(tmp) } catch {}
+    throw error
+  }
+  const dir = openSync(dirname(real), 'r')
+  try { fsyncSync(dir) } catch {} finally { closeSync(dir) }
+}
+
 // Seat the planned principals, then check them as the operator would. Shared by a fresh apply and by the repair of an
 // install that stopped after the manifest went in. `done(state, ok, detail)` reports each state as it is observed.
 export function seatPrincipals({ manifest, keysPath, publicKey, feedKey = null, family = 'claude', run, done, when = 'the deploy' }) {
@@ -114,7 +140,7 @@ export function seatPrincipals({ manifest, keysPath, publicKey, feedKey = null, 
         const at = lines.map(l => l.trim()).indexOf(plan.old)
         if (at < 0 || lines.map(l => l.trim()).lastIndexOf(plan.old) !== at) throw new Error('the older channel line changed while upgrading it')
         lines[at] = plan.line
-        writeFileSync(keysPath, lines.join('\n'))
+        replaceFileAtomic(keysPath, text, lines.join('\n'))
       }
       seated.push(`${plan.role} ${plan.action === 'append' ? 'appended' : plan.action === 'upgrade' ? 'upgraded to name its key fingerprint' : 'already present'}`)
     }
