@@ -28,6 +28,7 @@ import {
 import { startMemoryDaemon } from '../mcp/tools/memory-daemon.mjs'
 import {
   buildDreamPacket,
+  curationObservationEnd,
   computeTopicEigenvectors,
   evaluateDreamTriggers,
   planMerkleDream,
@@ -37,6 +38,7 @@ import {
   readCuratorStateFile,
   runCuratorCycle,
   weaveDreamStory,
+  writeCuratorStateFile,
   writeDreamPacket,
 } from '../mcp/tools/memory-curate.mjs'
 import {
@@ -1527,6 +1529,52 @@ await test('writeDreamPacket writes 0640 global-scope packets, strips @mentions/
     assert.equal(digitRes.ok, false, 'verifier must reject digits/counts in title and dream')
     assert(digitRes.errors.some(e => e.includes('draft.title') && e.includes('digits')))
     assert(digitRes.errors.some(e => e.includes('draft.dream') && e.includes('digits')))
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+await test('consecutive dream packets persist the measured horizon and count a replacement once', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'nvoy-dream-horizon-'))
+  try {
+    const stateFile = join(tmp, 'curator-state.json')
+    const scope = `room:${GLOBAL_CH}`
+    const prior = { scope, author_pubkey: 'a'.repeat(64), d: 'replacement', event_id: '11'.repeat(32), created_at: 101, expires_at: null }
+    const replacement = { ...prior, event_id: '22'.repeat(32), created_at: 102 }
+    const other = { scope, author_pubkey: 'b'.repeat(64), d: 'other', event_id: '33'.repeat(32), created_at: 150, expires_at: null }
+    const firstSubmitted = [{ id: replacement.event_id, d: 'replacement', created_at: replacement.created_at }]
+    const first = buildDreamPacket({
+      lastCuratedAt: 90,
+      writeSeqAfter: 2,
+      ranAt: 100,
+      historyComplete: true,
+      historyRecords: [prior, replacement],
+      plan: { promotions: [{ scope, topic: 'nvoy', slug: 'replacement', claim: 'Replacement accepted', template: { tags: [['d', 'replacement']] } }] },
+      submitted: firstSubmitted,
+    })
+    assert.equal(first.stats.window_end, 102)
+    assert.equal(first.stats.claims_superseded, 1)
+
+    const measuredHorizon = curationObservationEnd(100, firstSubmitted)
+    writeCuratorStateFile(stateFile, { last_curated_at: 90, last_curated_write_seq: 1,
+      pending_curated_at: measuredHorizon, pending_curated_write_seq: 2, pending_dream_packet: first })
+    const staged = readCuratorStateFile(stateFile)
+    assert.equal(staged.pending_curated_at, first.stats.window_end, 'recovery stages the packet measurement boundary')
+    writeCuratorStateFile(stateFile, { last_curated_at: staged.pending_curated_at, last_curated_write_seq: staged.pending_curated_write_seq })
+    const durable = readCuratorStateFile(stateFile)
+    assert.equal(durable.last_curated_at, 102)
+
+    const second = buildDreamPacket({
+      lastCuratedAt: durable.last_curated_at,
+      writeSeqAfter: 3,
+      ranAt: 200,
+      historyComplete: true,
+      historyRecords: [prior, replacement, other],
+      plan: { promotions: [{ scope, topic: 'nvoy', slug: 'other', claim: 'Other claim accepted', template: { tags: [['d', 'other']] } }] },
+      submitted: [{ id: other.event_id, d: 'other', created_at: other.created_at }],
+    })
+    assert.equal(second.stats.window_start, first.stats.window_end)
+    assert.equal(second.stats.claims_superseded, 0, 'the prior replacement is outside the next measured window')
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }

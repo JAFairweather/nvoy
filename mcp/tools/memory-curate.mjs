@@ -390,6 +390,11 @@ export function weaveDreamStory({
   }
 }
 
+export function curationObservationEnd(ranAt, submitted = []) {
+  return Math.max(ranAt, ...(Array.isArray(submitted) ? submitted : [])
+    .map(s => Number.isSafeInteger(s?.created_at) ? s.created_at : ranAt))
+}
+
 export function buildDreamPacket({
   lastCuratedWriteSeq = 0,
   lastCuratedAt = 0,
@@ -513,8 +518,7 @@ export function buildDreamPacket({
   const windowStart = Number(lastCuratedAt || 0)
   // The writer may advance a replacement's created_at past the cycle clock to
   // follow its prior claim. That accepted write belongs in this cycle's window.
-  const windowEnd = Math.max(ranAt, ...(Array.isArray(submitted) ? submitted : [])
-    .map(s => Number.isSafeInteger(s?.created_at) ? s.created_at : ranAt))
+  const windowEnd = curationObservationEnd(ranAt, submitted)
   const history = (Array.isArray(historyRecords) ? historyRecords : [])
     .filter(r => r && r.scope === allowedScope && Number.isFinite(r.created_at) && r.created_at <= windowEnd)
     .sort((a, b) => a.created_at - b.created_at || String(b.event_id || '').localeCompare(String(a.event_id || '')))
@@ -1880,7 +1884,10 @@ export async function runCuratorCycle({
       cursorAdvanced = true
     }
     const nextCuratedAt = cursorAdvanced
-      ? (submitted.length === 0 && persisted?.pending_curated_at ? Number(persisted.pending_curated_at) : nowSec)
+      ? Math.max(effectiveLastCuratedAt,
+          submitted.length === 0 && persisted?.pending_curated_at
+            ? Number(persisted.pending_curated_at)
+            : curationObservationEnd(nowSec, submitted))
       : effectiveLastCuratedAt
     const nextCuratedWriteSeq = cursorAdvanced
       ? (submitted.length === 0 && persisted?.pending_curated_write_seq ? Number(persisted.pending_curated_write_seq) : postWriteSeq)
