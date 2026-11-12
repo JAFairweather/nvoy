@@ -8,15 +8,28 @@ by design, no key. This note proposes the bridge. James's grants for GrokDoggyDo
 ## Shape
 
 - **Host unit, per instance:** `nvoy-recall-gw@<id>.socket` (`ListenStream=/run/nvoy-recall-gw/<id>/socket`,
-  `Accept=yes`, `SocketUser` = the instance's broker host user, `SocketMode=0660`, group = the broker-adapter group)
-  and `nvoy-recall-gw@<id>.service`. That runs, as the broker host user,
-  `ssh -i <key> -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile=<pinned> hive-memory-gw@herd-cloud`,
-  and nothing else. The gateway's forced command chooses the reader. The client sends no arguments.
+  `Accept=yes`, `MaxConnections=4` (recall's in-flight limit), `SocketUser` = the instance's broker host user,
+  `SocketMode=0660`, and group = a **dedicated** group, `nvoy-recall-<id>`, whose only member is the recall
+  container's uid; not the broker-adapter group, which other roles share) and `nvoy-recall-gw@<id>.service`. That
+  runs, as the broker host user, one fully pinned command and nothing else: `ssh -F /dev/null -i <key> -o IdentitiesOnly=yes -o IdentityAgent=none
+  -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=<pinned> -o ClearAllForwardings=yes -o
+  ConnectTimeout=10 -T hive-memory-gw@herd-cloud`. The gateway's forced command chooses the reader, and the client
+  sends no arguments. A changed host key fails closed: the connection is refused and the error is logged, with no
+  retry. The service sets `RuntimeMaxSec=25`, so a hung SSH can't pile up, plus `NoNewPrivileges=yes`,
+  `ProtectSystem=strict`, `PrivateTmp=yes` and `ProtectHome=read-only` (the key path is under /etc), and logs one
+  line per connection with no request content.
+- **The socket is a raw pipe.** The forwarder's two-tool allowlist runs inside recall, so a compromised recall could
+  write any bytes to the socket. The gateway's forced command must itself refuse everything except a read-only
+  wake or query for its bound reader, with no write method and no other reader. That is herd-cloud's existing
+  reader gateway contract; the live gates below test it directly, not only through the forwarder (GrokDoggyDog,
+  PR 382 read).
 - **Key:** `/etc/nvoy/recall-keys/<id>` (mode 0600, owner the broker host user), on nvoy-fleet only. It is never
   mounted into any container. Making it, and authorizing its public half on herd-cloud's gateway as reader `<id>`,
   is the operator's step. The authorization is James's grant.
 - **Container side:** the manifest uses `may_recall: { read: { socket: "/run/nvoy-recall-gw/socket" } }`. Compose
-  bind-mounts only the instance's socket directory read-write into `recall`, never into door, adapter or worker.
+  bind-mounts only the instance's socket directory into `recall`, never into door, adapter or worker, with host-path
+  creation off (`bind.create_host_path: false`), so a missing unit fails the start rather than Docker making an empty
+  root-owned directory. Recall runs as a member of `nvoy-recall-<id>`, and its start is ordered after the socket unit.
   `recall` keeps its current limits: two tools, 20 s, fail closed, 4 in flight, 1 MiB lines.
 - **No new capability in the container:** no SSH binary is needed, there is no key path, and there is no network
   route. The socket is the only way out.
@@ -27,7 +40,9 @@ by design, no key. This note proposes the bridge. James's grants for GrokDoggyDo
   service mounts `/etc/nvoy/recall-keys`.
 - Forwarder against a fake socket gateway: wake and query pass through, while claim, submit and anything else are
   refused before any connection.
-- Unit files: `ExecStart` takes no client-supplied argument. The socket is 0660 with the broker-adapter group.
+- Unit files: `ExecStart` is the fixed, pinned ssh line, with no client-supplied argument. The socket is 0660 with
+  the dedicated group, `MaxConnections=4`, `RuntimeMaxSec` and the hardening keys present.
+- Compose: the socket bind uses `create_host_path: false`, recall has the dedicated group, and no other service has it.
 
 ## Done when (Murphy's live gates)
 
@@ -37,8 +52,12 @@ On nvoy-fleet:
 - the installed forced command and reader mapping, including any earlier reader key, are verified;
 - the deployed SHA and socket permissions are verified;
 - wake and query work live;
-- a write or an arbitrary method is refused without contacting the store;
-- an outside-room read and a cross-instance read are both refused.
+- a write or an arbitrary method is refused without contacting the store, both through the forwarder and as raw
+  bytes sent straight to the socket (the gateway's own refusal);
+- an outside-room read and a cross-instance read are both refused;
+- the adapter and door containers cannot connect to the socket;
+- revoking the key's authorization on herd-cloud stops recall at once;
+- no other key is authorized for this reader name, and this key is not shared with another instance.
 
 ## Who
 
