@@ -2272,7 +2272,34 @@ export async function readInitialHistory(reader, pageLimit, pageSize, maxAttempt
   throw new Error('memory history changed during bounded read retries')
 }
 
-export async function readPostCycleSnapshot(reader, expectedWriteSeq, pageLimit, pageSize, nowSec) {
+export function mergeCycleRecentActivity(priorActivity = [], postActivity = []) {
+  const preList = Array.isArray(priorActivity) ? priorActivity.filter(Boolean) : []
+  const postList = Array.isArray(postActivity) ? postActivity.filter(Boolean) : []
+  if (preList.length === 0) return postList
+  if (postList.length === 0) return preList
+  const postSeqs = new Set()
+  const postKeys = new Set()
+  for (const a of postList) {
+    if (Number.isSafeInteger(a.seq)) postSeqs.add(a.seq)
+    postKeys.add(`${a.actor || ''}:${a.kind || ''}:${a.at || 0}:${a.d || ''}:${a.topic || ''}`)
+  }
+  const preservedPeers = preList.filter(a => {
+    if (!a || a.actor === 'curator' || a.actor === 'viewer') return false
+    if (Number.isSafeInteger(a.seq) && postSeqs.has(a.seq)) return false
+    const key = `${a.actor || ''}:${a.kind || ''}:${a.at || 0}:${a.d || ''}:${a.topic || ''}`
+    return !postKeys.has(key)
+  })
+  return [...preservedPeers, ...postList]
+}
+
+export async function readPostCycleSnapshot(
+  reader,
+  expectedWriteSeq,
+  pageLimit,
+  pageSize,
+  nowSec,
+  { priorRecentActivity = null, priorAgentRoster = null } = {}
+) {
   const start = await reader.callReadTool('memory_wake', {})
   if (start?.store_state?.state !== 'READY' || Number(start.store_state.write_seq) !== expectedWriteSeq) return null
   const historyRecords = []
@@ -2301,16 +2328,23 @@ export async function readPostCycleSnapshot(reader, expectedWriteSeq, pageLimit,
   if (cursor !== null) return null
   const end = await reader.callReadTool('memory_wake', {})
   if (end?.store_state?.state !== 'READY' || Number(end.store_state.write_seq) !== expectedWriteSeq) return null
+  const postActivity = Array.isArray(end?.recent_activity)
+    ? end.recent_activity
+    : (Array.isArray(start?.recent_activity) ? start.recent_activity : [])
+  const mergedActivity = mergeCycleRecentActivity(priorRecentActivity, postActivity)
+  const effectiveRoster = Array.isArray(end?.agent_roster) && end.agent_roster.length > 0
+    ? end.agent_roster
+    : (Array.isArray(priorAgentRoster) ? priorAgentRoster : [])
   const coherence = computeCoherence({
     records,
     history_records: historyRecords,
-    agent_roster: Array.isArray(end?.agent_roster) ? end.agent_roster : [],
-    recent_activity: Array.isArray(end?.recent_activity) ? end.recent_activity : [],
+    agent_roster: effectiveRoster,
+    recent_activity: mergedActivity,
     store_state: end.store_state,
     now_sec: nowSec,
     history_complete: true,
   })
-  return { historyRecords, coherenceScore: Number.isFinite(coherence?.score) ? coherence.score : null }
+  return { historyRecords, coherenceScore: Number.isFinite(coherence?.score) ? coherence.score : null, coherence }
 }
 
 // Executes a full Curator Dream & Nightmare cycle over the daemon's reader and writer sockets.
@@ -2561,7 +2595,10 @@ export async function runCuratorCycle({
       if (submitted.length > 0 && resolvedPacketDir) {
         let postSnapshot = null
         try {
-          postSnapshot = await readPostCycleSnapshot(reader, postWriteSeq, pageLimit, effectivePageSize, nowSec)
+          postSnapshot = await readPostCycleSnapshot(reader, postWriteSeq, pageLimit, effectivePageSize, nowSec, {
+            priorRecentActivity: resolvedRecentActivity,
+            priorAgentRoster: Array.isArray(wake?.agent_roster) ? wake.agent_roster : [],
+          })
         } catch {
           // The packet still records known submitted changes; unknown counters remain null.
         }

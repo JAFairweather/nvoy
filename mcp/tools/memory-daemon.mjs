@@ -90,11 +90,11 @@ const isCuratorReader = (binding, config) =>
   (binding.name === CURATOR_READER || Boolean(config?.curators?.has(config?.readers.get(binding.name) || '')))
 
 // In-memory telemetry for the viewer only: metadata, never claim text, because, evidence or query text, and
-// never the viewer's own calls. Each ref keeps its claim's scope and author so viewerActivity can apply the
-// viewer's read ACL when it serves the ring. Durable hourly aggregate counts are also persisted in SQLite
-// (`activity_rollups`) so 24h and 7d recall totals survive ACTIVITY_MAX ring overflow and daemon restarts.
+// never the viewer's or curator reader's own snapshot/pagination calls. Each ref keeps its claim's scope and author
+// so viewerActivity can apply the viewer's read ACL when it serves the ring. Durable hourly aggregate counts are also
+// persisted in SQLite (`activity_rollups`) so 24h and 7d recall totals survive ACTIVITY_MAX ring overflow and daemon restarts.
 function noteActivity(activity, binding, nowSec, { kind, count = null, refs = [], filter = null, accepted = null, code = null }, store = null) {
-  if (isViewer(binding)) return
+  if (isViewer(binding) || (isCuratorReader(binding, store?.config) && (kind === 'wake' || kind === 'query'))) return
   let rollupOk = true
   if (store && typeof store.recordActivityRollup === 'function') {
     const retCount = Number.isSafeInteger(count) ? count : (Array.isArray(refs) ? refs.length : 0)

@@ -25,13 +25,15 @@ import {
   recordVerifiedBackup,
   validateAndResolveConfig,
 } from '../mcp/tools/hive_memory_store.mjs'
-import { startMemoryDaemon } from '../mcp/tools/memory-daemon.mjs'
+import { ACTIVITY_MAX, handleSocketJsonRpc, startMemoryDaemon } from '../mcp/tools/memory-daemon.mjs'
+import { computeCoherence } from '../mcp/tools/memory-viewer.mjs'
 import {
   buildDreamPacket,
   computeEigenAxisProposals,
   curationObservationEnd,
   computeTopicEigenvectors,
   evaluateDreamTriggers,
+  mergeCycleRecentActivity,
   planMerkleDream,
   readInitialHistory,
   readPostCycleSnapshot,
@@ -2043,6 +2045,178 @@ await test('memory-dream-verify.mjs --mcp serves local stdio JSON-RPC for memory
     assert.equal(lines.length, 2, 'symlinked --mcp child process must emit initialize + tools/list JSON-RPC responses')
     assert.equal(lines[0].result.serverInfo.name, 'hive-dream')
     assert.equal(lines[1].result.tools[0].name, 'memory_dream_verify')
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+await test('nvoy #378 regression (dream-2567 shape): curator reader pagination never evicts peer recall from recent_activity, readPostCycleSnapshot preserves peer recall, and descending query records sort chronologically for recent-window convergence', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'nvoy-dream2567-'))
+  try {
+    const skOwner = generateSecretKey()
+    const pkOwner = getPublicKey(skOwner)
+    const skCurator = generateSecretKey()
+    const pkCurator = getPublicKey(skCurator)
+    const peerNames = [
+      'crystalclaude', 'djcodex', 'hr', 'crusty', 'waggle-dev', 'biggy',
+      'dead-rabbit', 'mydude', 'murphy', 'neil', 'dennis', 'kerouac',
+      'mc-claude', 'pi-dog', 'grokdoggydog', 'lukedog',
+    ]
+    const peerKeys = Object.fromEntries(peerNames.map(n => {
+      const sk = generateSecretKey()
+      return [n, { sk, pk: getPublicKey(sk) }]
+    }))
+    const readersCfg = {
+      viewer: null,
+      curator: pkCurator,
+      ...Object.fromEntries(peerNames.map(n => [n, peerKeys[n].pk])),
+    }
+    const writersCfg = {
+      owner: { pubkey: pkOwner, perHour: 100 },
+      curator: { pubkey: pkCurator, perHour: 300 },
+      ...Object.fromEntries(peerNames.map(n => [n, { pubkey: peerKeys[n].pk, perHour: 50 }])),
+    }
+    const allMembers = [pkOwner, pkCurator, ...peerNames.map(n => peerKeys[n].pk)]
+    const cfg = validateAndResolveConfig({
+      memoryGlobalChannelId: GLOBAL_CH,
+      ownerPubkey: pkOwner,
+      maxUnbackedSec: 3600,
+      globalWriters: [],
+      canonWriters: [pkOwner],
+      curators: [pkCurator],
+      readers: readersCfg,
+      writers: writersCfg,
+      rooms: { [ROOM_ID]: { members: allMembers, writers: allMembers } },
+    })
+
+    const dbPath = join(tmp, 'memory.sqlite')
+    const ledgerPath = join(tmp, 'accepted-ledger.jsonl')
+    const receiptPath = join(tmp, 'last-verified-backup.json')
+    initEmptyStore({ dbPath, ledgerPath, nowSec: 1000 })
+    recordVerifiedBackup({ dbPath, ledgerPath, receiptPath, snapshotId: SNAP_ID, writeSeq: 1, at: 1000 })
+    const store = new HiveMemoryStore({ dbPath, ledgerPath, receiptPath, config: cfg })
+    try {
+      assert.equal(store.start(1000).ready, true)
+      const activity = { seq: 0, events: [] }
+      const rpc = (binding, name, args = {}, at = 1010) => {
+        const res = handleSocketJsonRpc({
+          store,
+          binding,
+          nowSec: at,
+          activity,
+          message: { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } },
+        })
+        return JSON.parse(res.result.content[0].text)
+      }
+
+      // 1. Five of 16 peer readers execute memory_wake (31.3% recall coverage, matching dream-2567 pre-cycle state)
+      for (const peer of peerNames.slice(0, 5)) {
+        rpc({ kind: 'reader', name: peer }, 'memory_wake', {}, 1010)
+      }
+      assert.equal(activity.events.length, 5, '5 peer recall events recorded in activity ring')
+
+      // 2. Curator reader executes >ACTIVITY_MAX (90) wake/query pagination calls: must NOT evict peer recall events
+      for (let i = 0; i < ACTIVITY_MAX + 10; i++) {
+        rpc({ kind: 'reader', name: 'curator' }, i % 15 === 0 ? 'memory_wake' : 'memory_query', { limit: 150, format: 'full', include_history: true }, 1015)
+      }
+      assert.equal(activity.events.length, 5, 'curator reader pagination calls must not pollute activity.events or evict peers')
+      const wakeAfterPaging = rpc({ kind: 'reader', name: 'curator' }, 'memory_wake', {}, 1016)
+      assert.equal(wakeAfterPaging.recent_activity.length, 5, 'all 5 peer recall events remain in recent_activity after 90 curator reads')
+
+      // 3. Refused calls on curator reader socket ARE still recorded for nightmare refusal-spike detection
+      rpc({ kind: 'reader', name: 'curator' }, 'memory_submit', {}, 1017)
+      assert.equal(activity.events.at(-1).kind, 'refused')
+
+      // 4. Even if post-cycle recent_activity had 4 of 5 peer events evicted by writer traffic,
+      // mergeCycleRecentActivity + readPostCycleSnapshot preserve pre-cycle peer recall events
+      const mergedAct = mergeCycleRecentActivity(
+        wakeAfterPaging.recent_activity,
+        [wakeAfterPaging.recent_activity[0], { seq: 999, at: 1020, kind: 'submit', actor: 'curator', accepted: true }]
+      )
+      const mergedPeers = new Set(mergedAct.filter(a => a.kind === 'wake').map(a => a.actor))
+      assert.equal(mergedPeers.size, 5, 'mergeCycleRecentActivity preserves all 5 peer recall events across cycle boundary')
+
+      // 5. Chronological ordering in evaluateCoherenceSlice: passing records in memory_query DESC order
+      // vs chronological ASC order must evaluate recent-window topic corroboration on the NEWEST 18 claims, not the oldest 18.
+      const baseRecords = []
+      // Oldest 4 claims (created_at 1100..1103): single-author uncorroborated topic 'waggle' (2 claims by mydude) and 'r1' (2 claims by mc-claude)
+      for (let i = 0; i < 2; i++) {
+        baseRecords.push({
+          event_id: `old-w-${i}`.padEnd(64, '0'),
+          author_pubkey: peerKeys.mydude.pk,
+          scope: `room:${ROOM_ID}`,
+          d: `hive-memory:room:${ROOM_ID}:waggle-old-${i}`,
+          topic: 'waggle',
+          claim: `Old waggle claim ${i} PR #100`,
+          evidence: ['PR #100'],
+          as_of_git: 'aaaaaaa',
+          created_at: 1100 + i,
+          expires_at: 200000,
+          status: 'active',
+          verification: 'accepted',
+          is_current: true,
+        })
+        baseRecords.push({
+          event_id: `old-r-${i}`.padEnd(64, '0'),
+          author_pubkey: peerKeys['mc-claude'].pk,
+          scope: `room:${ROOM_ID}`,
+          d: `hive-memory:room:${ROOM_ID}:r1-old-${i}`,
+          topic: 'r1',
+          claim: `Old r1 claim ${i} PR #101`,
+          evidence: ['PR #101'],
+          as_of_git: 'bbbbbbb',
+          created_at: 1102 + i,
+          expires_at: 200000,
+          status: 'active',
+          verification: 'accepted',
+          is_current: true,
+        })
+      }
+      // Newest 18 claims (created_at 1200..1217): multi-author corroborated claims on 'nvoy' and 'herd-infra'
+      for (let i = 0; i < 18; i++) {
+        const authorName = peerNames[i % 6]
+        const topic = i % 2 === 0 ? 'nvoy' : 'herd-infra'
+        baseRecords.push({
+          event_id: `new-${String(i).padStart(2, '0')}`.padEnd(64, '0'),
+          author_pubkey: peerKeys[authorName].pk,
+          scope: `room:${ROOM_ID}`,
+          d: `hive-memory:room:${ROOM_ID}:${topic}-new-${i}`,
+          topic,
+          claim: `Recent ${topic} claim ${i} PR #${370 + Math.floor(i / 3)}`,
+          evidence: [`PR #${370 + Math.floor(i / 3)}`],
+          as_of_git: '4baea98',
+          created_at: 1200 + i,
+          expires_at: i % 3 === 0 ? null : 200000,
+          status: 'active',
+          verification: 'accepted',
+          is_current: true,
+        })
+      }
+      const descRecords = [...baseRecords].sort((a, b) => b.created_at - a.created_at)
+      const cohAsc = computeCoherence({
+        records: baseRecords,
+        history_records: baseRecords,
+        agent_roster: wakeAfterPaging.agent_roster,
+        recent_activity: wakeAfterPaging.recent_activity,
+        store_state: { state: 'READY', write_seq: baseRecords.length },
+        now_sec: 1220,
+        history_complete: true,
+      })
+      const cohDesc = computeCoherence({
+        records: descRecords,
+        history_records: descRecords,
+        agent_roster: wakeAfterPaging.agent_roster,
+        recent_activity: wakeAfterPaging.recent_activity,
+        store_state: { state: 'READY', write_seq: descRecords.length },
+        now_sec: 1220,
+        history_complete: true,
+      })
+      assert.equal(cohDesc.axes.convergence, cohAsc.axes.convergence, 'DESC query order must match ASC chronological order on convergence')
+      assert.equal(cohDesc.score, cohAsc.score, 'DESC query order must match ASC chronological order on overall coherence score')
+      assert.equal(cohDesc.axes.convergence, 100, 'newest 18 multi-author corroborated claims achieve 100% convergence without tail-order artifact')
+    } finally {
+      store.close()
+    }
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }
