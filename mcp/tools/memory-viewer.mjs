@@ -8716,6 +8716,7 @@ export async function startMemoryViewer({
   host,
   port,
   pollMs = DEFAULT_POLL_MS,
+  // Clock in epoch seconds for poll timestamps and trend windows; tests inject a fixed clock.
   now = () => Math.floor(Date.now() / 1000),
 } = {}) {
   if (!socketPath || !isAbsolute(socketPath)) {
@@ -8817,7 +8818,7 @@ export async function startMemoryViewer({
 
   async function runPoll({ forceFull = true } = {}) {
     if (stopped) return currentState
-    const nowSec = typeof now === 'function' ? now() : Math.floor(Date.now() / 1000)
+    const nowSec = Math.floor(now())
     const nowMs = Date.now()
     pollSeq += 1
     let nextSnapshot

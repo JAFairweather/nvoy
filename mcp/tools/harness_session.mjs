@@ -4,6 +4,7 @@
 
 import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { basename, dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { recallServerEntry, sshChannelEntry } from './channel_client.mjs'
 
 export const serverName = manifest => `nvoy-${manifest.id}`
@@ -20,6 +21,15 @@ export const DREAM_VERIFY_SERVER = 'hive-dream'
 export const DREAM_VERIFY_TOOLS = ['memory_dream_verify']
 export const LOCAL_DREAM_VERIFY = '/opt/hive-memory/nvoy/mcp/tools/memory-dream-verify.mjs'
 
+// Off the fleet the channel is an ssh child of the session, and every release (and manifest edit) recreates
+// the identity's adapter, which ends that ssh. Claude Code does not reconnect a stdio server, so the session
+// holds the channel through the reconnecting proxy instead: it keeps the session's stdio open, dials ssh
+// again with backoff and replays initialize. A release then costs a reconnect, not a session restart.
+export const RECONNECT_PROXY = fileURLToPath(new URL('./mcp-reconnect.mjs', import.meta.url))
+export function reconnectingEntry(entry, { node = process.execPath, proxy = RECONNECT_PROXY } = {}) {
+  return { command: node, args: [proxy, '--', entry.command, ...entry.args] }
+}
+
 // The channel runs as the session's own MCP child, under the same worker UID that the SSH forced
 // command would use, so it keeps exactly the queue permissions that path has. Off the fleet it is
 // that SSH forced command, reached with the same entry claude-channel-doctor renders for a client.
@@ -29,7 +39,7 @@ export function mcpConfig({ manifest, root, remote = null, dreamVerify = null })
     ? dreamVerify
     : (dreamVerify === true || (dreamVerify === null && manifest.id === 'curator' && existsSync(LOCAL_DREAM_VERIFY)) ? LOCAL_DREAM_VERIFY : null)
   const dream = verifyScript ? { [DREAM_VERIFY_SERVER]: { command: 'node', args: [verifyScript, '--mcp'] } } : {}
-  if (remote) return { mcpServers: { [serverName(manifest)]: sshChannelEntry(remote), ...recall, ...dream } }
+  if (remote) return { mcpServers: { [serverName(manifest)]: reconnectingEntry(sshChannelEntry(remote)), ...recall, ...dream } }
   return { mcpServers: { [serverName(manifest)]: {
     command: 'node',
     args: ['/srv/nvoy/mcp/tools/claude-channel.mjs', '--instance', manifest.id],
@@ -243,6 +253,31 @@ export function channelProcessUp(psText, rootPid, entryArgs) {
     queue.push(...(children.get(pid) || []))
   }
   return false
+}
+
+// The reconnecting proxy and its link, among the session's descendants. `proxy`: a process running the
+// proxy script for this session. `link`: the pid of that proxy's live child (its ssh), or ''. Startup waits for the link,
+// so a fleet that refuses the key still keeps a session from being called ready; after that only the proxy
+// going away restarts the session, and a dropped link is the proxy's to redial.
+export function channelState(psText, rootPid, { proxy = RECONNECT_PROXY, node = process.execPath } = {}) {
+  const children = new Map(), commands = new Map()
+  for (const line of String(psText || '').split('\n')) {
+    const match = line.match(/^\s*(\d+)\s+(\d+)\s(.*)$/)
+    if (!match) continue
+    const [, pid, ppid, command] = match
+    commands.set(pid, command.trim())
+    children.set(ppid, [...(children.get(ppid) || []), pid])
+  }
+  const queue = [...(children.get(String(rootPid)) || [])]
+  for (const seen = new Set(); queue.length;) {
+    const pid = queue.shift()
+    if (seen.has(pid)) continue
+    seen.add(pid)
+    const words = (commands.get(pid) || '').split(/\s+/)
+    if (words[0] === node && words[1] === proxy && words.includes('--')) return { proxy: true, link: (children.get(pid) || [])[0] || '' }
+    queue.push(...(children.get(pid) || []))
+  }
+  return { proxy: false, link: '' }
 }
 
 // Claude Code keeps each working directory's conversations under ~/.claude/projects/<cwd with

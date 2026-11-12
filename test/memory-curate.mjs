@@ -29,13 +29,17 @@ import { startMemoryDaemon } from '../mcp/tools/memory-daemon.mjs'
 import {
   buildDreamPacket,
   computeEigenAxisProposals,
+  curationObservationEnd,
   computeTopicEigenvectors,
   evaluateDreamTriggers,
   planMerkleDream,
+  readInitialHistory,
+  readPostCycleSnapshot,
   readConsolidationLedger,
   readCuratorStateFile,
   runCuratorCycle,
   weaveDreamStory,
+  writeCuratorStateFile,
   writeDreamPacket,
 } from '../mcp/tools/memory-curate.mjs'
 import {
@@ -65,6 +69,69 @@ async function test(name, fn) {
 }
 
 console.log('=== Hive Shared Memory Merkle Dreaming & Curator Tests ===')
+
+await test('initial history restarts a bounded scan when a concurrent save advances write_seq', async () => {
+  const record = id => ({ event_id: id, is_current: true, status: 'active', verification: 'accepted' })
+  const page = (seq, cursor) => ({ answer: 'found', answer_reason: null, format: 'full',
+    records: [record(cursor ? 'second' : 'first')], total_matched: 2, returned: 1,
+    next_cursor: cursor ? null : '1', store_state: { state: 'READY', write_seq: seq } })
+  let wakes = 0
+  let queries = 0
+  const reader = { callReadTool: async (name, args) => {
+    if (name === 'memory_wake') return { store_state: { state: 'READY', write_seq: ++wakes === 1 ? 42 : 43 } }
+    queries++
+    return page(queries === 2 ? 43 : queries === 1 ? 42 : 43, Boolean(args.cursor))
+  } }
+  const scan = await readInitialHistory(reader, 3, 1)
+  assert.equal(scan.wake.store_state.write_seq, 43)
+  assert.deepEqual(scan.historyRecords.map(r => r.event_id), ['first', 'second'])
+  assert.equal(scan.historyComplete, true)
+  assert.equal(queries, 4, 'a changed page restarts from the first page')
+
+  let growingQueries = 0
+  const growing = { callReadTool: async (name, args) => {
+    if (name === 'memory_wake') return { store_state: { state: 'READY', write_seq: growingQueries === 0 ? 42 : 43 } }
+    growingQueries++
+    const offset = Number(args.cursor ?? 0)
+    const seq = growingQueries === 1 ? 42 : 43
+    const total = seq === 42 ? 2 : 3
+    return { answer: 'found', answer_reason: null, format: 'full',
+      records: [record(['first', 'second', 'third'][offset])], total_matched: total, returned: 1,
+      next_cursor: offset + 1 === total ? null : String(offset + 1),
+      store_state: { state: 'READY', write_seq: seq } }
+  } }
+  const grownScan = await readInitialHistory(growing, 4, 1)
+  assert.deepEqual(grownScan.historyRecords.map(r => r.event_id), ['first', 'second', 'third'])
+  assert.equal(growingQueries, 5, 'a save that grows history restarts from the first page')
+
+  let malformedQueries = 0
+  const malformed = { callReadTool: async name => name === 'memory_wake'
+    ? { store_state: { state: 'READY', write_seq: 42 } }
+    : (malformedQueries++, { ...page(43, false), answer: 'unknown', answer_reason: 'store-not-ready' }) }
+  await assert.rejects(() => readInitialHistory(malformed, 3, 1), /complete ready history page/)
+  assert.equal(malformedQueries, 1, 'malformed history fails closed without retry')
+
+  let changingSeq = 0
+  const alwaysChanging = { callReadTool: async name => name === 'memory_wake'
+    ? { store_state: { state: 'READY', write_seq: ++changingSeq } }
+    : page(changingSeq + 1, false) }
+  await assert.rejects(() => readInitialHistory(alwaysChanging, 3, 1), /bounded read retries/)
+  assert.equal(changingSeq, 3, 'write-sequence retries are bounded to three scans')
+})
+
+await test('post-cycle history rejects degraded or malformed queries before measuring counters', async () => {
+  const state = { state: 'READY', write_seq: 42 }
+  const wake = { store_state: state, agent_roster: [], recent_activity: [] }
+  const readerFor = page => ({ callReadTool: async name => name === 'memory_wake' ? wake : page })
+  const validEmpty = { answer: 'none', answer_reason: null, format: 'full', records: [],
+    total_matched: 0, returned: 0, next_cursor: null, store_state: state }
+  const complete = await readPostCycleSnapshot(readerFor(validEmpty), 42, 3, 100, 1794225262)
+  assert(complete && Array.isArray(complete.historyRecords), 'a ready empty store is a complete observation')
+  assert.equal(complete.historyRecords.length, 0)
+  assert.equal(await readPostCycleSnapshot(readerFor({ ...validEmpty, answer: 'unknown', answer_reason: 'store-not-ready' }), 42, 3, 100, 1794225262), null)
+  assert.equal(await readPostCycleSnapshot(readerFor({ ...validEmpty, store_state: { state: 'BACKUP_DEGRADED', write_seq: 42 } }), 42, 3, 100, 1794225262), null)
+  assert.equal(await readPostCycleSnapshot(readerFor({ ...validEmpty, records: undefined }), 42, 3, 100, 1794225262), null)
+})
 
 await test('computeSourceMerkleRoot and validateMemoryEvent enforce cryptographic merkle_sources', () => {
   const idA = 'a'.repeat(64)
@@ -1470,11 +1537,26 @@ await test('writeDreamPacket writes 0640 global-scope packets, strips @mentions/
     const claimIdPrivate = 'b2'.repeat(32)
 
     const pkt = buildDreamPacket({
+      lastCuratedAt: 1794225000,
       writeSeqBefore: 1000,
       writeSeqAfter: 1023,
       ranAt: 1794225262,
       ledgerRef: '/var/lib/hive-memory-curator/consolidation-ledger.jsonl#write_seq=1023',
       coherenceScore: 75.6,
+      coherenceBefore: 74.1,
+      coherenceAfter: 75.6,
+      historyComplete: true,
+      historyRecords: [
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'a'.repeat(64), d: 'old', event_id: '01'.repeat(32), created_at: 1794224900, expires_at: null },
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'a'.repeat(64), d: 'old', event_id: '02'.repeat(32), created_at: 1794225100, expires_at: null },
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'b'.repeat(64), d: 'gone', event_id: '03'.repeat(32), created_at: 1794225200, status: 'withdrawn', expires_at: 1794225250 },
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'c'.repeat(64), d: 'aged', event_id: '04'.repeat(32), created_at: 1794224800, expires_at: 1794225200 },
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'e'.repeat(64), d: 'current', event_id: '03'.repeat(32), created_at: 1794224900, expires_at: null },
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'e'.repeat(64), d: 'current', event_id: claimIdGlobal, created_at: 1794225250, expires_at: null },
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'f'.repeat(64), d: 'same-second', event_id: 'ff'.repeat(32), created_at: 1794224800, expires_at: 1794225200 },
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'f'.repeat(64), d: 'same-second', event_id: '00'.repeat(32), created_at: 1794224800, expires_at: null },
+        { scope: 'room:private-other-room', author_pubkey: 'd'.repeat(64), d: 'private', event_id: '05'.repeat(32), created_at: 1794225100, status: 'withdrawn', expires_at: 1794225200 },
+      ],
       triggers: { reasons: ['synaptic_volume(delta=69>=20)'] },
       plan: {
         promotions: [
@@ -1509,6 +1591,31 @@ await test('writeDreamPacket writes 0640 global-scope packets, strips @mentions/
     assert.equal(pkt.id, 'dream-1023')
     assert.equal(pkt.changes.length, 1, 'non-global room claims must be strictly excluded from dream packet')
     assert.equal(pkt.changes[0].claim_event_id, claimIdGlobal)
+    assert.deepEqual(pkt.stats.retired, { withdrawn: 1, expired: 1, folded: 2, total: 4 })
+    assert.equal(pkt.stats.claims_merged, 1)
+    assert.equal(pkt.stats.claims_superseded, 2, 'include this cycle\'s replacement in the post-write observation')
+    assert.equal(pkt.stats.coherence.delta, 1.5)
+    const adjustedStamp = buildDreamPacket({
+      lastCuratedAt: 1794225000,
+      writeSeqAfter: 1024,
+      ranAt: 1794225262,
+      historyComplete: true,
+      historyRecords: [
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'a'.repeat(64), d: 'adjusted', event_id: '11'.repeat(32), created_at: 1794225250, expires_at: null },
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'a'.repeat(64), d: 'adjusted', event_id: claimIdGlobal, created_at: 1794225263, expires_at: null },
+      ],
+      plan: { promotions: [{ scope: `room:${GLOBAL_CH}`, topic: 'herd-infra', slug: 'adjusted', claim: 'Accepted after timestamp adjustment',
+        template: { tags: [['d', 'adjusted']] } }] },
+      submitted: [{ id: claimIdGlobal, d: 'adjusted', created_at: 1794225263 }],
+    })
+    assert.equal(adjustedStamp.stats.window_end, 1794225263, 'observation boundary includes the accepted adjusted timestamp')
+    assert.equal(adjustedStamp.stats.claims_superseded, 1, 'same-second accepted replacement is counted')
+    const unknown = buildDreamPacket({ writeSeqAfter: 1023, ranAt: 1794225262, plan: {
+      promotions: [{ scope: `room:${GLOBAL_CH}`, topic: 'herd-infra', slug: 'unknown', claim: 'Known merge',
+        template: { tags: [['d', `herd-infra:room:${GLOBAL_CH}:unknown`]] } }], distillations: [] },
+      submitted: [{ id: claimIdGlobal, d: `herd-infra:room:${GLOBAL_CH}:unknown` }] })
+    assert.equal(unknown.stats.claims_superseded, null, 'incomplete history is unknown rather than measured zero')
+    assert.equal(unknown.stats.retired.total, null)
     assert(!pkt.changes[0].summary.includes('0d7ac776bf6e9cd0b5f6216ea2f59ac7932a9948'), 'raw 64-hex commit SHA must be sanitized in summary')
     assert(!pkt.changes[0].summary.includes('@mydude'), '@mention syntax must be stripped from packet summary')
     assert(!pkt.changes[0].summary.includes('https://'), 'raw URLs must be stripped from packet summary')
@@ -1557,9 +1664,10 @@ await test('writeDreamPacket writes 0640 global-scope packets, strips @mentions/
     assert.deepEqual(goodRes.record.changes[0], pkt.changes[0], 'verifier must copy each packet change verbatim including change_id, d, topic, and source_count')
     const buzzPost = formatDreamBuzzPost(goodRes.record)
     assert(!buzzPost.includes('@mydude') && !buzzPost.includes('https://'), 'formatted Buzz post must contain no @mentions or URLs')
-    assert(!buzzPost.includes('dream-1023') && !buzzPost.includes('Consolidated Changes') && !buzzPost.includes('validation'), 'formatted Buzz post must be journey-only without dream ID, validation metadata, or Consolidated Changes list')
+    assert(buzzPost.endsWith('Dream ID: dream-1023'), 'published dream must identify its exact packet for the Cyber Times')
+    assert(!buzzPost.includes('Consolidated Changes') && !buzzPost.includes('validation'), 'formatted Buzz post must omit validation metadata and Consolidated Changes list')
     const seedBuzzPost = formatDreamBuzzPost(seedRes.record)
-    assert(!/\d/.test(seedBuzzPost), 'formatted Buzz post from story_seed must contain zero statistics, sequence numbers, or counts')
+    assert(!/\d/.test(seedBuzzPost.split('\n\nDream ID: ')[0]), 'formatted dream story must contain zero statistics, sequence numbers, or counts')
 
     // Unsanitized packet summary with @mention or URL fails closed in verifier
     const dirtyPkt = {
@@ -1615,6 +1723,52 @@ await test('writeDreamPacket writes 0640 global-scope packets, strips @mentions/
     assert.equal(digitRes.ok, false, 'verifier must reject digits/counts in title and dream')
     assert(digitRes.errors.some(e => e.includes('draft.title') && e.includes('digits')))
     assert(digitRes.errors.some(e => e.includes('draft.dream') && e.includes('digits')))
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+await test('consecutive dream packets persist the measured horizon and count a replacement once', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'nvoy-dream-horizon-'))
+  try {
+    const stateFile = join(tmp, 'curator-state.json')
+    const scope = `room:${GLOBAL_CH}`
+    const prior = { scope, author_pubkey: 'a'.repeat(64), d: 'replacement', event_id: '11'.repeat(32), created_at: 101, expires_at: null }
+    const replacement = { ...prior, event_id: '22'.repeat(32), created_at: 102 }
+    const other = { scope, author_pubkey: 'b'.repeat(64), d: 'other', event_id: '33'.repeat(32), created_at: 150, expires_at: null }
+    const firstSubmitted = [{ id: replacement.event_id, d: 'replacement', created_at: replacement.created_at }]
+    const first = buildDreamPacket({
+      lastCuratedAt: 90,
+      writeSeqAfter: 2,
+      ranAt: 100,
+      historyComplete: true,
+      historyRecords: [prior, replacement],
+      plan: { promotions: [{ scope, topic: 'nvoy', slug: 'replacement', claim: 'Replacement accepted', template: { tags: [['d', 'replacement']] } }] },
+      submitted: firstSubmitted,
+    })
+    assert.equal(first.stats.window_end, 102)
+    assert.equal(first.stats.claims_superseded, 1)
+
+    const measuredHorizon = curationObservationEnd(100, firstSubmitted)
+    writeCuratorStateFile(stateFile, { last_curated_at: 90, last_curated_write_seq: 1,
+      pending_curated_at: measuredHorizon, pending_curated_write_seq: 2, pending_dream_packet: first })
+    const staged = readCuratorStateFile(stateFile)
+    assert.equal(staged.pending_curated_at, first.stats.window_end, 'recovery stages the packet measurement boundary')
+    writeCuratorStateFile(stateFile, { last_curated_at: staged.pending_curated_at, last_curated_write_seq: staged.pending_curated_write_seq })
+    const durable = readCuratorStateFile(stateFile)
+    assert.equal(durable.last_curated_at, 102)
+
+    const second = buildDreamPacket({
+      lastCuratedAt: durable.last_curated_at,
+      writeSeqAfter: 3,
+      ranAt: 200,
+      historyComplete: true,
+      historyRecords: [prior, replacement, other],
+      plan: { promotions: [{ scope, topic: 'nvoy', slug: 'other', claim: 'Other claim accepted', template: { tags: [['d', 'other']] } }] },
+      submitted: [{ id: other.event_id, d: 'other', created_at: other.created_at }],
+    })
+    assert.equal(second.stats.window_start, first.stats.window_end)
+    assert.equal(second.stats.claims_superseded, 0, 'the prior replacement is outside the next measured window')
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }
@@ -1724,6 +1878,8 @@ await test('runCuratorCycle does not advance cursor or ledger when writeDreamPac
     const stagedState = readCuratorStateFile(stateFile)
     assert.equal(stagedState.last_curated_write_seq, 0, 'cursor must not advance when packet write fails')
     assert(stagedState.pending_dream_packet, 'pending_dream_packet must be staged in curator-state.json for retry recovery')
+    assert.notEqual(stagedState.pending_dream_packet.stats.claims_superseded, null, 'complete post-write history measures replacements')
+    assert.notEqual(stagedState.pending_dream_packet.stats.coherence.after, null, 'post-write coherence is measured before staging')
     const consLedgerPath = join(tmp, 'consolidation-ledger.jsonl')
     assert.equal(readConsolidationLedger(consLedgerPath).length, 0, 'consolidation ledger must not advance before packet write succeeds')
 
