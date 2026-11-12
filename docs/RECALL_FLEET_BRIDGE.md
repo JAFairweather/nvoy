@@ -21,7 +21,7 @@ by design, no key. This note proposes the bridge. James's grants for GrokDoggyDo
 - **The socket is a raw pipe.** The forwarder's two-tool allowlist runs inside recall, so a compromised recall could
   write any bytes to the socket. The gateway's forced command must itself refuse everything except a read-only
   wake or query for its bound reader, with no write method and no other reader. That is herd-cloud's existing
-  reader gateway contract; the live gates below test it directly, not only through the forwarder (GrokDoggyDog,
+  reader gateway contract, which this PR does not prove: it is a live gate; the live gates below test it directly, not only through the forwarder (GrokDoggyDog,
   PR 382 read).
 - **Key:** `/etc/nvoy/recall-keys/<id>` (mode 0600, owner the broker host user), on nvoy-fleet only. It is never
   mounted into any container. Making it, and authorizing its public half on herd-cloud's gateway as reader `<id>`,
@@ -42,6 +42,8 @@ by design, no key. This note proposes the bridge. James's grants for GrokDoggyDo
   refused before any connection.
 - Unit files: `ExecStart` is the fixed, pinned ssh line, with no client-supplied argument. The socket is 0660 with
   the dedicated group, `MaxConnections=4`, `RuntimeMaxSec` and the hardening keys present.
+- Logging: drive one wake and one query through the unit with a marker string in the request, and check that the
+  journal line carries the connection only (time, instance, exit status), never the marker or any request bytes.
 - Compose: the socket bind uses `create_host_path: false`, recall has the dedicated group, and no other service has it.
 
 ## Done when (Murphy's live gates)
