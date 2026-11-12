@@ -31,6 +31,7 @@ import {
   computeTopicEigenvectors,
   evaluateDreamTriggers,
   planMerkleDream,
+  readPostCycleSnapshot,
   readConsolidationLedger,
   readCuratorStateFile,
   runCuratorCycle,
@@ -64,6 +65,20 @@ async function test(name, fn) {
 }
 
 console.log('=== Hive Shared Memory Merkle Dreaming & Curator Tests ===')
+
+await test('post-cycle history rejects degraded or malformed queries before measuring counters', async () => {
+  const state = { state: 'READY', write_seq: 42 }
+  const wake = { store_state: state, agent_roster: [], recent_activity: [] }
+  const readerFor = page => ({ callReadTool: async name => name === 'memory_wake' ? wake : page })
+  const validEmpty = { answer: 'none', answer_reason: null, format: 'full', records: [],
+    total_matched: 0, returned: 0, next_cursor: null, store_state: state }
+  const complete = await readPostCycleSnapshot(readerFor(validEmpty), 42, 3, 100, 1794225262)
+  assert(complete && Array.isArray(complete.historyRecords), 'a ready empty store is a complete observation')
+  assert.equal(complete.historyRecords.length, 0)
+  assert.equal(await readPostCycleSnapshot(readerFor({ ...validEmpty, answer: 'unknown', answer_reason: 'store-not-ready' }), 42, 3, 100, 1794225262), null)
+  assert.equal(await readPostCycleSnapshot(readerFor({ ...validEmpty, store_state: { state: 'BACKUP_DEGRADED', write_seq: 42 } }), 42, 3, 100, 1794225262), null)
+  assert.equal(await readPostCycleSnapshot(readerFor({ ...validEmpty, records: undefined }), 42, 3, 100, 1794225262), null)
+})
 
 await test('computeSourceMerkleRoot and validateMemoryEvent enforce cryptographic merkle_sources', () => {
   const idA = 'a'.repeat(64)
@@ -1334,6 +1349,21 @@ await test('writeDreamPacket writes 0640 global-scope packets, strips @mentions/
     assert.equal(pkt.stats.claims_merged, 1)
     assert.equal(pkt.stats.claims_superseded, 2, 'include this cycle\'s replacement in the post-write observation')
     assert.equal(pkt.stats.coherence.delta, 1.5)
+    const adjustedStamp = buildDreamPacket({
+      lastCuratedAt: 1794225000,
+      writeSeqAfter: 1024,
+      ranAt: 1794225262,
+      historyComplete: true,
+      historyRecords: [
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'a'.repeat(64), d: 'adjusted', event_id: '11'.repeat(32), created_at: 1794225250, expires_at: null },
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'a'.repeat(64), d: 'adjusted', event_id: claimIdGlobal, created_at: 1794225263, expires_at: null },
+      ],
+      plan: { promotions: [{ scope: `room:${GLOBAL_CH}`, topic: 'herd-infra', slug: 'adjusted', claim: 'Accepted after timestamp adjustment',
+        template: { tags: [['d', 'adjusted']] } }] },
+      submitted: [{ id: claimIdGlobal, d: 'adjusted', created_at: 1794225263 }],
+    })
+    assert.equal(adjustedStamp.stats.window_end, 1794225263, 'observation boundary includes the accepted adjusted timestamp')
+    assert.equal(adjustedStamp.stats.claims_superseded, 1, 'same-second accepted replacement is counted')
     const unknown = buildDreamPacket({ writeSeqAfter: 1023, ranAt: 1794225262, plan: {
       promotions: [{ scope: `room:${GLOBAL_CH}`, topic: 'herd-infra', slug: 'unknown', claim: 'Known merge',
         template: { tags: [['d', `herd-infra:room:${GLOBAL_CH}:unknown`]] } }], distillations: [] },
