@@ -91,9 +91,22 @@ const isCuratorReader = (binding, config) =>
 
 // In-memory telemetry for the viewer only: metadata, never claim text, because, evidence or query text, and
 // never the viewer's own calls. Each ref keeps its claim's scope and author so viewerActivity can apply the
-// viewer's read ACL when it serves the ring.
-function noteActivity(activity, binding, nowSec, { kind, count = null, refs = [], filter = null, accepted = null, code = null }) {
-  if (!activity || isViewer(binding)) return
+// viewer's read ACL when it serves the ring. Durable hourly aggregate counts are also persisted in SQLite
+// (`activity_rollups`) so 24h and 7d recall totals survive ACTIVITY_MAX ring overflow and daemon restarts.
+function noteActivity(activity, binding, nowSec, { kind, count = null, refs = [], filter = null, accepted = null, code = null }, store = null) {
+  if (isViewer(binding)) return
+  let rollupOk = true
+  if (store && typeof store.recordActivityRollup === 'function') {
+    const retCount = Number.isSafeInteger(count) ? count : (Array.isArray(refs) ? refs.length : 0)
+    rollupOk = store.recordActivityRollup({ at: nowSec, actor: binding.name, kind, count: retCount })
+  }
+  if (!activity) return
+  if (!Number.isSafeInteger(activity.started_at)) activity.started_at = nowSec
+  if (!rollupOk) {
+    activity.rollup_write_failures = (activity.rollup_write_failures || 0) + 1
+    activity.first_rollup_failure_at ??= nowSec
+    activity.last_rollup_failure_at = nowSec
+  }
   activity.seq += 1
   activity.events.push({ seq: activity.seq, at: nowSec, kind, actor: binding.name, count, refs, filter, accepted, code })
   if (activity.events.length > ACTIVITY_MAX) activity.events.shift()
@@ -145,7 +158,7 @@ export function handleSocketJsonRpc({ store, binding, message, nowSec, activity 
   const { id, method, params } = message
   const reply = result => ({ jsonrpc: '2.0', id, result })
   const writer = binding.kind === 'writer'
-  const note = entry => noteActivity(activity, binding, nowSec, entry)
+  const note = entry => noteActivity(activity, binding, nowSec, entry, store)
 
   if (method === 'initialize') {
     const readerPubkey = writer ? null : store.config?.readers.get(binding.name)
@@ -226,7 +239,24 @@ export function handleSocketJsonRpc({ store, binding, message, nowSec, activity 
     note({ kind: 'wake', count: Array.isArray(out.records) ? out.records.length : 0, refs: recordRefs(out.records) })
     const includeTelemetry = isViewer(binding) || isCuratorReader(binding, store.config)
     const telemetry = activity && includeTelemetry
-      ? { recent_activity: viewerActivity(activity, store.config, binding.name), agent_roster: agentRoster(store, nowSec) }
+      ? {
+          recent_activity: viewerActivity(activity, store.config, binding.name),
+          agent_roster: agentRoster(store, nowSec),
+          activity_ring: {
+            seq: activity.seq,
+            cap: ACTIVITY_MAX,
+            retained: activity.events.length,
+            overflowed: activity.seq > ACTIVITY_MAX,
+            started_at: Number.isSafeInteger(activity.started_at) ? activity.started_at : nowSec,
+            oldest_at: activity.events[0]?.at ?? null,
+            rollup_write_failures: Math.max(Number(activity.rollup_write_failures || 0), Number(store.rollupWriteFailures || 0)),
+            first_rollup_failure_at: activity.first_rollup_failure_at ?? store.firstRollupFailureAt ?? null,
+            last_rollup_failure_at: activity.last_rollup_failure_at ?? store.lastRollupFailureAt ?? null,
+          },
+          ...(typeof store.activityRollups === 'function'
+            ? { activity_rollups: store.activityRollups({ sinceSec: Math.max(0, nowSec - 14 * 86400), nowSec }) }
+            : {}),
+        }
       : {}
     return reply(mcpToolResult({ ...who, ...out, ...telemetry }))
   }
@@ -313,7 +343,7 @@ export async function startMemoryDaemon({
 
   const servers = []
   const connections = new Set()
-  const activity = { seq: 0, events: [] }
+  const activity = { seq: 0, started_at: now(), events: [] }
   const attach = (binding, target) => new Promise((resolveListen, rejectListen) => {
     const srv = createServer(conn => {
       const entry = { conn, binding, signature: bindingSignature(store.config, binding) }

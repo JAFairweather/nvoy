@@ -24,7 +24,7 @@ import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest
 import { readClientConfig } from './channel_client.mjs'
 import { runCodexHarness } from './codex_harness.mjs'
 import { herdrAgentName, herdrClient, herdrSession } from './harness_herdr.mjs'
-import { channelProcessUp, classifyPane, claudeArgs, ensureInstructions, hasPriorSession, LOCAL_DREAM_VERIFY, mcpConfig, seedClaudeJson, seedSettings, serverName } from './harness_session.mjs'
+import { channelState, classifyPane, claudeArgs, ensureInstructions, hasPriorSession, LOCAL_DREAM_VERIFY, mcpConfig, seedClaudeJson, seedSettings, serverName } from './harness_session.mjs'
 
 const die = message => { console.error(`instance-harness: ${message}`); process.exit(1) }
 const log = message => console.log(`instance-harness: ${message}`)
@@ -72,6 +72,10 @@ const WATCH_MS = Number(process.env.HARNESS_WATCH_MS || 5000)
 const RETRY_MS = Number(process.env.HARNESS_RETRY_MS || 5000)
 const RETRY_MAX_MS = Number(process.env.HARNESS_RETRY_MAX_MS || 300000)
 const SETTLE_MS = Number(process.env.HARNESS_CHANNEL_SETTLE_MS || 10000)
+// A ready session whose proxy cannot hold a link for this long (a refused key, a lock the fleet still holds, an
+// adapter that stays down) is restarted as before, so a dead channel never looks up. A release's drop is a few
+// seconds and stays on the reconnect path.
+const DOWN_MS = Number(process.env.HARNESS_CHANNEL_DOWN_MS || 600000)
 const LAUNCH_MS = Number(process.env.HARNESS_LAUNCH_MS || 10000)
 
 function readJson(path) { try { return JSON.parse(readFileSync(path, 'utf8')) } catch { return {} } }
@@ -144,17 +148,23 @@ if (mode === 'herdr' && !remote) die('a herdr terminal is for the portable harne
 const term = useHerdr ? herdrTerminal(herdr) : tmuxTerminal()
 log(`the session runs in ${useHerdr ? 'herdr' : 'tmux'}`)
 
-// Off the fleet the channel is an ssh child of the session, and it dies whenever the fleet recreates
-// the identity's adapter (each release, each manifest change). Claude Code never restarts it, so
-// the supervisor watches for it and restarts the session. The fleet form is left as it was.
+// Off the fleet the channel is the reconnecting proxy (harness_session.mjs reconnectingEntry) with ssh under
+// it. A release or manifest change recreates the adapter and ends the ssh; the proxy dials again and the
+// session carries on. At startup the supervisor waits for the proxy's live link (so a refused key never looks
+// ready); after that it restarts the session if the proxy itself is gone, or if no link has held for DOWN_MS.
+// The proxy swallows the replayed initialize response, so the session keeps the tool list it started with:
+// a release that adds or removes adapter tools needs a session restart to show them. The fleet form is left as it was.
 let watchChannel = !!remote
-function channelUp() {
+function channelNow() {
   const pid = term.pid()
-  if (!/^\d+$/.test(pid || '')) return false
+  if (!/^\d+$/.test(pid || '')) return { proxy: false, link: '' }
   const ps = spawnSync('ps', ['-A', '-ww', '-o', 'pid=,ppid=,command='], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
   if (ps.status !== 0) { watchChannel = false; log('cannot list processes; the channel is not watched'); return null }
-  return channelProcessUp(ps.stdout, pid, sessionMcp.mcpServers[server].args)
+  return channelState(ps.stdout, pid)
 }
+// Startup: the channel is up once the proxy holds a live link to the fleet; it returns that link's pid, so a
+// redial (a new pid) during startup counts as the channel closing, however briefly it was down.
+function channelUp() { const now = channelNow(); return now === null ? null : now.proxy && now.link ? now.link : false }
 
 let stopping = false
 for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, async () => { stopping = true; await term.stop(); process.exit(0) })
@@ -166,7 +176,7 @@ async function start() {
   log(`${resume ? 'resuming' : 'starting'} the ${manifest.id} session with channel ${server}`)
   const answered = new Map()
   const deadline = Date.now() + STARTUP_MS
-  let readyAt = 0, channelSince = 0
+  let readyAt = 0, channelSince = 0, channelLink = ''
   while (!stopping && Date.now() < deadline) {
     await sleep(POLL_MS)
     const { dead, status } = term.dead()
@@ -178,7 +188,8 @@ async function start() {
     // key, ends the ssh within a second while the prompt looks ready (mc-claude, 2026-09-25).
     if (watchChannel) {
       const up = channelUp()
-      if (up) channelSince ||= Date.now()
+      if (up && channelSince && up !== channelLink) throw new Error('the channel to the fleet closed during startup and was redialled; the fleet may still hold the channel lock from an earlier session')
+      if (up) { channelSince ||= Date.now(); channelLink = up }
       else if (up === false && channelSince) throw new Error('the channel to the fleet closed during startup; the fleet may still hold the channel lock from an earlier session')
     }
     if (readyAt) {
@@ -208,12 +219,23 @@ while (!stopping) {
   const startedAt = Date.now()
   try {
     await start()
+    let link = channelNow()?.link || '', linkSince = Date.now(), heldAt = Date.now()
     while (!stopping) {
       await sleep(WATCH_MS)
       term.named()
       const { dead, status } = term.dead()
       if (dead) { log(`session exited (status ${status}); restarting`); break }
-      if (watchChannel && channelUp() === false) { log('the channel to the fleet closed; restarting the session to reconnect it'); break }
+      if (watchChannel) {
+        const now = channelNow()
+        if (now && !now.proxy) { log('the channel proxy exited; restarting the session'); break }
+        if (now && now.link !== link) {
+          log(!now.link ? 'the channel to the fleet dropped; the proxy is reconnecting it' : link ? 'the channel to the fleet was redialled' : 'the channel to the fleet is back')
+          link = now.link; linkSince = Date.now()
+        }
+        // Held: the same link has stayed up for the settle time, as startup requires.
+        if (now && now.link && Date.now() - linkSince >= SETTLE_MS) heldAt = Date.now()
+        if (Date.now() - heldAt > DOWN_MS) { log(`the channel to the fleet has not held a link for ${Math.round(DOWN_MS / 1000)}s; restarting the session`); break }
+      }
     }
     if (Date.now() - startedAt > RETRY_MAX_MS) delay = RETRY_MS
   } catch (error) {

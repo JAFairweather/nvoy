@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto'
 import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -309,6 +310,40 @@ try {
   ok(`the throttle case reached its precondition — listed before the poll announced (threw: ${error.message})`, false)
   ok('listing an envelope does not suppress its first notification to a client that wakes on them', false)
 } finally { try { await throttleClient.close() } catch { /* already gone */ } }
+
+// A reply is handled work: an envelope answered without nvoy_channel_read (its words reached the agent
+// in another envelope's context) must stop being announced. Before, only a read stopped it, and the
+// answered envelope was re-announced every renotifyMs for good (mc-claude, 47c7ab2f, 11 Nov).
+const repliedRuntime = join(root, 'replied-runtime'), repliedId = 'claude-replied-test', repliedPubkey = randomBytes(32).toString('hex')
+mkdirSync(repliedRuntime); mkdirSync(join(repliedRuntime, 'claude-channel-state'))
+writeFileSync(join(manifests, `${repliedId}.json`), JSON.stringify({ ...manifest, id: repliedId, pubkey: repliedPubkey, runtime_dir: repliedRuntime,
+  state_dir: join(root, 'replied-state'), spool_dir: join(root, 'replied-spool') }))
+const repliedEnvelope = 'c'.repeat(64)
+writeFileSync(join(repliedRuntime, 'admitted-tasks.jsonl'), JSON.stringify({ ...task, instance: repliedId, envelope: repliedEnvelope,
+  authority: { ...task.authority, scope_subject: repliedPubkey } }) + '\n', { mode: 0o600 })
+writeFileSync(join(repliedRuntime, 'reply-requests.jsonl'), '', { mode: 0o640 })
+const repliedClient = new Client({ name: 'claude-channel-replied', version: '0.1.0' })
+const repliedWakes = []
+repliedClient.setNotificationHandler(Channel, note => { if (note.params?.meta?.envelope === repliedEnvelope) repliedWakes.push(Date.now()) })
+try {
+  const repliedTransport = new StdioClientTransport({ command: process.execPath,
+    args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', repliedId, '--poll-ms', '250', '--renotify-ms', '1000'],
+    env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stderr: 'pipe' })
+  let repliedStderr = ''
+  repliedTransport.stderr?.on('data', d => { repliedStderr += d })
+  globalThis.repliedStderr = () => repliedStderr
+  await repliedClient.connect(repliedTransport)
+  const until = async (test, ms) => { const end = Date.now() + ms; while (!test() && Date.now() < end) await new Promise(done => setTimeout(done, 50)); return test() }
+  ok('an unread envelope is announced again on the interval', await until(() => repliedWakes.length >= 2, 5000))
+  const answered = await repliedClient.callTool({ name: 'nvoy_channel_reply', arguments: { envelope: repliedEnvelope, text: 'handled from context' } })
+  const before = repliedWakes.length
+  await new Promise(done => setTimeout(done, 2600))
+  ok('a reply to an envelope never read stops its re-announce, and records it read',
+    JSON.parse(answered.content[0].text).queued === true && repliedWakes.length === before &&
+    readFileSync(join(repliedRuntime, 'claude-channel-state', 'read.jsonl'), 'utf8').includes(repliedEnvelope))
+} catch (error) {
+  ok(`a reply to an envelope never read stops its re-announce (threw: ${error.message}) STDERR=${globalThis.repliedStderr?.()}`, false)
+} finally { try { await repliedClient.close() } catch { /* already gone */ } }
 
 // The `!task` arm of the read guard, which nothing above drives. Dropping it — the tempting
 // `if (!(read || notifiedThisRun.has(envelope) || listedThisRun.has(envelope)))` — passes the rest
