@@ -8626,6 +8626,8 @@ export async function startMemoryViewer({
   host,
   port,
   pollMs = DEFAULT_POLL_MS,
+  // Clock in epoch seconds for poll timestamps and trend windows; tests inject a fixed clock.
+  now = () => Math.floor(Date.now() / 1000),
 } = {}) {
   if (!socketPath || !isAbsolute(socketPath)) {
     throw new Error('--socket <absolute-path> is required')
@@ -8724,7 +8726,7 @@ export async function startMemoryViewer({
 
   async function runPoll({ forceFull = true } = {}) {
     if (stopped) return currentState
-    const nowSec = Math.floor(Date.now() / 1000)
+    const nowSec = Math.floor(now())
     const nowMs = Date.now()
     pollSeq += 1
     let nextSnapshot

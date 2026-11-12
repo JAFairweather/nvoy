@@ -2187,6 +2187,7 @@ await test('durable SQLite activity_rollups survive >80 ring overflow & daemon r
       host: '127.0.0.1',
       port: 0,
       pollMs: 60000,
+      now: () => clockSec,
     })
     try {
       const mobileState = viewer.getMobileState()
