@@ -31,6 +31,7 @@ import {
   computeTopicEigenvectors,
   evaluateDreamTriggers,
   planMerkleDream,
+  readInitialHistory,
   readPostCycleSnapshot,
   readConsolidationLedger,
   readCuratorStateFile,
@@ -65,6 +66,39 @@ async function test(name, fn) {
 }
 
 console.log('=== Hive Shared Memory Merkle Dreaming & Curator Tests ===')
+
+await test('initial history restarts a bounded scan when a concurrent save advances write_seq', async () => {
+  const record = id => ({ event_id: id, is_current: true, status: 'active', verification: 'accepted' })
+  const page = (seq, cursor) => ({ answer: 'found', answer_reason: null, format: 'full',
+    records: [record(cursor ? 'second' : 'first')], total_matched: 2, returned: 1,
+    next_cursor: cursor ? null : '1', store_state: { state: 'READY', write_seq: seq } })
+  let wakes = 0
+  let queries = 0
+  const reader = { callReadTool: async (name, args) => {
+    if (name === 'memory_wake') return { store_state: { state: 'READY', write_seq: ++wakes === 1 ? 42 : 43 } }
+    queries++
+    return page(queries === 2 ? 43 : queries === 1 ? 42 : 43, Boolean(args.cursor))
+  } }
+  const scan = await readInitialHistory(reader, 3, 1)
+  assert.equal(scan.wake.store_state.write_seq, 43)
+  assert.deepEqual(scan.historyRecords.map(r => r.event_id), ['first', 'second'])
+  assert.equal(scan.historyComplete, true)
+  assert.equal(queries, 4, 'a changed page restarts from the first page')
+
+  let malformedQueries = 0
+  const malformed = { callReadTool: async name => name === 'memory_wake'
+    ? { store_state: { state: 'READY', write_seq: 42 } }
+    : (malformedQueries++, { ...page(43, false), answer: 'unknown', answer_reason: 'store-not-ready' }) }
+  await assert.rejects(() => readInitialHistory(malformed, 3, 1), /complete ready history page/)
+  assert.equal(malformedQueries, 1, 'malformed history fails closed without retry')
+
+  let changingSeq = 0
+  const alwaysChanging = { callReadTool: async name => name === 'memory_wake'
+    ? { store_state: { state: 'READY', write_seq: ++changingSeq } }
+    : page(changingSeq + 1, false) }
+  await assert.rejects(() => readInitialHistory(alwaysChanging, 3, 1), /bounded read retries/)
+  assert.equal(changingSeq, 3, 'write-sequence retries are bounded to three scans')
+})
 
 await test('post-cycle history rejects degraded or malformed queries before measuring counters', async () => {
   const state = { state: 'READY', write_seq: 42 }

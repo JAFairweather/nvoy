@@ -1614,6 +1614,57 @@ function completeHistoryPage(page, expectedWriteSeq, offset, expectedTotal = nul
     : page.records.length > 0 && page.next_cursor === String(nextOffset)
 }
 
+export async function readInitialHistory(reader, pageLimit, pageSize, maxAttempts = 3) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const wake = await reader.callReadTool('memory_wake', {})
+    const writeSeq = Number(wake?.store_state?.write_seq)
+    if (wake?.store_state?.state !== 'READY' || !Number.isSafeInteger(writeSeq)) {
+      throw new Error('memory_wake did not return a ready store state')
+    }
+    const records = []
+    const historyRecords = []
+    let cursor = '0'
+    let pages = 0
+    let expectedTotal = null
+    let changed = false
+    while (cursor !== null && pages < pageLimit) {
+      const page = await reader.callReadTool('memory_query', {
+        limit: pageSize,
+        format: 'full',
+        include_history: true,
+        ...(cursor !== '0' ? { cursor } : {}),
+      })
+      if (!completeHistoryPage(page, writeSeq, Number(cursor), expectedTotal)) {
+        const pageSeq = Number(page?.store_state?.write_seq)
+        if (Number.isSafeInteger(pageSeq) && pageSeq !== writeSeq &&
+            completeHistoryPage(page, pageSeq, Number(cursor), expectedTotal)) {
+          changed = true
+          break
+        }
+        throw new Error('memory_query did not return a complete ready history page')
+      }
+      expectedTotal = page.total_matched
+      for (const r of page.records) {
+        historyRecords.push(r)
+        if ((r.is_current === undefined || r.is_current === true) && r.status !== 'withdrawn' && r.verification === 'accepted') {
+          records.push(r)
+        }
+      }
+      cursor = typeof page.next_cursor === 'string' && page.next_cursor ? page.next_cursor : null
+      pages += 1
+    }
+    if (changed) continue
+    const end = await reader.callReadTool('memory_wake', {})
+    const endSeq = Number(end?.store_state?.write_seq)
+    if (end?.store_state?.state !== 'READY' || !Number.isSafeInteger(endSeq)) {
+      throw new Error('memory_wake did not return a ready store state')
+    }
+    if (endSeq !== writeSeq) continue
+    return { wake, records, historyRecords, historyComplete: cursor === null }
+  }
+  throw new Error('memory history changed during bounded read retries')
+}
+
 export async function readPostCycleSnapshot(reader, expectedWriteSeq, pageLimit, pageSize, nowSec) {
   const start = await reader.callReadTool('memory_wake', {})
   if (start?.store_state?.state !== 'READY' || Number(start.store_state.write_seq) !== expectedWriteSeq) return null
@@ -1693,39 +1744,9 @@ export async function runCuratorCycle({
 
   const reader = createSingleSocketMcpClient(readerSocket)
   try {
-    const wake = await reader.callReadTool('memory_wake', {})
-    if (wake?.store_state?.state !== 'READY' || !Number.isSafeInteger(Number(wake.store_state.write_seq))) {
-      throw new Error('memory_wake did not return a ready store state')
-    }
-    const records = []
-    const historyRecords = []
-    let cursor = '0'
-    let pages = 0
-    let expectedTotal = null
     const pageLimit = Math.max(1, Number(maxPages) || 500)
     const effectivePageSize = Math.max(1, Math.min(200, Number(pageSize) || 100))
-    while (cursor !== null && pages < pageLimit) {
-      const page = await reader.callReadTool('memory_query', {
-        limit: effectivePageSize,
-        format: 'full',
-        include_history: true,
-        ...(cursor !== '0' ? { cursor } : {}),
-      })
-      if (!completeHistoryPage(page, Number(wake.store_state.write_seq), Number(cursor), expectedTotal)) {
-        throw new Error('memory_query did not return a complete ready history page')
-      }
-      expectedTotal = page.total_matched
-      for (const r of page.records) {
-        historyRecords.push(r)
-        if ((r.is_current === undefined || r.is_current === true) && r.status !== 'withdrawn' && r.verification === 'accepted') {
-          records.push(r)
-        }
-      }
-      cursor = typeof page?.next_cursor === 'string' && page.next_cursor ? page.next_cursor : null
-      pages += 1
-    }
-
-    const historyComplete = cursor === null
+    const { wake, records, historyRecords, historyComplete } = await readInitialHistory(reader, pageLimit, effectivePageSize)
     const storeState = wake?.store_state || {}
     const resolvedRecentActivity = Array.isArray(recentActivity)
       ? recentActivity
