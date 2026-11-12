@@ -23,7 +23,7 @@ const QUERIES = ['telescope', 'battery maintenance', 'lens alignment', 'garden w
 const NOW = 1_800_000_000
 const GLOBAL_CH = '11111111-2222-4333-8444-555555555555'
 
-export function runSyntheticLoad({ rows = 50_000, samples = 1_000, warmups = 100 } = {}) {
+export function runSyntheticLoad({ rows = 50_000, samples = 1_000, warmups = 100, onProgress = () => {} } = {}) {
   for (const [name, value] of Object.entries({ rows, samples, warmups })) {
     if (!Number.isSafeInteger(value) || value < (name === 'warmups' ? 0 : 1)) throw new Error(`invalid ${name}`)
   }
@@ -39,6 +39,7 @@ export function runSyntheticLoad({ rows = 50_000, samples = 1_000, warmups = 100
     const paths = { dbPath: join(dir, 'memory.sqlite'), ledgerPath: join(dir, 'ledger.jsonl'), receiptPath: join(dir, 'receipt.json') }
     const fixtureHash = createHash('sha256')
     const started = performance.now()
+    const progress = phase => onProgress(phase, performance.now() - started)
     const entries = Array.from({ length: rows }, (_, i) => {
       const claim = `Synthetic station ${i}: ${VOCAB[i % VOCAB.length]}. Serial marker${i}.`
       fixtureHash.update(`${claim}\n`)
@@ -48,12 +49,15 @@ export function runSyntheticLoad({ rows = 50_000, samples = 1_000, warmups = 100
         asOfGit: 'synthetic-fixture-v1', memoryGlobalChannelId: GLOBAL_CH, ttlSec: 0, nowSec: NOW,
       }), sk) }
     })
+    progress('signed-fixture-generated')
     const storeJsonPath = join(dir, 'fixture.json')
     writeFileSync(storeJsonPath, JSON.stringify({ version: 1, entries }), { mode: 0o600 })
     migrateStoreJson({ storeJsonPath, ...paths, config, nowSec: NOW })
+    progress('verified-migration-complete')
     recordVerifiedBackup({ receiptPath: paths.receiptPath, snapshotId: SHA('synthetic-backup-receipt'), writeSeq: 1, at: NOW, nowSec: NOW })
     store = new HiveMemoryStore({ ...paths, config })
     assert.equal(store.start().ready, true, 'fixture must reconcile, not fake READY')
+    progress('store-reconciled')
     const setup_ms = performance.now() - started
     const actualRows = store.db.prepare('SELECT count(*) AS n FROM events WHERE is_current = 1').get().n
     const fts_rows = store.db.prepare('SELECT count(*) AS n FROM events_fts').get().n
@@ -75,6 +79,7 @@ export function runSyntheticLoad({ rows = 50_000, samples = 1_000, warmups = 100
       assert.notEqual(result.answer, 'unknown', 'unknown is not a valid fast result')
       queries.push({ text, answer: result.answer, total_matched: result.total_matched, returned: result.returned, ms })
       timings_ms.push(ms)
+      if ((i + 1) % 5 === 0) progress(`measured-${i + 1}`)
     }
     const here = dirname(fileURLToPath(import.meta.url))
     return {
@@ -98,5 +103,7 @@ export function runSyntheticLoad({ rows = 50_000, samples = 1_000, warmups = 100
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
   if (process.argv.length > 5) throw new Error('usage: node memory-load-benchmark.mjs [rows [samples [warmups]]]')
   const [rows = 50_000, samples = 1_000, warmups = 100] = process.argv.slice(2).map(Number)
-  console.log(JSON.stringify(runSyntheticLoad({ rows, samples, warmups }), null, 2))
+  console.log(JSON.stringify(runSyntheticLoad({
+    rows, samples, warmups, onProgress: (phase, elapsed_ms) => console.error(JSON.stringify({ phase, elapsed_ms })),
+  }), null, 2))
 }
