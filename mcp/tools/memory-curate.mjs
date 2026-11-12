@@ -1637,7 +1637,7 @@ export async function readInitialHistory(reader, pageLimit, pageSize, maxAttempt
       if (!completeHistoryPage(page, writeSeq, Number(cursor), expectedTotal)) {
         const pageSeq = Number(page?.store_state?.write_seq)
         if (Number.isSafeInteger(pageSeq) && pageSeq !== writeSeq &&
-            completeHistoryPage(page, pageSeq, Number(cursor), expectedTotal)) {
+            completeHistoryPage(page, pageSeq, Number(cursor), null)) {
           changed = true
           break
         }

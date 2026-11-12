@@ -85,6 +85,22 @@ await test('initial history restarts a bounded scan when a concurrent save advan
   assert.equal(scan.historyComplete, true)
   assert.equal(queries, 4, 'a changed page restarts from the first page')
 
+  let growingQueries = 0
+  const growing = { callReadTool: async (name, args) => {
+    if (name === 'memory_wake') return { store_state: { state: 'READY', write_seq: growingQueries === 0 ? 42 : 43 } }
+    growingQueries++
+    const offset = Number(args.cursor ?? 0)
+    const seq = growingQueries === 1 ? 42 : 43
+    const total = seq === 42 ? 2 : 3
+    return { answer: 'found', answer_reason: null, format: 'full',
+      records: [record(['first', 'second', 'third'][offset])], total_matched: total, returned: 1,
+      next_cursor: offset + 1 === total ? null : String(offset + 1),
+      store_state: { state: 'READY', write_seq: seq } }
+  } }
+  const grownScan = await readInitialHistory(growing, 4, 1)
+  assert.deepEqual(grownScan.historyRecords.map(r => r.event_id), ['first', 'second', 'third'])
+  assert.equal(growingQueries, 5, 'a save that grows history restarts from the first page')
+
   let malformedQueries = 0
   const malformed = { callReadTool: async name => name === 'memory_wake'
     ? { store_state: { state: 'READY', write_seq: 42 } }
