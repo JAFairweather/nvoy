@@ -5792,7 +5792,8 @@ export function renderViewerHtml(initialState) {
               var metricTxt = ap.kind === 'retire'
                 ? ('0w/7d · ' + (ap.class_b_count || 0) + ' Class B')
                 : ('cos ' + Number(ap.mean_intra_cosine ?? ap.cosine_affinity ?? 0).toFixed(2));
-              var deltaTxt = ap.coherence_delta_label || ('+' + Number(ap.coherence_delta || 0).toFixed(1) + '%');
+              var deltaVal = Number(ap.coherence_delta || 0);
+              var deltaTxt = ap.coherence_delta_label || ((deltaVal > 0 ? '+' : '') + deltaVal.toFixed(1) + ' pts');
               var slugsTxt = Array.isArray(ap.sample_slugs) && ap.sample_slugs.length > 0
                 ? ' · samples: ' + ap.sample_slugs.slice(0, 3).join(', ')
                 : '';
@@ -7993,8 +7994,14 @@ export function buildMobileState(state = {}, nowSec = undefined, extraHistoryRec
       author: String(s?.author || 'unknown'),
       event_id: typeof s?.event_id === 'string' ? s.event_id.slice(0, 12) : null,
     })),
-    coherence_delta: Number.isFinite(p?.coherence_delta) ? p.coherence_delta : 0,
-    coherence_delta_label: String(p?.coherence_delta_label || `+${Number(p?.coherence_delta || 0).toFixed(1)}%`),
+    coherence_delta: Number.isFinite(p?.coherence_delta) ? (Object.is(p.coherence_delta, -0) ? 0 : p.coherence_delta) : 0,
+    coherence_delta_units: String(p?.coherence_delta_units || 'coherence_points'),
+    coherence_delta_label: String(
+      p?.coherence_delta_label ||
+        `${Number(p?.coherence_delta || 0) > 0 ? '+' : ''}${Number(p?.coherence_delta || 0).toFixed(1)} pts`
+    ),
+    baseline_partition_coherence: Number.isFinite(p?.baseline_partition_coherence) ? p.baseline_partition_coherence : null,
+    counterfactual_partition_coherence: Number.isFinite(p?.counterfactual_partition_coherence) ? p.counterfactual_partition_coherence : null,
     counterfactual: true,
     approval_required: true,
     status: p?.status === 'approved' ? 'approved' : 'pending_james_approval',
@@ -8388,13 +8395,11 @@ export function renderMobileViewerHtml(initialMobileState = {}) {
       score: mobileData.coherence?.score,
       lifetime_score: mobileData.coherence?.lifetime_score,
       drift_status: mobileData.coherence?.drift_status,
-      axes: mobileData.coherence?.axes,
       counts: { grounded_claims: mobileData.coherence?.counts?.grounded_claims ?? 0 },
     },
     synaptic_efficiency: {
       score: mobileData.synaptic_efficiency?.score,
       lifetime_score: mobileData.synaptic_efficiency?.lifetime_score,
-      axes: mobileData.synaptic_efficiency?.axes,
       reuse: { durable_claims: mobileData.synaptic_efficiency?.reuse?.durable_claims ?? 0 },
     },
     trends: {
@@ -8405,13 +8410,10 @@ export function renderMobileViewerHtml(initialMobileState = {}) {
         synaptic_efficiency_axes: tr.window_24h.synaptic_efficiency_axes,
         new_claims: tr.window_24h.new_claims,
         recall_hits: tr.window_24h.recall_hits,
-        recall_coverage: tr.window_24h.recall_coverage,
         recall_incomplete: tr.window_24h.recall_incomplete,
         conflicts_raised: tr.window_24h.conflicts_raised,
         conflicts_resolved: tr.window_24h.conflicts_resolved,
         active_writers: tr.window_24h.active_writers,
-        handoff_count: tr.window_24h.handoff_count,
-        median_handoff_min: tr.window_24h.median_handoff_min,
       },
       window_7d: tr.window_7d && {
         coherence_score: tr.window_7d.coherence_score,
@@ -8422,14 +8424,11 @@ export function renderMobileViewerHtml(initialMobileState = {}) {
         claims_per_day: tr.window_7d.claims_per_day,
         recall_hits: tr.window_7d.recall_hits,
         recall_hits_per_day: tr.window_7d.recall_hits_per_day,
-        recall_coverage: tr.window_7d.recall_coverage,
         recall_incomplete: tr.window_7d.recall_incomplete,
         conflicts_raised: tr.window_7d.conflicts_raised,
         conflicts_resolved: tr.window_7d.conflicts_resolved,
         active_writers: tr.window_7d.active_writers,
         active_writers_per_day: tr.window_7d.active_writers_per_day,
-        handoff_count: tr.window_7d.handoff_count,
-        median_handoff_min: tr.window_7d.median_handoff_min,
       },
       lifetime: tr.lifetime,
       today_signals: tr.today_signals && {
@@ -8469,14 +8468,24 @@ export function renderMobileViewerHtml(initialMobileState = {}) {
       write_delta_threshold: mobileData.dreams?.write_delta_threshold,
       counts: mobileData.dreams?.counts,
       planned_summary: mobileData.dreams?.planned_summary,
-      recent_consolidations: (mobileData.dreams?.recent_consolidations || []).slice(0, 4),
-      eigenvectors: (mobileData.dreams?.eigenvectors || []).slice(0, 1),
-      eigen_axis_proposals: (mobileData.dreams?.eigen_axis_proposals || []).slice(0, 4).map(p => ({
+      recent_consolidations: (mobileData.dreams?.recent_consolidations || []).slice(0, 4).map(c => ({
+        topic: c.topic,
+        slug: c.slug,
+        source_count: c.source_count,
+        at: c.at,
+      })),
+      eigenvectors: (mobileData.dreams?.eigenvectors || []).slice(0, 1).map(e => ({
+        label: e.label,
+        variance_pct: e.variance_pct,
+        persisted: e.persisted,
+      })),
+      eigen_axis_proposals: (mobileData.dreams?.eigen_axis_proposals || []).slice(0, 3).map(p => ({
         kind: p.kind,
         from_topic: p.from_topic,
         proposed_topic: p.proposed_topic,
         claim_count: p.claim_count,
         sample_slugs: (p.sample_slugs || []).slice(0, 2),
+        coherence_delta: p.coherence_delta,
         coherence_delta_label: p.coherence_delta_label,
       })),
     },
@@ -8645,7 +8654,7 @@ bars('d-trigger-bars',[['Circadian ('+fD(elp)+'/'+fD(dI)+')',Math.min(100,Math.r
 if(el('d-ledger-list')){
 var rw=(dr.recent_consolidations||[]).slice(0,4).map(function(c){return '<div class="cr"><span class="cm"><span class="pill violet">#'+esc(c.topic)+'</span> <b>'+esc(c.slug)+'</b> ('+c.source_count+' folded)</span><span>'+esc(fA(c.at,now))+'</span></div>';});
 var eg=(dr.eigenvectors||[])[0];if(eg)rw.push('<div class="cr"><span class="cm"><span class="pill info">Eigen λ1</span> <b>'+esc(eg.label)+'</b> ('+eg.variance_pct+'% var)</span><span>'+(eg.persisted?'persisted':'spectral')+'</span></div>');
-var eap=(dr.eigen_axis_proposals||[]).slice(0,5);for(var pi=0;pi<eap.length;pi++){var pr=eap[pi],pk=String(pr.kind||'split').toUpperCase(),pc=pr.kind==='split'?'violet':pr.kind==='merge'?'info':'warn',psl=(pr.sample_slugs||[]).slice(0,2).join(', ');rw.push('<div class="cr"><span class="cm"><span class="pill '+pc+'">'+esc(pk)+'</span> <b>#'+esc(pr.from_topic)+' → '+esc(pr.proposed_topic)+'</b> ('+pr.claim_count+'c'+(psl?' · '+esc(psl):'')+')</span><span class="pill ok" title="Counterfactual · Awaiting James approval">'+esc(pr.coherence_delta_label||('+'+Number(pr.coherence_delta||0).toFixed(1)+'%'))+' cf</span></div>');}
+var eap=(dr.eigen_axis_proposals||[]).slice(0,5);for(var pi=0;pi<eap.length;pi++){var pr=eap[pi],pk=String(pr.kind||'split').toUpperCase(),pc=pr.kind==='split'?'violet':pr.kind==='merge'?'info':'warn',psl=(pr.sample_slugs||[]).slice(0,2).join(', '),dv=Number(pr.coherence_delta||0),dc2=dv>0?'ok':dv<0?'err':'info',dl=pr.coherence_delta_label||((dv>0?'+':'')+dv.toFixed(1)+' pts');rw.push('<div class="cr"><span class="cm"><span class="pill '+pc+'">'+esc(pk)+'</span> <b>#'+esc(pr.from_topic)+' → '+esc(pr.proposed_topic)+'</b> ('+pr.claim_count+'c'+(psl?' · '+esc(psl):'')+')</span><span class="pill '+dc2+'" title="Counterfactual · Awaiting James approval">'+esc(dl)+' cf</span></div>');}
 el('d-ledger-list').innerHTML=rw.join('')||'<div class="stat-box"><small>No consolidations yet.</small></div>';
 }
 rAg(d);
@@ -8707,6 +8716,7 @@ export async function startMemoryViewer({
   host,
   port,
   pollMs = DEFAULT_POLL_MS,
+  now = () => Math.floor(Date.now() / 1000),
 } = {}) {
   if (!socketPath || !isAbsolute(socketPath)) {
     throw new Error('--socket <absolute-path> is required')
@@ -8807,7 +8817,7 @@ export async function startMemoryViewer({
 
   async function runPoll({ forceFull = true } = {}) {
     if (stopped) return currentState
-    const nowSec = Math.floor(Date.now() / 1000)
+    const nowSec = typeof now === 'function' ? now() : Math.floor(Date.now() / 1000)
     const nowMs = Date.now()
     pollSeq += 1
     let nextSnapshot

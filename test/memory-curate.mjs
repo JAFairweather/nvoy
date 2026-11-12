@@ -1051,7 +1051,8 @@ await test('computeTopicEigenvectors extracts orthonormal eigen-axes and planMer
     assert(Array.isArray(sp.sample_claims) && sp.sample_claims.length > 0, 'proposal must include sample_claims')
     assert(Array.isArray(sp.sample_slugs) && sp.sample_slugs.length > 0, 'proposal must include sample_slugs')
     assert(typeof sp.coherence_delta === 'number' && sp.coherence_delta > 0, 'proposal must report positive counterfactual coherence_delta')
-    assert(/^\+\d+\.\d%$/.test(sp.coherence_delta_label), `coherence_delta_label must be formatted +X.X%, got ${sp.coherence_delta_label}`)
+    assert.equal(sp.coherence_delta_units, 'coherence_points', 'proposal must report coherence_points units')
+    assert(/^\+\d+\.\d pts$/.test(sp.coherence_delta_label), `coherence_delta_label must be formatted +X.X pts, got ${sp.coherence_delta_label}`)
     assert.equal(sp.counterfactual, true)
     assert.equal(sp.approval_required, true)
     assert.equal(sp.status, 'pending_james_approval')
@@ -1060,6 +1061,7 @@ await test('computeTopicEigenvectors extracts orthonormal eigen-axes and planMer
   const mergeProposal = proposals.find(p => p.kind === 'merge' && p.from_topic === 'r1-audio' && p.to_topic === 'r1')
   assert(mergeProposal, 'must propose merging overlapping topic r1-audio into r1 (cosine >= 0.55)')
   assert(mergeProposal.cosine_affinity >= 0.55)
+  assert.equal(mergeProposal.coherence_delta_units, 'coherence_points')
   assert.equal(mergeProposal.counterfactual, true)
   assert.equal(mergeProposal.status, 'pending_james_approval')
 
@@ -1067,8 +1069,68 @@ await test('computeTopicEigenvectors extracts orthonormal eigen-axes and planMer
   assert(retireProposal, 'must propose retiring idle topic legacy-experiment (0 writes in 7d, <= 3 Class B claims)')
   assert.equal(retireProposal.writes_7d, 0)
   assert(retireProposal.class_b_count <= 3)
+  assert.equal(retireProposal.coherence_delta_units, 'coherence_points')
   assert.equal(retireProposal.counterfactual, true)
   assert.equal(retireProposal.status, 'pending_james_approval')
+
+  // Non-improving proposal regression: harmful/non-improving split and retirement must preserve signed negative delta and true counterfactual score (never clamped to +0.1)
+  const nonImprovingCorpus = []
+  for (let i = 0; i < 25; i++) {
+    const isSub = i < 8
+    nonImprovingCorpus.push({
+      event_id: `cc${String(i).padStart(2, '0')}`.padEnd(64, '0'),
+      pubkey: 'b'.repeat(64),
+      author: 'neil',
+      created_at: isSub ? now - 10 * 86400 : now - 3600,
+      expires_at: now + 86400 * 7,
+      scope: `room:${ROOM_ID}`,
+      topic: 'herd-infra',
+      d: `hive-memory:room:${ROOM_ID}:herd-infra-unit-${i}`,
+      claim: `Systemd service unit daemon socket watchdog timer slice health verified on host ${isSub ? 'journald vacuum ' : 'cgroup limit '}${i % 4}`,
+      because: 'Systemd service unit daemon socket watchdog timer slice health.',
+      evidence: ['git:herd-infra@11111111:scripts/watchdog.sh'],
+      verification: 'accepted',
+      status: 'active',
+    })
+  }
+  for (let i = 0; i < 6; i++) {
+    nonImprovingCorpus.push({
+      event_id: `dd${String(i).padStart(2, '0')}`.padEnd(64, '0'),
+      pubkey: 'c'.repeat(64),
+      author: 'kerouac',
+      created_at: now - 12 * 86400,
+      expires_at: now + 86400,
+      scope: `room:${ROOM_ID}`,
+      topic: 'old-migration',
+      d: `hive-memory:room:${ROOM_ID}:old-migration-${i}`,
+      claim: 'Legacy migration script archive checksum manifest verified on host.',
+      because: 'Migration check.',
+      evidence: ['git:nvoy@22222222:scripts/migrate.sh'],
+      verification: 'accepted',
+      status: 'active',
+    })
+  }
+  const nonImprovingProposals = computeEigenAxisProposals(nonImprovingCorpus, { nowSec: now })
+  const harmfulSplit = nonImprovingProposals.find(p => p.kind === 'split' && p.from_topic === 'herd-infra')
+  assert(harmfulSplit, 'must evaluate sub-axis split proposal on overlapping parent corpus')
+  assert(harmfulSplit.coherence_delta < 0, `non-improving split must preserve negative coherence_delta, got ${harmfulSplit.coherence_delta}`)
+  assert.equal(harmfulSplit.coherence_delta_units, 'coherence_points')
+  assert(/^-\d+\.\d pts$/.test(harmfulSplit.coherence_delta_label), `negative split label must be -X.X pts, got ${harmfulSplit.coherence_delta_label}`)
+  assert(
+    harmfulSplit.counterfactual_partition_coherence < harmfulSplit.baseline_partition_coherence,
+    `counterfactual score (${harmfulSplit.counterfactual_partition_coherence}) must be less than baseline (${harmfulSplit.baseline_partition_coherence})`
+  )
+
+  const harmfulRetire = nonImprovingProposals.find(p => p.kind === 'retire' && p.from_topic === 'old-migration')
+  assert(harmfulRetire, 'must evaluate retirement proposal for idle topic old-migration')
+  assert(harmfulRetire.coherence_delta < 0, `non-improving retirement must preserve negative coherence_delta, got ${harmfulRetire.coherence_delta}`)
+  assert.equal(harmfulRetire.coherence_delta_units, 'coherence_points')
+  assert(/^-\d+\.\d pts$/.test(harmfulRetire.coherence_delta_label), `negative retire label must be -X.X pts, got ${harmfulRetire.coherence_delta_label}`)
+  assert.equal(
+    Math.round((harmfulRetire.baseline_partition_coherence + harmfulRetire.coherence_delta) * 10) / 10,
+    harmfulRetire.counterfactual_partition_coherence,
+    'counterfactual_partition_coherence must match measured counterfactual score without +0.1 floor'
+  )
 
   // Verify planMerkleDream exposes eigen_axis_proposals and NEVER auto-refiles claims into unapproved sub-axes!
   const largePlan = planMerkleDream({ records: largeTopicCorpus, nowSec: now })

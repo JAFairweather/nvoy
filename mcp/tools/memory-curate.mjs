@@ -794,8 +794,8 @@ function cleanLexicalTermForSubAxis(feat, parentTopicTokens) {
   return parts[0] || null
 }
 
-// Evaluates deterministic partition coherence on [0, 100] for a fixed corpus under a given topic assignment.
-// Used strictly to compute counterfactual `coherence_delta` (+X.X%) per proposal without mutating records or charts.
+// Evaluates deterministic partition coherence on [0, 100] (coherence points) for a fixed corpus under a given topic assignment.
+// Used strictly to compute signed counterfactual `coherence_delta` (in coherence points, `pts`) per proposal without mutating records or charts.
 function evaluateCorpusTopicPartitionCoherence(activeClaims, claimUnitVectors, topicForClaimFn, nowSec) {
   const N = activeClaims.length
   if (N === 0) return 0
@@ -877,12 +877,27 @@ function evaluateCorpusTopicPartitionCoherence(activeClaims, claimUnitVectors, t
   return Math.max(0, Math.min(100, baseIntraScore - overlapPenalty - idlePenalty))
 }
 
+function buildCounterfactualCoherenceMetrics(baselineCoherence, cfCoherence) {
+  const baselineRounded = Math.round(baselineCoherence * 10) / 10
+  const counterfactualRounded = Math.round(cfCoherence * 10) / 10
+  const rawDelta = Math.round((cfCoherence - baselineCoherence) * 10) / 10
+  const coherenceDelta = Object.is(rawDelta, -0) ? 0 : rawDelta
+  const sign = coherenceDelta > 0 ? '+' : ''
+  return {
+    coherence_delta: coherenceDelta,
+    coherence_delta_units: 'coherence_points',
+    coherence_delta_label: `${sign}${coherenceDelta.toFixed(1)} pts`,
+    baseline_partition_coherence: Object.is(baselineRounded, -0) ? 0 : baselineRounded,
+    counterfactual_partition_coherence: Object.is(counterfactualRounded, -0) ? 0 : counterfactualRounded,
+  }
+}
+
 // Computes eigen-axis proposals for James's review & approval:
 //   1. Intra-topic TF-IDF clustering for large topics (>= 25 claims, e.g. herd-infra, hive-memory, r1),
 //      proposing named sub-axes `<topic>-<top-terms>` when a cluster is coherent (mean intra-cosine >= 0.35, size >= 8).
 //   2. Merge proposals for topics whose TF-IDF centroids overlap (cosine >= 0.55).
 //   3. Retirement proposals for idle topics (0 writes in 7d, <= 3 Class B claims).
-//   4. Counterfactual `coherence_delta` (+X.X%) per proposal evaluated on the fixed corpus without re-filing claims.
+//   4. Signed counterfactual `coherence_delta` (coherence points on [0, 100], `pts`) per proposal evaluated on the fixed corpus without re-filing claims.
 export function computeEigenAxisProposals(
   records = [],
   {
@@ -1097,8 +1112,7 @@ export function computeEigenAxisProposals(
         (_r, idx) => (globalIndices.has(idx) ? proposedTopic : baselineAssignment[idx]),
         nowSec
       )
-      const rawDelta = Math.round((cfCoherence - baselineCoherence) * 10) / 10
-      const coherenceDelta = Math.max(0.1, rawDelta)
+      const cfMetrics = buildCounterfactualCoherenceMetrics(baselineCoherence, cfCoherence)
 
       const sortedSamples = [...bestCluster.refined]
         .sort((a, b) => b.sim - a.sim)
@@ -1129,10 +1143,7 @@ export function computeEigenAxisProposals(
         sample_slugs: sortedSamples.map(s => s.slug),
         sample_claims: sortedSamples,
         event_ids: clusterRecords.map(r => r.event_id).filter(Boolean),
-        coherence_delta: coherenceDelta,
-        coherence_delta_label: `+${coherenceDelta.toFixed(1)}%`,
-        baseline_partition_coherence: Math.round(baselineCoherence * 10) / 10,
-        counterfactual_partition_coherence: Math.round((baselineCoherence + coherenceDelta) * 10) / 10,
+        ...cfMetrics,
         counterfactual: true,
         approval_required: true,
         status: approvedSet.has(proposalId) ? 'approved' : 'pending_james_approval',
@@ -1203,8 +1214,7 @@ export function computeEigenAxisProposals(
         (_r, idx) => (baselineAssignment[idx] === fromTopic ? toTopic : baselineAssignment[idx]),
         nowSec
       )
-      const rawDelta = Math.round((cfCoherence - baselineCoherence) * 10) / 10
-      const coherenceDelta = Math.max(0.1, rawDelta)
+      const cfMetrics = buildCounterfactualCoherenceMetrics(baselineCoherence, cfCoherence)
       const proposalId = `merge:${fromTopic}->${toTopic}`
 
       const samples = [
@@ -1234,10 +1244,7 @@ export function computeEigenAxisProposals(
         sample_slugs: samples.map(s => s.slug),
         sample_claims: samples,
         event_ids: fromRecords.map(r => r.event_id).filter(Boolean),
-        coherence_delta: coherenceDelta,
-        coherence_delta_label: `+${coherenceDelta.toFixed(1)}%`,
-        baseline_partition_coherence: Math.round(baselineCoherence * 10) / 10,
-        counterfactual_partition_coherence: Math.round((baselineCoherence + coherenceDelta) * 10) / 10,
+        ...cfMetrics,
         counterfactual: true,
         approval_required: true,
         status: approvedSet.has(proposalId) ? 'approved' : 'pending_james_approval',
@@ -1281,8 +1288,7 @@ export function computeEigenAxisProposals(
       (_r, idx) => (baselineAssignment[idx] === top ? (archiveTarget || null) : baselineAssignment[idx]),
       nowSec
     )
-    const rawDelta = Math.round((cfCoherence - baselineCoherence) * 10) / 10
-    const coherenceDelta = Math.max(0.1, rawDelta)
+    const cfMetrics = buildCounterfactualCoherenceMetrics(baselineCoherence, cfCoherence)
     const proposalId = `retire:${top}`
 
     const topFeatTerms = vocab
@@ -1310,10 +1316,7 @@ export function computeEigenAxisProposals(
       sample_slugs: retireSamples.map(s => s.slug),
       sample_claims: retireSamples,
       event_ids: recs.map(r => r.event_id).filter(Boolean),
-      coherence_delta: coherenceDelta,
-      coherence_delta_label: `+${coherenceDelta.toFixed(1)}%`,
-      baseline_partition_coherence: Math.round(baselineCoherence * 10) / 10,
-      counterfactual_partition_coherence: Math.round((baselineCoherence + coherenceDelta) * 10) / 10,
+      ...cfMetrics,
       counterfactual: true,
       approval_required: true,
       status: approvedSet.has(proposalId) ? 'approved' : 'pending_james_approval',
