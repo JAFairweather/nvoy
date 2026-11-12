@@ -303,8 +303,11 @@ function evaluateCoherenceSlice(slice, rosterByPk, expectedRosterSize, writeSeqE
   const targetSharedRefs = slice.length <= 15 ? Math.max(1, slice.length * 0.4) : Math.max(6, nonCanon.length * 0.14)
   const refDensityScore = Math.min(100, (sharedRefs / targetSharedRefs) * 100)
 
-  const peerNonCanon = nonCanon.filter(r => !r.merkle_sources && rosterByPk.get(String(r.author_pubkey || '')) !== 'curator')
-  const recentNonCanon = (peerNonCanon.length > 0 ? peerNonCanon : nonCanon).slice(-18)
+  const chronoNonCanon = [...nonCanon].sort(
+    (a, b) => (a.created_at || 0) - (b.created_at || 0) || (String(a.event_id || '') < String(b.event_id || '') ? -1 : 1)
+  )
+  const peerNonCanon = chronoNonCanon.filter(r => !r.merkle_sources && rosterByPk.get(String(r.author_pubkey || '')) !== 'curator')
+  const recentNonCanon = (peerNonCanon.length > 0 ? peerNonCanon : chronoNonCanon).slice(-18)
   const recentTopics = new Map()
   const recentAuthors = new Set()
   for (const r of recentNonCanon) {
