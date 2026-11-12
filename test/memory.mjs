@@ -17,6 +17,7 @@ import {
 import {
   HiveMemoryStore, RETENTION_PURGE_AFTER_SEC, acquireStoreLock, initEmptyStore, migrateStoreJson, readLedger, recordVerifiedBackup,
   canRead, restoreSnapshot, snapshotStore, validateAndResolveConfig, writeRefusal,
+  extractClaimEdges, buildConstellationLinks, compileTopicPagesFromRecords, renderTopicPageMarkdown,
 } from '../mcp/tools/hive_memory_store.mjs'
 import { startMemoryDaemon } from '../mcp/tools/memory-daemon.mjs'
 
@@ -1335,6 +1336,135 @@ os.execv(sys.argv[3], [sys.argv[3], sys.argv[4], "--db", sys.argv[5], "--ledger"
   ok('5,000 claims: a keyless reader sees only the 625 hive:ops heads', kiosk.total_matched === 625)
   ok('5,000 claims: wake stays within its character budget', wake.non_canon_bytes <= wake.max_chars && wake.counts.ops_omitted > 0)
   ok('5,000 claims: every query and the wake finish within 1.5 s', Math.max(worst, tTopic, tChain, tKiosk, tWake) < 1500)
+  s.close()
+}
+
+// --- 6. Hybrid Retrieval (BM25 + Vector RRF), First-Class Entity-Link Graph (claim_edges), and Above/Below-the-Line Topic Pages ---
+{
+  const p = setup('hybrid-graph-topics')
+  const s = open(p)
+  const cCanon = claim(james, 'hive:canon', 'hive-memory-canon-rule', {
+    topic: 'hive-memory',
+    ttlSec: 0,
+    claim: 'Every PR to mcp/tools/memory-viewer.mjs requires review by @mydude before merge.',
+    because: 'Standing Hive canon rule set by James.',
+    evidence: ['nvoy@083ddc0c:mcp/tools/memory-viewer.mjs'],
+    asOfGit: '083ddc0c8385f8cff5215f281deffad5a7dbddd3',
+    nowSec: T0 + 10,
+  })
+  const cViewer = claim(biggy, roomA, 'hive-memory-viewer-pr351-status', {
+    topic: 'hive-memory',
+    ttlSec: 14 * DAY,
+    claim: 'Cortex Observatory web viewer on port 8795 updated in nvoy PR #351 by @biggy.',
+    because: 'Inspector header flex-wrap fix for Merkle Dreaming consolidated clusters.',
+    evidence: ['nvoy@e2cd9ebe:mcp/tools/memory-viewer.mjs'],
+    asOfGit: 'e2cd9ebea92579c98cda558d003270941ba50d97',
+    nowSec: T0 + 20,
+  })
+  const cDecision = claim(crusty, roomA, 'hive-memory-hybrid-rrf-decision', {
+    topic: 'hive-memory',
+    ttlSec: 0,
+    claim: 'Adopted SQLite FTS5 BM25 + semantic vector RRF and claim_edges entity graph in PR #351.',
+    because: 'Eliminates zero-hit lexical misses between viewer and visualizer queries.',
+    evidence: ['nvoy@e2cd9ebe:mcp/tools/hive_memory_store.mjs', 'nvoy@e2cd9ebe:mcp/tools/memory-viewer.mjs'],
+    asOfGit: 'e2cd9ebea92579c98cda558d003270941ba50d97',
+    nowSec: T0 + 30,
+  })
+  const cSecretRoomB = claim(crusty, roomB, 'secret-visualizer-plan', {
+    topic: 'hive-memory',
+    ttlSec: 14 * DAY,
+    claim: 'Private room B visualizer note referencing PR #351.',
+    because: 'Testing ACL isolation on hybrid search and entity graph.',
+    nowSec: T0 + 40,
+  })
+
+  s.submit({ writer: 'james', event: cCanon, expectedPriorId: null, nowSec: T0 + 10 })
+  s.submit({ writer: 'biggy', event: cViewer, expectedPriorId: null, nowSec: T0 + 20 })
+  s.submit({ writer: 'crusty', event: cDecision, expectedPriorId: null, nowSec: T0 + 30 })
+  s.submit({ writer: 'crusty', event: cSecretRoomB, expectedPriorId: null, nowSec: T0 + 40 })
+
+  // 1. Hybrid Retrieval (BM25 + Semantic Vector RRF)
+  const qVisualizer = s.query({ readerPubkey: biggy.pk, text: 'visualizer', format: 'full', nowSec: T0 + 50 })
+  ok('Hybrid Retrieval: querying "visualizer" matches "viewer" / "observatory" claims via semantic vector + BM25 RRF and excludes unreadable room B',
+    qVisualizer.answer === 'found' &&
+    qVisualizer.records.some(r => r.event_id === cViewer.id) &&
+    qVisualizer.records.some(r => r.event_id === cDecision.id) &&
+    !qVisualizer.records.some(r => r.event_id === cSecretRoomB.id) &&
+    qVisualizer.records.every(r => r.authority === null && r.trustedInstruction === false))
+
+  const qStem = s.query({ readerPubkey: biggy.pk, text: 'consolidating', format: 'full', nowSec: T0 + 50 })
+  ok('Hybrid Retrieval: FTS5 Porter stemming + semantic vectors match "consolidating" against "consolidated"',
+    qStem.answer === 'found' && qStem.records.some(r => r.event_id === cViewer.id))
+
+  const qNoHit = s.query({ readerPubkey: biggy.pk, text: 'quantum-tokamak-superconductor', nowSec: T0 + 50 })
+  ok('Hybrid Retrieval: unrelated query terms still return answer="none" with 0 false positives',
+    qNoHit.answer === 'none' && qNoHit.total_matched === 0)
+
+  // 2. First-Class Entity-Link Graph (claim_edges + linked_to + constellation mesh)
+  const byPr = s.query({ readerPubkey: biggy.pk, linkedTo: 'pr:351', format: 'full', nowSec: T0 + 50 })
+  ok('Entity-Link Graph: linked_to="pr:351" traverses claim_edges to find all readable claims referencing PR #351 while hiding room B',
+    byPr.answer === 'found' &&
+    byPr.records.map(r => r.event_id).sort().join() === [cViewer.id, cDecision.id].sort().join())
+
+  const byFile = s.query({ readerPubkey: biggy.pk, linkedTo: 'file:mcp/tools/memory-viewer.mjs', format: 'full', nowSec: T0 + 50 })
+  ok('Entity-Link Graph: linked_to="file:mcp/tools/memory-viewer.mjs" returns Canon, Class B, and Class A claims touching that file',
+    byFile.total_matched === 3 &&
+    byFile.records.some(r => r.event_id === cCanon.id) &&
+    byFile.records.some(r => r.event_id === cViewer.id) &&
+    byFile.records.some(r => r.event_id === cDecision.id))
+
+  const edgesRes = s.claimEdges({ readerPubkey: biggy.pk })
+  const edges = edgesRes.entity_edges || []
+  const constellation = buildConstellationLinks(byFile.records)
+  ok('Entity-Link Graph: store.claimEdges() and buildConstellationLinks() build typed entity edges and constellation links',
+    edges.some(e => e.edge_type === 'pr' && e.target_ref === 'pr:351') &&
+    edges.some(e => e.edge_type === 'agent' && e.target_ref === 'agent:mydude') &&
+    constellation.links.length >= 2 &&
+    constellation.links.some(l => l.shared_entities.includes('pr:351')))
+
+  // 3. Above-the-Line / Below-the-Line Topic Pages & Markdown Mirror
+  const pageRes = s.compileTopicPage({ readerPubkey: biggy.pk, topic: 'hive-memory', nowSec: T0 + 50 })
+  const page = pageRes.page
+  ok('Topic Pages: compileTopicPage separates Above-the-Line (Canon + Class B) from Below-the-Line (Active Class A Timeline)',
+    page !== null &&
+    page.counts.above_the_line === 2 &&
+    page.counts.canon === 1 &&
+    page.counts.class_b_decisions === 1 &&
+    page.counts.below_the_line === 1 &&
+    page.above_the_line.canon.some(x => x.event_id === cCanon.id) &&
+    page.above_the_line.decisions.some(x => x.event_id === cDecision.id) &&
+    page.below_the_line.active_timeline.some(x => x.event_id === cViewer.id))
+
+  const mirrorDir = join(p.dir, 'topics-mirror')
+  const exported = s.exportTopicMarkdownMirror(mirrorDir, { readerPubkey: biggy.pk, nowSec: T0 + 50 })
+  const topicMd = readFileSync(join(mirrorDir, 'hive-memory.md'), 'utf8')
+  const indexMd = readFileSync(join(mirrorDir, 'INDEX.md'), 'utf8')
+  ok('Topic Pages: exportTopicMarkdownMirror writes deterministic read-only Markdown with Above/Below-the-Line sections',
+    exported.files_written.includes('hive-memory.md') &&
+    topicMd.includes('## Above the Line — Compiled Truth') &&
+    topicMd.includes('## Below the Line — Active Class A Evidence Timeline & Lineage') &&
+    topicMd.includes('hive-memory-hybrid-rrf-decision') &&
+    !topicMd.includes('secret-visualizer-plan') &&
+    indexMd.includes('#hive-memory'))
+
+  // 4. Regression for pre-#352 database / snapshot upgrade: submit() immediately after reconcile()
+  // (before any text or linked_to query) must succeed without 'the SQLite transaction failed'.
+  s.db.exec('DROP TABLE IF EXISTS events_fts; DROP TABLE IF EXISTS claim_edges;')
+  const recAfterDrop = s.reconcile()
+  const cPreQueryWrite = claim(biggy, roomA, 'hive-memory-post-upgrade-first-submit', {
+    topic: 'hive-memory',
+    ttlSec: 14 * DAY,
+    claim: 'First submit after pre-#352 database upgrade succeeds before any text query.',
+    because: 'reconcile() and indexDerivedEvent() ensure events_fts and claim_edges exist before READY.',
+    evidence: ['nvoy@14b30ef:mcp/tools/hive_memory_store.mjs'],
+    nowSec: T0 + 60,
+  })
+  const firstSubmitRes = s.submit({ writer: 'biggy', event: cPreQueryWrite, expectedPriorId: null, nowSec: T0 + 60 })
+  ok('Pre-#352 DB upgrade regression: reconcile() initializes derived tables before READY so immediate submit() succeeds',
+    recAfterDrop.ready === true &&
+    firstSubmitRes.accepted === true &&
+    firstSubmitRes.id === cPreQueryWrite.id)
+
   s.close()
 }
 

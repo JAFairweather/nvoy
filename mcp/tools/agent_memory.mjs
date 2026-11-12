@@ -32,11 +32,13 @@ const FIELDS = Object.freeze({
 })
 const schemaOf = op => MEMORY_TOOL_SPECS.find(s => s.name === TOOLS[op]).inputSchema
 
-export function memoryToolSpec(manifest, op) {
-  const m = manifest.mayRemember, schema = schemaOf(op)
+// The tool without this manifest's limits: what a client that cannot see the manifest (the pi
+// harness) offers; the fleet's own tools/list appends the rooms and cap, or the refusal.
+// mayRecall: whether this seat can call memory_query; the duplicate-check hint is shown only then (callers pass the
+// seat's may_recall; the default hides it).
+export function memoryToolBase(op, mayRecall = false) {
+  const schema = schemaOf(op)
   const { scope, ...properties } = schema.properties
-  const limits = m ? ` Rooms: ${m.rooms.join(', ')} (default ${m.rooms[0]}). At most ${m.perHour} memory writes an hour.`
-    : ` Refused: ${MEMORY_NOT_PERMITTED}.`
   const what = op === 'claim'
     ? 'Record a signed room memory claim in the private Hive memory store under your own key.' +
       ' What counts: (1) a reviewed decision with who made it and why, (2) a non-obvious fact or gotcha another agent would otherwise rediscover,' +
@@ -47,16 +49,23 @@ export function memoryToolSpec(manifest, op) {
       ' a workflow checkpoint (slug ending -review, -status, -owner, -wip or -handoff) defaults to 86400 (24 h) and is capped at 48 h;' +
       ' 0 for a Class B durable decision or standing project fact that stays active until withdrawn or superseded.' +
       ' When your claim closes another agent\'s checkpoint (you merged the PR they reviewed), name its event id in supersedes so it leaves the default view.' +
-      (manifest.mayRecall ? ' Check memory_query first to avoid duplicates.' : '') + ' When a fact changes, supersede it at the same slug (supersedes: [<prior event id>]); when it stops being true, call memory_withdraw.' +
+      (mayRecall ? ' Check memory_query first to avoid duplicates.' : '') + ' When a fact changes, supersede it at the same slug (supersedes: [<prior event id>]); when it stops being true, call memory_withdraw.' +
       ' Never record chatter, narration, guesses, personal details, secrets, or prose already in git or docs: cite those in evidence instead.'
     : 'Withdraw your room memory claim at one slug as soon as it stops being true, is resolved, or was wrong.' +
       ' The broker looks up your current claim at the fact key and submits a replacement marked withdrawn, with a strictly later created_at.'
   return {
     name: TOOLS[op],
-    description: `${what} The broker checks the manifest's may_remember block, signs a kind ${REMEMBER_KIND} and submits it to the private Hive memory store, never to a relay. Only room:<uuid> scopes; hive:ops, hive:canon and self are refused.${limits}`,
+    description: `${what} The broker checks the manifest's may_remember block, signs a kind ${REMEMBER_KIND} and submits it to the private Hive memory store, never to a relay. Only room:<uuid> scopes; hive:ops, hive:canon and self are refused.`,
     inputSchema: { type: 'object', properties: { room: { type: 'string', pattern: UUID.source }, scope, ...properties },
       required: schema.required.filter(k => k !== 'scope'), additionalProperties: false },
   }
+}
+
+export function memoryToolSpec(manifest, op) {
+  const m = manifest.mayRemember, base = memoryToolBase(op, Boolean(manifest.mayRecall))
+  const limits = m ? ` Rooms: ${m.rooms.join(', ')} (default ${m.rooms[0]}). At most ${m.perHour} memory writes an hour.`
+    : ` Refused: ${MEMORY_NOT_PERMITTED}.`
+  return { ...base, description: base.description + limits }
 }
 
 const fitsString = (value, s) => typeof value === 'string' && value.length >= (s.minLength || 0) &&

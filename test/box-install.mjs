@@ -98,6 +98,13 @@ writeFileSync(clientPath, JSON.stringify({ ...client, recall: { ...recall, comma
 assert.throws(() => readClientConfig(clientPath, id), /recall takes exactly/, 'a recall block holds only the three paths')
 writeFileSync(clientPath, JSON.stringify({ ...client, recall: { ...recall, ssh_target: 'gw@herd-cloud -oProxyCommand=x' } }))
 assert.throws(() => readClientConfig(clientPath, id), /recall ssh_target/)
+// On the store's box: "local" mounts the root-owned bridge, with no key and no seat name.
+const bridge = join(root, 'connect'); writeFileSync(bridge, '#!/bin/sh\n', { mode: 0o755 })
+writeFileSync(clientPath, JSON.stringify({ ...client, recall: 'local' }))
+assert.deepEqual({ ...readClientConfig(clientPath, id, { bridge }).recall }, { local: true, bridge: realpathSync(bridge) }, '"local" recall names the box\'s own bridge')
+assert.throws(() => readClientConfig(clientPath, id, { bridge: join(root, 'absent') }), /Hive memory bridge is missing/, 'no bridge on this box, no local recall')
+writeFileSync(clientPath, JSON.stringify({ ...client, recall: 'remote' }))
+assert.throws(() => readClientConfig(clientPath, id, { bridge }), /recall must be an object, or "local"/)
 writeFileSync(clientPath, JSON.stringify(client))
 assert.ok(!(r.stdout + r.stderr).includes('not-a-real-token'), 'the login is never printed')
 

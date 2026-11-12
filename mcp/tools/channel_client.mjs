@@ -89,13 +89,17 @@ export function rememberFlag(value) {
   return value === true
 }
 
-// `recall` names the instance's own Hive memory read key: { identity_file, known_hosts_file, ssh_target }. The
-// session then mounts that reader as the hive-memory MCP server and its instructions carry the recall rule. The
-// gateway's forced command binds the key to one reader socket, which serves only memory_wake and memory_query.
+// `recall` names the instance's own Hive memory reader. The session mounts it as the hive-memory MCP server and its
+// instructions carry the recall rule. Off the store's box it is the read key: { identity_file, known_hosts_file,
+// ssh_target }, which the gateway's forced command binds to one reader socket serving only memory_wake and
+// memory_query. On the store's box (herd-cloud) it is "local": the root-owned bridge binds the calling agent-NAME
+// login to its own reader socket, seat aliases included (agent-waggle reads as waggle-dev), so nothing names a seat.
+export const LOCAL_RECALL = '/usr/local/lib/hive-memory/connect'
 const RECALL_FIELDS = ['identity_file', 'known_hosts_file', 'ssh_target']
-export function recallEntry(value) {
+export function recallEntry(value, { bridge = LOCAL_RECALL } = {}) {
   if (value === undefined) return null
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('client config recall must be an object')
+  if (value === 'local') return Object.freeze({ local: true, bridge: fixedPath(bridge, 'Hive memory bridge', null).path })
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('client config recall must be an object, or "local"')
   const keys = Object.keys(value)
   if (keys.length !== RECALL_FIELDS.length || !RECALL_FIELDS.every(k => keys.includes(k))) {
     throw new Error(`client config recall takes exactly ${RECALL_FIELDS.join(', ')}`)
@@ -105,8 +109,9 @@ export function recallEntry(value) {
   return Object.freeze({ identity: privateFile(String(value.identity_file), 'Hive memory read key'),
     knownHosts: knownHostsFile(String(value.known_hosts_file)), target })
 }
+export const recallServerEntry = recall => recall.local ? { command: recall.bridge, args: [] } : sshChannelEntry(recall)
 
-export function readClientConfig(path, id) {
+export function readClientConfig(path, id, { bridge } = {}) {
   const file = fixedPath(path, 'client config', 64 * 1024)
   if ((file.stat.mode & 0o022) !== 0) throw new Error('client config must not be group/world writable')
   let raw
@@ -133,7 +138,7 @@ export function readClientConfig(path, id) {
   if (!Array.isArray(channels) || !channels.every(c => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(c))) throw new Error('client config channels must be Buzz channel ids')
   const config = Object.freeze({
     id: instanceId(id), target, home: resolve(home), model, pubkey, channels, remember: rememberFlag(raw.remember),
-    recall: recallEntry(raw.recall),
+    recall: recallEntry(raw.recall, { bridge }),
     identity: privateFile(String(raw.identity_file || ''), 'SSH identity file'),
     knownHosts: knownHostsFile(String(raw.known_hosts_file || '')),
     credentialFile: privateFile(String(raw.credential_file || ''), 'Claude login credential file'),

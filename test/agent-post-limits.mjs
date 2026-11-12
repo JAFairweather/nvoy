@@ -118,7 +118,7 @@ refused('a fractional per_hour', { may_post: { ...mayPost, per_hour: 2.5 } }, /p
 refused('a mention that is not a key', { may_post: { ...mayPost, mention: ['dennis'] } }, /pubkey or \{ name, pubkey \}/)
 refused('a duplicate mention', { may_post: { ...mayPost, mention: [dennis, { name: 'd', pubkey: dennis }] } }, /pubkeys must be distinct/)
 refused('a duplicate mention name', { may_post: { ...mayPost, mention: [{ name: 'Neil', pubkey: neil }, { name: 'neil', pubkey: dennis }] } }, /names must be distinct/)
-refused('an unknown may_post field', { may_post: { ...mayPost, anyone: true } }, /takes only channels, per_hour and mention/)
+refused('an unknown may_post field', { may_post: { ...mayPost, anyone: true } }, /takes only channels, per_hour, mention and mention_rooms/)
 refused('may_post on a headless worker manifest', { may_post: mayPost, delivery_mode: 'headless', worker_enabled: true,
   worker_image: `ghcr.io/x/w@sha256:${'a'.repeat(64)}`, worker_runner: 'codex', worker_credential_ref: '/etc/nvoy/w' }, /local-broker, worker-disabled notify_only/)
 refused('max_hops 0', { agent_limits: { max_hops: 0 } }, /max_hops must be an integer from 1 to 10/)

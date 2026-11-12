@@ -37,12 +37,16 @@ const WRITER_FD_PREFIX = 'writer.'
 export const ACTIVITY_MAX = 80
 const ACTIVITY_IDS_MAX = 20
 const VIEWER_READER = 'viewer'
+const CURATOR_READER = 'curator'
 
 const withStaleFiles = t => ({
   ...t,
   inputSchema: {
     ...t.inputSchema,
-    properties: { ...t.inputSchema.properties, stale_files: { type: 'array', items: { type: 'string', maxLength: 300 }, maxItems: 200 } },
+    properties: {
+      ...t.inputSchema.properties,
+      stale_files: { type: 'array', items: { type: 'string', maxLength: 300 }, maxItems: 200 },
+    },
   },
 })
 const READER_TOOLS = Object.freeze(MEMORY_TOOL_SPECS.filter(t => t.name === 'memory_wake' || t.name === 'memory_query').map(withStaleFiles))
@@ -81,12 +85,28 @@ export function bindingSignature(config, { kind, name }) {
 }
 
 const isViewer = binding => binding.kind === 'reader' && binding.name === VIEWER_READER
+const isCuratorReader = (binding, config) =>
+  binding.kind === 'reader' &&
+  (binding.name === CURATOR_READER || Boolean(config?.curators?.has(config?.readers.get(binding.name) || '')))
 
 // In-memory telemetry for the viewer only: metadata, never claim text, because, evidence or query text, and
 // never the viewer's own calls. Each ref keeps its claim's scope and author so viewerActivity can apply the
-// viewer's read ACL when it serves the ring.
-function noteActivity(activity, binding, nowSec, { kind, count = null, refs = [], filter = null, accepted = null, code = null }) {
-  if (!activity || isViewer(binding)) return
+// viewer's read ACL when it serves the ring. Durable hourly aggregate counts are also persisted in SQLite
+// (`activity_rollups`) so 24h and 7d recall totals survive ACTIVITY_MAX ring overflow and daemon restarts.
+function noteActivity(activity, binding, nowSec, { kind, count = null, refs = [], filter = null, accepted = null, code = null }, store = null) {
+  if (isViewer(binding)) return
+  let rollupOk = true
+  if (store && typeof store.recordActivityRollup === 'function') {
+    const retCount = Number.isSafeInteger(count) ? count : (Array.isArray(refs) ? refs.length : 0)
+    rollupOk = store.recordActivityRollup({ at: nowSec, actor: binding.name, kind, count: retCount })
+  }
+  if (!activity) return
+  if (!Number.isSafeInteger(activity.started_at)) activity.started_at = nowSec
+  if (!rollupOk) {
+    activity.rollup_write_failures = (activity.rollup_write_failures || 0) + 1
+    activity.first_rollup_failure_at ??= nowSec
+    activity.last_rollup_failure_at = nowSec
+  }
   activity.seq += 1
   activity.events.push({ seq: activity.seq, at: nowSec, kind, actor: binding.name, count, refs, filter, accepted, code })
   if (activity.events.length > ACTIVITY_MAX) activity.events.shift()
@@ -94,8 +114,8 @@ function noteActivity(activity, binding, nowSec, { kind, count = null, refs = []
 
 const recordRefs = records => (Array.isArray(records) ? records : []).map(r => ({ id: r.event_id, d: null, scope: r.scope, pubkey: r.author_pubkey }))
 
-function viewerActivity(activity, config) {
-  const pk = config?.readers.get(VIEWER_READER) || ''
+function viewerActivity(activity, config, readerName = VIEWER_READER) {
+  const pk = config?.readers.get(readerName) || ''
   const readable = ({ scope, pubkey }) => typeof scope === 'string' &&
     canRead(pk, scope.startsWith('room:') ? { scope_type: 'room', room_id: scope.slice(5), pubkey } : { scope_type: scope, pubkey }, config)
   const scopeShown = s => Boolean(config) && (s === 'hive:canon' || s === 'hive:ops' ||
@@ -138,7 +158,7 @@ export function handleSocketJsonRpc({ store, binding, message, nowSec, activity 
   const { id, method, params } = message
   const reply = result => ({ jsonrpc: '2.0', id, result })
   const writer = binding.kind === 'writer'
-  const note = entry => noteActivity(activity, binding, nowSec, entry)
+  const note = entry => noteActivity(activity, binding, nowSec, entry, store)
 
   if (method === 'initialize') {
     const readerPubkey = writer ? null : store.config?.readers.get(binding.name)
@@ -217,7 +237,27 @@ export function handleSocketJsonRpc({ store, binding, message, nowSec, activity 
       frame: o => mcpToolResult({ ...who, ...o }).content[0].text,
     })
     note({ kind: 'wake', count: Array.isArray(out.records) ? out.records.length : 0, refs: recordRefs(out.records) })
-    const telemetry = activity && isViewer(binding) ? { recent_activity: viewerActivity(activity, store.config), agent_roster: agentRoster(store, nowSec) } : {}
+    const includeTelemetry = isViewer(binding) || isCuratorReader(binding, store.config)
+    const telemetry = activity && includeTelemetry
+      ? {
+          recent_activity: viewerActivity(activity, store.config, binding.name),
+          agent_roster: agentRoster(store, nowSec),
+          activity_ring: {
+            seq: activity.seq,
+            cap: ACTIVITY_MAX,
+            retained: activity.events.length,
+            overflowed: activity.seq > ACTIVITY_MAX,
+            started_at: Number.isSafeInteger(activity.started_at) ? activity.started_at : nowSec,
+            oldest_at: activity.events[0]?.at ?? null,
+            rollup_write_failures: Math.max(Number(activity.rollup_write_failures || 0), Number(store.rollupWriteFailures || 0)),
+            first_rollup_failure_at: activity.first_rollup_failure_at ?? store.firstRollupFailureAt ?? null,
+            last_rollup_failure_at: activity.last_rollup_failure_at ?? store.lastRollupFailureAt ?? null,
+          },
+          ...(typeof store.activityRollups === 'function'
+            ? { activity_rollups: store.activityRollups({ sinceSec: Math.max(0, nowSec - 14 * 86400), nowSec }) }
+            : {}),
+        }
+      : {}
     return reply(mcpToolResult({ ...who, ...out, ...telemetry }))
   }
   const out = store.query({
@@ -303,7 +343,7 @@ export async function startMemoryDaemon({
 
   const servers = []
   const connections = new Set()
-  const activity = { seq: 0, events: [] }
+  const activity = { seq: 0, started_at: now(), events: [] }
   const attach = (binding, target) => new Promise((resolveListen, rejectListen) => {
     const srv = createServer(conn => {
       const entry = { conn, binding, signature: bindingSignature(store.config, binding) }

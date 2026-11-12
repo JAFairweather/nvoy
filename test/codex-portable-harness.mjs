@@ -10,6 +10,7 @@ import { sshChannelEntry } from '../mcp/tools/channel_client.mjs'
 import { CODEX_CHANNEL_TOOLS, codexConfigToml, codexRules, codexTurnText } from '../mcp/tools/harness_session.mjs'
 import { attachCommand, codexApprovals, codexGrants, codexInstall, sshFeedArgs } from '../mcp/tools/codex_portable_harness.mjs'
 import { claimPidLock } from '../mcp/tools/pid_lock.mjs'
+import { keyFingerprint } from '../mcp/tools/participant_unit.mjs'
 import { fakeHerdr } from './fake-herdr.mjs'
 
 let fails = 0
@@ -93,6 +94,9 @@ ok('a recall block mounts the reader with its own key and host, and approves onl
   /"-i", "\/keys\/cx-read", "hive-memory-gw@herd-cloud"\]/.test(recallToml) && recallToml.includes('UserKnownHostsFile=/keys/herd_known_hosts') &&
   /^\[mcp_servers\.hive-memory\.tools\.memory_wake\]$/m.test(recallToml) && /^\[mcp_servers\.hive-memory\.tools\.memory_query\]$/m.test(recallToml) &&
   (recallToml.match(/^\[mcp_servers\.hive-memory\.tools\./gm) || []).length === 2 && recallToml.startsWith(toml))
+const localToml = codexConfigToml({ manifest: { id: 'cx-test', recall: { local: true, bridge: '/usr/local/lib/hive-memory/connect' } }, root: '', auth: 'chatgpt', remote })
+ok('local recall mounts the box\'s bridge with no arguments and approves only its two read tools', localToml.includes('[mcp_servers.hive-memory]\ncommand = "/usr/local/lib/hive-memory/connect"\nargs = []\n') &&
+  (localToml.match(/^\[mcp_servers\.hive-memory\.tools\./gm) || []).length === 2 && !localToml.includes('hive-memory-gw'))
 ok('without a recall block there is no reader', !toml.includes('hive-memory'))
 ok('a model is set only when chosen', !/^model = /m.test(toml) && /^model = "gpt-5\.5"$/m.test(codexConfigToml({ manifest: { id: 'cx-test' }, root: '', model: 'gpt-5.5', auth: 'chatgpt', remote })))
 ok('a ChatGPT config without the SSH channel, or an unknown auth mode, is refused', (() => { try { codexConfigToml({ manifest: { id: 'x' }, root: '', auth: 'chatgpt' }); return false } catch { return true } })() &&
@@ -108,8 +112,8 @@ const keyLine = (...extra) => spawnSync(process.execPath, ['mcp/tools/instance-c
 const feedLine = keyLine('--mode', 'feed'), channelLine = keyLine(), defaultLine = keyLine('--mode', 'channel')
 ok('--mode feed renders one restricted line fixing the worker, container, feed program and instance, under its own tag', feedLine.status === 0 &&
   feedLine.stdout === `restrict,command="/usr/bin/docker exec -i --user ${process.getuid()}:${workerHandoffGid} nvoy-cx-adapter /usr/local/bin/node /srv/nvoy/mcp/tools/codex-channel-feed.mjs --instance cx-test" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestOnly nvoy-codex-feed-cx-test\n`)
-ok('the channel line is unchanged, by default and as --mode channel', channelLine.stdout === defaultLine.stdout &&
-  channelLine.stdout.includes('/codex-channel-mcp.mjs --instance cx-test" ssh-ed25519') && channelLine.stdout.trim().endsWith(' nvoy-codex-channel-cx-test'))
+ok('the channel line is the same by default and as --mode channel, and names its own key fingerprint', channelLine.stdout === defaultLine.stdout &&
+  channelLine.stdout.includes(`/codex-channel-mcp.mjs --instance cx-test --key-fp ${keyFingerprint('AAAAC3NzaC1lZDI1NTE5AAAAITestOnly')}" ssh-ed25519`) && channelLine.stdout.trim().endsWith(' nvoy-codex-channel-cx-test'))
 ok('an unknown mode is refused', /--mode must be channel or feed/.test(keyLine('--mode', 'shell').stderr) && keyLine('--mode', 'shell').status !== 0)
 
 // Wake feed

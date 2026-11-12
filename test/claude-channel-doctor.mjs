@@ -161,7 +161,7 @@ ok('broker doctor emits the exact worker UID/GID baseline before key installatio
   ok('the emitted arguments actually drive the renderer to a principal line',
     rendered.status === 0 && /^restrict,command="/.test(rendered.stdout.trim()))
   ok('  …and that line is the forced command, bound to the worker identity and taking no caller argument',
-    /command="\/usr\/bin\/docker exec -i --user 41014:42012 nvoy-claude-1 \/usr\/local\/bin\/node \/srv\/nvoy\/mcp\/tools\/claude-channel\.mjs --instance claude-test"/.test(rendered.stdout))
+    /command="\/usr\/bin\/docker exec -i --user 41014:42012 nvoy-claude-1 \/usr\/local\/bin\/node \/srv\/nvoy\/mcp\/tools\/claude-channel\.mjs --instance claude-test --key-fp SHA256:[A-Za-z0-9+\/]{43}"/.test(rendered.stdout))
   ok('  …and it carries the key the doctor was asked about',
     rendered.stdout.includes('ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestOnly'))
 

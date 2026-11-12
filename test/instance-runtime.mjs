@@ -156,7 +156,7 @@ const claudeManifest = { ...manifest, id: 'claude-channel', pubkey: 'c'.repeat(6
 writeFileSync(join(manifestRoot, 'claude-channel.json'), JSON.stringify(claudeManifest))
 const forcedClaudeKey = spawnSync(process.execPath, ['mcp/tools/instance-claude-channel-authorized-key.mjs', '--instance', 'claude-channel', '--public-key-file', desktopPublicKey, '--container', 'nvoy-claude-channel-adapter-1'], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
 ok('the Claude channel installer fixes a restricted worker-UID/GID MCP command distinct from the adapter', forcedClaudeKey.status === 0 &&
-  forcedClaudeKey.stdout.startsWith(`restrict,command="/usr/bin/docker exec -i --user ${manifest.worker_uid}:${manifest.worker_handoff_gid} nvoy-claude-channel-adapter-1 /usr/local/bin/node /srv/nvoy/mcp/tools/claude-channel.mjs --instance claude-channel" ssh-ed25519 `) &&
+  forcedClaudeKey.stdout.startsWith(`restrict,command="/usr/bin/docker exec -i --user ${manifest.worker_uid}:${manifest.worker_handoff_gid} nvoy-claude-channel-adapter-1 /usr/local/bin/node /srv/nvoy/mcp/tools/claude-channel.mjs --instance claude-channel --key-fp SHA256:`) &&
   !forcedClaudeKey.stdout.includes(`--user ${manifest.adapter_uid}:`) && !/permitopen|environment=|pty/.test(forcedClaudeKey.stdout))
 writeFileSync(join(manifestRoot, 'bad-desktop.json'), JSON.stringify({ ...manifest, id: 'bad-desktop', pubkey: '4'.repeat(64), state_dir: join(root, 'state-bad-desktop'), runtime_dir: join(root, 'run-bad-desktop'), spool_dir: join(root, 'spool-bad-desktop'), worker_image: '', worker_runner: '', worker_credential_ref: '', delivery_mode: 'codex_app_server' }))
 const badDesktop = cli('describe', '--instance', 'bad-desktop')
@@ -177,6 +177,21 @@ const desktopComposeManifest = { ...manifest, id: 'desktop-compose', pubkey: 'b'
 writeFileSync(join(manifestRoot, 'desktop-compose.json'), JSON.stringify(desktopComposeManifest))
 const renderedDesktop = spawnSync(process.execPath, ['mcp/tools/render-instance-compose.mjs', '--instance', 'desktop-compose', '--image', image], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
 ok('Desktop Compose omits the independent model worker and every provider-secret provisioning path', renderedDesktop.status === 0 && !/\n  worker:/.test(renderedDesktop.stdout) && !/worker-provider|worker_credentials|nvoy_worker_provider|WORKER_CREDENTIAL|WORKER_IMAGE|WORKER_RUNNER/.test(renderedDesktop.stdout))
+// The assertion above enumerates IDENTIFIERS, so prose describing the provider credential went
+// straight through it. The two comment lines explaining `nvoy_worker_provider` sat ABOVE
+// `# @worker-begin`, outside the block the renderer strips, so every worker-disabled compose kept a
+// `secrets:` block naming an OPENAI_API_KEY it does not have. That is not cosmetic: it read as a
+// seated credential to a host audit and cost three rounds of checks to settle (#179, waggle#428).
+const secretsBlock = (out) => (out.match(/\nsecrets:[\s\S]*?(?=\nvolumes:|\n[a-z]+:\n|$)/) || [''])[0]
+const disabledSecrets = secretsBlock(renderedDesktop.stdout), enabledSecrets = secretsBlock(rendered.stdout)
+ok('a worker-disabled compose names no OPENAI_API_KEY, because it carries none',
+  renderedDesktop.status === 0 && !/OPENAI_API_KEY/.test(renderedDesktop.stdout))
+ok('  …and its secrets: block explains only the two Bunker credentials it does carry',
+  disabledSecrets.includes('nvoy_bunker_uri') && disabledSecrets.includes('nvoy_bunker_client') && !/provider/i.test(disabledSecrets))
+// Both directions: a guard that strips every mention would pass the two above and destroy the
+// explanation for the instances that DO seat a provider credential, which is who it is written for.
+ok('NEGATIVE CONTROL — a worker-ENABLED compose still explains what its provider credential is',
+  rendered.status === 0 && enabledSecrets.includes('nvoy_worker_provider') && /OPENAI_API_KEY/.test(enabledSecrets) && /never into the broker/.test(enabledSecrets))
 const desktopWorkerOverride = spawnSync(process.execPath, ['mcp/tools/render-instance-compose.mjs', '--instance', 'desktop-compose', '--image', image, '--worker-image', releaseWorkerImage], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
 ok('a worker release cannot silently add a model worker to a worker-disabled Desktop identity', desktopWorkerOverride.status !== 0 && /worker-disabled/.test(desktopWorkerOverride.stderr))
 const taggedImage = spawnSync(process.execPath, ['mcp/tools/render-instance-compose.mjs', '--instance', 'codex-test', '--image', 'nvoy:latest'], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })

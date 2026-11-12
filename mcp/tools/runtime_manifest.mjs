@@ -78,7 +78,14 @@ export function readManifest(root, requestedId) {
     // owner may switch them off, but only with an explicit boolean.
     const statusReactions = raw.buzz?.status_reactions ?? true
     if (typeof statusReactions !== 'boolean') die('buzz.status_reactions must be true or false')
-    buzz = Object.freeze({ relay, channels: Object.freeze(channels), statusReactions })
+    // The key the community relay signs its room member lists (kind 39002) with. Pinned here from
+    // trusted instance configuration, never learned from the relay (#321).
+    let relaySigner = null
+    if (raw.buzz?.relay_signer != null) {
+      try { relaySigner = toHex(raw.buzz.relay_signer) } catch { relaySigner = '' }
+      if (!valid(relaySigner)) die('buzz.relay_signer must be a pubkey')
+    }
+    buzz = Object.freeze({ relay, channels: Object.freeze(channels), statusReactions, relaySigner })
   }
   if (!valid(pubkey) || !grantors.length || !grantors.every(valid) || !relays.length) die('manifest requires pubkey, grantors, and wss relays')
   if (new Set(carriers.map(entry => entry.pubkey)).size !== carriers.length) die('task_carrier pubkeys must be distinct')
@@ -218,7 +225,7 @@ export function readManifest(root, requestedId) {
   let mayPost = null
   if (raw.may_post != null) {
     const block = raw.may_post
-    if (typeof block !== 'object' || Array.isArray(block) || Object.keys(block).some(k => !['channels', 'per_hour', 'mention'].includes(k))) die('may_post takes only channels, per_hour and mention')
+    if (typeof block !== 'object' || Array.isArray(block) || Object.keys(block).some(k => !['channels', 'per_hour', 'mention', 'mention_rooms'].includes(k))) die('may_post takes only channels, per_hour, mention and mention_rooms')
     if (!buzz) die('may_post requires a buzz block')
     if (brokerMode !== 'local' || deliveryMode !== 'notify_only' || workerEnabled) die('may_post requires a local-broker, worker-disabled notify_only manifest')
     const channels = (Array.isArray(block.channels) ? block.channels : []).map(value => String(value || '').toLowerCase())
@@ -238,7 +245,11 @@ export function readManifest(root, requestedId) {
     if (new Set(mention.map(m => m.pubkey)).size !== mention.length) die('may_post.mention pubkeys must be distinct')
     const names = mention.filter(m => m.name).map(m => m.name.toLowerCase())
     if (new Set(names).size !== names.length) die('may_post.mention names must be distinct')
-    mayPost = Object.freeze({ channels: Object.freeze(channels), perHour: block.per_hour, mention: Object.freeze(mention) })
+    // Opt-in: the members of each may_post room become mentionable in that room (#321).
+    const mentionRooms = block.mention_rooms ?? false
+    if (typeof mentionRooms !== 'boolean') die('may_post.mention_rooms must be true or false')
+    if (mentionRooms && !buzz.relaySigner) die('may_post.mention_rooms requires buzz.relay_signer')
+    mayPost = Object.freeze({ channels: Object.freeze(channels), perHour: block.per_hour, mention: Object.freeze(mention), mentionRooms })
   }
   // Room-scoped Hive memory claims under the identity's own key (agent_memory.mjs), off until the
   // owner names the rooms, an hourly cap and the writer transport to the private store. Every claim

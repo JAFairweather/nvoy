@@ -1,0 +1,15 @@
+[Unit]
+Description=nvoy channel presence collector (waggle #721 step 4): counts bound channel sessions per instance
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Host stage only: reads /proc, the adapter container ids and the installed authorized_keys line, and
+# writes one counts-only snapshot per instance for the broker to read. It signs nothing and holds no
+# credential. Edit --authorized-keys to the channel account's file (see /etc/nvoy/onboard/runner.json).
+ExecStart=/usr/local/bin/node /opt/nvoy-hub/mcp/tools/presence-collect.mjs --out /var/lib/nvoy/presence --authorized-keys /root/.ssh/authorized_keys
+TimeoutStartSec=30

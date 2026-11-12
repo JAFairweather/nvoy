@@ -1,0 +1,19 @@
+[Unit]
+Description=nvoy onboarding, phase B: run every owner-signed add_agent request (docs/ONBOARD_PHASE_B.md)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+# Nothing runs until the runner key is paired; a missing config is not a failure to retry.
+ConditionPathExists=/etc/nvoy/onboard/runner.json
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# One tick: every unfinished request, oldest first. A pairing that waits for the owner holds this run
+# (up to 300 s), and systemd starts no second run while one is going.
+ExecStart=/bin/sh /opt/nvoy-hub/deploy/nvoy-onboard.sh watch
+# 75: an operator's run holds the lock, so this tick stood aside.
+SuccessExitStatus=75
+TimeoutStartSec=900

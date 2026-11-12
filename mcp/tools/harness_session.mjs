@@ -4,26 +4,47 @@
 
 import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { basename, dirname, resolve } from 'node:path'
-import { sshChannelEntry } from './channel_client.mjs'
+import { fileURLToPath } from 'node:url'
+import { recallServerEntry, sshChannelEntry } from './channel_client.mjs'
 
 export const serverName = manifest => `nvoy-${manifest.id}`
 
 // An instance with a recall block reads Hive memory through its own reader: the gateway's forced command binds the
-// key to one reader socket, which serves only these two tools.
+// key to one reader socket (or, on the store's box, the bridge binds the login to it), which serves only these two tools.
 export const RECALL_SERVER = 'hive-memory'
 export const RECALL_TOOLS = ['memory_wake', 'memory_query']
+
+// On herd-cloud, agent-curator's Nvoy channel runs over SSH on nave.pub, whereas Merkle Dreaming cycle packets land
+// locally in /var/lib/hive-memory-curator/packets/ (readable via curator-packet-reader). Mounting memory-dream-verify.mjs
+// as a local stdio MCP server lets agent-curator verify drafts against the host packet without shell access.
+export const DREAM_VERIFY_SERVER = 'hive-dream'
+export const DREAM_VERIFY_TOOLS = ['memory_dream_verify']
+export const LOCAL_DREAM_VERIFY = '/opt/hive-memory/nvoy/mcp/tools/memory-dream-verify.mjs'
+
+// Off the fleet the channel is an ssh child of the session, and every release (and manifest edit) recreates
+// the identity's adapter, which ends that ssh. Claude Code does not reconnect a stdio server, so the session
+// holds the channel through the reconnecting proxy instead: it keeps the session's stdio open, dials ssh
+// again with backoff and replays initialize. A release then costs a reconnect, not a session restart.
+export const RECONNECT_PROXY = fileURLToPath(new URL('./mcp-reconnect.mjs', import.meta.url))
+export function reconnectingEntry(entry, { node = process.execPath, proxy = RECONNECT_PROXY } = {}) {
+  return { command: node, args: [proxy, '--', entry.command, ...entry.args] }
+}
 
 // The channel runs as the session's own MCP child, under the same worker UID that the SSH forced
 // command would use, so it keeps exactly the queue permissions that path has. Off the fleet it is
 // that SSH forced command, reached with the same entry claude-channel-doctor renders for a client.
-export function mcpConfig({ manifest, root, remote = null }) {
-  const recall = manifest.recall ? { [RECALL_SERVER]: sshChannelEntry(manifest.recall) } : {}
-  if (remote) return { mcpServers: { [serverName(manifest)]: sshChannelEntry(remote), ...recall } }
+export function mcpConfig({ manifest, root, remote = null, dreamVerify = null }) {
+  const recall = manifest.recall ? { [RECALL_SERVER]: recallServerEntry(manifest.recall) } : {}
+  const verifyScript = typeof dreamVerify === 'string'
+    ? dreamVerify
+    : (dreamVerify === true || (dreamVerify === null && manifest.id === 'curator' && existsSync(LOCAL_DREAM_VERIFY)) ? LOCAL_DREAM_VERIFY : null)
+  const dream = verifyScript ? { [DREAM_VERIFY_SERVER]: { command: 'node', args: [verifyScript, '--mcp'] } } : {}
+  if (remote) return { mcpServers: { [serverName(manifest)]: reconnectingEntry(sshChannelEntry(remote)), ...recall, ...dream } }
   return { mcpServers: { [serverName(manifest)]: {
     command: 'node',
     args: ['/srv/nvoy/mcp/tools/claude-channel.mjs', '--instance', manifest.id],
     env: { NVOY_INSTANCE_ROOT: root },
-  }, ...recall } }
+  }, ...recall, ...dream } }
 }
 
 // ~/.claude.json belongs to Claude Code, which rewrites it; only the first-run and folder-trust
@@ -40,11 +61,15 @@ export function seedClaudeJson(existing, workdir) {
 // Nobody is at the keyboard, so a permission prompt would stall the session for good. The channel's
 // tools are allowed; anything else is refused rather than asked about, unless the operator has
 // chosen another mode or added rules in this persistent file.
-export function seedSettings(existing, server, { recall = false } = {}) {
+export function seedSettings(existing, server, { recall = false, dreamVerify = false } = {}) {
   const out = existing && typeof existing === 'object' && !Array.isArray(existing) ? { ...existing } : {}
   const permissions = out.permissions && typeof out.permissions === 'object' ? { ...out.permissions } : {}
   const allow = Array.isArray(permissions.allow) ? [...permissions.allow] : []
-  const rules = [`mcp__${server}`, ...(recall ? RECALL_TOOLS.map(tool => `mcp__${RECALL_SERVER}__${tool}`) : [])]
+  const rules = [
+    `mcp__${server}`,
+    ...(recall ? RECALL_TOOLS.map(tool => `mcp__${RECALL_SERVER}__${tool}`) : []),
+    ...(dreamVerify ? DREAM_VERIFY_TOOLS.map(tool => `mcp__${DREAM_VERIFY_SERVER}__${tool}`) : []),
+  ]
   for (const rule of rules) if (!allow.includes(rule)) allow.push(rule)
   permissions.allow = allow
   if (!permissions.defaultMode) permissions.defaultMode = 'dontAsk'
@@ -130,11 +155,44 @@ export function recallRule(manifest) {
   ].join('\n')
 }
 
+// James, 2026-11-08: check memory at the start of every turn, not only when a task starts. Its own marker,
+// so a file that already carries the recall rule gains it (rules are appended by marker, never rewritten).
+export const TURN_RULE_MARKER = '## Check memory every turn'
+export function turnRule(manifest) {
+  if (!manifest.recall) return ''
+  return [
+    TURN_RULE_MARKER,
+    '',
+    'At the start of every turn, before you act on the message, call `memory_query` for the facts that bear',
+    'on your current work and tasks, by the work\'s topic and a few words of the task. The wake digest at',
+    'session start does not replace this; other agents save while you work. Say which records you relied',
+    'on, or that none bore on it.',
+    '',
+  ].join('\n')
+}
+
+// Any agent that reads or saves memory reports a failure at once (2026-11-07: every save was refused for eight
+// hours and no agent said so).
+export const MEMORY_FAILURE_RULE_MARKER = '## Report Hive memory failures'
+export function memoryFailureRule(manifest) {
+  if (!manifest.mayRemember && !manifest.recall) return ''
+  return [
+    MEMORY_FAILURE_RULE_MARKER,
+    '',
+    'Memory is a critical resource. If a read or a save fails (an error, a refused claim, a wake with no',
+    'canon, a timeout or a missing memory tool), post in #waggle-test straight away and mention @Neil: what',
+    'failed, the exact error and the time (UTC). Don\'t carry on as if memory had nothing to say. Put any facts',
+    'you could not save in that post, and save them once memory is back. On 2026-11-07 every save was refused',
+    'for eight hours, nobody said so, and those facts were lost.',
+    '',
+  ].join('\n')
+}
+
 // The instructions file as it should be: the defaults when missing, plus each standing rule once, under its
 // marker. Returns the text to write, or null when the file is already right.
 export function instructionsUpdate(current, manifest) {
   let text = current ?? defaultInstructions(manifest)
-  for (const [marker, rule] of [[MEMORY_RULE_MARKER, memoryRule(manifest)], [RECALL_RULE_MARKER, recallRule(manifest)]]) {
+  for (const [marker, rule] of [[MEMORY_RULE_MARKER, memoryRule(manifest)], [RECALL_RULE_MARKER, recallRule(manifest)], [TURN_RULE_MARKER, turnRule(manifest)], [MEMORY_FAILURE_RULE_MARKER, memoryFailureRule(manifest)]]) {
     if (rule && !text.includes(marker)) text = `${text.replace(/\n*$/, '\n\n')}${rule}`
   }
   return current != null && text === current ? null : text
@@ -197,6 +255,31 @@ export function channelProcessUp(psText, rootPid, entryArgs) {
   return false
 }
 
+// The reconnecting proxy and its link, among the session's descendants. `proxy`: a process running the
+// proxy script for this session. `link`: the pid of that proxy's live child (its ssh), or ''. Startup waits for the link,
+// so a fleet that refuses the key still keeps a session from being called ready; after that only the proxy
+// going away restarts the session, and a dropped link is the proxy's to redial.
+export function channelState(psText, rootPid, { proxy = RECONNECT_PROXY, node = process.execPath } = {}) {
+  const children = new Map(), commands = new Map()
+  for (const line of String(psText || '').split('\n')) {
+    const match = line.match(/^\s*(\d+)\s+(\d+)\s(.*)$/)
+    if (!match) continue
+    const [, pid, ppid, command] = match
+    commands.set(pid, command.trim())
+    children.set(ppid, [...(children.get(ppid) || []), pid])
+  }
+  const queue = [...(children.get(String(rootPid)) || [])]
+  for (const seen = new Set(); queue.length;) {
+    const pid = queue.shift()
+    if (seen.has(pid)) continue
+    seen.add(pid)
+    const words = (commands.get(pid) || '').split(/\s+/)
+    if (words[0] === node && words[1] === proxy && words.includes('--')) return { proxy: true, link: (children.get(pid) || [])[0] || '' }
+    queue.push(...(children.get(pid) || []))
+  }
+  return { proxy: false, link: '' }
+}
+
 // Claude Code keeps each working directory's conversations under ~/.claude/projects/<cwd with
 // every non-alphanumeric replaced by '-'>. One there means `--continue` resumes this session.
 export function hasPriorSession(home, workdir) {
@@ -231,7 +314,7 @@ export const CHANNEL_PERMISSIONS = 'nvoy-channel'
 
 function codexRecall(manifest) {
   if (!manifest.recall) return []
-  const q = value => JSON.stringify(String(value)), entry = sshChannelEntry(manifest.recall)
+  const q = value => JSON.stringify(String(value)), entry = recallServerEntry(manifest.recall)
   return [`[mcp_servers.${RECALL_SERVER}]`, `command = ${q(entry.command)}`, `args = [${entry.args.map(q).join(', ')}]`, '',
     ...RECALL_TOOLS.flatMap(tool => [`[mcp_servers.${RECALL_SERVER}.tools.${tool}]`, 'approval_mode = "approve"', ''])]
 }

@@ -1,0 +1,56 @@
+// onboard_stage.mjs — the hosted agent's channel public key, staged across by an operator helper
+// (waggle docs/DESIGN_ADD_AN_AGENT.md, "Two ways in"). The runner cannot read herd-cloud's agent home, so
+// the helper writes only the public half, atomically, to a request-bound name in the runner's state dir.
+//
+// Contract with the helper: file `<stateDir>/<request id>.staged-channel.pub`, a regular file (no link),
+// at most 1 KiB, one OpenSSH line `<type> <base64> nvoy-stage:<instance>:<request id>` (a Pi or Codex agent adds
+// `<request id>.staged-feed.pub` with the comment `nvoy-stage-feed:<instance>:<request id>`). The comment binds
+// the key to this instance and this request. The runner reports what it finds; it never trusts it.
+// The row carries a public key only. Anything that looks private is refused and never echoed.
+
+import { createHash } from 'node:crypto'
+import { lstatSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { readPublicKey } from './instance_apply.mjs'
+
+export const STAGED_MAX_BYTES = 1024
+// Two roles: the channel key, and for a Pi or Codex agent the wake-feed key (principal_family.mjs).
+const ROLE_FILE = { channel: 'staged-channel', feed: 'staged-feed' }
+const ROLE_TAG = { channel: 'nvoy-stage', feed: 'nvoy-stage-feed' }
+export const stagedKeyPath = (stateDir, request, role = 'channel') => join(stateDir, `${request}.${ROLE_FILE[role]}.pub`)
+
+// SHA256:<unpadded base64>, the form `ssh-keygen -lf` prints, so the page and the owner can compare.
+export const keyFingerprint = ({ keyBody }) =>
+  `SHA256:${createHash('sha256').update(Buffer.from(keyBody, 'base64')).digest('base64').replace(/=+$/, '')}`
+
+// -> null when nothing is staged for this request (an own-box agent), else { state, detail, key? }.
+export function readStagedKey({ stateDir, request, instance, role = 'channel', bound = null, fs = { lstatSync, readFileSync } }) {
+  if (!ROLE_FILE[role]) throw new Error('role must be channel or feed')
+  const path = stagedKeyPath(stateDir, request, role)
+  const noun = role === 'feed' ? 'feed key' : 'channel key'
+  let st
+  try { st = (fs.lstatSync || lstatSync)(path) } catch (error) {
+    if (error?.code === 'ENOENT') return null
+    return { state: 'refused', detail: `cannot read the staged ${noun}: ${error?.code || 'error'}` }
+  }
+  if (!st.isFile()) return { state: 'refused', detail: `the staged ${noun} is not a plain file` }
+  if (st.size > STAGED_MAX_BYTES) return { state: 'refused', detail: `the staged ${noun} file is too large` }
+  let text
+  try { text = (fs.readFileSync || readFileSync)(path, 'utf8') } catch (error) {
+    return { state: 'refused', detail: `cannot read the staged ${noun}: ${error?.code || 'error'}` }
+  }
+  let key
+  try { key = readPublicKey(text) } catch (error) {
+    // readPublicKey's messages never repeat the input.
+    return { state: 'refused', detail: `the staged ${noun} is not one public key: ${error.message}` }
+  }
+  // Exactly three tokens: type, key, binding comment. readPublicKey allows trailing text; the contract does not.
+  const tokens = text.trim().split(/\s+/)
+  if (tokens.length !== 3 || tokens[2] !== `${ROLE_TAG[role]}:${instance}:${request}`)
+    return { state: 'refused', detail: tokens.length > 3 ? `the staged ${noun} line has extra text after its binding comment`
+      : `the staged ${noun} is not bound to this instance and request` }
+  const fingerprint = keyFingerprint(key)
+  if (bound && (bound.keyType !== key.keyType || bound.keyBody !== key.keyBody))
+    return { state: 'refused', detail: `the staged ${noun} ${fingerprint} differs from the key the owner bound ${keyFingerprint(bound)}`, key }
+  return { state: 'done', detail: `${key.keyType} ${key.keyBody} (${fingerprint}), staged for the owner to bind`, key }
+}

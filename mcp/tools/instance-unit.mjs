@@ -19,6 +19,7 @@ import { lstatSync, readFileSync, writeFileSync } from 'node:fs'
 import { resolve, join } from 'node:path'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { principalLine, principalComment, forcedCommand, verifyPrincipal, parsePrincipal, volumeLifecycle } from './participant_unit.mjs'
+import { codexComment, codexForcedCommand, verifyCodexPrincipal, codexManifestRefusal } from './principal_family.mjs'
 
 const TOOL = 'instance-unit'
 const die = m => { console.error(`${TOOL}: ${m}`); process.exit(1) }
@@ -150,6 +151,30 @@ const keysPath = flag('--authorized-keys') || process.env.NVOY_AUTHORIZED_KEYS |
 if (!keysPath) die('--authorized-keys <path> is required to verify the installed access surface')
 const file = boundedFile(keysPath, 'authorized_keys')
 if (file.missing) inconclusive(`authorized_keys ${keysPath} does not exist — cannot tell "never installed" from "cannot read"`)
+
+// --family codex: a Pi or Codex agent has two principals, a channel line and a feed line, each its own program.
+// Both must be present and exact; the Claude check below is for the Claude family only.
+if (flag('--family') === 'codex') {
+  const bad = codexManifestRefusal(manifest)
+  if (bad) die(bad)
+  let all = true
+  for (const role of ['channel', 'feed']) {
+    const want = codexComment(manifest, role)
+    const lines = file.text.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'))
+      .filter(l => { const p = parsePrincipal(l); return p ? p.comment === want : l.includes(want) })
+    if (lines.length !== 1) {
+      console.error(`${TOOL}: FAIL — ${lines.length ? `${lines.length} principals carry` : 'no principal carries'} ${want} in ${keysPath}`)
+      console.error(`  expected command: ${codexForcedCommand(manifest, role)}${role === 'channel' ? ' --key-fp <SHA256 fingerprint of the channel key>' : ''}`)
+      all = false; continue
+    }
+    const result = verifyCodexPrincipal(manifest, role, lines[0])
+    if (!result) { console.error(`${TOOL}: FAIL — the installed ${role} line for ${manifest.id} is not a parseable forced-command principal`); all = false; continue }
+    for (const f of result.findings) console.log(`${f.ok ? 'ok  ' : 'FAIL'} — ${role}: ${f.label}${f.detail ? `: ${f.detail}` : ''}`)
+    if (!result.ok) all = false
+  }
+  console.log(`${TOOL}: ${all ? 'verified' : 'FAILED'} both principals (channel, feed) for ${manifest.id}`)
+  process.exit(all ? 0 : 1)
+}
 
 const comment = principalComment(manifest)
 // Match on our own comment rather than on the command, so a principal whose command has drifted is

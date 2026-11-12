@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto'
 import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -310,6 +311,40 @@ try {
   ok('listing an envelope does not suppress its first notification to a client that wakes on them', false)
 } finally { try { await throttleClient.close() } catch { /* already gone */ } }
 
+// A reply is handled work: an envelope answered without nvoy_channel_read (its words reached the agent
+// in another envelope's context) must stop being announced. Before, only a read stopped it, and the
+// answered envelope was re-announced every renotifyMs for good (mc-claude, 47c7ab2f, 11 Nov).
+const repliedRuntime = join(root, 'replied-runtime'), repliedId = 'claude-replied-test', repliedPubkey = randomBytes(32).toString('hex')
+mkdirSync(repliedRuntime); mkdirSync(join(repliedRuntime, 'claude-channel-state'))
+writeFileSync(join(manifests, `${repliedId}.json`), JSON.stringify({ ...manifest, id: repliedId, pubkey: repliedPubkey, runtime_dir: repliedRuntime,
+  state_dir: join(root, 'replied-state'), spool_dir: join(root, 'replied-spool') }))
+const repliedEnvelope = 'c'.repeat(64)
+writeFileSync(join(repliedRuntime, 'admitted-tasks.jsonl'), JSON.stringify({ ...task, instance: repliedId, envelope: repliedEnvelope,
+  authority: { ...task.authority, scope_subject: repliedPubkey } }) + '\n', { mode: 0o600 })
+writeFileSync(join(repliedRuntime, 'reply-requests.jsonl'), '', { mode: 0o640 })
+const repliedClient = new Client({ name: 'claude-channel-replied', version: '0.1.0' })
+const repliedWakes = []
+repliedClient.setNotificationHandler(Channel, note => { if (note.params?.meta?.envelope === repliedEnvelope) repliedWakes.push(Date.now()) })
+try {
+  const repliedTransport = new StdioClientTransport({ command: process.execPath,
+    args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', repliedId, '--poll-ms', '250', '--renotify-ms', '1000'],
+    env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stderr: 'pipe' })
+  let repliedStderr = ''
+  repliedTransport.stderr?.on('data', d => { repliedStderr += d })
+  globalThis.repliedStderr = () => repliedStderr
+  await repliedClient.connect(repliedTransport)
+  const until = async (test, ms) => { const end = Date.now() + ms; while (!test() && Date.now() < end) await new Promise(done => setTimeout(done, 50)); return test() }
+  ok('an unread envelope is announced again on the interval', await until(() => repliedWakes.length >= 2, 5000))
+  const answered = await repliedClient.callTool({ name: 'nvoy_channel_reply', arguments: { envelope: repliedEnvelope, text: 'handled from context' } })
+  const before = repliedWakes.length
+  await new Promise(done => setTimeout(done, 2600))
+  ok('a reply to an envelope never read stops its re-announce, and records it read',
+    JSON.parse(answered.content[0].text).queued === true && repliedWakes.length === before &&
+    readFileSync(join(repliedRuntime, 'claude-channel-state', 'read.jsonl'), 'utf8').includes(repliedEnvelope))
+} catch (error) {
+  ok(`a reply to an envelope never read stops its re-announce (threw: ${error.message}) STDERR=${globalThis.repliedStderr?.()}`, false)
+} finally { try { await repliedClient.close() } catch { /* already gone */ } }
+
 // The `!task` arm of the read guard, which nothing above drives. Dropping it — the tempting
 // `if (!(read || notifiedThisRun.has(envelope) || listedThisRun.has(envelope)))` — passes the rest
 // of this suite, and the resulting failure is worse than a plain refusal: `read.jsonl` is
@@ -342,10 +377,117 @@ try {
   const alive = (await trimClient.listTools()).tools.map(tool => tool.name)
   ok('the refusal left the session alive — the throw was prevented, not merely caught',
     alive.includes('nvoy_channel_read') && alive.includes('nvoy_channel_list'))
+  const nonCuratorVerify = await trimClient.callTool({
+    name: 'memory_dream_verify',
+    arguments: {
+      packet_path: '/var/lib/hive-memory-curator/packets/dream-1142.json',
+      title: 'Test Dream',
+      dream: 'A short valid dream.',
+      referenced_change_ids: ['chg-1'],
+    },
+  })
+  ok('non-curator instance is refused memory_dream_verify (NVOY_DREAM_VERIFY_NOT_PERMITTED)',
+    nonCuratorVerify.isError === true && /NVOY_DREAM_VERIFY_NOT_PERMITTED/.test(nonCuratorVerify.content[0].text))
 } catch (error) {
   ok(`an envelope read but no longer in the queue is refused, not dereferenced (threw: ${error.message})`, false)
   ok('the refusal left the session alive — the throw was prevented, not merely caught', false)
+  ok('non-curator instance is refused memory_dream_verify (NVOY_DREAM_VERIFY_NOT_PERMITTED)', false)
 } finally { try { await trimClient.close() } catch { /* already gone */ } }
+
+// Curator instance exposes memory_dream_verify, enforces packet directory confinement, and returns checked dream record + buzz_post without shell access.
+const curatorRuntime = join(root, 'curator-runtime')
+const curatorPackets = join(root, 'curator-packets')
+mkdirSync(curatorRuntime); mkdirSync(join(curatorRuntime, 'claude-channel-state')); mkdirSync(curatorPackets)
+writeFileSync(join(manifests, 'curator.json'), JSON.stringify({
+  ...manifest,
+  id: 'curator',
+  pubkey: 'a'.repeat(64),
+  runtime_dir: curatorRuntime,
+  state_dir: join(root, 'curator-state'),
+  spool_dir: join(root, 'curator-spool'),
+}))
+writeFileSync(join(curatorRuntime, 'admitted-tasks.jsonl'), '', { mode: 0o600 })
+writeFileSync(join(curatorRuntime, 'reply-requests.jsonl'), '', { mode: 0o640 })
+const packetFile = join(curatorPackets, 'dream-1142.json')
+writeFileSync(packetFile, JSON.stringify({
+  id: 'dream-1142',
+  at: '2026-11-09T18:58:00.000Z',
+  ledger_ref: 'seq:1142',
+  changes: [
+    {
+      change_id: 'chg-1',
+      kind: 'distilled',
+      claim_event_id: 'a'.repeat(64),
+      summary: 'Consolidated three room status claims on nvoy viewer into a single checkpoint.',
+    },
+  ],
+}), { mode: 0o640 })
+const curatorTransport = new StdioClientTransport({
+  command: process.execPath,
+  args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', 'curator', '--poll-ms', '60000'],
+  env: { ...process.env, NVOY_INSTANCE_ROOT: manifests, HIVE_MEMORY_CURATOR_PACKET_DIR: curatorPackets },
+  stderr: 'pipe',
+})
+const curatorClient = new Client({ name: 'claude-channel-curator', version: '0.1.0' })
+try {
+  await curatorClient.connect(curatorTransport)
+  const curatorTools = (await curatorClient.listTools()).tools.map(t => t.name)
+  ok('curator instance exposes memory_dream_verify tool in listTools',
+    curatorTools.includes('memory_dream_verify'))
+  const outsidePath = await curatorClient.callTool({
+    name: 'memory_dream_verify',
+    arguments: {
+      packet_path: join(root, 'outside.json'),
+      title: 'Nightly Synthesis',
+      dream: 'Three scattered notes folded into one clear stone along the corridor.',
+      referenced_change_ids: ['chg-1'],
+    },
+  })
+  ok('memory_dream_verify refuses packet_path outside HIVE_MEMORY_CURATOR_PACKET_DIR',
+    outsidePath.isError === true && /NVOY_BAD_DREAM_PACKET/.test(outsidePath.content[0].text))
+  const validVerify = await curatorClient.callTool({
+    name: 'memory_dream_verify',
+    arguments: {
+      packet_path: packetFile,
+      title: 'Corridor of Folded Stones',
+      dream: 'Three scattered notes along the observatory wall folded quietly into a single carved keystone.',
+      referenced_change_ids: ['chg-1'],
+    },
+  })
+  const verifiedPayload = JSON.parse(validVerify.content[0].text)
+  ok('memory_dream_verify verifies draft against packet and returns checked record + buzz_post',
+    !validVerify.isError &&
+    verifiedPayload.ok === true &&
+    verifiedPayload.record?.id === 'dream-1142' &&
+    verifiedPayload.record?.checked === true &&
+    verifiedPayload.record?.validation === 'structural' &&
+    typeof verifiedPayload.buzz_post === 'string' &&
+    verifiedPayload.buzz_post.includes('Corridor of Folded Stones') &&
+    verifiedPayload.buzz_post.endsWith('Dream ID: dream-1142') &&
+    !verifiedPayload.buzz_post.includes('Consolidated Changes') &&
+    !/\d/.test(verifiedPayload.buzz_post.split('\n\nDream ID: ')[0]))
+} catch (error) {
+  ok(`curator instance exposes memory_dream_verify tool in listTools (threw: ${error.message})`, false)
+  ok('memory_dream_verify refuses packet_path outside HIVE_MEMORY_CURATOR_PACKET_DIR', false)
+  ok('memory_dream_verify verifies draft against packet and returns checked record + buzz_post', false)
+} finally { try { await curatorClient.close() } catch { /* already gone */ } }
+
+// When the packet directory is absent on the host (e.g. remote nave.pub channel), curator omits memory_dream_verify from listTools so local hive-dream is not shadowed.
+const remoteCuratorTransport = new StdioClientTransport({
+  command: process.execPath,
+  args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', 'curator', '--poll-ms', '60000'],
+  env: { ...process.env, NVOY_INSTANCE_ROOT: manifests, HIVE_MEMORY_CURATOR_PACKET_DIR: join(root, 'missing-packets') },
+  stderr: 'pipe',
+})
+const remoteCuratorClient = new Client({ name: 'claude-channel-curator-remote', version: '0.1.0' })
+try {
+  await remoteCuratorClient.connect(remoteCuratorTransport)
+  const remoteCuratorTools = (await remoteCuratorClient.listTools()).tools.map(t => t.name)
+  ok('curator instance omits memory_dream_verify in listTools when packet directory is absent on host',
+    !remoteCuratorTools.includes('memory_dream_verify'))
+} catch (error) {
+  ok(`curator instance omits memory_dream_verify in listTools when packet directory is absent on host (threw: ${error.message})`, false)
+} finally { try { await remoteCuratorClient.close() } catch { /* already gone */ } }
 
 // The shipped window bounds how long a restarted portable harness is refused: 30s × 4 is
 // ~2¼ min, where 60s × 10 was ten. The measured formula above is what makes the default a window.

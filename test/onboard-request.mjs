@@ -99,4 +99,19 @@ refuses('ONBOARD_BAD_TAG', request({ tags: [['d', 'nvoy-onboard/hr/bind_runtime'
   ['like', 'crystalclaude'], ['channel_key', KEY], ['invite', sealed], ['policy', '3']] }))
 refuses('ONBOARD_SECRET', request({ tags: [...request().tags, ['policy', 'nsec1abc']] }))
 
-console.log('onboard-request: fields, owner, replay, age, closed tags, secrets, bind_runtime, newest and the sealed invite pass')
+// The display name and about the owner gave (waggle #717): the agent's first kind 0, for add_agent only.
+assert.equal(good.profile, null)
+const named = parse(request({ tags: [...request().tags, ['display_name', ' Biggy '], ['about', 'Dreams up what the hive builds next.\nThen hands it over.']] }))
+assert.deepEqual(named.profile, { name: 'Biggy', display_name: 'Biggy', about: 'Dreams up what the hive builds next.\nThen hands it over.' })
+assert.deepEqual(parse(request({ tags: [...request().tags, ['display_name', 'Biggy']] })).profile, { name: 'Biggy', display_name: 'Biggy' })
+refuses('ONBOARD_BAD_PROFILE', request({ tags: [...request().tags, ['display_name', '  ']] }))
+refuses('ONBOARD_BAD_PROFILE', request({ tags: [...request().tags, ['display_name', 'x'.repeat(65)]] }))
+refuses('ONBOARD_BAD_PROFILE', request({ tags: [...request().tags, ['display_name', 'Two\nlines']] }))
+refuses('ONBOARD_BAD_PROFILE', request({ tags: [...request().tags, ['display_name', 'Biggy'], ['about', 'y'.repeat(501)]] }))
+refuses('ONBOARD_BAD_PROFILE', request({ tags: [...request().tags, ['about', 'no name']] }))
+refuses('ONBOARD_BAD_TAG', request({ tags: [...request().tags, ['display_name', 'A'], ['display_name', 'B']] }))
+refuses('ONBOARD_SECRET', request({ tags: [...request().tags, ['display_name', 'nsec1abc']] }))
+refuses('ONBOARD_BAD_TAG', request({ tags: [['d', 'nvoy-onboard/hr/bind_runtime'], ['op', 'bind_runtime'], ['p', agent], ['harness', 'claude-code'],
+  ['like', 'crystalclaude'], ['channel_key', KEY], ['display_name', 'Biggy']] }))
+
+console.log('onboard-request: fields, owner, replay, age, closed tags, secrets, bind_runtime, newest, the sealed invite and the profile pass')

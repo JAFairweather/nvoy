@@ -1,0 +1,11 @@
+[Unit]
+Description=Collect channel presence every 30 seconds (waggle #721 step 4)
+
+[Timer]
+OnBootSec=1min
+# Measured from the last run's end, so a slow docker never stacks two collectors.
+OnUnitInactiveSec=30s
+AccuracySec=2s
+
+[Install]
+WantedBy=timers.target

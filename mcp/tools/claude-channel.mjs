@@ -17,6 +17,7 @@ import { requestWorkingStatus } from './buzz_status.mjs'
 import { MENTION_SCHEMA, capabilityHash, capabilityInstructions, capabilitySummary, mentionView, notMentioned, postToolSpec, queuePost, resolveReplyMention } from './agent_post.mjs'
 import { profileToolSpec, profileStatusToolSpec, queueProfile, profileStatus, waitProfile } from './agent_profile.mjs'
 import { memoryToolSpec, queueMemory } from './agent_memory.mjs'
+import { DEFAULT_CURATOR_PACKET_DIR, dreamVerifyToolSpec, runDreamVerifyTool } from './memory-dream-verify.mjs'
 import { claimPidLock } from './pid_lock.mjs'
 import { credentialIn, withheld } from './outbound_secrets.mjs'
 
@@ -176,6 +177,8 @@ if (baseline) {
   process.exit(0)
 }
 
+const hasLocalCuratorPackets = () => existsSync(process.env.HIVE_MEMORY_CURATOR_PACKET_DIR || DEFAULT_CURATOR_PACKET_DIR)
+
 const mcp = new Server(
   { name: `nvoy-${manifest.id}`, version: '0.1.0' },
   {
@@ -190,6 +193,7 @@ const mcp = new Server(
       'To start a new conversation, call nvoy_channel_post; it is refused unless this identity\'s manifest allows posting.',
       'To update your public profile, call nvoy_profile_set; it is refused unless this identity\'s manifest allows profile changes.',
       'To record or withdraw a room memory claim under your own key, call memory_claim or memory_withdraw; they are refused unless this identity\'s manifest allows memory writes.',
+      ...(manifest.id === 'curator' && hasLocalCuratorPackets() ? ['To structurally verify a Merkle Dreaming narrative against its packet in /var/lib/hive-memory-curator/packets, call memory_dream_verify.'] : []),
       capabilityInstructions(view()),
     ].join(' '),
   },
@@ -220,11 +224,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [
   profileStatusToolSpec(),
   memoryToolSpec(manifest, 'claim'),
   memoryToolSpec(manifest, 'withdraw'),
+  ...(manifest.id === 'curator' && hasLocalCuratorPackets() ? [dreamVerifyToolSpec()] : []),
 ] }))
 
 mcp.setRequestHandler(CallToolRequestSchema, async request => {
   capabilitiesHeard()
   const args = request.params.arguments || {}
+  if (request.params.name === 'memory_dream_verify') {
+    if (manifest.id !== 'curator') {
+      return toolResult({ code: 'NVOY_DREAM_VERIFY_NOT_PERMITTED', message: 'memory_dream_verify is restricted to the curator instance' }, true)
+    }
+    const { ok, error } = runDreamVerifyTool(args)
+    return error ? toolResult(error, true) : toolResult(ok)
+  }
   if (request.params.name === 'nvoy_profile_set') {
     const { ok, error } = queueProfile(manifest, args)
     if (error) return toolResult(error, true)
@@ -297,7 +309,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async request => {
     return toolResult({ code: 'NVOY_REPLY_REQUIRES_ONE_SENDER' }, true)
   }
   const allowed = view()
-  const { mention, unresolved, ...refused } = resolveReplyMention(allowed, args.mention, content)
+  // A reply resolves against the envelope's own room (#321).
+  const room = task.authority?.reply_channel
+  const { mention, unresolved, ...refused } = resolveReplyMention(allowed, args.mention, content, room)
   if (refused.code) return toolResult(refused, true)
   try {
     const prior = lines(replyPath, 'Desktop reply queue').map(line => { try { return JSON.parse(line) } catch { throw new Error('Desktop reply queue contains malformed JSON') } })
@@ -306,7 +320,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async request => {
       instance: manifest.id, receipt: envelope, content, ...(mention.length ? { mention } : {}) }
     appendFileSync(replyPath, JSON.stringify(record) + '\n', { mode: 0o640 })
     chmodSync(replyPath, 0o640)
-    return toolResult({ queued: true, envelope, request: record.id, ...(mention.length ? { mention } : {}), ...notMentioned(allowed.mayPost, unresolved) })
+    // A reply means the envelope was handled, whether or not it was read here first (its words can
+    // reach the agent in another envelope's context). Only a read stops the re-announce, so an
+    // answered envelope that was never read was announced every renotifyMs for good (mc-claude,
+    // 47c7ab2f, 11 Nov). The reply is already queued, so a failed read-log write is logged, not returned.
+    if (!read) {
+      try {
+        appendFileSync(readPath, JSON.stringify({ version: 1, instance: manifest.id, envelope, read_at: Date.now(), by: 'reply' }) + '\n', { mode: 0o600 })
+        chmodSync(readPath, 0o600)
+      } catch (error) { console.error(`nvoy-claude-channel: reply queued but ${envelope} not marked read: ${error.message}`) }
+    }
+    return toolResult({ queued: true, envelope, request: record.id, ...(mention.length ? { mention } : {}), ...notMentioned(allowed.mayPost, unresolved, room) })
   } catch (error) { return toolResult({ code: 'NVOY_REPLY_QUEUE_FAILED', message: error.message }, true) }
 })
 

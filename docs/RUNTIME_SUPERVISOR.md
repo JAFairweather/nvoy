@@ -113,6 +113,14 @@ node mcp/tools/nvoy-onboard.mjs show <name>
 node mcp/tools/nvoy-onboard.mjs run <name> --authorized-keys /home/<channel-account>/.ssh/authorized_keys
 ```
 
+On the fleet host, which has no node, `deploy/nvoy-onboard.sh` runs the same tool in the deployed
+runtime image, with the host paths the steps write mounted at the same paths and the docker CLI and
+socket that apply's baseline needs (#322). On nvoy-fleet the channel account is root:
+
+```bash
+sh /opt/nvoy-hub/deploy/nvoy-onboard.sh run <name> --authorized-keys /root/.ssh/authorized_keys
+```
+
 The request is a kind 30078 event with `d` = `nvoy-onboard/<name>/add_agent`: the agent's key, its
 harness, the live agent to copy (`like`), who may give it work, and its rooms. A second one,
 `nvoy-onboard/<name>/bind_runtime`, carries the public channel key made on the agent's box. Only a
@@ -125,8 +133,49 @@ those seats, so it waits for `--givers-redeploy`, and backs each manifest up und
 request that made it: a newer signed `add_agent` for the same name is staged afresh from its own
 `like`, and the earlier one is kept beside it as `.superseded-<id>`. A step that is waiting writes a `pending` receipt in
 `/var/lib/nvoy-onboard/<request id>.jsonl` saying on what, and `run` exits 4. Run it again to carry
-on: each step checks the state it makes, so nothing runs twice. The relay writer entry and the hive
-invite stay pending until nave.pub #157 and the sealed invite land.
+on: each step checks the state it makes, so nothing runs twice. The relay writer step is done when the
+request owner's newest writer list on relay.nave.pub (kind 30000, `d` = `nave-relay-writers`, nave.pub
+#157) names the agent; it is read, never written, by nvoy-onboard. The hive invite stays pending until
+the sealed invite lands.
+
+#### Phase B: the fleet runs it (#323)
+
+`watch` is one tick of the same steps for every unfinished request, oldest first, with no operator
+(`docs/ONBOARD_PHASE_B.md`). It never redeploys a giver, and the pairing link and every step's state
+reach the owner only inside a receipt sealed to them and signed by the runner key `nvoy-onboard`. A
+lock in `/var/lib/nvoy-onboard/.lock` keeps a tick and an operator's `run` apart; the second exits 75.
+
+Setup, once, on the fleet host:
+
+1. The owner makes a key named `nvoy-onboard` in their Bunker and gives the operator its npub (never
+   the nsec). nave.pub adds it to `deploy/relay/allowlist.json` `allow` by PR, so its receipts are
+   stored on relay.nave.pub.
+2. Write `/etc/nvoy/onboard/runner.json` (root 0600, in a root 0700 directory):
+
+   ```json
+   { "pubkey": "npub1…", "relays": ["wss://relay.nave.pub"],
+     "bunker_client_ref": "/etc/nvoy/onboard/nvoy-onboard.nip46-client",
+     "bunker_uri_ref": "/etc/nvoy/onboard/nvoy-onboard.bunker-uri",
+     "authorized_keys": "/root/.ssh/authorized_keys", "ssh_target": "root@<fleet host>" }
+   ```
+
+3. Pair it. The link prints once; the owner approves it with the `nvoy-onboard` key:
+
+   ```bash
+   sh /opt/nvoy-hub/deploy/nvoy-onboard.sh runner-pair
+   ```
+
+4. Install and start the timer (the service does nothing while `runner.json` is missing):
+
+   ```bash
+   install -m 0644 /opt/nvoy-hub/deploy/nvoy-onboard.service /etc/systemd/system/
+   install -m 0644 /opt/nvoy-hub/deploy/nvoy-onboard.timer /etc/systemd/system/
+   systemctl daemon-reload
+   systemctl enable --now nvoy-onboard.timer
+   ```
+
+Read a tick with `journalctl -u nvoy-onboard.service`; it never logs the pairing link. Stop phase B
+with `systemctl disable --now nvoy-onboard.timer`; `run` works as before.
 
 `worker_credential_ref` is intentionally a different credential class: a dedicated, revocable
 model-provider API key used by the headless Claude/Codex process. It is mounted only in the
