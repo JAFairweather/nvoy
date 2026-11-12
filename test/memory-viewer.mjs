@@ -1741,6 +1741,10 @@ await test('PR #354 regressions: cached event immutability, pre-curation elapsed
     assert.equal(parsedApiMobile.trends.hourly_24h_series.length, 6, 'hourly_24h_series must contain 6 4h buckets')
     assert(typeof parsedApiMobile.trends.lifetime.coherence_score === 'number')
     assert(typeof parsedApiMobile.trends.lifetime.synaptic_efficiency_score === 'number')
+    assert(Array.isArray(sAfterCanary.eigen_axis_proposals), 'desktop state must include eigen_axis_proposals array')
+    assert(Array.isArray(sAfterCanary.curator_state.eigen_axis_proposals), 'curator_state must include eigen_axis_proposals array')
+    assert(Array.isArray(parsedApiMobile.eigen_axis_proposals), '/api/mobile must include eigen_axis_proposals array')
+    assert(Array.isArray(parsedApiMobile.dreams.eigen_axis_proposals), '/api/mobile dreams must include eigen_axis_proposals array')
 
     const htmlMobileRes = await httpGet(viewer.port, '/mobile')
     assert.equal(htmlMobileRes.status, 200)
