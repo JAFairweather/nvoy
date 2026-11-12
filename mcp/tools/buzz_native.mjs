@@ -96,16 +96,32 @@ export function channelPost({ channel, content, mentions = [], now = Math.floor(
   return { kind: 9, created_at: now, content, tags: [['h', channel], ...mentions.map(p => ['p', p]), [HOP_TAG, '1']] }
 }
 
+export const threadRoot = ev => {
+  const marked = marker => (ev.tags || []).find(t => t?.[0] === 'e' && t[3] === marker && HEX64.test(String(t[1])))?.[1]
+  return marked('root') || marked('reply') || ev.id
+}
+
 // Is this a message addressed to `me` in one of `channels`? Returns the facts admission needs,
 // or null. Desktop tags an off-channel mention ["mention", pk] instead of ["p", pk]; both count.
-export function nativeMention(ev, { me, channels, now = Math.floor(Date.now() / 1000), verify = verifyEvent }) {
+// A reply anywhere in a thread `me` started (one of `threads`, from ownRoots) is addressed too,
+// mention or not, so a reviewer's verdict reaches whoever asked (#280). Addressed is not authorised: the
+// author still needs a grant.
+export function nativeMention(ev, { me, channels, threads = [], now = Math.floor(Date.now() / 1000), verify = verifyEvent }) {
   if (!ev || !CHANNEL_KINDS.includes(ev.kind) || !HEX64.test(String(ev.pubkey)) || ev.pubkey === me) return null
   if (!Number.isSafeInteger(ev.created_at) || ev.created_at > now + 900) return null
   const h = tagValues(ev, 'h')
   if (h.length !== 1 || !channels.includes(h[0])) return null
-  if (![...tagValues(ev, 'p'), ...tagValues(ev, 'mention')].includes(me)) return null
-  if (!verified(ev, verify)) return null
-  return { channel: h[0], author: ev.pubkey, event_id: ev.id, created_at: ev.created_at }
+  const addressed = [...tagValues(ev, 'p'), ...tagValues(ev, 'mention')].includes(me) ? 'mention'
+    : threadRoot(ev) !== ev.id && threads.some(t => t.id === threadRoot(ev) && t.channel === h[0]) ? 'own-thread' : null
+  if (!addressed || !verified(ev, verify)) return null
+  return { channel: h[0], author: ev.pubkey, event_id: ev.id, created_at: ev.created_at, addressed }
+}
+
+// The threads `me` started: its own signed top-level messages in `channels`, as { id, channel }.
+export function ownRoots(events, { me, channels, verify = verifyEvent }) {
+  return (Array.isArray(events) ? events : []).filter(ev => ev?.kind === 9 && ev.pubkey === me && HEX64.test(String(ev.id)) &&
+    threadRoot(ev) === ev.id && tagValues(ev, 'h').length === 1 && channels.includes(tagValues(ev, 'h')[0]) && verified(ev, verify))
+    .map(ev => ({ id: ev.id, channel: tagValues(ev, 'h')[0] }))
 }
 
 // The conversation around an admitted message, so the agent can follow the room it was asked in
@@ -113,10 +129,6 @@ export function nativeMention(ev, { me, channels, now = Math.floor(Date.now() / 
 // channel's last messages before the source, the thread's root, and the thread's replies.
 export const CONTEXT_LIMIT = 30
 const CONTEXT_MESSAGE_BYTES = 4000, CONTEXT_BYTES = 48 * 1024
-const threadRoot = ev => {
-  const marked = marker => (ev.tags || []).find(t => t?.[0] === 'e' && t[3] === marker && HEX64.test(String(t[1])))?.[1]
-  return marked('root') || marked('reply') || ev.id
-}
 export function contextFilters(source) {
   const h = tagValues(source, 'h')
   if (h.length !== 1 || !validChannel(h[0]) || !Number.isSafeInteger(source.created_at)) return null

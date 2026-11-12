@@ -1,7 +1,7 @@
 // Native ears and mouth on a Buzz relay (salvage plan 2.3): the keyless watcher logs in through
 // the broker's AUTH oracle and marks mentions; the keyed broker re-fetches, admits on the author's
 // own grant, and answers with a kind:9. The stub relay keeps subscriptions open past EOSE and
-// honours #h, #p, ids, kinds and since, as Buzz does, so a watcher that hears nothing fails here.
+// honours #h, #p, #e, ids, authors, kinds and since, as Buzz does, so a watcher that hears nothing fails here.
 import { WebSocketServer } from 'ws'
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:http'
@@ -25,14 +25,16 @@ const throws = fn => { try { fn(); return null } catch (e) { return e.message } 
 const CH = '3f1c2a4b-5d6e-4f70-8a91-b2c3d4e5f607', OTHER = '00000000-0000-4000-8000-000000000000'
 const agentSk = generateSecretKey(), agent = getPublicKey(agentSk)
 const humanSk = generateSecretKey(), human = getPublicKey(humanSk)
+const thirdSk = generateSecretKey(), third = getPublicKey(thirdSk)
 const local = sk => ({ getPublicKey: async () => getPublicKey(sk), signEvent: async t => finalizeEvent(t, sk) })
 
 // --- a Buzz-shaped relay with live subscriptions ---
-const members = new Set([agent, human]), stored = [], sockets = []
+const members = new Set([agent, human, third]), stored = [], sockets = []
 const matches = (f, ev) => {
   const vals = n => ev.tags.filter(t => t[0] === n).map(t => t[1])
   return f['#h'].some(h => vals('h').includes(h)) && (!f.ids || f.ids.includes(ev.id)) && (!f.kinds || f.kinds.includes(ev.kind)) &&
-    (!f['#p'] || f['#p'].some(p => vals('p').includes(p))) && (!f.since || ev.created_at >= f.since)
+    (!f['#p'] || f['#p'].some(p => vals('p').includes(p))) && (!f['#e'] || f['#e'].some(e => vals('e').includes(e))) &&
+    (!f.authors || f.authors.includes(ev.pubkey)) && (!f.since || ev.created_at >= f.since)
 }
 const http = createServer((req, res) => { res.writeHead(404); res.end() })
 await new Promise(r => http.listen(0, '127.0.0.1', r))
@@ -150,6 +152,7 @@ const startWatcher = (socketPath = oracleSock) => {
   return child
 }
 const pendingFor = id => join(spool, `${id}.buzz.pending`)
+const asked = await post(agentSk, { kind: 9, content: 'please review', tags: [['h', CH], ['p', human]] })
 let watcher = startWatcher()
 ok('the watcher logs in and listens', await until(() => /listening on 1 channel/.test(watcherLog)))
 const mention = await post(humanSk, { kind: 9, content: 'agent, what is the status?', tags: [['h', CH], ['p', agent]] })
@@ -178,6 +181,19 @@ watcher = startWatcher()
 ok('the restarted watcher listens again', await until(() => (watcherLog.match(/listening on 1 channel/g) || []).length >= 3))
 await sleep(300)
 ok('a replayed mention is not marked twice', !existsSync(pendingFor(mention.id)))
+// #280: a reply anywhere in a thread the agent started is heard, mention or not.
+const inThread = (root, parent) => [['h', CH], ['e', root.id, '', 'root'], ['e', parent.id, '', 'reply']]
+ok('the watcher follows the thread the agent started before it began', /following 1 own thread/.test(watcherLog))
+const aside = await post(thirdSk, { kind: 9, content: 'a question first', tags: [['h', CH], ['e', asked.id, '', 'reply'], ['p', agent]] })
+const verdict = await post(humanSk, { kind: 9, content: 'verdict: approve', tags: [...inThread(asked, aside), ['p', third]] })
+ok('a reply to a third party inside the agent\'s thread, with no mention of it, leaves a marker', await until(() => existsSync(pendingFor(verdict.id))))
+const theirs = await post(thirdSk, { kind: 9, content: 'their own question', tags: [['h', CH]] })
+const notOurs = await post(humanSk, { kind: 9, content: 'an answer', tags: [...inThread(theirs, theirs), ['p', third]] })
+const later = await post(agentSk, { kind: 9, content: 'a second request', tags: [['h', CH], ['p', human]] })
+ok('a thread the agent starts while listening is followed', await until(() => /following 2 own thread/.test(watcherLog)))
+const laterReply = await post(humanSk, { kind: 9, content: 'done', tags: [['h', CH], ['e', later.id, '', 'reply']] })
+ok('a reply in that thread leaves a marker', await until(() => existsSync(pendingFor(laterReply.id))))
+ok('a reply in a thread the agent did not start leaves no marker', !existsSync(pendingFor(notOurs.id)))
 watcher.kill()
 watcherLog = ''
 watcher = startWatcher(join(root, 'no-oracle.sock'))
@@ -212,6 +228,11 @@ r = await deliver('ears', second.id)
 ok('with no relay answering for grants, a real mention is requeued, not consumed', r.status === 75 && /policy unavailable|policy check failed/.test(r.stderr) && existsSync(pendingFor(second.id)))
 ok('no receipt exists before a grant was seen', !existsSync(join(root, 'state', 'receipts', `${second.id}.json`)))
 ok('the broker lock is released on exit', !existsSync(join(root, 'state', 'broker.lock')))
+r = await deliver('ears', verdict.id)
+ok('a reply in the agent\'s own thread is addressed, and goes on to the author\'s grant', r.status === 75 && /policy unavailable|policy check failed/.test(r.stderr) && existsSync(pendingFor(verdict.id)))
+plant(notOurs.id)
+r = await deliver('ears', notOurs.id)
+ok('a reply in a thread the agent did not start is terminal, not a task', r.status === 0 && /not a signed mention/.test(r.stderr))
 manifestWith('down', { buzz: { relay: 'ws://127.0.0.1:1', channels: [CH] } })
 plant(second.id.replace(/.$/, '0'))
 r = await deliver('down', second.id.replace(/.$/, '0'))

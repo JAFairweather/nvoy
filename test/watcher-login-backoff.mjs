@@ -66,7 +66,7 @@ wss.on('connection', ws => {
   const challenge = Buffer.from(generateSecretKey()).toString('hex'), subs = new Map()
   let authed = false
   ws.send(JSON.stringify(['AUTH', challenge]))
-  const deliver = ev => { for (const [id, f] of subs) if (ev.tags.some(t => t[0] === 'p' && f['#p'].includes(t[1]))) ws.send(JSON.stringify(['EVENT', id, ev])) }
+  const deliver = ev => { for (const [id, f] of subs) if (ev.tags.some(t => t[0] === 'p' && f['#p']?.includes(t[1]))) ws.send(JSON.stringify(['EVENT', id, ev])) }
   live.add(deliver); ws.on('close', () => live.delete(deliver))
   ws.on('message', raw => {
     const m = JSON.parse(raw.toString())
@@ -77,12 +77,14 @@ wss.on('connection', ws => {
     }
     if (m[0] === 'REQ') {
       if (!authed) return ws.send(JSON.stringify(['CLOSED', m[1], 'auth-required']))
-      stats.reqs++; subs.set(m[1], m[2])
+      // Counted: the message subscription. Each refresh also re-reads the agent's own threads (#280).
+      if (m[2]['#p']) stats.reqs++
+      subs.set(m[1], m[2])
       ws.send(JSON.stringify(['EOSE', m[1]]))
       if (dropAfterEose) setTimeout(() => ws.terminate(), 50)
       return
     }
-    if (m[0] === 'CLOSE') { stats.closes++; subs.delete(m[1]) }
+    if (m[0] === 'CLOSE') { if (subs.get(m[1])?.['#p']) stats.closes++; subs.delete(m[1]) }
   })
 })
 
