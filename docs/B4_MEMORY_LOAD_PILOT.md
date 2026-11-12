@@ -39,6 +39,31 @@ pinning, cache flushing or claim of an uncontended host is made. Code hashes,
 revision, Node/platform/CPU and deterministic fixture-text hash accompany results.
 Random fixture signers/event IDs can affect tie ordering across runs.
 
+## Recorded 30-sample pilot
+
+The committed `docs/benchmarks/b4-synthetic-load-pilot.json` was executed at
+`b5ffcbf0657b495329b4da7eaac94a5dd86f97b0`, with 50,000 current rows, 50,000
+FTS rows and a 50,000-match participation probe. There are 30 measured calls
+after 2 warmups (six calls per workload string), not the proposed 1,000-call
+baseline. Node was v22.22.1 on Linux x64, AMD EPYC 9354P, on a shared host.
+
+| Measurement | Milliseconds |
+|---|---:|
+| Setup, signing, verified migration and reconciliation | 909230.591369 |
+| First query after startup (not OS-cold) | 4303.900125000044 |
+| Nearest-rank p50 | 3419.1988980000606 |
+| Nearest-rank p95 (29th sorted sample) | 5253.448459999985 |
+| Maximum | 5425.294401000021 |
+
+All 30 raw durations are retained without trimming. The 24 positive calls each
+matched 12,500 rows and returned ten cards; six absent-token calls matched and
+returned zero. No unknown response occurred. Artifact code hashes were verified
+against both the executed git revision and unchanged working source. Earlier
+foreground timeout produced no data and is not included in these statistics.
+
+These are measured engineering observations, not a service SLO pass, population
+estimate, real-recall quality score or completion of B4.
+
 ## Limits and remaining B4 work
 
 All rows are current, accepted, one writer, one ops scope, with short repetitive
