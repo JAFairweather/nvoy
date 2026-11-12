@@ -390,13 +390,23 @@ export function weaveDreamStory({
   }
 }
 
+export function curationObservationEnd(ranAt, submitted = []) {
+  return Math.max(ranAt, ...(Array.isArray(submitted) ? submitted : [])
+    .map(s => Number.isSafeInteger(s?.created_at) ? s.created_at : ranAt))
+}
+
 export function buildDreamPacket({
   lastCuratedWriteSeq = 0,
+  lastCuratedAt = 0,
   writeSeqBefore = 0,
   writeSeqAfter = 0,
   ranAt = Math.floor(Date.now() / 1000),
   ledgerRef = null,
   coherenceScore = null,
+  coherenceBefore = null,
+  coherenceAfter = null,
+  historyRecords = [],
+  historyComplete = false,
   triggers = null,
   plan = null,
   submitted = [],
@@ -503,6 +513,54 @@ export function buildDreamPacket({
   }))
 
   const packetId = `dream-${writeSeqAfter}`
+  // Count the complete post-write history since the preceding completed curation.
+  // A missing post-write snapshot is unknown, never a measured zero.
+  const windowStart = Number(lastCuratedAt || 0)
+  // The writer may advance a replacement's created_at past the cycle clock to
+  // follow its prior claim. That accepted write belongs in this cycle's window.
+  const windowEnd = curationObservationEnd(ranAt, submitted)
+  const history = (Array.isArray(historyRecords) ? historyRecords : [])
+    .filter(r => r && r.scope === allowedScope && Number.isFinite(r.created_at) && r.created_at <= windowEnd)
+    .sort((a, b) => a.created_at - b.created_at || String(b.event_id || '').localeCompare(String(a.event_id || '')))
+  const inWindow = r => r.created_at > windowStart
+  const later = (next, r) => next.event_id !== r.event_id &&
+    (next.created_at > r.created_at || (next.created_at === r.created_at && String(next.event_id) < String(r.event_id)))
+  const withdrawn = historyComplete ? history.filter(r => inWindow(r) && (r.status === 'withdrawn' || r.verification === 'withdrawn')).length : null
+  const expired = historyComplete ? history.filter(r => r.status !== 'withdrawn' && r.verification !== 'withdrawn' &&
+    Number.isFinite(r.expires_at) && r.expires_at > windowStart && r.expires_at <= windowEnd &&
+    !history.some(next => next.author_pubkey === r.author_pubkey && next.d === r.d && later(next, r) &&
+      next.created_at <= r.expires_at)).length : null
+  const heads = new Map()
+  let superseded = 0
+  for (const r of history) {
+    const key = `${r.author_pubkey || ''}:${r.d || ''}`
+    if (r.status === 'withdrawn' || r.verification === 'withdrawn') {
+      heads.delete(key)
+    } else {
+      const prior = heads.get(key)
+      if (inWindow(r) && prior && (prior.expires_at === null || prior.expires_at === undefined || prior.expires_at > r.created_at)) {
+        superseded++
+      }
+      heads.set(key, r)
+    }
+  }
+  const folded = [...new Set([
+    ...(Array.isArray(plan?.promotions) ? plan.promotions : []),
+    ...(Array.isArray(plan?.distillations) ? plan.distillations : []),
+  ].filter(p => p.scope === allowedScope && submittedByD.has(p.template?.tags?.find(t => t[0] === 'd')?.[1] ||
+    `${p.topic}:${p.scope}:${p.slug}`)).flatMap(p => Array.isArray(p.source_event_ids) ? p.source_event_ids : []))].length
+  const merged = changes.filter(c => c.kind === 'promotion' || c.kind === 'distillation').length
+  const beforeScore = Number.isFinite(coherenceBefore) ? coherenceBefore : null
+  const afterScore = Number.isFinite(coherenceAfter) ? coherenceAfter : null
+  const stats = {
+    window_start: historyComplete ? windowStart || null : null,
+    window_end: historyComplete ? windowEnd : null,
+    claims_merged: merged,
+    claims_superseded: historyComplete ? superseded : null,
+    retired: { withdrawn, expired, folded, total: historyComplete ? withdrawn + expired + folded : null },
+    coherence: { before: beforeScore, after: afterScore,
+      delta: beforeScore !== null && afterScore !== null ? Math.round((afterScore - beforeScore) * 10) / 10 : null },
+  }
   const storySeed = weaveDreamStory({
     id: packetId,
     changes,
@@ -526,6 +584,7 @@ export function buildDreamPacket({
     triggers: Array.isArray(triggers?.reasons) ? triggers.reasons : [],
     topic_eigenvectors: normalizedEigenvectors,
     story_seed: storySeed,
+    stats,
     changes,
   }
 }
@@ -1543,6 +1602,114 @@ export function formatCuratorBriefing({
   return lines.join('\n')
 }
 
+function completeHistoryPage(page, expectedWriteSeq, offset, expectedTotal = null) {
+  if (!page || !['found', 'none'].includes(page.answer) || page.answer_reason != null ||
+      page.format !== 'full' || page.store_state?.state !== 'READY' ||
+      Number(page.store_state.write_seq) !== expectedWriteSeq || !Array.isArray(page.records) ||
+      !Number.isSafeInteger(page.total_matched) || page.total_matched < 0 ||
+      page.returned !== page.records.length ||
+      (expectedTotal !== null && page.total_matched !== expectedTotal) ||
+      (page.answer === 'none' && page.total_matched !== 0) ||
+      (page.answer === 'found' && page.total_matched === 0)) return false
+  const nextOffset = offset + page.records.length
+  if (nextOffset > page.total_matched) return false
+  return page.next_cursor === null
+    ? nextOffset === page.total_matched
+    : page.records.length > 0 && page.next_cursor === String(nextOffset)
+}
+
+export async function readInitialHistory(reader, pageLimit, pageSize, maxAttempts = 3) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const wake = await reader.callReadTool('memory_wake', {})
+    const writeSeq = Number(wake?.store_state?.write_seq)
+    if (wake?.store_state?.state !== 'READY' || !Number.isSafeInteger(writeSeq)) {
+      throw new Error('memory_wake did not return a ready store state')
+    }
+    const records = []
+    const historyRecords = []
+    let cursor = '0'
+    let pages = 0
+    let expectedTotal = null
+    let changed = false
+    while (cursor !== null && pages < pageLimit) {
+      const page = await reader.callReadTool('memory_query', {
+        limit: pageSize,
+        format: 'full',
+        include_history: true,
+        ...(cursor !== '0' ? { cursor } : {}),
+      })
+      if (!completeHistoryPage(page, writeSeq, Number(cursor), expectedTotal)) {
+        const pageSeq = Number(page?.store_state?.write_seq)
+        if (Number.isSafeInteger(pageSeq) && pageSeq !== writeSeq &&
+            completeHistoryPage(page, pageSeq, Number(cursor), null)) {
+          changed = true
+          break
+        }
+        throw new Error('memory_query did not return a complete ready history page')
+      }
+      expectedTotal = page.total_matched
+      for (const r of page.records) {
+        historyRecords.push(r)
+        if ((r.is_current === undefined || r.is_current === true) && r.status !== 'withdrawn' && r.verification === 'accepted') {
+          records.push(r)
+        }
+      }
+      cursor = typeof page.next_cursor === 'string' && page.next_cursor ? page.next_cursor : null
+      pages += 1
+    }
+    if (changed) continue
+    const end = await reader.callReadTool('memory_wake', {})
+    const endSeq = Number(end?.store_state?.write_seq)
+    if (end?.store_state?.state !== 'READY' || !Number.isSafeInteger(endSeq)) {
+      throw new Error('memory_wake did not return a ready store state')
+    }
+    if (endSeq !== writeSeq) continue
+    return { wake, records, historyRecords, historyComplete: cursor === null }
+  }
+  throw new Error('memory history changed during bounded read retries')
+}
+
+export async function readPostCycleSnapshot(reader, expectedWriteSeq, pageLimit, pageSize, nowSec) {
+  const start = await reader.callReadTool('memory_wake', {})
+  if (start?.store_state?.state !== 'READY' || Number(start.store_state.write_seq) !== expectedWriteSeq) return null
+  const historyRecords = []
+  const records = []
+  let cursor = '0'
+  let pages = 0
+  let expectedTotal = null
+  while (cursor !== null && pages < pageLimit) {
+    const page = await reader.callReadTool('memory_query', {
+      limit: pageSize,
+      format: 'full',
+      include_history: true,
+      ...(cursor !== '0' ? { cursor } : {}),
+    })
+    if (!completeHistoryPage(page, expectedWriteSeq, Number(cursor), expectedTotal)) return null
+    expectedTotal = page.total_matched
+    for (const r of page.records) {
+      historyRecords.push(r)
+      if ((r.is_current === undefined || r.is_current === true) && r.status !== 'withdrawn' && r.verification === 'accepted') {
+        records.push(r)
+      }
+    }
+    cursor = typeof page?.next_cursor === 'string' && page.next_cursor ? page.next_cursor : null
+    pages += 1
+  }
+  if (cursor !== null) return null
+  const end = await reader.callReadTool('memory_wake', {})
+  if (end?.store_state?.state !== 'READY' || Number(end.store_state.write_seq) !== expectedWriteSeq) return null
+  const coherence = computeCoherence({
+    records,
+    history_records: historyRecords,
+    agent_roster: Array.isArray(end?.agent_roster) ? end.agent_roster : [],
+    recent_activity: Array.isArray(end?.recent_activity) ? end.recent_activity : [],
+    store_state: end.store_state,
+    now_sec: nowSec,
+    history_complete: true,
+  })
+  return { historyRecords, coherenceScore: Number.isFinite(coherence?.score) ? coherence.score : null }
+}
+
 // Executes a full Curator Dream & Nightmare cycle over the daemon's reader and writer sockets.
 export async function runCuratorCycle({
   readerSocket,
@@ -1581,31 +1748,9 @@ export async function runCuratorCycle({
 
   const reader = createSingleSocketMcpClient(readerSocket)
   try {
-    const wake = await reader.callReadTool('memory_wake', {})
-    const records = []
-    const historyRecords = []
-    let cursor = '0'
-    let pages = 0
     const pageLimit = Math.max(1, Number(maxPages) || 500)
     const effectivePageSize = Math.max(1, Math.min(200, Number(pageSize) || 100))
-    while (cursor !== null && pages < pageLimit) {
-      const page = await reader.callReadTool('memory_query', {
-        limit: effectivePageSize,
-        format: 'full',
-        include_history: true,
-        ...(cursor !== '0' ? { cursor } : {}),
-      })
-      for (const r of Array.isArray(page?.records) ? page.records : []) {
-        historyRecords.push(r)
-        if ((r.is_current === undefined || r.is_current === true) && r.status !== 'withdrawn' && r.verification === 'accepted') {
-          records.push(r)
-        }
-      }
-      cursor = typeof page?.next_cursor === 'string' && page.next_cursor ? page.next_cursor : null
-      pages += 1
-    }
-
-    const historyComplete = cursor === null
+    const { wake, records, historyRecords, historyComplete } = await readInitialHistory(reader, pageLimit, effectivePageSize)
     const storeState = wake?.store_state || {}
     const resolvedRecentActivity = Array.isArray(recentActivity)
       ? recentActivity
@@ -1686,7 +1831,8 @@ export async function runCuratorCycle({
             expected_prior_id: expectedPriorId,
           })
           if (res?.accepted) {
-            submitted.push({ id: res.id, d: dTag, stage: item.stage || item.action, merkle_sources: item.merkle_sources })
+            submitted.push({ id: res.id, d: dTag, stage: item.stage || item.action, merkle_sources: item.merkle_sources,
+              created_at: adjustedTemplate.created_at })
           } else {
             refused.push({ d: dTag, code: res?.code || 'REFUSED', message: res?.message || '' })
           }
@@ -1738,7 +1884,10 @@ export async function runCuratorCycle({
       cursorAdvanced = true
     }
     const nextCuratedAt = cursorAdvanced
-      ? (submitted.length === 0 && persisted?.pending_curated_at ? Number(persisted.pending_curated_at) : nowSec)
+      ? Math.max(effectiveLastCuratedAt,
+          submitted.length === 0 && persisted?.pending_curated_at
+            ? Number(persisted.pending_curated_at)
+            : curationObservationEnd(nowSec, submitted))
       : effectiveLastCuratedAt
     const nextCuratedWriteSeq = cursorAdvanced
       ? (submitted.length === 0 && persisted?.pending_curated_write_seq ? Number(persisted.pending_curated_write_seq) : postWriteSeq)
@@ -1804,10 +1953,21 @@ export async function runCuratorCycle({
           })
 
       if (submitted.length > 0 && resolvedPacketDir) {
+        let postSnapshot = null
+        try {
+          postSnapshot = await readPostCycleSnapshot(reader, postWriteSeq, pageLimit, effectivePageSize, nowSec)
+        } catch {
+          // The packet still records known submitted changes; unknown counters remain null.
+        }
         dreamPacket = buildDreamPacket({
           lastCuratedWriteSeq: effectiveLastCuratedWriteSeq,
+          lastCuratedAt: effectiveLastCuratedAt,
           writeSeqBefore: Number(storeState.write_seq || 0),
           writeSeqAfter: nextCuratedWriteSeq,
+          coherenceBefore: triggerEval.coherence_score,
+          coherenceAfter: postSnapshot?.coherenceScore ?? null,
+          historyRecords: postSnapshot?.historyRecords || [],
+          historyComplete: Boolean(postSnapshot),
           ranAt: nowSec,
           ledgerRef: ledgerPath ? `${ledgerPath}#write_seq=${nextCuratedWriteSeq}` : null,
           coherenceScore: triggerEval.coherence_score,

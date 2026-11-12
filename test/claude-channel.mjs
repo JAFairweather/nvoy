@@ -463,9 +463,9 @@ try {
     verifiedPayload.record?.validation === 'structural' &&
     typeof verifiedPayload.buzz_post === 'string' &&
     verifiedPayload.buzz_post.includes('Corridor of Folded Stones') &&
-    !verifiedPayload.buzz_post.includes('dream-1142') &&
+    verifiedPayload.buzz_post.endsWith('Dream ID: dream-1142') &&
     !verifiedPayload.buzz_post.includes('Consolidated Changes') &&
-    !/\d/.test(verifiedPayload.buzz_post))
+    !/\d/.test(verifiedPayload.buzz_post.split('\n\nDream ID: ')[0]))
 } catch (error) {
   ok(`curator instance exposes memory_dream_verify tool in listTools (threw: ${error.message})`, false)
   ok('memory_dream_verify refuses packet_path outside HIVE_MEMORY_CURATOR_PACKET_DIR', false)
