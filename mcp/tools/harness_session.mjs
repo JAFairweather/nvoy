@@ -297,7 +297,7 @@ export function hasPriorSession(home, workdir) {
 // are the only MCP server, and each is pre-approved: `approval_policy` does not cover MCP tool
 // calls, which Codex otherwise puts to the client as an elicitation the harness must decline
 // (DJ Codex, 2026-09-25). The broker still rechecks the grant before it signs any reply.
-export const CODEX_CHANNEL_TOOLS = ['nvoy_channel_list', 'nvoy_channel_read', 'nvoy_channel_reply', 'nvoy_channel_post', 'nvoy_profile_set', 'nvoy_profile_status', 'memory_claim', 'memory_withdraw']
+export const CODEX_CHANNEL_TOOLS = ['nvoy_channel_list', 'nvoy_channel_read', 'nvoy_channel_reply', 'nvoy_channel_post', 'nvoy_profile_set', 'nvoy_profile_status', 'memory_claim', 'memory_withdraw', 'memory_wake', 'memory_query']
 //
 // `auth: 'chatgpt'` is the portable harness (codex_portable_harness.mjs): Codex on its owner's
 // ChatGPT login, stored as a file in a CODEX_HOME that is the harness's own. No provider block and

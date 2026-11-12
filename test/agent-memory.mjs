@@ -4,6 +4,7 @@
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
+import { connect } from 'node:net'
 import { join, resolve } from 'node:path'
 import { finalizeEvent, generateSecretKey, getEventHash, getPublicKey, verifyEvent } from 'nostr-tools/pure'
 import { nsecEncode } from 'nostr-tools/nip19'
@@ -16,6 +17,7 @@ import { MAX_TTL_SEC, validateMemoryEvent } from '../mcp/tools/memory.mjs'
 import { initEmptyStore, recordVerifiedBackup, validateAndResolveConfig } from '../mcp/tools/hive_memory_store.mjs'
 import { startMemoryDaemon } from '../mcp/tools/memory-daemon.mjs'
 import { CODEX_CHANNEL_TOOLS } from '../mcp/tools/harness_session.mjs'
+import { RECALL_TOOL_SPECS, recallMemory, startRecallForwarder } from '../mcp/tools/agent_recall.mjs'
 
 let fails = 0, passes = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); value ? passes++ : fails++ }
@@ -330,6 +332,61 @@ ok('the race rate log holds twelve id/time rows and no claim text',
   raceRate.trim().split('\n').length === 12 && !raceRate.includes('secret-race-words') && !raceRate.includes('claim') &&
   raceRate.trim().split('\n').every(l => Object.keys(JSON.parse(l)).sort().join() === 'id,requested_at'))
 ok('no enactment record keeps the words', queuedIds.every(id => !readFileSync(join(race.state, 'memory', `${id}.json`), 'utf8').includes('secret-race-words')))
+
+// --- 10. may_recall: reading memory through the broker, independent of may_remember ---
+const readerSocket = join(sockDir, 'owner.sock'), mayRecall = { read: { socket: readerSocket } }
+const reader = fixture('reader', { may_recall: mayRecall }).load()
+ok('may_recall parses its reader socket, frozen, and needs no may_remember', reader.mayRecall.read.socket === readerSocket && reader.mayRemember === null &&
+  Object.isFrozen(reader.mayRecall) && Object.isFrozen(reader.mayRecall.read))
+const viaBridge = fixture('readcmd', { may_recall: { read: { command: [process.execPath, bridge, readerSocket] } } }).load()
+ok('may_recall parses a forced-command reader bridge', viaBridge.mayRecall.read.command.join() === [process.execPath, bridge, readerSocket].join() && Object.isFrozen(viaBridge.mayRecall.read.command))
+ok('may_remember alone grants no reading', rememberer.mayRecall === null && plain.mayRecall === null)
+const both = fixture('both', { may_remember: mayRemember, may_recall: mayRecall }).load()
+ok('an identity may both read and write, each through its own transport', both.mayRecall.read.socket === readerSocket && both.mayRemember.submit.socket === writerSocket)
+refused('an unknown may_recall field', { may_recall: { ...mayRecall, rooms: [ROOM] } }, /may_recall takes only read/)
+refused('may_recall with a submit instead of read', { may_recall: { submit } }, /may_recall takes only read/)
+refused('no reader transport', { may_recall: {} }, /may_recall\.read takes exactly one of socket/)
+refused('a relative reader socket', { may_recall: { read: { socket: 's/owner.sock' } } }, /may_recall\.read takes exactly one of socket/)
+refused('a relative reader command', { may_recall: { read: { command: ['ssh', 'herd-cloud'] } } }, /may_recall\.read takes exactly one of socket/)
+refused('both a reader socket and a command', { may_recall: { read: { socket: readerSocket, command: [process.execPath] } } }, /may_recall\.read takes exactly one of socket/)
+refused('an extra reader transport field', { may_recall: { read: { socket: readerSocket, timeout: 5 } } }, /may_recall\.read takes exactly one of socket/)
+refused('may_recall on a headless worker manifest', { may_recall: mayRecall, delivery_mode: 'headless', worker_enabled: true,
+  worker_image: `ghcr.io/x/w@sha256:${'a'.repeat(64)}`, worker_runner: 'codex', worker_credential_ref: '/etc/nvoy/w' }, /may_recall requires a local-broker, worker-disabled notify_only/)
+ok('the claim tool says to check memory_query first only where the identity may read memory',
+  /Check memory_query first to avoid duplicates/.test(memoryToolSpec(both, 'claim').description) && !/memory_query/.test(memoryToolSpec(rememberer, 'claim').description))
+ok('the Codex harness pre-approves both memory read tools', CODEX_CHANNEL_TOOLS.includes('memory_wake') && CODEX_CHANNEL_TOOLS.includes('memory_query'))
+
+// The forwarder against the real store's reader socket, and over a forced-command bridge to it.
+const readFixture = fixture('recall', { may_recall: mayRecall }), rm2 = readFixture.load()
+mkdirSync(join(readFixture.run, 'memory-recall'))
+let forwarder = await startRecallForwarder({ manifest: rm2, log: () => {} })
+const direct = await new Promise(done => {
+  const c = connect(readerSocket); let buf = ''
+  c.setEncoding('utf8'); c.on('data', x => { buf += x; if (buf.includes('\n')) { c.end(); done(JSON.parse(buf.slice(0, buf.indexOf('\n')))) } })
+  c.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'memory_query', arguments: { d: qCmd.ok.d } } }) + '\n')
+})
+const viaForwarder = await recallMemory(rm2, 'memory_query', { d: qCmd.ok.d })
+const answered = JSON.parse(viaForwarder.content?.[0]?.text || '{}')
+ok('memory_query through the forwarder returns the store\'s own answer: the claim, as data', !viaForwarder.isError && answered.answer === 'found' &&
+  answered.records?.[0]?.authority === null && answered.records[0].trustedInstruction === false &&
+  JSON.stringify(direct.result.content.map(c => JSON.parse(c.text).records.map(r => r.event_id))) === JSON.stringify(viaForwarder.content.map(c => JSON.parse(c.text).records.map(r => r.event_id))))
+const wake = JSON.parse((await recallMemory(rm2, 'memory_wake', { room_id: ROOM })).content[0].text)
+ok('memory_wake through the forwarder returns the store\'s wake digest', wake.record_type === 'memory-wake-digest' && wake.authority === null)
+ok('the keyless side refuses a write tool before it reaches the forwarder', /NVOY_RECALL_REFUSED/.test((await recallMemory(rm2, 'memory_submit', {})).content[0].text))
+await forwarder.close()
+const cmdFixture = fixture('recallcmd', { may_recall: { read: { command: [process.execPath, bridge, readerSocket] } } }), rc = cmdFixture.load()
+mkdirSync(join(cmdFixture.run, 'memory-recall'))
+forwarder = await startRecallForwarder({ manifest: rc, log: () => {} })
+const bridged = JSON.parse((await recallMemory(rc, 'memory_query', { scope: `room:${ROOM}` })).content[0].text)
+ok('the forwarder reads through a forced-command bridge as well as a socket', bridged.answer === 'found' && bridged.records.length > 0)
+await forwarder.close()
+const goneFixture = fixture('recallgone', { may_recall: { read: { socket: join(root, 'absent.sock') } } }), rg = goneFixture.load()
+mkdirSync(join(goneFixture.run, 'memory-recall'))
+forwarder = await startRecallForwarder({ manifest: rg, log: () => {} })
+const gone = await recallMemory(rg, 'memory_query', {})
+ok('an unreachable store is a refusal, never an empty answer', gone.isError === true && /NVOY_RECALL_UNAVAILABLE/.test(gone.content[0].text))
+await forwarder.close()
+ok('an identity without may_recall cannot start a forwarder', /this identity may not read memory/.test(await startRecallForwarder({ manifest: plain }).then(() => '', e => e.message)))
 
 await daemon.close()
 console.log(`\n${passes} passed, ${fails} failed`)

@@ -45,7 +45,7 @@ export const PI_CHANNEL_TOOLS = [
     parameters: {"type": "object", "properties": {"request": {"type": "string", "pattern": "^[0-9a-f]{32}$"}}, "required": ["request"], "additionalProperties": false} },
   // The fleet adds this seat's rooms and hourly cap, or its refusal, to these descriptions.
   ...[['claim', 'Hive memory: claim'], ['withdraw', 'Hive memory: withdraw']].map(([op, label]) => {
-    const { name, description, inputSchema } = memoryToolBase(op)
+    const { name, description, inputSchema } = memoryToolBase(op, false)   // mirrors the fleet channel's tool, which shows the memory_query hint only with may_recall
     return { name, label, description, parameters: inputSchema }
   }),
 ]
