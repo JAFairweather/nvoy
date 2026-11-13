@@ -112,8 +112,11 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
   log(`  bind_runtime: ${bind ? `${bind.channelKey.keyType} key, ${bind.id.slice(0, 12)}` : 'not yet'}`)
   if (command === 'show') return { request: add, bind, receipts: [] }
   // A delegate's accepted request: the public acceptance proof goes out, and reads back, before any effect. If it does not,
-  // nothing is done this run and the next one tries again.
-  if (add.delegated && markAccepted && !(await markAccepted(add))) {
+  // nothing is done this run and the next one tries again. A caller that cannot publish the proof (the operator's `run`,
+  // or a watch with no relay readback) never acts on a delegate's request: refused here, before the ledger or any effect.
+  if (add.delegated && !markAccepted)
+    throw new OnboardRefusal('ONBOARD_DELEGATE_NEEDS_PROOF', "a delegate's request runs only from the watch, which publishes and reads back the runner's acceptance proof; nothing was done")
+  if (add.delegated && !(await markAccepted(add))) {
     log(`pending  ${name}: the acceptance proof for request ${add.id.slice(0, 12)} is not out yet; nothing was done, and the next run tries again`)
     return { request: add, bind, receipts: [] }
   }

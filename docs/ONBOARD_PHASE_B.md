@@ -184,6 +184,10 @@ not even a ledger entry, and the next tick tries again. It goes out once per req
 and is never withdrawn; a later refusal or revocation is the terminal marker's to say. An owner's own request
 and a request refused at parse get none.
 
+A caller that cannot publish the proof never acts on a delegate's request. That covers the operator's `run`, and a
+watch with no relay readback. Such a request is refused `ONBOARD_DELEGATE_NEEDS_PROOF` before the ledger or any
+effect, and the watch retries it rather than setting it aside.
+
 ## The terminal marker
 
 When a request ends, finished or refused, the watch publishes a public marker signed by the runner:

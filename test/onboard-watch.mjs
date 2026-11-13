@@ -322,6 +322,17 @@ r = await tick({ ...member, stateDir: sState, readEvent, publish: markerPublish 
 assert.deepEqual(setAside(), [sAdd.id], 'the next tick gets the marker out, then sets it aside')
 assert.ok(markers().some(ev => ev.tags.some(t => t[0] === 'e' && t[1] === sAdd.id)), 'with its marker published')
 
+// ── A delegate's request with no relay readback: refused for now, retried, never set aside or acted on ──
+{
+  const nState = join(tmp, 'state-noproof'), nKey = generateSecretKey(), nHex = getPublicKey(nKey), NG = 'f'.repeat(64)
+  const nAdd = signAs(nKey, [['d', 'nvoy-onboard/noproof/add_agent'], ['op', 'add_agent'], ['p', getPublicKey(generateSecretKey())], ['harness', 'claude-code'], ['like', 'crystalclaude'], ['consent', NG]], at + 95)
+  const nLive = { known: true, live: new Map([[nHex, [{ grantId: NG, grantor: ownerHex, delegate: nHex, created_at: at, policy: 'terms-v3', age: 'confirmed' }]]]) }
+  events = [nAdd]; lines = []
+  const r = await tick({ ...member, stateDir: nState, runner: { ...runner, onboardTemplates: ['crystalclaude'] }, readDelegates: async () => nLive, readTermsFor: async () => ({ ok: true, version: 'terms-v3' }) })
+  assert.ok(r.ran[0]?.error && /acceptance proof/.test(r.ran[0].error), "a watch that cannot read the proof back does not act on a delegate's request")
+  assert.ok(!existsSync(join(nState, 'watch-refused.jsonl')) && !existsSync(join(nState, 'requests.jsonl')), 'and neither sets it aside nor enters it in the ledger, so a later tick can still run it')
+}
+
 // ── A delegate's request: a second receipt, sealed to the delegate, without the pairing link ─────────
 {
   const delKey = generateSecretKey(), delHex2 = getPublicKey(delKey)
@@ -333,7 +344,7 @@ assert.ok(markers().some(ev => ev.tags.some(t => t[0] === 'e' && t[1] === sAdd.i
   events = [dAdd]; approved = false
   const before = published.length
   await tick({ ...member, stateDir: dState, runner: { ...runner, onboardTemplates: ['crystalclaude'] }, readDelegates: async () => live,
-    readTermsFor: async () => ({ ok: true, version: 'terms-v3' }) })
+    readTermsFor: async () => ({ ok: true, version: 'terms-v3' }), readEvent: async ev => wire(ev) })
   const fresh = published.slice(before)
   const ownerCopy = fresh.filter(ev => ev.tags.find(t => t[0] === 'd')?.[1] === `nvoy-onboard:${dAdd.id}`)
   const delCopy = fresh.filter(ev => ev.tags.find(t => t[0] === 'd')?.[1] === `nvoy-onboard:${dAdd.id}:delegate`)
@@ -352,7 +363,7 @@ assert.ok(markers().some(ev => ev.tags.some(t => t[0] === 'e' && t[1] === sAdd.i
   const isDelegateCopy = ev => /:delegate$/.test(ev.tags.find(t => t[0] === 'd')?.[1] || '')
   const flaky = async ev => { if (!delegateTakes && isDelegateCopy(ev)) return [{ relay: 'wss://relay.nave.pub', accepted: false, message: 'blocked' }]; published.push(ev); return [{ relay: 'wss://relay.nave.pub', accepted: true }] }
   const ticked = () => tick({ ...member, stateDir: d2State, runner: { ...runner, onboardTemplates: ['crystalclaude'] }, readDelegates: async () => live,
-    readTermsFor: async () => ({ ok: true, version: 'terms-v3' }), publish: flaky })
+    readTermsFor: async () => ({ ok: true, version: 'terms-v3' }), publish: flaky, readEvent: async ev => wire(ev) })
   lines = []
   const mark = published.length
   await ticked()

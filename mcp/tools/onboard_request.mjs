@@ -44,7 +44,7 @@ export class OnboardRefusal extends Error {
 }
 // Refusals that say "can't tell yet", not "no": the watcher retries these on the next tick instead of
 // setting the request aside.
-export const RETRY_CODES = Object.freeze(['ONBOARD_NO_RELAY', 'ONBOARD_TERMS_UNKNOWN'])
+export const RETRY_CODES = Object.freeze(['ONBOARD_NO_RELAY', 'ONBOARD_TERMS_UNKNOWN', 'ONBOARD_DELEGATE_NEEDS_PROOF'])
 
 // A delegate adds at most this many new names in any 24 hours (James, 12 Nov).
 export const DELEGATE_DAILY_CAP = 1
