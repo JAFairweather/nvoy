@@ -2663,16 +2663,16 @@ await test('nvoy #383 regression: SSE suppresses unchanged polls, sends compact 
       'server state (/api/state & /topics/*.md) still retains full topic_pages'
     )
 
-    // 2. Initial /events?since_seq=<matching>&since_claims=<matching> sends compact delta frame without duplicating corpus
+    // 2. Initial /events?since_seq=<matching>&since_claims=<matching>&since_digest=<matching> sends compact delta frame without duplicating corpus
     const curState = viewer.getState()
     const sinceFrames = connectSse(
-      `/events?since_seq=${curState.store_state.write_seq}&since_claims=${curState.store_state.current_claims}`
+      `/events?since_seq=${curState.store_state.write_seq}&since_claims=${curState.store_state.current_claims}&since_digest=${curState.corpus_digest}`
     )
     for (let i = 0; i < 20 && sinceFrames.length < 1; i++) {
       await new Promise(r => setTimeout(r, 20))
     }
     assert.equal(sinceFrames.length, 1)
-    assert.equal(sinceFrames[0].corpus_unchanged, true, 'matching since_seq receives compact delta on connect')
+    assert.equal(sinceFrames[0].corpus_unchanged, true, 'matching since_seq/since_claims/since_digest receives compact delta on connect')
     assert.equal(sinceFrames[0].records, undefined, 'compact delta omits records array')
     assert.equal(sinceFrames[0].topic_pages, undefined, 'compact delta omits topic_pages')
     assert.equal(sinceFrames[0].consolidated_sources, undefined, 'compact delta omits consolidated_sources')
@@ -2856,6 +2856,19 @@ await test('nvoy #383 regression: SSE suppresses unchanged polls, sends compact 
     assert.equal(staleDigestFrames.length, 1)
     assert.equal(staleDigestFrames[0].corpus_unchanged, false, 'stale since_digest at matching since_seq must receive full corpus')
     assert.equal(Array.isArray(staleDigestFrames[0].records), true)
+
+    // Connecting without since_digest (e.g., pre-upgrade page reconnecting after same-count visibility swap) must also receive full corpus
+    const noDigestFrames = connectSse(
+      `/events?since_seq=${preSwapState.store_state.write_seq}&since_claims=${preSwapState.store_state.current_claims}`
+    )
+    for (let i = 0; i < 20 && noDigestFrames.length < 1; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(noDigestFrames.length, 1)
+    assert.equal(noDigestFrames[0].corpus_unchanged, false, 'no-digest reconnect at matching since_seq & since_claims must receive full corpus')
+    assert.equal(Array.isArray(noDigestFrames[0].records), true)
+    assert(!noDigestFrames[0].records.some(r => r.event_id === roomAEv.id), 'no-digest reconnect must not retain revoked room A claim')
+    assert(noDigestFrames[0].records.some(r => r.event_id === roomBEv.id), 'no-digest reconnect must receive newly visible room B claim')
 
     // 6. Slow-client backpressure coalescing and max buffer enforcement
     const mockMap = new Map()

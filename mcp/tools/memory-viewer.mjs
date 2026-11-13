@@ -9667,15 +9667,17 @@ export async function startMemoryViewer({
       const sinceClaimsMatch = /(?:^|&)since_claims=([^&]*)/.exec(queryStr)
       const sinceDigestMatch = /(?:^|&)since_digest=([^&]*)/.exec(queryStr)
       const sinceSeq = sinceSeqMatch && /^[0-9]+$/.test(sinceSeqMatch[1]) ? sinceSeqMatch[1] : null
-      const sinceClaims = sinceClaimsMatch ? (/^[0-9]+$/.test(sinceClaimsMatch[1]) ? sinceClaimsMatch[1] : 'invalid') : null
-      const sinceDigest = sinceDigestMatch ? (/^[0-9a-f]+$/i.test(sinceDigestMatch[1]) ? sinceDigestMatch[1].toLowerCase() : 'invalid') : null
+      const sinceClaims = sinceClaimsMatch && /^[0-9]+$/.test(sinceClaimsMatch[1]) ? sinceClaimsMatch[1] : null
+      const sinceDigest = sinceDigestMatch && /^[0-9a-f]+$/i.test(sinceDigestMatch[1]) ? sinceDigestMatch[1].toLowerCase() : null
       const clientHasCorpus =
         Boolean(currentState.connected) &&
         sinceSeq !== null &&
-        sinceSeq !== '' &&
         sinceSeq === String(currentState.store_state?.write_seq ?? '') &&
-        (sinceClaims === null || sinceClaims === '' || sinceClaims === String(currentState.store_state?.current_claims ?? '')) &&
-        (sinceDigest !== null ? sinceDigest === String(currentState.corpus_digest || '') : (cachedCorpus?.connGen ?? 0) <= 1)
+        sinceClaims !== null &&
+        sinceClaims === String(currentState.store_state?.current_claims ?? '') &&
+        Boolean(currentState.corpus_digest) &&
+        sinceDigest !== null &&
+        sinceDigest === String(currentState.corpus_digest)
       registerSseClient(sseClients, req, res, clientHasCorpus ? currentCorpusKey : null)
       const initialClientState = buildClientViewerState(currentState, { includeCorpus: !clientHasCorpus })
       writeToSseClient(sseClients, res, `data: ${JSON.stringify(initialClientState)}\n\n`, {
