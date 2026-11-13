@@ -732,14 +732,17 @@ function tokenize(text) {
   )
 }
 
-export function tokenJaccard(aText, bText) {
-  const a = tokenize(aText)
-  const b = tokenize(bText)
-  if (!a.size || !b.size) return 0
+export function tokenSetJaccard(a, b) {
+  if (!a?.size || !b?.size) return 0
   let inter = 0
-  for (const w of a) if (b.has(w)) inter += 1
+  const [smaller, larger] = a.size <= b.size ? [a, b] : [b, a]
+  for (const w of smaller) if (larger.has(w)) inter += 1
   const union = a.size + b.size - inter
   return union > 0 ? inter / union : 0
+}
+
+export function tokenJaccard(aText, bText) {
+  return tokenSetJaccard(tokenize(aText), tokenize(bText))
 }
 
 function extractWorkSubject(rec) {
@@ -1043,9 +1046,9 @@ export function computeEigenAxisProposals(
 
     const parentTokens = new Set(topic.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean))
     const topicDocFreq = new Map()
-    const localFeats = entries.map(({ rec }) => {
+    const localFeats = entries.map(({ rec, index }) => {
       const m = new Map()
-      const rawFeats = extractClaimFeatures(rec)
+      const rawFeats = rawFeaturesPerClaim[index] || extractClaimFeatures(rec)
       for (const [f, w] of rawFeats.entries()) {
         const cleanTerm = cleanLexicalTermForSubAxis(f, parentTokens)
         if (!cleanTerm) continue
@@ -1080,13 +1083,20 @@ export function computeEigenAxisProposals(
       return v
     })
 
-    const dotLocal = (i, j) => {
+    const E = entries.length
+    const dotMat = new Float64Array(E * E)
+    for (let i = 0; i < E; i++) {
+      dotMat[i * E + i] = 1
       const va = localVecs[i]
-      const vb = localVecs[j]
-      let s = 0
-      for (let li = 0; li < LF; li++) s += va[li] * vb[li]
-      return s
+      for (let j = i + 1; j < E; j++) {
+        const vb = localVecs[j]
+        let s = 0
+        for (let li = 0; li < LF; li++) s += va[li] * vb[li]
+        dotMat[i * E + j] = s
+        dotMat[j * E + i] = s
+      }
     }
+    const dotLocal = (i, j) => dotMat[i * E + j]
 
     const assignedLocal = new Set()
     const usedSubAxisNames = new Set()
@@ -1827,6 +1837,7 @@ export function planMerkleDream({
   memoryGlobalChannelId = '',
   nowSec = Math.floor(Date.now() / 1000),
   gitAncestryCheck = null,
+  spectral: precomputedSpectral = null,
 } = {}) {
   const cleanCuratorPk = String(curatorPubkey || '').toLowerCase()
   const active = (Array.isArray(records) ? records : []).filter(
@@ -1925,7 +1936,10 @@ export function planMerkleDream({
   }
 
   // 2. Stage 0: Spectral Topic Eigenvector Analysis & Topic Normalization
-  const spectral = computeTopicEigenvectors(active, { nowSec })
+  const spectral =
+    precomputedSpectral && typeof precomputedSpectral === 'object' && precomputedSpectral.topic_map
+      ? precomputedSpectral
+      : computeTopicEigenvectors(active, { nowSec })
   const resolveEigenTopic = rawTopic => {
     const trimmed = String(rawTopic || '').trim()
     return spectral.topic_map[trimmed] || normalizeMemoryTopic(trimmed) || 'hive-memory'
@@ -1953,12 +1967,18 @@ export function planMerkleDream({
   for (const { scope, topic, items } of classAByScopeTopic.values()) {
     if (items.length < 2) continue
     // Cluster items within (scope, topic) by shared work subject (e.g. pr336) or token Jaccard >= 0.42
+    // Pre-tokenize each item once per group to avoid O(N^2) regex tokenization on large topics.
+    const itemTokens = new Map()
+    for (const item of items) {
+      itemTokens.set(item, tokenize(`${item.d} ${item.claim}`))
+    }
     const clusters = []
     for (const item of items) {
       const subj = extractWorkSubject(item)
+      const iToks = itemTokens.get(item)
       let placed = false
       for (const cl of clusters) {
-        if (cl.subject === subj || cl.members.some(m => tokenJaccard(`${m.d} ${m.claim}`, `${item.d} ${item.claim}`) >= 0.42)) {
+        if (cl.subject === subj || cl.members.some(m => tokenSetJaccard(itemTokens.get(m), iToks) >= 0.42)) {
           cl.members.push(item)
           placed = true
           break

@@ -40,9 +40,73 @@ import {
 const DEFAULT_POLL_MS = 3000
 const MAX_EVENT_LOG = 60
 export const CORPUS_CACHE_TTL_MS = 300_000
+export const MAX_SSE_CLIENT_BUFFER_BYTES = 4 * 1024 * 1024
+export const SSE_KEEPALIVE_INTERVAL_MS = 30_000
 // One version for the page and the live snapshot: the page reloads whenever they differ.
-const VIEWER_VERSION = '2026-11-11-v18'
+const VIEWER_VERSION = '2026-11-13-v19'
 const ACTIVITY_KINDS = new Set(['wake', 'query', 'lookup', 'submit', 'refused'])
+
+export function compactTopicPagesForClient(topicPages) {
+  if (!topicPages || typeof topicPages !== 'object') return {}
+  const out = {}
+  for (const [key, p] of Object.entries(topicPages)) {
+    if (!p || typeof p !== 'object') continue
+    const entLinks = p.below_the_line?.entity_links || {}
+    const folded = Array.isArray(p.below_the_line?.folded_lineage)
+      ? p.below_the_line.folded_lineage.slice(0, 8).map(f => ({
+          event_id: f.event_id,
+          d: f.d,
+          slug: f.slug,
+          folded_into: f.folded_into,
+          claim: typeof f.claim === 'string' && f.claim.length > 240 ? `${f.claim.slice(0, 239)}…` : f.claim,
+        }))
+      : []
+    out[key] = {
+      topic: p.topic || key,
+      counts: p.counts || {
+        above_the_line: 0,
+        below_the_line: 0,
+        canon: 0,
+        class_b_decisions: 0,
+        curated_syntheses: 0,
+        folded_lineage: 0,
+      },
+      below_the_line: {
+        folded_lineage: folded,
+        entity_links: {
+          prs: Array.isArray(entLinks.prs) ? entLinks.prs.slice(0, 12) : [],
+          issues: Array.isArray(entLinks.issues) ? entLinks.issues.slice(0, 12) : [],
+          commits: Array.isArray(entLinks.commits) ? entLinks.commits.slice(0, 12) : [],
+          files: Array.isArray(entLinks.files) ? entLinks.files.slice(0, 12) : [],
+          agents: Array.isArray(entLinks.agents) ? entLinks.agents.slice(0, 12) : [],
+        },
+      },
+    }
+  }
+  return out
+}
+
+export function buildClientViewerState(state, { includeCorpus = true } = {}) {
+  if (!state || typeof state !== 'object') return state
+  if (!includeCorpus) {
+    const {
+      records: _records,
+      consolidated_sources: _consolidated,
+      constellation_links: _links,
+      topic_pages: _pages,
+      ...telemetryOnly
+    } = state
+    return {
+      ...telemetryOnly,
+      corpus_unchanged: true,
+    }
+  }
+  return {
+    ...state,
+    corpus_unchanged: false,
+    topic_pages: compactTopicPagesForClient(state.topic_pages),
+  }
+}
 
 export function escapeHtml(value) {
   return String(value ?? '')
@@ -2852,7 +2916,8 @@ export function createSingleSocketMcpClient(socketPath) {
 }
 
 export function renderViewerHtml(initialState) {
-  const escapedInitial = safeJsonForScript(initialState)
+  const clientInitial = buildClientViewerState(initialState, { includeCorpus: true })
+  const escapedInitial = safeJsonForScript(clientInitial)
   const syncState = escapeHtml(initialState.store_state?.state || 'CONNECTING')
   const readerName = escapeHtml(initialState.reader || 'viewer')
   const serverName = escapeHtml(initialState.server_name || 'hive-memory-viewer')
@@ -3553,9 +3618,14 @@ export function renderViewerHtml(initialState) {
       var latestConstellationLinks = [];
       var latestEntityGraphStats = null;
       var latestTopicPages = {};
+      var latestRecords = [];
       var latestStoreState = {};
       var latestRecentActivity = [];
       var prevByEventId = {};
+      var lastRenderedCorpusSig = null;
+      var lastRenderedLogSig = null;
+      var lastRenderedPollSeq = null;
+      var lastRenderedStateKey = null;
       var mode3D = true;
       var autoOrbit3D = true;
       var rotX = 0.34;
@@ -4028,39 +4098,43 @@ export function renderViewerHtml(initialState) {
         });
       }
 
-      function syncGraph(s, animate) {
-        var records = Array.isArray(s.records) ? s.records : [];
-        syncAgents(s);
-        syncTopics(records);
-        layout();
-
-        var byKey = {};
-        var oldByEventId = {};
-        nodes.forEach(function (n) {
-          byKey[n.key] = n;
-          if (n.rec && n.rec.event_id) oldByEventId[n.rec.event_id] = n;
-        });
-        prevByEventId = oldByEventId;
+      function syncGraph(s, animate, corpusChanged) {
+        var records = Array.isArray(s.records) ? s.records : latestRecords;
+        syncAgents(Object.assign({}, s, { records: records }));
         var fresh = [];
-        var nextNodes = records.map(function (rec, i) {
-          var key = rec.author_pubkey + ':' + rec.d;
-          var n = byKey[key];
-          if (!n) {
-            n = { key: key, rec: rec, x: 0, y: 0, vx: 0, vy: 0, birthGlow: animate ? 1 : 0 };
-            placeNode(n, i);
-            fresh.push(n);
-          } else {
-            if (n.rec.event_id !== rec.event_id) {
-              n.birthGlow = 1;
+        if (corpusChanged !== false) {
+          syncTopics(records);
+          layout();
+
+          var byKey = {};
+          var oldByEventId = {};
+          nodes.forEach(function (n) {
+            byKey[n.key] = n;
+            if (n.rec && n.rec.event_id) oldByEventId[n.rec.event_id] = n;
+          });
+          prevByEventId = oldByEventId;
+          var nextNodes = records.map(function (rec, i) {
+            var key = rec.author_pubkey + ':' + rec.d;
+            var n = byKey[key];
+            if (!n) {
+              n = { key: key, rec: rec, x: 0, y: 0, vx: 0, vy: 0, birthGlow: animate ? 1 : 0 };
+              placeNode(n, i);
               fresh.push(n);
+            } else {
+              if (n.rec.event_id !== rec.event_id) {
+                n.birthGlow = 1;
+                fresh.push(n);
+              }
+              n.rec = rec;
             }
-            n.rec = rec;
-          }
-          return n;
-        });
-        nodes = nextNodes;
-        if (selected && selected.type === 'memory' && nodes.indexOf(selected.data) < 0) selected = null;
-        if (hovered && hovered.type === 'memory' && nodes.indexOf(hovered.data) < 0) hovered = null;
+            return n;
+          });
+          nodes = nextNodes;
+          if (selected && selected.type === 'memory' && nodes.indexOf(selected.data) < 0) selected = null;
+          if (hovered && hovered.type === 'memory' && nodes.indexOf(hovered.data) < 0) hovered = null;
+        } else {
+          layout();
+        }
         if (selected && selected.type === 'agent') selected = agentById(selected.data.id) ? { type: 'agent', data: agentById(selected.data.id) } : null;
 
         var activity = Array.isArray(s.recent_activity) ? s.recent_activity : [];
@@ -5817,18 +5891,22 @@ export function renderViewerHtml(initialState) {
           var belowList = [];
           var foldedList = [];
           var entSummaryParts = [];
-          if (tp && tp.above_the_line) {
-            (tp.above_the_line.canon || []).forEach(function (x) { aboveList.push(Object.assign({}, x, { tier: 'canon' })); });
-            (tp.above_the_line.curated_syntheses || []).forEach(function (x) { aboveList.push(Object.assign({}, x, { tier: x.expires_at == null ? 'curated_class_b' : 'curated_synthesis' })); });
-            (tp.above_the_line.decisions || []).forEach(function (x) { aboveList.push(Object.assign({}, x, { tier: 'class_b_decision' })); });
-            belowList = (tp.below_the_line && Array.isArray(tp.below_the_line.active_timeline)) ? tp.below_the_line.active_timeline : [];
-            foldedList = (tp.below_the_line && Array.isArray(tp.below_the_line.folded_lineage)) ? tp.below_the_line.folded_lineage : [];
-            var entObj = (tp.below_the_line && tp.below_the_line.entity_links) || {};
+          if (tp && tp.below_the_line) {
+            foldedList = Array.isArray(tp.below_the_line.folded_lineage) ? tp.below_the_line.folded_lineage : [];
+            var entObj = tp.below_the_line.entity_links || {};
             ['prs', 'issues', 'commits', 'files', 'agents'].forEach(function (k) {
               if (Array.isArray(entObj[k])) {
                 entObj[k].forEach(function (ref) { entSummaryParts.push(ref); });
               }
             });
+          }
+          if (tp && tp.above_the_line) {
+            (tp.above_the_line.canon || []).forEach(function (x) { aboveList.push(Object.assign({}, x, { tier: 'canon' })); });
+            (tp.above_the_line.curated_syntheses || []).forEach(function (x) { aboveList.push(Object.assign({}, x, { tier: x.expires_at == null ? 'curated_class_b' : 'curated_synthesis' })); });
+            (tp.above_the_line.decisions || []).forEach(function (x) { aboveList.push(Object.assign({}, x, { tier: 'class_b_decision' })); });
+            if (tp.below_the_line && Array.isArray(tp.below_the_line.active_timeline)) {
+              belowList = tp.below_the_line.active_timeline;
+            }
           } else {
             nodes.forEach(function (n) {
               if (topicOf(n.rec) !== tId) return;
@@ -7525,8 +7603,30 @@ export function renderViewerHtml(initialState) {
         }
         var nowSec = s.polled_at || Math.floor(Date.now() / 1000);
         var st = s.store_state || {};
+        var actTail = Array.isArray(s.recent_activity) && s.recent_activity.length ? s.recent_activity[s.recent_activity.length - 1].seq : 0;
+        var stateKey =
+          String(s.connected) + ':' +
+          String(s.error || '') + ':' +
+          String(s.reader || '') + ':' +
+          String(s.reader_pubkey || '') + ':' +
+          String(s.corpus_digest || '') + ':' +
+          String(st.state || '') + ':' +
+          String(st.write_seq ?? '') + ':' +
+          String(st.current_claims ?? '') + ':' +
+          String(st.unbacked_writes ?? '') + ':' +
+          String(actTail) + ':' +
+          String(s.curator_state ? s.curator_state.last_curated_write_seq : '') + ':' +
+          String(s.curator_state ? s.curator_state.last_ran_at : '') + ':' +
+          String(s.watch ? s.watch.alert : '') + ':' +
+          String(Array.isArray(s.event_log) ? s.event_log.length : 0);
+        if (graphReady && stateKey === lastRenderedStateKey && s.poll_seq === lastRenderedPollSeq) {
+          return;
+        }
+        lastRenderedStateKey = stateKey;
+        lastRenderedPollSeq = s.poll_seq;
         latestStoreState = st;
         latestRecentActivity = Array.isArray(s.recent_activity) ? s.recent_activity : [];
+        if (Array.isArray(s.records)) latestRecords = s.records;
         if (s.trends && typeof s.trends === 'object') latestTrends = s.trends;
         if (s.curator_state && typeof s.curator_state === 'object') latestCuratorState = s.curator_state;
         if (s.consolidated_sources && typeof s.consolidated_sources === 'object') latestConsolidatedSources = s.consolidated_sources;
@@ -7602,22 +7702,54 @@ export function renderViewerHtml(initialState) {
         el('count-self').textContent = String(sc.self ?? 0);
         el('sub-unverified').textContent = 'unverified total: ' + String(sc.unverified_total ?? 0);
 
-        renderRecords(Array.isArray(s.records) ? s.records : [], nowSec);
-        renderLog(s.event_log);
+        var corpusSig =
+          String(st.state || '') + ':' +
+          String(st.write_seq ?? '') + ':' +
+          String(st.current_claims ?? '') + ':' +
+          String(latestRecords.length) + ':' +
+          String(s.corpus_digest || '') + ':' +
+          latestRecords.map(function (r) { return r && (r.event_id || (r.author_pubkey + ':' + r.d)); }).join(',');
+        var corpusChanged = !graphReady || corpusSig !== lastRenderedCorpusSig;
+        if (corpusChanged) {
+          renderRecords(latestRecords, nowSec);
+          lastRenderedCorpusSig = corpusSig;
+        }
+        var logList = Array.isArray(s.event_log) ? s.event_log : [];
+        var logSig = logList.length + ':' + (logList.length ? (logList[logList.length - 1].at + ':' + logList[logList.length - 1].summary) : '');
+        if (!graphReady || logSig !== lastRenderedLogSig) {
+          renderLog(logList);
+          lastRenderedLogSig = logSig;
+        }
         measureHud();
-        syncGraph(s, graphReady);
+        syncGraph(s, graphReady, corpusChanged);
         graphReady = true;
       }
 
+      var initialCorpusDigest = '';
       resize();
       try {
         var initJson = el('initial-state').textContent;
-        if (initJson) renderState(JSON.parse(initJson));
+        if (initJson) {
+          var parsedInit = JSON.parse(initJson);
+          if (parsedInit && typeof parsedInit.corpus_digest === 'string') initialCorpusDigest = parsedInit.corpus_digest;
+          renderState(parsedInit);
+        }
       } catch (_) {}
       requestAnimationFrame(frame);
 
       if (typeof EventSource !== 'undefined') {
-        var es = new EventSource('/events');
+        var initSeq = latestStoreState && latestStoreState.write_seq != null ? latestStoreState.write_seq : '';
+        var initClaims = latestStoreState && latestStoreState.current_claims != null ? latestStoreState.current_claims : '';
+        var esUrl =
+          '/events' +
+          (initSeq !== ''
+            ? '?since_seq=' +
+              encodeURIComponent(initSeq) +
+              '&since_claims=' +
+              encodeURIComponent(initClaims) +
+              (initialCorpusDigest ? '&since_digest=' + encodeURIComponent(initialCorpusDigest) : '')
+            : '');
+        var es = new EventSource(esUrl);
         var sseBadge = el('sse-badge');
         es.onopen = function () {
           sseBadge.textContent = 'SSE: live';
@@ -8392,8 +8524,38 @@ export function renderMobileViewerHtml(initialMobileState = {}) {
       write_seq: mobileData.store_state?.write_seq,
       current_claims: mobileData.store_state?.current_claims,
     },
-    backup: mobileData.backup,
-    velocities: mobileData.velocities,
+    backup: mobileData.backup && {
+      status: mobileData.backup.status,
+      age_sec: mobileData.backup.age_sec,
+      unbacked_writes: mobileData.backup.unbacked_writes,
+      freshness_pct: mobileData.backup.freshness_pct,
+      watch: mobileData.backup.watch && {
+        saving: mobileData.backup.watch.saving,
+        fenced: mobileData.backup.watch.fenced,
+      },
+      last_receipt: mobileData.backup.last_receipt,
+    },
+    velocities: mobileData.velocities && {
+      new_memory: mobileData.velocities.new_memory && {
+        writes_1h: mobileData.velocities.new_memory.writes_1h,
+        writes_6h: mobileData.velocities.new_memory.writes_6h,
+        writes_24h: mobileData.velocities.new_memory.writes_24h,
+        refusals_15m: mobileData.velocities.new_memory.refusals_15m,
+        last_write_at: mobileData.velocities.new_memory.last_write_at,
+        sparkline_12h: mobileData.velocities.new_memory.sparkline_12h,
+      },
+      recall: mobileData.velocities.recall && {
+        recalls_5m: mobileData.velocities.recall.recalls_5m,
+        recalls_1h: mobileData.velocities.recall.recalls_1h,
+        wakes_window: mobileData.velocities.recall.wakes_window,
+        queries_window: mobileData.velocities.recall.queries_window,
+        recall_coverage_pct: mobileData.velocities.recall.recall_coverage_pct,
+        query_hit_rate_pct: mobileData.velocities.recall.query_hit_rate_pct,
+        recalling_agents: mobileData.velocities.recall.recalling_agents,
+        active_agents: mobileData.velocities.recall.active_agents,
+        sparkline_60m: mobileData.velocities.recall.sparkline_60m,
+      },
+    },
     coherence: {
       score: mobileData.coherence?.score,
       lifetime_score: mobileData.coherence?.lifetime_score,
@@ -8623,9 +8785,12 @@ var now=d.polled_at||Math.floor(Date.now()/1000),ls=(d.agents.roster||[]).filter
 if(!ls.length){b.innerHTML='<div class="stat-box"><small>No matching seats.</small></div>';return;}
 b.innerHTML=ls.map(function(a,i){var inf=aI(a.id,i),hc=a.health==='active'?'ok':a.health==='warm'?'info':a.health==='error'?'err':'',bd=a.fenced?'<span class="pill err">FENCED</span>':(a.compliance_status&&a.compliance_status!=='compliant')?'<span class="pill warn">'+esc(a.compliance_status)+'</span>':'';return '<div class="ag-c'+(sAg===a.id?' hi':'')+'" data-agent-id="'+esc(a.id)+'"><div class="row-sb"><div class="ag-id"><span class="dot" style="background:'+inf.c+'"></span><span>'+esc(inf.n)+'</span><span style="font-size:10px;color:var(--mut)">@'+esc(a.id)+'</span></div><div>'+bd+' <span class="pill '+hc+'">'+esc(a.health)+'</span></div></div><div class="ag-m"><span>5m: <b>'+a.reads_5m+'R/'+a.writes_5m+'W</b></span><span>claims: <b>'+a.active_claims+'</b></span><span>coh: <b>'+a.coherence_score+'%</b></span>'+(a.refusals_15m?'<span style="color:#fca5a5">refused: <b>'+a.refusals_15m+'</b></span>':'')+'<span>R: '+esc(fA(a.last_recall_at,now))+'</span><span>W: '+esc(fA(a.last_write_at,now))+(a.last_write_slug?' ('+esc(a.last_write_slug.slice(0,18))+')':'')+'</span></div></div>';}).join('');
 }
+var mS=null;
 function rMob(d){
-if(!d||typeof d!=='object')return;cur=d;
+if(!d||typeof d!=='object')return;
 var now=d.polled_at||Math.floor(Date.now()/1000),ss=d.store_state||{},bk=d.backup||{},vel=d.velocities||{},nm=vel.new_memory||{},rc=vel.recall||{},coh=d.coherence||{},eff=d.synaptic_efficiency||{},tr=d.trends||{},dr=d.dreams||{},ag=d.agents||{},vt=d.vitals||{};
+var sg=[d.connected,ss.write_seq,ss.current_claims,d.polled_at,rc.recalls_5m,nm.writes_1h,(d.alerts||[]).length,wM,aF].join(':');
+if(sg===mS&&cur){cur=d;return;}mS=sg;cur=d;
 var w24=tr.window_24h||{},w7=tr.window_7d||{},lf=tr.lifetime||{},td=tr.today_signals||{},ds=tr.daily_series||[];
 var c24=w24.coherence_score??coh.score_24h??coh.score??0,c7=w7.coherence_score??coh.score_7d??c24,cL=lf.coherence_score??coh.lifetime_score??coh.score??0;
 var e24=w24.synaptic_efficiency_score??eff.score_24h??eff.score??0,e7=w7.synaptic_efficiency_score??eff.score_7d??e24,eL=lf.synaptic_efficiency_score??eff.lifetime_score??eff.score??0;
@@ -8667,6 +8832,7 @@ bars('m-topic-bars',tps.slice(0,7).map(function(t){return['#'+t.topic+' ('+t.abo
 var cv=el('pocket-cortex'),ctx=cv?cv.getContext('2d'):null,pts=[],nodes=[],tk=0;
 function draw(){
 if(!cv||!ctx)return;
+if(document.hidden){requestAnimationFrame(draw);return;}
 var dpr=Math.min(window.devicePixelRatio||1,2),r=cv.getBoundingClientRect(),w=Math.max(300,Math.floor(r.width)),h=Math.max(180,Math.floor(r.height));
 if(cv.width!==w*dpr||cv.height!==h*dpr){cv.width=w*dpr;cv.height=h*dpr;}
 ctx.save();ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);tk+=0.025;
@@ -8697,8 +8863,8 @@ var r=cv.getBoundingClientRect(),x=ev.clientX-r.left,y=ev.clientY-r.top;
 for(var i=0;i<nodes.length;i++){var n=nodes[i];if(Math.hypot(x-n.x,y-n.y)<26){sAg=n.id;txt('m-canvas-caption','Selected @'+n.id+' ('+n.h+')');rAg(cur);break;}}
 });
 function bB(s,a,cb){var b=document.querySelectorAll(s);for(var i=0;i<b.length;i++)b[i].addEventListener('click',function(){for(var k=0;k<b.length;k++)b[k].classList.remove('active');this.classList.add('active');cb(this.getAttribute(a));});}
-bB('#w-filter-row .f-btn','data-win',function(v){wM=v||'7d';if(cur)rMob(cur);});
-bB('#a-filter-row .f-btn','data-filter',function(v){aF=v||'all';rAg(cur);});
+bB('#w-filter-row .f-btn','data-win',function(v){wM=v||'7d';mS=null;if(cur)rMob(cur);});
+bB('#a-filter-row .f-btn','data-filter',function(v){aF=v||'all';mS=null;rAg(cur);});
 bB('.bnav .nbtn','data-jump',function(v){var s=el(v);if(s&&s.scrollIntoView)s.scrollIntoView({behavior:'smooth'});});
 if(el('m-desktop-btn'))el('m-desktop-btn').addEventListener('click',function(){window.location.href='/';});
 try{var raw=el('initial-mobile-state').textContent;if(raw)rMob(JSON.parse(raw));}catch(_){}
@@ -8711,6 +8877,97 @@ es.onerror=function(){txt('m-sse-pill','POLL');cls('m-sse-pill','pill warn');};
 }
 })();
 </script></body></html>`
+}
+
+export function removeSseClient(clientMap, res) {
+  const entry = clientMap.get(res)
+  if (!entry) return
+  clientMap.delete(res)
+  if (entry.onDrain) {
+    res.removeListener?.('drain', entry.onDrain)
+  }
+}
+
+export function writeToSseClient(
+  clientMap,
+  res,
+  payload,
+  { corpusKey = null, isKeepalive = false, maxBufferBytes = MAX_SSE_CLIENT_BUFFER_BYTES } = {}
+) {
+  const entry = clientMap.get(res)
+  if (!entry) return false
+  if (res.destroyed || res.writableEnded) {
+    removeSseClient(clientMap, res)
+    return false
+  }
+  const bufferedBytes = typeof res.writableLength === 'number' ? res.writableLength : 0
+  if (bufferedBytes > maxBufferBytes) {
+    removeSseClient(clientMap, res)
+    try {
+      res.destroy()
+    } catch {
+      /* ignore */
+    }
+    return false
+  }
+  if (entry.waitingDrain || res.writableNeedDrain) {
+    if (!isKeepalive) {
+      entry.pendingPayload = payload
+      entry.pendingCorpusKey = corpusKey
+      entry.droppedFrames += 1
+    }
+    entry.waitingDrain = true
+    return false
+  }
+  try {
+    const ok = res.write(payload)
+    if (!isKeepalive && corpusKey !== null) {
+      entry.sentCorpusKey = corpusKey
+    }
+    if (ok === false || res.writableNeedDrain) {
+      entry.waitingDrain = true
+    }
+    return ok !== false
+  } catch {
+    removeSseClient(clientMap, res)
+    try {
+      res.destroy()
+    } catch {
+      /* ignore */
+    }
+    return false
+  }
+}
+
+export function registerSseClient(clientMap, req, res, initialCorpusKey = null) {
+  const entry = {
+    res,
+    waitingDrain: false,
+    pendingPayload: null,
+    pendingCorpusKey: null,
+    sentCorpusKey: initialCorpusKey,
+    droppedFrames: 0,
+    onDrain: null,
+  }
+  entry.onDrain = () => {
+    if (!clientMap.has(res) || res.destroyed || res.writableEnded) {
+      removeSseClient(clientMap, res)
+      return
+    }
+    entry.waitingDrain = false
+    if (entry.pendingPayload !== null) {
+      const nextPayload = entry.pendingPayload
+      const nextCorpusKey = entry.pendingCorpusKey
+      entry.pendingPayload = null
+      entry.pendingCorpusKey = null
+      writeToSseClient(clientMap, res, nextPayload, { corpusKey: nextCorpusKey })
+    }
+  }
+  clientMap.set(res, entry)
+  res.on?.('drain', entry.onDrain)
+  res.on?.('error', () => removeSseClient(clientMap, res))
+  req?.on?.('close', () => removeSseClient(clientMap, res))
+  return entry
 }
 
 export async function startMemoryViewer({
@@ -8728,8 +8985,8 @@ export async function startMemoryViewer({
   const resolvedStateFile = resolveCuratorStatePath({ stateFile, socketPath })
   const target = parseListenTarget({ host, port })
   const client = createSingleSocketMcpClient(socketPath)
-  const sseClients = new Set()
-  const mobileSseClients = new Set()
+  const sseClients = new Map()
+  const mobileSseClients = new Map()
   const eventLog = []
   const agentTelemetry = new Map()
   let pollSeq = 0
@@ -8788,33 +9045,97 @@ export async function startMemoryViewer({
   let pollTimer = null
   let cachedCorpus = null
   let cachedHtmlKey = null
+  let cachedHtmlContentKey = null
+  let cachedHtmlTemplateStr = null
   let cachedHtmlBuf = null
   let cachedMobileHtmlKey = null
   let cachedMobileHtmlBuf = null
+  let cachedMobilePollSeq = -1
+  let cachedMobileState = null
+  let lastBroadcastKey = null
+  let currentCorpusKey = null
+  let lastKeepaliveAtMs = 0
 
   function currentMobileSnapshot() {
-    return buildMobileState(currentState, currentState.polled_at ?? undefined, cachedCorpus?.historyRecords)
+    if (cachedMobileState && cachedMobilePollSeq === (currentState.poll_seq ?? 0)) {
+      return cachedMobileState
+    }
+    cachedMobileState = buildMobileState(currentState, currentState.polled_at ?? undefined, cachedCorpus?.historyRecords)
+    cachedMobilePollSeq = currentState.poll_seq ?? 0
+    return cachedMobileState
   }
 
-  function broadcastState() {
+  function hashCorpusKeyHex(str) {
+    let h1 = 0x811c9dc5
+    let h2 = 0x01000193
+    for (let i = 0; i < str.length; i++) {
+      const c = str.charCodeAt(i)
+      h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0
+      h2 = Math.imul(h2 ^ (c + (i & 0xff)), 0x85ebca6b) >>> 0
+    }
+    return h1.toString(16).padStart(8, '0') + h2.toString(16).padStart(8, '0')
+  }
+
+  function computeCorpusBroadcastKey(state) {
+    const ss = state.store_state || {}
+    const recs = Array.isArray(state.records) ? state.records : []
+    const recIds =
+      cachedCorpus?.records === recs && typeof cachedCorpus?.recordIdsSig === 'string'
+        ? cachedCorpus.recordIdsSig
+        : recs.map(r => r?.event_id || `${r?.author_pubkey || ''}:${r?.d || ''}:${r?.created_at || 0}`).join(',')
+    const connGen = cachedCorpus?.connGen ?? 0
+    const scopeSig = cachedCorpus?.scopeSig ?? ''
+    return `${state.connected}:${state.error || ''}:${state.reader || ''}:${state.reader_pubkey || ''}:${ss.state || ''}:${ss.write_seq ?? ''}:${ss.current_claims ?? ''}:${recs.length}:${connGen}:${scopeSig}:${recIds}`
+  }
+
+  function computeBroadcastKey(state, corpusKey) {
+    const ss = state.store_state || {}
+    const cs = state.curator_state || {}
+    const ra = state.recent_activity || []
+    const lastActSeq = ra.length ? ra[ra.length - 1].seq : 0
+    const w = state.watch || {}
+    const ah = state.agent_health || {}
+    return `${corpusKey}:${ss.unbacked_writes ?? ''}:${ss.last_backup_write_seq ?? ''}:${ss.last_backup_snapshot_id || ''}:${(ss.last_backup_age_sec ?? 0) > 3600 ? 1 : 0}:${lastActSeq}:${cs.last_curated_write_seq ?? 0}:${cs.last_curated_at ?? 0}:${cs.last_ran_at ?? 0}:${cs.state_file_error || ''}:${cs.should_run ? 1 : 0}:${w.saving || ''}:${w.alert ? 1 : 0}:${w.hard ? 1 : 0}:${ah.active_5m ?? 0}:${ah.warm_20m ?? 0}:${ah.stale ?? 0}:${ah.error ?? 0}:${state.event_log?.length ?? 0}`
+  }
+
+  function broadcastState({ changed = true, nowMs = Date.now() } = {}) {
+    if (!changed) {
+      if (nowMs - lastKeepaliveAtMs >= SSE_KEEPALIVE_INTERVAL_MS) {
+        lastKeepaliveAtMs = nowMs
+        for (const [res] of sseClients) {
+          writeToSseClient(sseClients, res, ': keepalive\n\n', { isKeepalive: true })
+        }
+        for (const [res] of mobileSseClients) {
+          writeToSseClient(mobileSseClients, res, ': keepalive\n\n', { isKeepalive: true })
+        }
+      }
+      return
+    }
+    lastKeepaliveAtMs = nowMs
     if (sseClients.size > 0) {
-      const payload = `data: ${JSON.stringify(currentState)}\n\n`
-      for (const res of sseClients) {
-        try {
-          res.write(payload)
-        } catch {
-          sseClients.delete(res)
+      let fullPayload = null
+      let deltaPayload = null
+      for (const [res, entry] of sseClients) {
+        const needsFull =
+          entry.sentCorpusKey !== currentCorpusKey ||
+          (entry.pendingPayload !== null && entry.pendingCorpusKey !== currentCorpusKey)
+        if (needsFull) {
+          if (fullPayload === null) {
+            fullPayload = `data: ${JSON.stringify(buildClientViewerState(currentState, { includeCorpus: true }))}\n\n`
+          }
+          writeToSseClient(sseClients, res, fullPayload, { corpusKey: currentCorpusKey })
+        } else {
+          if (deltaPayload === null) {
+            deltaPayload = `data: ${JSON.stringify(buildClientViewerState(currentState, { includeCorpus: false }))}\n\n`
+          }
+          writeToSseClient(sseClients, res, deltaPayload, { corpusKey: currentCorpusKey })
         }
       }
     }
     if (mobileSseClients.size > 0) {
       const mobilePayload = `data: ${JSON.stringify(currentMobileSnapshot())}\n\n`
-      for (const res of mobileSseClients) {
-        try {
-          res.write(mobilePayload)
-        } catch {
-          mobileSseClients.delete(res)
-        }
+      for (const [res] of mobileSseClients) {
+        writeToSseClient(mobileSseClients, res, mobilePayload, { corpusKey: currentCorpusKey })
       }
     }
   }
@@ -8838,6 +9159,7 @@ export async function startMemoryViewer({
         wakeConnGen,
         wake?.counts || null,
         wake?.topic_directory || null,
+        Array.isArray(wake?.records) ? wake.records.map(r => `${r?.event_id || ''}:${r?.scope || ''}:${r?.d || ''}`) : null,
       ])
       const canReuseCorpus =
         !forceFull &&
@@ -8916,7 +9238,7 @@ export async function startMemoryViewer({
         historyRecords = [...byEventId.values()]
         historyComplete = cursor === null
         spectral = computeTopicEigenvectors(records, { maxComponents: 7, nowSec })
-        previewPlan = planMerkleDream({ records, nowSec })
+        previewPlan = planMerkleDream({ records, nowSec, spectral })
         consolidatedSources = {}
         for (const r of records) {
           if (Array.isArray(r.supersedes)) {
@@ -8943,6 +9265,9 @@ export async function startMemoryViewer({
             return [p.topic, rest]
           })
         )
+        const recordIdsSig = records
+          .map(r => r?.event_id || `${r?.author_pubkey || ''}:${r?.d || ''}:${r?.created_at || 0}`)
+          .join(',')
         cachedCorpus = {
           writeSeq: wakeSeq ?? firstQuery?.store_state?.write_seq ?? null,
           currentClaims: wakeCurrentClaims ?? firstQuery?.store_state?.current_claims ?? null,
@@ -8950,6 +9275,7 @@ export async function startMemoryViewer({
           readerPubkey: wakeReaderPubkey,
           connGen: wakeConnGen,
           scopeSig: wakeScopeSig,
+          recordIdsSig,
           atMs: nowMs,
           records,
           historyRecords,
@@ -9000,7 +9326,7 @@ export async function startMemoryViewer({
       const writeDeltaThreshold = Number(persistedCurator?.write_delta_threshold || DEFAULT_WRITE_DELTA_THRESHOLD)
       const topicPressureThreshold = Number(persistedCurator?.topic_pressure_threshold || DEFAULT_TOPIC_PRESSURE_THRESHOLD)
       const latestActivitySeq = recentActivity.length ? recentActivity[recentActivity.length - 1].seq : 0
-      const derivedKey = `${storeState.write_seq ?? ''}:${storeState.current_claims ?? ''}:${latestActivitySeq}:${lastCuratedWriteSeq}:${lastCuratedAt}:${persistedCurator?.last_ran_at || 0}:${curatorStateReadError || ''}:${storeState.unbacked_writes ?? ''}:${(storeState.last_backup_age_sec ?? 0) > 3600 ? 1 : 0}:${Math.floor(nowSec / 15)}`
+      const derivedKey = `${storeState.write_seq ?? ''}:${storeState.current_claims ?? ''}:${latestActivitySeq}:${lastCuratedWriteSeq}:${lastCuratedAt}:${persistedCurator?.last_ran_at || 0}:${curatorStateReadError || ''}:${storeState.unbacked_writes ?? ''}:${(storeState.last_backup_age_sec ?? 0) > 3600 ? 1 : 0}:${Math.floor(nowSec / 300)}`
 
       let coherence
       let curatorState
@@ -9249,11 +9575,18 @@ export async function startMemoryViewer({
       eventLog.push(d)
       if (eventLog.length > MAX_EVENT_LOG) eventLog.shift()
     }
+    const nextCorpusKey = computeCorpusBroadcastKey( nextSnapshot )
+    const nextCorpusDigest = hashCorpusKeyHex(nextCorpusKey)
     currentState = {
       ...nextSnapshot,
+      corpus_digest: nextCorpusDigest,
       event_log: [...eventLog],
     }
-    broadcastState()
+    const nextBroadcastKey = computeBroadcastKey(currentState, nextCorpusKey)
+    const changed = nextBroadcastKey !== lastBroadcastKey || diffs.length > 0
+    currentCorpusKey = nextCorpusKey
+    lastBroadcastKey = nextBroadcastKey
+    broadcastState({ changed, nowMs })
     return currentState
   }
 
@@ -9312,10 +9645,9 @@ export async function startMemoryViewer({
         res.end()
         return
       }
-      res.write(`data: ${JSON.stringify(currentMobileSnapshot())}\n\n`)
-      mobileSseClients.add(res)
-      req.on('close', () => {
-        mobileSseClients.delete(res)
+      registerSseClient(mobileSseClients, req, res, currentCorpusKey)
+      writeToSseClient(mobileSseClients, res, `data: ${JSON.stringify(currentMobileSnapshot())}\n\n`, {
+        corpusKey: currentCorpusKey,
       })
       return
     }
@@ -9331,10 +9663,25 @@ export async function startMemoryViewer({
         res.end()
         return
       }
-      res.write(`data: ${JSON.stringify(currentState)}\n\n`)
-      sseClients.add(res)
-      req.on('close', () => {
-        sseClients.delete(res)
+      const sinceSeqMatch = /(?:^|&)since_seq=([^&]*)/.exec(queryStr)
+      const sinceClaimsMatch = /(?:^|&)since_claims=([^&]*)/.exec(queryStr)
+      const sinceDigestMatch = /(?:^|&)since_digest=([^&]*)/.exec(queryStr)
+      const sinceSeq = sinceSeqMatch && /^[0-9]+$/.test(sinceSeqMatch[1]) ? sinceSeqMatch[1] : null
+      const sinceClaims = sinceClaimsMatch && /^[0-9]+$/.test(sinceClaimsMatch[1]) ? sinceClaimsMatch[1] : null
+      const sinceDigest = sinceDigestMatch && /^[0-9a-f]+$/i.test(sinceDigestMatch[1]) ? sinceDigestMatch[1].toLowerCase() : null
+      const clientHasCorpus =
+        Boolean(currentState.connected) &&
+        sinceSeq !== null &&
+        sinceSeq === String(currentState.store_state?.write_seq ?? '') &&
+        sinceClaims !== null &&
+        sinceClaims === String(currentState.store_state?.current_claims ?? '') &&
+        Boolean(currentState.corpus_digest) &&
+        sinceDigest !== null &&
+        sinceDigest === String(currentState.corpus_digest)
+      registerSseClient(sseClients, req, res, clientHasCorpus ? currentCorpusKey : null)
+      const initialClientState = buildClientViewerState(currentState, { includeCorpus: !clientHasCorpus })
+      writeToSseClient(sseClients, res, `data: ${JSON.stringify(initialClientState)}\n\n`, {
+        corpusKey: currentCorpusKey,
       })
       return
     }
@@ -9416,7 +9763,8 @@ export async function startMemoryViewer({
       }
     }
 
-    const htmlKey = `${currentState.poll_seq ?? 0}:${currentState.connected}:${currentState.error || ''}:${currentState.store_state?.state || ''}:${currentState.store_state?.write_seq ?? ''}:${currentState.records?.length ?? 0}:${currentState.curator_state?.last_curated_write_seq ?? 0}:${currentState.event_log?.length ?? 0}`
+    const htmlContentKey = `${lastBroadcastKey || ''}:${currentState.connected}:${currentState.error || ''}:${currentState.store_state?.state || ''}:${currentState.store_state?.write_seq ?? ''}:${currentState.records?.length ?? 0}:${currentState.curator_state?.last_curated_write_seq ?? 0}:${currentState.event_log?.length ?? 0}`
+    const htmlKey = `${currentState.poll_seq ?? 0}:${currentState.polled_at ?? 0}:${htmlContentKey}`
 
     if (
       urlPath === '/mobile' ||
@@ -9440,7 +9788,17 @@ export async function startMemoryViewer({
 
     if (urlPath === '/' || urlPath === '/index.html') {
       if (cachedHtmlKey !== htmlKey || !cachedHtmlBuf) {
-        cachedHtmlBuf = Buffer.from(renderViewerHtml(currentState), 'utf8')
+        if (cachedHtmlContentKey === htmlContentKey && cachedHtmlTemplateStr) {
+          const patchedHtml = cachedHtmlTemplateStr.replace(
+            /"polled_at":(?:\d+|null),"poll_seq":\d+/,
+            `"polled_at":${currentState.polled_at ?? 'null'},"poll_seq":${currentState.poll_seq ?? 0}`
+          )
+          cachedHtmlBuf = Buffer.from(patchedHtml, 'utf8')
+        } else {
+          cachedHtmlTemplateStr = renderViewerHtml(currentState)
+          cachedHtmlContentKey = htmlContentKey
+          cachedHtmlBuf = Buffer.from(cachedHtmlTemplateStr, 'utf8')
+        }
         cachedHtmlKey = htmlKey
       }
       res.writeHead(200, {
@@ -9476,7 +9834,8 @@ export async function startMemoryViewer({
     async stop() {
       stopped = true
       clearTimeout(pollTimer)
-      for (const res of sseClients) {
+      for (const [res] of sseClients) {
+        removeSseClient(sseClients, res)
         try {
           res.end()
         } catch {
@@ -9484,7 +9843,8 @@ export async function startMemoryViewer({
         }
       }
       sseClients.clear()
-      for (const res of mobileSseClients) {
+      for (const [res] of mobileSseClients) {
+        removeSseClient(mobileSseClients, res)
         try {
           res.end()
         } catch {

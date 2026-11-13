@@ -2214,6 +2214,58 @@ await test('nvoy #378 regression (dream-2567 shape): curator reader pagination n
       assert.equal(cohDesc.axes.convergence, cohAsc.axes.convergence, 'DESC query order must match ASC chronological order on convergence')
       assert.equal(cohDesc.score, cohAsc.score, 'DESC query order must match ASC chronological order on overall coherence score')
       assert.equal(cohDesc.axes.convergence, 100, 'newest 18 multi-author corroborated claims achieve 100% convergence without tail-order artifact')
+
+      const mockPostReader = {
+        async callReadTool(name) {
+          if (name === 'memory_wake') {
+            return {
+              store_state: { state: 'READY', write_seq: baseRecords.length },
+              recent_activity: [{ seq: 999, at: 1020, kind: 'submit', actor: 'curator', accepted: true }],
+              agent_roster: [],
+            }
+          }
+          return {
+            answer: 'found',
+            answer_reason: null,
+            format: 'full',
+            store_state: { state: 'READY', write_seq: baseRecords.length },
+            total_matched: baseRecords.length,
+            returned: baseRecords.length,
+            omitted: 0,
+            unverified: 0,
+            next_cursor: null,
+            records: descRecords,
+          }
+        },
+      }
+      const postSnapWithPrior = await readPostCycleSnapshot(
+        mockPostReader,
+        baseRecords.length,
+        5,
+        100,
+        1220,
+        {
+          priorRecentActivity: wakeAfterPaging.recent_activity,
+          priorAgentRoster: wakeAfterPaging.agent_roster,
+        }
+      )
+      const postSnapWithoutPrior = await readPostCycleSnapshot(
+        mockPostReader,
+        baseRecords.length,
+        5,
+        100,
+        1220,
+        {
+          priorRecentActivity: [],
+          priorAgentRoster: wakeAfterPaging.agent_roster,
+        }
+      )
+      assert(postSnapWithPrior !== null && postSnapWithoutPrior !== null)
+      assert(
+        postSnapWithPrior.coherence.axes.coupling > postSnapWithoutPrior.coherence.axes.coupling,
+        'readPostCycleSnapshot with priorRecentActivity + priorAgentRoster preserves peer recall coupling when post-cycle wake ring is evicted'
+      )
+      assert.equal(postSnapWithPrior.coherenceScore, cohAsc.score)
     } finally {
       store.close()
     }
