@@ -86,9 +86,13 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
   // A delegate's request also needs the hive's current terms, read fresh from the template's hive relay, and
   // the fleet's onboard_templates. An owner's request reads neither.
   const addEvent = newestRequest(events, name, 'add_agent')
+  const bindSigned = newestRequest(events, name, 'bind_runtime')
   let terms = null
-  if (addEvent && delegateAuthors(delegates).includes(addEvent.pubkey)) {
-    const like = (addEvent.tags || []).find(tag => tag[0] === 'like')?.[1]
+  // Read when either request is a delegate's, so a delegate's bind is judged (and refused on a signer mismatch) rather
+  // than failing for want of terms.
+  const delegateEvent = [addEvent, bindSigned].find(ev => ev && delegateAuthors(delegates).includes(ev.pubkey))
+  if (delegateEvent) {
+    const like = (delegateEvent.tags || []).find(tag => tag[0] === 'like')?.[1]
     const relay = manifests.get(String(like || ''))?.buzz?.relay
     terms = relay && readTermsFor ? await readTermsFor(relay) : { ok: false, reason: relay ? 'no terms reader' : 'the template names no hive relay' }
   }
@@ -99,6 +103,9 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
   if (bindEvent) {
     bind = parseSetupRequest(bindEvent, { name, manifests, seen, now: now(), delegation })
     if (bind.pubkey !== add.pubkey || bind.owner !== add.owner) throw new OnboardRefusal('ONBOARD_BIND_MISMATCH', 'bind_runtime names a different key or owner than add_agent')
+    // The bind must come from whoever signed the add (Murphy, PR 394 review). Otherwise an owner's add with a delegate's bind
+    // would seat a delegate-chosen key with no acceptance proof and no fresh grant check, since both gate on the add.
+    if (bind.signer !== add.signer) throw new OnboardRefusal('ONBOARD_BIND_MISMATCH', 'bind_runtime is signed by a different key than add_agent; the same signer must sign both')
     // Both signed fields must agree, exactly: the harness decides which principals are seated and `like` which template
     // the agent started like. A bind for another harness, or another template, is a different intent, not a variant.
     if (bind.harness !== add.harness) throw new OnboardRefusal('ONBOARD_BIND_MISMATCH', `bind_runtime is for a ${bind.harness} agent but add_agent is ${add.harness}`)

@@ -161,6 +161,20 @@ ok((() => { try { runnerConfig({ ...base, onboard_templates: 'mc-claude' }); ret
     ok(res.receipts.length === 0 && !existsSync(join(held.out, 'hr.json')) && !existsSync(join(held.stateDir, 'requests.jsonl')), 'a proof that is not out holds everything: no step, no ledger entry')
   }
 
+  // ── An owner's add with a delegate's bind is refused: the same signer must sign both (Murphy, PR 394 review) ──
+  {
+    const hx = harness(false)
+    const ownerAdd = finalizeEvent({ kind: 30078, created_at: at, content: '', tags: [['d', 'nvoy-onboard/hr/add_agent'], ['op', 'add_agent'], ['p', agent],
+      ['harness', 'claude-code'], ['like', 'crystalclaude']] }, owner)
+    await assert.rejects(hx.runWith(async () => state(), [ownerAdd, hx.bindEv]), e => e.code === 'ONBOARD_BIND_MISMATCH' && /same signer/.test(e.message))
+    ok(!existsSync(join(hx.out, 'hr.json')) && hx.applied() === 0, "an owner's add_agent with a delegate's bind_runtime is refused before anything is staged or seated")
+    const delegateAdd = hx.add
+    const ownerBind = finalizeEvent({ kind: 30078, created_at: at, content: '', tags: [['d', 'nvoy-onboard/hr/bind_runtime'], ['op', 'bind_runtime'], ['p', agent],
+      ['harness', 'claude-code'], ['like', 'crystalclaude'], ['channel_key', KEY]] }, owner)
+    await assert.rejects(hx.runWith(async () => state(), [delegateAdd, ownerBind]), e => e.code === 'ONBOARD_BIND_MISMATCH')
+    ok(true, "and so is a delegate's add_agent with the owner's bind_runtime")
+  }
+
   // ── Piece 3: the grant is re-read before every step; revoked refuses, unknown waits, nothing is seated ──
   const revoked = { known: true, live: new Map() }, unknownState = { known: false, live: new Map(), reason: 'only 1 of 4 grant relays read in full; 3 needed' }
   // The first read (to fetch and parse) sees the grant; the reads before each step see whatever `after` says.
