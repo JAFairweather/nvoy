@@ -203,8 +203,8 @@ ok('a manifest without channel_door renders no door, network or hash', withoutDo
 
 // --- may_recall: a broker-side forwarder, and still no key in any channel role -----------------
 const recallInstances = join(root, 'recall-instances'); mkdirSync(recallInstances)
-const readSocket = '/var/lib/nvoy/door-ok/state/hive-memory/read.sock'
-writeFileSync(join(recallInstances, 'door-ok.json'), JSON.stringify(manifest('door-ok', { may_recall: { read: { socket: readSocket } } })))
+const readSocket = '/run/nvoy-recall-gw/socket'
+writeFileSync(join(recallInstances, 'door-ok.json'), JSON.stringify(manifest('door-ok', { service_user: 'nvoy_door_ok', may_recall: { read: { socket: readSocket }, gateway_gid: gid + 20 } })))
 const withRecall = render(recallInstances, 'door-ok'), recallRoot = realpathSync(recallInstances)
 const service = (out, name) => (out.split(new RegExp(`^  ${name}:$`, 'm'))[1] || '').split(/^  [a-z_-]+:$|^  #|^[a-z]/m)[0].trimEnd()
 const sources = chunk => [...chunk.matchAll(/^\s+source: (.+)$/gm)].map(x => x[1])
@@ -212,13 +212,17 @@ const recallService = service(withRecall.stdout, 'recall')
 ok('a may_recall manifest renders the recall forwarder as the broker UID', withRecall.status === 0 &&
   recallService.includes('"node", "mcp/tools/instance-broker-recall.mjs", "--instance", "door-ok"') && recallService.includes(`user: "${uid + 12}:${gid}"`))
 ok('…holding no credential: the manifest, the broker state read-only and the shared runtime, no secrets',
-  sources(recallService).join() === `"${recallRoot}",broker_state,adapter_runtime` && /source: broker_state\n\s+target: .+\n\s+read_only: true/.test(recallService) &&
+  sources(recallService).join() === `"${recallRoot}",broker_state,adapter_runtime,"/run/nvoy-recall-gw/door-ok"` && /source: broker_state\n\s+target: .+\n\s+read_only: true/.test(recallService) &&
   !/secrets:|credential/i.test(recallService.replace(/^\s*#.*$/gm, '')))
+ok('…using only the per-instance host socket group and no network',
+  recallService.includes(`group_add: ["${gid + 20}"]`) && recallService.includes('network_mode: none') &&
+  recallService.includes('target: /run/nvoy-recall-gw') && recallService.includes('create_host_path: false') &&
+  !/^[ \t]+networks:/m.test(recallService))
 ok('the channel roles render byte-identical with may_recall, mounting no key or credential but the door hash',
   ['door', 'adapter'].every(name => service(withRecall.stdout, name).replaceAll(recallRoot, 'R') === service(withDoor.stdout, name).replaceAll(realpathSync(instances), 'R')) &&
   sources(service(withRecall.stdout, 'door')).join() === `"${recallRoot}",adapter_runtime,channel_door_credentials` &&
   sources(service(withRecall.stdout, 'adapter')).join() === `"${recallRoot}",adapter_runtime`)
-ok('the read transport never enters the Compose file', !withRecall.stdout.includes(readSocket) && !withRecall.stdout.includes('hive-memory'))
+ok('the read key and gateway target never enter the Compose file', !withRecall.stdout.includes('/etc/nvoy/recall-keys') && !withRecall.stdout.includes('hive-memory-gw@herd-cloud'))
 ok('a manifest without may_recall renders no recall forwarder', !/instance-broker-recall|^  recall:$/m.test(withDoor.stdout))
 ok('the initializer gives the recall socket a broker-owned, worker-group directory',
   /if \(m\.mayRecall\) provision\(`\$\{m\.runtimeDir\}\/memory-recall`, m\.brokerUid, m\.workerHandoffGid, 0o2750/.test(initSource))

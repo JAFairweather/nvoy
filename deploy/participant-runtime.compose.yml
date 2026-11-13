@@ -362,6 +362,9 @@ services:
   recall:
     image: ${NVOY_IMAGE:?set NVOY_IMAGE}
     user: "${BROKER_UID:?}:${BROKER_ADAPTER_GID:?}"
+    network_mode: none
+    # The supplementary group is dedicated to this instance's read socket.
+    group_add: ["${RECALL_GATEWAY_GID:?}"]
     init: true
     read_only: true
     cap_drop: [ALL]
@@ -382,6 +385,12 @@ services:
       - type: volume
         source: adapter_runtime
         target: ${RUNTIME_DIR:?}
+      - type: bind
+        source: ${RECALL_GATEWAY_HOST_DIR:?}
+        target: /run/nvoy-recall-gw
+        read_only: true
+        bind:
+          create_host_path: false
     depends_on:
       init:
         condition: service_completed_successfully

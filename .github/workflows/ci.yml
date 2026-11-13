@@ -79,3 +79,9 @@ jobs:
         # container boundary is proven by deploy/runtime-image-boundary.py, which the deploy runner
         # calls unconditionally before every promotion — not by anything in this job.
         run: npm test
+
+      - name: Recall gateway installer container render
+        run: |
+          python3 test/recall-gateway-installer.py
+          docker build -q -t nvoy-recall-installer-test -f deploy/nvoy-runtime.Dockerfile .
+          sudo python3 deploy/test-recall-gateway-container.py nvoy-recall-installer-test
