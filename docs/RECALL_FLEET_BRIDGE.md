@@ -46,8 +46,8 @@ by design, no key. This note describes the host socket implementation. James's g
 The operator chooses a successful digest-pinned `nvoy-runtime` image from the merged release, adds a dedicated `gateway_gid` and the broker's named `service_user` to the manifest, and places a trusted root-owned `/etc/nvoy/recall-known-hosts` pin. `fleet-deploy read-key-create` makes the read key root-owned; the installer transfers ownership to the broker host user. Run the reviewed script from the merged nvoy checkout on nvoy-fleet:
 
 ```sh
-python3 deploy/install-recall-gateway.py --instance grokdoggydog --image ghcr.io/jafairweather/nvoy-runtime@sha256:<successful-release-digest> --check
-python3 deploy/install-recall-gateway.py --instance grokdoggydog --image ghcr.io/jafairweather/nvoy-runtime@sha256:<successful-release-digest>
+sudo python3 deploy/install-recall-gateway.py --instance grokdoggydog --image ghcr.io/jafairweather/nvoy-runtime@sha256:<successful-release-digest> --check
+sudo python3 deploy/install-recall-gateway.py --instance grokdoggydog --image ghcr.io/jafairweather/nvoy-runtime@sha256:<successful-release-digest>
 ```
 
 The script renders from the immutable image, checks the key and pin without printing their contents, creates only this instance's dedicated group, installs both units, and starts the socket. It refuses an installed unit whose content differs. The runtime deploy runner checks the live socket, group and key before starting or declaring the recall container healthy. James authorizes the key's public half on herd-cloud only after the live gates below. Production Compose refuses the old `read.command` path because that command would run inside the keyless container.

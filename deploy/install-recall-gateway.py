@@ -26,6 +26,8 @@ UNITS = Path('/etc/systemd/system')
 IMAGE = re.compile(r'[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}\Z', re.I)
 ID = re.compile(r'[a-z0-9][a-z0-9._-]{1,63}\Z')
 USER = re.compile(r'[a-z_][a-z0-9_-]*\Z')
+RENDER_UID = 65532
+RENDER_GID = 65532
 
 
 def fail(message):
@@ -50,8 +52,8 @@ def main():
     args = parser.parse_args()
     if not ID.fullmatch(args.instance) or not IMAGE.fullmatch(args.image):
         fail('instance or immutable image reference is invalid')
-    if not args.check and os.geteuid() != 0:
-        fail('installation requires root')
+    if os.geteuid() != 0:
+        fail('installer checks and installation require root')
     manifest_path = ROOT / f'{args.instance}.json'
     regular(manifest_path, 'manifest')
     raw = json.loads(manifest_path.read_text())
@@ -93,8 +95,12 @@ def main():
     # secret is mounted: only manifest metadata and the empty output directory.
     with tempfile.TemporaryDirectory(prefix='nvoy-recall-') as stage_name:
         stage = Path(stage_name)
+        # TemporaryDirectory is root-owned 0700. Give only the image's fixed
+        # renderer identity access to this disposable output mount.
+        os.chown(stage, RENDER_UID, RENDER_GID)
         command('docker', 'run', '--rm', '--read-only', '--network', 'none',
-                '--tmpfs', '/tmp:mode=1777', '-e', f'NVOY_INSTANCE_ROOT={ROOT}',
+                '--tmpfs', '/tmp:mode=1777', '--user', f'{RENDER_UID}:{RENDER_GID}',
+                '-e', f'NVOY_INSTANCE_ROOT={ROOT}',
                 '-v', f'{ROOT}:{ROOT}:ro', '-v', f'{stage}:{stage}:rw', args.image,
                 'node', 'mcp/tools/instance-unit.mjs', 'render', '--instance', args.instance,
                 '--image', args.image, '--out-dir', str(stage))
