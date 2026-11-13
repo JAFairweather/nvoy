@@ -68,7 +68,7 @@ export function rewrite(root, id, change, { backupRoot, now }) {
 export async function onboard({ command, name, root, out, stateDir, keysPath = '', giversRedeploy = false,
   backupRoot = '/root', fetchEvents, runTool, joinWith, now = () => Date.now(), log = console.log,
   pair = null, report = null, readWriters = null, verify = () => false, readDelegates = null, delegateTemplates = [], readTermsFor = null,
-  markTerminal = null }) {
+  markTerminal = null, markAccepted = null }) {
   if (!['show', 'run'].includes(command)) throw new OnboardRefusal('ONBOARD_USAGE', 'command is show or run')
   const ledger = join(stateDir, 'requests.jsonl')
   const rows = lines(ledger), seen = new Set(rows.filter(row => row.finished).map(row => row.id))
@@ -111,6 +111,12 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
   if (add.rooms.length) log(`  rooms ${add.rooms.join(', ')}`)
   log(`  bind_runtime: ${bind ? `${bind.channelKey.keyType} key, ${bind.id.slice(0, 12)}` : 'not yet'}`)
   if (command === 'show') return { request: add, bind, receipts: [] }
+  // A delegate's accepted request: the public acceptance proof goes out, and reads back, before any effect. If it does not,
+  // nothing is done this run and the next one tries again.
+  if (add.delegated && markAccepted && !(await markAccepted(add))) {
+    log(`pending  ${name}: the acceptance proof for request ${add.id.slice(0, 12)} is not out yet; nothing was done, and the next run tries again`)
+    return { request: add, bind, receipts: [] }
+  }
 
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
   if (!inProgress.has(add.id)) appendFileSync(ledger, JSON.stringify({ id: add.id, name, op: 'add_agent', at: now(),

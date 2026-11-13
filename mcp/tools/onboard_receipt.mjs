@@ -22,6 +22,12 @@ export const delegateReceiptD = request => `nvoy-onboard:${request}:delegate`
 // one e. It means this request can no longer authorize anything, whether it finished or was refused.
 export const terminalD = request => `nvoy-onboard:${request}:terminal`
 export const terminalEvent = (request, created_at) => ({ kind: RECEIPT_KIND, created_at, content: '', tags: [['d', terminalD(request)], ['e', request]] })
+// The public acceptance proof (agreed with nave.pub's writer gate): runner-signed, empty content, exactly d, e, p and
+// consent. It says the runner accepted this delegate's add_agent, every parse check passed, before any effect. It is never
+// withdrawn: a later refusal or revocation is the terminal marker's to say.
+export const acceptedD = request => `nvoy-onboard:${request}:accepted`
+export const acceptedEvent = ({ request, target, grantId }, created_at) => ({ kind: RECEIPT_KIND, created_at, content: '',
+  tags: [['d', acceptedD(request)], ['e', request], ['p', target], ['consent', grantId]] })
 const HEX64 = /^[0-9a-f]{64}$/, HEX40 = /^[0-9a-f]{40}$/
 
 // What the runner's connection may do, and nothing more: no decrypt, no post, no reaction, no join.
