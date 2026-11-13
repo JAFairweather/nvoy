@@ -279,6 +279,91 @@ assert.deepEqual(opTick.ran.map(r => r.name), ['operator'], 'the watch tick take
 assert.ok(published.length > count && allDone(published.at(-1)), 'and sends the owner the finished receipt')
 assert.deepEqual(opFinished().map(row => row.id), [opAdd.id], 'only then is it finished')
 
+// ── The public terminal marker (piece 3; the shape agreed with nave.pub's writer gate) ──────────────
+// A finished request: the marker is published and read back before the ledger says finished.
+const warden = getPublicKey(generateSecretKey()); keys.warden = warden
+const wAdd = signAs(owner, [['d', 'nvoy-onboard/warden/add_agent'], ['op', 'add_agent'], ['p', warden], ['harness', 'claude-code'], ['like', 'crystalclaude']], at + 70)
+const wBind = signAs(owner, [['d', 'nvoy-onboard/warden/bind_runtime'], ['op', 'bind_runtime'], ['p', warden], ['harness', 'claude-code'], ['like', 'crystalclaude'], ['channel_key', KEY]], at + 71)
+const wState = join(tmp, 'state-warden')
+const markers = () => published.filter(ev => ev.tags.some(t => t[0] === 'd' && /:terminal$/.test(t[1])))
+const wFinished = () => existsSync(join(wState, 'requests.jsonl')) ? readFileSync(join(wState, 'requests.jsonl'), 'utf8').split('\n').filter(Boolean).map(JSON.parse).filter(row => row.finished).map(row => row.id) : []
+events = [wAdd, wBind]; writers = { answered: true, events: [list(owner, [warden], at + 72)] }
+let readsBack = false
+const readEvent = async event => readsBack ? wire(event) : null
+lines = []; clock += HEARTBEAT_MS * 2
+await tick({ ...member, stateDir: wState, readEvent })
+const mk = markers().at(-1)
+assert.ok(mk && mk.pubkey === runnerHex && mk.kind === 30078 && mk.content === '', 'the marker is a runner-signed kind 30078 with empty content')
+assert.deepEqual(mk.tags, [['d', `nvoy-onboard:${wAdd.id}:terminal`], ['e', wAdd.id]], 'with exactly one d and one e')
+assert.ok(verify(wire(mk)), 'and it verifies')
+assert.deepEqual(wFinished(), [], 'a marker that did not read back leaves the request unfinished')
+assert.ok(lines.some(line => /terminal marker for .* not out: it did not read back/.test(line)))
+readsBack = true; clock += 30_000
+await tick({ ...member, stateDir: wState, readEvent })
+assert.deepEqual(wFinished(), [wAdd.id], 'once the marker reads back, the request is finished')
+assert.ok(existsSync(join(wState, `${wAdd.id}.terminal.json`)))
+const markerCount = markers().length; clock += HEARTBEAT_MS * 2
+await tick({ ...member, stateDir: wState, readEvent })
+assert.equal(markers().length, markerCount, 'and the marker is not sent again')
+
+// A refused request: no relay takes the marker, so it is not set aside; the next tick retries the marker, then sets it aside.
+const stranger2 = generateSecretKey()
+const sAdd = signAs(stranger2, [['d', 'nvoy-onboard/interloper/add_agent'], ['op', 'add_agent'], ['p', getPublicKey(generateSecretKey())], ['harness', 'claude-code'], ['like', 'crystalclaude']], at + 80)
+const sState = join(tmp, 'state-interloper')
+const setAside = () => existsSync(join(sState, 'watch-refused.jsonl')) ? readFileSync(join(sState, 'watch-refused.jsonl'), 'utf8').split('\n').filter(Boolean).map(JSON.parse).map(row => row.id) : []
+events = [sAdd]
+let relayTakes = false
+const markerPublish = async event => { if (!relayTakes && /:terminal$/.test(event.tags.find(t => t[0] === 'd')?.[1] || '')) return [{ relay: 'wss://relay.nave.pub', accepted: false, message: 'blocked' }]; published.push(event); return [{ relay: 'wss://relay.nave.pub', accepted: true }] }
+let r = await tick({ ...member, stateDir: sState, readEvent, publish: markerPublish })
+assert.equal(r.ran[0]?.refused, 'ONBOARD_NOT_OWNER')
+assert.deepEqual(setAside(), [], 'a refused request whose marker no relay took is not set aside')
+relayTakes = true; clock += 30_000
+r = await tick({ ...member, stateDir: sState, readEvent, publish: markerPublish })
+assert.deepEqual(setAside(), [sAdd.id], 'the next tick gets the marker out, then sets it aside')
+assert.ok(markers().some(ev => ev.tags.some(t => t[0] === 'e' && t[1] === sAdd.id)), 'with its marker published')
+
+// ── A delegate's request: a second receipt, sealed to the delegate, without the pairing link ─────────
+{
+  const delKey = generateSecretKey(), delHex2 = getPublicKey(delKey)
+  const GID = 'd'.repeat(64)
+  const dState = join(tmp, 'state-delegate')
+  const deputy = getPublicKey(generateSecretKey()); keys.deputy = deputy
+  const dAdd = signAs(delKey, [['d', 'nvoy-onboard/deputy/add_agent'], ['op', 'add_agent'], ['p', deputy], ['harness', 'claude-code'], ['like', 'crystalclaude'], ['consent', GID]], at + 90)
+  const live = { known: true, live: new Map([[delHex2, [{ grantId: GID, grantor: ownerHex, delegate: delHex2, created_at: at, policy: 'terms-v3', age: 'confirmed' }]]]) }
+  events = [dAdd]; approved = false
+  const before = published.length
+  await tick({ ...member, stateDir: dState, runner: { ...runner, onboardTemplates: ['crystalclaude'] }, readDelegates: async () => live,
+    readTermsFor: async () => ({ ok: true, version: 'terms-v3' }) })
+  const fresh = published.slice(before)
+  const ownerCopy = fresh.filter(ev => ev.tags.find(t => t[0] === 'd')?.[1] === `nvoy-onboard:${dAdd.id}`)
+  const delCopy = fresh.filter(ev => ev.tags.find(t => t[0] === 'd')?.[1] === `nvoy-onboard:${dAdd.id}:delegate`)
+  assert.ok(ownerCopy.length && delCopy.length, "a delegate's request gets the owner's receipt and a delegate copy")
+  assert.ok(ownerCopy.every(ev => ev.tags.find(t => t[0] === 'p')?.[1] === ownerHex), "the owner's copy is sealed to the owner")
+  assert.ok(delCopy.every(ev => ev.tags.find(t => t[0] === 'p')?.[1] === delHex2 && ev.pubkey === runnerHex), 'the copy is sealed to the delegate, signed by the runner')
+  const openAs = (key, ev) => JSON.parse(nip44.decrypt(ev.content, nip44.utils.getConversationKey(key, runnerHex)))
+  assert.ok(ownerCopy.some(ev => openAs(owner, ev).pairing), 'the pairing link reaches the owner')
+  assert.ok(delCopy.every(ev => !('pairing' in openAs(delKey, ev))), 'and never the delegate')
+  assert.ok(delCopy.every(ev => openAs(delKey, ev).request === dAdd.id), 'the delegate can read its own request\'s progress')
+
+  // A delegate copy that no relay takes is not lost: the run does not count the request as reported, and the
+  // next tick sends that copy again, even though the owner's copy is unchanged and inside its heartbeat.
+  const d2State = join(tmp, 'state-delegate-2')
+  let delegateTakes = false
+  const isDelegateCopy = ev => /:delegate$/.test(ev.tags.find(t => t[0] === 'd')?.[1] || '')
+  const flaky = async ev => { if (!delegateTakes && isDelegateCopy(ev)) return [{ relay: 'wss://relay.nave.pub', accepted: false, message: 'blocked' }]; published.push(ev); return [{ relay: 'wss://relay.nave.pub', accepted: true }] }
+  const ticked = () => tick({ ...member, stateDir: d2State, runner: { ...runner, onboardTemplates: ['crystalclaude'] }, readDelegates: async () => live,
+    readTermsFor: async () => ({ ok: true, version: 'terms-v3' }), publish: flaky })
+  lines = []
+  const mark = published.length
+  await ticked()
+  assert.ok(!published.slice(mark).some(isDelegateCopy) && lines.some(l => /receipt not published: no relay took the delegate's receipt copy/.test(l)), "a delegate copy no relay takes is reported as not published")
+  delegateTakes = true; clock += 30_000
+  const mark2 = published.length
+  await ticked()
+  assert.ok(published.slice(mark2).some(isDelegateCopy), 'the next tick sends the delegate copy again, inside the owner copy\'s heartbeat')
+  assert.ok(existsSync(join(d2State, `${dAdd.id}.delegate-receipt.json`)), 'and records it as sent')
+}
+
 // No trusted owner yet: nothing is read.
 const empty = join(tmp, 'empty'); mkdirSync(empty)
 assert.deepEqual((await tick({ root: empty, fetchAll: async () => { throw new Error('read with no owner') } })).ran, [])

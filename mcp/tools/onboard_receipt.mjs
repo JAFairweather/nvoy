@@ -16,6 +16,12 @@ export const RECEIPT_KIND = 30078
 export const RECEIPT_VERSION = 1
 export const RECEIPT_TTL_S = 30 * 24 * 60 * 60
 export const receiptD = request => `nvoy-onboard:${request}`
+// A delegate's own copy of the receipt (DESIGN_ONBOARDING_DELEGATE), sealed to the delegate, never with the pairing link.
+export const delegateReceiptD = request => `nvoy-onboard:${request}:delegate`
+// The public terminal marker (agreed with nave.pub's writer gate): runner-signed, empty content, exactly one d and
+// one e. It means this request can no longer authorize anything, whether it finished or was refused.
+export const terminalD = request => `nvoy-onboard:${request}:terminal`
+export const terminalEvent = (request, created_at) => ({ kind: RECEIPT_KIND, created_at, content: '', tags: [['d', terminalD(request)], ['e', request]] })
 const HEX64 = /^[0-9a-f]{64}$/, HEX40 = /^[0-9a-f]{40}$/
 
 // What the runner's connection may do, and nothing more: no decrypt, no post, no reaction, no join.
@@ -85,11 +91,11 @@ export function receiptBody({ name, request, instance, rows, pairing = null, ins
 // relay never keeps an older receipt over a newer one made in the same second.
 export function makeSealer(signer, { now = () => Math.floor(Date.now() / 1000) } = {}) {
   let last = 0
-  return async ({ owner, request, body }) => {
+  return async ({ owner, request, body, d = receiptD(request) }) => {
     if (!HEX64.test(owner || '') || !HEX64.test(request || '')) throw new Error('a receipt needs the owner and request ids')
     const content = await signer.nip44Encrypt(owner, JSON.stringify(body))
     const created_at = last = Math.max(now(), last + 1)
     return signer.signEvent({ kind: RECEIPT_KIND, created_at, content,
-      tags: [['d', receiptD(request)], ['p', owner], ['e', request], ['expiration', String(created_at + RECEIPT_TTL_S)]] })
+      tags: [['d', d], ['p', owner], ['e', request], ['expiration', String(created_at + RECEIPT_TTL_S)]] })
   }
 }
