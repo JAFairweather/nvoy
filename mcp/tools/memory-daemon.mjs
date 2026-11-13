@@ -252,6 +252,7 @@ export function handleSocketJsonRpc({ store, binding, message, nowSec, activity 
             rollup_write_failures: Math.max(Number(activity.rollup_write_failures || 0), Number(store.rollupWriteFailures || 0)),
             first_rollup_failure_at: activity.first_rollup_failure_at ?? store.firstRollupFailureAt ?? null,
             last_rollup_failure_at: activity.last_rollup_failure_at ?? store.lastRollupFailureAt ?? null,
+            binding_sig: bindingSignature(store.config, binding),
           },
           ...(typeof store.activityRollups === 'function'
             ? { activity_rollups: store.activityRollups({ sinceSec: Math.max(0, nowSec - 14 * 86400), nowSec }) }
