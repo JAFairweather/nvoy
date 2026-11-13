@@ -16,7 +16,7 @@
     "ledger": "node test/ledger.mjs",
     "capgrants": "node test/capgrants.mjs && node test/task-authority.mjs",
     "accept": "node test/m4accept.mjs",
-    "posttest": "node --test test/memory-load-benchmark.mjs",
+    "posttest": "node --test test/memory-load-benchmark.mjs test/memory-recall-benchmark.mjs",
     "ttl-daemon": "node bin/nvoy-ttl.mjs",
     "console": "node console/serve.mjs",
     "wsrelay": "node test/wsrelay.mjs 4460",
