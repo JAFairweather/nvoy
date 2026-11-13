@@ -146,6 +146,7 @@ An owner may grant a delegate key the right to ask for new agents, with one kind
 - A 441 from the grant's own grantor revokes it whatever either `created_at` says.
 - Fewer than a quorum of complete relay reads is "grant state unknown". It reads no delegate, and the
   tick logs it.
+- Grants count only from complete reads; a 441 from any relay that answered still revokes.
 - Live delegates are added to the authors both fetch paths read setup requests from.
 
 A delegate's request is not accepted yet. Authorization (consent, the template allowlist, no giver,

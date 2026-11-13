@@ -73,9 +73,10 @@ export function foldOnboardGrants(events, { grantors, verify, scopeHash, nowSec 
 
 // One cold read of the owners' grants and revocations from `urls`. `read(url, filter)` resolves to
 // { answered, complete, events } (onboard_watch.mjs readPages gives that shape). The answer is known
-// only when at least a quorum of the relays read in full; then the events of every relay that answered,
-// in full or not, are folded together, so a 441 seen on any relay counts. Otherwise `known` is false and
-// `live` is empty: the caller runs no delegate step and says the grant state is unknown.
+// only when at least a quorum of the relays read in full. Then grants come only from the complete reads,
+// since a partial read may hold a grant without the 441 that ended it; but a 441 from any relay that
+// answered, in full or not, still revokes. Otherwise `known` is false and `live` is empty: the caller
+// runs no delegate step and says the grant state is unknown.
 export async function readOnboardGrants({ urls, grantors, read, verify, scopeHash, nowSec }) {
   const list = [...new Set(urls || [])]
   const owners = [...new Set((grantors || []).map(g => String(g).toLowerCase()))].filter(g => HEX64.test(g))
@@ -85,7 +86,9 @@ export async function readOnboardGrants({ urls, grantors, read, verify, scopeHas
   }))
   const complete = reads.filter(r => r?.answered && r.complete).length, needed = quorumOf(list.length)
   if (complete < needed) return { known: false, live: new Map(), complete, needed, reason: `only ${complete} of ${list.length} grant relays read in full; ${needed} needed` }
-  const events = [...new Map(reads.filter(r => r?.answered).flatMap(r => r.events || []).map(ev => [ev?.id, ev])).values()]
+  const fromComplete = reads.filter(r => r?.answered && r.complete).flatMap(r => r.events || [])
+  const vetoes = reads.filter(r => r?.answered && !r.complete).flatMap(r => (r.events || []).filter(ev => ev?.kind === REVOKE_KIND))
+  const events = [...new Map([...fromComplete, ...vetoes].map(ev => [ev?.id, ev])).values()]
   const { live, rejected } = foldOnboardGrants(events, { grantors: owners, verify, scopeHash, nowSec })
   return { known: true, live, complete, needed, rejected }
 }
