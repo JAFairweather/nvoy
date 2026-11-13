@@ -85,7 +85,7 @@ ok((() => { try { runnerConfig({ ...base, onboard_templates: 'mc-claude' }); ret
   const { tmpdir } = await import('node:os')
   const { join } = await import('node:path')
   const { onboard } = await import('../mcp/tools/onboard_run.mjs')
-  const harness = staged => {
+  const harness = (staged, { readDelegates = async () => state(), pairOk = true } = {}) => {
     const tmp = mkdtempSync(join(tmpdir(), 'nvoy-delegate-run-'))
     const root = join(tmp, 'instances'), out = join(tmp, 'staged'), stateDir = join(tmp, 'state'), creds = join(tmp, 'creds'), backupRoot = join(tmp, 'root')
     for (const d of [root, out, creds, backupRoot]) mkdirSync(d, { recursive: true })
@@ -106,16 +106,21 @@ ok((() => { try { runnerConfig({ ...base, onboard_templates: 'mc-claude' }); ret
     const runTool = (tool, args) => {
       const op = tool === 'instance-pair.mjs' ? 'pair' : args[0], id = args[args.indexOf('--id') + 1]
       if (op === 'allocate') { writeFileSync(join(out, `${id}.json`), JSON.stringify(raw(id, agent))); return 0 }
-      if (op === 'pair') { writeFileSync(join(creds, `${id}.bunker-uri`), 'x'); writeFileSync(join(creds, `${id}.nip46-client`), 'x'); return 0 }
+      if (op === 'pair') { if (!pairOk) return 1; writeFileSync(join(creds, `${id}.bunker-uri`), 'x'); writeFileSync(join(creds, `${id}.nip46-client`), 'x'); return 0 }
+      if (op === 'apply') applied++
       if (op === 'check') return 0
       if (op === 'apply') { copyFileSync(join(out, 'hr.json'), join(root, 'hr.json')); return 0 }
       throw new Error(`unexpected tool ${tool} ${op}`)
     }
     const termsAsked = []
+    let applied = 0
+    const runWith = (reader, events) => onboard({ command: 'run', name: 'hr', root, out, stateDir, backupRoot, keysPath: join(tmp, 'authorized_keys'), log: () => {},
+      fetchEvents: async () => events, runTool, joinWith: () => ({ signer: {}, open: async () => { throw new Error('AUTH refused: not a member') }, close() {} }),
+      readDelegates: reader, delegateTemplates: ['crystalclaude'], readTermsFor: async () => ({ ok: true, version: 'terms-v3' }) })
     const run = events => onboard({ command: 'run', name: 'hr', root, out, stateDir, backupRoot, keysPath: join(tmp, 'authorized_keys'), log: () => {},
       fetchEvents: async () => events, runTool, joinWith: () => ({ signer: {}, open: async () => { throw new Error('AUTH refused: not a member') }, close() {} }),
-      readDelegates: async () => state(), delegateTemplates: ['crystalclaude'], readTermsFor: async relay => { termsAsked.push(relay); return { ok: true, version: 'terms-v3' } } })
-    return { tmp, stateDir, add, bindEv, run, termsAsked, ledger: () => readFileSync(join(stateDir, 'requests.jsonl'), 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)) }
+      readDelegates, delegateTemplates: ['crystalclaude'], readTermsFor: async relay => { termsAsked.push(relay); return { ok: true, version: 'terms-v3' } } })
+    return { tmp, out, stateDir, add, bindEv, run, runWith, termsAsked, applied: () => applied, ledger: () => readFileSync(join(stateDir, 'requests.jsonl'), 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)) }
   }
   const states = result => Object.fromEntries(result.receipts.map(row => [row.step, row.state]))
 
@@ -138,6 +143,44 @@ ok((() => { try { runnerConfig({ ...base, onboard_templates: 'mc-claude' }); ret
   writeFileSync(join(c.stateDir, `${c.add.id}.staged-channel.pub`), `ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK0${'b'.repeat(40)} nvoy-stage:hr:${c.add.id}\n`)
   res = await c.run([c.add, c.bindEv])
   ok(states(res).started === 'refused', "a staged key that differs from the delegate's bind is refused")
+
+  // ── Piece 3: the grant is re-read before every step; revoked refuses, unknown waits, nothing is seated ──
+  const { existsSync, readdirSync } = await import('node:fs')
+  const revoked = { known: true, live: new Map() }, unknownState = { known: false, live: new Map(), reason: 'only 1 of 4 grant relays read in full; 3 needed' }
+  // The first read (to fetch and parse) sees the grant; the reads before each step see whatever `after` says.
+  const sequence = after => { let calls = 0; return async () => (++calls === 1 ? state() : after(calls)) }
+
+  // Revoked between the parse and the first step: refused before staging, nothing allocated, no later step.
+  const h1 = harness(false)
+  res = await h1.runWith(sequence(() => revoked), [h1.add])
+  ok(states(res).staged === 'refused' && /delegate revoked/.test(res.receipts[0].detail) && !existsSync(join(h1.out, 'hr.json')) && res.receipts.length === 1,
+    'a grant revoked after the request was read stops it before staging: nothing is allocated, and no later step runs')
+
+  // In flight: staged and paired under a live grant, revoked before the bind's apply: refused, nothing seated,
+  // and the staged manifest is moved aside.
+  const h2 = harness(false)
+  await h2.run([h2.add])
+  writeFileSync(join(h2.stateDir, `${h2.add.id}.staged-channel.pub`), `${KEY} nvoy-stage:hr:${h2.add.id}\n`)
+  const before = h2.applied()
+  res = await h2.runWith(sequence(() => revoked), [h2.add, h2.bindEv])
+  ok(h2.applied() === before && Object.values(states(res)).includes('refused'), 'revoked in flight: refused before the apply, so no principal is seated')
+  ok(!existsSync(join(h2.out, 'hr.json')) && readdirSync(h2.out).some(f => /^hr\.json\.revoked-/.test(f)), 'and its staged manifest is moved aside')
+
+  // Unknown at a step: nothing done that step, the run stops; a later run with the grant live carries on.
+  const h3 = harness(false)
+  res = await h3.runWith(sequence(() => unknownState), [h3.add])
+  ok(states(res).staged === 'pending' && /grant state unknown/.test(res.receipts[0].detail) && !existsSync(join(h3.out, 'hr.json')), 'unknown grant state at a step does nothing and waits')
+  res = await h3.runWith(async () => state(), [h3.add])
+  ok(states(res).staged === 'done', 'and the next run with the grant live goes ahead')
+
+  // Queued, then revoked: the next run refuses it at the parse. A request dated before the revocation gains nothing.
+  const h4 = harness(false)
+  await assert.rejects(h4.runWith(async () => revoked, [h4.add]), e => e.code === 'ONBOARD_NOT_OWNER')
+  ok(!existsSync(join(h4.out, 'hr.json')), 'a queued request whose grant is revoked is refused at the next run, and nothing is staged')
+  const backdated = finalizeEvent({ kind: 30078, created_at: at - 3 * 24 * 3600, content: '', tags: [['d', 'nvoy-onboard/hr/add_agent'], ['op', 'add_agent'],
+    ['p', agent], ['harness', 'claude-code'], ['like', 'crystalclaude'], ['consent', GRANT]] }, del)
+  await assert.rejects(h4.runWith(async () => revoked, [backdated]), e => e.code === 'ONBOARD_NOT_OWNER')
+  ok(true, 'a request dated before the revocation is refused just the same: validity never comes from created_at')
 }
 
 // ── The hive join opens a delegate's invite with the delegate's key ─────────────────────────────

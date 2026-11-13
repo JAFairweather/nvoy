@@ -14,7 +14,7 @@ import { joinHive, joinRooms } from './onboard_join.mjs'
 import { readStagedKey } from './onboard_stage.mjs'
 import { familyOf } from './principal_family.mjs'
 import { profileRequestIdsPath, profileResultsPath, profileStatus, queueProfile } from './agent_profile.mjs'
-import { delegateAuthors } from './onboard_delegate.mjs'
+import { delegateAuthors, liveGrantById } from './onboard_delegate.mjs'
 
 
 export const WRITERS_KIND = 30000, WRITERS_D = 'nave-relay-writers'
@@ -67,7 +67,8 @@ export function rewrite(root, id, change, { backupRoot, now }) {
 
 export async function onboard({ command, name, root, out, stateDir, keysPath = '', giversRedeploy = false,
   backupRoot = '/root', fetchEvents, runTool, joinWith, now = () => Date.now(), log = console.log,
-  pair = null, report = null, readWriters = null, verify = () => false, readDelegates = null, delegateTemplates = [], readTermsFor = null }) {
+  pair = null, report = null, readWriters = null, verify = () => false, readDelegates = null, delegateTemplates = [], readTermsFor = null,
+  markTerminal = null }) {
   if (!['show', 'run'].includes(command)) throw new OnboardRefusal('ONBOARD_USAGE', 'command is show or run')
   const ledger = join(stateDir, 'requests.jsonl')
   const rows = lines(ledger), seen = new Set(rows.filter(row => row.finished).map(row => row.id))
@@ -131,6 +132,21 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
   }
   const isInstalled = () => manifests.has(name)
   const stagedPath = join(out, `${name}.json`), stagedFor = join(out, `${name}.request`)
+
+  // A delegate's request is re-checked before every step (DESIGN_ONBOARDING_DELEGATE, "the stop bound"): a
+  // fresh, complete read of grants and 441s, never this run's earlier answer. Unknown does nothing this step
+  // and waits; a grant that is no longer live refuses, before any effect. A refusal before the apply moves the
+  // staged manifest aside, so nothing is seated. `null` means the step may go ahead.
+  const templateGrantors = manifests.get(add.like)?.grantors || []
+  const gate = async step => {
+    if (!add.delegated) return null
+    const fresh = readDelegates ? await readDelegates({ relays, owners }) : null
+    if (!fresh?.known) return receipt(step, 'pending', `grant state unknown${fresh?.reason ? ` (${fresh.reason})` : ''}; nothing was done, and the next run checks again`)
+    if (liveGrantById(fresh, add.signer, add.grantId, templateGrantors)) return null
+    if (!isInstalled() && existsSync(stagedPath) && existsSync(stagedFor) && readFileSync(stagedFor, 'utf8').trim() === add.id)
+      renameSync(stagedPath, `${stagedPath}.revoked-${add.id.slice(0, 12)}`)
+    return receipt(step, 'refused', "delegate revoked: the onboard grant behind this request is no longer live; nothing was done")
+  }
 
   const steps = [
     ['staged', () => {
@@ -314,7 +330,9 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
     if (fed) { receipt('feed_key', fed.state, fed.detail); await publish() }
   }
   try {
-    for (const [index, [, step]] of steps.entries()) {
+    for (const [index, [label, step]] of steps.entries()) {
+      // A held step stops the run: no later step runs on a grant that is unknown or gone.
+      if (await gate(label) !== null) { await publish(); break }
       const done = await step()
       await publish()
       if (!done && index < 4) break
@@ -325,6 +343,9 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
     // operator's `run` has no runner key to seal one, so it leaves the request open for the next watch
     // tick to send the finished receipt; the steps are done, so that tick only reports.
     if (!report) log('pending  finished: every step is done; left open, so the next watch tick sends the owner the finished receipt')
+    // The public terminal marker goes out, and is read back, before the ledger says finished (piece 4's relay
+    // gate reads it). If it does not, the request stays open and the next tick tries again.
+    else if (reported && markTerminal && !(await markTerminal(add.id))) log('pending  finished: every step is done, but the terminal marker is not out yet; the next run tries again')
     else if (reported) appendFileSync(ledger, JSON.stringify({ id: add.id, name, op: 'add_agent', at: now(), finished: true }) + '\n')
     else log('pending  finished: every step is done, but the owner has not been told; the next run sends the receipt again')
   }

@@ -7,9 +7,9 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
-import { OnboardRefusal, RETRY_CODES, SETUP_KIND, SETUP_PREFIX } from './onboard_request.mjs'
+import { MAX_AGE_S, OnboardRefusal, RETRY_CODES, SETUP_KIND, SETUP_PREFIX } from './onboard_request.mjs'
 import { installed, onboard } from './onboard_run.mjs'
-import { latestSteps, makeSealer, receiptBody } from './onboard_receipt.mjs'
+import { delegateReceiptD, latestSteps, makeSealer, receiptBody, terminalEvent } from './onboard_receipt.mjs'
 import { delegateAuthors } from './onboard_delegate.mjs'
 
 const ADD = new RegExp(`^${SETUP_PREFIX.replace(/[/]/g, '\\/')}([a-z0-9][a-z0-9._-]{1,63})\\/add_agent$`, 'i')
@@ -74,7 +74,7 @@ const refusedIds = stateDir => {
 }
 
 export async function watchTick({ root, out, stateDir, runner, fetchAll, fetchEvents, runTool, joinWith, pair, readWriters,
-  publish, signer, verify, installFor, readDelegates = null, readTermsFor = null, now = () => Date.now(), log = console.log }) {
+  publish, signer, verify, installFor, readDelegates = null, readTermsFor = null, readEvent = null, now = () => Date.now(), log = console.log }) {
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
   const manifests = installed(root)
   const owners = [...new Set([...manifests.values()].flatMap(manifest => manifest.grantors))]
@@ -90,10 +90,34 @@ export async function watchTick({ root, out, stateDir, runner, fetchAll, fetchEv
   const read = await fetchAll({ relays, owners, delegates: delegateAuthors(delegates) })
   const incomplete = Array.isArray(read) ? [] : read.incomplete || []
   for (const url of incomplete) log(`warning  ${url} gave an incomplete read of the owner's events (more in one second than a page, or it stopped answering); an unfinished request may not be listed`)
-  const queue = pendingRequests(Array.isArray(read) ? read : read.events, { verify, finished, refused: refusedIds(stateDir) })
+  const refused = refusedIds(stateDir)
+  const seal = makeSealer(signer, { now: () => Math.floor(now() / 1000) })
+  // The public terminal marker: published, then read back from a relay, once per request, before the request is
+  // recorded as finished or set aside. Without a reader (an older caller) no marker goes out and nothing waits on it.
+  const markTerminal = readEvent ? async id => {
+    const done = join(stateDir, `${id}.terminal.json`)
+    if (existsSync(done)) return true
+    try {
+      const event = await signer.signEvent(terminalEvent(id, Math.floor(now() / 1000)))
+      if (event.pubkey !== runner.pubkey) throw new Error('the runner connection signs as another key')
+      const took = (await publish(event)).filter(result => result.accepted).map(result => result.relay)
+      if (!took.length) throw new Error('no relay took it')
+      const back = await readEvent(event, took)
+      if (!back || back.id !== event.id || !verify(back)) throw new Error('it did not read back')
+      writeFileSync(done, JSON.stringify({ id: event.id, at: now(), relays: took }) + '\n', { mode: 0o600 })
+      return true
+    } catch (error) { log(`warning  terminal marker for ${id.slice(0, 12)} not out: ${error.message}; the next tick tries again`); return false }
+  } : null
+  // A request refused in an earlier tick whose marker did not go out tries again, while its request could still count.
+  if (markTerminal) {
+    const cutoff = now() - (MAX_AGE_S + 600) * 1000
+    const recent = new Map([...rows(join(stateDir, 'requests.jsonl')), ...rows(join(stateDir, 'watch-refused.jsonl'))]
+      .filter(row => row?.id && Number(row.at) > cutoff).map(row => [row.id, row]))
+    for (const id of refused) if (recent.has(id) && !existsSync(join(stateDir, `${id}.terminal.json`))) await markTerminal(id)
+  }
+  const queue = pendingRequests(Array.isArray(read) ? read : read.events, { verify, finished, refused })
   if (!queue.length) return { ran: [], incomplete }
 
-  const seal = makeSealer(signer, { now: () => Math.floor(now() / 1000) })
   const ran = []
   for (const { name, id } of queue) {
     log(`watch: ${name}, request ${id.slice(0, 12)}`)
@@ -115,10 +139,21 @@ export async function watchTick({ root, out, stateDir, runner, fetchAll, fetchEv
       for (const result of results.filter(result => !result.accepted)) log(`warning  ${result.relay} did not take the receipt: ${result.message}`)
       if (!took.length) throw new Error('no relay took the receipt')
       writeFileSync(sentPath, JSON.stringify({ digest, at: now(), id: event.id, relays: took }) + '\n', { mode: 0o600 })
+      // A delegate's request: a second copy, sealed to the delegate, without the pairing link, which is the owner's
+      // Bunker approval and only theirs to see. A copy that no relay takes is logged; the owner's receipt stands.
+      if (request.delegated) {
+        const { pairing: _owners, ...own } = body
+        try {
+          const copy = await seal({ owner: request.signer, request: request.id, body: own, d: delegateReceiptD(request.id) })
+          if (copy.pubkey !== runner.pubkey) throw new Error('the runner connection signs as another key')
+          if (!(await publish(copy)).some(result => result.accepted)) throw new Error('no relay took it')
+        } catch (error) { log(`warning  the delegate's receipt copy was not published: ${error.message}`) }
+      }
     }
     try {
       const result = await onboard({ command: 'run', name, root, out, stateDir, keysPath: runner.authorizedKeys, giversRedeploy: false,
-        fetchEvents, runTool, joinWith, now, log, pair, report, readWriters, verify, readDelegates, readTermsFor, delegateTemplates: runner.onboardTemplates || [] })
+        fetchEvents, runTool, joinWith, now, log, pair, report, readWriters, verify, readDelegates, readTermsFor, delegateTemplates: runner.onboardTemplates || [], markTerminal })
+      if (markTerminal && result.receipts.some(row => row.state === 'refused')) await markTerminal(id)
       ran.push({ name, id, receipts: result.receipts })
     } catch (error) {
       // A crash, or no relay answering, leaves everything as it was for the next tick.
@@ -128,7 +163,9 @@ export async function watchTick({ root, out, stateDir, runner, fetchAll, fetchEv
         continue
       }
       // A request that does not qualify is set aside by id, so the next tick does not retry it; a
-      // newer request for the name is a new id.
+      // newer request for the name is a new id. Its terminal marker goes out first; if it does not, it is
+      // not set aside, and the next tick refuses it again and retries the marker.
+      if (markTerminal && !(await markTerminal(id))) { ran.push({ name, id, refused: error.code || 'ERROR', marker: 'pending' }); continue }
       appendFileSync(join(stateDir, 'watch-refused.jsonl'), JSON.stringify({ id, name, at: now(), code: error.code || 'ERROR', detail: error.message }) + '\n')
       log(`refused  ${name}: ${error.code ? `${error.code}: ` : ''}${error.message}`)
       ran.push({ name, id, refused: error.code || 'ERROR' })

@@ -116,7 +116,9 @@ async function watch(runner) {
       const urls = [...new Set([...runner.relays, ...readUrls([])])]
       return Promise.all(urls.map(url => publishRelay(url, event)))
     }
-    const tick = await watchTick({ root, out, stateDir, runner, fetchAll, fetchEvents, runTool, joinWith, pair, readWriters: writersFrom(runner.writerRelay), readDelegates, readTermsFor: relay => readTerms(relay),
+    // The terminal marker reads back from the relays that took it.
+    const readEvent = async (event, relays) => (await readAll(relays, { ids: [event.id] }).catch(() => [])).find(found => found.id === event.id) || null
+    const tick = await watchTick({ root, out, stateDir, runner, fetchAll, fetchEvents, runTool, joinWith, pair, readWriters: writersFrom(runner.writerRelay), readDelegates, readTermsFor: relay => readTerms(relay), readEvent,
       publish, signer, verify,
       installFor: name => readInstallDetails({ instance: name, sshTarget: runner.sshTarget }) })
     const { ran, incomplete } = tick

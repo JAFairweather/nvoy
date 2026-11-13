@@ -163,6 +163,24 @@ A delegate's request is accepted only within the owner's limits (`parseSetupRequ
 - A delegate's `bind_runtime` seats nothing unless the staged key from the agent's box exists and
   matches it.
 - The hive step opens a delegate's sealed invite as sealed by the delegate.
+- **Before every step**, a delegate's request re-reads the grants fresh (the stop bound):
+  - "unknown" does nothing that step, and the run stops and waits;
+  - a grant that is no longer live refuses the step before any effect, and the run stops;
+  - before the apply, the staged manifest is moved aside (`<name>.json.revoked-<request>`), so nothing is seated.
+  The grant checked is the one the request names in `consent`.
+- The watch seals a second receipt copy to the delegate (`d = nvoy-onboard:<request>:delegate`) without
+  `pairing`. The pairing link is the owner's Bunker approval.
+
+## The terminal marker
+
+When a request ends, finished or refused, the watch publishes a public marker signed by the runner:
+- kind 30078, empty content, tags exactly `d = nvoy-onboard:<request>:terminal` and `e = <request>`;
+- it means this request can no longer authorize anything; nave.pub's delegate writer gate reads it.
+
+It must be taken by a relay and read back (verified) before the ledger says `finished`, or before a
+refused request is set aside. Otherwise the request stays open and the next tick tries again. A request
+refused in an earlier tick, within the request window, gets its missing marker retried. Each marker goes
+out once (`<request>.terminal.json`).
 
 ## Failure and replay
 
