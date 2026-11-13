@@ -39,8 +39,13 @@ export function runnerConfig(raw) {
   if (!SSH_TARGET.test(raw.ssh_target || '')) fail('ssh_target must be user@host')
   const writerRelay = raw.writer_relay ?? WRITER_RELAY
   if (!wss(writerRelay)) fail('writer_relay must be a wss:// URL')
+  // The agents a delegate may start a new agent like (DESIGN_ONBOARDING_DELEGATE). Absent or empty: none,
+  // so every delegate request is refused. The owner changes it by a reviewed config change.
+  const templates = raw.onboard_templates ?? []
+  if (!Array.isArray(templates) || !templates.every(id => typeof id === 'string' && /^[a-z0-9][a-z0-9._-]{1,63}$/i.test(id))) fail('onboard_templates must be a list of agent ids')
   return Object.freeze({ id: 'nvoy-onboard', pubkey, relays: [...new Set(raw.relays)], bunkerClientRef: raw.bunker_client_ref,
-    bunkerUriRef: raw.bunker_uri_ref, authorizedKeys: raw.authorized_keys, sshTarget: raw.ssh_target, writerRelay, perms: RUNNER_PERMS })
+    bunkerUriRef: raw.bunker_uri_ref, authorizedKeys: raw.authorized_keys, sshTarget: raw.ssh_target, writerRelay, perms: RUNNER_PERMS,
+    onboardTemplates: Object.freeze([...new Set(templates)]) })
 }
 export const readRunnerConfig = (path = RUNNER_CONFIG) => runnerConfig(JSON.parse(readFileSync(path, 'utf8')))
 

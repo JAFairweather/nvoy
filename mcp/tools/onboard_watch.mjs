@@ -7,7 +7,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
-import { OnboardRefusal, SETUP_KIND, SETUP_PREFIX } from './onboard_request.mjs'
+import { OnboardRefusal, RETRY_CODES, SETUP_KIND, SETUP_PREFIX } from './onboard_request.mjs'
 import { installed, onboard } from './onboard_run.mjs'
 import { latestSteps, makeSealer, receiptBody } from './onboard_receipt.mjs'
 import { delegateAuthors } from './onboard_delegate.mjs'
@@ -74,7 +74,7 @@ const refusedIds = stateDir => {
 }
 
 export async function watchTick({ root, out, stateDir, runner, fetchAll, fetchEvents, runTool, joinWith, pair, readWriters,
-  publish, signer, verify, installFor, readDelegates = null, now = () => Date.now(), log = console.log }) {
+  publish, signer, verify, installFor, readDelegates = null, readTermsFor = null, now = () => Date.now(), log = console.log }) {
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
   const manifests = installed(root)
   const owners = [...new Set([...manifests.values()].flatMap(manifest => manifest.grantors))]
@@ -118,11 +118,11 @@ export async function watchTick({ root, out, stateDir, runner, fetchAll, fetchEv
     }
     try {
       const result = await onboard({ command: 'run', name, root, out, stateDir, keysPath: runner.authorizedKeys, giversRedeploy: false,
-        fetchEvents, runTool, joinWith, now, log, pair, report, readWriters, verify, readDelegates })
+        fetchEvents, runTool, joinWith, now, log, pair, report, readWriters, verify, readDelegates, readTermsFor, delegateTemplates: runner.onboardTemplates || [] })
       ran.push({ name, id, receipts: result.receipts })
     } catch (error) {
       // A crash, or no relay answering, leaves everything as it was for the next tick.
-      if (!(error instanceof OnboardRefusal) || error.code === 'ONBOARD_NO_RELAY') {
+      if (!(error instanceof OnboardRefusal) || RETRY_CODES.includes(error.code)) {
         log(`error    ${name}: ${error.message}; the next tick tries again`)
         ran.push({ name, id, error: error.message })
         continue

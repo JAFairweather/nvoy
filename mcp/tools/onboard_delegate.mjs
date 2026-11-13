@@ -101,5 +101,13 @@ export function liveGrantFor(state, delegate, grantors) {
   return (state.live.get(String(delegate || '').toLowerCase()) || []).find(g => allowed.has(g.grantor)) || null
 }
 
+// The live grant a request names by its signed `consent` id, from one of `grantors`, or null. A delegate may hold
+// more than one live grant; the request is judged against the one it names, never the newest.
+export function liveGrantById(state, delegate, grantId, grantors) {
+  if (!state?.known || typeof grantId !== 'string') return null
+  const allowed = new Set((grantors || []).map(g => String(g).toLowerCase()))
+  return (state.live.get(String(delegate || '').toLowerCase()) || []).find(g => g.grantId === grantId && allowed.has(g.grantor)) || null
+}
+
 // The extra authors a fetch of setup requests reads: every live delegate, never when unknown.
 export const delegateAuthors = state => state?.known ? [...state.live.keys()] : []

@@ -67,7 +67,7 @@ export function rewrite(root, id, change, { backupRoot, now }) {
 
 export async function onboard({ command, name, root, out, stateDir, keysPath = '', giversRedeploy = false,
   backupRoot = '/root', fetchEvents, runTool, joinWith, now = () => Date.now(), log = console.log,
-  pair = null, report = null, readWriters = null, verify = () => false, readDelegates = null }) {
+  pair = null, report = null, readWriters = null, verify = () => false, readDelegates = null, delegateTemplates = [], readTermsFor = null }) {
   if (!['show', 'run'].includes(command)) throw new OnboardRefusal('ONBOARD_USAGE', 'command is show or run')
   const ledger = join(stateDir, 'requests.jsonl')
   const rows = lines(ledger), seen = new Set(rows.filter(row => row.finished).map(row => row.id))
@@ -82,11 +82,21 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
   if (delegates && !delegates.known) log(`warning  grant state unknown (${delegates.reason}); delegate requests are not read`)
   const events = await fetchEvents({ relays, owners, name, delegates: delegateAuthors(delegates) })
   const earlier = rows.filter(row => row.op === 'add_agent' && row.name === name && row.pubkey)
-  const add = parseSetupRequest(newestRequest(events, name, 'add_agent'), { name, manifests, seen, inProgress, earlier, now: now() })
+  // A delegate's request also needs the hive's current terms, read fresh from the template's hive relay, and
+  // the fleet's onboard_templates. An owner's request reads neither.
+  const addEvent = newestRequest(events, name, 'add_agent')
+  let terms = null
+  if (addEvent && delegateAuthors(delegates).includes(addEvent.pubkey)) {
+    const like = (addEvent.tags || []).find(tag => tag[0] === 'like')?.[1]
+    const relay = manifests.get(String(like || ''))?.buzz?.relay
+    terms = relay && readTermsFor ? await readTermsFor(relay) : { ok: false, reason: relay ? 'no terms reader' : 'the template names no hive relay' }
+  }
+  const delegation = delegates ? { state: delegates, templates: delegateTemplates, terms, ledger: rows } : null
+  const add = parseSetupRequest(addEvent, { name, manifests, seen, inProgress, earlier, now: now(), delegation })
   let bind = null
   const bindEvent = newestRequest(events, name, 'bind_runtime')
   if (bindEvent) {
-    bind = parseSetupRequest(bindEvent, { name, manifests, seen, now: now() })
+    bind = parseSetupRequest(bindEvent, { name, manifests, seen, now: now(), delegation })
     if (bind.pubkey !== add.pubkey || bind.owner !== add.owner) throw new OnboardRefusal('ONBOARD_BIND_MISMATCH', 'bind_runtime names a different key or owner than add_agent')
     // Both signed fields must agree, exactly: the harness decides which principals are seated and `like` which template
     // the agent started like. A bind for another harness, or another template, is a different intent, not a variant.
@@ -103,7 +113,7 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
 
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
   if (!inProgress.has(add.id)) appendFileSync(ledger, JSON.stringify({ id: add.id, name, op: 'add_agent', at: now(),
-    pubkey: add.pubkey, owner: add.owner, harness: add.harness, like: add.like }) + '\n')
+    pubkey: add.pubkey, owner: add.owner, signer: add.signer, harness: add.harness, like: add.like }) + '\n')
   const receiptPath = join(stateDir, `${add.id}.jsonl`), receipts = []
   const receipt = (step, state, detail) => {
     const row = { step, state, at: now(), detail }
@@ -190,6 +200,8 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
       for (const role of two ? ['channel', 'feed'] : ['channel']) {
         const again = readStagedKey({ stateDir, request: add.id, instance: name, role, bound: role === 'feed' ? bind.feedKey : bind.channelKey })
         if (again?.state === 'refused') return receipt('started', 'refused', again.detail)
+        // A delegate may bind only the key the agent's own box made: the staged file is mandatory and must match.
+        if (bind.delegated && again?.state !== 'done') return receipt('started', 'refused', `a delegate's bind needs the ${role} key staged from the agent's box, and none is; nothing was seated`)
       }
       if (two) {
         if (!bind.feedKey) return receipt('started', 'refused', 'the bind carries no feed key, so a second principal cannot be seated')

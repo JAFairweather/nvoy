@@ -29,6 +29,7 @@ import { onboard, WRITERS_D, WRITERS_KIND } from './onboard_run.mjs'
 import { readInstallDetails, readRunnerConfig, WRITER_RELAY } from './onboard_receipt.mjs'
 import { readPages, watchTick } from './onboard_watch.mjs'
 import { readOnboardGrants } from './onboard_delegate.mjs'
+import { readTerms } from './onboard_join.mjs'
 import { scopeHash } from './grant_fold.mjs'
 import { pairInstance } from './instance-pair.mjs'
 import { readManifest } from './runtime_manifest.mjs'
@@ -115,7 +116,7 @@ async function watch(runner) {
       const urls = [...new Set([...runner.relays, ...readUrls([])])]
       return Promise.all(urls.map(url => publishRelay(url, event)))
     }
-    const tick = await watchTick({ root, out, stateDir, runner, fetchAll, fetchEvents, runTool, joinWith, pair, readWriters: writersFrom(runner.writerRelay), readDelegates,
+    const tick = await watchTick({ root, out, stateDir, runner, fetchAll, fetchEvents, runTool, joinWith, pair, readWriters: writersFrom(runner.writerRelay), readDelegates, readTermsFor: relay => readTerms(relay),
       publish, signer, verify,
       installFor: name => readInstallDetails({ instance: name, sshTarget: runner.sshTarget }) })
     const { ran, incomplete } = tick
