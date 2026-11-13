@@ -276,11 +276,13 @@ export function readManifest(root, requestedId) {
   let mayRecall = null
   if (raw.may_recall != null) {
     const block = raw.may_recall
-    if (typeof block !== 'object' || Array.isArray(block) || Object.keys(block).some(k => k !== 'read')) die('may_recall takes only read')
+    if (typeof block !== 'object' || Array.isArray(block) || Object.keys(block).some(k => !['read', 'gateway_gid'].includes(k))) die('may_recall takes only read and gateway_gid')
     const read = storeTransport(block.read)
     if (!read) die('may_recall.read takes exactly one of socket (an absolute path) or command (an absolute executable and its arguments)')
     if (brokerMode !== 'local' || deliveryMode !== 'notify_only' || workerEnabled) die('may_recall requires a local-broker, worker-disabled notify_only manifest')
-    mayRecall = Object.freeze({ read })
+    const gatewayGid = block.gateway_gid == null ? null : block.gateway_gid
+    if (gatewayGid !== null && (!Number.isSafeInteger(gatewayGid) || gatewayGid < 1 || gatewayGid === brokerAdapterGid || gatewayGid === workerHandoffGid)) die('may_recall.gateway_gid must be a dedicated positive group ID')
+    mayRecall = Object.freeze({ read, gatewayGid })
   }
   let maySetProfile = null
   if (raw.may_set_profile != null) {
@@ -338,7 +340,8 @@ export function assertNoCollisions(root, candidate) {
     const id = name.slice(0, -5)
     let m
     try { m = readManifest(canonicalRoot, id) } catch (e) { die(`invalid manifest ${name}: ${e.message}`) }
-    for (const [field, value] of [['pubkey', m.pubkey], ['stateDir', m.stateDir], ['runtimeDir', m.runtimeDir], ['spoolDir', m.spoolDir]]) {
+    for (const [field, value] of [['pubkey', m.pubkey], ['stateDir', m.stateDir], ['runtimeDir', m.runtimeDir], ['spoolDir', m.spoolDir],
+      ...(m.mayRecall?.gatewayGid ? [['recallGatewayGid', m.mayRecall.gatewayGid]] : [])]) {
       const key = `${field}:${value}`
       if (seen.has(key)) die(`${field} collision between ${seen.get(key)} and ${m.id}`)
       seen.set(key, m.id)
