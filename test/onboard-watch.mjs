@@ -344,6 +344,24 @@ assert.ok(markers().some(ev => ev.tags.some(t => t[0] === 'e' && t[1] === sAdd.i
   assert.ok(ownerCopy.some(ev => openAs(owner, ev).pairing), 'the pairing link reaches the owner')
   assert.ok(delCopy.every(ev => !('pairing' in openAs(delKey, ev))), 'and never the delegate')
   assert.ok(delCopy.every(ev => openAs(delKey, ev).request === dAdd.id), 'the delegate can read its own request\'s progress')
+
+  // A delegate copy that no relay takes is not lost: the run does not count the request as reported, and the
+  // next tick sends that copy again, even though the owner's copy is unchanged and inside its heartbeat.
+  const d2State = join(tmp, 'state-delegate-2')
+  let delegateTakes = false
+  const isDelegateCopy = ev => /:delegate$/.test(ev.tags.find(t => t[0] === 'd')?.[1] || '')
+  const flaky = async ev => { if (!delegateTakes && isDelegateCopy(ev)) return [{ relay: 'wss://relay.nave.pub', accepted: false, message: 'blocked' }]; published.push(ev); return [{ relay: 'wss://relay.nave.pub', accepted: true }] }
+  const ticked = () => tick({ ...member, stateDir: d2State, runner: { ...runner, onboardTemplates: ['crystalclaude'] }, readDelegates: async () => live,
+    readTermsFor: async () => ({ ok: true, version: 'terms-v3' }), publish: flaky })
+  lines = []
+  const mark = published.length
+  await ticked()
+  assert.ok(!published.slice(mark).some(isDelegateCopy) && lines.some(l => /receipt not published: no relay took the delegate's receipt copy/.test(l)), "a delegate copy no relay takes is reported as not published")
+  delegateTakes = true; clock += 30_000
+  const mark2 = published.length
+  await ticked()
+  assert.ok(published.slice(mark2).some(isDelegateCopy), 'the next tick sends the delegate copy again, inside the owner copy\'s heartbeat')
+  assert.ok(existsSync(join(d2State, `${dAdd.id}.delegate-receipt.json`)), 'and records it as sent')
 }
 
 // No trusted owner yet: nothing is read.

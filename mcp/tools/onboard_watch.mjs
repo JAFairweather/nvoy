@@ -128,26 +128,27 @@ export async function watchTick({ root, out, stateDir, runner, fetchAll, fetchEv
         try { install = installFor(name) } catch (error) { log(`warning  no install details in the receipt: ${error.message}`) }
       }
       const body = receiptBody({ name, request: request.id, instance: name, rows: all, pairing, install })
-      // Stamps aside, an unchanged receipt goes out only on the heartbeat. Each link is new, so it differs.
-      const digest = createHash('sha256').update(JSON.stringify({ ...body, steps: body.steps.map(({ at, ...step }) => step) })).digest('hex')
-      const last = existsSync(sentPath) ? JSON.parse(readFileSync(sentPath, 'utf8')) : null
-      if (last?.digest === digest && now() - last.at < HEARTBEAT_MS) return
-      const event = await seal({ owner: request.owner, request: request.id, body })
-      if (event.pubkey !== runner.pubkey) throw new Error('the runner connection signs as another key; nothing published')
-      const results = await publish(event)
-      const took = results.filter(result => result.accepted).map(result => result.relay)
-      for (const result of results.filter(result => !result.accepted)) log(`warning  ${result.relay} did not take the receipt: ${result.message}`)
-      if (!took.length) throw new Error('no relay took the receipt')
-      writeFileSync(sentPath, JSON.stringify({ digest, at: now(), id: event.id, relays: took }) + '\n', { mode: 0o600 })
+      // Each copy is tracked on its own: stamps aside, an unchanged copy goes out only on the heartbeat (each link is
+      // new, so it differs). A copy no relay takes throws, so the run does not count the request as reported, and
+      // never marks it finished; the next tick sends that copy again even when the other one is up to date.
+      const send = async ({ path, to, content, d, what }) => {
+        const digest = createHash('sha256').update(JSON.stringify({ ...content, steps: content.steps.map(({ at, ...step }) => step) })).digest('hex')
+        const last = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : null
+        if (last?.digest === digest && now() - last.at < HEARTBEAT_MS) return
+        const event = await seal({ owner: to, request: request.id, body: content, ...(d ? { d } : {}) })
+        if (event.pubkey !== runner.pubkey) throw new Error('the runner connection signs as another key; nothing published')
+        const results = await publish(event)
+        const took = results.filter(result => result.accepted).map(result => result.relay)
+        for (const result of results.filter(result => !result.accepted)) log(`warning  ${result.relay} did not take the ${what}: ${result.message}`)
+        if (!took.length) throw new Error(`no relay took the ${what}`)
+        writeFileSync(path, JSON.stringify({ digest, at: now(), id: event.id, relays: took }) + '\n', { mode: 0o600 })
+      }
+      await send({ path: sentPath, to: request.owner, content: body, what: 'receipt' })
       // A delegate's request: a second copy, sealed to the delegate, without the pairing link, which is the owner's
-      // Bunker approval and only theirs to see. A copy that no relay takes is logged; the owner's receipt stands.
+      // Bunker approval and only theirs to see.
       if (request.delegated) {
         const { pairing: _owners, ...own } = body
-        try {
-          const copy = await seal({ owner: request.signer, request: request.id, body: own, d: delegateReceiptD(request.id) })
-          if (copy.pubkey !== runner.pubkey) throw new Error('the runner connection signs as another key')
-          if (!(await publish(copy)).some(result => result.accepted)) throw new Error('no relay took it')
-        } catch (error) { log(`warning  the delegate's receipt copy was not published: ${error.message}`) }
+        await send({ path: join(stateDir, `${id}.delegate-receipt.json`), to: request.signer, content: own, d: delegateReceiptD(request.id), what: "delegate's receipt copy" })
       }
     }
     try {
