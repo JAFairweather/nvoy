@@ -108,6 +108,17 @@ export function readCuratorStateFile(stateFilePath) {
     topic_reorganizations: Array.isArray(raw.topic_reorganizations)
       ? raw.topic_reorganizations.map(r => ({ ...r, persisted: r?.persisted !== false, simulated: Boolean(r?.simulated) }))
       : null,
+    eigen_axis_proposals: Array.isArray(raw.eigen_axis_proposals)
+      ? raw.eigen_axis_proposals.map(p => ({
+          ...p,
+          counterfactual: true,
+          approval_required: true,
+          status: p?.status === 'approved' ? 'approved' : 'pending_james_approval',
+        }))
+      : null,
+    approved_axis_proposals: Array.isArray(raw.approved_axis_proposals)
+      ? raw.approved_axis_proposals.filter(x => typeof x === 'string')
+      : [],
     pending_curated_at: typeof raw.pending_curated_at === 'number' && Number.isFinite(raw.pending_curated_at) ? raw.pending_curated_at : null,
     pending_curated_write_seq: typeof raw.pending_curated_write_seq === 'number' && Number.isFinite(raw.pending_curated_write_seq) ? raw.pending_curated_write_seq : null,
     pending_dream_packet: raw.pending_dream_packet && typeof raw.pending_dream_packet === 'object' ? raw.pending_dream_packet : null,
@@ -391,13 +402,23 @@ export function weaveDreamStory({
   }
 }
 
+export function curationObservationEnd(ranAt, submitted = []) {
+  return Math.max(ranAt, ...(Array.isArray(submitted) ? submitted : [])
+    .map(s => Number.isSafeInteger(s?.created_at) ? s.created_at : ranAt))
+}
+
 export function buildDreamPacket({
   lastCuratedWriteSeq = 0,
+  lastCuratedAt = 0,
   writeSeqBefore = 0,
   writeSeqAfter = 0,
   ranAt = Math.floor(Date.now() / 1000),
   ledgerRef = null,
   coherenceScore = null,
+  coherenceBefore = null,
+  coherenceAfter = null,
+  historyRecords = [],
+  historyComplete = false,
   triggers = null,
   plan = null,
   submitted = [],
@@ -504,6 +525,54 @@ export function buildDreamPacket({
   }))
 
   const packetId = `dream-${writeSeqAfter}`
+  // Count the complete post-write history since the preceding completed curation.
+  // A missing post-write snapshot is unknown, never a measured zero.
+  const windowStart = Number(lastCuratedAt || 0)
+  // The writer may advance a replacement's created_at past the cycle clock to
+  // follow its prior claim. That accepted write belongs in this cycle's window.
+  const windowEnd = curationObservationEnd(ranAt, submitted)
+  const history = (Array.isArray(historyRecords) ? historyRecords : [])
+    .filter(r => r && r.scope === allowedScope && Number.isFinite(r.created_at) && r.created_at <= windowEnd)
+    .sort((a, b) => a.created_at - b.created_at || String(b.event_id || '').localeCompare(String(a.event_id || '')))
+  const inWindow = r => r.created_at > windowStart
+  const later = (next, r) => next.event_id !== r.event_id &&
+    (next.created_at > r.created_at || (next.created_at === r.created_at && String(next.event_id) < String(r.event_id)))
+  const withdrawn = historyComplete ? history.filter(r => inWindow(r) && (r.status === 'withdrawn' || r.verification === 'withdrawn')).length : null
+  const expired = historyComplete ? history.filter(r => r.status !== 'withdrawn' && r.verification !== 'withdrawn' &&
+    Number.isFinite(r.expires_at) && r.expires_at > windowStart && r.expires_at <= windowEnd &&
+    !history.some(next => next.author_pubkey === r.author_pubkey && next.d === r.d && later(next, r) &&
+      next.created_at <= r.expires_at)).length : null
+  const heads = new Map()
+  let superseded = 0
+  for (const r of history) {
+    const key = `${r.author_pubkey || ''}:${r.d || ''}`
+    if (r.status === 'withdrawn' || r.verification === 'withdrawn') {
+      heads.delete(key)
+    } else {
+      const prior = heads.get(key)
+      if (inWindow(r) && prior && (prior.expires_at === null || prior.expires_at === undefined || prior.expires_at > r.created_at)) {
+        superseded++
+      }
+      heads.set(key, r)
+    }
+  }
+  const folded = [...new Set([
+    ...(Array.isArray(plan?.promotions) ? plan.promotions : []),
+    ...(Array.isArray(plan?.distillations) ? plan.distillations : []),
+  ].filter(p => p.scope === allowedScope && submittedByD.has(p.template?.tags?.find(t => t[0] === 'd')?.[1] ||
+    `${p.topic}:${p.scope}:${p.slug}`)).flatMap(p => Array.isArray(p.source_event_ids) ? p.source_event_ids : []))].length
+  const merged = changes.filter(c => c.kind === 'promotion' || c.kind === 'distillation').length
+  const beforeScore = Number.isFinite(coherenceBefore) ? coherenceBefore : null
+  const afterScore = Number.isFinite(coherenceAfter) ? coherenceAfter : null
+  const stats = {
+    window_start: historyComplete ? windowStart || null : null,
+    window_end: historyComplete ? windowEnd : null,
+    claims_merged: merged,
+    claims_superseded: historyComplete ? superseded : null,
+    retired: { withdrawn, expired, folded, total: historyComplete ? withdrawn + expired + folded : null },
+    coherence: { before: beforeScore, after: afterScore,
+      delta: beforeScore !== null && afterScore !== null ? Math.round((afterScore - beforeScore) * 10) / 10 : null },
+  }
   const storySeed = weaveDreamStory({
     id: packetId,
     changes,
@@ -527,6 +596,7 @@ export function buildDreamPacket({
     triggers: Array.isArray(triggers?.reasons) ? triggers.reasons : [],
     topic_eigenvectors: normalizedEigenvectors,
     story_seed: storySeed,
+    stats,
     changes,
   }
 }
@@ -663,14 +733,17 @@ function tokenize(text) {
   )
 }
 
-export function tokenJaccard(aText, bText) {
-  const a = tokenize(aText)
-  const b = tokenize(bText)
-  if (!a.size || !b.size) return 0
+export function tokenSetJaccard(a, b) {
+  if (!a?.size || !b?.size) return 0
   let inter = 0
-  for (const w of a) if (b.has(w)) inter += 1
+  const [smaller, larger] = a.size <= b.size ? [a, b] : [b, a]
+  for (const w of smaller) if (larger.has(w)) inter += 1
   const union = a.size + b.size - inter
   return union > 0 ? inter / union : 0
+}
+
+export function tokenJaccard(aText, bText) {
+  return tokenSetJaccard(tokenize(aText), tokenize(bText))
 }
 
 function extractWorkSubject(rec) {
@@ -730,15 +803,609 @@ function extractClaimFeatures(rec) {
   return weights
 }
 
+const SUB_AXIS_STOPWORDS = new Set([
+  'status', 'owner', 'review', 'claim', 'claims', 'merged', 'approved', 'updated', 'verified', 'passed',
+  'check', 'checks', 'head', 'commit', 'branch', 'test', 'tests', 'true', 'false', 'room', 'scope',
+  'topic', 'memory', 'hive', 'herd', 'infra', 'cloud', 'agent', 'agents', 'next', 'relied', 'curated',
+  'decision', 'distilled', 'promoted', 'active', 'ready', 'done', 'open', 'closed', 'fixed', 'fix',
+  'issue', 'pull', 'request', 'repo', 'path', 'subj', 'file', 'line', 'lines', 'code', 'work', 'task',
+  'tasks', 'step', 'steps', 'runs', 'run', 'running', 'live', 'current', 'latest', 'prior', 'new',
+  'old', 'via', 'with', 'from', 'into', 'over', 'under', 'after', 'before', 'when', 'where', 'while',
+  'that', 'this', 'these', 'those', 'have', 'has', 'had', 'been', 'were', 'was', 'are', 'will', 'would',
+  'should', 'could', 'must', 'only', 'also', 'both', 'each', 'every', 'some', 'more', 'most', 'other',
+  'such', 'than', 'then', 'them', 'they', 'their', 'there', 'here', 'what', 'which', 'who', 'whom',
+  'whose', 'why', 'how', 'all', 'any', 'none', 'not', 'nor', 'but', 'and', 'for', 'the', 'use', 'used',
+  'using', 'make', 'made', 'take', 'took', 'taken', 'keep', 'kept', 'set', 'sets', 'get', 'gets', 'got',
+  'add', 'added', 'adds', 'update', 'updates', 'change', 'changes', 'changed', 'verify', 'verifies',
+  'confirm', 'confirmed', 'confirms', 'ensure', 'ensures', 'ensured', 'burndown', 'item', 'items',
+  'james', 'mydude', 'biggy', 'neil', 'kerouac', 'crusty', 'curator', 'rabbit', 'dead', 'claude', 'codex',
+  'lukedog', 'pidog', 'waggle', 'nvoy', 'buzz',
+])
+
+function extractSampleClaimSummary(rec) {
+  const dStr = String(rec?.d || '')
+  const parsed = parseFactKey(dStr)
+  const slug = parsed?.slug || dStr.split(':').pop() || dStr || 'claim'
+  const preview = String(rec?.claim || rec?.claim_preview || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 140)
+  return {
+    event_id: rec?.event_id || null,
+    d: dStr || null,
+    slug,
+    author: rec?.author || (rec?.author_pubkey ? String(rec.author_pubkey).slice(0, 8) : 'unknown'),
+    claim_preview: preview,
+  }
+}
+
+function cleanLexicalTermForSubAxis(feat, parentTopicTokens) {
+  const raw = String(feat || '')
+    .replace(/^(?:repo|path|subj):/i, '')
+    .toLowerCase()
+  const parts = raw
+    .split(/[^a-z0-9]+/)
+    .filter(
+      p =>
+        p.length >= 3 &&
+        !/^\d+$/.test(p) &&
+        !/^pr\d+$/i.test(p) &&
+        !/^v\d+$/i.test(p) &&
+        !SUB_AXIS_STOPWORDS.has(p) &&
+        !parentTopicTokens.has(p)
+    )
+  return parts[0] || null
+}
+
+// Evaluates deterministic partition coherence on [0, 100] (coherence points) for a fixed corpus under a given topic assignment.
+// Used strictly to compute signed counterfactual `coherence_delta` (in coherence points, `pts`) per proposal without mutating records or charts.
+function evaluateCorpusTopicPartitionCoherence(activeClaims, claimUnitVectors, topicForClaimFn, nowSec) {
+  const N = activeClaims.length
+  if (N === 0) return 0
+  const dim = claimUnitVectors[0]?.length || 0
+  if (dim === 0) return 0
+
+  const groups = new Map()
+  for (let i = 0; i < N; i++) {
+    const top = topicForClaimFn(activeClaims[i], i)
+    if (!top) continue
+    let g = groups.get(top)
+    if (!g) {
+      g = { indices: [], writes7d: 0, classB: 0 }
+      groups.set(top, g)
+    }
+    g.indices.push(i)
+    const r = activeClaims[i]
+    if ((r.created_at || 0) >= nowSec - 7 * 86400) g.writes7d += 1
+    if (r.expires_at === null || r.expires_at === undefined || r.retention === 'decision') g.classB += 1
+  }
+
+  const groupKeys = [...groups.keys()]
+  if (groupKeys.length === 0) return 0
+
+  const centroids = new Map()
+  let weightedIntraSum = 0
+  let totalAssigned = 0
+
+  for (const top of groupKeys) {
+    const g = groups.get(top)
+    const c = new Float64Array(dim)
+    for (const idx of g.indices) {
+      const v = claimUnitVectors[idx]
+      for (let f = 0; f < dim; f++) c[f] += v[f]
+    }
+    let norm = 0
+    for (let f = 0; f < dim; f++) norm += c[f] * c[f]
+    norm = Math.sqrt(norm) || 1
+    for (let f = 0; f < dim; f++) c[f] /= norm
+    centroids.set(top, c)
+
+    for (const idx of g.indices) {
+      const v = claimUnitVectors[idx]
+      let dot = 0
+      for (let f = 0; f < dim; f++) dot += v[f] * c[f]
+      weightedIntraSum += Math.max(0, dot)
+      totalAssigned += 1
+    }
+  }
+
+  const baseIntraScore = totalAssigned > 0 ? (weightedIntraSum / totalAssigned) * 100 : 0
+
+  // Penalty for overlapping topic centroids (cosine >= 0.55)
+  let overlapPenalty = 0
+  for (let i = 0; i < groupKeys.length; i++) {
+    for (let j = i + 1; j < groupKeys.length; j++) {
+      const tA = groupKeys[i]
+      const tB = groupKeys[j]
+      const cA = centroids.get(tA)
+      const cB = centroids.get(tB)
+      let cos = 0
+      for (let f = 0; f < dim; f++) cos += cA[f] * cB[f]
+      if (cos >= 0.55) {
+        const massShare = (groups.get(tA).indices.length + groups.get(tB).indices.length) / Math.max(1, totalAssigned)
+        overlapPenalty += massShare * (cos - 0.35) * 42
+      }
+    }
+  }
+
+  // Penalty for idle low-Class-B topics (0 writes in 7d, <= 3 Class B claims)
+  let idlePenalty = 0
+  for (const top of groupKeys) {
+    const g = groups.get(top)
+    if (g.writes7d === 0 && g.classB <= 3) {
+      idlePenalty += ((g.indices.length + 1) / (totalAssigned + 10)) * 22
+    }
+  }
+
+  return Math.max(0, Math.min(100, baseIntraScore - overlapPenalty - idlePenalty))
+}
+
+function buildCounterfactualCoherenceMetrics(baselineCoherence, cfCoherence) {
+  const baselineRounded = Math.round(baselineCoherence * 10) / 10
+  const counterfactualRounded = Math.round(cfCoherence * 10) / 10
+  const rawDelta = Math.round((cfCoherence - baselineCoherence) * 10) / 10
+  const coherenceDelta = Object.is(rawDelta, -0) ? 0 : rawDelta
+  const sign = coherenceDelta > 0 ? '+' : ''
+  return {
+    coherence_delta: coherenceDelta,
+    coherence_delta_units: 'coherence_points',
+    coherence_delta_label: `${sign}${coherenceDelta.toFixed(1)} pts`,
+    baseline_partition_coherence: Object.is(baselineRounded, -0) ? 0 : baselineRounded,
+    counterfactual_partition_coherence: Object.is(counterfactualRounded, -0) ? 0 : counterfactualRounded,
+  }
+}
+
+// Computes eigen-axis proposals for James's review & approval:
+//   1. Intra-topic TF-IDF clustering for large topics (>= 25 claims, e.g. herd-infra, hive-memory, r1),
+//      proposing named sub-axes `<topic>-<top-terms>` when a cluster is coherent (mean intra-cosine >= 0.35, size >= 8).
+//   2. Merge proposals for topics whose TF-IDF centroids overlap (cosine >= 0.55).
+//   3. Retirement proposals for idle topics (0 writes in 7d, <= 3 Class B claims).
+//   4. Signed counterfactual `coherence_delta` (coherence points on [0, 100], `pts`) per proposal evaluated on the fixed corpus without re-filing claims.
+export function computeEigenAxisProposals(
+  records = [],
+  {
+    nowSec = Math.floor(Date.now() / 1000),
+    largeTopicMinClaims = 25,
+    minSubAxisSize = 8,
+    minIntraCosine = 0.35,
+    minMergeCosine = 0.55,
+    retireIdleWindowSec = 7 * 86400,
+    retireMaxClassB = 3,
+    approvedProposalIds = [],
+  } = {}
+) {
+  const active = (Array.isArray(records) ? records : []).filter(
+    r => r && r.verification !== 'withdrawn' && r.status !== 'withdrawn' && r.scope !== 'hive:canon'
+  )
+  if (active.length === 0) return []
+
+  const approvedSet = new Set(Array.isArray(approvedProposalIds) ? approvedProposalIds : [])
+  const docFreq = new Map()
+  const rawFeaturesPerClaim = []
+  const topicGroups = new Map()
+
+  for (let i = 0; i < active.length; i++) {
+    const r = active[i]
+    const feats = extractClaimFeatures(r)
+    rawFeaturesPerClaim.push(feats)
+    for (const f of feats.keys()) {
+      docFreq.set(f, (docFreq.get(f) || 0) + 1)
+    }
+    const rawTop = String(r.topic || 'untagged').trim()
+    const normTop = normalizeMemoryTopic(rawTop) || rawTop
+    if (!topicGroups.has(normTop)) topicGroups.set(normTop, [])
+    topicGroups.get(normTop).push({ rec: r, index: i })
+  }
+
+  const N = active.length
+  const vocab = [...docFreq.entries()]
+    .filter(([f, df]) => df >= 2 || f.startsWith('repo:') || f.startsWith('path:') || f.startsWith('subj:'))
+    .map(([f]) => f)
+    .sort()
+  const vocabIndex = new Map(vocab.map((f, i) => [f, i]))
+  const F = vocab.length
+  if (F === 0) return []
+
+  // Global L2-normalized TF-IDF vector per active claim
+  const claimUnitVectors = active.map((_, idx) => {
+    const vec = new Float64Array(F)
+    const feats = rawFeaturesPerClaim[idx]
+    for (const [f, w] of feats.entries()) {
+      const fi = vocabIndex.get(f)
+      if (fi === undefined) continue
+      const idf = Math.log(1 + N / Math.max(1, docFreq.get(f) || 1))
+      vec[fi] += w * idf
+    }
+    let norm = 0
+    for (let fi = 0; fi < F; fi++) norm += vec[fi] * vec[fi]
+    norm = Math.sqrt(norm) || 1
+    for (let fi = 0; fi < F; fi++) vec[fi] /= norm
+    return vec
+  })
+
+  const baseTopics = [...topicGroups.keys()].sort((a, b) => {
+    const diff = topicGroups.get(b).length - topicGroups.get(a).length
+    return diff !== 0 ? diff : a.localeCompare(b)
+  })
+  const baselineAssignment = active.map(r => {
+    const rawTop = String(r.topic || 'untagged').trim()
+    return normalizeMemoryTopic(rawTop) || rawTop
+  })
+  const baselineCoherence = evaluateCorpusTopicPartitionCoherence(
+    active,
+    claimUnitVectors,
+    (_r, idx) => baselineAssignment[idx],
+    nowSec
+  )
+
+  const proposals = []
+
+  // ── 1. Intra-topic TF-IDF Sub-Axis Clustering for large topics (>= largeTopicMinClaims) ──
+  for (const topic of baseTopics) {
+    const entries = topicGroups.get(topic) || []
+    if (entries.length < largeTopicMinClaims) continue
+
+    const parentTokens = new Set(topic.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean))
+    const topicDocFreq = new Map()
+    const localFeats = entries.map(({ rec, index }) => {
+      const m = new Map()
+      const rawFeats = rawFeaturesPerClaim[index] || extractClaimFeatures(rec)
+      for (const [f, w] of rawFeats.entries()) {
+        const cleanTerm = cleanLexicalTermForSubAxis(f, parentTokens)
+        if (!cleanTerm) continue
+        m.set(cleanTerm, (m.get(cleanTerm) || 0) + w)
+      }
+      for (const t of m.keys()) {
+        topicDocFreq.set(t, (topicDocFreq.get(t) || 0) + 1)
+      }
+      return m
+    })
+
+    const localVocab = [...topicDocFreq.entries()]
+      .filter(([, df]) => df >= 2 && df <= Math.max(2, Math.floor(entries.length * 0.85)))
+      .map(([t]) => t)
+      .sort()
+    const localVocabIdx = new Map(localVocab.map((t, i) => [t, i]))
+    const LF = localVocab.length
+    if (LF === 0) continue
+
+    const localVecs = localFeats.map(m => {
+      const v = new Float64Array(LF)
+      for (const [t, w] of m.entries()) {
+        const li = localVocabIdx.get(t)
+        if (li === undefined) continue
+        const idf = Math.log(1 + entries.length / Math.max(1, topicDocFreq.get(t) || 1))
+        v[li] += w * idf
+      }
+      let norm = 0
+      for (let li = 0; li < LF; li++) norm += v[li] * v[li]
+      norm = Math.sqrt(norm) || 1
+      for (let li = 0; li < LF; li++) v[li] /= norm
+      return v
+    })
+
+    const E = entries.length
+    const dotMat = new Float64Array(E * E)
+    for (let i = 0; i < E; i++) {
+      dotMat[i * E + i] = 1
+      const va = localVecs[i]
+      for (let j = i + 1; j < E; j++) {
+        const vb = localVecs[j]
+        let s = 0
+        for (let li = 0; li < LF; li++) s += va[li] * vb[li]
+        dotMat[i * E + j] = s
+        dotMat[j * E + i] = s
+      }
+    }
+    const dotLocal = (i, j) => dotMat[i * E + j]
+
+    const assignedLocal = new Set()
+    const usedSubAxisNames = new Set()
+
+    for (let pass = 0; pass < 3; pass++) {
+      let bestCluster = null
+      let bestScore = -1
+
+      for (let seed = 0; seed < entries.length; seed++) {
+        if (assignedLocal.has(seed)) continue
+        const initial = []
+        for (let j = 0; j < entries.length; j++) {
+          if (assignedLocal.has(j)) continue
+          if (j === seed || dotLocal(seed, j) >= 0.28) initial.push(j)
+        }
+        if (initial.length < minSubAxisSize) continue
+
+        // Compute unit centroid of initial neighborhood and refine members
+        const centroid = new Float64Array(LF)
+        for (const j of initial) {
+          for (let li = 0; li < LF; li++) centroid[li] += localVecs[j][li]
+        }
+        let cNorm = 0
+        for (let li = 0; li < LF; li++) cNorm += centroid[li] * centroid[li]
+        cNorm = Math.sqrt(cNorm) || 1
+        for (let li = 0; li < LF; li++) centroid[li] /= cNorm
+
+        const refined = []
+        for (let j = 0; j < entries.length; j++) {
+          if (assignedLocal.has(j)) continue
+          let sim = 0
+          for (let li = 0; li < LF; li++) sim += localVecs[j][li] * centroid[li]
+          if (sim >= 0.5) refined.push({ localIdx: j, sim })
+        }
+        if (refined.length < minSubAxisSize) continue
+
+        // Compute exact mean pairwise intra-cluster cosine similarity
+        const members = refined.map(x => x.localIdx)
+        let pairSum = 0
+        let pairCount = 0
+        for (let a = 0; a < members.length; a++) {
+          for (let b = a + 1; b < members.length; b++) {
+            pairSum += dotLocal(members[a], members[b])
+            pairCount += 1
+          }
+        }
+        const meanIntra = pairCount > 0 ? pairSum / pairCount : 0
+        if (meanIntra < minIntraCosine) continue
+
+        const score = members.length * meanIntra
+        if (score > bestScore) {
+          bestScore = score
+          bestCluster = { members, refined, meanIntra }
+        }
+      }
+
+      if (!bestCluster) break
+      for (const m of bestCluster.members) assignedLocal.add(m)
+
+      // Rank top distinguishing lexical terms in the cluster
+      const termWeights = new Float64Array(LF)
+      for (const m of bestCluster.members) {
+        for (let li = 0; li < LF; li++) termWeights[li] += localVecs[m][li]
+      }
+      const rankedTerms = localVocab
+        .map((t, li) => ({ term: t, weight: termWeights[li] }))
+        .filter(x => x.weight > 0)
+        .sort((a, b) => b.weight - a.weight || a.term.localeCompare(b.term))
+        .map(x => x.term)
+
+      const topTerms = rankedTerms.slice(0, 4)
+      const suffixTerms = topTerms.slice(0, 2)
+      if (suffixTerms.length === 0) continue
+      const proposedTopic = `${topic}-${suffixTerms.join('-')}`
+      if (usedSubAxisNames.has(proposedTopic)) continue
+      usedSubAxisNames.add(proposedTopic)
+
+      const globalIndices = new Set(bestCluster.members.map(m => entries[m].index))
+      const cfCoherence = evaluateCorpusTopicPartitionCoherence(
+        active,
+        claimUnitVectors,
+        (_r, idx) => (globalIndices.has(idx) ? proposedTopic : baselineAssignment[idx]),
+        nowSec
+      )
+      const cfMetrics = buildCounterfactualCoherenceMetrics(baselineCoherence, cfCoherence)
+
+      const sortedSamples = [...bestCluster.refined]
+        .sort((a, b) => b.sim - a.sim)
+        .slice(0, 4)
+        .map(x => extractSampleClaimSummary(entries[x.localIdx].rec))
+
+      const clusterRecords = bestCluster.members.map(m => entries[m].rec)
+      const writes7d = clusterRecords.filter(r => (r.created_at || 0) >= nowSec - retireIdleWindowSec).length
+      const classBCount = clusterRecords.filter(
+        r => r.expires_at === null || r.expires_at === undefined || r.retention === 'decision'
+      ).length
+      const proposalId = `split:${topic}->${proposedTopic}`
+
+      proposals.push({
+        proposal_id: proposalId,
+        kind: 'split',
+        action_label: 'Sub-Axis Split',
+        from_topic: topic,
+        to_topic: proposedTopic,
+        proposed_topic: proposedTopic,
+        parent_claim_count: entries.length,
+        claim_count: bestCluster.members.length,
+        class_b_count: classBCount,
+        writes_7d: writes7d,
+        mean_intra_cosine: Math.round(bestCluster.meanIntra * 1000) / 1000,
+        cosine_affinity: Math.round(bestCluster.meanIntra * 1000) / 1000,
+        top_terms: topTerms,
+        sample_slugs: sortedSamples.map(s => s.slug),
+        sample_claims: sortedSamples,
+        event_ids: clusterRecords.map(r => r.event_id).filter(Boolean),
+        ...cfMetrics,
+        counterfactual: true,
+        approval_required: true,
+        status: approvedSet.has(proposalId) ? 'approved' : 'pending_james_approval',
+        rationale: `${bestCluster.members.length} of ${entries.length} claims in #${topic} form a coherent sub-cluster (mean intra-cosine ${bestCluster.meanIntra.toFixed(2)} >= ${minIntraCosine}) around ${topTerms.slice(0, 3).join(', ')}.`,
+      })
+    }
+  }
+
+  // ── 2. Topic Merge Proposals for Overlapping Topic Centroids (cosine >= minMergeCosine = 0.55) ──
+  const topicCentroids = new Map()
+  for (const top of baseTopics) {
+    const entries = topicGroups.get(top) || []
+    const c = new Float64Array(F)
+    for (const { index } of entries) {
+      const v = claimUnitVectors[index]
+      for (let fi = 0; fi < F; fi++) c[fi] += v[fi]
+    }
+    let norm = 0
+    for (let fi = 0; fi < F; fi++) norm += c[fi] * c[fi]
+    norm = Math.sqrt(norm) || 1
+    for (let fi = 0; fi < F; fi++) c[fi] /= norm
+    topicCentroids.set(top, c)
+  }
+
+  const seenMergeFrom = new Set()
+  for (let i = 0; i < baseTopics.length; i++) {
+    for (let j = i + 1; j < baseTopics.length; j++) {
+      const topA = baseTopics[i]
+      const topB = baseTopics[j]
+      const cA = topicCentroids.get(topA)
+      const cB = topicCentroids.get(topB)
+      let cos = 0
+      const sharedTerms = []
+      for (let fi = 0; fi < F; fi++) {
+        const prod = cA[fi] * cB[fi]
+        if (prod > 0) {
+          cos += prod
+          sharedTerms.push({ term: vocab[fi].replace(/^(?:repo|path|subj):/i, ''), prod })
+        }
+      }
+      if (cos < minMergeCosine) continue
+
+      const aIsCore = CORE_EIGEN_TOPICS.has(topA)
+      const bIsCore = CORE_EIGEN_TOPICS.has(topB)
+      const countA = topicGroups.get(topA).length
+      const countB = topicGroups.get(topB).length
+
+      let fromTopic = topB
+      let toTopic = topA
+      if (bIsCore && !aIsCore) {
+        fromTopic = topA
+        toTopic = topB
+      } else if (aIsCore === bIsCore && countB > countA) {
+        fromTopic = topA
+        toTopic = topB
+      }
+      if (seenMergeFrom.has(fromTopic)) continue
+      seenMergeFrom.add(fromTopic)
+
+      sharedTerms.sort((a, b) => b.prod - a.prod)
+      const topShared = [...new Set(sharedTerms.map(x => x.term))].slice(0, 4)
+      const fromEntries = topicGroups.get(fromTopic) || []
+      const toEntries = topicGroups.get(toTopic) || []
+
+      const cfCoherence = evaluateCorpusTopicPartitionCoherence(
+        active,
+        claimUnitVectors,
+        (_r, idx) => (baselineAssignment[idx] === fromTopic ? toTopic : baselineAssignment[idx]),
+        nowSec
+      )
+      const cfMetrics = buildCounterfactualCoherenceMetrics(baselineCoherence, cfCoherence)
+      const proposalId = `merge:${fromTopic}->${toTopic}`
+
+      const samples = [
+        ...fromEntries.slice(0, 2).map(e => extractSampleClaimSummary(e.rec)),
+        ...toEntries.slice(0, 2).map(e => extractSampleClaimSummary(e.rec)),
+      ]
+      const fromRecords = fromEntries.map(e => e.rec)
+      const writes7d = fromRecords.filter(r => (r.created_at || 0) >= nowSec - retireIdleWindowSec).length
+      const classBCount = fromRecords.filter(
+        r => r.expires_at === null || r.expires_at === undefined || r.retention === 'decision'
+      ).length
+
+      proposals.push({
+        proposal_id: proposalId,
+        kind: 'merge',
+        action_label: 'Topic Merge',
+        from_topic: fromTopic,
+        to_topic: toTopic,
+        proposed_topic: toTopic,
+        claim_count: fromEntries.length,
+        target_claim_count: toEntries.length,
+        class_b_count: classBCount,
+        writes_7d: writes7d,
+        mean_intra_cosine: Math.round(cos * 1000) / 1000,
+        cosine_affinity: Math.round(cos * 1000) / 1000,
+        top_terms: topShared,
+        sample_slugs: samples.map(s => s.slug),
+        sample_claims: samples,
+        event_ids: fromRecords.map(r => r.event_id).filter(Boolean),
+        ...cfMetrics,
+        counterfactual: true,
+        approval_required: true,
+        status: approvedSet.has(proposalId) ? 'approved' : 'pending_james_approval',
+        rationale: `#${fromTopic} (${fromEntries.length} claims) and #${toTopic} (${toEntries.length} claims) have overlapping TF-IDF centroids (cosine ${cos.toFixed(2)} >= ${minMergeCosine}).`,
+      })
+    }
+  }
+
+  // ── 3. Idle Topic Retirement Proposals (0 writes in 7d, <= 3 Class B claims) ──
+  for (const top of baseTopics) {
+    if (seenMergeFrom.has(top)) continue
+    const entries = topicGroups.get(top) || []
+    const recs = entries.map(e => e.rec)
+    const writes7d = recs.filter(r => (r.created_at || 0) >= nowSec - retireIdleWindowSec).length
+    const classBCount = recs.filter(
+      r => r.expires_at === null || r.expires_at === undefined || r.retention === 'decision'
+    ).length
+    if (writes7d > 0 || classBCount > retireMaxClassB) continue
+
+    // Find closest active core topic (if any) for archival reference
+    let archiveTarget = null
+    let bestCos = 0
+    const cTop = topicCentroids.get(top)
+    for (const candidate of baseTopics) {
+      if (candidate === top) continue
+      const candEntries = topicGroups.get(candidate) || []
+      const candWrites7d = candEntries.filter(e => (e.rec.created_at || 0) >= nowSec - retireIdleWindowSec).length
+      if (candWrites7d === 0 && !CORE_EIGEN_TOPICS.has(candidate)) continue
+      const cCand = topicCentroids.get(candidate)
+      let cos = 0
+      for (let fi = 0; fi < F; fi++) cos += cTop[fi] * cCand[fi]
+      if (cos > bestCos) {
+        bestCos = cos
+        archiveTarget = candidate
+      }
+    }
+
+    const cfCoherence = evaluateCorpusTopicPartitionCoherence(
+      active,
+      claimUnitVectors,
+      (_r, idx) => (baselineAssignment[idx] === top ? (archiveTarget || null) : baselineAssignment[idx]),
+      nowSec
+    )
+    const cfMetrics = buildCounterfactualCoherenceMetrics(baselineCoherence, cfCoherence)
+    const proposalId = `retire:${top}`
+
+    const topFeatTerms = vocab
+      .map((f, fi) => ({ term: f.replace(/^(?:repo|path|subj):/i, ''), w: cTop[fi] }))
+      .filter(x => x.w > 0)
+      .sort((a, b) => b.w - a.w)
+      .slice(0, 4)
+      .map(x => x.term)
+
+    const retireSamples = entries.slice(0, 4).map(e => extractSampleClaimSummary(e.rec))
+
+    proposals.push({
+      proposal_id: proposalId,
+      kind: 'retire',
+      action_label: 'Idle Topic Retirement',
+      from_topic: top,
+      to_topic: archiveTarget,
+      proposed_topic: archiveTarget ? `retire (#${top} -> #${archiveTarget})` : `retire (#${top})`,
+      claim_count: entries.length,
+      class_b_count: classBCount,
+      writes_7d: writes7d,
+      mean_intra_cosine: Math.round(bestCos * 1000) / 1000,
+      cosine_affinity: Math.round(bestCos * 1000) / 1000,
+      top_terms: topFeatTerms,
+      sample_slugs: retireSamples.map(s => s.slug),
+      sample_claims: retireSamples,
+      event_ids: recs.map(r => r.event_id).filter(Boolean),
+      ...cfMetrics,
+      counterfactual: true,
+      approval_required: true,
+      status: approvedSet.has(proposalId) ? 'approved' : 'pending_james_approval',
+      rationale: `#${top} has 0 writes in 7d and ${classBCount} Class B claim(s) (<= ${retireMaxClassB}); candidate for retirement.`,
+    })
+  }
+
+  return proposals
+}
+
 // Computes the spectral principal components (eigenvectors + eigenvalues) of the active memory store's
 // topic-by-feature space via Power Iteration with Hotelling Deflation, and identifies fragmented or
 // mis-tagged topics that should reorganize into canonical eigen-topics during Dreaming.
-export function computeTopicEigenvectors(records = [], { maxComponents = 7 } = {}) {
+export function computeTopicEigenvectors(records = [], { maxComponents = 7, nowSec = Math.floor(Date.now() / 1000), approvedProposalIds = [] } = {}) {
   const active = (Array.isArray(records) ? records : []).filter(
     r => r && r.verification !== 'withdrawn' && r.status !== 'withdrawn' && r.scope !== 'hive:canon'
   )
   if (active.length === 0) {
-    return { eigenvectors: [], topic_map: {}, reorganizations: [], total_variance: 0 }
+    return { eigenvectors: [], topic_map: {}, reorganizations: [], axis_proposals: [], total_variance: 0 }
   }
 
   // 1. Build document frequency for IDF weighting and group claims by raw topic
@@ -772,7 +1439,7 @@ export function computeTopicEigenvectors(records = [], { maxComponents = 7 } = {
   const T = rawTopics.length
 
   if (F === 0 || T === 0) {
-    return { eigenvectors: [], topic_map: {}, reorganizations: [], total_variance: 0 }
+    return { eigenvectors: [], topic_map: {}, reorganizations: [], axis_proposals: [], total_variance: 0 }
   }
 
   // 2. Build L2-normalized TF-IDF centroid vectors per topic: V[t][f]
@@ -984,10 +1651,13 @@ export function computeTopicEigenvectors(records = [], { maxComponents = 7 } = {
     }
   }
 
+  const axisProposals = computeEigenAxisProposals(active, { nowSec, approvedProposalIds })
+
   return {
     eigenvectors,
     topic_map: topicMap,
     reorganizations,
+    axis_proposals: axisProposals,
     total_variance: Math.round(totalTrace * 100) / 100,
   }
 }
@@ -1168,6 +1838,7 @@ export function planMerkleDream({
   memoryGlobalChannelId = '',
   nowSec = Math.floor(Date.now() / 1000),
   gitAncestryCheck = null,
+  spectral: precomputedSpectral = null,
 } = {}) {
   const cleanCuratorPk = String(curatorPubkey || '').toLowerCase()
   const active = (Array.isArray(records) ? records : []).filter(
@@ -1266,7 +1937,10 @@ export function planMerkleDream({
   }
 
   // 2. Stage 0: Spectral Topic Eigenvector Analysis & Topic Normalization
-  const spectral = computeTopicEigenvectors(active)
+  const spectral =
+    precomputedSpectral && typeof precomputedSpectral === 'object' && precomputedSpectral.topic_map
+      ? precomputedSpectral
+      : computeTopicEigenvectors(active, { nowSec })
   const resolveEigenTopic = rawTopic => {
     const trimmed = String(rawTopic || '').trim()
     return spectral.topic_map[trimmed] || normalizeMemoryTopic(trimmed) || 'hive-memory'
@@ -1294,12 +1968,18 @@ export function planMerkleDream({
   for (const { scope, topic, items } of classAByScopeTopic.values()) {
     if (items.length < 2) continue
     // Cluster items within (scope, topic) by shared work subject (e.g. pr336) or token Jaccard >= 0.42
+    // Pre-tokenize each item once per group to avoid O(N^2) regex tokenization on large topics.
+    const itemTokens = new Map()
+    for (const item of items) {
+      itemTokens.set(item, tokenize(`${item.d} ${item.claim}`))
+    }
     const clusters = []
     for (const item of items) {
       const subj = extractWorkSubject(item)
+      const iToks = itemTokens.get(item)
       let placed = false
       for (const cl of clusters) {
-        if (cl.subject === subj || cl.members.some(m => tokenJaccard(`${m.d} ${m.claim}`, `${item.d} ${item.claim}`) >= 0.42)) {
+        if (cl.subject === subj || cl.members.some(m => tokenSetJaccard(itemTokens.get(m), iToks) >= 0.42)) {
           cl.members.push(item)
           placed = true
           break
@@ -1456,6 +2136,7 @@ export function planMerkleDream({
     planned_at: nowSec,
     topic_eigenvectors: spectral.eigenvectors,
     topic_reorganizations: spectral.reorganizations,
+    eigen_axis_proposals: spectral.axis_proposals,
     distillations,
     promotions,
     solidifications,
@@ -1463,6 +2144,7 @@ export function planMerkleDream({
     summary: {
       topic_eigenvectors: spectral.eigenvectors.length,
       topic_reorganizations: spectral.reorganizations.length,
+      eigen_axis_proposals: spectral.axis_proposals.length,
       distillations: distillations.length,
       promotions: promotions.length,
       solidifications: solidifications.length,
@@ -1544,6 +2226,148 @@ export function formatCuratorBriefing({
   return lines.join('\n')
 }
 
+function completeHistoryPage(page, expectedWriteSeq, offset, expectedTotal = null) {
+  if (!page || !['found', 'none'].includes(page.answer) || page.answer_reason != null ||
+      page.format !== 'full' || page.store_state?.state !== 'READY' ||
+      Number(page.store_state.write_seq) !== expectedWriteSeq || !Array.isArray(page.records) ||
+      !Number.isSafeInteger(page.total_matched) || page.total_matched < 0 ||
+      page.returned !== page.records.length ||
+      (expectedTotal !== null && page.total_matched !== expectedTotal) ||
+      (page.answer === 'none' && page.total_matched !== 0) ||
+      (page.answer === 'found' && page.total_matched === 0)) return false
+  const nextOffset = offset + page.records.length
+  if (nextOffset > page.total_matched) return false
+  return page.next_cursor === null
+    ? nextOffset === page.total_matched
+    : page.records.length > 0 && page.next_cursor === String(nextOffset)
+}
+
+export async function readInitialHistory(reader, pageLimit, pageSize, maxAttempts = 3) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const wake = await reader.callReadTool('memory_wake', {})
+    const writeSeq = Number(wake?.store_state?.write_seq)
+    if (wake?.store_state?.state !== 'READY' || !Number.isSafeInteger(writeSeq)) {
+      throw new Error('memory_wake did not return a ready store state')
+    }
+    const records = []
+    const historyRecords = []
+    let cursor = '0'
+    let pages = 0
+    let expectedTotal = null
+    let changed = false
+    while (cursor !== null && pages < pageLimit) {
+      const page = await reader.callReadTool('memory_query', {
+        limit: pageSize,
+        format: 'full',
+        include_history: true,
+        ...(cursor !== '0' ? { cursor } : {}),
+      })
+      if (!completeHistoryPage(page, writeSeq, Number(cursor), expectedTotal)) {
+        const pageSeq = Number(page?.store_state?.write_seq)
+        if (Number.isSafeInteger(pageSeq) && pageSeq !== writeSeq &&
+            completeHistoryPage(page, pageSeq, Number(cursor), null)) {
+          changed = true
+          break
+        }
+        throw new Error('memory_query did not return a complete ready history page')
+      }
+      expectedTotal = page.total_matched
+      for (const r of page.records) {
+        historyRecords.push(r)
+        if ((r.is_current === undefined || r.is_current === true) && r.status !== 'withdrawn' && r.verification === 'accepted') {
+          records.push(r)
+        }
+      }
+      cursor = typeof page.next_cursor === 'string' && page.next_cursor ? page.next_cursor : null
+      pages += 1
+    }
+    if (changed) continue
+    const end = await reader.callReadTool('memory_wake', {})
+    const endSeq = Number(end?.store_state?.write_seq)
+    if (end?.store_state?.state !== 'READY' || !Number.isSafeInteger(endSeq)) {
+      throw new Error('memory_wake did not return a ready store state')
+    }
+    if (endSeq !== writeSeq) continue
+    return { wake, records, historyRecords, historyComplete: cursor === null }
+  }
+  throw new Error('memory history changed during bounded read retries')
+}
+
+export function mergeCycleRecentActivity(priorActivity = [], postActivity = []) {
+  const preList = Array.isArray(priorActivity) ? priorActivity.filter(Boolean) : []
+  const postList = Array.isArray(postActivity) ? postActivity.filter(Boolean) : []
+  if (preList.length === 0) return postList
+  if (postList.length === 0) return preList
+  const postSeqs = new Set()
+  const postKeys = new Set()
+  for (const a of postList) {
+    if (Number.isSafeInteger(a.seq)) postSeqs.add(a.seq)
+    postKeys.add(`${a.actor || ''}:${a.kind || ''}:${a.at || 0}:${a.d || ''}:${a.topic || ''}`)
+  }
+  const preservedPeers = preList.filter(a => {
+    if (!a || a.actor === 'curator' || a.actor === 'viewer') return false
+    if (Number.isSafeInteger(a.seq) && postSeqs.has(a.seq)) return false
+    const key = `${a.actor || ''}:${a.kind || ''}:${a.at || 0}:${a.d || ''}:${a.topic || ''}`
+    return !postKeys.has(key)
+  })
+  return [...preservedPeers, ...postList]
+}
+
+export async function readPostCycleSnapshot(
+  reader,
+  expectedWriteSeq,
+  pageLimit,
+  pageSize,
+  nowSec,
+  { priorRecentActivity = null, priorAgentRoster = null } = {}
+) {
+  const start = await reader.callReadTool('memory_wake', {})
+  if (start?.store_state?.state !== 'READY' || Number(start.store_state.write_seq) !== expectedWriteSeq) return null
+  const historyRecords = []
+  const records = []
+  let cursor = '0'
+  let pages = 0
+  let expectedTotal = null
+  while (cursor !== null && pages < pageLimit) {
+    const page = await reader.callReadTool('memory_query', {
+      limit: pageSize,
+      format: 'full',
+      include_history: true,
+      ...(cursor !== '0' ? { cursor } : {}),
+    })
+    if (!completeHistoryPage(page, expectedWriteSeq, Number(cursor), expectedTotal)) return null
+    expectedTotal = page.total_matched
+    for (const r of page.records) {
+      historyRecords.push(r)
+      if ((r.is_current === undefined || r.is_current === true) && r.status !== 'withdrawn' && r.verification === 'accepted') {
+        records.push(r)
+      }
+    }
+    cursor = typeof page?.next_cursor === 'string' && page.next_cursor ? page.next_cursor : null
+    pages += 1
+  }
+  if (cursor !== null) return null
+  const end = await reader.callReadTool('memory_wake', {})
+  if (end?.store_state?.state !== 'READY' || Number(end.store_state.write_seq) !== expectedWriteSeq) return null
+  const postActivity = Array.isArray(end?.recent_activity)
+    ? end.recent_activity
+    : (Array.isArray(start?.recent_activity) ? start.recent_activity : [])
+  const mergedActivity = mergeCycleRecentActivity(priorRecentActivity, postActivity)
+  const effectiveRoster = Array.isArray(end?.agent_roster) && end.agent_roster.length > 0
+    ? end.agent_roster
+    : (Array.isArray(priorAgentRoster) ? priorAgentRoster : [])
+  const coherence = computeCoherence({
+    records,
+    history_records: historyRecords,
+    agent_roster: effectiveRoster,
+    recent_activity: mergedActivity,
+    store_state: end.store_state,
+    now_sec: nowSec,
+    history_complete: true,
+  })
+  return { historyRecords, coherenceScore: Number.isFinite(coherence?.score) ? coherence.score : null, coherence }
+}
+
 // Executes a full Curator Dream & Nightmare cycle over the daemon's reader and writer sockets.
 export async function runCuratorCycle({
   readerSocket,
@@ -1582,31 +2406,9 @@ export async function runCuratorCycle({
 
   const reader = createSingleSocketMcpClient(readerSocket)
   try {
-    const wake = await reader.callReadTool('memory_wake', {})
-    const records = []
-    const historyRecords = []
-    let cursor = '0'
-    let pages = 0
     const pageLimit = Math.max(1, Number(maxPages) || 500)
     const effectivePageSize = Math.max(1, Math.min(200, Number(pageSize) || 100))
-    while (cursor !== null && pages < pageLimit) {
-      const page = await reader.callReadTool('memory_query', {
-        limit: effectivePageSize,
-        format: 'full',
-        include_history: true,
-        ...(cursor !== '0' ? { cursor } : {}),
-      })
-      for (const r of Array.isArray(page?.records) ? page.records : []) {
-        historyRecords.push(r)
-        if ((r.is_current === undefined || r.is_current === true) && r.status !== 'withdrawn' && r.verification === 'accepted') {
-          records.push(r)
-        }
-      }
-      cursor = typeof page?.next_cursor === 'string' && page.next_cursor ? page.next_cursor : null
-      pages += 1
-    }
-
-    const historyComplete = cursor === null
+    const { wake, records, historyRecords, historyComplete } = await readInitialHistory(reader, pageLimit, effectivePageSize)
     const storeState = wake?.store_state || {}
     const resolvedRecentActivity = Array.isArray(recentActivity)
       ? recentActivity
@@ -1687,7 +2489,8 @@ export async function runCuratorCycle({
             expected_prior_id: expectedPriorId,
           })
           if (res?.accepted) {
-            submitted.push({ id: res.id, d: dTag, stage: item.stage || item.action, merkle_sources: item.merkle_sources })
+            submitted.push({ id: res.id, d: dTag, stage: item.stage || item.action, merkle_sources: item.merkle_sources,
+              created_at: adjustedTemplate.created_at })
           } else {
             refused.push({ d: dTag, code: res?.code || 'REFUSED', message: res?.message || '' })
           }
@@ -1739,7 +2542,10 @@ export async function runCuratorCycle({
       cursorAdvanced = true
     }
     const nextCuratedAt = cursorAdvanced
-      ? (submitted.length === 0 && persisted?.pending_curated_at ? Number(persisted.pending_curated_at) : nowSec)
+      ? Math.max(effectiveLastCuratedAt,
+          submitted.length === 0 && persisted?.pending_curated_at
+            ? Number(persisted.pending_curated_at)
+            : curationObservationEnd(nowSec, submitted))
       : effectiveLastCuratedAt
     const nextCuratedWriteSeq = cursorAdvanced
       ? (submitted.length === 0 && persisted?.pending_curated_write_seq ? Number(persisted.pending_curated_write_seq) : postWriteSeq)
@@ -1772,6 +2578,9 @@ export async function runCuratorCycle({
                 .map(r => ({ ...r, persisted: true, simulated: false }))
             : [])
         : (Array.isArray(persisted?.topic_reorganizations) ? persisted.topic_reorganizations : [])
+      const persistedAxisProposals = Array.isArray(plan.eigen_axis_proposals)
+        ? plan.eigen_axis_proposals
+        : (Array.isArray(persisted?.eigen_axis_proposals) ? persisted.eigen_axis_proposals : [])
 
       const ledgerEntry = submitted.length > 0
         ? {
@@ -1805,10 +2614,24 @@ export async function runCuratorCycle({
           })
 
       if (submitted.length > 0 && resolvedPacketDir) {
+        let postSnapshot = null
+        try {
+          postSnapshot = await readPostCycleSnapshot(reader, postWriteSeq, pageLimit, effectivePageSize, nowSec, {
+            priorRecentActivity: resolvedRecentActivity,
+            priorAgentRoster: Array.isArray(wake?.agent_roster) ? wake.agent_roster : [],
+          })
+        } catch {
+          // The packet still records known submitted changes; unknown counters remain null.
+        }
         dreamPacket = buildDreamPacket({
           lastCuratedWriteSeq: effectiveLastCuratedWriteSeq,
+          lastCuratedAt: effectiveLastCuratedAt,
           writeSeqBefore: Number(storeState.write_seq || 0),
           writeSeqAfter: nextCuratedWriteSeq,
+          coherenceBefore: triggerEval.coherence_score,
+          coherenceAfter: postSnapshot?.coherenceScore ?? null,
+          historyRecords: postSnapshot?.historyRecords || [],
+          historyComplete: Boolean(postSnapshot),
           ranAt: nowSec,
           ledgerRef: ledgerPath ? `${ledgerPath}#write_seq=${nextCuratedWriteSeq}` : null,
           coherenceScore: triggerEval.coherence_score,
@@ -1838,6 +2661,7 @@ export async function runCuratorCycle({
           coherence_score: triggerEval.coherence_score,
           topic_eigenvectors: persistedEigenvectors,
           topic_reorganizations: persistedReorganizations,
+          eigen_axis_proposals: persistedAxisProposals,
           pending_curated_at: nextCuratedAt,
           pending_curated_write_seq: nextCuratedWriteSeq,
           pending_dream_packet: dreamPacket || null,
@@ -1865,6 +2689,7 @@ export async function runCuratorCycle({
         coherence_score: triggerEval.coherence_score,
         topic_eigenvectors: persistedEigenvectors,
         topic_reorganizations: persistedReorganizations,
+        eigen_axis_proposals: persistedAxisProposals,
         pending_curated_at: null,
         pending_curated_write_seq: null,
         pending_dream_packet: null,

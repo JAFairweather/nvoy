@@ -3,11 +3,13 @@
 // A request names an operation from a closed list and carries public fields only. Nothing in it is
 // an instruction: an unknown tag, a second value where one is allowed, or anything that looks like
 // key material refuses the whole request. The signer must be a grantor of the template agent the
-// request copies, so an owner the fleet already trusts is the only one who can ask.
+// request copies, so an owner the fleet already trusts is the only one who can ask, or a delegate that
+// holds a live `onboard` grant from one, within the owner's limits (waggle DESIGN_ONBOARDING_DELEGATE).
 
 import { verifyEvent } from 'nostr-tools/pure'
 import { familyOf } from './principal_family.mjs'
 import { readPublicKey } from './instance_apply.mjs'
+import { liveGrantById, liveGrantFor } from './onboard_delegate.mjs'
 
 export const SETUP_KIND = 30078
 export const SETUP_PREFIX = 'nvoy-onboard/'
@@ -19,7 +21,7 @@ const NAME = /^[a-z0-9][a-z0-9._-]{1,63}$/i
 const HEX = /^[0-9a-f]{64}$/
 const ROOM = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const SECRETISH = /nsec1|bunker:|nostrconnect:|PRIVATE KEY|secret=/i
-const ONE = ['d', 'op', 'p', 'harness', 'like', 'channel_key', 'feed_key', 'invite', 'policy', 'age', 'display_name', 'about']
+const ONE = ['d', 'op', 'p', 'harness', 'like', 'channel_key', 'feed_key', 'invite', 'policy', 'age', 'display_name', 'about', 'consent']
 const JOIN_TAGS = ['invite', 'policy', 'age']
 const PROFILE_TAGS = ['display_name', 'about']
 // Shown text, one line for the name: no control characters, and short enough for a member list.
@@ -40,6 +42,13 @@ const MANY = ['giver', 'room']
 export class OnboardRefusal extends Error {
   constructor(code, message) { super(message); this.code = code }
 }
+// Refusals that say "can't tell yet", not "no": the watcher retries these on the next tick instead of
+// setting the request aside.
+export const RETRY_CODES = Object.freeze(['ONBOARD_NO_RELAY', 'ONBOARD_TERMS_UNKNOWN', 'ONBOARD_DELEGATE_NEEDS_PROOF'])
+
+// A delegate adds at most this many new names in any 24 hours (James, 12 Nov).
+export const DELEGATE_DAILY_CAP = 1
+const DAY_MS = 24 * 60 * 60 * 1000
 const refuse = (code, message) => { throw new OnboardRefusal(code, message) }
 
 // Each op has its own d tag, so a later bind_runtime does not replace the add_agent it follows.
@@ -57,7 +66,12 @@ export function newestRequest(events, name, op) {
 // inProgress: request ids with receipts, so an add_agent whose own install has landed still reads.
 // earlier: the ledger's add_agent rows for this name. A newer add_agent the owner signs again (changed
 // terms, an expired invite or request) continues the install only when its identity fields match one.
-export function parseSetupRequest(event, { name, manifests, seen = new Set(), inProgress = new Set(), earlier = [], now = Date.now() }) {
+// delegation: null (no delegate is accepted, as before), or { state, templates, terms, ledger }:
+//   state     the cold grant read (onboard_delegate.mjs readOnboardGrants); unknown backs no delegate
+//   templates the fleet's onboard_templates: the only agents a delegate may start an agent like
+//   terms     the hive's current terms ({ ok, version }, onboard_join.mjs readTerms); the grant's policy must equal it
+//   ledger    every ledger row, for the daily cap
+export function parseSetupRequest(event, { name, manifests, seen = new Set(), inProgress = new Set(), earlier = [], now = Date.now(), delegation = null }) {
   if (!NAME.test(String(name || ''))) refuse('ONBOARD_BAD_NAME', 'name must be a short stable identifier')
   if (!event) refuse('ONBOARD_NO_REQUEST', `no setup request for ${name}`)
   if (event.kind !== SETUP_KIND) refuse('ONBOARD_BAD_REQUEST', 'not a setup request')
@@ -88,20 +102,45 @@ export function parseSetupRequest(event, { name, manifests, seen = new Set(), in
   if (!HEX.test(pubkey)) refuse('ONBOARD_BAD_PUBKEY', 'p must be 64 lowercase hex')
   const template = manifests.get(String(one.like || ''))
   if (!template) refuse('ONBOARD_BAD_TEMPLATE', 'like must name an installed agent')
-  if (!template.grantors.includes(event.pubkey)) refuse('ONBOARD_NOT_OWNER', `the signer is not a grantor of ${template.id}`)
+  // A grantor asks as today. Anyone else must hold a live onboard grant from one of this template's grantors;
+  // the request is then recorded with that grantor as the owner and the delegate as the signer.
+  let owner = event.pubkey, grant = null
+  if (!template.grantors.includes(event.pubkey)) {
+    if (!delegation || !liveGrantFor(delegation.state, event.pubkey, template.grantors))
+      refuse('ONBOARD_NOT_OWNER', `the signer is not a grantor of ${template.id}, and holds no live onboard grant from one`)
+    // Standing consent (DESIGN_ONBOARDING_DELEGATE): the terms and the age are the owner's own statements, in the
+    // grant. The request names that grant by id, and is judged against that grant, not the delegate's newest.
+    grant = liveGrantById(delegation.state, event.pubkey, one.consent, template.grantors)
+    if (!grant) refuse('ONBOARD_DELEGATE_CONSENT', "a delegate request must name, in consent, one of its live onboard grants from this template's grantors")
+    owner = grant.grantor
+    if (!(delegation.templates || []).includes(template.id)) refuse('ONBOARD_DELEGATE_TEMPLATE', `a delegate may not start an agent like ${template.id}; the owner's onboard_templates do not list it`)
+    if ('policy' in one || 'age' in one) refuse('ONBOARD_DELEGATE_CONSENT', "a delegate request carries consent, never the owner's policy or age")
+    if (!POLICY.test(String(grant.policy || ''))) refuse('ONBOARD_DELEGATE_CONSENT', 'the onboard grant carries no terms version')
+    if (grant.age !== 'confirmed') refuse('ONBOARD_DELEGATE_CONSENT', "the onboard grant carries no age confirmation")
+    if (!delegation.terms?.ok) refuse('ONBOARD_TERMS_UNKNOWN', `can't read the hive's terms${delegation.terms?.reason ? ` (${delegation.terms.reason})` : ''}; run again`)
+    if (delegation.terms.version !== grant.policy) refuse('ONBOARD_DELEGATE_CONSENT', `the onboard grant agreed terms ${grant.policy}, but the hive serves ${delegation.terms.version}; the owner signs a new grant`)
+    if (many.giver.length) refuse('ONBOARD_DELEGATE_GIVER', 'a delegate request names no giver: who may give the agent work stays a grant, so stays the owner\'s')
+  } else if ('consent' in one) refuse('ONBOARD_BAD_TAG', 'consent is for a delegate request; an owner signs policy and age')
 
   const installed = [...manifests.values()].find(manifest => manifest.pubkey === pubkey)
   if (one.op === 'add_agent') {
     const continues = earlier.some(row => row.op === 'add_agent' && row.name === name && row.pubkey === pubkey &&
-      row.owner === event.pubkey && row.harness === one.harness && row.like === one.like)
+      row.owner === owner && (row.signer || row.owner) === event.pubkey && row.harness === one.harness && row.like === one.like)
     const resumed = (inProgress.has(event.id) || continues) && (!installed || installed.id === name) &&
       (!manifests.has(name) || manifests.get(name).pubkey === pubkey)
     if (manifests.has(name) && !resumed) refuse('ONBOARD_EXISTS', `${name} is already installed`)
+    // The daily cap counts new names: a re-signed request for a name this delegate already asked for is not one.
+    if (grant && !resumed && !(earlier || []).some(row => row.op === 'add_agent' && row.name === name && (row.signer || row.owner) === event.pubkey)) {
+      const since = now - DAY_MS
+      const names = new Set((delegation.ledger || []).filter(row => row?.op === 'add_agent' && row.signer === event.pubkey &&
+        row.name !== name && Number.isFinite(row.at) && row.at > since).map(row => row.name))
+      if (names.size >= DELEGATE_DAILY_CAP) refuse('ONBOARD_DELEGATE_CAP', `a delegate adds at most ${DELEGATE_DAILY_CAP} new agent${DELEGATE_DAILY_CAP === 1 ? '' : 's'} a day`)
+    }
     if (installed && !resumed) refuse('ONBOARD_EXISTS', `that key is already ${installed.id}`)
     if ('channel_key' in one) refuse('ONBOARD_BAD_TAG', 'channel_key belongs to bind_runtime')
     if ('feed_key' in one) refuse('ONBOARD_BAD_TAG', 'feed_key belongs to bind_runtime')
     if ('invite' in one && !sealedShape(one.invite)) refuse('ONBOARD_BAD_INVITE', 'the invite must be sealed to the agent (NIP-44), never plain')
-    if ('invite' in one && !('policy' in one)) refuse('ONBOARD_BAD_TAG', 'an invite needs the policy the owner agreed to, or none')
+    if ('invite' in one && !('policy' in one) && !grant) refuse('ONBOARD_BAD_TAG', 'an invite needs the policy the owner agreed to, or none')
     if ('policy' in one && !POLICY.test(one.policy)) refuse('ONBOARD_BAD_TAG', 'policy is a terms version, or none')
     if ('age' in one && one.age !== 'confirmed') refuse('ONBOARD_BAD_TAG', 'age is confirmed, or absent')
     if ('display_name' in one && (!one.display_name.trim() || one.display_name.length > 64 || CONTROL.test(one.display_name)))
@@ -129,7 +168,7 @@ export function parseSetupRequest(event, { name, manifests, seen = new Set(), in
     if (!HEX.test(giver)) refuse('ONBOARD_BAD_GIVER', 'a giver is 64 lowercase hex')
     if (giver === pubkey) refuse('ONBOARD_BAD_GIVER', 'an agent does not give itself work')
     if (seatKeys.has(giver)) return { pubkey: giver, seat: seatKeys.get(giver) }
-    if (event.pubkey === giver) return { pubkey: giver, owner: true }
+    if (owner === giver) return { pubkey: giver, owner: true }
     // A Buzz agent, or anyone else outside the fleet: reported, and nothing runs for it here.
     return { pubkey: giver, outside: true }
   })
@@ -151,7 +190,9 @@ export function parseSetupRequest(event, { name, manifests, seen = new Set(), in
     if (channelKey && feedKey.keyBody === channelKey.keyBody) refuse('ONBOARD_BAD_FEED_KEY', 'the channel key and the feed key are the same key; each forced command admits exactly one')
   }
 
-  return Object.freeze({ id: event.id, owner: event.pubkey, created_at: event.created_at, name, op: one.op,
-    pubkey, harness: one.harness, like: template.id, givers, rooms, channelKey, feedKey,
-    invite: one.invite || '', policy: one.policy || '', ageConfirmed: one.age === 'confirmed', profile })
+  // owner: who the request is for, the grantor (receipts are sealed to them). signer: who signed it, the owner
+  // or a delegate. A delegate's terms and age come from the owner's own grant.
+  return Object.freeze({ id: event.id, owner, signer: event.pubkey, delegated: !!grant, grantId: grant?.grantId || null,
+    created_at: event.created_at, name, op: one.op, pubkey, harness: one.harness, like: template.id, givers, rooms, channelKey, feedKey,
+    invite: one.invite || '', policy: grant ? grant.policy : one.policy || '', ageConfirmed: grant ? grant.age === 'confirmed' : one.age === 'confirmed', profile })
 }

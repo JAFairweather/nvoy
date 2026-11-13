@@ -680,6 +680,10 @@ export async function evaluateDreamCycleOverSocket({
 
     let exportedPacket = null
     if (exportPacketDir && targetEntry) {
+      const precedingEntry = ledgerEntries.filter(e => Number(e.write_seq_after) < Number(targetEntry.write_seq_after)).at(-1)
+      const targetAt = Number(targetEntry.at || nowSec)
+      const targetHistory = historyRecords.filter(r => !laterCycleIds.has(r.event_id) &&
+        (Number(r.created_at) <= targetAt || cycleSubmittedIds.includes(r.event_id)))
       const byId = new Map(historyRecords.map(r => [r.event_id, r]))
       const promotions = []
       const distillations = []
@@ -701,16 +705,22 @@ export async function evaluateDreamCycleOverSocket({
         }
       }
       const pkt = buildDreamPacket({
+        lastCuratedAt: Number(precedingEntry?.at || 0),
         writeSeqBefore: targetEntry.write_seq_before,
         writeSeqAfter: targetEntry.write_seq_after,
         ranAt: targetEntry.at || nowSec,
         ledgerRef: `${resolvedLedger}#write_seq=${targetEntry.write_seq_after}`,
         coherenceScore: targetEntry.coherence_score,
+        coherenceBefore: targetEntry.coherence_score,
+        // Historical evaluation cannot reconstruct an exact post-write coherence score.
+        coherenceAfter: null,
+        historyRecords: targetHistory,
+        historyComplete: cursor === null,
         triggers: { reasons: targetEntry.reasons || [] },
         plan: { promotions, distillations, solidifications: [], nightmares: [] },
         submitted: targetEntry.submitted || [],
       })
-      if (pkt) {
+      if (pkt && !existsSync(join(exportPacketDir, `${pkt.id}.json`))) {
         exportedPacket = writeDreamPacket({ packetDir: exportPacketDir, packet: pkt })
       }
     }

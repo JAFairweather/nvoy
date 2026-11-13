@@ -186,6 +186,8 @@ export function formatDreamBuzzPost(record) {
     `🌙 ${record.title}`,
     '',
     record.dream,
+    '',
+    `Dream ID: ${record.id}`,
   ].join('\n')
 }
 

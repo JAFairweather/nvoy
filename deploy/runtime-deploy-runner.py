@@ -13,10 +13,13 @@ which recreates the identity whose manifest changed.
 from __future__ import annotations
 
 import hashlib
+import grp
 import json
 import os
+import pwd
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -182,7 +185,8 @@ def instances() -> list[dict]:
         if not isinstance(enabled, bool):
             raise RuntimeError(f"{path.name}: worker_enabled must be boolean")
         result.append({"id": raw["id"], "worker": enabled, "harness": raw.get("harness") is not None,
-                       "notifier": raw.get("wake_webhook") is not None, "door": raw.get("channel_door") is not None})
+                       "notifier": raw.get("wake_webhook") is not None, "door": raw.get("channel_door") is not None,
+                       "recall": raw.get("may_recall") is not None})
     if not result:
         raise RuntimeError(f"no instance manifests in {ROOT}")
     return result
@@ -202,10 +206,12 @@ def verify_compose(path: Path, instance: dict, runtime_ref: str, worker_ref: str
 
 
 def verify_running(path: Path, instance: dict) -> None:
+    if instance.get("recall"):
+        verify_recall_gateway(instance["id"])
     running = set(compose(path, ["ps", "--status", "running", "--services"], True).split())
     expected = (["watcher", "broker", "adapter"] + (["worker"] if instance["worker"] else [])
                 + (["harness"] if instance["harness"] else []) + (["notifier"] if instance.get("notifier") else [])
-                + (["door"] if instance.get("door") else []))
+                + (["door"] if instance.get("door") else []) + (["recall"] if instance.get("recall") else []))
     missing = [service for service in expected if service not in running]
     if missing:
         raise RuntimeError(f"{instance['id']}: services not running: {', '.join(missing)}")
@@ -219,6 +225,43 @@ def verify_running(path: Path, instance: dict) -> None:
         raise RuntimeError(f"{instance['id']}: initializer status was not valid JSON") from error
     if not rows or any(row.get("State") != "exited" or int(row.get("ExitCode", -1)) != 0 for row in rows):
         raise RuntimeError(f"{instance['id']}: initializer did not complete cleanly")
+
+
+def verify_recall_gateway(instance_id: str) -> None:
+    """Fail closed if a recall container would start without its pinned host reader."""
+    raw = json.loads((ROOT / f"{instance_id}.json").read_text())
+    recall = raw.get("may_recall") or {}
+    if recall.get("read") != {"socket": "/run/nvoy-recall-gw/socket"}:
+        raise RuntimeError(f"{instance_id}: recall must use the fixed host gateway socket")
+    user = raw.get("service_user")
+    gid = recall.get("gateway_gid")
+    if not isinstance(user, str) or not isinstance(gid, int) or isinstance(gid, bool):
+        raise RuntimeError(f"{instance_id}: recall broker user or group is missing")
+    owner = pwd.getpwnam(user)
+    group = grp.getgrnam(f"nvoy-recall-{instance_id}")
+    if owner.pw_uid != raw.get("broker_uid") or owner.pw_uid == 0 or group.gr_gid != gid or group.gr_mem or \
+            any(account.pw_gid == gid for account in pwd.getpwall()):
+        raise RuntimeError(f"{instance_id}: recall identity or dedicated group drifted")
+    key = Path(f"/etc/nvoy/recall-keys/{instance_id}")
+    pin = Path("/etc/nvoy/recall-known-hosts")
+    if key.is_symlink() or pin.is_symlink() or not key.is_file() or not pin.is_file():
+        raise RuntimeError(f"{instance_id}: recall key or trusted host pin is absent")
+    key_dir = key.parent
+    directory = key_dir.lstat()
+    if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != 0 or stat.S_IMODE(directory.st_mode) != 0o711:
+        raise RuntimeError(f"{instance_id}: recall key directory is unsafe or not traversable")
+    key_info = key.stat()
+    if key_info.st_uid != owner.pw_uid or stat.S_IMODE(key_info.st_mode) != 0o600:
+        raise RuntimeError(f"{instance_id}: recall key owner or mode drifted")
+    pin_info = pin.stat()
+    if pin_info.st_uid != 0 or stat.S_IMODE(pin_info.st_mode) != 0o644 or pin_info.st_size == 0:
+        raise RuntimeError(f"{instance_id}: trusted host pin drifted")
+    unit = f"nvoy-recall-gw-{instance_id}.socket"
+    run(["systemctl", "is-active", "--quiet", unit])
+    path = Path(f"/run/nvoy-recall-gw/{instance_id}/socket")
+    info = path.lstat()
+    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != owner.pw_uid or info.st_gid != gid or stat.S_IMODE(info.st_mode) != 0o660:
+        raise RuntimeError(f"{instance_id}: recall host socket is absent or has the wrong owner, group or mode")
 
 
 def settle() -> None:
@@ -337,6 +380,8 @@ def main() -> None:
         changed: list[dict] = []
         try:
             for instance in identity_list:
+                if instance.get("recall"):
+                    verify_recall_gateway(instance["id"])
                 staged = candidate / f"{instance['id']}.compose.yml"
                 staged.write_text(render(instance, runtime_ref, worker_ref))
                 os.chmod(staged, 0o600)

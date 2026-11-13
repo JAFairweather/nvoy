@@ -60,7 +60,7 @@ ok('the Codex release that runs its shell commands is readable too, and nothing 
 ok('its one MCP server is the hardened ssh entry to the channel forced command', (toml.match(/^\[mcp_servers\.[^.\]]+\]$/gm) || []).length === 1 &&
   toml.includes('[mcp_servers.nvoy-cx-test]\ncommand = "/usr/bin/ssh"\n') && JSON.stringify(args) === JSON.stringify(sshChannelEntry(remote).args) && !/NVOY_INSTANCE_ROOT/.test(toml))
 ok('each keyless channel tool, and only those, is pre-approved', CODEX_CHANNEL_TOOLS.every(tool => toml.includes(`[mcp_servers.nvoy-cx-test.tools.${tool}]\napproval_mode = "approve"\n`)) &&
-  (toml.match(/^approval_mode = /gm) || []).length === 8)
+  (toml.match(/^approval_mode = /gm) || []).length === 10)
 // grants: one harness's extra reach, never its own login, keys or the home directory itself
 const gOwn = '/Users/o', gHome = '/Users/o/.nvoy-harness/x/codex', gKeys = ['/Users/o/.nvoy-harness/x/id_channel', '/Users/o/.nvoy-harness/x/id_feed']
 const grant = raw => { try { return codexGrants(raw, { own: gOwn, codexHome: gHome, keys: gKeys }) } catch (e) { return e.message } }

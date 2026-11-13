@@ -345,6 +345,38 @@ try {
   ok(`a reply to an envelope never read stops its re-announce (threw: ${error.message}) STDERR=${globalThis.repliedStderr?.()}`, false)
 } finally { try { await repliedClient.close() } catch { /* already gone */ } }
 
+// Already answered but never marked read (a reply queued by a runtime from before replies marked envelopes read,
+// or a lost read log): a second reply is refused NVOY_ALREADY_REPLIED, and must still mark the envelope read, or
+// it is announced for good and nothing the agent does clears it (mc-claude, 13 Nov).
+const againRuntime = join(root, 'again-runtime'), againId = 'claude-again-test', againPubkey = randomBytes(32).toString('hex')
+mkdirSync(againRuntime); mkdirSync(join(againRuntime, 'claude-channel-state'))
+writeFileSync(join(manifests, `${againId}.json`), JSON.stringify({ ...manifest, id: againId, pubkey: againPubkey, runtime_dir: againRuntime,
+  state_dir: join(root, 'again-state'), spool_dir: join(root, 'again-spool') }))
+const againEnvelope = 'd'.repeat(64)
+writeFileSync(join(againRuntime, 'admitted-tasks.jsonl'), JSON.stringify({ ...task, instance: againId, envelope: againEnvelope,
+  authority: { ...task.authority, scope_subject: againPubkey } }) + '\n', { mode: 0o600 })
+writeFileSync(join(againRuntime, 'reply-requests.jsonl'), JSON.stringify({ version: 1, type: 'reply-request', id: 'e'.repeat(32),
+  instance: againId, receipt: againEnvelope, content: 'answered by an older runtime' }) + '\n', { mode: 0o640 })
+const againClient = new Client({ name: 'claude-channel-again', version: '0.1.0' })
+const againWakes = []
+againClient.setNotificationHandler(Channel, note => { if (note.params?.meta?.envelope === againEnvelope) againWakes.push(Date.now()) })
+try {
+  await againClient.connect(new StdioClientTransport({ command: process.execPath,
+    args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', againId, '--poll-ms', '250', '--renotify-ms', '1000'],
+    env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stderr: 'pipe' }))
+  const until = async (test, ms) => { const end = Date.now() + ms; while (!test() && Date.now() < end) await new Promise(done => setTimeout(done, 50)); return test() }
+  ok('an answered but unread envelope is still announced on the interval', await until(() => againWakes.length >= 2, 5000))
+  const again = await againClient.callTool({ name: 'nvoy_channel_reply', arguments: { envelope: againEnvelope, text: 'clearing a repeat' } })
+  const before = againWakes.length
+  await new Promise(done => setTimeout(done, 2600))
+  ok('a second reply is refused as already replied, and still marks it read so the re-announce stops',
+    JSON.parse(again.content[0].text).code === 'NVOY_ALREADY_REPLIED' && againWakes.length === before &&
+    readFileSync(join(againRuntime, 'claude-channel-state', 'read.jsonl'), 'utf8').includes(againEnvelope))
+  ok('and queues no second reply', readFileSync(join(againRuntime, 'reply-requests.jsonl'), 'utf8').trim().split('\n').length === 1)
+} catch (error) {
+  ok(`an already-answered envelope stops its re-announce (threw: ${error.message})`, false)
+} finally { try { await againClient.close() } catch { /* already gone */ } }
+
 // The `!task` arm of the read guard, which nothing above drives. Dropping it — the tempting
 // `if (!(read || notifiedThisRun.has(envelope) || listedThisRun.has(envelope)))` — passes the rest
 // of this suite, and the resulting failure is worse than a plain refusal: `read.jsonl` is
@@ -463,9 +495,9 @@ try {
     verifiedPayload.record?.validation === 'structural' &&
     typeof verifiedPayload.buzz_post === 'string' &&
     verifiedPayload.buzz_post.includes('Corridor of Folded Stones') &&
-    !verifiedPayload.buzz_post.includes('dream-1142') &&
+    verifiedPayload.buzz_post.endsWith('Dream ID: dream-1142') &&
     !verifiedPayload.buzz_post.includes('Consolidated Changes') &&
-    !/\d/.test(verifiedPayload.buzz_post))
+    !/\d/.test(verifiedPayload.buzz_post.split('\n\nDream ID: ')[0]))
 } catch (error) {
   ok(`curator instance exposes memory_dream_verify tool in listTools (threw: ${error.message})`, false)
   ok('memory_dream_verify refuses packet_path outside HIVE_MEMORY_CURATOR_PACKET_DIR', false)

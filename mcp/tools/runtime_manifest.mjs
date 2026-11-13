@@ -25,6 +25,13 @@ export function instanceId(value) {
   return id
 }
 
+// A Hive memory store transport: its local socket, or a forced command whose stdio is that socket.
+function storeTransport(transport) {
+  if (!transport || typeof transport !== 'object' || Array.isArray(transport) || Object.keys(transport).length !== 1 ||
+      !(typeof transport.socket === 'string' ? isAbsolute(transport.socket) && !transport.socket.includes('\0')
+        : Array.isArray(transport.command) && transport.command.length > 0 && transport.command.every(a => typeof a === 'string' && a.length > 0 && !a.includes('\0')) && isAbsolute(transport.command[0]))) return null
+  return transport.socket ? Object.freeze({ socket: transport.socket }) : Object.freeze({ command: Object.freeze([...transport.command]) })
+}
 function regular(path, label) {
   let st
   try { st = lstatSync(path) } catch { die(`${label} is missing`) }
@@ -252,20 +259,30 @@ export function readManifest(root, requestedId) {
   if (raw.may_remember != null) {
     const block = raw.may_remember
     if (typeof block !== 'object' || Array.isArray(block) || Object.keys(block).some(k => !['rooms', 'per_hour', 'submit'].includes(k))) die('may_remember takes only rooms, per_hour and submit')
-    const transport = block.submit
-    if (!transport || typeof transport !== 'object' || Array.isArray(transport) || Object.keys(transport).length !== 1 ||
-        !(typeof transport.socket === 'string' ? isAbsolute(transport.socket) && !transport.socket.includes('\0')
-          : Array.isArray(transport.command) && transport.command.length > 0 && transport.command.every(a => typeof a === 'string' && a.length > 0 && !a.includes('\0')) && isAbsolute(transport.command[0]))) {
-      die('may_remember.submit takes exactly one of socket (an absolute path) or command (an absolute executable and its arguments)')
-    }
+    const submit = storeTransport(block.submit)
+    if (!submit) die('may_remember.submit takes exactly one of socket (an absolute path) or command (an absolute executable and its arguments)')
     if (!buzz) die('may_remember requires a buzz block')
     if (brokerMode !== 'local' || deliveryMode !== 'notify_only' || workerEnabled) die('may_remember requires a local-broker, worker-disabled notify_only manifest')
     const rooms = (Array.isArray(block.rooms) ? block.rooms : []).map(value => String(value || '').toLowerCase())
     if (!rooms.length || !rooms.every(validChannel) || new Set(rooms).size !== rooms.length) die('may_remember.rooms requires distinct room UUIDs')
     if (!rooms.every(r => buzz.channels.includes(r))) die('may_remember.rooms must be a subset of buzz.channels')
     if (!Number.isInteger(block.per_hour) || block.per_hour < 1 || block.per_hour > 30) die('may_remember.per_hour must be an integer from 1 to 30')
-    const submit = transport.socket ? Object.freeze({ socket: transport.socket }) : Object.freeze({ command: Object.freeze([...transport.command]) })
     mayRemember = Object.freeze({ rooms: Object.freeze(rooms), perHour: block.per_hour, submit })
+  }
+  // Reading Hive memory (memory_wake, memory_query), independent of may_remember: an identity may
+  // read without writing. `read` is the store's reader socket or the forced-command SSH bridge to it,
+  // reached only by the broker-side forwarder (instance-broker-recall.mjs), so the read key never
+  // reaches the keyless channel. The store's reader ACL decides what comes back.
+  let mayRecall = null
+  if (raw.may_recall != null) {
+    const block = raw.may_recall
+    if (typeof block !== 'object' || Array.isArray(block) || Object.keys(block).some(k => !['read', 'gateway_gid'].includes(k))) die('may_recall takes only read and gateway_gid')
+    const read = storeTransport(block.read)
+    if (!read) die('may_recall.read takes exactly one of socket (an absolute path) or command (an absolute executable and its arguments)')
+    if (brokerMode !== 'local' || deliveryMode !== 'notify_only' || workerEnabled) die('may_recall requires a local-broker, worker-disabled notify_only manifest')
+    const gatewayGid = block.gateway_gid == null ? null : block.gateway_gid
+    if (gatewayGid !== null && (!Number.isSafeInteger(gatewayGid) || gatewayGid < 1 || gatewayGid === brokerAdapterGid || gatewayGid === workerHandoffGid)) die('may_recall.gateway_gid must be a dedicated positive group ID')
+    mayRecall = Object.freeze({ read, gatewayGid })
   }
   let maySetProfile = null
   if (raw.may_set_profile != null) {
@@ -309,7 +326,7 @@ export function readManifest(root, requestedId) {
     }
   }
   return Object.freeze({ id, path, root: canonicalRoot, pubkey, grantors, carriers: Object.freeze(carriers), buzz, relays, stateDir, runtimeDir, spoolDir,
-    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, adapterContainer, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath, codexAppBundleId, codexProjectLabel, codexChatLabel, codexUiDriver, harness, wakeWebhook, channelDoor, mayPost, mayRemember, maySetProfile, agentLimits, agentCard,
+    brokerMode, brokerAdapterGid, workerHandoffGid, watcherUid, brokerUid, adapterUid, workerUid, adapterContainer, serviceUser: String(raw.service_user || raw.serviceUser || ''), keyRef, bunkerUriRef, bunkerClientRef, workerEnabled, workerImage, workerRunner, workerCredentialRef, deliveryMode, codexThreadId, codexTransport, codexSocketPath, codexAppBundleId, codexProjectLabel, codexChatLabel, codexUiDriver, harness, wakeWebhook, channelDoor, mayPost, mayRemember, mayRecall, maySetProfile, agentLimits, agentCard,
     sshTarget, sshIdentityFile, sshKnownHostsFile, sshKnownHostsSha256, approvalEndpoint: approvalEndpoint.replace(/\/$/, '') })
 }
 
@@ -323,7 +340,8 @@ export function assertNoCollisions(root, candidate) {
     const id = name.slice(0, -5)
     let m
     try { m = readManifest(canonicalRoot, id) } catch (e) { die(`invalid manifest ${name}: ${e.message}`) }
-    for (const [field, value] of [['pubkey', m.pubkey], ['stateDir', m.stateDir], ['runtimeDir', m.runtimeDir], ['spoolDir', m.spoolDir]]) {
+    for (const [field, value] of [['pubkey', m.pubkey], ['stateDir', m.stateDir], ['runtimeDir', m.runtimeDir], ['spoolDir', m.spoolDir],
+      ...(m.mayRecall?.gatewayGid ? [['recallGatewayGid', m.mayRecall.gatewayGid]] : [])]) {
       const key = `${field}:${value}`
       if (seen.has(key)) die(`${field} collision between ${seen.get(key)} and ${m.id}`)
       seen.set(key, m.id)

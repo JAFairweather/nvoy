@@ -140,7 +140,7 @@ ok('nip01Newer: newer created_at wins; a same-second tie goes to the lower id',
 // --- 1. Static: the hive-memory modules never import a relay, grant or Bunker client ---
 {
   const files = ['mcp/tools/hive_memory_store.mjs', 'mcp/tools/memory-daemon.mjs', 'mcp/tools/memory.mjs', 'mcp/tools/memory-viewer.mjs',
-    'mcp/tools/instance-broker-memory.mjs', 'bin/hive-memory-restore.mjs', 'bin/hive-memory-purge.mjs', 'bin/hive-memory-backup.mjs']
+    'mcp/tools/instance-broker-memory.mjs', 'mcp/tools/agent_recall.mjs', 'mcp/tools/instance-broker-recall.mjs', 'bin/hive-memory-restore.mjs', 'bin/hive-memory-purge.mjs', 'bin/hive-memory-backup.mjs']
   const banned = /^(ws|.*buzz_native.*|.*grant_relays.*|.*nip46.*|.*liverelay.*)$/
   const hits = files.flatMap(f => [...readFileSync(resolve(import.meta.dirname, '..', f), 'utf8').matchAll(/from '([^']+)'/g)]
     .map(m => m[1]).filter(spec => banned.test(spec.split('/').pop()) || banned.test(spec)).map(spec => `${f}: ${spec}`))

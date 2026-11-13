@@ -25,18 +25,25 @@ import {
   recordVerifiedBackup,
   validateAndResolveConfig,
 } from '../mcp/tools/hive_memory_store.mjs'
-import { startMemoryDaemon } from '../mcp/tools/memory-daemon.mjs'
+import { ACTIVITY_MAX, handleSocketJsonRpc, startMemoryDaemon } from '../mcp/tools/memory-daemon.mjs'
+import { computeCoherence } from '../mcp/tools/memory-viewer.mjs'
 import {
   buildDreamPacket,
+  computeEigenAxisProposals,
+  curationObservationEnd,
   computeTopicEigenvectors,
   evaluateDreamTriggers,
+  mergeCycleRecentActivity,
   planMerkleDream,
+  readInitialHistory,
+  readPostCycleSnapshot,
   readConsolidationLedger,
   readCuratorStateFile,
   runCuratorCycle,
   curatorSignerFromFlags,
   parseCuratorFlags,
   weaveDreamStory,
+  writeCuratorStateFile,
   writeDreamPacket,
 } from '../mcp/tools/memory-curate.mjs'
 import {
@@ -66,6 +73,69 @@ async function test(name, fn) {
 }
 
 console.log('=== Hive Shared Memory Merkle Dreaming & Curator Tests ===')
+
+await test('initial history restarts a bounded scan when a concurrent save advances write_seq', async () => {
+  const record = id => ({ event_id: id, is_current: true, status: 'active', verification: 'accepted' })
+  const page = (seq, cursor) => ({ answer: 'found', answer_reason: null, format: 'full',
+    records: [record(cursor ? 'second' : 'first')], total_matched: 2, returned: 1,
+    next_cursor: cursor ? null : '1', store_state: { state: 'READY', write_seq: seq } })
+  let wakes = 0
+  let queries = 0
+  const reader = { callReadTool: async (name, args) => {
+    if (name === 'memory_wake') return { store_state: { state: 'READY', write_seq: ++wakes === 1 ? 42 : 43 } }
+    queries++
+    return page(queries === 2 ? 43 : queries === 1 ? 42 : 43, Boolean(args.cursor))
+  } }
+  const scan = await readInitialHistory(reader, 3, 1)
+  assert.equal(scan.wake.store_state.write_seq, 43)
+  assert.deepEqual(scan.historyRecords.map(r => r.event_id), ['first', 'second'])
+  assert.equal(scan.historyComplete, true)
+  assert.equal(queries, 4, 'a changed page restarts from the first page')
+
+  let growingQueries = 0
+  const growing = { callReadTool: async (name, args) => {
+    if (name === 'memory_wake') return { store_state: { state: 'READY', write_seq: growingQueries === 0 ? 42 : 43 } }
+    growingQueries++
+    const offset = Number(args.cursor ?? 0)
+    const seq = growingQueries === 1 ? 42 : 43
+    const total = seq === 42 ? 2 : 3
+    return { answer: 'found', answer_reason: null, format: 'full',
+      records: [record(['first', 'second', 'third'][offset])], total_matched: total, returned: 1,
+      next_cursor: offset + 1 === total ? null : String(offset + 1),
+      store_state: { state: 'READY', write_seq: seq } }
+  } }
+  const grownScan = await readInitialHistory(growing, 4, 1)
+  assert.deepEqual(grownScan.historyRecords.map(r => r.event_id), ['first', 'second', 'third'])
+  assert.equal(growingQueries, 5, 'a save that grows history restarts from the first page')
+
+  let malformedQueries = 0
+  const malformed = { callReadTool: async name => name === 'memory_wake'
+    ? { store_state: { state: 'READY', write_seq: 42 } }
+    : (malformedQueries++, { ...page(43, false), answer: 'unknown', answer_reason: 'store-not-ready' }) }
+  await assert.rejects(() => readInitialHistory(malformed, 3, 1), /complete ready history page/)
+  assert.equal(malformedQueries, 1, 'malformed history fails closed without retry')
+
+  let changingSeq = 0
+  const alwaysChanging = { callReadTool: async name => name === 'memory_wake'
+    ? { store_state: { state: 'READY', write_seq: ++changingSeq } }
+    : page(changingSeq + 1, false) }
+  await assert.rejects(() => readInitialHistory(alwaysChanging, 3, 1), /bounded read retries/)
+  assert.equal(changingSeq, 3, 'write-sequence retries are bounded to three scans')
+})
+
+await test('post-cycle history rejects degraded or malformed queries before measuring counters', async () => {
+  const state = { state: 'READY', write_seq: 42 }
+  const wake = { store_state: state, agent_roster: [], recent_activity: [] }
+  const readerFor = page => ({ callReadTool: async name => name === 'memory_wake' ? wake : page })
+  const validEmpty = { answer: 'none', answer_reason: null, format: 'full', records: [],
+    total_matched: 0, returned: 0, next_cursor: null, store_state: state }
+  const complete = await readPostCycleSnapshot(readerFor(validEmpty), 42, 3, 100, 1794225262)
+  assert(complete && Array.isArray(complete.historyRecords), 'a ready empty store is a complete observation')
+  assert.equal(complete.historyRecords.length, 0)
+  assert.equal(await readPostCycleSnapshot(readerFor({ ...validEmpty, answer: 'unknown', answer_reason: 'store-not-ready' }), 42, 3, 100, 1794225262), null)
+  assert.equal(await readPostCycleSnapshot(readerFor({ ...validEmpty, store_state: { state: 'BACKUP_DEGRADED', write_seq: 42 } }), 42, 3, 100, 1794225262), null)
+  assert.equal(await readPostCycleSnapshot(readerFor({ ...validEmpty, records: undefined }), 42, 3, 100, 1794225262), null)
+})
 
 await test('computeSourceMerkleRoot and validateMemoryEvent enforce cryptographic merkle_sources', () => {
   const idA = 'a'.repeat(64)
@@ -949,6 +1019,199 @@ await test('computeTopicEigenvectors extracts orthonormal eigen-axes and planMer
     false,
     'zero-overlap topic astro must not appear in reorganizations'
   )
+
+  // ── mem-eigen-axes: Intra-topic TF-IDF sub-axis clustering (>=25 claims), merge (cos >= 0.55), retire (0w/7d, <=3 Class B), counterfactual coherence_delta, no auto-refiling ──
+  const largeTopicCorpus = []
+  // 12 coherent systemd/watchdog claims in herd-infra
+  for (let i = 0; i < 12; i++) {
+    largeTopicCorpus.push({
+      event_id: `fa${String(i).padStart(2, '0')}`.padEnd(64, '0'),
+      pubkey: 'b'.repeat(64),
+      author: 'neil',
+      created_at: now - 3600 - i * 60,
+      expires_at: now + 86400 * 7,
+      scope: `room:${ROOM_ID}`,
+      topic: 'herd-infra',
+      d: `hive-memory:room:${ROOM_ID}:herd-infra-systemd-watchdog-${i}`,
+      claim: `Systemd service unit watchdog timer health check and slice memory threshold verified on host node ${i}.`,
+      because: 'Systemd watchdog slice health check.',
+      evidence: ['git:herd-infra@11111111:scripts/watchdog.sh'],
+      verification: 'accepted',
+      status: 'active',
+    })
+  }
+  // 10 coherent restic/backblaze backup claims in herd-infra
+  for (let i = 0; i < 10; i++) {
+    largeTopicCorpus.push({
+      event_id: `fb${String(i).padStart(2, '0')}`.padEnd(64, '0'),
+      pubkey: 'c'.repeat(64),
+      author: 'dead-rabbit',
+      created_at: now - 7200 - i * 60,
+      expires_at: now + 86400 * 7,
+      scope: `room:${ROOM_ID}`,
+      topic: 'herd-infra',
+      d: `hive-memory:room:${ROOM_ID}:herd-infra-restic-backup-${i}`,
+      claim: `Restic snapshot repository backup to Backblaze bucket verified with prune retention receipt ${i}.`,
+      because: 'Half-hourly restic backup to Backblaze B2.',
+      evidence: ['git:herd-infra@22222222:host/backup/restic.sh'],
+      verification: 'accepted',
+      status: 'active',
+    })
+  }
+  // 5 miscellaneous claims in herd-infra so total in herd-infra is 27 (>= 25)
+  for (let i = 0; i < 5; i++) {
+    largeTopicCorpus.push({
+      event_id: `fc${String(i).padStart(2, '0')}`.padEnd(64, '0'),
+      pubkey: 'a'.repeat(64),
+      author: 'biggy',
+      created_at: now - 9000 - i * 60,
+      expires_at: now + 86400 * 7,
+      scope: `room:${ROOM_ID}`,
+      topic: 'herd-infra',
+      d: `hive-memory:room:${ROOM_ID}:herd-infra-ssh-key-${i}`,
+      claim: `Authorized ssh key provisioning and known_hosts fingerprint check ${i}.`,
+      because: 'SSH key rotation.',
+      evidence: ['git:herd-infra@33333333:bin/put-keys'],
+      verification: 'accepted',
+      status: 'active',
+    })
+  }
+  // Overlapping topic (`r1-audio` overlapping with `r1`, cosine >= 0.55)
+  for (let i = 0; i < 4; i++) {
+    largeTopicCorpus.push({
+      event_id: `fd${String(i).padStart(2, '0')}`.padEnd(64, '0'),
+      pubkey: 'a'.repeat(64),
+      author: 'mc-claude',
+      created_at: now - 1800 - i * 60,
+      expires_at: now + 86400 * 7,
+      scope: `room:${ROOM_ID}`,
+      topic: i < 2 ? 'r1' : 'r1-audio',
+      d: `hive-memory:room:${ROOM_ID}:r1-voice-speak-socket-${i}`,
+      claim: 'Rabbit R1 voice speak socket streams spoken audio replies over r1-speak systemd socket.',
+      because: 'R1 voice speak socket verification.',
+      evidence: ['git:rabidrabbit@72540514:usr/local/lib/r1-herd/voice'],
+      verification: 'accepted',
+      status: 'active',
+    })
+  }
+  // Idle topic (`legacy-experiment`: 0 writes in 7d, <= 3 Class B claims)
+  largeTopicCorpus.push({
+    event_id: 'fe00'.padEnd(64, '0'),
+    pubkey: 'd'.repeat(64),
+    author: 'kerouac',
+    created_at: now - 10 * 86400,
+    expires_at: null,
+    retention: 'decision',
+    scope: `room:${ROOM_ID}`,
+    topic: 'legacy-experiment',
+    d: `hive-memory:room:${ROOM_ID}:legacy-experiment-note`,
+    claim: 'Early prototype layout notes from ten days ago.',
+    because: 'Historical note.',
+    evidence: [],
+    verification: 'accepted',
+    status: 'active',
+  })
+
+  const proposals = computeEigenAxisProposals(largeTopicCorpus, { nowSec: now })
+  const splitProposals = proposals.filter(p => p.kind === 'split' && p.from_topic === 'herd-infra')
+  assert(splitProposals.length >= 2, `expected >= 2 coherent sub-axis split proposals for herd-infra (27 claims), got ${splitProposals.length}`)
+  for (const sp of splitProposals) {
+    assert(sp.proposed_topic.startsWith('herd-infra-'), `sub-axis name must follow <topic>-<top-terms>, got ${sp.proposed_topic}`)
+    assert(sp.claim_count >= 8, `sub-axis cluster must have size >= 8, got ${sp.claim_count}`)
+    assert(sp.mean_intra_cosine >= 0.35, `sub-axis cluster must have mean_intra_cosine >= 0.35, got ${sp.mean_intra_cosine}`)
+    assert(Array.isArray(sp.sample_claims) && sp.sample_claims.length > 0, 'proposal must include sample_claims')
+    assert(Array.isArray(sp.sample_slugs) && sp.sample_slugs.length > 0, 'proposal must include sample_slugs')
+    assert(typeof sp.coherence_delta === 'number' && sp.coherence_delta > 0, 'proposal must report positive counterfactual coherence_delta')
+    assert.equal(sp.coherence_delta_units, 'coherence_points', 'proposal must report coherence_points units')
+    assert(/^\+\d+\.\d pts$/.test(sp.coherence_delta_label), `coherence_delta_label must be formatted +X.X pts, got ${sp.coherence_delta_label}`)
+    assert.equal(sp.counterfactual, true)
+    assert.equal(sp.approval_required, true)
+    assert.equal(sp.status, 'pending_james_approval')
+  }
+
+  const mergeProposal = proposals.find(p => p.kind === 'merge' && p.from_topic === 'r1-audio' && p.to_topic === 'r1')
+  assert(mergeProposal, 'must propose merging overlapping topic r1-audio into r1 (cosine >= 0.55)')
+  assert(mergeProposal.cosine_affinity >= 0.55)
+  assert.equal(mergeProposal.coherence_delta_units, 'coherence_points')
+  assert.equal(mergeProposal.counterfactual, true)
+  assert.equal(mergeProposal.status, 'pending_james_approval')
+
+  const retireProposal = proposals.find(p => p.kind === 'retire' && p.from_topic === 'legacy-experiment')
+  assert(retireProposal, 'must propose retiring idle topic legacy-experiment (0 writes in 7d, <= 3 Class B claims)')
+  assert.equal(retireProposal.writes_7d, 0)
+  assert(retireProposal.class_b_count <= 3)
+  assert.equal(retireProposal.coherence_delta_units, 'coherence_points')
+  assert.equal(retireProposal.counterfactual, true)
+  assert.equal(retireProposal.status, 'pending_james_approval')
+
+  // Non-improving proposal regression: harmful/non-improving split and retirement must preserve signed negative delta and true counterfactual score (never clamped to +0.1)
+  const nonImprovingCorpus = []
+  for (let i = 0; i < 25; i++) {
+    const isSub = i < 8
+    nonImprovingCorpus.push({
+      event_id: `cc${String(i).padStart(2, '0')}`.padEnd(64, '0'),
+      pubkey: 'b'.repeat(64),
+      author: 'neil',
+      created_at: isSub ? now - 10 * 86400 : now - 3600,
+      expires_at: now + 86400 * 7,
+      scope: `room:${ROOM_ID}`,
+      topic: 'herd-infra',
+      d: `hive-memory:room:${ROOM_ID}:herd-infra-unit-${i}`,
+      claim: `Systemd service unit daemon socket watchdog timer slice health verified on host ${isSub ? 'journald vacuum ' : 'cgroup limit '}${i % 4}`,
+      because: 'Systemd service unit daemon socket watchdog timer slice health.',
+      evidence: ['git:herd-infra@11111111:scripts/watchdog.sh'],
+      verification: 'accepted',
+      status: 'active',
+    })
+  }
+  for (let i = 0; i < 6; i++) {
+    nonImprovingCorpus.push({
+      event_id: `dd${String(i).padStart(2, '0')}`.padEnd(64, '0'),
+      pubkey: 'c'.repeat(64),
+      author: 'kerouac',
+      created_at: now - 12 * 86400,
+      expires_at: now + 86400,
+      scope: `room:${ROOM_ID}`,
+      topic: 'old-migration',
+      d: `hive-memory:room:${ROOM_ID}:old-migration-${i}`,
+      claim: 'Legacy migration script archive checksum manifest verified on host.',
+      because: 'Migration check.',
+      evidence: ['git:nvoy@22222222:scripts/migrate.sh'],
+      verification: 'accepted',
+      status: 'active',
+    })
+  }
+  const nonImprovingProposals = computeEigenAxisProposals(nonImprovingCorpus, { nowSec: now })
+  const harmfulSplit = nonImprovingProposals.find(p => p.kind === 'split' && p.from_topic === 'herd-infra')
+  assert(harmfulSplit, 'must evaluate sub-axis split proposal on overlapping parent corpus')
+  assert(harmfulSplit.coherence_delta < 0, `non-improving split must preserve negative coherence_delta, got ${harmfulSplit.coherence_delta}`)
+  assert.equal(harmfulSplit.coherence_delta_units, 'coherence_points')
+  assert(/^-\d+\.\d pts$/.test(harmfulSplit.coherence_delta_label), `negative split label must be -X.X pts, got ${harmfulSplit.coherence_delta_label}`)
+  assert(
+    harmfulSplit.counterfactual_partition_coherence < harmfulSplit.baseline_partition_coherence,
+    `counterfactual score (${harmfulSplit.counterfactual_partition_coherence}) must be less than baseline (${harmfulSplit.baseline_partition_coherence})`
+  )
+
+  const harmfulRetire = nonImprovingProposals.find(p => p.kind === 'retire' && p.from_topic === 'old-migration')
+  assert(harmfulRetire, 'must evaluate retirement proposal for idle topic old-migration')
+  assert(harmfulRetire.coherence_delta < 0, `non-improving retirement must preserve negative coherence_delta, got ${harmfulRetire.coherence_delta}`)
+  assert.equal(harmfulRetire.coherence_delta_units, 'coherence_points')
+  assert(/^-\d+\.\d pts$/.test(harmfulRetire.coherence_delta_label), `negative retire label must be -X.X pts, got ${harmfulRetire.coherence_delta_label}`)
+  assert.equal(
+    Math.round((harmfulRetire.baseline_partition_coherence + harmfulRetire.coherence_delta) * 10) / 10,
+    harmfulRetire.counterfactual_partition_coherence,
+    'counterfactual_partition_coherence must match measured counterfactual score without +0.1 floor'
+  )
+
+  // Verify planMerkleDream exposes eigen_axis_proposals and NEVER auto-refiles claims into unapproved sub-axes!
+  const largePlan = planMerkleDream({ records: largeTopicCorpus, nowSec: now })
+  assert(Array.isArray(largePlan.eigen_axis_proposals) && largePlan.eigen_axis_proposals.length >= 4)
+  for (const item of [...largePlan.promotions, ...largePlan.distillations]) {
+    assert(
+      !splitProposals.some(sp => sp.proposed_topic === item.topic),
+      `planMerkleDream must never re-file claims into unapproved sub-axis ${item.topic} before James approves`
+    )
+  }
 })
 
 // ── Test 7: Fail-closed malformed state cursors, initial temporal trigger, and incomplete-history write gate ──
@@ -1278,11 +1541,26 @@ await test('writeDreamPacket writes 0640 global-scope packets, strips @mentions/
     const claimIdPrivate = 'b2'.repeat(32)
 
     const pkt = buildDreamPacket({
+      lastCuratedAt: 1794225000,
       writeSeqBefore: 1000,
       writeSeqAfter: 1023,
       ranAt: 1794225262,
       ledgerRef: '/var/lib/hive-memory-curator/consolidation-ledger.jsonl#write_seq=1023',
       coherenceScore: 75.6,
+      coherenceBefore: 74.1,
+      coherenceAfter: 75.6,
+      historyComplete: true,
+      historyRecords: [
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'a'.repeat(64), d: 'old', event_id: '01'.repeat(32), created_at: 1794224900, expires_at: null },
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'a'.repeat(64), d: 'old', event_id: '02'.repeat(32), created_at: 1794225100, expires_at: null },
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'b'.repeat(64), d: 'gone', event_id: '03'.repeat(32), created_at: 1794225200, status: 'withdrawn', expires_at: 1794225250 },
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'c'.repeat(64), d: 'aged', event_id: '04'.repeat(32), created_at: 1794224800, expires_at: 1794225200 },
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'e'.repeat(64), d: 'current', event_id: '03'.repeat(32), created_at: 1794224900, expires_at: null },
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'e'.repeat(64), d: 'current', event_id: claimIdGlobal, created_at: 1794225250, expires_at: null },
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'f'.repeat(64), d: 'same-second', event_id: 'ff'.repeat(32), created_at: 1794224800, expires_at: 1794225200 },
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'f'.repeat(64), d: 'same-second', event_id: '00'.repeat(32), created_at: 1794224800, expires_at: null },
+        { scope: 'room:private-other-room', author_pubkey: 'd'.repeat(64), d: 'private', event_id: '05'.repeat(32), created_at: 1794225100, status: 'withdrawn', expires_at: 1794225200 },
+      ],
       triggers: { reasons: ['synaptic_volume(delta=69>=20)'] },
       plan: {
         promotions: [
@@ -1317,6 +1595,31 @@ await test('writeDreamPacket writes 0640 global-scope packets, strips @mentions/
     assert.equal(pkt.id, 'dream-1023')
     assert.equal(pkt.changes.length, 1, 'non-global room claims must be strictly excluded from dream packet')
     assert.equal(pkt.changes[0].claim_event_id, claimIdGlobal)
+    assert.deepEqual(pkt.stats.retired, { withdrawn: 1, expired: 1, folded: 2, total: 4 })
+    assert.equal(pkt.stats.claims_merged, 1)
+    assert.equal(pkt.stats.claims_superseded, 2, 'include this cycle\'s replacement in the post-write observation')
+    assert.equal(pkt.stats.coherence.delta, 1.5)
+    const adjustedStamp = buildDreamPacket({
+      lastCuratedAt: 1794225000,
+      writeSeqAfter: 1024,
+      ranAt: 1794225262,
+      historyComplete: true,
+      historyRecords: [
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'a'.repeat(64), d: 'adjusted', event_id: '11'.repeat(32), created_at: 1794225250, expires_at: null },
+        { scope: `room:${GLOBAL_CH}`, author_pubkey: 'a'.repeat(64), d: 'adjusted', event_id: claimIdGlobal, created_at: 1794225263, expires_at: null },
+      ],
+      plan: { promotions: [{ scope: `room:${GLOBAL_CH}`, topic: 'herd-infra', slug: 'adjusted', claim: 'Accepted after timestamp adjustment',
+        template: { tags: [['d', 'adjusted']] } }] },
+      submitted: [{ id: claimIdGlobal, d: 'adjusted', created_at: 1794225263 }],
+    })
+    assert.equal(adjustedStamp.stats.window_end, 1794225263, 'observation boundary includes the accepted adjusted timestamp')
+    assert.equal(adjustedStamp.stats.claims_superseded, 1, 'same-second accepted replacement is counted')
+    const unknown = buildDreamPacket({ writeSeqAfter: 1023, ranAt: 1794225262, plan: {
+      promotions: [{ scope: `room:${GLOBAL_CH}`, topic: 'herd-infra', slug: 'unknown', claim: 'Known merge',
+        template: { tags: [['d', `herd-infra:room:${GLOBAL_CH}:unknown`]] } }], distillations: [] },
+      submitted: [{ id: claimIdGlobal, d: `herd-infra:room:${GLOBAL_CH}:unknown` }] })
+    assert.equal(unknown.stats.claims_superseded, null, 'incomplete history is unknown rather than measured zero')
+    assert.equal(unknown.stats.retired.total, null)
     assert(!pkt.changes[0].summary.includes('0d7ac776bf6e9cd0b5f6216ea2f59ac7932a9948'), 'raw 64-hex commit SHA must be sanitized in summary')
     assert(!pkt.changes[0].summary.includes('@mydude'), '@mention syntax must be stripped from packet summary')
     assert(!pkt.changes[0].summary.includes('https://'), 'raw URLs must be stripped from packet summary')
@@ -1365,9 +1668,10 @@ await test('writeDreamPacket writes 0640 global-scope packets, strips @mentions/
     assert.deepEqual(goodRes.record.changes[0], pkt.changes[0], 'verifier must copy each packet change verbatim including change_id, d, topic, and source_count')
     const buzzPost = formatDreamBuzzPost(goodRes.record)
     assert(!buzzPost.includes('@mydude') && !buzzPost.includes('https://'), 'formatted Buzz post must contain no @mentions or URLs')
-    assert(!buzzPost.includes('dream-1023') && !buzzPost.includes('Consolidated Changes') && !buzzPost.includes('validation'), 'formatted Buzz post must be journey-only without dream ID, validation metadata, or Consolidated Changes list')
+    assert(buzzPost.endsWith('Dream ID: dream-1023'), 'published dream must identify its exact packet for the Cyber Times')
+    assert(!buzzPost.includes('Consolidated Changes') && !buzzPost.includes('validation'), 'formatted Buzz post must omit validation metadata and Consolidated Changes list')
     const seedBuzzPost = formatDreamBuzzPost(seedRes.record)
-    assert(!/\d/.test(seedBuzzPost), 'formatted Buzz post from story_seed must contain zero statistics, sequence numbers, or counts')
+    assert(!/\d/.test(seedBuzzPost.split('\n\nDream ID: ')[0]), 'formatted dream story must contain zero statistics, sequence numbers, or counts')
 
     // Unsanitized packet summary with @mention or URL fails closed in verifier
     const dirtyPkt = {
@@ -1423,6 +1727,52 @@ await test('writeDreamPacket writes 0640 global-scope packets, strips @mentions/
     assert.equal(digitRes.ok, false, 'verifier must reject digits/counts in title and dream')
     assert(digitRes.errors.some(e => e.includes('draft.title') && e.includes('digits')))
     assert(digitRes.errors.some(e => e.includes('draft.dream') && e.includes('digits')))
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+await test('consecutive dream packets persist the measured horizon and count a replacement once', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'nvoy-dream-horizon-'))
+  try {
+    const stateFile = join(tmp, 'curator-state.json')
+    const scope = `room:${GLOBAL_CH}`
+    const prior = { scope, author_pubkey: 'a'.repeat(64), d: 'replacement', event_id: '11'.repeat(32), created_at: 101, expires_at: null }
+    const replacement = { ...prior, event_id: '22'.repeat(32), created_at: 102 }
+    const other = { scope, author_pubkey: 'b'.repeat(64), d: 'other', event_id: '33'.repeat(32), created_at: 150, expires_at: null }
+    const firstSubmitted = [{ id: replacement.event_id, d: 'replacement', created_at: replacement.created_at }]
+    const first = buildDreamPacket({
+      lastCuratedAt: 90,
+      writeSeqAfter: 2,
+      ranAt: 100,
+      historyComplete: true,
+      historyRecords: [prior, replacement],
+      plan: { promotions: [{ scope, topic: 'nvoy', slug: 'replacement', claim: 'Replacement accepted', template: { tags: [['d', 'replacement']] } }] },
+      submitted: firstSubmitted,
+    })
+    assert.equal(first.stats.window_end, 102)
+    assert.equal(first.stats.claims_superseded, 1)
+
+    const measuredHorizon = curationObservationEnd(100, firstSubmitted)
+    writeCuratorStateFile(stateFile, { last_curated_at: 90, last_curated_write_seq: 1,
+      pending_curated_at: measuredHorizon, pending_curated_write_seq: 2, pending_dream_packet: first })
+    const staged = readCuratorStateFile(stateFile)
+    assert.equal(staged.pending_curated_at, first.stats.window_end, 'recovery stages the packet measurement boundary')
+    writeCuratorStateFile(stateFile, { last_curated_at: staged.pending_curated_at, last_curated_write_seq: staged.pending_curated_write_seq })
+    const durable = readCuratorStateFile(stateFile)
+    assert.equal(durable.last_curated_at, 102)
+
+    const second = buildDreamPacket({
+      lastCuratedAt: durable.last_curated_at,
+      writeSeqAfter: 3,
+      ranAt: 200,
+      historyComplete: true,
+      historyRecords: [prior, replacement, other],
+      plan: { promotions: [{ scope, topic: 'nvoy', slug: 'other', claim: 'Other claim accepted', template: { tags: [['d', 'other']] } }] },
+      submitted: [{ id: other.event_id, d: 'other', created_at: other.created_at }],
+    })
+    assert.equal(second.stats.window_start, first.stats.window_end)
+    assert.equal(second.stats.claims_superseded, 0, 'the prior replacement is outside the next measured window')
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }
@@ -1532,6 +1882,8 @@ await test('runCuratorCycle does not advance cursor or ledger when writeDreamPac
     const stagedState = readCuratorStateFile(stateFile)
     assert.equal(stagedState.last_curated_write_seq, 0, 'cursor must not advance when packet write fails')
     assert(stagedState.pending_dream_packet, 'pending_dream_packet must be staged in curator-state.json for retry recovery')
+    assert.notEqual(stagedState.pending_dream_packet.stats.claims_superseded, null, 'complete post-write history measures replacements')
+    assert.notEqual(stagedState.pending_dream_packet.stats.coherence.after, null, 'post-write coherence is measured before staging')
     const consLedgerPath = join(tmp, 'consolidation-ledger.jsonl')
     assert.equal(readConsolidationLedger(consLedgerPath).length, 0, 'consolidation ledger must not advance before packet write succeeds')
 
@@ -1695,6 +2047,230 @@ await test('memory-dream-verify.mjs --mcp serves local stdio JSON-RPC for memory
     assert.equal(lines.length, 2, 'symlinked --mcp child process must emit initialize + tools/list JSON-RPC responses')
     assert.equal(lines[0].result.serverInfo.name, 'hive-dream')
     assert.equal(lines[1].result.tools[0].name, 'memory_dream_verify')
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+await test('nvoy #378 regression (dream-2567 shape): curator reader pagination never evicts peer recall from recent_activity, readPostCycleSnapshot preserves peer recall, and descending query records sort chronologically for recent-window convergence', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'nvoy-dream2567-'))
+  try {
+    const skOwner = generateSecretKey()
+    const pkOwner = getPublicKey(skOwner)
+    const skCurator = generateSecretKey()
+    const pkCurator = getPublicKey(skCurator)
+    const peerNames = [
+      'crystalclaude', 'djcodex', 'hr', 'crusty', 'waggle-dev', 'biggy',
+      'dead-rabbit', 'mydude', 'murphy', 'neil', 'dennis', 'kerouac',
+      'mc-claude', 'pi-dog', 'grokdoggydog', 'lukedog',
+    ]
+    const peerKeys = Object.fromEntries(peerNames.map(n => {
+      const sk = generateSecretKey()
+      return [n, { sk, pk: getPublicKey(sk) }]
+    }))
+    const readersCfg = {
+      viewer: null,
+      curator: pkCurator,
+      ...Object.fromEntries(peerNames.map(n => [n, peerKeys[n].pk])),
+    }
+    const writersCfg = {
+      owner: { pubkey: pkOwner, perHour: 100 },
+      curator: { pubkey: pkCurator, perHour: 300 },
+      ...Object.fromEntries(peerNames.map(n => [n, { pubkey: peerKeys[n].pk, perHour: 50 }])),
+    }
+    const allMembers = [pkOwner, pkCurator, ...peerNames.map(n => peerKeys[n].pk)]
+    const cfg = validateAndResolveConfig({
+      memoryGlobalChannelId: GLOBAL_CH,
+      ownerPubkey: pkOwner,
+      maxUnbackedSec: 3600,
+      globalWriters: [],
+      canonWriters: [pkOwner],
+      curators: [pkCurator],
+      readers: readersCfg,
+      writers: writersCfg,
+      rooms: { [ROOM_ID]: { members: allMembers, writers: allMembers } },
+    })
+
+    const dbPath = join(tmp, 'memory.sqlite')
+    const ledgerPath = join(tmp, 'accepted-ledger.jsonl')
+    const receiptPath = join(tmp, 'last-verified-backup.json')
+    initEmptyStore({ dbPath, ledgerPath, nowSec: 1000 })
+    recordVerifiedBackup({ dbPath, ledgerPath, receiptPath, snapshotId: SNAP_ID, writeSeq: 1, at: 1000 })
+    const store = new HiveMemoryStore({ dbPath, ledgerPath, receiptPath, config: cfg })
+    try {
+      assert.equal(store.start(1000).ready, true)
+      const activity = { seq: 0, events: [] }
+      const rpc = (binding, name, args = {}, at = 1010) => {
+        const res = handleSocketJsonRpc({
+          store,
+          binding,
+          nowSec: at,
+          activity,
+          message: { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } },
+        })
+        return JSON.parse(res.result.content[0].text)
+      }
+
+      // 1. Five of 16 peer readers execute memory_wake (31.3% recall coverage, matching dream-2567 pre-cycle state)
+      for (const peer of peerNames.slice(0, 5)) {
+        rpc({ kind: 'reader', name: peer }, 'memory_wake', {}, 1010)
+      }
+      assert.equal(activity.events.length, 5, '5 peer recall events recorded in activity ring')
+
+      // 2. Curator reader executes >ACTIVITY_MAX (90) wake/query pagination calls: must NOT evict peer recall events
+      for (let i = 0; i < ACTIVITY_MAX + 10; i++) {
+        rpc({ kind: 'reader', name: 'curator' }, i % 15 === 0 ? 'memory_wake' : 'memory_query', { limit: 150, format: 'full', include_history: true }, 1015)
+      }
+      assert.equal(activity.events.length, 5, 'curator reader pagination calls must not pollute activity.events or evict peers')
+      const wakeAfterPaging = rpc({ kind: 'reader', name: 'curator' }, 'memory_wake', {}, 1016)
+      assert.equal(wakeAfterPaging.recent_activity.length, 5, 'all 5 peer recall events remain in recent_activity after 90 curator reads')
+
+      // 3. Refused calls on curator reader socket ARE still recorded for nightmare refusal-spike detection
+      rpc({ kind: 'reader', name: 'curator' }, 'memory_submit', {}, 1017)
+      assert.equal(activity.events.at(-1).kind, 'refused')
+
+      // 4. Even if post-cycle recent_activity had 4 of 5 peer events evicted by writer traffic,
+      // mergeCycleRecentActivity + readPostCycleSnapshot preserve pre-cycle peer recall events
+      const mergedAct = mergeCycleRecentActivity(
+        wakeAfterPaging.recent_activity,
+        [wakeAfterPaging.recent_activity[0], { seq: 999, at: 1020, kind: 'submit', actor: 'curator', accepted: true }]
+      )
+      const mergedPeers = new Set(mergedAct.filter(a => a.kind === 'wake').map(a => a.actor))
+      assert.equal(mergedPeers.size, 5, 'mergeCycleRecentActivity preserves all 5 peer recall events across cycle boundary')
+
+      // 5. Chronological ordering in evaluateCoherenceSlice: passing records in memory_query DESC order
+      // vs chronological ASC order must evaluate recent-window topic corroboration on the NEWEST 18 claims, not the oldest 18.
+      const baseRecords = []
+      // Oldest 4 claims (created_at 1100..1103): single-author uncorroborated topic 'waggle' (2 claims by mydude) and 'r1' (2 claims by mc-claude)
+      for (let i = 0; i < 2; i++) {
+        baseRecords.push({
+          event_id: `old-w-${i}`.padEnd(64, '0'),
+          author_pubkey: peerKeys.mydude.pk,
+          scope: `room:${ROOM_ID}`,
+          d: `hive-memory:room:${ROOM_ID}:waggle-old-${i}`,
+          topic: 'waggle',
+          claim: `Old waggle claim ${i} PR #100`,
+          evidence: ['PR #100'],
+          as_of_git: 'aaaaaaa',
+          created_at: 1100 + i,
+          expires_at: 200000,
+          status: 'active',
+          verification: 'accepted',
+          is_current: true,
+        })
+        baseRecords.push({
+          event_id: `old-r-${i}`.padEnd(64, '0'),
+          author_pubkey: peerKeys['mc-claude'].pk,
+          scope: `room:${ROOM_ID}`,
+          d: `hive-memory:room:${ROOM_ID}:r1-old-${i}`,
+          topic: 'r1',
+          claim: `Old r1 claim ${i} PR #101`,
+          evidence: ['PR #101'],
+          as_of_git: 'bbbbbbb',
+          created_at: 1102 + i,
+          expires_at: 200000,
+          status: 'active',
+          verification: 'accepted',
+          is_current: true,
+        })
+      }
+      // Newest 18 claims (created_at 1200..1217): multi-author corroborated claims on 'nvoy' and 'herd-infra'
+      for (let i = 0; i < 18; i++) {
+        const authorName = peerNames[i % 6]
+        const topic = i % 2 === 0 ? 'nvoy' : 'herd-infra'
+        baseRecords.push({
+          event_id: `new-${String(i).padStart(2, '0')}`.padEnd(64, '0'),
+          author_pubkey: peerKeys[authorName].pk,
+          scope: `room:${ROOM_ID}`,
+          d: `hive-memory:room:${ROOM_ID}:${topic}-new-${i}`,
+          topic,
+          claim: `Recent ${topic} claim ${i} PR #${370 + Math.floor(i / 3)}`,
+          evidence: [`PR #${370 + Math.floor(i / 3)}`],
+          as_of_git: '4baea98',
+          created_at: 1200 + i,
+          expires_at: i % 3 === 0 ? null : 200000,
+          status: 'active',
+          verification: 'accepted',
+          is_current: true,
+        })
+      }
+      const descRecords = [...baseRecords].sort((a, b) => b.created_at - a.created_at)
+      const cohAsc = computeCoherence({
+        records: baseRecords,
+        history_records: baseRecords,
+        agent_roster: wakeAfterPaging.agent_roster,
+        recent_activity: wakeAfterPaging.recent_activity,
+        store_state: { state: 'READY', write_seq: baseRecords.length },
+        now_sec: 1220,
+        history_complete: true,
+      })
+      const cohDesc = computeCoherence({
+        records: descRecords,
+        history_records: descRecords,
+        agent_roster: wakeAfterPaging.agent_roster,
+        recent_activity: wakeAfterPaging.recent_activity,
+        store_state: { state: 'READY', write_seq: descRecords.length },
+        now_sec: 1220,
+        history_complete: true,
+      })
+      assert.equal(cohDesc.axes.convergence, cohAsc.axes.convergence, 'DESC query order must match ASC chronological order on convergence')
+      assert.equal(cohDesc.score, cohAsc.score, 'DESC query order must match ASC chronological order on overall coherence score')
+      assert.equal(cohDesc.axes.convergence, 100, 'newest 18 multi-author corroborated claims achieve 100% convergence without tail-order artifact')
+
+      const mockPostReader = {
+        async callReadTool(name) {
+          if (name === 'memory_wake') {
+            return {
+              store_state: { state: 'READY', write_seq: baseRecords.length },
+              recent_activity: [{ seq: 999, at: 1020, kind: 'submit', actor: 'curator', accepted: true }],
+              agent_roster: [],
+            }
+          }
+          return {
+            answer: 'found',
+            answer_reason: null,
+            format: 'full',
+            store_state: { state: 'READY', write_seq: baseRecords.length },
+            total_matched: baseRecords.length,
+            returned: baseRecords.length,
+            omitted: 0,
+            unverified: 0,
+            next_cursor: null,
+            records: descRecords,
+          }
+        },
+      }
+      const postSnapWithPrior = await readPostCycleSnapshot(
+        mockPostReader,
+        baseRecords.length,
+        5,
+        100,
+        1220,
+        {
+          priorRecentActivity: wakeAfterPaging.recent_activity,
+          priorAgentRoster: wakeAfterPaging.agent_roster,
+        }
+      )
+      const postSnapWithoutPrior = await readPostCycleSnapshot(
+        mockPostReader,
+        baseRecords.length,
+        5,
+        100,
+        1220,
+        {
+          priorRecentActivity: [],
+          priorAgentRoster: wakeAfterPaging.agent_roster,
+        }
+      )
+      assert(postSnapWithPrior !== null && postSnapWithoutPrior !== null)
+      assert(
+        postSnapWithPrior.coherence.axes.coupling > postSnapWithoutPrior.coherence.axes.coupling,
+        'readPostCycleSnapshot with priorRecentActivity + priorAgentRoster preserves peer recall coupling when post-cycle wake ring is evicted'
+      )
+      assert.equal(postSnapWithPrior.coherenceScore, cohAsc.score)
+    } finally {
+      store.close()
+    }
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }
