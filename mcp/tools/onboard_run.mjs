@@ -14,6 +14,8 @@ import { joinHive, joinRooms } from './onboard_join.mjs'
 import { readStagedKey } from './onboard_stage.mjs'
 import { familyOf } from './principal_family.mjs'
 import { profileRequestIdsPath, profileResultsPath, profileStatus, queueProfile } from './agent_profile.mjs'
+import { delegateAuthors } from './onboard_delegate.mjs'
+
 
 export const WRITERS_KIND = 30000, WRITERS_D = 'nave-relay-writers'
 
@@ -65,7 +67,7 @@ export function rewrite(root, id, change, { backupRoot, now }) {
 
 export async function onboard({ command, name, root, out, stateDir, keysPath = '', giversRedeploy = false,
   backupRoot = '/root', fetchEvents, runTool, joinWith, now = () => Date.now(), log = console.log,
-  pair = null, report = null, readWriters = null, verify = () => false }) {
+  pair = null, report = null, readWriters = null, verify = () => false, readDelegates = null }) {
   if (!['show', 'run'].includes(command)) throw new OnboardRefusal('ONBOARD_USAGE', 'command is show or run')
   const ledger = join(stateDir, 'requests.jsonl')
   const rows = lines(ledger), seen = new Set(rows.filter(row => row.finished).map(row => row.id))
@@ -73,7 +75,12 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
   let manifests = installed(root)
   const owners = [...new Set([...manifests.values()].flatMap(manifest => manifest.grantors))]
   const relays = [...new Set([...manifests.values()].flatMap(manifest => manifest.relays))]
-  const events = await fetchEvents({ relays, owners, name })
+  // Delegate discovery, a fresh cold read (DESIGN_ONBOARDING_DELEGATE): live `onboard` grantees are read
+  // as authors too. Unknown grant state adds no one. Accepting a delegate's request is parseSetupRequest's
+  // decision, not this fetch's.
+  const delegates = readDelegates ? await readDelegates({ relays, owners }) : null
+  if (delegates && !delegates.known) log(`warning  grant state unknown (${delegates.reason}); delegate requests are not read`)
+  const events = await fetchEvents({ relays, owners, name, delegates: delegateAuthors(delegates) })
   const earlier = rows.filter(row => row.op === 'add_agent' && row.name === name && row.pubkey)
   const add = parseSetupRequest(newestRequest(events, name, 'add_agent'), { name, manifests, seen, inProgress, earlier, now: now() })
   let bind = null
