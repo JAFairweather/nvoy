@@ -9,7 +9,7 @@ import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { MAX_AGE_S, OnboardRefusal, RETRY_CODES, SETUP_KIND, SETUP_PREFIX } from './onboard_request.mjs'
 import { installed, onboard } from './onboard_run.mjs'
-import { delegateReceiptD, latestSteps, makeSealer, receiptBody, terminalEvent } from './onboard_receipt.mjs'
+import { acceptedEvent, delegateReceiptD, latestSteps, makeSealer, receiptBody, terminalEvent } from './onboard_receipt.mjs'
 import { delegateAuthors } from './onboard_delegate.mjs'
 
 const ADD = new RegExp(`^${SETUP_PREFIX.replace(/[/]/g, '\\/')}([a-z0-9][a-z0-9._-]{1,63})\\/add_agent$`, 'i')
@@ -108,6 +108,21 @@ export async function watchTick({ root, out, stateDir, runner, fetchAll, fetchEv
       return true
     } catch (error) { log(`warning  terminal marker for ${id.slice(0, 12)} not out: ${error.message}; the next tick tries again`); return false }
   } : null
+  // The public acceptance proof for a delegate's accepted request: published and read back once, before any effect.
+  const markAccepted = readEvent ? async add => {
+    const done = join(stateDir, `${add.id}.accepted.json`)
+    if (existsSync(done)) return true
+    try {
+      const event = await signer.signEvent(acceptedEvent({ request: add.id, target: add.pubkey, grantId: add.grantId }, Math.floor(now() / 1000)))
+      if (event.pubkey !== runner.pubkey) throw new Error('the runner connection signs as another key')
+      const took = (await publish(event)).filter(result => result.accepted).map(result => result.relay)
+      if (!took.length) throw new Error('no relay took it')
+      const back = await readEvent(event, took)
+      if (!back || back.id !== event.id || !verify(back)) throw new Error('it did not read back')
+      writeFileSync(done, JSON.stringify({ id: event.id, at: now(), relays: took }) + '\n', { mode: 0o600 })
+      return true
+    } catch (error) { log(`warning  acceptance proof for ${add.id.slice(0, 12)} not out: ${error.message}; the next tick tries again`); return false }
+  } : null
   // A request refused in an earlier tick whose marker did not go out tries again, while its request could still count.
   if (markTerminal) {
     const cutoff = now() - (MAX_AGE_S + 600) * 1000
@@ -153,7 +168,7 @@ export async function watchTick({ root, out, stateDir, runner, fetchAll, fetchEv
     }
     try {
       const result = await onboard({ command: 'run', name, root, out, stateDir, keysPath: runner.authorizedKeys, giversRedeploy: false,
-        fetchEvents, runTool, joinWith, now, log, pair, report, readWriters, verify, readDelegates, readTermsFor, delegateTemplates: runner.onboardTemplates || [], markTerminal })
+        fetchEvents, runTool, joinWith, now, log, pair, report, readWriters, verify, readDelegates, readTermsFor, delegateTemplates: runner.onboardTemplates || [], markTerminal, markAccepted })
       if (markTerminal && result.receipts.some(row => row.state === 'refused')) await markTerminal(id)
       ran.push({ name, id, receipts: result.receipts })
     } catch (error) {

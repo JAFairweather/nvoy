@@ -171,6 +171,23 @@ A delegate's request is accepted only within the owner's limits (`parseSetupRequ
 - The watch seals a second receipt copy to the delegate (`d = nvoy-onboard:<request>:delegate`) without
   `pairing`. The pairing link is the owner's Bunker approval.
 
+## The acceptance proof
+
+For a delegate's `add_agent` that passes every parse check, the watch publishes a public proof signed by the
+runner, before any effect (before `staged`):
+- kind 30078, empty content, tags exactly `d = nvoy-onboard:<request>:accepted`, `e = <request>`,
+  `p = <target>` and `consent = <grant id>`;
+- nave.pub's delegate writer gate needs it, with no terminal marker and a live grant, before it admits a new writer.
+
+It must be taken by a relay and read back (verified) before the run continues. Otherwise nothing is done that run,
+not even a ledger entry, and the next tick tries again. It goes out once per request (`<request>.accepted.json`)
+and is never withdrawn; a later refusal or revocation is the terminal marker's to say. An owner's own request
+and a request refused at parse get none.
+
+A caller that cannot publish the proof never acts on a delegate's request. That covers the operator's `run`, and a
+watch with no relay readback. Such a request is refused `ONBOARD_DELEGATE_NEEDS_PROOF` before the ledger or any
+effect, and the watch retries it rather than setting it aside.
+
 ## The terminal marker
 
 When a request ends, finished or refused, the watch publishes a public marker signed by the runner:

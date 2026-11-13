@@ -322,6 +322,17 @@ r = await tick({ ...member, stateDir: sState, readEvent, publish: markerPublish 
 assert.deepEqual(setAside(), [sAdd.id], 'the next tick gets the marker out, then sets it aside')
 assert.ok(markers().some(ev => ev.tags.some(t => t[0] === 'e' && t[1] === sAdd.id)), 'with its marker published')
 
+// ── A delegate's request with no relay readback: refused for now, retried, never set aside or acted on ──
+{
+  const nState = join(tmp, 'state-noproof'), nKey = generateSecretKey(), nHex = getPublicKey(nKey), NG = 'f'.repeat(64)
+  const nAdd = signAs(nKey, [['d', 'nvoy-onboard/noproof/add_agent'], ['op', 'add_agent'], ['p', getPublicKey(generateSecretKey())], ['harness', 'claude-code'], ['like', 'crystalclaude'], ['consent', NG]], at + 95)
+  const nLive = { known: true, live: new Map([[nHex, [{ grantId: NG, grantor: ownerHex, delegate: nHex, created_at: at, policy: 'terms-v3', age: 'confirmed' }]]]) }
+  events = [nAdd]; lines = []
+  const r = await tick({ ...member, stateDir: nState, runner: { ...runner, onboardTemplates: ['crystalclaude'] }, readDelegates: async () => nLive, readTermsFor: async () => ({ ok: true, version: 'terms-v3' }) })
+  assert.ok(r.ran[0]?.error && /acceptance proof/.test(r.ran[0].error), "a watch that cannot read the proof back does not act on a delegate's request")
+  assert.ok(!existsSync(join(nState, 'watch-refused.jsonl')) && !existsSync(join(nState, 'requests.jsonl')), 'and neither sets it aside nor enters it in the ledger, so a later tick can still run it')
+}
+
 // ── A delegate's request: a second receipt, sealed to the delegate, without the pairing link ─────────
 {
   const delKey = generateSecretKey(), delHex2 = getPublicKey(delKey)
@@ -333,7 +344,7 @@ assert.ok(markers().some(ev => ev.tags.some(t => t[0] === 'e' && t[1] === sAdd.i
   events = [dAdd]; approved = false
   const before = published.length
   await tick({ ...member, stateDir: dState, runner: { ...runner, onboardTemplates: ['crystalclaude'] }, readDelegates: async () => live,
-    readTermsFor: async () => ({ ok: true, version: 'terms-v3' }) })
+    readTermsFor: async () => ({ ok: true, version: 'terms-v3' }), readEvent: async ev => wire(ev) })
   const fresh = published.slice(before)
   const ownerCopy = fresh.filter(ev => ev.tags.find(t => t[0] === 'd')?.[1] === `nvoy-onboard:${dAdd.id}`)
   const delCopy = fresh.filter(ev => ev.tags.find(t => t[0] === 'd')?.[1] === `nvoy-onboard:${dAdd.id}:delegate`)
@@ -352,7 +363,7 @@ assert.ok(markers().some(ev => ev.tags.some(t => t[0] === 'e' && t[1] === sAdd.i
   const isDelegateCopy = ev => /:delegate$/.test(ev.tags.find(t => t[0] === 'd')?.[1] || '')
   const flaky = async ev => { if (!delegateTakes && isDelegateCopy(ev)) return [{ relay: 'wss://relay.nave.pub', accepted: false, message: 'blocked' }]; published.push(ev); return [{ relay: 'wss://relay.nave.pub', accepted: true }] }
   const ticked = () => tick({ ...member, stateDir: d2State, runner: { ...runner, onboardTemplates: ['crystalclaude'] }, readDelegates: async () => live,
-    readTermsFor: async () => ({ ok: true, version: 'terms-v3' }), publish: flaky })
+    readTermsFor: async () => ({ ok: true, version: 'terms-v3' }), publish: flaky, readEvent: async ev => wire(ev) })
   lines = []
   const mark = published.length
   await ticked()
@@ -362,7 +373,38 @@ assert.ok(markers().some(ev => ev.tags.some(t => t[0] === 'e' && t[1] === sAdd.i
   await ticked()
   assert.ok(published.slice(mark2).some(isDelegateCopy), 'the next tick sends the delegate copy again, inside the owner copy\'s heartbeat')
   assert.ok(existsSync(join(d2State, `${dAdd.id}.delegate-receipt.json`)), 'and records it as sent')
+
+  // The acceptance proof (piece 3b, nave.pub's writer gate): for a delegate's accepted add_agent only, published and read
+  // back before any effect; exactly d, e, p, consent; once per request.
+  const aState = join(tmp, 'state-accepted')
+  const isAccepted = ev => /:accepted$/.test(ev.tags.find(t => t[0] === 'd')?.[1] || '')
+  let acceptReads = false
+  const aRead = async ev => (isAccepted(ev) && !acceptReads) ? null : wire(ev)
+  const aTick = () => tick({ ...member, stateDir: aState, runner: { ...runner, onboardTemplates: ['crystalclaude'] }, readDelegates: async () => live,
+    readTermsFor: async () => ({ ok: true, version: 'terms-v3' }), readEvent: aRead })
+  lines = []
+  let m0 = published.length
+  await aTick()
+  const firstTick = published.slice(m0)
+  assert.ok(firstTick.some(isAccepted), 'the proof is published')
+  assert.ok(!firstTick.some(ev => ev.tags.find(t => t[0] === 'd')?.[1] === `nvoy-onboard:${dAdd.id}`), 'but while it does not read back, nothing else happens: no receipt, no step')
+  assert.ok(!existsSync(join(aState, 'requests.jsonl')) || !readFileSync(join(aState, 'requests.jsonl'), 'utf8').includes(dAdd.id), 'and the request is not even entered in the ledger')
+  assert.ok(lines.some(l => /acceptance proof for .* not out: it did not read back/.test(l)))
+  acceptReads = true; clock += 30_000
+  m0 = published.length
+  await aTick()
+  const secondTick = published.slice(m0)
+  const proof = secondTick.find(isAccepted)
+  assert.ok(proof && proof.pubkey === runnerHex && proof.kind === 30078 && proof.content === '' && verify(wire(proof)), 'the proof is a runner-signed kind 30078 with empty content')
+  assert.deepEqual(proof.tags, [['d', `nvoy-onboard:${dAdd.id}:accepted`], ['e', dAdd.id], ['p', deputy], ['consent', GID]], 'with exactly d, e, p (the target) and consent (the grant)')
+  const proofAt = secondTick.indexOf(proof), firstReceipt = secondTick.findIndex(ev => ev.tags.find(t => t[0] === 'd')?.[1] === `nvoy-onboard:${dAdd.id}`)
+  assert.ok(firstReceipt > proofAt, 'and it goes out before the first receipt, so before any effect')
+  clock += 30_000; m0 = published.length
+  await aTick()
+  assert.ok(!published.slice(m0).some(isAccepted), 'it goes out once per request')
 }
+assert.ok(!published.some(ev => /:accepted$/.test(ev.tags.find(t => t[0] === 'd')?.[1] || '') && [wAdd.id, sAdd.id].includes(ev.tags.find(t => t[0] === 'e')?.[1])),
+  "an owner's own request and a refused request get no acceptance proof")
 
 // No trusted owner yet: nothing is read.
 const empty = join(tmp, 'empty'); mkdirSync(empty)

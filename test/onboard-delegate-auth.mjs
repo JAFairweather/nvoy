@@ -114,12 +114,12 @@ ok((() => { try { runnerConfig({ ...base, onboard_templates: 'mc-claude' }); ret
     }
     const termsAsked = []
     let applied = 0
-    const runWith = (reader, events) => onboard({ command: 'run', name: 'hr', root, out, stateDir, backupRoot, keysPath: join(tmp, 'authorized_keys'), log: () => {},
+    const runWith = (reader, events, extra = {}) => onboard({ command: 'run', name: 'hr', root, out, stateDir, backupRoot, keysPath: join(tmp, 'authorized_keys'), log: () => {},
       fetchEvents: async () => events, runTool, joinWith: () => ({ signer: {}, open: async () => { throw new Error('AUTH refused: not a member') }, close() {} }),
-      readDelegates: reader, delegateTemplates: ['crystalclaude'], readTermsFor: async () => ({ ok: true, version: 'terms-v3' }) })
+      readDelegates: reader, delegateTemplates: ['crystalclaude'], readTermsFor: async () => ({ ok: true, version: 'terms-v3' }), markAccepted: async () => true, ...extra })
     const run = events => onboard({ command: 'run', name: 'hr', root, out, stateDir, backupRoot, keysPath: join(tmp, 'authorized_keys'), log: () => {},
       fetchEvents: async () => events, runTool, joinWith: () => ({ signer: {}, open: async () => { throw new Error('AUTH refused: not a member') }, close() {} }),
-      readDelegates, delegateTemplates: ['crystalclaude'], readTermsFor: async relay => { termsAsked.push(relay); return { ok: true, version: 'terms-v3' } } })
+      readDelegates, delegateTemplates: ['crystalclaude'], readTermsFor: async relay => { termsAsked.push(relay); return { ok: true, version: 'terms-v3' } }, markAccepted: async () => true })
     return { tmp, out, stateDir, add, bindEv, run, runWith, termsAsked, applied: () => applied, ledger: () => readFileSync(join(stateDir, 'requests.jsonl'), 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)) }
   }
   const states = result => Object.fromEntries(result.receipts.map(row => [row.step, row.state]))
@@ -144,8 +144,38 @@ ok((() => { try { runnerConfig({ ...base, onboard_templates: 'mc-claude' }); ret
   res = await c.run([c.add, c.bindEv])
   ok(states(res).started === 'refused', "a staged key that differs from the delegate's bind is refused")
 
-  // ── Piece 3: the grant is re-read before every step; revoked refuses, unknown waits, nothing is seated ──
   const { existsSync, readdirSync } = await import('node:fs')
+  // ── Piece 3b: a delegate's request never runs without the acceptance proof hook (My Dude, PR 394 review) ──
+  {
+    const { onboard: run3b } = await import('../mcp/tools/onboard_run.mjs')
+    const h0 = harness(false)
+    await assert.rejects(run3b({ command: 'run', name: 'hr', root: join(h0.tmp, 'instances'), out: h0.out, stateDir: h0.stateDir, backupRoot: join(h0.tmp, 'root'), log: () => {},
+      fetchEvents: async () => [h0.add], runTool: () => { throw new Error('no tool may run') }, joinWith: () => { throw new Error('no join') },
+      readDelegates: async () => state(), delegateTemplates: ['crystalclaude'], readTermsFor: async () => ({ ok: true, version: 'terms-v3' }) }),
+    e => e.code === 'ONBOARD_DELEGATE_NEEDS_PROOF')
+    ok(!existsSync(join(h0.out, 'hr.json')) && !existsSync(join(h0.stateDir, 'requests.jsonl')), "with no acceptance-proof hook (the operator's run), a delegate's request is refused before the ledger or any effect")
+    const { RETRY_CODES: codes } = await import('../mcp/tools/onboard_request.mjs')
+    ok(codes.includes('ONBOARD_DELEGATE_NEEDS_PROOF'), 'and a watch without the hook retries rather than setting the request aside')
+    const held = harness(false)
+    res = await held.runWith(async () => state(), [held.add], { markAccepted: async () => false })
+    ok(res.receipts.length === 0 && !existsSync(join(held.out, 'hr.json')) && !existsSync(join(held.stateDir, 'requests.jsonl')), 'a proof that is not out holds everything: no step, no ledger entry')
+  }
+
+  // ── An owner's add with a delegate's bind is refused: the same signer must sign both (Murphy, PR 394 review) ──
+  {
+    const hx = harness(false)
+    const ownerAdd = finalizeEvent({ kind: 30078, created_at: at, content: '', tags: [['d', 'nvoy-onboard/hr/add_agent'], ['op', 'add_agent'], ['p', agent],
+      ['harness', 'claude-code'], ['like', 'crystalclaude']] }, owner)
+    await assert.rejects(hx.runWith(async () => state(), [ownerAdd, hx.bindEv]), e => e.code === 'ONBOARD_BIND_MISMATCH' && /same signer/.test(e.message))
+    ok(!existsSync(join(hx.out, 'hr.json')) && hx.applied() === 0, "an owner's add_agent with a delegate's bind_runtime is refused before anything is staged or seated")
+    const delegateAdd = hx.add
+    const ownerBind = finalizeEvent({ kind: 30078, created_at: at, content: '', tags: [['d', 'nvoy-onboard/hr/bind_runtime'], ['op', 'bind_runtime'], ['p', agent],
+      ['harness', 'claude-code'], ['like', 'crystalclaude'], ['channel_key', KEY]] }, owner)
+    await assert.rejects(hx.runWith(async () => state(), [delegateAdd, ownerBind]), e => e.code === 'ONBOARD_BIND_MISMATCH')
+    ok(true, "and so is a delegate's add_agent with the owner's bind_runtime")
+  }
+
+  // ── Piece 3: the grant is re-read before every step; revoked refuses, unknown waits, nothing is seated ──
   const revoked = { known: true, live: new Map() }, unknownState = { known: false, live: new Map(), reason: 'only 1 of 4 grant relays read in full; 3 needed' }
   // The first read (to fetch and parse) sees the grant; the reads before each step see whatever `after` says.
   const sequence = after => { let calls = 0; return async () => (++calls === 1 ? state() : after(calls)) }
