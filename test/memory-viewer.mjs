@@ -10,7 +10,9 @@ import { buildClaimTemplate } from '../mcp/tools/memory.mjs'
 import { ACTIVITY_MAX, handleSocketJsonRpc, startMemoryDaemon } from '../mcp/tools/memory-daemon.mjs'
 import { HiveMemoryStore, initEmptyStore, recordVerifiedBackup, validateAndResolveConfig } from '../mcp/tools/hive_memory_store.mjs'
 import {
+  buildClientViewerState,
   buildMobileState,
+  compactTopicPagesForClient,
   computeAgentHealth,
   computeCoherence,
   computeDreamingTelemetry,
@@ -18,10 +20,14 @@ import {
   computeSynapticEfficacy,
   CORPUS_CACHE_TTL_MS,
   diffViewerSnapshots,
+  MAX_SSE_CLIENT_BUFFER_BYTES,
   readWatchStatus,
+  registerSseClient,
+  removeSseClient,
   watchAlert,
   watchView,
   WATCH_STALE_SEC,
+  writeToSseClient,
   escapeHtml,
   parseListenTarget,
   parseViewerFlags,
@@ -2549,6 +2555,267 @@ await test('durable SQLite activity_rollups survive >80 ring overflow & daemon r
     }
   } finally {
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await test('nvoy #383 regression: SSE suppresses unchanged polls, sends compact deltas on activity-only polls, and bounds slow-client backpressure', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'viewer-sse-383-'))
+  const dbPath = join(tmp, 'memory.sqlite')
+  const ledgerPath = join(tmp, 'accepted-ledger.jsonl')
+  const receiptPath = join(tmp, 'last-verified-backup.json')
+  const socketDir = join(tmp, 'sockets')
+  const ownerSk = generateSecretKey()
+  const ownerPk = getPublicKey(ownerSk)
+  const peerSk = generateSecretKey()
+  const peerPk = getPublicKey(peerSk)
+  const viewerSk = generateSecretKey()
+  const viewerPk = getPublicKey(viewerSk)
+  const room = 'a8186b53-537d-46ad-a7e7-b6486c58970e'
+  let nowSec = 1794530000
+
+  initEmptyStore({ dbPath, ledgerPath })
+  recordVerifiedBackup({ receiptPath, snapshotId: SNAP_ID, writeSeq: 1, at: nowSec })
+  const daemon = await startMemoryDaemon({
+    dbPath,
+    ledgerPath,
+    receiptPath,
+    config: {
+      memoryGlobalChannelId: room,
+      ownerPubkey: ownerPk,
+      maxUnbackedSec: 3600,
+      globalWriters: [ownerPk],
+      canonWriters: [ownerPk],
+      readers: { viewer: viewerPk, biggy: peerPk },
+      writers: { james: { pubkey: ownerPk, perHour: 30 }, biggy: { pubkey: peerPk, perHour: 30 } },
+      rooms: { [room]: { members: [ownerPk, peerPk, viewerPk], writers: [ownerPk, peerPk] } },
+    },
+    readers: ['viewer', 'biggy'],
+    writers: ['james', 'biggy'],
+    socketDir,
+    log: () => {},
+  })
+
+  // Seed one claim so topic_pages and records are non-empty
+  const seedEv = finalizeEvent(buildClaimTemplate({
+    pubkey: peerPk,
+    scope: `room:${room}`,
+    slug: 'nvoy-viewer-sse-383-seed',
+    topic: 'nvoy',
+    claim: 'Seed claim for PR #383 SSE delta and backpressure test',
+    because: 'Regression fixture',
+    evidence: ['PR #383', 'mcp/tools/memory-viewer.mjs'],
+    asOfGit: 'nvoy@523feac',
+    memoryGlobalChannelId: room,
+    nowSec: nowSec + 1,
+  }), peerSk)
+  assert.equal(daemon.store.submit({ writer: 'biggy', event: seedEv, nowSec: nowSec + 1 }).accepted, true)
+
+  let viewer = null
+  const openReqs = []
+  function connectSse(path) {
+    const frames = []
+    const req = httpRequest({ host: '127.0.0.1', port: viewer.port, path, method: 'GET' }, res => {
+      res.setEncoding('utf8')
+      let buf = ''
+      res.on('data', chunk => {
+        buf += chunk
+        let idx
+        while ((idx = buf.indexOf('\n\n')) >= 0) {
+          const rawFrame = buf.slice(0, idx)
+          buf = buf.slice(idx + 2)
+          if (rawFrame.startsWith('data: ')) {
+            frames.push(JSON.parse(rawFrame.slice(6)))
+          }
+        }
+      })
+    })
+    req.end()
+    openReqs.push(req)
+    return frames
+  }
+
+  try {
+    viewer = await startMemoryViewer({
+      socketPath: join(socketDir, 'viewer.sock'),
+      host: '127.0.0.1',
+      port: 0,
+      pollMs: 60000,
+      now: () => nowSec,
+    })
+
+    // 1. Initial /events without since_seq sends full corpus with compacted topic_pages, while /api/state retains full topic_pages
+    const fullFrames = connectSse('/events')
+    const mobileFrames = connectSse('/mobile/events')
+    for (let i = 0; i < 20 && (fullFrames.length < 1 || mobileFrames.length < 1); i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(fullFrames.length, 1, 'initial /events connection receives 1 frame')
+    assert.equal(mobileFrames.length, 1, 'initial /mobile/events connection receives 1 frame')
+    assert.equal(fullFrames[0].corpus_unchanged, false)
+    assert.equal(Array.isArray(fullFrames[0].records), true)
+    assert.equal(fullFrames[0].records.length, 1)
+    assert.equal(fullFrames[0].topic_pages.nvoy.above_the_line, undefined, 'client topic_pages omits duplicate above_the_line claim arrays')
+    assert.equal(fullFrames[0].topic_pages.nvoy.below_the_line.active_timeline, undefined, 'client topic_pages omits duplicate active_timeline array')
+    assert(Array.isArray(fullFrames[0].topic_pages.nvoy.below_the_line.entity_links.prs), 'client topic_pages preserves entity_links')
+    assert.equal(
+      Array.isArray(viewer.getState().topic_pages.nvoy.below_the_line.active_timeline),
+      true,
+      'server state (/api/state & /topics/*.md) still retains full topic_pages'
+    )
+
+    // 2. Initial /events?since_seq=<matching>&since_claims=<matching> sends compact delta frame without duplicating corpus
+    const curState = viewer.getState()
+    const sinceFrames = connectSse(
+      `/events?since_seq=${curState.store_state.write_seq}&since_claims=${curState.store_state.current_claims}`
+    )
+    for (let i = 0; i < 20 && sinceFrames.length < 1; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(sinceFrames.length, 1)
+    assert.equal(sinceFrames[0].corpus_unchanged, true, 'matching since_seq receives compact delta on connect')
+    assert.equal(sinceFrames[0].records, undefined, 'compact delta omits records array')
+    assert.equal(sinceFrames[0].topic_pages, undefined, 'compact delta omits topic_pages')
+    assert.equal(sinceFrames[0].consolidated_sources, undefined, 'compact delta omits consolidated_sources')
+    assert.equal(sinceFrames[0].constellation_links, undefined, 'compact delta omits constellation_links')
+
+    // 3. Unchanged poll broadcasts ZERO SSE frames to desktop or mobile clients
+    nowSec += 3
+    await viewer.pollOnce({ forceFull: false })
+    await new Promise(r => setTimeout(r, 40))
+    assert.equal(fullFrames.length, 1, 'unchanged poll must not broadcast redundant desktop SSE frame')
+    assert.equal(sinceFrames.length, 1, 'unchanged poll must not broadcast redundant delta SSE frame')
+    assert.equal(mobileFrames.length, 1, 'unchanged poll must not broadcast redundant mobile SSE frame')
+
+    // 4. Activity-only poll (write_seq unchanged, new recall activity) broadcasts compact delta frame (corpus_unchanged: true)
+    nowSec += 3
+    // Trigger a recall on biggy's reader socket via the daemon's socket server
+    await new Promise((resolveCall, rejectCall) => {
+      import('node:net').then(({ createConnection }) => {
+        const sock = createConnection(join(socketDir, 'biggy.sock'))
+        sock.on('error', rejectCall)
+        sock.on('connect', () => {
+          sock.write(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: 1,
+              method: 'tools/call',
+              params: { name: 'memory_query', arguments: { topic: 'nvoy' } },
+            }) + '\n'
+          )
+        })
+        sock.on('data', chunk => {
+          if (String(chunk).includes('"id":1')) {
+            sock.end()
+            resolveCall()
+          }
+        })
+      })
+    })
+    await viewer.pollOnce({ forceFull: false })
+    for (let i = 0; i < 20 && fullFrames.length < 2; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(fullFrames.length, 2, 'activity change broadcasts 1 update frame')
+    assert.equal(fullFrames[1].corpus_unchanged, true, 'activity-only update must set corpus_unchanged: true')
+    assert.equal(fullFrames[1].records, undefined, 'activity-only update must omit records array')
+    assert.equal(mobileFrames.length, 2, 'activity change updates mobile SSE client')
+
+    // 5. Store write (write_seq advances) broadcasts full corpus frame (corpus_unchanged: false)
+    nowSec += 3
+    const secondEv = finalizeEvent(buildClaimTemplate({
+      pubkey: peerPk,
+      scope: `room:${room}`,
+      slug: 'nvoy-viewer-sse-383-second',
+      topic: 'nvoy',
+      claim: 'Second claim advancing write_seq for full SSE broadcast',
+      because: 'Regression fixture',
+      evidence: ['PR #383'],
+      asOfGit: 'nvoy@523feac',
+      memoryGlobalChannelId: room,
+      nowSec,
+    }), peerSk)
+    assert.equal(daemon.store.submit({ writer: 'biggy', event: secondEv, nowSec }).accepted, true)
+    await viewer.pollOnce({ forceFull: false })
+    for (let i = 0; i < 20 && fullFrames.length < 3; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(fullFrames.length, 3, 'write_seq advance broadcasts full corpus frame')
+    assert.equal(fullFrames[2].corpus_unchanged, false)
+    assert.equal(Array.isArray(fullFrames[2].records), true)
+    assert.equal(fullFrames[2].records.length, 2)
+
+    // 6. Slow-client backpressure coalescing and max buffer enforcement
+    const mockMap = new Map()
+    const written = []
+    let drainHandler = null
+    let destroyed = false
+    const mockRes = {
+      destroyed: false,
+      writableEnded: false,
+      writableNeedDrain: false,
+      writableLength: 0,
+      on(ev, fn) {
+        if (ev === 'drain') drainHandler = fn
+      },
+      removeListener(ev, fn) {
+        if (ev === 'drain' && drainHandler === fn) drainHandler = null
+      },
+      write(payload) {
+        written.push(payload)
+        // Simulate TCP send buffer filling on the first write
+        this.writableNeedDrain = true
+        return false
+      },
+      destroy() {
+        destroyed = true
+        this.destroyed = true
+      },
+    }
+    const entry = registerSseClient(mockMap, { on() {} }, mockRes, 'corpus-k1')
+    // Write 1 succeeds into kernel buffer but signals backpressure (returns false)
+    assert.equal(writeToSseClient(mockMap, mockRes, 'frame-1', { corpusKey: 'corpus-k1' }), false)
+    assert.equal(entry.waitingDrain, true)
+    assert.equal(entry.sentCorpusKey, 'corpus-k1')
+    assert.equal(written.length, 1)
+
+    // While backpressured, corpus advances to 'corpus-k2' (frame-2-full), then an activity poll happens at 'corpus-k2' (frame-3).
+    // Because entry.sentCorpusKey is still 'corpus-k1' (!== 'corpus-k2'), the caller sees entry.sentCorpusKey !== 'corpus-k2'
+    // and coalesces frame-3 with corpusKey: 'corpus-k2' so the client never misses the corpus update!
+    assert.equal(writeToSseClient(mockMap, mockRes, 'frame-2-full', { corpusKey: 'corpus-k2' }), false)
+    assert.equal(entry.sentCorpusKey, 'corpus-k1', 'coalesced pending frame must not advance sentCorpusKey before write')
+    assert.equal(entry.pendingPayload, 'frame-2-full')
+    assert.equal(entry.pendingCorpusKey, 'corpus-k2')
+    // Keepalive while backpressured is dropped without overwriting pendingPayload
+    assert.equal(writeToSseClient(mockMap, mockRes, ': keepalive\n\n', { isKeepalive: true }), false)
+    assert.equal(entry.pendingPayload, 'frame-2-full', 'keepalive must not overwrite pending snapshot')
+    // Second coalesced update overwrites pendingPayload
+    assert.equal(writeToSseClient(mockMap, mockRes, 'frame-3-full', { corpusKey: 'corpus-k2' }), false)
+    assert.equal(entry.droppedFrames, 2)
+    assert.equal(written.length, 1, 'no additional res.write calls while waiting for drain')
+
+    // Drain fires -> flushes only the latest coalesced frame ('frame-3-full') and updates sentCorpusKey to 'corpus-k2'
+    mockRes.writableNeedDrain = false
+    drainHandler()
+    assert.deepEqual(written, ['frame-1', 'frame-3-full'])
+    assert.equal(entry.sentCorpusKey, 'corpus-k2')
+    assert.equal(entry.pendingPayload, null)
+
+    // Exceeding MAX_SSE_CLIENT_BUFFER_BYTES disconnects and removes wedged client
+    mockRes.writableLength = MAX_SSE_CLIENT_BUFFER_BYTES + 1
+    assert.equal(writeToSseClient(mockMap, mockRes, 'frame-overflow', { corpusKey: 'corpus-k2' }), false)
+    assert.equal(destroyed, true, 'wedged client exceeding MAX_SSE_CLIENT_BUFFER_BYTES must be destroyed')
+    assert.equal(mockMap.has(mockRes), false, 'destroyed client must be removed from clientMap')
+  } finally {
+    for (const r of openReqs) {
+      try {
+        r.destroy()
+      } catch {
+        /* ignore */
+      }
+    }
+    if (viewer) await viewer.stop()
+    await daemon.close()
+    rmSync(tmp, { recursive: true, force: true })
   }
 })
 
