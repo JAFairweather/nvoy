@@ -122,7 +122,7 @@ ok(fetched.delegates.length === 0, 'and reads none when the grant state is unkno
 // A delegate's request is fetched, and with no onboard_templates configured it is refused.
 const dkey = generateSecretKey(), dhex = getPublicKey(dkey)
 const dreq = finalizeEvent({ kind: 30078, created_at: Math.floor(Date.now() / 1000), content: '', tags: [['d', 'nvoy-onboard/newagent/add_agent'], ['op', 'add_agent'],
-  ['p', getPublicKey(generateSecretKey())], ['harness', 'claude-code'], ['like', 'crystalclaude']] }, dkey)
+  ['p', getPublicKey(generateSecretKey())], ['harness', 'claude-code'], ['like', 'crystalclaude'], ['consent', g.id]] }, dkey)
 const liveD = { known: true, live: new Map([[dhex, [{ grantId: g.id, grantor: ownerHex, delegate: dhex }]]]) }
 await assert.rejects(onboard({ command: 'show', name: 'newagent', root, out, stateDir, verify, log: () => {},
   readDelegates: async () => liveD, fetchEvents: async () => [dreq] }), err => err.code === 'ONBOARD_DELEGATE_TEMPLATE')

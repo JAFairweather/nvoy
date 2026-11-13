@@ -9,7 +9,7 @@
 import { verifyEvent } from 'nostr-tools/pure'
 import { familyOf } from './principal_family.mjs'
 import { readPublicKey } from './instance_apply.mjs'
-import { liveGrantFor } from './onboard_delegate.mjs'
+import { liveGrantById, liveGrantFor } from './onboard_delegate.mjs'
 
 export const SETUP_KIND = 30078
 export const SETUP_PREFIX = 'nvoy-onboard/'
@@ -106,13 +106,14 @@ export function parseSetupRequest(event, { name, manifests, seen = new Set(), in
   // the request is then recorded with that grantor as the owner and the delegate as the signer.
   let owner = event.pubkey, grant = null
   if (!template.grantors.includes(event.pubkey)) {
-    grant = delegation ? liveGrantFor(delegation.state, event.pubkey, template.grantors) : null
-    if (!grant) refuse('ONBOARD_NOT_OWNER', `the signer is not a grantor of ${template.id}, and holds no live onboard grant from one`)
+    if (!delegation || !liveGrantFor(delegation.state, event.pubkey, template.grantors))
+      refuse('ONBOARD_NOT_OWNER', `the signer is not a grantor of ${template.id}, and holds no live onboard grant from one`)
+    // Standing consent (DESIGN_ONBOARDING_DELEGATE): the terms and the age are the owner's own statements, in the
+    // grant. The request names that grant by id, and is judged against that grant, not the delegate's newest.
+    grant = liveGrantById(delegation.state, event.pubkey, one.consent, template.grantors)
+    if (!grant) refuse('ONBOARD_DELEGATE_CONSENT', "a delegate request must name, in consent, one of its live onboard grants from this template's grantors")
     owner = grant.grantor
     if (!(delegation.templates || []).includes(template.id)) refuse('ONBOARD_DELEGATE_TEMPLATE', `a delegate may not start an agent like ${template.id}; the owner's onboard_templates do not list it`)
-    // Standing consent (DESIGN_ONBOARDING_DELEGATE): the terms and the age are the owner's own statements, in the
-    // grant. The request names that grant; it never carries them itself.
-    if (one.consent !== grant.grantId) refuse('ONBOARD_DELEGATE_CONSENT', 'a delegate request must name its live onboard grant in consent')
     if ('policy' in one || 'age' in one) refuse('ONBOARD_DELEGATE_CONSENT', "a delegate request carries consent, never the owner's policy or age")
     if (!POLICY.test(String(grant.policy || ''))) refuse('ONBOARD_DELEGATE_CONSENT', 'the onboard grant carries no terms version')
     if (grant.age !== 'confirmed') refuse('ONBOARD_DELEGATE_CONSENT', "the onboard grant carries no age confirmation")

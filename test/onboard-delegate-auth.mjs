@@ -53,6 +53,13 @@ ok(code(() => parse(good, { delegation: delegation({ terms: { ok: false, reason:
 ok(code(() => parse(req(del, { extra: [['consent', GRANT], ['giver', ownerHex]] }), { delegation: delegation() }), 'ONBOARD_DELEGATE_GIVER'), 'a delegate request that names any giver is refused')
 ok(code(() => parse(req(owner, { extra: [['consent', GRANT]] }), { delegation: delegation() }), 'ONBOARD_BAD_TAG'), "an owner's request has no use for consent")
 
+// Two live grants: the request is judged against the one its consent names, not the newest (My Dude, PR 389 review).
+const OLDER = 'c'.repeat(64)
+const two = { known: true, live: new Map([[delHex, [grant({ grantId: GRANT, created_at: at - 10, policy: 'terms-v4' }), grant({ grantId: OLDER, created_at: at - 1000, policy: 'terms-v3' })]]]) }
+const named = parse(req(del, { extra: [['consent', OLDER]] }), { delegation: delegation({ state: two }) })
+ok(named.grantId === OLDER && named.policy === 'terms-v3', 'with two live grants, a request naming the older one is judged against that one')
+ok(code(() => parse(req(del, { extra: [['consent', GRANT]] }), { delegation: delegation({ state: two }) }), 'ONBOARD_DELEGATE_CONSENT'), 'and the newer one, whose terms are stale, is still refused')
+
 // ── The daily cap ───────────────────────────────────────────────────────────────────────────────
 ok(DELEGATE_DAILY_CAP === 1, 'the cap is one new agent a day (James, 12 Nov)')
 const row = (name, ago, signer = delHex) => ({ id: name + ago, name, op: 'add_agent', at: nowMs - ago, signer, owner: ownerHex })
