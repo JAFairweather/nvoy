@@ -3,7 +3,7 @@
 
 import assert from 'node:assert/strict'
 import { execFile as execFileCb, spawn } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -40,6 +40,8 @@ import {
   readConsolidationLedger,
   readCuratorStateFile,
   runCuratorCycle,
+  curatorSignerFromFlags,
+  parseCuratorFlags,
   weaveDreamStory,
   writeCuratorStateFile,
   writeDreamPacket,
@@ -2272,6 +2274,72 @@ await test('nvoy #378 regression (dream-2567 shape): curator reader pagination n
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }
+})
+
+await test('A4: a cycle signs through an injected Bunker signer, and the store takes the curator-signed claim', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'nvoy-curate-bunker-'))
+  try {
+    const sockDir = join(tmp, 'sock'), dbPath = join(tmp, 'memory.sqlite'), ledgerPath = join(tmp, 'ledger.jsonl'), receiptPath = join(tmp, 'receipt.json')
+    const ownerSk = generateSecretKey(), ownerPk = getPublicKey(ownerSk)
+    const aliceSk = generateSecretKey(), alicePk = getPublicKey(aliceSk)
+    const curatorSk = generateSecretKey(), curatorPk = getPublicKey(curatorSk)
+    const nowSec = Math.floor(Date.now() / 1000)
+    initEmptyStore({ dbPath, ledgerPath, nowSec })
+    recordVerifiedBackup({ receiptPath, snapshotId: SNAP_ID, writeSeq: 1, at: nowSec, nowSec })
+    const daemon = await startMemoryDaemon({ dbPath, ledgerPath, receiptPath,
+      config: { memoryGlobalChannelId: GLOBAL_CH, ownerPubkey: ownerPk, maxUnbackedSec: 3600, globalWriters: [ownerPk, curatorPk], curators: [curatorPk],
+        readers: { curator: curatorPk },
+        writers: { owner: { pubkey: ownerPk, perHour: 100 }, alice: { pubkey: alicePk, perHour: 50 }, curator: { pubkey: curatorPk, perHour: 120 } },
+        rooms: { [ROOM_ID]: { members: [ownerPk, alicePk, curatorPk], writers: [ownerPk, alicePk, curatorPk] } } },
+      readers: 'curator', writers: 'alice:curator', socketDir: sockDir, log: () => {} })
+    try {
+      const checkpoint = (slug, claim, sha, at) => finalizeEvent(buildClaimTemplate({ pubkey: alicePk, scope: `room:${ROOM_ID}`, slug, topic: 'r1', claim,
+        because: claim, evidence: [`rabidrabbit@${sha}`], asOfGit: `rabidrabbit@${sha}`, nowSec: nowSec + at }), aliceSk)
+      assert.equal(daemon.store.submit({ writer: 'alice', event: checkpoint('r1-pr400-wip', 'PR #400 opened for R1 audio', 'aaaa111', 1), nowSec: nowSec + 1 }).accepted, true)
+      assert.equal(daemon.store.submit({ writer: 'alice', event: checkpoint('r1-pr400-status', 'PR #400 tests passing for R1 audio', 'bbbb222', 2), nowSec: nowSec + 2 }).accepted, true)
+      const signed = []
+      // Stands in for makeBunkerSigner: the key never reaches the cycle, only signEvent does.
+      const curatorSigner = { pubkey: curatorPk, signEvent: async (template) => { signed.push(template.kind); return finalizeEvent(template, curatorSk) } }
+      const cycle = await runCuratorCycle({ readerSocket: join(sockDir, 'curator.sock'), writerSocket: join(sockDir, 'writers', 'curator.sock'),
+        curatorSigner, memoryGlobalChannelId: GLOBAL_CH, force: true, nowSec: nowSec + 20 })
+      assert.equal(cycle.ok, true, `cycle not ok: ${cycle.cycle_status}`)
+      assert.ok(cycle.submitted.length >= 1, 'the distillation was submitted')
+      assert.equal(signed.length, cycle.submitted.length + cycle.refused.length, 'every submission went through the signer')
+      assert.equal(cycle.refused.length, 0, 'the store accepted the curator-signed claims')
+    } finally { await daemon.close?.() }
+  } finally { rmSync(tmp, { recursive: true, force: true }) }
+})
+
+await test('A4: Bunker refs are read privately, pinned to the curator identity, and never mixed with a raw key', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'nvoy-curate-refs-'))
+  try {
+    const uriFile = join(tmp, 'bunker-uri'), clientFile = join(tmp, 'bunker-client')
+    writeFileSync(uriFile, 'bunker://' + 'b'.repeat(64) + '?relay=wss%3A%2F%2Frelay.example\n', { mode: 0o600 })
+    writeFileSync(clientFile, 'c'.repeat(64) + '\n', { mode: 0o600 })
+    const curatorPk = 'a'.repeat(64)
+    const parsed = parseCuratorFlags(['--bunker-uri-file', uriFile, '--bunker-client-file', clientFile, '--expect-pubkey', curatorPk])
+    assert.equal(parsed.bunkerUriFile, uriFile); assert.equal(parsed.bunkerClientFile, clientFile); assert.equal(parsed.expectPubkey, curatorPk)
+    let closed = 0, got = null
+    const fake = signsAs => (uri, client) => { got = { uri, client }; return { getPublicKey: async () => signsAs, signEvent: async e => ({ ...e, sig: 'x' }), close: () => { closed++ } } }
+    assert.equal(await curatorSignerFromFlags({}), null, 'no refs: no signer')
+    const signer = await curatorSignerFromFlags(parsed, { makeSigner: fake(curatorPk) })
+    assert.equal(signer.pubkey, curatorPk)
+    assert.ok(got.uri.startsWith('bunker://') && got.client === 'c'.repeat(64), 'the refs reach the signer, trimmed')
+    assert.equal((await signer.signEvent({ kind: 30078 })).sig, 'x')
+    const refuses = async (flags, pattern, makeSigner = fake(curatorPk)) => {
+      await assert.rejects(curatorSignerFromFlags(flags, { makeSigner }), pattern)
+    }
+    await refuses({ ...parsed, secretKeyFile: join(tmp, 'curator.sec') }, /either --secret-key-file or the Bunker refs, not both/)
+    await refuses({ ...parsed, bunkerClientFile: null }, /needs both/)
+    await refuses({ ...parsed, expectPubkey: null }, /--expect-pubkey/)
+    const before = closed
+    await refuses(parsed, /not the curator/, fake('d'.repeat(64)))
+    assert.equal(closed, before + 1, 'a mispaired Bunker is closed and signs nothing')
+    writeFileSync(join(tmp, 'loose'), 'c'.repeat(64)); chmodSync(join(tmp, 'loose'), 0o644)
+    await refuses({ ...parsed, bunkerClientFile: join(tmp, 'loose') }, /readable by group or others/)
+    symlinkSync(clientFile, join(tmp, 'link'))
+    await refuses({ ...parsed, bunkerClientFile: join(tmp, 'link') }, /not a regular file/)
+  } finally { rmSync(tmp, { recursive: true, force: true }) }
 })
 
 console.log(`\nResults: ${passed} passed, ${failed} failed`)
