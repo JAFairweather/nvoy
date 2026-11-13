@@ -43,11 +43,11 @@ export const CORPUS_CACHE_TTL_MS = 300_000
 export const MAX_SSE_CLIENT_BUFFER_BYTES = 4 * 1024 * 1024
 export const SSE_KEEPALIVE_INTERVAL_MS = 30_000
 export const MAX_CORPUS_HISTORY = 64
-export const INITIAL_STATE_RECORDS_LIMIT = 20
+export const INITIAL_STATE_RECORDS_LIMIT = 18
 export const FIRST_LOAD_HTML_BUDGET_BYTES = 262_144
 export const MOBILE_HTML_BUDGET_BYTES = 40_000
 // One version for the page and the live snapshot: the page reloads whenever they differ.
-const VIEWER_VERSION = '2026-11-13-v20'
+const VIEWER_VERSION = '2026-11-13-v21'
 const ACTIVITY_KINDS = new Set(['wake', 'query', 'lookup', 'submit', 'refused'])
 
 export function compactTopicPagesForClient(topicPages) {
@@ -215,6 +215,8 @@ export function buildCorpusDelta(fromSnap, toSnap) {
     to_seq: toSnap.writeSeq,
     from_digest: fromSnap.corpusDigest,
     to_digest: toSnap.corpusDigest,
+    acl_digest: toSnap.aclDigest || '',
+    corpus_epoch: toSnap.corpusEpoch ?? null,
     expected_current_claims: toSnap.currentClaims,
     upserted_records: upsertedRecords,
     removed_event_ids: removedEventIds,
@@ -230,45 +232,103 @@ export function buildCorpusDelta(fromSnap, toSnap) {
 
 export function applyClientCorpusDelta(clientState, sseFrame) {
   if (!sseFrame || typeof sseFrame !== 'object') return clientState
+  const prevResetGen = Number.isSafeInteger(clientState?.corpus_reset_gen) ? clientState.corpus_reset_gen : 0
+  const prevResyncSeq = Number.isSafeInteger(clientState?.resync_request_seq) ? clientState.resync_request_seq : 0
+  const prevDigest = String(clientState?.corpus_digest || '')
+  const prevCorpusWriteSeq =
+    clientState?.corpus_write_seq !== undefined
+      ? clientState.corpus_write_seq
+      : (clientState?.store_state?.write_seq ?? null)
+  const prevAclDigest = String(clientState?.acl_digest || '')
+  const prevEpoch = Number.isSafeInteger(clientState?.corpus_epoch) ? clientState.corpus_epoch : null
+  const frameDigest = String(sseFrame?.corpus_digest || sseFrame?.corpus_delta?.to_digest || '')
+  const frameAclDigest = String(sseFrame?.acl_digest || sseFrame?.corpus_delta?.acl_digest || prevAclDigest)
+  const frameEpoch = Number.isSafeInteger(sseFrame?.corpus_epoch)
+    ? sseFrame.corpus_epoch
+    : Number.isSafeInteger(sseFrame?.corpus_delta?.corpus_epoch)
+      ? sseFrame.corpus_delta.corpus_epoch
+      : prevEpoch
+  const framePollSeq = Number.isSafeInteger(sseFrame?.poll_seq)
+    ? Math.max(sseFrame.poll_seq, Number.isSafeInteger(clientState?.last_sse_poll_seq) ? clientState.last_sse_poll_seq : 0)
+    : (Number.isSafeInteger(clientState?.last_sse_poll_seq) ? clientState.last_sse_poll_seq : 0)
+
   if (Array.isArray(sseFrame.records)) {
     return {
       ...clientState,
       ...sseFrame,
+      corpus_digest: frameDigest,
+      target_corpus_digest: frameDigest,
+      corpus_write_seq: sseFrame?.store_state?.write_seq ?? null,
+      acl_digest: frameAclDigest,
+      corpus_epoch: frameEpoch,
+      last_sse_poll_seq: framePollSeq,
+      corpus_reset_gen: prevResetGen + 1,
+      resync_request_seq: prevResyncSeq + 1,
       needs_full_resync: false,
       resync_reason: null,
     }
   }
+  const aclOrEpochChanged =
+    Boolean(frameAclDigest && prevAclDigest && frameAclDigest !== prevAclDigest) ||
+    Boolean(frameEpoch !== null && prevEpoch !== null && frameEpoch !== prevEpoch)
+
   if (sseFrame.corpus_unchanged === true && !sseFrame.corpus_delta) {
+    const digestMismatch = Boolean(frameDigest && prevDigest && frameDigest !== prevDigest)
+    const needsResync = Boolean(clientState?.needs_full_resync || aclOrEpochChanged || digestMismatch)
     return {
       ...clientState,
       ...sseFrame,
+      corpus_digest: prevDigest,
+      target_corpus_digest: frameDigest || String(clientState?.target_corpus_digest || prevDigest),
+      corpus_write_seq: prevCorpusWriteSeq,
+      acl_digest: frameAclDigest,
+      corpus_epoch: frameEpoch,
+      last_sse_poll_seq: framePollSeq,
+      corpus_reset_gen: aclOrEpochChanged ? prevResetGen + 1 : prevResetGen,
+      resync_request_seq: needsResync && !clientState?.needs_full_resync ? prevResyncSeq + 1 : prevResyncSeq,
       records: Array.isArray(clientState?.records) ? clientState.records : [],
       consolidated_sources: clientState?.consolidated_sources || {},
       constellation_links: Array.isArray(clientState?.constellation_links) ? clientState.constellation_links : [],
       topic_pages: clientState?.topic_pages || {},
-      needs_full_resync: false,
-      resync_reason: null,
+      needs_full_resync: needsResync,
+      resync_reason: needsResync ? (clientState?.resync_reason || 'unchanged_frame_digest_or_acl_mismatch') : null,
     }
   }
   if (!sseFrame.corpus_delta || typeof sseFrame.corpus_delta !== 'object') {
     return {
       ...clientState,
       ...sseFrame,
+      corpus_digest: prevDigest,
+      target_corpus_digest: frameDigest || String(clientState?.target_corpus_digest || prevDigest),
+      corpus_write_seq: prevCorpusWriteSeq,
+      acl_digest: frameAclDigest,
+      corpus_epoch: frameEpoch,
+      last_sse_poll_seq: framePollSeq,
+      corpus_reset_gen: aclOrEpochChanged ? prevResetGen + 1 : prevResetGen,
+      resync_request_seq: prevResyncSeq + 1,
       records: Array.isArray(clientState?.records) ? clientState.records : [],
       needs_full_resync: true,
       resync_reason: 'missing_corpus_payload',
     }
   }
   const d = sseFrame.corpus_delta
-  const prevDigest = String(clientState?.corpus_digest || '')
-  const prevSeq = clientState?.store_state?.write_seq ?? null
   if (
+    clientState?.needs_full_resync === true ||
+    aclOrEpochChanged ||
     (d.from_digest && prevDigest && d.from_digest !== prevDigest) ||
-    (d.from_seq != null && prevSeq != null && d.from_seq !== prevSeq)
+    (d.from_seq != null && prevCorpusWriteSeq != null && d.from_seq !== prevCorpusWriteSeq)
   ) {
     return {
       ...clientState,
       ...sseFrame,
+      corpus_digest: prevDigest,
+      target_corpus_digest: String(d.to_digest || frameDigest || clientState?.target_corpus_digest || prevDigest),
+      corpus_write_seq: prevCorpusWriteSeq,
+      acl_digest: frameAclDigest,
+      corpus_epoch: frameEpoch,
+      last_sse_poll_seq: framePollSeq,
+      corpus_reset_gen: aclOrEpochChanged ? prevResetGen + 1 : prevResetGen,
+      resync_request_seq: prevResyncSeq + 1,
       records: Array.isArray(clientState?.records) ? clientState.records : [],
       needs_full_resync: true,
       resync_reason: 'precondition_mismatch',
@@ -331,11 +391,20 @@ export function applyClientCorpusDelta(clientState, sseFrame) {
     !isTruncated &&
     Number.isSafeInteger(d.expected_current_claims) &&
     nextRecords.length !== d.expected_current_claims
+  const nextDigest = String(d.to_digest || frameDigest || prevDigest)
+  const nextWriteSeq = d.to_seq ?? sseFrame?.store_state?.write_seq ?? prevCorpusWriteSeq
 
   return {
     ...clientState,
     ...sseFrame,
-    corpus_digest: d.to_digest || sseFrame.corpus_digest || prevDigest,
+    corpus_digest: nextDigest,
+    target_corpus_digest: nextDigest,
+    corpus_write_seq: nextWriteSeq,
+    acl_digest: frameAclDigest,
+    corpus_epoch: frameEpoch,
+    last_sse_poll_seq: framePollSeq,
+    corpus_reset_gen: prevResetGen,
+    resync_request_seq: postconditionFailed ? prevResyncSeq + 1 : prevResyncSeq,
     records: nextRecords,
     total_records: Number.isSafeInteger(d.expected_current_claims) ? d.expected_current_claims : nextRecords.length,
     consolidated_sources: nextSources,
@@ -344,6 +413,137 @@ export function applyClientCorpusDelta(clientState, sseFrame) {
     entity_graph_stats: d.entity_graph_stats || sseFrame.entity_graph_stats || clientState?.entity_graph_stats,
     needs_full_resync: postconditionFailed,
     resync_reason: postconditionFailed ? 'postcondition_claim_count_mismatch' : null,
+  }
+}
+
+export function applyClientRecordsResponse(
+  clientState,
+  apiResponse,
+  { mode = 'merge', requestCorpusGen = null, requestResyncSeq = null, requestDigest = null } = {}
+) {
+  if (!clientState || typeof clientState !== 'object') return clientState
+  if (!apiResponse || typeof apiResponse !== 'object' || !Array.isArray(apiResponse.records)) {
+    return { ...clientState, applied: false, rejected_reason: 'invalid_response' }
+  }
+  const respDigest = String(apiResponse.corpus_digest || '')
+  const respAclDigest = String(apiResponse.acl_digest || '')
+  const respEpoch = Number.isSafeInteger(apiResponse.corpus_epoch) ? apiResponse.corpus_epoch : null
+  const respPollSeq = Number.isSafeInteger(apiResponse.poll_seq) ? apiResponse.poll_seq : null
+  const curDigest = String(clientState.corpus_digest || '')
+  const targetDigest = String(clientState.target_corpus_digest || curDigest || '')
+  const curAclDigest = String(clientState.acl_digest || '')
+  const curEpoch = Number.isSafeInteger(clientState.corpus_epoch) ? clientState.corpus_epoch : null
+  const curResetGen = Number.isSafeInteger(clientState.corpus_reset_gen) ? clientState.corpus_reset_gen : 0
+  const curResyncSeq = Number.isSafeInteger(clientState.resync_request_seq) ? clientState.resync_request_seq : 0
+  const lastSsePollSeq = Number.isSafeInteger(clientState.last_sse_poll_seq) ? clientState.last_sse_poll_seq : 0
+
+  if (mode === 'resync') {
+    if (apiResponse.connected === false || (apiResponse.store_state && apiResponse.store_state.state !== 'READY')) {
+      return { ...clientState, applied: false, rejected_reason: 'store_not_ready' }
+    }
+    if (requestCorpusGen !== null && requestCorpusGen !== curResetGen) {
+      return { ...clientState, applied: false, rejected_reason: 'superseded_by_corpus_reset' }
+    }
+    if (requestResyncSeq !== null && requestResyncSeq !== curResyncSeq) {
+      return { ...clientState, applied: false, rejected_reason: 'superseded_by_newer_resync' }
+    }
+    if (curAclDigest && respAclDigest && respAclDigest !== curAclDigest) {
+      return { ...clientState, applied: false, rejected_reason: 'stale_acl_digest' }
+    }
+    if (curEpoch !== null && respEpoch !== null && respEpoch !== curEpoch) {
+      return { ...clientState, applied: false, rejected_reason: 'stale_corpus_epoch' }
+    }
+    if (respPollSeq !== null && lastSsePollSeq > 0 && respPollSeq < lastSsePollSeq) {
+      return { ...clientState, applied: false, rejected_reason: 'stale_poll_seq' }
+    }
+    if (!respDigest || (targetDigest && respDigest !== targetDigest && (respPollSeq === null || respPollSeq <= lastSsePollSeq))) {
+      return { ...clientState, applied: false, rejected_reason: 'stale_corpus_digest' }
+    }
+    const totalRecords = Number.isSafeInteger(apiResponse.total_records)
+      ? apiResponse.total_records
+      : apiResponse.records.length
+    const truncated = Boolean(apiResponse.next_offset !== null && apiResponse.records.length < totalRecords)
+    return {
+      ...clientState,
+      records: apiResponse.records,
+      total_records: totalRecords,
+      records_truncated: truncated,
+      corpus_digest: respDigest,
+      target_corpus_digest: respDigest,
+      corpus_write_seq: apiResponse.store_state?.write_seq ?? clientState.corpus_write_seq ?? null,
+      acl_digest: respAclDigest || curAclDigest,
+      corpus_epoch: respEpoch ?? curEpoch,
+      last_sse_poll_seq: respPollSeq !== null ? Math.max(lastSsePollSeq, respPollSeq) : lastSsePollSeq,
+      store_state: apiResponse.store_state || clientState.store_state,
+      consolidated_sources: apiResponse.consolidated_sources || clientState.consolidated_sources || {},
+      constellation_links: Array.isArray(apiResponse.constellation_links)
+        ? apiResponse.constellation_links
+        : (clientState.constellation_links || []),
+      entity_graph_stats: apiResponse.entity_graph_stats || clientState.entity_graph_stats,
+      topic_pages: apiResponse.topic_pages || clientState.topic_pages || {},
+      needs_full_resync: false,
+      resync_reason: null,
+      applied: true,
+      rejected_reason: null,
+    }
+  }
+
+  if (clientState.needs_full_resync) {
+    return { ...clientState, applied: false, rejected_reason: 'resync_pending' }
+  }
+  if (requestCorpusGen !== null && requestCorpusGen !== curResetGen) {
+    return { ...clientState, applied: false, rejected_reason: 'superseded_by_corpus_reset' }
+  }
+  if (!respDigest || !curDigest || respDigest !== curDigest) {
+    return { ...clientState, applied: false, rejected_reason: 'stale_corpus_digest' }
+  }
+  if (requestDigest !== null && respDigest !== requestDigest) {
+    return { ...clientState, applied: false, rejected_reason: 'request_digest_mismatch' }
+  }
+  if (targetDigest && respDigest !== targetDigest) {
+    return { ...clientState, applied: false, rejected_reason: 'target_digest_mismatch' }
+  }
+  if (curAclDigest && respAclDigest && respAclDigest !== curAclDigest) {
+    return { ...clientState, applied: false, rejected_reason: 'stale_acl_digest' }
+  }
+  if (curEpoch !== null && respEpoch !== null && respEpoch !== curEpoch) {
+    return { ...clientState, applied: false, rejected_reason: 'stale_corpus_epoch' }
+  }
+
+  const incoming = apiResponse.records.filter(r => r && typeof r === 'object')
+  const incomingEvents = new Set(incoming.map(r => r.event_id).filter(Boolean))
+  const incomingKeys = new Set(
+    incoming.map(r => (r.author_pubkey && r.d ? `${r.author_pubkey}:${r.d}` : '')).filter(Boolean)
+  )
+  const existing = Array.isArray(clientState.records) ? clientState.records : []
+  const kept = existing.filter(r => {
+    if (!r || typeof r !== 'object') return false
+    if (r.event_id && incomingEvents.has(r.event_id)) return false
+    const fk = r.author_pubkey && r.d ? `${r.author_pubkey}:${r.d}` : ''
+    if (fk && incomingKeys.has(fk)) return false
+    return true
+  })
+  const merged = [...kept, ...incoming].sort(
+    (a, b) => (a.computed_rank || 99) - (b.computed_rank || 99) || (b.created_at || 0) - (a.created_at || 0)
+  )
+  const nextSources = { ...(clientState.consolidated_sources || {}) }
+  if (apiResponse.consolidated_sources && typeof apiResponse.consolidated_sources === 'object') {
+    Object.assign(nextSources, apiResponse.consolidated_sources)
+  }
+  const totalRecords = Number.isSafeInteger(apiResponse.total_records)
+    ? apiResponse.total_records
+    : (clientState.total_records ?? merged.length)
+  const nextTruncated =
+    Boolean(clientState.records_truncated) &&
+    !(apiResponse.next_offset === null && totalRecords > 0 && merged.length >= totalRecords)
+  return {
+    ...clientState,
+    records: merged,
+    consolidated_sources: nextSources,
+    total_records: totalRecords,
+    records_truncated: nextTruncated,
+    applied: true,
+    rejected_reason: null,
   }
 }
 
@@ -3959,6 +4159,14 @@ export function renderViewerHtml(initialState) {
       var recordsTruncated = false;
       var totalStoreRecords = 0;
       var currentCorpusDigest = '';
+      var currentCorpusWriteSeq = null;
+      var targetServerDigest = '';
+      var currentAclDigest = '';
+      var currentCorpusEpoch = null;
+      var lastSsePollSeq = 0;
+      var corpusResetGen = 0;
+      var resyncRequestSeq = 0;
+      var needsFullResync = false;
       var fetchedTopics = {};
       var resyncInFlight = false;
       var searchFetchTimer = null;
@@ -4028,6 +4236,19 @@ export function renderViewerHtml(initialState) {
         return false;
       }
 
+      function canMergeFetchedPayload(data, reqCorpusGen, reqDigest) {
+        if (!data || !Array.isArray(data.records)) return false;
+        if (needsFullResync) return false;
+        if (reqCorpusGen != null && reqCorpusGen !== corpusResetGen) return false;
+        var respDigest = typeof data.corpus_digest === 'string' ? data.corpus_digest : '';
+        if (!respDigest || !currentCorpusDigest || respDigest !== currentCorpusDigest) return false;
+        if (reqDigest && respDigest !== reqDigest) return false;
+        if (targetServerDigest && respDigest !== targetServerDigest) return false;
+        if (currentAclDigest && data.acl_digest && data.acl_digest !== currentAclDigest) return false;
+        if (currentCorpusEpoch != null && data.corpus_epoch != null && data.corpus_epoch !== currentCorpusEpoch) return false;
+        return true;
+      }
+
       function mergeFetchedRecords(incomingRecords, incomingSources) {
         if (!Array.isArray(incomingRecords) || !incomingRecords.length) return;
         var incomingByEvent = {};
@@ -4075,21 +4296,49 @@ export function renderViewerHtml(initialState) {
       }
 
       function forceFullCorpusResync() {
-        if (resyncInFlight || typeof fetch !== 'function') return;
+        needsFullResync = true;
+        if (typeof fetch !== 'function') return;
+        var reqGen = corpusResetGen;
+        var reqSeq = ++resyncRequestSeq;
         resyncInFlight = true;
         fetch('/api/records?include_corpus=1')
           .then(function (r) { return r.ok ? r.json() : null; })
           .then(function (data) {
+            if (reqSeq !== resyncRequestSeq || reqGen !== corpusResetGen) return;
             resyncInFlight = false;
-            if (!data || !Array.isArray(data.records)) return;
+            if (!data || !Array.isArray(data.records) || data.connected === false) return;
+            if (data.store_state && data.store_state.state !== 'READY') return;
+            if (currentAclDigest && data.acl_digest && data.acl_digest !== currentAclDigest) return;
+            if (currentCorpusEpoch != null && data.corpus_epoch != null && data.corpus_epoch !== currentCorpusEpoch) return;
+            if (typeof data.poll_seq === 'number' && lastSsePollSeq > 0 && data.poll_seq < lastSsePollSeq) {
+              if (targetServerDigest && data.corpus_digest !== targetServerDigest) {
+                forceFullCorpusResync();
+              }
+              return;
+            }
+            var respDigest = typeof data.corpus_digest === 'string' ? data.corpus_digest : '';
+            if (!respDigest || (targetServerDigest && respDigest !== targetServerDigest && (typeof data.poll_seq !== 'number' || data.poll_seq <= lastSsePollSeq))) {
+              return;
+            }
+            needsFullResync = false;
+            fetchedTopics = {};
             latestRecords = data.records;
             totalStoreRecords = typeof data.total_records === 'number' ? data.total_records : data.records.length;
             recordsTruncated = Boolean(data.next_offset !== null && latestRecords.length < totalStoreRecords);
-            if (typeof data.corpus_digest === 'string' && data.corpus_digest) {
-              currentCorpusDigest = data.corpus_digest;
+            currentCorpusDigest = respDigest;
+            targetServerDigest = respDigest;
+            if (typeof data.acl_digest === 'string' && data.acl_digest) {
+              currentAclDigest = data.acl_digest;
+            }
+            if (typeof data.corpus_epoch === 'number') {
+              currentCorpusEpoch = data.corpus_epoch;
+            }
+            if (typeof data.poll_seq === 'number' && data.poll_seq > lastSsePollSeq) {
+              lastSsePollSeq = data.poll_seq;
             }
             if (data.store_state && typeof data.store_state === 'object') {
               latestStoreState = data.store_state;
+              if (data.store_state.write_seq != null) currentCorpusWriteSeq = data.store_state.write_seq;
             }
             if (data.consolidated_sources && typeof data.consolidated_sources === 'object') {
               latestConsolidatedSources = data.consolidated_sources;
@@ -4113,7 +4362,9 @@ export function renderViewerHtml(initialState) {
             }, graphReady, true);
             renderInspector();
           })
-          .catch(function () { resyncInFlight = false; });
+          .catch(function () {
+            if (reqSeq === resyncRequestSeq) resyncInFlight = false;
+          });
       }
 
       function openTopicInspector(topicId) {
@@ -4125,15 +4376,21 @@ export function renderViewerHtml(initialState) {
         renderAgentRoster();
         renderInspector();
         if (recordsTruncated && topicId && !fetchedTopics[topicId] && typeof fetch === 'function') {
+          var reqGen = corpusResetGen;
+          var reqDigest = currentCorpusDigest;
           fetchedTopics[topicId] = true;
           fetch('/api/records?topic=' + encodeURIComponent(topicId) + '&limit=200')
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (data) {
-              if (data && Array.isArray(data.records)) {
-                mergeFetchedRecords(data.records, data.consolidated_sources);
+              if (!canMergeFetchedPayload(data, reqGen, reqDigest)) {
+                delete fetchedTopics[topicId];
+                return;
               }
+              mergeFetchedRecords(data.records, data.consolidated_sources);
             })
-            .catch(function () {});
+            .catch(function () {
+              delete fetchedTopics[topicId];
+            });
         }
       }
 
@@ -4256,15 +4513,20 @@ export function renderViewerHtml(initialState) {
           moreBtn.textContent = 'Load more records (' + (totalStoreRecords - records.length) + ' remaining)';
           moreBtn.addEventListener('click', function () {
             if (typeof fetch !== 'function') return;
+            var reqGen = corpusResetGen;
+            var reqDigest = currentCorpusDigest;
             moreBtn.disabled = true;
             moreBtn.textContent = 'Loading records…';
             fetch('/api/records?offset=' + encodeURIComponent(records.length) + '&limit=200')
               .then(function (res) { return res.ok ? res.json() : null; })
               .then(function (data) {
-                if (data && Array.isArray(data.records)) {
-                  if (data.next_offset === null) recordsTruncated = false;
-                  mergeFetchedRecords(data.records, data.consolidated_sources);
+                if (!canMergeFetchedPayload(data, reqGen, reqDigest)) {
+                  moreBtn.disabled = false;
+                  renderRecords(latestRecords, nowSec);
+                  return;
                 }
+                if (data.next_offset === null) recordsTruncated = false;
+                mergeFetchedRecords(data.records, data.consolidated_sources);
               })
               .catch(function () {
                 moreBtn.disabled = false;
@@ -7727,12 +7989,13 @@ export function renderViewerHtml(initialState) {
           if (searchFetchTimer) clearTimeout(searchFetchTimer);
           var qVal = searchQuery.trim();
           searchFetchTimer = setTimeout(function () {
+            var reqGen = corpusResetGen;
+            var reqDigest = currentCorpusDigest;
             fetch('/api/records?q=' + encodeURIComponent(qVal) + '&limit=100')
               .then(function (r) { return r.ok ? r.json() : null; })
               .then(function (data) {
-                if (data && Array.isArray(data.records)) {
-                  mergeFetchedRecords(data.records, data.consolidated_sources);
-                }
+                if (!canMergeFetchedPayload(data, reqGen, reqDigest)) return;
+                mergeFetchedRecords(data.records, data.consolidated_sources);
               })
               .catch(function () {});
           }, 180);
@@ -8105,17 +8368,41 @@ export function renderViewerHtml(initialState) {
         if (graphReady && stateKey === lastRenderedStateKey && s.poll_seq === lastRenderedPollSeq) {
           return;
         }
-        var prevSeqBeforeUpdate = latestStoreState && latestStoreState.write_seq != null ? latestStoreState.write_seq : null;
         lastRenderedStateKey = stateKey;
         lastRenderedPollSeq = s.poll_seq;
+        if (typeof s.poll_seq === 'number' && s.poll_seq > lastSsePollSeq) {
+          lastSsePollSeq = s.poll_seq;
+        }
         latestStoreState = st;
         latestRecentActivity = Array.isArray(s.recent_activity) ? s.recent_activity : [];
+        var incomingAcl = typeof s.acl_digest === 'string' && s.acl_digest
+          ? s.acl_digest
+          : (s.corpus_delta && typeof s.corpus_delta.acl_digest === 'string' ? s.corpus_delta.acl_digest : '');
+        var incomingEpoch = typeof s.corpus_epoch === 'number'
+          ? s.corpus_epoch
+          : (s.corpus_delta && typeof s.corpus_delta.corpus_epoch === 'number' ? s.corpus_delta.corpus_epoch : null);
+        var aclOrEpochChanged =
+          Boolean(incomingAcl && currentAclDigest && incomingAcl !== currentAclDigest) ||
+          Boolean(incomingEpoch != null && currentCorpusEpoch != null && incomingEpoch !== currentCorpusEpoch);
+        if (incomingAcl) currentAclDigest = incomingAcl;
+        if (incomingEpoch != null) currentCorpusEpoch = incomingEpoch;
+        var incomingTargetDigest =
+          (s.corpus_delta && typeof s.corpus_delta.to_digest === 'string' && s.corpus_delta.to_digest) ||
+          (typeof s.corpus_digest === 'string' && s.corpus_digest) ||
+          '';
+        if (incomingTargetDigest) targetServerDigest = incomingTargetDigest;
         if (s.corpus_delta && typeof s.corpus_delta === 'object') {
           var cd = s.corpus_delta;
           var precondMismatch =
+            needsFullResync ||
+            aclOrEpochChanged ||
             (cd.from_digest && currentCorpusDigest && cd.from_digest !== currentCorpusDigest) ||
-            (cd.from_seq != null && prevSeqBeforeUpdate != null && cd.from_seq !== prevSeqBeforeUpdate);
+            (cd.from_seq != null && currentCorpusWriteSeq != null && cd.from_seq !== currentCorpusWriteSeq);
           if (precondMismatch) {
+            if (aclOrEpochChanged) {
+              corpusResetGen += 1;
+              fetchedTopics = {};
+            }
             forceFullCorpusResync();
           } else {
             var remEvs = {};
@@ -8157,8 +8444,15 @@ export function renderViewerHtml(initialState) {
             }
             if (typeof cd.to_digest === 'string' && cd.to_digest) {
               currentCorpusDigest = cd.to_digest;
+              targetServerDigest = cd.to_digest;
             } else if (typeof s.corpus_digest === 'string' && s.corpus_digest) {
               currentCorpusDigest = s.corpus_digest;
+              targetServerDigest = s.corpus_digest;
+            }
+            if (cd.to_seq != null) {
+              currentCorpusWriteSeq = cd.to_seq;
+            } else if (st.write_seq != null) {
+              currentCorpusWriteSeq = st.write_seq;
             }
             if (Array.isArray(cd.removed_consolidated_source_ids)) {
               for (idx = 0; idx < cd.removed_consolidated_source_ids.length; idx++) {
@@ -8198,14 +8492,30 @@ export function renderViewerHtml(initialState) {
             }
           }
         } else if (Array.isArray(s.records)) {
+          corpusResetGen += 1;
+          resyncRequestSeq += 1;
+          resyncInFlight = false;
+          needsFullResync = false;
+          fetchedTopics = {};
           latestRecords = s.records;
           recordsTruncated = Boolean(s.records_truncated);
           totalStoreRecords = typeof s.total_records === 'number' ? s.total_records : (st.current_claims != null ? st.current_claims : s.records.length);
           if (typeof s.corpus_digest === 'string' && s.corpus_digest) {
             currentCorpusDigest = s.corpus_digest;
+            targetServerDigest = s.corpus_digest;
           }
-        } else if (typeof s.corpus_digest === 'string' && s.corpus_digest) {
+          if (st.write_seq != null) {
+            currentCorpusWriteSeq = st.write_seq;
+          }
+        } else if (aclOrEpochChanged || (typeof s.corpus_digest === 'string' && s.corpus_digest && currentCorpusDigest && s.corpus_digest !== currentCorpusDigest)) {
+          if (aclOrEpochChanged) {
+            corpusResetGen += 1;
+            fetchedTopics = {};
+          }
+          forceFullCorpusResync();
+        } else if (typeof s.corpus_digest === 'string' && s.corpus_digest && !currentCorpusDigest) {
           currentCorpusDigest = s.corpus_digest;
+          targetServerDigest = s.corpus_digest;
         }
         if (s.trends && typeof s.trends === 'object') latestTrends = s.trends;
         if (s.curator_state && typeof s.curator_state === 'object') latestCuratorState = s.curator_state;
@@ -9607,10 +9917,12 @@ export async function startMemoryViewer({
   let cachedMobileState = null
   let lastBroadcastKey = null
   let currentCorpusKey = null
+  let currentCorpusEpoch = 0
+  let currentAclDigest = ''
   let lastKeepaliveAtMs = 0
   const corpusHistory = []
 
-  function createCorpusSnapshot(state, corpusKey, aclSig, historyComplete, byEventId) {
+  function createCorpusSnapshot(state, corpusKey, aclSig, aclDigest, corpusEpoch, historyComplete, byEventId) {
     const records = Array.isArray(state.records) ? state.records : []
     const byEventMap = new Map()
     const byFactKey = new Map()
@@ -9627,6 +9939,8 @@ export async function startMemoryViewer({
       connected: Boolean(state.connected),
       storeReady: state.store_state?.state === 'READY',
       aclSig: aclSig || '',
+      aclDigest: aclDigest || '',
+      corpusEpoch: corpusEpoch ?? 0,
       historyComplete: Boolean(historyComplete),
       allHistoryEventIds: byEventId instanceof Map ? new Set(byEventId.keys()) : new Set(byEventMap.keys()),
       records,
@@ -10204,29 +10518,40 @@ export async function startMemoryViewer({
       eventLog.push(d)
       if (eventLog.length > MAX_EVENT_LOG) eventLog.shift()
     }
-    const nextCorpusKey = computeCorpusBroadcastKey( nextSnapshot )
+    const nextCorpusKey = computeCorpusBroadcastKey(nextSnapshot)
     const nextCorpusDigest = hashCorpusKeyHex(nextCorpusKey)
+    const nextAclDigest = cachedCorpus?.aclSig ? hashCorpusKeyHex(cachedCorpus.aclSig) : ''
+    currentAclDigest = nextAclDigest
     currentState = {
       ...nextSnapshot,
       corpus_digest: nextCorpusDigest,
+      acl_digest: nextAclDigest,
+      corpus_epoch: currentCorpusEpoch,
       event_log: [...eventLog],
     }
     if (nextCorpusKey !== currentCorpusKey) {
       if (!currentState.connected || currentState.store_state?.state !== 'READY') {
         corpusHistory.length = 0
+        currentCorpusEpoch += 1
+        currentState.corpus_epoch = currentCorpusEpoch
       } else {
-        const currSnap = createCorpusSnapshot(
+        const prevSnap = corpusHistory.length > 0 ? corpusHistory[corpusHistory.length - 1] : null
+        const tempSnap = createCorpusSnapshot(
           currentState,
           nextCorpusKey,
           cachedCorpus?.aclSig || '',
+          nextAclDigest,
+          currentCorpusEpoch,
           cachedCorpus?.historyComplete,
           cachedCorpus?.byEventId
         )
-        const prevSnap = corpusHistory.length > 0 ? corpusHistory[corpusHistory.length - 1] : null
-        if (prevSnap && !isIncrementalWriteTransition(prevSnap, currSnap)) {
+        if (!prevSnap || !isIncrementalWriteTransition(prevSnap, tempSnap)) {
           corpusHistory.length = 0
+          currentCorpusEpoch += 1
+          tempSnap.corpusEpoch = currentCorpusEpoch
+          currentState.corpus_epoch = currentCorpusEpoch
         }
-        corpusHistory.push(currSnap)
+        corpusHistory.push(tempSnap)
         while (corpusHistory.length > MAX_CORPUS_HISTORY) {
           corpusHistory.shift()
         }
@@ -10432,6 +10757,8 @@ export async function startMemoryViewer({
         poll_seq: currentState.poll_seq,
         store_state: currentState.store_state,
         corpus_digest: currentState.corpus_digest || null,
+        acl_digest: currentState.acl_digest || null,
+        corpus_epoch: currentState.corpus_epoch ?? null,
         total_records: allRecords.length,
         total_matched: filtered.length,
         offset: rawOffset,

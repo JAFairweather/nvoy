@@ -11,6 +11,7 @@ import { ACTIVITY_MAX, handleSocketJsonRpc, startMemoryDaemon } from '../mcp/too
 import { HiveMemoryStore, initEmptyStore, recordVerifiedBackup, validateAndResolveConfig } from '../mcp/tools/hive_memory_store.mjs'
 import {
   applyClientCorpusDelta,
+  applyClientRecordsResponse,
   buildClientViewerState,
   buildCorpusDelta,
   buildMobileState,
@@ -2971,6 +2972,7 @@ await test('nvoy #385 regression: per-write SSE deltas, first-load slimming, /ap
   const viewerSk = generateSecretKey()
   const viewerPk = getPublicKey(viewerSk)
   const room = 'a8186b53-537d-46ad-a7e7-b6486c58970e'
+  const secretRoom = 'b9297c64-648e-57be-b8f8-c7597d69081f'
   let nowSec = 1794530000
 
   initEmptyStore({ dbPath, ledgerPath })
@@ -2988,7 +2990,10 @@ await test('nvoy #385 regression: per-write SSE deltas, first-load slimming, /ap
       canonWriters: [ownerPk],
       readers: { viewer: viewerPk, biggy: peerPk },
       writers: { james: { pubkey: ownerPk, perHour: 3600 }, biggy: { pubkey: peerPk, perHour: 3600 } },
-      rooms: { [room]: { members: [ownerPk, peerPk, viewerPk], writers: [ownerPk, peerPk] } },
+      rooms: {
+        [room]: { members: [ownerPk, peerPk, viewerPk], writers: [ownerPk, peerPk] },
+        [secretRoom]: { members: [ownerPk, peerPk, viewerPk], writers: [ownerPk, peerPk] },
+      },
     },
     readers: ['viewer', 'biggy'],
     writers: ['james', 'biggy'],
@@ -3131,7 +3136,7 @@ await test('nvoy #385 regression: per-write SSE deltas, first-load slimming, /ap
     assert.equal(searchBody.total_matched, 1)
     assert(searchBody.records[0].d.endsWith(':claim-seed-005'))
 
-    const pageRes = await getRaw(`/api/records?offset=${INITIAL_STATE_RECORDS_LIMIT}&limit=40&include_corpus=1`)
+    const pageRes = await getRaw(`/api/records?offset=${INITIAL_STATE_RECORDS_LIMIT}&limit=50&include_corpus=1`)
     assert.equal(pageRes.status, 200)
     const pageBody = JSON.parse(pageRes.body)
     assert.equal(pageBody.records.length, 60 - INITIAL_STATE_RECORDS_LIMIT)
@@ -3223,6 +3228,15 @@ await test('nvoy #385 regression: per-write SSE deltas, first-load slimming, /ap
     assert(clientState.records.some(r => r.event_id === supersedeEv.id), 'new superseding event_id present in client records')
 
     // 3c. Claim withdrawal -> SSE frame sends corpus_delta removing the withdrawn claim and marking historical supersession
+    // Capture a pre-withdrawal /api/records response to verify a delayed HTTP response cannot reinsert the withdrawn claim
+    const preWithdrawFetchBody = JSON.parse((await getRaw('/api/records?topic=nvoy&limit=200')).body)
+    assert(
+      preWithdrawFetchBody.records.some(r => r.event_id === supersedeEv.id),
+      'pre-withdrawal /api/records response contains supersedeEv'
+    )
+    const preWithdrawReqGen = clientState.corpus_reset_gen
+    const preWithdrawReqDigest = clientState.corpus_digest
+
     nowSec += 5
     const withdrawEv = finalizeEvent(buildWithdrawalTemplate({
       pubkey: peerPk,
@@ -3252,6 +3266,19 @@ await test('nvoy #385 regression: per-write SSE deltas, first-load slimming, /ap
     assert.equal(clientState.needs_full_resync, false)
     assert.equal(clientState.records.length, 60, 'withdrawn claim cleanly removed from active client records')
     assert(!clientState.records.some(r => String(r.d || '').endsWith(':delta-added-claim')))
+
+    // Delayed pre-withdrawal /api/records HTTP response arriving after withdrawal SSE delta must be rejected
+    const delayedPreWithdrawMerge = applyClientRecordsResponse(clientState, preWithdrawFetchBody, {
+      mode: 'merge',
+      requestCorpusGen: preWithdrawReqGen,
+      requestDigest: preWithdrawReqDigest,
+    })
+    assert.equal(delayedPreWithdrawMerge.applied, false, 'delayed pre-withdrawal /api/records response must be rejected')
+    assert.equal(delayedPreWithdrawMerge.rejected_reason, 'stale_corpus_digest')
+    assert(
+      !delayedPreWithdrawMerge.records.some(r => r.event_id === supersedeEv.id),
+      'withdrawn claim must never be reinserted by a delayed /api/records response'
+    )
 
     // 4. Reconnect with since_seq + since_claims + since_digest within MAX_CORPUS_HISTORY receives cumulative delta
     const checkpointState = sseFrames[0] // at write_seq 60, before add+supersede+withdraw (now at write_seq 63)
@@ -3289,6 +3316,129 @@ await test('nvoy #385 regression: per-write SSE deltas, first-load slimming, /ap
       true,
       'post-apply count drift must trigger forced full resync'
     )
+
+    // 5b. Delayed on-demand /api/records AND full-resync /api/records?include_corpus=1 across reader ACL revocation
+    assert(rootRes.body.includes('function canMergeFetchedPayload('), 'browser script defines canMergeFetchedPayload guard')
+    assert(rootRes.body.includes('currentAclDigest'), 'browser script tracks currentAclDigest')
+    assert(rootRes.body.includes('currentCorpusEpoch'), 'browser script tracks currentCorpusEpoch')
+    nowSec += 5
+    const secretEv = finalizeEvent(buildClaimTemplate({
+      pubkey: peerPk,
+      scope: `room:${secretRoom}`,
+      slug: 'revoked-secret-claim-385',
+      topic: 'nvoy',
+      claim: 'Sensitive claim in secretRoom that will be revoked by reader ACL change.',
+      because: 'Testing delayed /api/records race across ACL revocation',
+      evidence: ['PR #387'],
+      asOfGit: 'nvoy@0bf696e',
+      memoryGlobalChannelId: room,
+      nowSec,
+    }), peerSk)
+    assert.equal(daemon.store.submit({ writer: 'biggy', event: secretEv, nowSec }).accepted, true)
+    await viewer.pollOnce({ forceFull: false })
+    for (let i = 0; i < 20 && sseFrames.length < 5; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(sseFrames.length, 5)
+    clientState = applyClientCorpusDelta(clientState, sseFrames[4])
+    assert(clientState.records.some(r => r.event_id === secretEv.id), 'secretEv visible before ACL revocation')
+
+    // Capture in-flight partial /api/records?topic=nvoy AND full-resync /api/records?include_corpus=1 under old ACL
+    const oldAclReqGen = clientState.corpus_reset_gen
+    const oldAclResyncSeq = clientState.resync_request_seq
+    const oldAclDigest = clientState.corpus_digest
+    const stalePartialTopicResp = JSON.parse((await getRaw('/api/records?topic=nvoy&limit=200')).body)
+    const staleFullResyncResp = JSON.parse((await getRaw('/api/records?include_corpus=1')).body)
+    assert(stalePartialTopicResp.records.some(r => r.event_id === secretEv.id), 'in-flight topic fetch read secretEv under old ACL')
+    assert(staleFullResyncResp.records.some(r => r.event_id === secretEv.id), 'in-flight full resync read secretEv under old ACL')
+
+    // Revoke viewerPk from secretRoom ACL (without any new write_seq!) and poll viewer
+    daemon.store.setConfig(
+      validateAndResolveConfig({
+        memoryGlobalChannelId: room,
+        ownerPubkey: ownerPk,
+        maxUnbackedSec: 3600,
+        globalWriters: [ownerPk],
+        canonWriters: [ownerPk],
+        readers: { viewer: viewerPk, biggy: peerPk },
+        writers: { james: { pubkey: ownerPk, perHour: 3600 }, biggy: { pubkey: peerPk, perHour: 3600 } },
+        rooms: {
+          [room]: { members: [ownerPk, peerPk, viewerPk], writers: [ownerPk, peerPk] },
+          [secretRoom]: { members: [ownerPk, peerPk], writers: [ownerPk, peerPk] },
+        },
+      })
+    )
+    await viewer.pollOnce({ forceFull: false })
+    for (let i = 0; i < 20 && sseFrames.length < 6; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(sseFrames.length, 6)
+    const aclResetFrame = sseFrames[5]
+    assert.equal(Array.isArray(aclResetFrame.records), true, 'ACL change triggers full SSE scope reset')
+    assert(!aclResetFrame.records.some(r => r.event_id === secretEv.id), 'full SSE scope reset removes revoked secretEv')
+    assert.notEqual(aclResetFrame.acl_digest, stalePartialTopicResp.acl_digest, 'ACL change rotates acl_digest')
+    assert(aclResetFrame.corpus_epoch > stalePartialTopicResp.corpus_epoch, 'ACL change increments corpus_epoch')
+
+    clientState = applyClientCorpusDelta(clientState, aclResetFrame)
+    assert(!clientState.records.some(r => r.event_id === secretEv.id))
+
+    // Now deliver the delayed HTTP responses read under the old ACL (both with and without request generation tokens)
+    const rejectedPartialWithGen = applyClientRecordsResponse(clientState, stalePartialTopicResp, {
+      mode: 'merge',
+      requestCorpusGen: oldAclReqGen,
+      requestDigest: oldAclDigest,
+    })
+    assert.equal(rejectedPartialWithGen.applied, false, 'delayed partial /api/records from old ACL must be rejected (gen guard)')
+    assert(!rejectedPartialWithGen.records.some(r => r.event_id === secretEv.id), 'revoked claim must not be reinserted')
+
+    const rejectedPartialByDigest = applyClientRecordsResponse(clientState, stalePartialTopicResp, {
+      mode: 'merge',
+    })
+    assert.equal(rejectedPartialByDigest.applied, false, 'delayed partial /api/records must also fail digest/ACL comparison directly')
+    assert.equal(rejectedPartialByDigest.rejected_reason, 'stale_corpus_digest')
+    assert(!rejectedPartialByDigest.records.some(r => r.event_id === secretEv.id))
+
+    const rejectedResyncWithSeq = applyClientRecordsResponse(clientState, staleFullResyncResp, {
+      mode: 'resync',
+      requestCorpusGen: oldAclReqGen,
+      requestResyncSeq: oldAclResyncSeq,
+    })
+    assert.equal(rejectedResyncWithSeq.applied, false, 'delayed full-resync from old ACL must be rejected (gen/seq guard)')
+    assert(!rejectedResyncWithSeq.records.some(r => r.event_id === secretEv.id), 'revoked claim must not overwrite SSE reset')
+
+    const rejectedResyncByAcl = applyClientRecordsResponse(clientState, staleFullResyncResp, {
+      mode: 'resync',
+    })
+    assert.equal(rejectedResyncByAcl.applied, false, 'delayed full-resync must also fail acl_digest / corpus_epoch / poll_seq checks directly')
+    assert.equal(rejectedResyncByAcl.rejected_reason, 'stale_acl_digest')
+    assert(!rejectedResyncByAcl.records.some(r => r.event_id === secretEv.id))
+
+    // Verify a fresh /api/records fetch under the new ACL and digest is accepted
+    const freshTopicResp = JSON.parse((await getRaw('/api/records?topic=nvoy&limit=200')).body)
+    const acceptedFreshMerge = applyClientRecordsResponse(
+      { ...clientState, records: clientState.records.slice(0, 10), records_truncated: true },
+      freshTopicResp,
+      {
+        mode: 'merge',
+        requestCorpusGen: clientState.corpus_reset_gen,
+        requestDigest: clientState.corpus_digest,
+      }
+    )
+    assert.equal(acceptedFreshMerge.applied, true, 'fresh /api/records matching current digest, ACL, and epoch must merge')
+    assert(!acceptedFreshMerge.records.some(r => r.event_id === secretEv.id), 'fresh merge still excludes revoked claim')
+
+    // Clean up secretEv so store.current_claims matches viewer-visible claims for step 7
+    nowSec += 1
+    const withdrawSecretEv = finalizeEvent(buildWithdrawalTemplate({
+      pubkey: peerPk,
+      priorEvent: secretEv,
+      scope: `room:${secretRoom}`,
+      slug: 'revoked-secret-claim-385',
+      because: 'Clean up secretRoom fixture after ACL race check',
+      memoryGlobalChannelId: room,
+      nowSec,
+    }).replacement, peerSk)
+    assert.equal(daemon.store.submit({ writer: 'biggy', event: withdrawSecretEv, expectedPriorId: secretEv.id, nowSec }).accepted, true)
 
     // 6. Advancing past MAX_CORPUS_HISTORY (64 writes) forces reconnect from old checkpoint to fall back to full corpus resync
     for (let i = 1; i <= MAX_CORPUS_HISTORY + 2; i++) {
