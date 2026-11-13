@@ -6,11 +6,14 @@ import { request as httpRequest } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
-import { buildClaimTemplate } from '../mcp/tools/memory.mjs'
+import { buildClaimTemplate, buildWithdrawalTemplate } from '../mcp/tools/memory.mjs'
 import { ACTIVITY_MAX, handleSocketJsonRpc, startMemoryDaemon } from '../mcp/tools/memory-daemon.mjs'
 import { HiveMemoryStore, initEmptyStore, recordVerifiedBackup, validateAndResolveConfig } from '../mcp/tools/hive_memory_store.mjs'
 import {
+  applyClientCorpusDelta,
+  applyClientRecordsResponse,
   buildClientViewerState,
+  buildCorpusDelta,
   buildMobileState,
   compactTopicPagesForClient,
   computeAgentHealth,
@@ -20,10 +23,15 @@ import {
   computeSynapticEfficacy,
   CORPUS_CACHE_TTL_MS,
   diffViewerSnapshots,
+  FIRST_LOAD_HTML_BUDGET_BYTES,
+  INITIAL_STATE_RECORDS_LIMIT,
+  MAX_CORPUS_HISTORY,
   MAX_SSE_CLIENT_BUFFER_BYTES,
+  MOBILE_HTML_BUDGET_BYTES,
   readWatchStatus,
   registerSseClient,
   removeSseClient,
+  selectInitialScreenRecords,
   watchAlert,
   watchView,
   WATCH_STALE_SEC,
@@ -2748,10 +2756,15 @@ await test('nvoy #383 regression: SSE suppresses unchanged polls, sends compact 
     for (let i = 0; i < 20 && fullFrames.length < 3; i++) {
       await new Promise(r => setTimeout(r, 20))
     }
-    assert.equal(fullFrames.length, 3, 'write_seq advance broadcasts full corpus frame')
+    assert.equal(fullFrames.length, 3, 'write_seq advance broadcasts incremental corpus_delta frame')
     assert.equal(fullFrames[2].corpus_unchanged, false)
-    assert.equal(Array.isArray(fullFrames[2].records), true)
-    assert.equal(fullFrames[2].records.length, 2)
+    assert.equal(fullFrames[2].records, undefined, 'incremental write sends corpus_delta instead of full records')
+    assert.equal(fullFrames[2].corpus_delta?.mode, 'delta')
+    assert.equal(fullFrames[2].corpus_delta?.upserted_records?.length, 1)
+    assert.equal(fullFrames[2].corpus_delta?.upserted_records?.[0]?.event_id, secondEv.id)
+    const appliedStep5 = applyClientCorpusDelta(fullFrames[0], fullFrames[2])
+    assert.equal(appliedStep5.needs_full_resync, false)
+    assert.equal(appliedStep5.records.length, 2)
 
     // 5b. Same-count visible record change at unchanged write_seq / current_claims / reader_pubkey must broadcast full corpus (corpus_unchanged: false)
     const roomA = '11111111-2222-4333-8444-555555555555'
@@ -2931,6 +2944,647 @@ await test('nvoy #383 regression: SSE suppresses unchanged polls, sends compact 
     assert.equal(writeToSseClient(mockMap, mockRes, 'frame-overflow', { corpusKey: 'corpus-k2' }), false)
     assert.equal(destroyed, true, 'wedged client exceeding MAX_SSE_CLIENT_BUFFER_BYTES must be destroyed')
     assert.equal(mockMap.has(mockRes), false, 'destroyed client must be removed from clientMap')
+  } finally {
+    for (const r of openReqs) {
+      try {
+        r.destroy()
+      } catch {
+        /* ignore */
+      }
+    }
+    if (viewer) await viewer.stop()
+    await daemon.close()
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+// ── Test 18: nvoy #385 per-write SSE deltas, first-load slimming, /api/records, and 1x/2x/5x scale ──
+await test('nvoy #385 regression: per-write SSE deltas, first-load slimming, /api/records, and 1x/2x/5x scale', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'hive-viewer-385-'))
+  const dbPath = join(tmp, 'memory.sqlite')
+  const ledgerPath = join(tmp, 'events.ndjson')
+  const receiptPath = join(tmp, 'backup.json')
+  const socketDir = join(tmp, 'socks')
+  const ownerSk = generateSecretKey()
+  const ownerPk = getPublicKey(ownerSk)
+  const peerSk = generateSecretKey()
+  const peerPk = getPublicKey(peerSk)
+  const viewerSk = generateSecretKey()
+  const viewerPk = getPublicKey(viewerSk)
+  const room = 'a8186b53-537d-46ad-a7e7-b6486c58970e'
+  const secretRoom = 'b9297c64-648e-57be-b8f8-c7597d69081f'
+  let nowSec = 1794530000
+
+  initEmptyStore({ dbPath, ledgerPath })
+  recordVerifiedBackup({ receiptPath, snapshotId: SNAP_ID, writeSeq: 1, at: nowSec })
+
+  const daemon = await startMemoryDaemon({
+    dbPath,
+    ledgerPath,
+    receiptPath,
+    config: {
+      memoryGlobalChannelId: room,
+      ownerPubkey: ownerPk,
+      maxUnbackedSec: 3600,
+      globalWriters: [ownerPk],
+      canonWriters: [ownerPk],
+      readers: { viewer: viewerPk, biggy: peerPk },
+      writers: { james: { pubkey: ownerPk, perHour: 3600 }, biggy: { pubkey: peerPk, perHour: 3600 } },
+      rooms: {
+        [room]: { members: [ownerPk, peerPk, viewerPk], writers: [ownerPk, peerPk] },
+        [secretRoom]: { members: [ownerPk, peerPk, viewerPk], writers: [ownerPk, peerPk] },
+      },
+    },
+    readers: ['viewer', 'biggy'],
+    writers: ['james', 'biggy'],
+    socketDir,
+    log: () => {},
+  })
+
+  let viewer = null
+  const openReqs = new Set()
+  try {
+    // Seed 60 claims across 3 topics so total_records (60) exceeds INITIAL_STATE_RECORDS_LIMIT (48)
+    const topics = ['nvoy', 'hive-memory', 'herd-infra']
+    for (let i = 1; i <= 58; i++) {
+      const ev = finalizeEvent(buildClaimTemplate({
+        pubkey: peerPk,
+        scope: `room:${room}`,
+        slug: `claim-seed-${String(i).padStart(3, '0')}`,
+        topic: topics[i % topics.length],
+        claim: `Seed claim #${i} with realistic payload text for memory-viewer delta and first-load scaling verification.`,
+        because: `Seed fixture #${i} for nvoy #385`,
+        evidence: [`test/memory-viewer.mjs#seed-${i}`],
+        asOfGit: 'nvoy@0bf696e',
+        memoryGlobalChannelId: room,
+        nowSec: nowSec + i,
+      }), peerSk)
+      assert.equal(daemon.store.submit({ writer: 'biggy', event: ev, nowSec: nowSec + i }).accepted, true)
+    }
+    nowSec += 60
+    for (let i = 1; i <= 2; i++) {
+      const canonEv = finalizeEvent(buildClaimTemplate({
+        pubkey: ownerPk,
+        scope: 'hive:canon',
+        slug: `canon-seed-${i}`,
+        topic: 'nvoy',
+        claim: `Standing canon rule #${i} prioritized on first screen regardless of write order.`,
+        because: 'Canon seed fixture',
+        evidence: ['PR #385'],
+        asOfGit: 'nvoy@0bf696e',
+        memoryGlobalChannelId: room,
+        nowSec: nowSec + i,
+      }), ownerSk)
+      assert.equal(daemon.store.submit({ writer: 'james', event: canonEv, nowSec: nowSec + i }).accepted, true)
+    }
+    nowSec += 10
+    recordVerifiedBackup({
+      receiptPath,
+      snapshotId: SNAP_ID,
+      writeSeq: daemon.store.storeState().write_seq,
+      at: nowSec,
+    })
+
+    viewer = await startMemoryViewer({
+      socketPath: join(socketDir, 'viewer.sock'),
+      host: '127.0.0.1',
+      port: 0,
+      pollMs: 60000,
+      now: () => nowSec,
+    })
+
+    const getRaw = path =>
+      new Promise((resolve, reject) => {
+        const req = httpRequest({ host: '127.0.0.1', port: viewer.port, path, method: 'GET' }, res => {
+          const chunks = []
+          res.on('data', c => chunks.push(c))
+          res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }))
+        })
+        req.on('error', reject)
+        req.end()
+      })
+
+    const connectSse = path => {
+      const frames = []
+      const req = httpRequest({ host: '127.0.0.1', port: viewer.port, path, method: 'GET' }, res => {
+        res.setEncoding('utf8')
+        let buf = ''
+        res.on('data', chunk => {
+          buf += chunk
+          let idx
+          while ((idx = buf.indexOf('\n\n')) >= 0) {
+            const raw = buf.slice(0, idx)
+            buf = buf.slice(idx + 2)
+            for (const line of raw.split('\n')) {
+              if (line.startsWith('data: ')) {
+                frames.push(JSON.parse(line.slice(6)))
+              }
+            }
+          }
+        })
+      })
+      req.on('error', () => {})
+      req.end()
+      openReqs.add(req)
+      return frames
+    }
+
+    // 1. First-load corpus slimming on `/` and `/mobile`
+    const rootRes = await getRaw('/')
+    assert.equal(rootRes.status, 200)
+    const rootBytes = Buffer.byteLength(rootRes.body, 'utf8')
+    assert(
+      rootBytes < FIRST_LOAD_HTML_BUDGET_BYTES,
+      `expected / first-load HTML < ${FIRST_LOAD_HTML_BUDGET_BYTES} bytes, got ${rootBytes}`
+    )
+    const initMatch = rootRes.body.match(/<script id="initial-state" type="application\/json">([\s\S]*?)<\/script>/)
+    assert(initMatch, 'expected <script id="initial-state"> in / HTML')
+    const initialState = JSON.parse(initMatch[1])
+    assert.equal(initialState.records.length, INITIAL_STATE_RECORDS_LIMIT, 'first-load embeds only INITIAL_STATE_RECORDS_LIMIT records')
+    assert.equal(initialState.records_truncated, true, 'first-load marks records_truncated: true when total > limit')
+    assert.equal(initialState.total_records, 60, 'first-load preserves total_records count')
+    assert.equal(
+      initialState.records.filter(r => r.scope === 'hive:canon').length,
+      2,
+      'first-load prioritizes all hive:canon records in initial screen slice'
+    )
+
+    const mobileRes = await getRaw('/mobile')
+    assert.equal(mobileRes.status, 200)
+    const mobileBytes = Buffer.byteLength(mobileRes.body, 'utf8')
+    assert(
+      mobileBytes < MOBILE_HTML_BUDGET_BYTES,
+      `expected /mobile first-load HTML < ${MOBILE_HTML_BUDGET_BYTES} bytes, got ${mobileBytes}`
+    )
+
+    // 2. On-demand `/api/records` by topic, scope, search query, pagination, and include_corpus
+    const topicRes = await getRaw('/api/records?topic=nvoy&limit=100')
+    assert.equal(topicRes.status, 200)
+    const topicBody = JSON.parse(topicRes.body)
+    assert(topicBody.records.length > 0 && topicBody.records.every(r => r.topic === 'nvoy'))
+    assert.equal(topicBody.total_records, 60)
+
+    const canonScopeRes = await getRaw('/api/records?scope=hive:canon')
+    assert.equal(canonScopeRes.status, 200)
+    const canonScopeBody = JSON.parse(canonScopeRes.body)
+    assert.equal(canonScopeBody.total_matched, 2)
+    assert.equal(canonScopeBody.records.length, 2)
+
+    const searchRes = await getRaw('/api/records?q=claim-seed-005')
+    assert.equal(searchRes.status, 200)
+    const searchBody = JSON.parse(searchRes.body)
+    assert.equal(searchBody.total_matched, 1)
+    assert(searchBody.records[0].d.endsWith(':claim-seed-005'))
+
+    const pageRes = await getRaw(`/api/records?offset=${INITIAL_STATE_RECORDS_LIMIT}&limit=50&include_corpus=1`)
+    assert.equal(pageRes.status, 200)
+    const pageBody = JSON.parse(pageRes.body)
+    assert.equal(pageBody.records.length, 60 - INITIAL_STATE_RECORDS_LIMIT)
+    assert.equal(pageBody.next_offset, null)
+    assert(pageBody.topic_pages && typeof pageBody.topic_pages === 'object', 'include_corpus=1 returns topic_pages')
+    assert(pageBody.entity_graph_stats && typeof pageBody.entity_graph_stats === 'object', 'include_corpus=1 returns entity_graph_stats')
+
+    const badQueryRes = await getRaw('/api/records?q=%E0%A4%A')
+    assert.equal(badQueryRes.status, 400, 'malformed URI component in /api/records returns 400')
+
+    // 3. Per-write SSE deltas: add, supersede, and withdraw
+    const sseFrames = connectSse('/events')
+    for (let i = 0; i < 20 && sseFrames.length < 1; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(sseFrames.length, 1)
+    let clientState = sseFrames[0]
+    assert.equal(Array.isArray(clientState.records), true)
+    assert.equal(clientState.records.length, 60)
+    const initialFullFrameBytes = Buffer.byteLength(JSON.stringify(clientState), 'utf8')
+
+    // 3a. Single claim add -> SSE frame sends corpus_delta with 1 upserted record
+    nowSec += 5
+    const addedEv = finalizeEvent(buildClaimTemplate({
+      pubkey: peerPk,
+      scope: `room:${room}`,
+      slug: 'delta-added-claim',
+      topic: 'nvoy',
+      claim: 'Newly added claim delivered via incremental SSE corpus_delta.',
+      because: 'Testing nvoy #385 add delta',
+      evidence: ['PR #385'],
+      asOfGit: 'nvoy@0bf696e',
+      memoryGlobalChannelId: room,
+      nowSec,
+    }), peerSk)
+    assert.equal(daemon.store.submit({ writer: 'biggy', event: addedEv, nowSec }).accepted, true)
+    await viewer.pollOnce({ forceFull: false })
+    for (let i = 0; i < 20 && sseFrames.length < 2; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(sseFrames.length, 2)
+    const addDeltaFrame = sseFrames[1]
+    const addDeltaBytes = Buffer.byteLength(JSON.stringify(addDeltaFrame), 'utf8')
+    assert.equal(addDeltaFrame.records, undefined, 'add delta frame omits full records array')
+    assert.equal(addDeltaFrame.corpus_delta?.mode, 'delta')
+    assert.equal(addDeltaFrame.corpus_delta?.upserted_records?.length, 1)
+    assert.equal(addDeltaFrame.corpus_delta?.upserted_records?.[0]?.event_id, addedEv.id)
+    assert.equal(addDeltaFrame.corpus_delta?.removed_event_ids?.length, 0)
+    assert(
+      addDeltaBytes < initialFullFrameBytes * 0.45,
+      `expected single-write delta frame (${addDeltaBytes}B) << full frame (${initialFullFrameBytes}B)`
+    )
+    clientState = applyClientCorpusDelta(clientState, addDeltaFrame)
+    assert.equal(clientState.needs_full_resync, false)
+    assert.equal(clientState.records.length, 61)
+    assert(clientState.records.some(r => r.event_id === addedEv.id))
+
+    // 3b. Claim supersede -> SSE frame sends corpus_delta with new event_id in upserted_records and old event_id in removed_event_ids
+    nowSec += 5
+    const supersedeEv = finalizeEvent(buildClaimTemplate({
+      pubkey: peerPk,
+      scope: `room:${room}`,
+      slug: 'delta-added-claim',
+      topic: 'nvoy',
+      claim: 'Superseded claim text replacing delta-added-claim in place.',
+      because: 'Testing nvoy #385 supersede delta',
+      evidence: ['PR #385'],
+      asOfGit: 'nvoy@0bf696e',
+      supersedes: [addedEv.id],
+      memoryGlobalChannelId: room,
+      nowSec,
+    }), peerSk)
+    assert.equal(daemon.store.submit({ writer: 'biggy', event: supersedeEv, expectedPriorId: addedEv.id, nowSec }).accepted, true)
+    await viewer.pollOnce({ forceFull: false })
+    for (let i = 0; i < 20 && sseFrames.length < 3; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(sseFrames.length, 3)
+    const supDeltaFrame = sseFrames[2]
+    assert.equal(supDeltaFrame.records, undefined)
+    assert.equal(supDeltaFrame.corpus_delta?.mode, 'delta')
+    assert.equal(supDeltaFrame.corpus_delta?.upserted_records?.length, 1)
+    assert.equal(supDeltaFrame.corpus_delta?.upserted_records?.[0]?.event_id, supersedeEv.id)
+    assert(supDeltaFrame.corpus_delta?.removed_event_ids?.includes(addedEv.id), 'superseded event_id listed in removed_event_ids')
+    clientState = applyClientCorpusDelta(clientState, supDeltaFrame)
+    assert.equal(clientState.needs_full_resync, false)
+    assert.equal(clientState.records.length, 61)
+    assert(!clientState.records.some(r => r.event_id === addedEv.id), 'old superseded event_id removed from client records')
+    assert(clientState.records.some(r => r.event_id === supersedeEv.id), 'new superseding event_id present in client records')
+
+    // 3c. Claim withdrawal -> SSE frame sends corpus_delta removing the withdrawn claim and marking historical supersession
+    // Capture a pre-withdrawal /api/records response to verify a delayed HTTP response cannot reinsert the withdrawn claim
+    const preWithdrawFetchBody = JSON.parse((await getRaw('/api/records?topic=nvoy&limit=200')).body)
+    assert(
+      preWithdrawFetchBody.records.some(r => r.event_id === supersedeEv.id),
+      'pre-withdrawal /api/records response contains supersedeEv'
+    )
+    const preWithdrawReqGen = clientState.corpus_reset_gen
+    const preWithdrawReqDigest = clientState.corpus_digest
+
+    nowSec += 5
+    const withdrawEv = finalizeEvent(buildWithdrawalTemplate({
+      pubkey: peerPk,
+      priorEvent: supersedeEv,
+      scope: `room:${room}`,
+      slug: 'delta-added-claim',
+      because: 'Testing nvoy #385 withdrawal delta',
+      memoryGlobalChannelId: room,
+      nowSec,
+    }).replacement, peerSk)
+    assert.equal(daemon.store.submit({ writer: 'biggy', event: withdrawEv, expectedPriorId: supersedeEv.id, nowSec }).accepted, true)
+    await viewer.pollOnce({ forceFull: false })
+    for (let i = 0; i < 20 && sseFrames.length < 4; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(sseFrames.length, 4)
+    const withdrawDeltaFrame = sseFrames[3]
+    assert.equal(withdrawDeltaFrame.records, undefined)
+    assert.equal(withdrawDeltaFrame.corpus_delta?.mode, 'delta')
+    assert.equal(withdrawDeltaFrame.corpus_delta?.upserted_records?.length, 0)
+    assert(withdrawDeltaFrame.corpus_delta?.removed_event_ids?.includes(supersedeEv.id), 'withdrawn current claim event_id removed')
+    assert(
+      withdrawDeltaFrame.corpus_delta?.removed_fact_keys?.includes(`${peerPk}:hive-memory:room:${room}:delta-added-claim`),
+      'withdrawn fact_key included in removed_fact_keys'
+    )
+    clientState = applyClientCorpusDelta(clientState, withdrawDeltaFrame)
+    assert.equal(clientState.needs_full_resync, false)
+    assert.equal(clientState.records.length, 60, 'withdrawn claim cleanly removed from active client records')
+    assert(!clientState.records.some(r => String(r.d || '').endsWith(':delta-added-claim')))
+
+    // Delayed pre-withdrawal /api/records HTTP response arriving after withdrawal SSE delta must be rejected
+    const delayedPreWithdrawMerge = applyClientRecordsResponse(clientState, preWithdrawFetchBody, {
+      mode: 'merge',
+      requestCorpusGen: preWithdrawReqGen,
+      requestDigest: preWithdrawReqDigest,
+    })
+    assert.equal(delayedPreWithdrawMerge.applied, false, 'delayed pre-withdrawal /api/records response must be rejected')
+    assert.equal(delayedPreWithdrawMerge.rejected_reason, 'stale_corpus_digest')
+    assert(
+      !delayedPreWithdrawMerge.records.some(r => r.event_id === supersedeEv.id),
+      'withdrawn claim must never be reinserted by a delayed /api/records response'
+    )
+
+    // 4. Reconnect with since_seq + since_claims + since_digest within MAX_CORPUS_HISTORY receives cumulative delta
+    const checkpointState = sseFrames[0] // at write_seq 60, before add+supersede+withdraw (now at write_seq 63)
+    const reconnectDeltaFrames = connectSse(
+      `/events?since_seq=${checkpointState.store_state.write_seq}&since_claims=${checkpointState.store_state.current_claims}&since_digest=${checkpointState.corpus_digest}`
+    )
+    for (let i = 0; i < 20 && reconnectDeltaFrames.length < 1; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(reconnectDeltaFrames.length, 1)
+    assert.equal(reconnectDeltaFrames[0].records, undefined, 'reconnect within MAX_CORPUS_HISTORY receives delta frame')
+    assert.equal(reconnectDeltaFrames[0].corpus_delta?.mode, 'delta')
+    assert.equal(reconnectDeltaFrames[0].corpus_delta?.from_seq, checkpointState.store_state.write_seq)
+    assert.equal(reconnectDeltaFrames[0].corpus_delta?.to_seq, withdrawDeltaFrame.store_state.write_seq)
+    const reconnectedState = applyClientCorpusDelta(checkpointState, reconnectDeltaFrames[0])
+    assert.equal(reconnectedState.needs_full_resync, false)
+    assert.equal(reconnectedState.records.length, 60)
+
+    // 5. Client delta trust guard: mismatched from_digest or expected_current_claims flags needs_full_resync
+    const tamperedDigestDelta = {
+      ...addDeltaFrame,
+      corpus_delta: { ...addDeltaFrame.corpus_delta, from_digest: 'deadbeef00000000' },
+    }
+    assert.equal(
+      applyClientCorpusDelta(sseFrames[0], tamperedDigestDelta).needs_full_resync,
+      true,
+      'mismatched from_digest must trigger forced full resync'
+    )
+    const tamperedCountDelta = {
+      ...addDeltaFrame,
+      corpus_delta: { ...addDeltaFrame.corpus_delta, expected_current_claims: 999 },
+    }
+    assert.equal(
+      applyClientCorpusDelta(sseFrames[0], tamperedCountDelta).needs_full_resync,
+      true,
+      'post-apply count drift must trigger forced full resync'
+    )
+
+    // 5b. Delayed on-demand /api/records AND full-resync /api/records?include_corpus=1 across reader ACL revocation
+    assert(rootRes.body.includes('function canMergeFetchedPayload('), 'browser script defines canMergeFetchedPayload guard')
+    assert(rootRes.body.includes('currentAclDigest'), 'browser script tracks currentAclDigest')
+    assert(rootRes.body.includes('currentCorpusEpoch'), 'browser script tracks currentCorpusEpoch')
+    nowSec += 5
+    const secretEv = finalizeEvent(buildClaimTemplate({
+      pubkey: peerPk,
+      scope: `room:${secretRoom}`,
+      slug: 'revoked-secret-claim-385',
+      topic: 'nvoy',
+      claim: 'Sensitive claim in secretRoom that will be revoked by reader ACL change.',
+      because: 'Testing delayed /api/records race across ACL revocation',
+      evidence: ['PR #387'],
+      asOfGit: 'nvoy@0bf696e',
+      memoryGlobalChannelId: room,
+      nowSec,
+    }), peerSk)
+    assert.equal(daemon.store.submit({ writer: 'biggy', event: secretEv, nowSec }).accepted, true)
+    await viewer.pollOnce({ forceFull: false })
+    for (let i = 0; i < 20 && sseFrames.length < 5; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(sseFrames.length, 5)
+    clientState = applyClientCorpusDelta(clientState, sseFrames[4])
+    assert(clientState.records.some(r => r.event_id === secretEv.id), 'secretEv visible before ACL revocation')
+
+    // Capture in-flight partial /api/records?topic=nvoy AND full-resync /api/records?include_corpus=1 under old ACL
+    const oldAclReqGen = clientState.corpus_reset_gen
+    const oldAclResyncSeq = clientState.resync_request_seq
+    const oldAclDigest = clientState.corpus_digest
+    const stalePartialTopicResp = JSON.parse((await getRaw('/api/records?topic=nvoy&limit=200')).body)
+    const staleFullResyncResp = JSON.parse((await getRaw('/api/records?include_corpus=1')).body)
+    assert(stalePartialTopicResp.records.some(r => r.event_id === secretEv.id), 'in-flight topic fetch read secretEv under old ACL')
+    assert(staleFullResyncResp.records.some(r => r.event_id === secretEv.id), 'in-flight full resync read secretEv under old ACL')
+
+    // Revoke viewerPk from secretRoom ACL (without any new write_seq!) and poll viewer
+    daemon.store.setConfig(
+      validateAndResolveConfig({
+        memoryGlobalChannelId: room,
+        ownerPubkey: ownerPk,
+        maxUnbackedSec: 3600,
+        globalWriters: [ownerPk],
+        canonWriters: [ownerPk],
+        readers: { viewer: viewerPk, biggy: peerPk },
+        writers: { james: { pubkey: ownerPk, perHour: 3600 }, biggy: { pubkey: peerPk, perHour: 3600 } },
+        rooms: {
+          [room]: { members: [ownerPk, peerPk, viewerPk], writers: [ownerPk, peerPk] },
+          [secretRoom]: { members: [ownerPk, peerPk], writers: [ownerPk, peerPk] },
+        },
+      })
+    )
+    await viewer.pollOnce({ forceFull: false })
+    for (let i = 0; i < 20 && sseFrames.length < 6; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(sseFrames.length, 6)
+    const aclResetFrame = sseFrames[5]
+    assert.equal(Array.isArray(aclResetFrame.records), true, 'ACL change triggers full SSE scope reset')
+    assert(!aclResetFrame.records.some(r => r.event_id === secretEv.id), 'full SSE scope reset removes revoked secretEv')
+    assert.notEqual(aclResetFrame.acl_digest, stalePartialTopicResp.acl_digest, 'ACL change rotates acl_digest')
+    assert(aclResetFrame.corpus_epoch > stalePartialTopicResp.corpus_epoch, 'ACL change increments corpus_epoch')
+
+    clientState = applyClientCorpusDelta(clientState, aclResetFrame)
+    assert(!clientState.records.some(r => r.event_id === secretEv.id))
+
+    // Now deliver the delayed HTTP responses read under the old ACL (both with and without request generation tokens)
+    const rejectedPartialWithGen = applyClientRecordsResponse(clientState, stalePartialTopicResp, {
+      mode: 'merge',
+      requestCorpusGen: oldAclReqGen,
+      requestDigest: oldAclDigest,
+    })
+    assert.equal(rejectedPartialWithGen.applied, false, 'delayed partial /api/records from old ACL must be rejected (gen guard)')
+    assert(!rejectedPartialWithGen.records.some(r => r.event_id === secretEv.id), 'revoked claim must not be reinserted')
+
+    const rejectedPartialByDigest = applyClientRecordsResponse(clientState, stalePartialTopicResp, {
+      mode: 'merge',
+    })
+    assert.equal(rejectedPartialByDigest.applied, false, 'delayed partial /api/records must also fail digest/ACL comparison directly')
+    assert.equal(rejectedPartialByDigest.rejected_reason, 'stale_corpus_digest')
+    assert(!rejectedPartialByDigest.records.some(r => r.event_id === secretEv.id))
+
+    const rejectedResyncWithSeq = applyClientRecordsResponse(clientState, staleFullResyncResp, {
+      mode: 'resync',
+      requestCorpusGen: oldAclReqGen,
+      requestResyncSeq: oldAclResyncSeq,
+    })
+    assert.equal(rejectedResyncWithSeq.applied, false, 'delayed full-resync from old ACL must be rejected (gen/seq guard)')
+    assert(!rejectedResyncWithSeq.records.some(r => r.event_id === secretEv.id), 'revoked claim must not overwrite SSE reset')
+
+    const rejectedResyncByAcl = applyClientRecordsResponse(clientState, staleFullResyncResp, {
+      mode: 'resync',
+    })
+    assert.equal(rejectedResyncByAcl.applied, false, 'delayed full-resync must also fail acl_digest / corpus_epoch / poll_seq checks directly')
+    assert.equal(rejectedResyncByAcl.rejected_reason, 'stale_acl_digest')
+    assert(!rejectedResyncByAcl.records.some(r => r.event_id === secretEv.id))
+
+    // Verify a fresh /api/records fetch under the new ACL and digest is accepted
+    const freshTopicResp = JSON.parse((await getRaw('/api/records?topic=nvoy&limit=200')).body)
+    const acceptedFreshMerge = applyClientRecordsResponse(
+      { ...clientState, records: clientState.records.slice(0, 10), records_truncated: true },
+      freshTopicResp,
+      {
+        mode: 'merge',
+        requestCorpusGen: clientState.corpus_reset_gen,
+        requestDigest: clientState.corpus_digest,
+      }
+    )
+    assert.equal(acceptedFreshMerge.applied, true, 'fresh /api/records matching current digest, ACL, and epoch must merge')
+    assert(!acceptedFreshMerge.records.some(r => r.event_id === secretEv.id), 'fresh merge still excludes revoked claim')
+
+    // Clean up secretEv so store.current_claims matches viewer-visible claims for step 7
+    nowSec += 1
+    const withdrawSecretEv = finalizeEvent(buildWithdrawalTemplate({
+      pubkey: peerPk,
+      priorEvent: secretEv,
+      scope: `room:${secretRoom}`,
+      slug: 'revoked-secret-claim-385',
+      because: 'Clean up secretRoom fixture after ACL race check',
+      memoryGlobalChannelId: room,
+      nowSec,
+    }).replacement, peerSk)
+    assert.equal(daemon.store.submit({ writer: 'biggy', event: withdrawSecretEv, expectedPriorId: secretEv.id, nowSec }).accepted, true)
+
+    // 6. Advancing past MAX_CORPUS_HISTORY (64 writes) forces reconnect from old checkpoint to fall back to full corpus resync
+    for (let i = 1; i <= MAX_CORPUS_HISTORY + 2; i++) {
+      nowSec += 1
+      const burstEv = finalizeEvent(buildClaimTemplate({
+        pubkey: peerPk,
+        scope: `room:${room}`,
+        slug: `burst-claim-${i}`,
+        topic: 'nvoy',
+        claim: `Burst claim #${i} advancing write_seq beyond MAX_CORPUS_HISTORY`,
+        because: 'History window overflow test',
+        evidence: ['PR #385'],
+        asOfGit: 'nvoy@0bf696e',
+        memoryGlobalChannelId: room,
+        nowSec,
+      }), peerSk)
+      assert.equal(daemon.store.submit({ writer: 'biggy', event: burstEv, nowSec }).accepted, true)
+    }
+    await viewer.pollOnce({ forceFull: false })
+    const overflowReconnectFrames = connectSse(
+      `/events?since_seq=${checkpointState.store_state.write_seq}&since_claims=${checkpointState.store_state.current_claims}&since_digest=${checkpointState.corpus_digest}`
+    )
+    for (let i = 0; i < 20 && overflowReconnectFrames.length < 1; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(overflowReconnectFrames.length, 1)
+    assert.equal(
+      Array.isArray(overflowReconnectFrames[0].records),
+      true,
+      'client behind by > MAX_CORPUS_HISTORY must receive full corpus resync'
+    )
+    assert.equal(overflowReconnectFrames[0].corpus_delta, undefined)
+
+    // 7. Synthetic corpus scaling benchmark at 1x (310), 2x (620), and 5x (1550) claims
+    // Verifies single-write SSE delta frame stays small & proportional to change (not corpus size),
+    // and first-load HTML for `/` (< 256 KB) and `/mobile` (< 40 KB) stays within budget at 1x, 2x, and 5x.
+    const scaleTargets = [
+      { label: '1x', targetClaims: 310 },
+      { label: '2x', targetClaims: 620 },
+      { label: '5x', targetClaims: 1550 },
+    ]
+    const scaleResults = []
+    let seededCount = daemon.store.storeState().current_claims
+
+    for (const { label, targetClaims } of scaleTargets) {
+      while (seededCount < targetClaims - 1) {
+        seededCount += 1
+        nowSec += 1
+        const scaleEv = finalizeEvent(buildClaimTemplate({
+          pubkey: peerPk,
+          scope: `room:${room}`,
+          slug: `scale-claim-${seededCount}`,
+          topic: topics[seededCount % topics.length],
+          claim: `Synthetic scale claim #${seededCount} testing viewer payload scaling at ${label} corpus size with realistic claim body text.`,
+          because: `Scale benchmark ${label} (#385)`,
+          evidence: [`nvoy#385-${label}`, `commit:0bf696e5fc7c`],
+          asOfGit: 'nvoy@0bf696e',
+          memoryGlobalChannelId: room,
+          nowSec,
+        }), peerSk)
+        assert.equal(daemon.store.submit({ writer: 'biggy', event: scaleEv, nowSec }).accepted, true)
+      }
+      recordVerifiedBackup({
+        receiptPath,
+        snapshotId: SNAP_ID,
+        writeSeq: daemon.store.storeState().write_seq,
+        at: nowSec,
+      })
+      await viewer.pollOnce({ forceFull: true })
+
+      // Connect a fresh SSE client to capture the full baseline frame at this scale, then perform 1 write
+      const scaleFrames = connectSse('/events')
+      for (let i = 0; i < 30 && scaleFrames.length < 1; i++) {
+        await new Promise(r => setTimeout(r, 20))
+      }
+      assert.equal(scaleFrames.length, 1)
+      const fullCorpusSseBytes = Buffer.byteLength(`data: ${JSON.stringify(scaleFrames[0])}\n\n`, 'utf8')
+
+      // Perform a single write at this scale
+      seededCount += 1
+      nowSec += 1
+      const singleWriteEv = finalizeEvent(buildClaimTemplate({
+        pubkey: peerPk,
+        scope: `room:${room}`,
+        slug: `scale-single-write-${label}`,
+        topic: 'nvoy',
+        claim: `Single incremental write at ${label} scale (${targetClaims} total claims).`,
+        because: `Verify O(delta) SSE broadcast at ${label}`,
+        evidence: [`nvoy#385-${label}`],
+        asOfGit: 'nvoy@0bf696e',
+        memoryGlobalChannelId: room,
+        nowSec,
+      }), peerSk)
+      assert.equal(daemon.store.submit({ writer: 'biggy', event: singleWriteEv, nowSec }).accepted, true)
+      await viewer.pollOnce({ forceFull: false })
+      for (let i = 0; i < 30 && scaleFrames.length < 2; i++) {
+        await new Promise(r => setTimeout(r, 20))
+      }
+      assert.equal(scaleFrames.length, 2, `expected incremental SSE frame at ${label}`)
+      assert.equal(scaleFrames[1].records, undefined, `single write at ${label} must omit full records`)
+      assert.equal(scaleFrames[1].corpus_delta?.mode, 'delta')
+      assert.equal(scaleFrames[1].corpus_delta?.upserted_records?.length, 1)
+      const deltaSseBytes = Buffer.byteLength(`data: ${JSON.stringify(scaleFrames[1])}\n\n`, 'utf8')
+
+      const slashHtmlRes = await getRaw('/')
+      const slashHtmlBytes = Buffer.byteLength(slashHtmlRes.body, 'utf8')
+      const mobileHtmlRes = await getRaw('/mobile')
+      const mobileHtmlBytes = Buffer.byteLength(mobileHtmlRes.body, 'utf8')
+
+      assert(
+        slashHtmlBytes < FIRST_LOAD_HTML_BUDGET_BYTES,
+        `expected / first-load HTML at ${label} < ${FIRST_LOAD_HTML_BUDGET_BYTES} bytes, got ${slashHtmlBytes}`
+      )
+      assert(
+        mobileHtmlBytes < MOBILE_HTML_BUDGET_BYTES,
+        `expected /mobile first-load HTML at ${label} < ${MOBILE_HTML_BUDGET_BYTES} bytes, got ${mobileHtmlBytes}`
+      )
+      assert(
+        deltaSseBytes < 40_000,
+        `expected single-write SSE delta frame at ${label} < 40000 bytes, got ${deltaSseBytes}`
+      )
+
+      scaleResults.push({
+        label,
+        claims: targetClaims,
+        fullCorpusSseBytes,
+        deltaSseBytes,
+        slashHtmlBytes,
+        mobileHtmlBytes,
+      })
+    }
+
+    // Verify single-write SSE delta frame does NOT scale with total claim count (5x delta stays within +15% of 1x delta)
+    assert(
+      scaleResults[2].deltaSseBytes <= scaleResults[0].deltaSseBytes * 1.15,
+      `expected 5x single-write SSE delta (${scaleResults[2].deltaSseBytes}B) to stay flat vs 1x (${scaleResults[0].deltaSseBytes}B)`
+    )
+    console.log(
+      '  #385 scale benchmark:',
+      scaleResults
+        .map(
+          r =>
+            `${r.label}(${r.claims}c): write_sse=${r.fullCorpusSseBytes}B->${r.deltaSseBytes}B, /=${r.slashHtmlBytes}B, /mobile=${r.mobileHtmlBytes}B`
+        )
+        .join(' | ')
+    )
   } finally {
     for (const r of openReqs) {
       try {

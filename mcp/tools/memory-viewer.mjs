@@ -42,8 +42,12 @@ const MAX_EVENT_LOG = 60
 export const CORPUS_CACHE_TTL_MS = 300_000
 export const MAX_SSE_CLIENT_BUFFER_BYTES = 4 * 1024 * 1024
 export const SSE_KEEPALIVE_INTERVAL_MS = 30_000
+export const MAX_CORPUS_HISTORY = 64
+export const INITIAL_STATE_RECORDS_LIMIT = 18
+export const FIRST_LOAD_HTML_BUDGET_BYTES = 262_144
+export const MOBILE_HTML_BUDGET_BYTES = 40_000
 // One version for the page and the live snapshot: the page reloads whenever they differ.
-const VIEWER_VERSION = '2026-11-13-v19'
+const VIEWER_VERSION = '2026-11-13-v21'
 const ACTIVITY_KINDS = new Set(['wake', 'query', 'lookup', 'submit', 'refused'])
 
 export function compactTopicPagesForClient(topicPages) {
@@ -86,25 +90,556 @@ export function compactTopicPagesForClient(topicPages) {
   return out
 }
 
-export function buildClientViewerState(state, { includeCorpus = true } = {}) {
-  if (!state || typeof state !== 'object') return state
-  if (!includeCorpus) {
-    const {
-      records: _records,
-      consolidated_sources: _consolidated,
-      constellation_links: _links,
-      topic_pages: _pages,
-      ...telemetryOnly
-    } = state
+export function selectInitialScreenRecords(records, limit = INITIAL_STATE_RECORDS_LIMIT) {
+  const list = Array.isArray(records) ? records.filter(r => r && typeof r === 'object') : []
+  const cap = Number.isSafeInteger(limit) && limit > 0 ? limit : INITIAL_STATE_RECORDS_LIMIT
+  if (list.length <= cap) {
+    return { records: list, truncated: false, total: list.length }
+  }
+  const canonCap = Math.min(16, Math.max(4, Math.floor(cap / 3)))
+  const canon = list.filter(r => r.scope === 'hive:canon').slice(0, canonCap)
+  const pickedIds = new Set(canon.map(r => r.event_id || `${r.author_pubkey || ''}:${r.d || ''}`))
+  const remaining = list
+    .filter(r => !pickedIds.has(r.event_id || `${r.author_pubkey || ''}:${r.d || ''}`))
+    .sort((a, b) => (b.created_at || 0) - (a.created_at || 0) || (a.computed_rank || 99) - (b.computed_rank || 99))
+    .slice(0, Math.max(0, cap - canon.length))
+  const combined = [...canon, ...remaining].sort(
+    (a, b) => (a.computed_rank || 99) - (b.computed_rank || 99) || (b.created_at || 0) - (a.created_at || 0)
+  )
+  return { records: combined, truncated: true, total: list.length }
+}
+
+function compactCuratorStateForClient(curatorState, { initialLoad = false } = {}) {
+  if (!curatorState || typeof curatorState !== 'object') return curatorState
+  const clusterLimit = initialLoad ? 4 : 8
+  const sourceLimit = initialLoad ? 4 : 6
+  const proposalLimit = initialLoad ? 3 : 6
+  const compactProposals = Array.isArray(curatorState.eigen_axis_proposals)
+    ? curatorState.eigen_axis_proposals.slice(0, proposalLimit).map(p => ({
+        proposal_id: p?.proposal_id,
+        kind: p?.kind,
+        action_label: p?.action_label,
+        from_topic: p?.from_topic,
+        to_topic: p?.to_topic,
+        proposed_topic: p?.proposed_topic,
+        claim_count: p?.claim_count,
+        class_b_count: p?.class_b_count,
+        writes_7d: p?.writes_7d,
+        mean_intra_cosine: p?.mean_intra_cosine,
+        cosine_affinity: p?.cosine_affinity,
+        top_terms: Array.isArray(p?.top_terms) ? p.top_terms.slice(0, 4) : [],
+        sample_slugs: Array.isArray(p?.sample_slugs) ? p.sample_slugs.slice(0, 4) : [],
+        coherence_delta: p?.coherence_delta,
+        coherence_delta_units: p?.coherence_delta_units,
+        coherence_delta_label: p?.coherence_delta_label,
+      }))
+    : curatorState.eigen_axis_proposals
+  return {
+    ...curatorState,
+    eigen_axis_proposals: compactProposals,
+    consolidation_ledger: Array.isArray(curatorState.consolidation_ledger)
+      ? curatorState.consolidation_ledger.slice(0, initialLoad ? 6 : 10)
+      : curatorState.consolidation_ledger,
+    planned_clusters: Array.isArray(curatorState.planned_clusters)
+      ? curatorState.planned_clusters.slice(0, clusterLimit).map(c => ({
+          ...c,
+          source_event_ids: Array.isArray(c?.source_event_ids) ? c.source_event_ids.slice(0, sourceLimit) : [],
+        }))
+      : curatorState.planned_clusters,
+  }
+}
+
+export function buildCorpusDelta(fromSnap, toSnap) {
+  const upsertedRecords = []
+  const removedEventIds = []
+  const removedFactKeys = []
+
+  for (const r of toSnap.records) {
+    if (!r || typeof r !== 'object') continue
+    const prev = r.event_id ? fromSnap.byEventMap.get(r.event_id) : fromSnap.byFactKey.get(`${r.author_pubkey}:${r.d}`)
+    if (!prev || JSON.stringify(prev) !== JSON.stringify(r)) {
+      upsertedRecords.push(r)
+    }
+  }
+  for (const [eventId] of fromSnap.byEventMap) {
+    if (!toSnap.byEventMap.has(eventId)) {
+      removedEventIds.push(eventId)
+    }
+  }
+  for (const [factKey] of fromSnap.byFactKey) {
+    if (!toSnap.byFactKey.has(factKey)) {
+      removedFactKeys.push(factKey)
+    }
+  }
+
+  const upsertedConsolidatedSources = {}
+  const removedConsolidatedSourceIds = []
+  const toSources = toSnap.consolidatedSources || {}
+  const fromSources = fromSnap.consolidatedSources || {}
+  for (const [sid, src] of Object.entries(toSources)) {
+    if (!fromSources[sid] || JSON.stringify(fromSources[sid]) !== JSON.stringify(src)) {
+      upsertedConsolidatedSources[sid] = src
+    }
+  }
+  for (const sid of Object.keys(fromSources)) {
+    if (!Object.prototype.hasOwnProperty.call(toSources, sid)) {
+      removedConsolidatedSourceIds.push(sid)
+    }
+  }
+
+  const upsertedTopicPages = {}
+  const removedTopics = []
+  const toPages = toSnap.topicPages || {}
+  const fromPages = fromSnap.topicPages || {}
+  for (const [topic, page] of Object.entries(toPages)) {
+    if (!fromPages[topic] || JSON.stringify(fromPages[topic]) !== JSON.stringify(page)) {
+      upsertedTopicPages[topic] = page
+    }
+  }
+  for (const topic of Object.keys(fromPages)) {
+    if (!Object.prototype.hasOwnProperty.call(toPages, topic)) {
+      removedTopics.push(topic)
+    }
+  }
+
+  const changedIds = new Set(upsertedRecords.map(r => r.event_id).filter(Boolean))
+  const removedIdSet = new Set(removedEventIds)
+  const upsertedConstellationLinks =
+    changedIds.size > 0 || removedIdSet.size > 0
+      ? (toSnap.constellationLinks || []).filter(l => changedIds.has(l.from_id) || changedIds.has(l.to_id)).slice(0, 24)
+      : []
+
+  return {
+    mode: 'delta',
+    from_seq: fromSnap.writeSeq,
+    to_seq: toSnap.writeSeq,
+    from_digest: fromSnap.corpusDigest,
+    to_digest: toSnap.corpusDigest,
+    acl_digest: toSnap.aclDigest || '',
+    corpus_epoch: toSnap.corpusEpoch ?? null,
+    expected_current_claims: toSnap.currentClaims,
+    upserted_records: upsertedRecords,
+    removed_event_ids: removedEventIds,
+    removed_fact_keys: removedFactKeys,
+    upserted_consolidated_sources: upsertedConsolidatedSources,
+    removed_consolidated_source_ids: removedConsolidatedSourceIds,
+    upserted_topic_pages: upsertedTopicPages,
+    removed_topics: removedTopics,
+    upserted_constellation_links: upsertedConstellationLinks,
+    entity_graph_stats: toSnap.entityGraphStats,
+  }
+}
+
+export function applyClientCorpusDelta(clientState, sseFrame) {
+  if (!sseFrame || typeof sseFrame !== 'object') return clientState
+  const prevResetGen = Number.isSafeInteger(clientState?.corpus_reset_gen) ? clientState.corpus_reset_gen : 0
+  const prevResyncSeq = Number.isSafeInteger(clientState?.resync_request_seq) ? clientState.resync_request_seq : 0
+  const prevDigest = String(clientState?.corpus_digest || '')
+  const prevCorpusWriteSeq =
+    clientState?.corpus_write_seq !== undefined
+      ? clientState.corpus_write_seq
+      : (clientState?.store_state?.write_seq ?? null)
+  const prevAclDigest = String(clientState?.acl_digest || '')
+  const prevEpoch = Number.isSafeInteger(clientState?.corpus_epoch) ? clientState.corpus_epoch : null
+  const frameDigest = String(sseFrame?.corpus_digest || sseFrame?.corpus_delta?.to_digest || '')
+  const frameAclDigest = String(sseFrame?.acl_digest || sseFrame?.corpus_delta?.acl_digest || prevAclDigest)
+  const frameEpoch = Number.isSafeInteger(sseFrame?.corpus_epoch)
+    ? sseFrame.corpus_epoch
+    : Number.isSafeInteger(sseFrame?.corpus_delta?.corpus_epoch)
+      ? sseFrame.corpus_delta.corpus_epoch
+      : prevEpoch
+  const framePollSeq = Number.isSafeInteger(sseFrame?.poll_seq)
+    ? Math.max(sseFrame.poll_seq, Number.isSafeInteger(clientState?.last_sse_poll_seq) ? clientState.last_sse_poll_seq : 0)
+    : (Number.isSafeInteger(clientState?.last_sse_poll_seq) ? clientState.last_sse_poll_seq : 0)
+
+  if (Array.isArray(sseFrame.records)) {
     return {
-      ...telemetryOnly,
+      ...clientState,
+      ...sseFrame,
+      corpus_digest: frameDigest,
+      target_corpus_digest: frameDigest,
+      corpus_write_seq: sseFrame?.store_state?.write_seq ?? null,
+      acl_digest: frameAclDigest,
+      corpus_epoch: frameEpoch,
+      last_sse_poll_seq: framePollSeq,
+      corpus_reset_gen: prevResetGen + 1,
+      resync_request_seq: prevResyncSeq + 1,
+      needs_full_resync: false,
+      resync_reason: null,
+    }
+  }
+  const aclOrEpochChanged =
+    Boolean(frameAclDigest && prevAclDigest && frameAclDigest !== prevAclDigest) ||
+    Boolean(frameEpoch !== null && prevEpoch !== null && frameEpoch !== prevEpoch)
+
+  if (sseFrame.corpus_unchanged === true && !sseFrame.corpus_delta) {
+    const digestMismatch = Boolean(frameDigest && prevDigest && frameDigest !== prevDigest)
+    const needsResync = Boolean(clientState?.needs_full_resync || aclOrEpochChanged || digestMismatch)
+    return {
+      ...clientState,
+      ...sseFrame,
+      corpus_digest: prevDigest,
+      target_corpus_digest: frameDigest || String(clientState?.target_corpus_digest || prevDigest),
+      corpus_write_seq: prevCorpusWriteSeq,
+      acl_digest: frameAclDigest,
+      corpus_epoch: frameEpoch,
+      last_sse_poll_seq: framePollSeq,
+      corpus_reset_gen: aclOrEpochChanged ? prevResetGen + 1 : prevResetGen,
+      resync_request_seq: needsResync && !clientState?.needs_full_resync ? prevResyncSeq + 1 : prevResyncSeq,
+      records: Array.isArray(clientState?.records) ? clientState.records : [],
+      consolidated_sources: clientState?.consolidated_sources || {},
+      constellation_links: Array.isArray(clientState?.constellation_links) ? clientState.constellation_links : [],
+      topic_pages: clientState?.topic_pages || {},
+      needs_full_resync: needsResync,
+      resync_reason: needsResync ? (clientState?.resync_reason || 'unchanged_frame_digest_or_acl_mismatch') : null,
+    }
+  }
+  if (!sseFrame.corpus_delta || typeof sseFrame.corpus_delta !== 'object') {
+    return {
+      ...clientState,
+      ...sseFrame,
+      corpus_digest: prevDigest,
+      target_corpus_digest: frameDigest || String(clientState?.target_corpus_digest || prevDigest),
+      corpus_write_seq: prevCorpusWriteSeq,
+      acl_digest: frameAclDigest,
+      corpus_epoch: frameEpoch,
+      last_sse_poll_seq: framePollSeq,
+      corpus_reset_gen: aclOrEpochChanged ? prevResetGen + 1 : prevResetGen,
+      resync_request_seq: prevResyncSeq + 1,
+      records: Array.isArray(clientState?.records) ? clientState.records : [],
+      needs_full_resync: true,
+      resync_reason: 'missing_corpus_payload',
+    }
+  }
+  const d = sseFrame.corpus_delta
+  if (
+    clientState?.needs_full_resync === true ||
+    aclOrEpochChanged ||
+    (d.from_digest && prevDigest && d.from_digest !== prevDigest) ||
+    (d.from_seq != null && prevCorpusWriteSeq != null && d.from_seq !== prevCorpusWriteSeq)
+  ) {
+    return {
+      ...clientState,
+      ...sseFrame,
+      corpus_digest: prevDigest,
+      target_corpus_digest: String(d.to_digest || frameDigest || clientState?.target_corpus_digest || prevDigest),
+      corpus_write_seq: prevCorpusWriteSeq,
+      acl_digest: frameAclDigest,
+      corpus_epoch: frameEpoch,
+      last_sse_poll_seq: framePollSeq,
+      corpus_reset_gen: aclOrEpochChanged ? prevResetGen + 1 : prevResetGen,
+      resync_request_seq: prevResyncSeq + 1,
+      records: Array.isArray(clientState?.records) ? clientState.records : [],
+      needs_full_resync: true,
+      resync_reason: 'precondition_mismatch',
+    }
+  }
+
+  const prevRecords = Array.isArray(clientState?.records) ? clientState.records : []
+  const removedEvents = new Set(Array.isArray(d.removed_event_ids) ? d.removed_event_ids : [])
+  const removedKeys = new Set(Array.isArray(d.removed_fact_keys) ? d.removed_fact_keys : [])
+  const upsertedList = Array.isArray(d.upserted_records) ? d.upserted_records.filter(Boolean) : []
+  const upsertedEvents = new Set(upsertedList.map(r => r.event_id).filter(Boolean))
+  const upsertedKeys = new Set(
+    upsertedList.map(r => (r.author_pubkey && r.d ? `${r.author_pubkey}:${r.d}` : '')).filter(Boolean)
+  )
+
+  const keptRecords = prevRecords.filter(r => {
+    if (!r || typeof r !== 'object') return false
+    if (r.event_id && (removedEvents.has(r.event_id) || upsertedEvents.has(r.event_id))) return false
+    const fk = r.author_pubkey && r.d ? `${r.author_pubkey}:${r.d}` : ''
+    if (fk && (removedKeys.has(fk) || upsertedKeys.has(fk))) return false
+    return true
+  })
+
+  const nextRecords = [...keptRecords, ...upsertedList].sort(
+    (a, b) => (a.computed_rank || 99) - (b.computed_rank || 99) || (b.created_at || 0) - (a.created_at || 0)
+  )
+
+  const nextSources = { ...(clientState?.consolidated_sources || {}) }
+  for (const sid of Array.isArray(d.removed_consolidated_source_ids) ? d.removed_consolidated_source_ids : []) {
+    delete nextSources[sid]
+  }
+  if (d.upserted_consolidated_sources && typeof d.upserted_consolidated_sources === 'object') {
+    Object.assign(nextSources, d.upserted_consolidated_sources)
+  }
+
+  const nextPages = { ...(clientState?.topic_pages || {}) }
+  for (const topic of Array.isArray(d.removed_topics) ? d.removed_topics : []) {
+    delete nextPages[topic]
+  }
+  if (d.upserted_topic_pages && typeof d.upserted_topic_pages === 'object') {
+    Object.assign(nextPages, d.upserted_topic_pages)
+  }
+
+  const prevLinks = Array.isArray(clientState?.constellation_links) ? clientState.constellation_links : []
+  const keptLinks = prevLinks.filter(
+    l =>
+      l &&
+      !removedEvents.has(l.from_id) &&
+      !removedEvents.has(l.to_id) &&
+      !upsertedEvents.has(l.from_id) &&
+      !upsertedEvents.has(l.to_id)
+  )
+  const nextLinks = [
+    ...keptLinks,
+    ...(Array.isArray(d.upserted_constellation_links) ? d.upserted_constellation_links : []),
+  ]
+
+  const isTruncated = Boolean(clientState?.records_truncated)
+  const postconditionFailed =
+    !isTruncated &&
+    Number.isSafeInteger(d.expected_current_claims) &&
+    nextRecords.length !== d.expected_current_claims
+  const nextDigest = String(d.to_digest || frameDigest || prevDigest)
+  const nextWriteSeq = d.to_seq ?? sseFrame?.store_state?.write_seq ?? prevCorpusWriteSeq
+
+  return {
+    ...clientState,
+    ...sseFrame,
+    corpus_digest: nextDigest,
+    target_corpus_digest: nextDigest,
+    corpus_write_seq: nextWriteSeq,
+    acl_digest: frameAclDigest,
+    corpus_epoch: frameEpoch,
+    last_sse_poll_seq: framePollSeq,
+    corpus_reset_gen: prevResetGen,
+    resync_request_seq: postconditionFailed ? prevResyncSeq + 1 : prevResyncSeq,
+    records: nextRecords,
+    total_records: Number.isSafeInteger(d.expected_current_claims) ? d.expected_current_claims : nextRecords.length,
+    consolidated_sources: nextSources,
+    topic_pages: nextPages,
+    constellation_links: nextLinks,
+    entity_graph_stats: d.entity_graph_stats || sseFrame.entity_graph_stats || clientState?.entity_graph_stats,
+    needs_full_resync: postconditionFailed,
+    resync_reason: postconditionFailed ? 'postcondition_claim_count_mismatch' : null,
+  }
+}
+
+export function applyClientRecordsResponse(
+  clientState,
+  apiResponse,
+  { mode = 'merge', requestCorpusGen = null, requestResyncSeq = null, requestDigest = null } = {}
+) {
+  if (!clientState || typeof clientState !== 'object') return clientState
+  if (!apiResponse || typeof apiResponse !== 'object' || !Array.isArray(apiResponse.records)) {
+    return { ...clientState, applied: false, rejected_reason: 'invalid_response' }
+  }
+  const respDigest = String(apiResponse.corpus_digest || '')
+  const respAclDigest = String(apiResponse.acl_digest || '')
+  const respEpoch = Number.isSafeInteger(apiResponse.corpus_epoch) ? apiResponse.corpus_epoch : null
+  const respPollSeq = Number.isSafeInteger(apiResponse.poll_seq) ? apiResponse.poll_seq : null
+  const curDigest = String(clientState.corpus_digest || '')
+  const targetDigest = String(clientState.target_corpus_digest || curDigest || '')
+  const curAclDigest = String(clientState.acl_digest || '')
+  const curEpoch = Number.isSafeInteger(clientState.corpus_epoch) ? clientState.corpus_epoch : null
+  const curResetGen = Number.isSafeInteger(clientState.corpus_reset_gen) ? clientState.corpus_reset_gen : 0
+  const curResyncSeq = Number.isSafeInteger(clientState.resync_request_seq) ? clientState.resync_request_seq : 0
+  const lastSsePollSeq = Number.isSafeInteger(clientState.last_sse_poll_seq) ? clientState.last_sse_poll_seq : 0
+
+  if (mode === 'resync') {
+    if (apiResponse.connected === false || (apiResponse.store_state && apiResponse.store_state.state !== 'READY')) {
+      return { ...clientState, applied: false, rejected_reason: 'store_not_ready' }
+    }
+    if (requestCorpusGen !== null && requestCorpusGen !== curResetGen) {
+      return { ...clientState, applied: false, rejected_reason: 'superseded_by_corpus_reset' }
+    }
+    if (requestResyncSeq !== null && requestResyncSeq !== curResyncSeq) {
+      return { ...clientState, applied: false, rejected_reason: 'superseded_by_newer_resync' }
+    }
+    if (curAclDigest && respAclDigest && respAclDigest !== curAclDigest) {
+      return { ...clientState, applied: false, rejected_reason: 'stale_acl_digest' }
+    }
+    if (curEpoch !== null && respEpoch !== null && respEpoch !== curEpoch) {
+      return { ...clientState, applied: false, rejected_reason: 'stale_corpus_epoch' }
+    }
+    if (respPollSeq !== null && lastSsePollSeq > 0 && respPollSeq < lastSsePollSeq) {
+      return { ...clientState, applied: false, rejected_reason: 'stale_poll_seq' }
+    }
+    if (!respDigest || (targetDigest && respDigest !== targetDigest && (respPollSeq === null || respPollSeq <= lastSsePollSeq))) {
+      return { ...clientState, applied: false, rejected_reason: 'stale_corpus_digest' }
+    }
+    const totalRecords = Number.isSafeInteger(apiResponse.total_records)
+      ? apiResponse.total_records
+      : apiResponse.records.length
+    const truncated = Boolean(apiResponse.next_offset !== null && apiResponse.records.length < totalRecords)
+    return {
+      ...clientState,
+      records: apiResponse.records,
+      total_records: totalRecords,
+      records_truncated: truncated,
+      corpus_digest: respDigest,
+      target_corpus_digest: respDigest,
+      corpus_write_seq: apiResponse.store_state?.write_seq ?? clientState.corpus_write_seq ?? null,
+      acl_digest: respAclDigest || curAclDigest,
+      corpus_epoch: respEpoch ?? curEpoch,
+      last_sse_poll_seq: respPollSeq !== null ? Math.max(lastSsePollSeq, respPollSeq) : lastSsePollSeq,
+      store_state: apiResponse.store_state || clientState.store_state,
+      consolidated_sources: apiResponse.consolidated_sources || clientState.consolidated_sources || {},
+      constellation_links: Array.isArray(apiResponse.constellation_links)
+        ? apiResponse.constellation_links
+        : (clientState.constellation_links || []),
+      entity_graph_stats: apiResponse.entity_graph_stats || clientState.entity_graph_stats,
+      topic_pages: apiResponse.topic_pages || clientState.topic_pages || {},
+      needs_full_resync: false,
+      resync_reason: null,
+      applied: true,
+      rejected_reason: null,
+    }
+  }
+
+  if (clientState.needs_full_resync) {
+    return { ...clientState, applied: false, rejected_reason: 'resync_pending' }
+  }
+  if (requestCorpusGen !== null && requestCorpusGen !== curResetGen) {
+    return { ...clientState, applied: false, rejected_reason: 'superseded_by_corpus_reset' }
+  }
+  if (!respDigest || !curDigest || respDigest !== curDigest) {
+    return { ...clientState, applied: false, rejected_reason: 'stale_corpus_digest' }
+  }
+  if (requestDigest !== null && respDigest !== requestDigest) {
+    return { ...clientState, applied: false, rejected_reason: 'request_digest_mismatch' }
+  }
+  if (targetDigest && respDigest !== targetDigest) {
+    return { ...clientState, applied: false, rejected_reason: 'target_digest_mismatch' }
+  }
+  if (curAclDigest && respAclDigest && respAclDigest !== curAclDigest) {
+    return { ...clientState, applied: false, rejected_reason: 'stale_acl_digest' }
+  }
+  if (curEpoch !== null && respEpoch !== null && respEpoch !== curEpoch) {
+    return { ...clientState, applied: false, rejected_reason: 'stale_corpus_epoch' }
+  }
+
+  const incoming = apiResponse.records.filter(r => r && typeof r === 'object')
+  const incomingEvents = new Set(incoming.map(r => r.event_id).filter(Boolean))
+  const incomingKeys = new Set(
+    incoming.map(r => (r.author_pubkey && r.d ? `${r.author_pubkey}:${r.d}` : '')).filter(Boolean)
+  )
+  const existing = Array.isArray(clientState.records) ? clientState.records : []
+  const kept = existing.filter(r => {
+    if (!r || typeof r !== 'object') return false
+    if (r.event_id && incomingEvents.has(r.event_id)) return false
+    const fk = r.author_pubkey && r.d ? `${r.author_pubkey}:${r.d}` : ''
+    if (fk && incomingKeys.has(fk)) return false
+    return true
+  })
+  const merged = [...kept, ...incoming].sort(
+    (a, b) => (a.computed_rank || 99) - (b.computed_rank || 99) || (b.created_at || 0) - (a.created_at || 0)
+  )
+  const nextSources = { ...(clientState.consolidated_sources || {}) }
+  if (apiResponse.consolidated_sources && typeof apiResponse.consolidated_sources === 'object') {
+    Object.assign(nextSources, apiResponse.consolidated_sources)
+  }
+  const totalRecords = Number.isSafeInteger(apiResponse.total_records)
+    ? apiResponse.total_records
+    : (clientState.total_records ?? merged.length)
+  const nextTruncated =
+    Boolean(clientState.records_truncated) &&
+    !(apiResponse.next_offset === null && totalRecords > 0 && merged.length >= totalRecords)
+  return {
+    ...clientState,
+    records: merged,
+    consolidated_sources: nextSources,
+    total_records: totalRecords,
+    records_truncated: nextTruncated,
+    applied: true,
+    rejected_reason: null,
+  }
+}
+
+export function buildClientViewerState(
+  state,
+  { includeCorpus = true, corpusDelta = null, initialLoad = false, initialLimit = INITIAL_STATE_RECORDS_LIMIT } = {}
+) {
+  if (!state || typeof state !== 'object') return state
+  const {
+    records: rawRecords,
+    consolidated_sources: rawSources,
+    constellation_links: rawLinks,
+    topic_pages: rawPages,
+    activity_rollups: _rollups,
+    eigen_axis_proposals: _dupProposals,
+    ...telemetryOnly
+  } = state
+  const compactCurator = compactCuratorStateForClient(state.curator_state, { initialLoad })
+  const compactProposals = compactCurator?.eigen_axis_proposals || []
+  const slimCoherence =
+    telemetryOnly.coherence && typeof telemetryOnly.coherence === 'object' && Array.isArray(telemetryOnly.coherence.daily_history)
+      ? { ...telemetryOnly.coherence, history: undefined }
+      : telemetryOnly.coherence
+  const slimEfficacy =
+    telemetryOnly.efficacy && typeof telemetryOnly.efficacy === 'object' && Array.isArray(telemetryOnly.efficacy.daily_history)
+      ? { ...telemetryOnly.efficacy, history: undefined }
+      : telemetryOnly.efficacy
+  const baseTelemetry = {
+    ...telemetryOnly,
+    coherence: slimCoherence,
+    efficacy: slimEfficacy,
+    recent_activity: Array.isArray(telemetryOnly.recent_activity)
+      ? telemetryOnly.recent_activity.slice(initialLoad ? -8 : -24)
+      : telemetryOnly.recent_activity,
+    event_log: Array.isArray(telemetryOnly.event_log)
+      ? telemetryOnly.event_log.slice(initialLoad ? -8 : -20)
+      : telemetryOnly.event_log,
+    curator_state: compactCurator,
+  }
+  if (!includeCorpus && !corpusDelta) {
+    return {
+      ...baseTelemetry,
+      eigen_axis_proposals: compactProposals,
       corpus_unchanged: true,
     }
   }
+  if (corpusDelta) {
+    return {
+      ...baseTelemetry,
+      eigen_axis_proposals: compactProposals,
+      corpus_unchanged: false,
+      corpus_delta: corpusDelta,
+    }
+  }
+  if (initialLoad) {
+    const sel = selectInitialScreenRecords(rawRecords, initialLimit)
+    const selectedIds = new Set(sel.records.map(r => r?.event_id).filter(Boolean))
+    const filteredSources = {}
+    if (rawSources && typeof rawSources === 'object') {
+      for (const r of sel.records) {
+        if (Array.isArray(r?.supersedes)) {
+          for (const sid of r.supersedes) {
+            if (rawSources[sid]) filteredSources[sid] = rawSources[sid]
+          }
+        }
+      }
+    }
+    const filteredLinks = Array.isArray(rawLinks)
+      ? rawLinks.filter(l => selectedIds.has(l?.from_id) || selectedIds.has(l?.to_id)).slice(0, 8)
+      : []
+    const slimTrends =
+      baseTelemetry.trends && typeof baseTelemetry.trends === 'object'
+        ? { ...baseTelemetry.trends, hourly_24h_series: undefined }
+        : baseTelemetry.trends
+    return {
+      ...baseTelemetry,
+      trends: slimTrends,
+      corpus_unchanged: false,
+      records: sel.records,
+      records_truncated: sel.truncated,
+      total_records: sel.total,
+      consolidated_sources: filteredSources,
+      constellation_links: filteredLinks,
+      topic_pages: compactTopicPagesForClient(rawPages),
+    }
+  }
   return {
-    ...state,
+    ...baseTelemetry,
+    eigen_axis_proposals: compactProposals,
     corpus_unchanged: false,
-    topic_pages: compactTopicPagesForClient(state.topic_pages),
+    records: Array.isArray(rawRecords) ? rawRecords : [],
+    records_truncated: false,
+    total_records: Array.isArray(rawRecords) ? rawRecords.length : 0,
+    consolidated_sources: rawSources || {},
+    constellation_links: Array.isArray(rawLinks) ? rawLinks : [],
+    topic_pages: compactTopicPagesForClient(rawPages),
   }
 }
 
@@ -2916,7 +3451,7 @@ export function createSingleSocketMcpClient(socketPath) {
 }
 
 export function renderViewerHtml(initialState) {
-  const clientInitial = buildClientViewerState(initialState, { includeCorpus: true })
+  const clientInitial = buildClientViewerState(initialState, { includeCorpus: true, initialLoad: true })
   const escapedInitial = safeJsonForScript(clientInitial)
   const syncState = escapeHtml(initialState.store_state?.state || 'CONNECTING')
   const readerName = escapeHtml(initialState.reader || 'viewer')
@@ -3621,6 +4156,20 @@ export function renderViewerHtml(initialState) {
       var latestRecords = [];
       var latestStoreState = {};
       var latestRecentActivity = [];
+      var recordsTruncated = false;
+      var totalStoreRecords = 0;
+      var currentCorpusDigest = '';
+      var currentCorpusWriteSeq = null;
+      var targetServerDigest = '';
+      var currentAclDigest = '';
+      var currentCorpusEpoch = null;
+      var lastSsePollSeq = 0;
+      var corpusResetGen = 0;
+      var resyncRequestSeq = 0;
+      var needsFullResync = false;
+      var fetchedTopics = {};
+      var resyncInFlight = false;
+      var searchFetchTimer = null;
       var prevByEventId = {};
       var lastRenderedCorpusSig = null;
       var lastRenderedLogSig = null;
@@ -3687,6 +4236,137 @@ export function renderViewerHtml(initialState) {
         return false;
       }
 
+      function canMergeFetchedPayload(data, reqCorpusGen, reqDigest) {
+        if (!data || !Array.isArray(data.records)) return false;
+        if (needsFullResync) return false;
+        if (reqCorpusGen != null && reqCorpusGen !== corpusResetGen) return false;
+        var respDigest = typeof data.corpus_digest === 'string' ? data.corpus_digest : '';
+        if (!respDigest || !currentCorpusDigest || respDigest !== currentCorpusDigest) return false;
+        if (reqDigest && respDigest !== reqDigest) return false;
+        if (targetServerDigest && respDigest !== targetServerDigest) return false;
+        if (currentAclDigest && data.acl_digest && data.acl_digest !== currentAclDigest) return false;
+        if (currentCorpusEpoch != null && data.corpus_epoch != null && data.corpus_epoch !== currentCorpusEpoch) return false;
+        return true;
+      }
+
+      function mergeFetchedRecords(incomingRecords, incomingSources) {
+        if (!Array.isArray(incomingRecords) || !incomingRecords.length) return;
+        var incomingByEvent = {};
+        var incomingByKey = {};
+        for (var i = 0; i < incomingRecords.length; i++) {
+          var ir = incomingRecords[i];
+          if (!ir || typeof ir !== 'object') continue;
+          if (ir.event_id) incomingByEvent[ir.event_id] = true;
+          if (ir.author_pubkey && ir.d) incomingByKey[ir.author_pubkey + ':' + ir.d] = true;
+        }
+        var merged = [];
+        for (var j = 0; j < latestRecords.length; j++) {
+          var er = latestRecords[j];
+          if (!er || typeof er !== 'object') continue;
+          if (er.event_id && incomingByEvent[er.event_id]) continue;
+          if (er.author_pubkey && er.d && incomingByKey[er.author_pubkey + ':' + er.d]) continue;
+          merged.push(er);
+        }
+        for (var k = 0; k < incomingRecords.length; k++) {
+          if (incomingRecords[k] && typeof incomingRecords[k] === 'object') merged.push(incomingRecords[k]);
+        }
+        merged.sort(function (a, b) {
+          return ((a.computed_rank || 99) - (b.computed_rank || 99)) || ((b.created_at || 0) - (a.created_at || 0));
+        });
+        latestRecords = merged;
+        if (incomingSources && typeof incomingSources === 'object') {
+          for (var sk in incomingSources) {
+            if (Object.prototype.hasOwnProperty.call(incomingSources, sk)) {
+              latestConsolidatedSources[sk] = incomingSources[sk];
+            }
+          }
+        }
+        if (totalStoreRecords > 0 && latestRecords.length >= totalStoreRecords) {
+          recordsTruncated = false;
+        }
+        renderRecords(latestRecords, nowSec());
+        syncGraph({
+          connected: true,
+          store_state: latestStoreState,
+          records: latestRecords,
+          agent_roster: agents,
+          recent_activity: latestRecentActivity
+        }, graphReady, true);
+        renderInspector();
+      }
+
+      function forceFullCorpusResync() {
+        needsFullResync = true;
+        if (typeof fetch !== 'function') return;
+        var reqGen = corpusResetGen;
+        var reqSeq = ++resyncRequestSeq;
+        resyncInFlight = true;
+        fetch('/api/records?include_corpus=1')
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (data) {
+            if (reqSeq !== resyncRequestSeq || reqGen !== corpusResetGen) return;
+            resyncInFlight = false;
+            if (!data || !Array.isArray(data.records) || data.connected === false) return;
+            if (data.store_state && data.store_state.state !== 'READY') return;
+            if (currentAclDigest && data.acl_digest && data.acl_digest !== currentAclDigest) return;
+            if (currentCorpusEpoch != null && data.corpus_epoch != null && data.corpus_epoch !== currentCorpusEpoch) return;
+            if (typeof data.poll_seq === 'number' && lastSsePollSeq > 0 && data.poll_seq < lastSsePollSeq) {
+              if (targetServerDigest && data.corpus_digest !== targetServerDigest) {
+                forceFullCorpusResync();
+              }
+              return;
+            }
+            var respDigest = typeof data.corpus_digest === 'string' ? data.corpus_digest : '';
+            if (!respDigest || (targetServerDigest && respDigest !== targetServerDigest && (typeof data.poll_seq !== 'number' || data.poll_seq <= lastSsePollSeq))) {
+              return;
+            }
+            needsFullResync = false;
+            fetchedTopics = {};
+            latestRecords = data.records;
+            totalStoreRecords = typeof data.total_records === 'number' ? data.total_records : data.records.length;
+            recordsTruncated = Boolean(data.next_offset !== null && latestRecords.length < totalStoreRecords);
+            currentCorpusDigest = respDigest;
+            targetServerDigest = respDigest;
+            if (typeof data.acl_digest === 'string' && data.acl_digest) {
+              currentAclDigest = data.acl_digest;
+            }
+            if (typeof data.corpus_epoch === 'number') {
+              currentCorpusEpoch = data.corpus_epoch;
+            }
+            if (typeof data.poll_seq === 'number' && data.poll_seq > lastSsePollSeq) {
+              lastSsePollSeq = data.poll_seq;
+            }
+            if (data.store_state && typeof data.store_state === 'object') {
+              latestStoreState = data.store_state;
+              if (data.store_state.write_seq != null) currentCorpusWriteSeq = data.store_state.write_seq;
+            }
+            if (data.consolidated_sources && typeof data.consolidated_sources === 'object') {
+              latestConsolidatedSources = data.consolidated_sources;
+            }
+            if (Array.isArray(data.constellation_links)) {
+              latestConstellationLinks = data.constellation_links;
+            }
+            if (data.entity_graph_stats && typeof data.entity_graph_stats === 'object') {
+              latestEntityGraphStats = data.entity_graph_stats;
+            }
+            if (data.topic_pages && typeof data.topic_pages === 'object') {
+              latestTopicPages = data.topic_pages;
+            }
+            renderRecords(latestRecords, nowSec());
+            syncGraph({
+              connected: true,
+              store_state: latestStoreState,
+              records: latestRecords,
+              agent_roster: agents,
+              recent_activity: latestRecentActivity
+            }, graphReady, true);
+            renderInspector();
+          })
+          .catch(function () {
+            if (reqSeq === resyncRequestSeq) resyncInFlight = false;
+          });
+      }
+
       function openTopicInspector(topicId) {
         if (view !== 'graph') switchView('graph');
         var topObj = topicById(topicId) || { id: topicId || 'general', color: '#38bdf8', x: 0, y: 0, radius: 40 };
@@ -3695,6 +4375,23 @@ export function renderViewerHtml(initialState) {
         if (width <= 1024) setDrawer('none');
         renderAgentRoster();
         renderInspector();
+        if (recordsTruncated && topicId && !fetchedTopics[topicId] && typeof fetch === 'function') {
+          var reqGen = corpusResetGen;
+          var reqDigest = currentCorpusDigest;
+          fetchedTopics[topicId] = true;
+          fetch('/api/records?topic=' + encodeURIComponent(topicId) + '&limit=200')
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (data) {
+              if (!canMergeFetchedPayload(data, reqGen, reqDigest)) {
+                delete fetchedTopics[topicId];
+                return;
+              }
+              mergeFetchedRecords(data.records, data.consolidated_sources);
+            })
+            .catch(function () {
+              delete fetchedTopics[topicId];
+            });
+        }
       }
 
       function fmtTime(sec) {
@@ -3749,7 +4446,10 @@ export function renderViewerHtml(initialState) {
       function renderRecords(records, nowSec) {
         var container = el('records-list');
         container.textContent = '';
-        el('records-count').textContent = records.length + (records.length === 1 ? ' record' : ' records');
+        var totalLabel = recordsTruncated && totalStoreRecords > records.length
+          ? (records.length + ' of ' + totalStoreRecords + ' records')
+          : (records.length + (records.length === 1 ? ' record' : ' records'));
+        el('records-count').textContent = totalLabel;
         if (!records.length) {
           var empty = document.createElement('div');
           empty.className = 'empty';
@@ -3803,6 +4503,37 @@ export function renderViewerHtml(initialState) {
 
           card.appendChild(meta);
           container.appendChild(card);
+        }
+        if (recordsTruncated && totalStoreRecords > records.length) {
+          var moreWrap = makeDiv('inspect-actions');
+          moreWrap.style.marginTop = '8px';
+          var moreBtn = document.createElement('button');
+          moreBtn.type = 'button';
+          moreBtn.className = 'btn sim';
+          moreBtn.textContent = 'Load more records (' + (totalStoreRecords - records.length) + ' remaining)';
+          moreBtn.addEventListener('click', function () {
+            if (typeof fetch !== 'function') return;
+            var reqGen = corpusResetGen;
+            var reqDigest = currentCorpusDigest;
+            moreBtn.disabled = true;
+            moreBtn.textContent = 'Loading records…';
+            fetch('/api/records?offset=' + encodeURIComponent(records.length) + '&limit=200')
+              .then(function (res) { return res.ok ? res.json() : null; })
+              .then(function (data) {
+                if (!canMergeFetchedPayload(data, reqGen, reqDigest)) {
+                  moreBtn.disabled = false;
+                  renderRecords(latestRecords, nowSec);
+                  return;
+                }
+                if (data.next_offset === null) recordsTruncated = false;
+                mergeFetchedRecords(data.records, data.consolidated_sources);
+              })
+              .catch(function () {
+                moreBtn.disabled = false;
+              });
+          });
+          moreWrap.appendChild(moreBtn);
+          container.appendChild(moreWrap);
         }
       }
 
@@ -7254,6 +7985,21 @@ export function renderViewerHtml(initialState) {
       });
       if (el('cortex-search')) el('cortex-search').addEventListener('input', function () {
         searchQuery = String(el('cortex-search').value || '');
+        if (recordsTruncated && searchQuery.trim().length >= 2 && typeof fetch === 'function') {
+          if (searchFetchTimer) clearTimeout(searchFetchTimer);
+          var qVal = searchQuery.trim();
+          searchFetchTimer = setTimeout(function () {
+            var reqGen = corpusResetGen;
+            var reqDigest = currentCorpusDigest;
+            fetch('/api/records?q=' + encodeURIComponent(qVal) + '&limit=100')
+              .then(function (r) { return r.ok ? r.json() : null; })
+              .then(function (data) {
+                if (!canMergeFetchedPayload(data, reqGen, reqDigest)) return;
+                mergeFetchedRecords(data.records, data.consolidated_sources);
+              })
+              .catch(function () {});
+          }, 180);
+        }
       });
 
       var latestCoherence = null;
@@ -7624,9 +8370,153 @@ export function renderViewerHtml(initialState) {
         }
         lastRenderedStateKey = stateKey;
         lastRenderedPollSeq = s.poll_seq;
+        if (typeof s.poll_seq === 'number' && s.poll_seq > lastSsePollSeq) {
+          lastSsePollSeq = s.poll_seq;
+        }
         latestStoreState = st;
         latestRecentActivity = Array.isArray(s.recent_activity) ? s.recent_activity : [];
-        if (Array.isArray(s.records)) latestRecords = s.records;
+        var incomingAcl = typeof s.acl_digest === 'string' && s.acl_digest
+          ? s.acl_digest
+          : (s.corpus_delta && typeof s.corpus_delta.acl_digest === 'string' ? s.corpus_delta.acl_digest : '');
+        var incomingEpoch = typeof s.corpus_epoch === 'number'
+          ? s.corpus_epoch
+          : (s.corpus_delta && typeof s.corpus_delta.corpus_epoch === 'number' ? s.corpus_delta.corpus_epoch : null);
+        var aclOrEpochChanged =
+          Boolean(incomingAcl && currentAclDigest && incomingAcl !== currentAclDigest) ||
+          Boolean(incomingEpoch != null && currentCorpusEpoch != null && incomingEpoch !== currentCorpusEpoch);
+        if (incomingAcl) currentAclDigest = incomingAcl;
+        if (incomingEpoch != null) currentCorpusEpoch = incomingEpoch;
+        var incomingTargetDigest =
+          (s.corpus_delta && typeof s.corpus_delta.to_digest === 'string' && s.corpus_delta.to_digest) ||
+          (typeof s.corpus_digest === 'string' && s.corpus_digest) ||
+          '';
+        if (incomingTargetDigest) targetServerDigest = incomingTargetDigest;
+        if (s.corpus_delta && typeof s.corpus_delta === 'object') {
+          var cd = s.corpus_delta;
+          var precondMismatch =
+            needsFullResync ||
+            aclOrEpochChanged ||
+            (cd.from_digest && currentCorpusDigest && cd.from_digest !== currentCorpusDigest) ||
+            (cd.from_seq != null && currentCorpusWriteSeq != null && cd.from_seq !== currentCorpusWriteSeq);
+          if (precondMismatch) {
+            if (aclOrEpochChanged) {
+              corpusResetGen += 1;
+              fetchedTopics = {};
+            }
+            forceFullCorpusResync();
+          } else {
+            var remEvs = {};
+            var remKeys = {};
+            var upsList = Array.isArray(cd.upserted_records) ? cd.upserted_records : [];
+            var upsEvs = {};
+            var upsKeys = {};
+            var idx;
+            if (Array.isArray(cd.removed_event_ids)) {
+              for (idx = 0; idx < cd.removed_event_ids.length; idx++) remEvs[cd.removed_event_ids[idx]] = true;
+            }
+            if (Array.isArray(cd.removed_fact_keys)) {
+              for (idx = 0; idx < cd.removed_fact_keys.length; idx++) remKeys[cd.removed_fact_keys[idx]] = true;
+            }
+            for (idx = 0; idx < upsList.length; idx++) {
+              var ur = upsList[idx];
+              if (!ur || typeof ur !== 'object') continue;
+              if (ur.event_id) upsEvs[ur.event_id] = true;
+              if (ur.author_pubkey && ur.d) upsKeys[ur.author_pubkey + ':' + ur.d] = true;
+            }
+            var nextRecs = [];
+            for (idx = 0; idx < latestRecords.length; idx++) {
+              var cr = latestRecords[idx];
+              if (!cr || typeof cr !== 'object') continue;
+              if (cr.event_id && (remEvs[cr.event_id] || upsEvs[cr.event_id])) continue;
+              var cfk = cr.author_pubkey && cr.d ? (cr.author_pubkey + ':' + cr.d) : '';
+              if (cfk && (remKeys[cfk] || upsKeys[cfk])) continue;
+              nextRecs.push(cr);
+            }
+            for (idx = 0; idx < upsList.length; idx++) {
+              if (upsList[idx] && typeof upsList[idx] === 'object') nextRecs.push(upsList[idx]);
+            }
+            nextRecs.sort(function (a, b) {
+              return ((a.computed_rank || 99) - (b.computed_rank || 99)) || ((b.created_at || 0) - (a.created_at || 0));
+            });
+            latestRecords = nextRecs;
+            if (typeof cd.expected_current_claims === 'number') {
+              totalStoreRecords = cd.expected_current_claims;
+            }
+            if (typeof cd.to_digest === 'string' && cd.to_digest) {
+              currentCorpusDigest = cd.to_digest;
+              targetServerDigest = cd.to_digest;
+            } else if (typeof s.corpus_digest === 'string' && s.corpus_digest) {
+              currentCorpusDigest = s.corpus_digest;
+              targetServerDigest = s.corpus_digest;
+            }
+            if (cd.to_seq != null) {
+              currentCorpusWriteSeq = cd.to_seq;
+            } else if (st.write_seq != null) {
+              currentCorpusWriteSeq = st.write_seq;
+            }
+            if (Array.isArray(cd.removed_consolidated_source_ids)) {
+              for (idx = 0; idx < cd.removed_consolidated_source_ids.length; idx++) {
+                delete latestConsolidatedSources[cd.removed_consolidated_source_ids[idx]];
+              }
+            }
+            if (cd.upserted_consolidated_sources && typeof cd.upserted_consolidated_sources === 'object') {
+              for (var csk in cd.upserted_consolidated_sources) {
+                if (Object.prototype.hasOwnProperty.call(cd.upserted_consolidated_sources, csk)) {
+                  latestConsolidatedSources[csk] = cd.upserted_consolidated_sources[csk];
+                }
+              }
+            }
+            if (Array.isArray(cd.removed_topics)) {
+              for (idx = 0; idx < cd.removed_topics.length; idx++) {
+                delete latestTopicPages[cd.removed_topics[idx]];
+              }
+            }
+            if (cd.upserted_topic_pages && typeof cd.upserted_topic_pages === 'object') {
+              for (var tpk in cd.upserted_topic_pages) {
+                if (Object.prototype.hasOwnProperty.call(cd.upserted_topic_pages, tpk)) {
+                  latestTopicPages[tpk] = cd.upserted_topic_pages[tpk];
+                }
+              }
+            }
+            if (Array.isArray(cd.upserted_constellation_links)) {
+              var keptLinks = latestConstellationLinks.filter(function (l) {
+                return l && !remEvs[l.from_id] && !remEvs[l.to_id] && !upsEvs[l.from_id] && !upsEvs[l.to_id];
+              });
+              latestConstellationLinks = keptLinks.concat(cd.upserted_constellation_links);
+            }
+            if (cd.entity_graph_stats && typeof cd.entity_graph_stats === 'object') {
+              latestEntityGraphStats = cd.entity_graph_stats;
+            }
+            if (!recordsTruncated && typeof cd.expected_current_claims === 'number' && latestRecords.length !== cd.expected_current_claims) {
+              forceFullCorpusResync();
+            }
+          }
+        } else if (Array.isArray(s.records)) {
+          corpusResetGen += 1;
+          resyncRequestSeq += 1;
+          resyncInFlight = false;
+          needsFullResync = false;
+          fetchedTopics = {};
+          latestRecords = s.records;
+          recordsTruncated = Boolean(s.records_truncated);
+          totalStoreRecords = typeof s.total_records === 'number' ? s.total_records : (st.current_claims != null ? st.current_claims : s.records.length);
+          if (typeof s.corpus_digest === 'string' && s.corpus_digest) {
+            currentCorpusDigest = s.corpus_digest;
+            targetServerDigest = s.corpus_digest;
+          }
+          if (st.write_seq != null) {
+            currentCorpusWriteSeq = st.write_seq;
+          }
+        } else if (aclOrEpochChanged || (typeof s.corpus_digest === 'string' && s.corpus_digest && currentCorpusDigest && s.corpus_digest !== currentCorpusDigest)) {
+          if (aclOrEpochChanged) {
+            corpusResetGen += 1;
+            fetchedTopics = {};
+          }
+          forceFullCorpusResync();
+        } else if (typeof s.corpus_digest === 'string' && s.corpus_digest && !currentCorpusDigest) {
+          currentCorpusDigest = s.corpus_digest;
+          targetServerDigest = s.corpus_digest;
+        }
         if (s.trends && typeof s.trends === 'object') latestTrends = s.trends;
         if (s.curator_state && typeof s.curator_state === 'object') latestCuratorState = s.curator_state;
         if (s.consolidated_sources && typeof s.consolidated_sources === 'object') latestConsolidatedSources = s.consolidated_sources;
@@ -7769,6 +8659,12 @@ export function renderViewerHtml(initialState) {
   </script>
 </body>
 </html>`
+    .replace(
+      /<style>([\s\S]*?)<\/style>/,
+      (_, css) => `<style>${css.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\n\s*/g, ' ').replace(/\s{2,}/g, ' ')}</style>`
+    )
+    .replace(/\n[ \t]+/g, '\n')
+    .replace(/\n+/g, '\n')
 }
 
 function sanitizeMobileAlertSummary(a = {}) {
@@ -8597,11 +9493,9 @@ export function renderMobileViewerHtml(initialMobileState = {}) {
       },
       lifetime: tr.lifetime,
       today_signals: tr.today_signals && {
-        label: tr.today_signals.label,
         new_claims: tr.today_signals.new_claims,
         recall_hits: tr.today_signals.recall_hits,
-        recall_coverage: tr.today_signals.recall_coverage,
-        recall_incomplete: tr.today_signals.recall_incomplete,
+        ...(tr.today_signals.recall_incomplete ? { recall_incomplete: true } : {}),
         conflicts_raised: tr.today_signals.conflicts_raised,
         conflicts_resolved: tr.today_signals.conflicts_resolved,
         active_writers: tr.today_signals.active_writers,
@@ -8612,15 +9506,10 @@ export function renderMobileViewerHtml(initialMobileState = {}) {
         synaptic_efficiency_score: d.synaptic_efficiency_score,
         new_claims: d.new_claims,
         recall_hits: d.recall_hits,
-        recall_incomplete: d.recall_incomplete,
+        ...(d.recall_incomplete ? { recall_incomplete: true } : {}),
         conflicts_raised: d.conflicts_raised,
         conflicts_resolved: d.conflicts_resolved,
         active_writers: d.active_writers,
-      })),
-      hourly_24h_series: (Array.isArray(tr.hourly_24h_series) ? tr.hourly_24h_series : []).map(h => ({
-        label: h.label,
-        coherence_score: h.coherence_score,
-        synaptic_efficiency_score: h.synaptic_efficiency_score,
       })),
     },
     dreams: {
@@ -8633,51 +9522,39 @@ export function renderMobileViewerHtml(initialMobileState = {}) {
       write_delta_threshold: mobileData.dreams?.write_delta_threshold,
       counts: mobileData.dreams?.counts,
       planned_summary: mobileData.dreams?.planned_summary,
-      recent_consolidations: (mobileData.dreams?.recent_consolidations || []).slice(0, 4).map(c => ({
-        topic: c.topic,
-        slug: c.slug,
-        source_count: c.source_count,
-        at: c.at,
-      })),
       eigenvectors: (mobileData.dreams?.eigenvectors || []).slice(0, 1).map(e => ({
         label: e.label,
         variance_pct: e.variance_pct,
         persisted: e.persisted,
       })),
-      eigen_axis_proposals: (mobileData.dreams?.eigen_axis_proposals || []).slice(0, 3).map(p => ({
-        kind: p.kind,
-        from_topic: p.from_topic,
-        proposed_topic: p.proposed_topic,
-        claim_count: p.claim_count,
-        sample_slugs: (p.sample_slugs || []).slice(0, 2),
-        coherence_delta: p.coherence_delta,
-        coherence_delta_label: p.coherence_delta_label,
-      })),
     },
     agents: {
       summary: mobileData.agents?.summary,
-      roster: (mobileData.agents?.roster || []).map(a => ({
-        id: a.id,
-        is_writer: a.is_writer,
-        fenced: a.fenced,
-        health: a.health,
-        compliance_status: a.compliance_status,
-        coherence_score: a.coherence_score,
-        reads_5m: a.reads_5m,
-        writes_5m: a.writes_5m,
-        refusals_15m: a.refusals_15m,
-        active_claims: a.active_claims,
-        last_recall_at: a.last_recall_at,
-        last_write_at: a.last_write_at,
-        last_write_slug: a.last_write_slug,
-      })),
+      roster: (mobileData.agents?.roster || []).map(a => {
+        const item = {
+          id: a.id,
+          is_writer: a.is_writer,
+          health: a.health,
+          compliance_status: a.compliance_status,
+          coherence_score: a.coherence_score,
+          reads_5m: a.reads_5m,
+          writes_5m: a.writes_5m,
+          active_claims: a.active_claims,
+        }
+        if (a.fenced) item.fenced = true
+        if (a.refusals_15m) item.refusals_15m = a.refusals_15m
+        if (a.last_recall_at) item.last_recall_at = a.last_recall_at
+        if (a.last_write_at) item.last_write_at = a.last_write_at
+        if (a.last_write_slug) item.last_write_slug = a.last_write_slug
+        return item
+      }),
     },
-    alerts: (mobileData.alerts || []).slice(0, 5),
+    alerts: (mobileData.alerts || []).slice(0, 2),
     vitals: {
       scope_counts: mobileData.vitals?.scope_counts,
       entity_graph: { total_edges: mobileData.vitals?.entity_graph?.total_edges || 0 },
-      topics: (mobileData.vitals?.topics || []).slice(0, 7),
-      recent_pulses: (mobileData.vitals?.recent_pulses || []).slice(0, 5),
+      topics: (mobileData.vitals?.topics || []).slice(0, 3),
+      recent_pulses: (mobileData.vitals?.recent_pulses || []).slice(0, 2),
     },
   }
   const escapedInitial = safeJsonForScript(initPayload)
@@ -8716,27 +9593,13 @@ html,body{margin:0;padding:0;background:radial-gradient(circle at 18% 6%,rgba(56
 .cr{background:rgba(4,9,22,.56);border:1px solid rgba(100,138,205,.16);border-radius:9px;padding:6px 9px;display:flex;justify-content:space-between;gap:8px;font-size:10.5px;font-family:var(--mono)}.cm{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .bnav{position:fixed;left:50%;transform:translateX(-50%);bottom:max(8px,env(safe-area-inset-bottom));width:calc(100% - 20px);max-width:500px;z-index:50;padding:5px;display:grid;grid-template-columns:repeat(5,1fr);gap:4px;border-radius:99px;background:rgba(7,12,26,.94);border:1px solid rgba(125,211,252,.3)}
 .nbtn{border:none;background:transparent;color:var(--mut);padding:6px 4px;border-radius:99px;font-size:11px;font-weight:700;cursor:pointer}.nbtn.active{background:rgba(56,189,248,.2);color:#e0f2fe}
-.foot{text-align:center;font-size:10px;color:var(--mut);font-family:var(--mono);padding:5px}
-</style></head><body>
-<div class="shell" id="top-sec">
-<header class="glass top-bar"><div class="brand"><div class="orb"></div><div style="min-width:0"><div class="brand-title">Pocket Cortex · Hive Memory</div><div class="sub">reader: <span id="m-reader">${readerName}</span> · metadata-only</div></div></div><div class="row-sb"><span id="m-sse-pill" class="pill info">LIVE</span><button id="m-desktop-btn" class="btn-g" type="button">3D View</button></div></header>
+.foot{text-align:center;font-size:10px;color:var(--mut);font-family:var(--mono);padding:5px}</style></head><body>
+<div class="shell" id="top-sec"><header class="glass top-bar"><div class="brand"><div class="orb"></div><div style="min-width:0"><div class="brand-title">Pocket Cortex · Hive Memory</div><div class="sub">reader: <span id="m-reader">${readerName}</span> · metadata-only</div></div></div><div class="row-sb"><span id="m-sse-pill" class="pill info">LIVE</span><button id="m-desktop-btn" class="btn-g" type="button">3D View</button></div></header>
 <section class="glass hero"><canvas id="pocket-cortex" width="480" height="186"></canvas><div class="ov-top"><span id="m-store-pill" class="pill ok">${syncState}</span><span id="m-seq-pill" class="pill">seq #-</span></div><div class="ov-bot"><span id="m-canvas-caption">Tap any agent node to inspect</span><span id="m-poll-age">polled just now</span></div></section>
 <section id="m-health-banner" class="glass hb healthy"><div class="row-sb"><span id="m-health-title">✓ Brain Healthy · Saving Open</span><span id="m-alert-count" class="pill ok">0 alerts</span></div><div id="m-alert-list" class="col"></div></section>
-<section class="g2" id="velocity-sec">
-<div class="glass vc"><div class="vl"><span>New Memory</span><span class="pill ok">1h</span></div><div id="v-write-val" class="vv" style="color:var(--em)">0/hr</div><div id="v-write-sub" class="sub">24h: 0</div><svg id="svg-write-spark" class="spk" viewBox="0 0 160 28" preserveAspectRatio="none"></svg></div>
-<div class="glass vc"><div class="vl"><span>Recall Velocity</span><span class="pill info">5m/1h</span></div><div id="v-recall-val" class="vv" style="color:var(--cyan)">0/hr</div><div id="v-recall-sub" class="sub">5m: 0</div><svg id="svg-recall-spark" class="spk" viewBox="0 0 160 28" preserveAspectRatio="none"></svg></div>
-<div class="glass vc"><div class="vl"><span>Coherence (24h)</span><span id="v-coh-delta" class="pill ok">24h</span></div><div id="v-coh-val" class="vv" style="color:#6ee7b7">0%</div><div id="v-coh-sub" class="sub">7d: 0% · life: 0%</div><svg id="svg-coh-spark" class="spk" viewBox="0 0 160 28" preserveAspectRatio="none"></svg></div>
-<div class="glass vc"><div class="vl"><span>Synaptic Eff (24h)</span><span id="v-eff-delta" class="pill violet">24h</span></div><div id="v-eff-val" class="vv" style="color:var(--vio)">0%</div><div id="v-eff-sub" class="sub">7d: 0% · life: 0%</div><svg id="svg-eff-spark" class="spk" viewBox="0 0 160 28" preserveAspectRatio="none"></svg></div>
-</section>
+<section class="g2" id="velocity-sec"><div class="glass vc"><div class="vl"><span>New Memory</span><span class="pill ok">1h</span></div><div id="v-write-val" class="vv" style="color:var(--em)">0/hr</div><div id="v-write-sub" class="sub">24h: 0</div><svg id="svg-write-spark" class="spk" viewBox="0 0 160 28" preserveAspectRatio="none"></svg></div><div class="glass vc"><div class="vl"><span>Recall Velocity</span><span class="pill info">5m/1h</span></div><div id="v-recall-val" class="vv" style="color:var(--cyan)">0/hr</div><div id="v-recall-sub" class="sub">5m: 0</div><svg id="svg-recall-spark" class="spk" viewBox="0 0 160 28" preserveAspectRatio="none"></svg></div><div class="glass vc"><div class="vl"><span>Coherence (24h)</span><span id="v-coh-delta" class="pill ok">24h</span></div><div id="v-coh-val" class="vv" style="color:#6ee7b7">0%</div><div id="v-coh-sub" class="sub">7d: 0% · life: 0%</div><svg id="svg-coh-spark" class="spk" viewBox="0 0 160 28" preserveAspectRatio="none"></svg></div><div class="glass vc"><div class="vl"><span>Synaptic Eff (24h)</span><span id="v-eff-delta" class="pill violet">24h</span></div><div id="v-eff-val" class="vv" style="color:var(--vio)">0%</div><div id="v-eff-sub" class="sub">7d: 0% · life: 0%</div><svg id="svg-eff-spark" class="spk" viewBox="0 0 160 28" preserveAspectRatio="none"></svg></div></section>
 <section class="glass sc"><div class="row-sb"><h2 class="st" style="color:var(--cyan)">⚡ Synaptic Velocity &amp; Flow</h2><span class="pill info">12h / 60m</span></div><div class="g3"><div class="stat-box"><b>Writes (1h/6h)</b><strong id="f-writes-1h6h" style="color:var(--em)">0 / 0</strong><small id="f-writes-24h">24h: 0</small></div><div class="stat-box"><b>Recalls (5m/1h)</b><strong id="f-recalls-5m1h" style="color:var(--cyan)">0 / 0</strong><small id="f-recalls-wq">0 wakes</small></div><div class="stat-box"><b>Recall Reach</b><strong id="f-coverage" style="color:#93c5fd">0%</strong><small id="f-hit-rate">hit: 0%</small></div></div><div class="col" id="m-pulse-list"></div></section>
-<section class="glass sc" id="health-sec">
-<div class="row-sb"><h2 class="st" style="color:#6ee7b7">🧭 Rolling 24h / 7d Trends &amp; Daily Signals</h2><span id="m-drift-pill" class="pill ok">aligned</span></div>
-<div class="row-sb"><div class="frow" id="w-filter-row"><button class="f-btn active" type="button" data-win="7d">7d by Date</button><button class="f-btn" type="button" data-win="24h">24h Rolling</button></div><span id="m-life-pill" class="pill" style="font-size:9.5px;color:var(--mut)">life: coh 0% · eff 0%</span></div>
-<svg id="svg-date-trends" viewBox="0 0 360 112" style="width:100%;height:112px;display:block;background:rgba(2,6,23,.72);border:1px solid rgba(100,138,205,.2);border-radius:11px"></svg>
-<div class="g2"><div class="stat-box"><b>New Claims / Day</b><strong id="s-claims-day" style="color:var(--em)">0</strong><small id="s-claims-sub">7d avg: 0/d</small></div><div class="stat-box"><b>Recall Hits / Day</b><strong id="s-recalls-day" style="color:var(--cyan)">0</strong><small id="s-recalls-sub">7d avg: 0/d</small></div><div class="stat-box"><b>Conflicts (Raised / Resolved)</b><strong id="s-conflicts-day" style="color:var(--gold)">0 / 0</strong><small id="s-conflicts-sub">7d: 0↑ / 0✓</small></div><div class="stat-box"><b>Writers Active / Day</b><strong id="s-writers-day" style="color:var(--vio)">0</strong><small id="s-writers-sub">7d: 0 unique</small></div></div>
-<div class="g2"><div class="stat-box"><b>Window Coherence</b><strong id="c-core-score" style="color:#6ee7b7">0%</strong><small id="c-grounded">0 grounded</small></div><div class="stat-box"><b>Window Synaptic Eff</b><strong id="e-compress" style="color:var(--vio)">0%</strong><small id="e-durable">0 durable</small></div></div>
-<div class="col" id="m-coh-axes"></div><div class="col" id="m-eff-axes"></div><div class="col" id="m-daily-trends-list"></div>
-</section>
+<section class="glass sc" id="health-sec"><div class="row-sb"><h2 class="st" style="color:#6ee7b7">🧭 Rolling 24h / 7d Trends &amp; Daily Signals</h2><span id="m-drift-pill" class="pill ok">aligned</span></div><div class="row-sb"><div class="frow" id="w-filter-row"><button class="f-btn active" type="button" data-win="7d">7d by Date</button><button class="f-btn" type="button" data-win="24h">24h Rolling</button></div><span id="m-life-pill" class="pill" style="font-size:9.5px;color:var(--mut)">life: coh 0% · eff 0%</span></div><svg id="svg-date-trends" viewBox="0 0 360 112" style="width:100%;height:112px;display:block;background:rgba(2,6,23,.72);border:1px solid rgba(100,138,205,.2);border-radius:11px"></svg><div class="g2"><div class="stat-box"><b>New Claims / Day</b><strong id="s-claims-day" style="color:var(--em)">0</strong><small id="s-claims-sub">7d avg: 0/d</small></div><div class="stat-box"><b>Recall Hits / Day</b><strong id="s-recalls-day" style="color:var(--cyan)">0</strong><small id="s-recalls-sub">7d avg: 0/d</small></div><div class="stat-box"><b>Conflicts (Raised / Resolved)</b><strong id="s-conflicts-day" style="color:var(--gold)">0 / 0</strong><small id="s-conflicts-sub">7d: 0↑ / 0✓</small></div><div class="stat-box"><b>Writers Active / Day</b><strong id="s-writers-day" style="color:var(--vio)">0</strong><small id="s-writers-sub">7d: 0 unique</small></div></div><div class="g2"><div class="stat-box"><b>Window Coherence</b><strong id="c-core-score" style="color:#6ee7b7">0%</strong><small id="c-grounded">0 grounded</small></div><div class="stat-box"><b>Window Synaptic Eff</b><strong id="e-compress" style="color:var(--vio)">0%</strong><small id="e-durable">0 durable</small></div></div><div class="col" id="m-coh-axes"></div><div class="col" id="m-eff-axes"></div><div class="col" id="m-daily-trends-list"></div></section>
 <section class="glass sc" id="backup-sec"><div class="row-sb"><h2 class="st" style="color:var(--gold)">🛡️ Backup State &amp; Write Fence</h2><span id="b-status-pill" class="pill ok">VERIFIED</span></div><div class="g3"><div class="stat-box"><b>Backup Age</b><strong id="b-age-val">-</strong><small>fence 60m</small></div><div class="stat-box"><b>Unbacked</b><strong id="b-unbacked-val">0</strong><small id="b-seq-sub">seq #-</small></div><div class="stat-box"><b>Saving Gate</b><strong id="b-saving-val" style="color:var(--ok)">OPEN</strong><small id="b-fenced-sub">0 fenced</small></div></div><div class="ax"><div class="row-sb"><span>Backup Window Freshness</span><span id="b-fresh-pct">100%</span></div><div class="bt"><div id="b-fresh-bar" class="bf" style="width:100%;background:#22c55e"></div></div></div><div class="stat-box"><b>Last Verified Backup Receipt</b><strong id="b-receipt-main" style="font-size:12px;color:#fde68a">receipt seq #-</strong><small id="b-receipt-sub">snapshot: -</small></div></section>
 <section class="glass sc" id="dream-sec"><div class="row-sb"><h2 class="st" style="color:var(--vio)">🌙 Merkle Dream &amp; Curator</h2><span id="d-mode-pill" class="pill violet">OBSERVED</span></div><div class="g3"><div class="stat-box"><b>Last Dream</b><strong id="d-last-val">-</strong><small id="d-last-seq">seq #-</small></div><div class="stat-box"><b>Syntheses</b><strong id="d-merkle-val" style="color:var(--vio)">0</strong><small id="d-folded-sub">0 folded</small></div><div class="stat-box"><b>Wake Savings</b><strong id="d-savings-val" style="color:var(--em)">0%</strong><small id="d-planned-sub">0 planned</small></div></div><div class="col" id="d-trigger-bars"></div><div class="col" id="d-ledger-list"></div></section>
 <section class="glass sc" id="agents-sec"><div class="row-sb"><h2 class="st" style="color:#93c5fd">🐝 Per-Agent Usage Status</h2><span id="a-summary-pill" class="pill info">0 active</span></div><div class="frow" id="a-filter-row"><button class="f-btn active" type="button" data-filter="all">All Seats</button><button class="f-btn" type="button" data-filter="active">Active / Warm</button><button class="f-btn" type="button" data-filter="writers">Writers</button><button class="f-btn" type="button" data-filter="alerts">Drift / Fenced</button></div><div class="col" id="m-agent-list"></div></section>
@@ -8770,7 +9633,7 @@ b.innerHTML=rs.map(function(r){var p=Math.max(0,Math.min(100,Math.round(Number(r
 var cur=null,aF='all',wM='7d',sAg=null;
 function dTr(tr){
 var g=el('svg-date-trends');if(!g||!tr)return;
-var pts=wM==='24h'?(tr.hourly_24h_series||[]):(tr.daily_series||[]);if(!pts.length)return;
+var pts=(wM==='24h'&&tr.hourly_24h_series&&tr.hourly_24h_series.length)?tr.hourly_24h_series:(tr.daily_series||[]);if(!pts.length)return;
 var w=360,px=28,pw=w-40,ph=72,n=pts.length;
 var xO=function(i){return(px+(n<=1?pw/2:(i/(n-1))*pw)).toFixed(1);},yO=function(v){return(92-(Math.max(0,Math.min(100,Number(v)||0))/100)*ph).toFixed(1);};
 var gr=[25,50,75,100].map(function(l){var y=yO(l);return '<line x1="'+px+'" y1="'+y+'" x2="350" y2="'+y+'" stroke="rgba(148,163,184,.16)"/><text x="4" y="'+(Number(y)+3)+'" fill="#94a3b8" font-size="8.5" font-family="monospace">'+l+'%</text>';}).join('');
@@ -8876,7 +9739,7 @@ es.onmessage=function(e){try{rMob(JSON.parse(e.data));}catch(_){}};
 es.onerror=function(){txt('m-sse-pill','POLL');cls('m-sse-pill','pill warn');};
 }
 })();
-</script></body></html>`
+</script></body></html>`.replace(/\n+/g, '')
 }
 
 export function removeSseClient(clientMap, res) {
@@ -9054,7 +9917,62 @@ export async function startMemoryViewer({
   let cachedMobileState = null
   let lastBroadcastKey = null
   let currentCorpusKey = null
+  let currentCorpusEpoch = 0
+  let currentAclDigest = ''
   let lastKeepaliveAtMs = 0
+  const corpusHistory = []
+
+  function createCorpusSnapshot(state, corpusKey, aclSig, aclDigest, corpusEpoch, historyComplete, byEventId) {
+    const records = Array.isArray(state.records) ? state.records : []
+    const byEventMap = new Map()
+    const byFactKey = new Map()
+    for (const r of records) {
+      if (!r || typeof r !== 'object') continue
+      if (r.event_id) byEventMap.set(r.event_id, r)
+      if (r.author_pubkey && r.d) byFactKey.set(`${r.author_pubkey}:${r.d}`, r)
+    }
+    return {
+      corpusKey,
+      corpusDigest: state.corpus_digest || '',
+      writeSeq: state.store_state?.write_seq ?? null,
+      currentClaims: state.store_state?.current_claims ?? null,
+      connected: Boolean(state.connected),
+      storeReady: state.store_state?.state === 'READY',
+      aclSig: aclSig || '',
+      aclDigest: aclDigest || '',
+      corpusEpoch: corpusEpoch ?? 0,
+      historyComplete: Boolean(historyComplete),
+      allHistoryEventIds: byEventId instanceof Map ? new Set(byEventId.keys()) : new Set(byEventMap.keys()),
+      records,
+      byEventMap,
+      byFactKey,
+      consolidatedSources: state.consolidated_sources || {},
+      topicPages: compactTopicPagesForClient(state.topic_pages || {}),
+      constellationLinks: Array.isArray(state.constellation_links) ? state.constellation_links : [],
+      entityGraphStats: state.entity_graph_stats || { total_edges: 0, link_count: 0, top_entities: [] },
+    }
+  }
+
+  function isIncrementalWriteTransition(prevSnap, currSnap) {
+    if (!prevSnap || !currSnap) return false
+    if (!prevSnap.connected || !currSnap.connected) return false
+    if (!prevSnap.storeReady || !currSnap.storeReady) return false
+    if (prevSnap.records.length === 0) return false
+    if (prevSnap.aclSig !== currSnap.aclSig) return false
+    if (!Number.isSafeInteger(prevSnap.writeSeq) || !Number.isSafeInteger(currSnap.writeSeq)) return false
+    const seqDiff = currSnap.writeSeq - prevSnap.writeSeq
+    if (seqDiff <= 0 || seqDiff > MAX_CORPUS_HISTORY) return false
+    if (!prevSnap.historyComplete || !currSnap.historyComplete) return false
+    for (const oldId of prevSnap.allHistoryEventIds) {
+      if (!currSnap.allHistoryEventIds.has(oldId)) return false
+    }
+    let addedHistoryCount = 0
+    for (const newId of currSnap.allHistoryEventIds) {
+      if (!prevSnap.allHistoryEventIds.has(newId)) addedHistoryCount += 1
+    }
+    if (addedHistoryCount > seqDiff) return false
+    return true
+  }
 
   function currentMobileSnapshot() {
     if (cachedMobileState && cachedMobilePollSeq === (currentState.poll_seq ?? 0)) {
@@ -9114,22 +10032,43 @@ export async function startMemoryViewer({
     lastKeepaliveAtMs = nowMs
     if (sseClients.size > 0) {
       let fullPayload = null
-      let deltaPayload = null
+      let unchangedPayload = null
+      const deltaPayloadsByFromKey = new Map()
+      const toSnap =
+        corpusHistory.length > 0 && corpusHistory[corpusHistory.length - 1].corpusKey === currentCorpusKey
+          ? corpusHistory[corpusHistory.length - 1]
+          : null
       for (const [res, entry] of sseClients) {
-        const needsFull =
-          entry.sentCorpusKey !== currentCorpusKey ||
-          (entry.pendingPayload !== null && entry.pendingCorpusKey !== currentCorpusKey)
-        if (needsFull) {
-          if (fullPayload === null) {
-            fullPayload = `data: ${JSON.stringify(buildClientViewerState(currentState, { includeCorpus: true }))}\n\n`
+        const corpusUnchangedForClient =
+          entry.sentCorpusKey === currentCorpusKey &&
+          (entry.pendingPayload === null || entry.pendingCorpusKey === currentCorpusKey)
+        if (corpusUnchangedForClient) {
+          if (unchangedPayload === null) {
+            unchangedPayload = `data: ${JSON.stringify(buildClientViewerState(currentState, { includeCorpus: false }))}\n\n`
           }
-          writeToSseClient(sseClients, res, fullPayload, { corpusKey: currentCorpusKey })
-        } else {
-          if (deltaPayload === null) {
-            deltaPayload = `data: ${JSON.stringify(buildClientViewerState(currentState, { includeCorpus: false }))}\n\n`
-          }
-          writeToSseClient(sseClients, res, deltaPayload, { corpusKey: currentCorpusKey })
+          writeToSseClient(sseClients, res, unchangedPayload, { corpusKey: currentCorpusKey })
+          continue
         }
+        const fromSnap =
+          toSnap && entry.sentCorpusKey !== null && entry.pendingPayload === null
+            ? corpusHistory.find(
+                s => s.corpusKey === entry.sentCorpusKey && s.aclSig === toSnap.aclSig && s.writeSeq < toSnap.writeSeq
+              )
+            : null
+        if (fromSnap) {
+          let deltaFrame = deltaPayloadsByFromKey.get(fromSnap.corpusKey)
+          if (!deltaFrame) {
+            const corpusDelta = buildCorpusDelta(fromSnap, toSnap)
+            deltaFrame = `data: ${JSON.stringify(buildClientViewerState(currentState, { includeCorpus: false, corpusDelta }))}\n\n`
+            deltaPayloadsByFromKey.set(fromSnap.corpusKey, deltaFrame)
+          }
+          writeToSseClient(sseClients, res, deltaFrame, { corpusKey: currentCorpusKey })
+          continue
+        }
+        if (fullPayload === null) {
+          fullPayload = `data: ${JSON.stringify(buildClientViewerState(currentState, { includeCorpus: true }))}\n\n`
+        }
+        writeToSseClient(sseClients, res, fullPayload, { corpusKey: currentCorpusKey })
       }
     }
     if (mobileSseClients.size > 0) {
@@ -9153,10 +10092,13 @@ export async function startMemoryViewer({
       const wakeReader = String(wake?.reader || '')
       const wakeReaderPubkey = String(wake?.reader_pubkey || '')
       const wakeConnGen = typeof client.getConnectionGeneration === 'function' ? client.getConnectionGeneration() : 0
+      const wakeBindingSig = typeof wake?.activity_ring?.binding_sig === 'string' ? wake.activity_ring.binding_sig : ''
+      const wakeAclSig = JSON.stringify([wakeReader, wakeReaderPubkey, wakeConnGen, wakeBindingSig])
       const wakeScopeSig = JSON.stringify([
         wakeReader,
         wakeReaderPubkey,
         wakeConnGen,
+        wakeBindingSig,
         wake?.counts || null,
         wake?.topic_directory || null,
         Array.isArray(wake?.records) ? wake.records.map(r => `${r?.event_id || ''}:${r?.scope || ''}:${r?.d || ''}`) : null,
@@ -9205,7 +10147,7 @@ export async function startMemoryViewer({
         firstQuery = null
         let cursor = '0'
         let pages = 0
-        while (cursor !== null && pages < 50) {
+        while (cursor !== null && pages < 100) {
           const page = await client.callReadTool('memory_query', {
             limit: 100,
             format: 'full',
@@ -9274,6 +10216,7 @@ export async function startMemoryViewer({
           reader: wakeReader,
           readerPubkey: wakeReaderPubkey,
           connGen: wakeConnGen,
+          aclSig: wakeAclSig,
           scopeSig: wakeScopeSig,
           recordIdsSig,
           atMs: nowMs,
@@ -9575,12 +10518,44 @@ export async function startMemoryViewer({
       eventLog.push(d)
       if (eventLog.length > MAX_EVENT_LOG) eventLog.shift()
     }
-    const nextCorpusKey = computeCorpusBroadcastKey( nextSnapshot )
+    const nextCorpusKey = computeCorpusBroadcastKey(nextSnapshot)
     const nextCorpusDigest = hashCorpusKeyHex(nextCorpusKey)
+    const nextAclDigest = cachedCorpus?.aclSig ? hashCorpusKeyHex(cachedCorpus.aclSig) : ''
+    currentAclDigest = nextAclDigest
     currentState = {
       ...nextSnapshot,
       corpus_digest: nextCorpusDigest,
+      acl_digest: nextAclDigest,
+      corpus_epoch: currentCorpusEpoch,
       event_log: [...eventLog],
+    }
+    if (nextCorpusKey !== currentCorpusKey) {
+      if (!currentState.connected || currentState.store_state?.state !== 'READY') {
+        corpusHistory.length = 0
+        currentCorpusEpoch += 1
+        currentState.corpus_epoch = currentCorpusEpoch
+      } else {
+        const prevSnap = corpusHistory.length > 0 ? corpusHistory[corpusHistory.length - 1] : null
+        const tempSnap = createCorpusSnapshot(
+          currentState,
+          nextCorpusKey,
+          cachedCorpus?.aclSig || '',
+          nextAclDigest,
+          currentCorpusEpoch,
+          cachedCorpus?.historyComplete,
+          cachedCorpus?.byEventId
+        )
+        if (!prevSnap || !isIncrementalWriteTransition(prevSnap, tempSnap)) {
+          corpusHistory.length = 0
+          currentCorpusEpoch += 1
+          tempSnap.corpusEpoch = currentCorpusEpoch
+          currentState.corpus_epoch = currentCorpusEpoch
+        }
+        corpusHistory.push(tempSnap)
+        while (corpusHistory.length > MAX_CORPUS_HISTORY) {
+          corpusHistory.shift()
+        }
+      }
     }
     const nextBroadcastKey = computeBroadcastKey(currentState, nextCorpusKey)
     const changed = nextBroadcastKey !== lastBroadcastKey || diffs.length > 0
@@ -9678,11 +10653,135 @@ export async function startMemoryViewer({
         Boolean(currentState.corpus_digest) &&
         sinceDigest !== null &&
         sinceDigest === String(currentState.corpus_digest)
-      registerSseClient(sseClients, req, res, clientHasCorpus ? currentCorpusKey : null)
-      const initialClientState = buildClientViewerState(currentState, { includeCorpus: !clientHasCorpus })
+      let reconnectDelta = null
+      if (!clientHasCorpus && Boolean(currentState.connected) && sinceSeq !== null && sinceDigest !== null && corpusHistory.length >= 2) {
+        const toSnap = corpusHistory[corpusHistory.length - 1]
+        if (toSnap && toSnap.corpusKey === currentCorpusKey) {
+          const fromSnap = corpusHistory.find(
+            s =>
+              String(s.writeSeq ?? '') === sinceSeq &&
+              s.corpusDigest === sinceDigest &&
+              (sinceClaims === null || String(s.currentClaims ?? '') === sinceClaims) &&
+              s.aclSig === toSnap.aclSig &&
+              s.writeSeq < toSnap.writeSeq
+          )
+          if (fromSnap) {
+            reconnectDelta = buildCorpusDelta(fromSnap, toSnap)
+          }
+        }
+      }
+      registerSseClient(sseClients, req, res, clientHasCorpus || reconnectDelta ? currentCorpusKey : null)
+      const initialClientState = reconnectDelta
+        ? buildClientViewerState(currentState, { includeCorpus: false, corpusDelta: reconnectDelta })
+        : buildClientViewerState(currentState, { includeCorpus: !clientHasCorpus })
       writeToSseClient(sseClients, res, `data: ${JSON.stringify(initialClientState)}\n\n`, {
         corpusKey: currentCorpusKey,
       })
+      return
+    }
+
+    if (urlPath === '/api/records' || urlPath === '/records.json') {
+      const parseParam = key => {
+        const re = new RegExp(`(?:^|&)${key}=([^&]*)`)
+        const m = re.exec(queryStr)
+        if (!m) return null
+        return decodeURIComponent(m[1].replace(/\+/g, ' '))
+      }
+      let topicParam = null
+      let scopeParam = null
+      let qParam = null
+      let offsetParam = null
+      let limitParam = null
+      let includeCorpusParam = null
+      try {
+        topicParam = parseParam('topic')
+        scopeParam = parseParam('scope')
+        qParam = parseParam('q')
+        offsetParam = parseParam('offset')
+        limitParam = parseParam('limit')
+        includeCorpusParam = parseParam('include_corpus')
+      } catch {
+        const badBody = 'Bad Request: malformed query parameter encoding\n'
+        res.writeHead(400, {
+          ...securityHeaders,
+          'Content-Type': 'text/plain; charset=utf-8',
+          'Content-Length': Buffer.byteLength(badBody),
+        })
+        res.end(method === 'HEAD' ? undefined : badBody)
+        return
+      }
+      const allRecords = Array.isArray(currentState.records) ? currentState.records : []
+      let filtered = allRecords
+      if (topicParam && topicParam.trim()) {
+        const wantTopic = topicParam.trim().replace(/^#/, '').toLowerCase()
+        filtered = filtered.filter(r => String(r?.topic || 'general').toLowerCase() === wantTopic)
+      }
+      if (scopeParam && scopeParam.trim()) {
+        const wantScope = scopeParam.trim().toLowerCase()
+        filtered = filtered.filter(r => String(r?.scope || '').toLowerCase() === wantScope)
+      }
+      if (qParam && qParam.trim()) {
+        const q = qParam.trim().toLowerCase()
+        const qClean = q.replace(/^(?:pr:|issue:|file:|agent:|#)/, '')
+        filtered = filtered.filter(r => {
+          const hay = `${r?.d || ''} ${r?.topic || ''} ${r?.scope || ''} ${r?.claim || ''} ${r?.because || ''} ${r?.as_of_git || ''} ${Array.isArray(r?.evidence) ? r.evidence.join(' ') : ''}`.toLowerCase()
+          return hay.includes(q) || (qClean && hay.includes(qClean))
+        })
+      }
+      const includeFullCorpus = includeCorpusParam === '1' || includeCorpusParam === 'true'
+      const rawOffset = offsetParam !== null && /^[0-9]+$/.test(offsetParam) ? Number(offsetParam) : 0
+      const defaultLimit = includeFullCorpus ? Math.max(100, filtered.length) : 100
+      const maxLimit = includeFullCorpus ? Math.max(5000, filtered.length) : 500
+      const rawLimit =
+        limitParam !== null && /^[0-9]+$/.test(limitParam) && Number(limitParam) > 0
+          ? Math.min(maxLimit, Number(limitParam))
+          : defaultLimit
+      const pageRecords = filtered.slice(rawOffset, rawOffset + rawLimit)
+      const nextOffset = rawOffset + pageRecords.length < filtered.length ? rawOffset + pageRecords.length : null
+      const pageSources = {}
+      for (const r of pageRecords) {
+        if (Array.isArray(r?.supersedes)) {
+          for (const sid of r.supersedes) {
+            if (currentState.consolidated_sources?.[sid]) {
+              pageSources[sid] = currentState.consolidated_sources[sid]
+            }
+          }
+        }
+      }
+      const payload = {
+        authority: null,
+        trustedInstruction: false,
+        connected: Boolean(currentState.connected),
+        reader: currentState.reader || 'viewer',
+        polled_at: currentState.polled_at,
+        poll_seq: currentState.poll_seq,
+        store_state: currentState.store_state,
+        corpus_digest: currentState.corpus_digest || null,
+        acl_digest: currentState.acl_digest || null,
+        corpus_epoch: currentState.corpus_epoch ?? null,
+        total_records: allRecords.length,
+        total_matched: filtered.length,
+        offset: rawOffset,
+        limit: rawLimit,
+        returned: pageRecords.length,
+        next_offset: nextOffset,
+        records: pageRecords,
+        consolidated_sources: includeFullCorpus ? currentState.consolidated_sources || {} : pageSources,
+        ...(includeFullCorpus
+          ? {
+              constellation_links: currentState.constellation_links || [],
+              entity_graph_stats: currentState.entity_graph_stats || { total_edges: 0, link_count: 0, top_entities: [] },
+              topic_pages: compactTopicPagesForClient(currentState.topic_pages || {}),
+            }
+          : {}),
+      }
+      const body = JSON.stringify(payload) + '\n'
+      res.writeHead(200, {
+        ...securityHeaders,
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Length': Buffer.byteLength(body),
+      })
+      res.end(method === 'HEAD' ? undefined : body)
       return
     }
 
