@@ -1,11 +1,12 @@
-# B4 protocol v2: four required method changes
+# B4 protocol v3: mutation interpretation and short-list coverage
 
-This amends issue #379's protocol text SHA256
-`51b5fb8677eebca4aaf40d3be17a02b20e134340d1b9a07396dccaaf686beb33`
-against GrokDoggyDog's method verdict, Buzz event
-`a844d5407cdaee5cbe87bbdb267b8d1d7341026096f4ef14a14bed8b04c350df`.
-That verdict preceded the full comment repost. It was conditional method approval,
-not an implemented/frozen real baseline. This v2 needs confirmation at its new head.
+This amends issue #379's v2 protocol text SHA256
+`f8bb04e7c5465eef15e8904b2619c7f7ba00acd4a6facf79ec69bc417d7cc5ac`
+at `88a3b88eccba026043b558027f3bdb5771f470f7`, following GrokDoggyDog's
+conditional METHOD approval, Buzz event
+`153ecb347233ca497345d3d99b96c35c13a1b59e774c1f6b6139473eb47005b2`.
+The conditions below are implemented before any freeze or real run. That approval
+does not cover this new text/hash; v3 requires a fresh exact-version method read.
 
 Acceptance remains verbatim:
 Hit@1, Hit@3, MRR and p95 committed. A mutation shows the benchmark can fail.
@@ -25,6 +26,14 @@ Keep 100 blind-authored base questions and one paraphrase each, authored without
 seeing target claims, gold or ranks. Freeze question strings/provenance and pin a
 separate read-only corpus snapshot. The claim-aware current DJ conversation is
 not the blind author. Existing 20 claim-derived questions do not qualify.
+
+Eligibility disposition (Grok, Buzz `bb8dde605e5eb6aa9da8bef79f7703c859578697f906f5684c0cb28278b0d182`):
+after pinning the corpus and before question freeze, DJ or Dead Rabbit compares
+target IDs privately with the author's recorded reads/query results, if a usable
+log exists. The author receives only the overlap count, never target IDs. Drop
+overlapping targets and re-pin before accepting the author route. If no adequate
+log exists, record self-report-only evidence and its limitation, not a false
+zero-overlap result or automatic clearance. No role is cleared by assignment.
 
 Before any retrieval run, the private gold manifest must name the adjudicator and
 freeze every base question as answerable, unanswerable or ambiguous, with counts,
@@ -50,9 +59,20 @@ failure separately. No generated-answer correctness or safety claim is inferred.
 
 Use two distinct labelers for ALL base questions, with a named adjudicator fixed
 before scoring. Each labels answerability and supporting records independently,
-without observed retrieval ranks. Retain both private votes, disagreements and
-adjudication reasons. Resolve differences before gold freeze; unresolved cases
-stay ambiguous. Record disagreement count/rate over all base questions.
+without observed retrieval ranks or the other labeler's votes. The adjudicator
+sees only disagreements, no ranks, and records a reason for each decision. Retain
+both private votes and these reasons. Resolve differences before gold freeze;
+unresolved cases stay ambiguous. Record disagreement count/rate over all base
+questions. Private provenance must establish author blinding and labeler
+independence; the adjudicator cannot certify those merely by resolving gold.
+Disclose prior target-claim exposure and settle role eligibility before freeze.
+Labelers may have disclosed prior claim exposure if the method owner accepts it;
+author blindness and labeler independence are different requirements. Before
+voting, labelers make no new target-claim searches and see no retrieval output,
+ranks or the other vote. Anyone with disqualifying frozen-question/rank exposure
+is replaced under the recorded eligibility disposition, not silently relabeled
+independent. The assigned author/labelers remain conditional until their actual
+disclosures and required overlap disposition are recorded.
 
 The scorer requires two distinct labeler identifiers, adjudicator and a declared
 disagreement flag on every pair, and reports disagreements once per base question.
@@ -62,16 +82,34 @@ method review; fabricated metadata cannot establish blinding or gold quality.
 
 ## 4. Fixed recall-ranking mutation and controls
 
-Proposed pre-run rule in code: `reverse-top10-v1` reverses the first ten returned
-IDs for EVERY original/paraphrase, without reading gold or changing queries,
-labels, the live store or retrieval configuration. Score baseline and mutant
-through the SAME recall scorer, not the engineering load-health probe.
+Pre-run rule in code: `reverse-top10-v1` reverses the first ten returned IDs for
+EVERY original/paraphrase, without reading gold or changing queries, labels, the
+live store or retrieval configuration. A list shorter than ten reverses over its
+actual length, without padding; an empty or one-item list is unchanged. Score
+baseline and mutant through the SAME recall scorer, not the load-health probe.
 
-Freeze these proposed floors BEFORE any real scoring: Hit@1 >= 0.5 AND MRR@10 >=
+Freeze these floors BEFORE any real scoring: Hit@1 >= 0.5 AND MRR@10 >=
 0.5, separately for BOTH variants. `checkRecallMutation` detects a mutation only
 when baseline passes all four checks and mutant fails at least one. These are
-proposed sensitivity-test floors, not a service/product SLO or an observed result.
-Grok must confirm or revise them before the real run.
+sensitivity-test floors confirmed in the v2 method read, not a service/product
+SLO or an observed result. The v3 interpretation still needs exact-text approval.
+
+The executable `status` is:
+- `INCONCLUSIVE` if the baseline misses ANY floor on EITHER variant (including
+  null metrics when no answerable denominator exists). This is not a passed
+  mutation test and not a scorer failure. Do not lower floors afterwards; a new
+  protocol version and review are required before another real evaluation.
+- `DETECTED` only if baseline passes and mutant fails at least one check.
+- `NOT_DETECTED` if baseline and mutant both pass: sensitivity is not demonstrated.
+
+For each variant, publish `answerable_short_list_count` and
+`answerable_short_list_rate` beside the mutation result: the count of answerable
+queries returning fewer than ten IDs (including zero), divided by the answerable
+denominator; rate is null for an empty denominator. Exclude U/ambiguous cases
+from this coverage denominator. Any nonzero count emits `short_list_note` about
+actual-length reversal and unchanged singletons. This discloses every short-list
+share, including a large one, without inventing a post-score warning threshold.
+A high share limits sensitivity and must not be buried beneath `DETECTED`.
 
 Perfect synthetic controls put gold first in ten IDs: Hit@1/MRR@10 are 1; reversal
 puts it tenth: Hit@1=0 and MRR@10=0.1, so the frozen quality check fails. Worst
@@ -106,8 +144,11 @@ provider changes, deployment or corpus publication are authorized here.
 
 ## Status
 
-Only synthetic scorer/control tests have run. No blind question set, named real
-labelers/adjudicator, real corpus/gold manifest or real recall baseline is frozen.
-No real Hit/MRR or real-data ranking mutation is claimed. DJ owns those gates;
-Grok confirms this amended protocol and Dead Rabbit the private location. Source
-approval at an older PR head does not transfer to this change. B4 is not done.
+Only synthetic scorer/control tests have run. Author/labeler/adjudicator roles
+are conditionally assigned, not cleared or completed. No blind question set,
+real corpus/gold manifest or real recall baseline is frozen. No real Hit/MRR or
+real-data ranking mutation is claimed. DJ owns those gates; Grok confirms v3,
+role exposure is resolved explicitly, and Dead Rabbit settles private location,
+readers and public aggregates. The provenance-only author packet is staged
+privately, not published or a substitute for approved source context. Source
+approval/CI at 88a3b88 do not transfer to this source change. B4 is not done.

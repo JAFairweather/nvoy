@@ -1,6 +1,6 @@
 // Pure B4 recall scoring. No corpus, network, file IO or production-store mutation.
 export const RECALL_CUTOFF = 10
-// Proposed v2 floors, fixed before any real-corpus run; method re-review still required.
+// Sensitivity floors confirmed for v2; amendments still require exact-version method review.
 export const QUALITY_FLOORS = Object.freeze({ hit_at_1: 0.5, mrr_at_10: 0.5 })
 export function checkRecallMutation(cases, options) {
   const baseline = scoreRecall(cases, options)
@@ -9,7 +9,11 @@ export function checkRecallMutation(cases, options) {
   const passes = report => ['original', 'paraphrase'].every(variant =>
     Object.entries(QUALITY_FLOORS).every(([key, floor]) => typeof report[variant][key] === 'number' && report[variant][key] >= floor))
   const baseline_passes = passes(baseline), mutant_passes = passes(mutant)
-  return { mutation: 'reverse-top10-v1', floors: QUALITY_FLOORS, baseline, mutant, baseline_passes, mutant_passes, detected: baseline_passes && !mutant_passes }
+  const status = !baseline_passes ? 'INCONCLUSIVE' : mutant_passes ? 'NOT_DETECTED' : 'DETECTED'
+  const short_list_note = ['original', 'paraphrase'].some(variant => baseline[variant].answerable_short_list_count > 0)
+    ? 'Short lists reverse over their actual length; singleton lists are unchanged. Report the per-variant answerable short-list counts and rates beside this mutation result.'
+    : null
+  return { mutation: 'reverse-top10-v1', floors: QUALITY_FLOORS, baseline, mutant, baseline_passes, mutant_passes, status, short_list_note, detected: status === 'DETECTED' }
 }
 export function scoreRecall(cases, { expectedQuestions = 100 } = {}) {
   if (!Array.isArray(cases) || !Number.isSafeInteger(expectedQuestions) || expectedQuestions < 1) throw new Error('invalid cases')
@@ -45,10 +49,13 @@ export function scoreRecall(cases, { expectedQuestions = 100 } = {}) {
     const answerable = rows.filter(row => row.answerability === 'answerable')
     const unanswerable = rows.filter(row => row.answerability === 'unanswerable')
     const scores = answerable.map(row => scoreRanking(row.ranking, row.gold))
+    const shortLists = answerable.filter(row => row.ranking.length < RECALL_CUTOFF).length
     const rate = key => scores.length ? scores.reduce((sum, score) => sum + score[key], 0) / scores.length : null
     return {
       answerable_count: answerable.length, unanswerable_count: unanswerable.length,
       ambiguous_count: rows.filter(row => row.answerability === 'ambiguous').length,
+      answerable_short_list_count: shortLists,
+      answerable_short_list_rate: answerable.length ? shortLists / answerable.length : null,
       hit_at_1: rate('hit_at_1'), hit_at_3: rate('hit_at_3'), mrr_at_10: rate('mrr_at_10'),
       correct_abstain_rate: unanswerable.length ? unanswerable.filter(row => row.abstained).length / unanswerable.length : null,
       false_answer_rate: unanswerable.length ? unanswerable.filter(row => !row.abstained).length / unanswerable.length : null,

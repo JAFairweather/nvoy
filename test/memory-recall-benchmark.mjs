@@ -71,13 +71,68 @@ test('reject malformed opaque identifiers instead of silently repairing them', (
   assert.throws(() => scoreRanking([], ['']), /invalid/)
 })
 
+test('mutation status is INCONCLUSIVE if either baseline variant misses a floor', () => {
+  const full = ['gold', ...Array.from({ length: 9 }, (_, i) => `wrong${i}`)]
+  const rows = ['original', 'paraphrase'].map(v => item('a', v, 'answerable', [...full]))
+  assert.equal(checkRecallMutation(rows, { expectedQuestions: 1 }).status, 'DETECTED')
+  rows[1].ranking = ['wrong', 'gold']
+  const report = checkRecallMutation(rows, { expectedQuestions: 1 })
+  assert.equal(report.baseline_passes, false)
+  assert.equal(report.status, 'INCONCLUSIVE')
+  assert.equal(report.detected, false)
+  rows[1].ranking = [...full]
+  rows[0].ranking = ['wrong', 'gold']
+  assert.equal(checkRecallMutation(rows, { expectedQuestions: 1 }).status, 'INCONCLUSIVE')
+})
+
 test('empty answerable denominator is null, while all questions remain counted', () => {
   const rows = ['original', 'paraphrase'].map(v => item('u', v, 'unanswerable', [], true))
   const result = scoreRecall(rows, { expectedQuestions: 1 })
   assert.equal(result.original.hit_at_1, null)
   assert.equal(result.original.mrr_at_10, null)
   assert.equal(result.original.correct_abstain_rate, 1)
+  assert.equal(result.original.answerable_short_list_count, 0)
+  assert.equal(result.original.answerable_short_list_rate, null)
+  assert.equal(checkRecallMutation(rows, { expectedQuestions: 1 }).status, 'INCONCLUSIVE')
   assert.equal(checkRecallMutation(rows, { expectedQuestions: 1 }).detected, false)
+})
+
+test('baseline equality at both floors passes, with no short-list note for full lists', () => {
+  const full = ['gold', ...Array.from({ length: 9 }, (_, i) => `wrong${i}`)]
+  const rows = ['original', 'paraphrase'].flatMap(v => [
+    item('a', v, 'answerable', [...full]),
+    item('b', v, 'answerable', full.map(id => id === 'gold' ? 'miss' : id)),
+  ])
+  const report = checkRecallMutation(rows, { expectedQuestions: 2 })
+  assert.equal(report.baseline.original.hit_at_1, 0.5)
+  assert.equal(report.baseline.original.mrr_at_10, 0.5)
+  assert.equal(report.baseline_passes, true)
+  assert.equal(report.status, 'DETECTED')
+  assert.equal(report.short_list_note, null)
+})
+
+test('actual-length reversal discloses answerable short lists separately by variant', () => {
+  const full = ['gold', ...Array.from({ length: 9 }, (_, i) => `wrong${i}`)]
+  const rows = ['original', 'paraphrase'].flatMap(v => [
+    item('single', v, 'answerable', ['gold']),
+    item('short', v, 'answerable', v === 'original' ? ['gold', 'wrong', 'other'] : [...full]),
+    item('full', v, 'answerable', [...full]),
+    item('empty', v, 'answerable', [], true),
+    item('u', v, 'unanswerable', [], true),
+    item('m', v, 'ambiguous', ['other']),
+  ])
+  const report = checkRecallMutation(rows, { expectedQuestions: 6 })
+  assert.equal(report.baseline.original.answerable_short_list_count, 3)
+  assert.equal(report.baseline.original.answerable_short_list_rate, 3 / 4)
+  assert.equal(report.baseline.paraphrase.answerable_short_list_count, 2)
+  assert.equal(report.baseline.paraphrase.answerable_short_list_rate, 2 / 4)
+  assert.equal(report.mutant.original.mrr_at_10, (1 + 1 / 3 + 0.1) / 4)
+  assert.match(report.short_list_note, /actual length/)
+  const single = ['original', 'paraphrase'].map(v => item('a', v, 'answerable', ['gold']))
+  const unchanged = checkRecallMutation(single, { expectedQuestions: 1 })
+  assert.equal(unchanged.mutant.original.mrr_at_10, 1)
+  assert.equal(unchanged.status, 'NOT_DETECTED')
+  assert.equal(unchanged.detected, false)
 })
 
 test('missing, duplicated, mismatched and errored cases refuse a complete evaluation', () => {
