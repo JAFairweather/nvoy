@@ -2678,6 +2678,15 @@ await test('nvoy #383 regression: SSE suppresses unchanged polls, sends compact 
     assert.equal(sinceFrames[0].consolidated_sources, undefined, 'compact delta omits consolidated_sources')
     assert.equal(sinceFrames[0].constellation_links, undefined, 'compact delta omits constellation_links')
 
+    // 2b. Malformed percent-encoding in since_seq / since_claims (/events?since_seq=%&since_claims=%) must not throw URIError or crash viewer
+    const malformedFrames = connectSse('/events?since_seq=%&since_claims=%')
+    for (let i = 0; i < 20 && malformedFrames.length < 1; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(malformedFrames.length, 1, 'malformed since_seq=% request stays up and falls back to full corpus frame')
+    assert.equal(malformedFrames[0].corpus_unchanged, false)
+    assert.equal(Array.isArray(malformedFrames[0].records), true)
+
     // 3. Unchanged poll broadcasts ZERO SSE frames to desktop or mobile clients
     nowSec += 3
     await viewer.pollOnce({ forceFull: false })

@@ -9624,8 +9624,8 @@ export async function startMemoryViewer({
       }
       const sinceSeqMatch = /(?:^|&)since_seq=([^&]*)/.exec(queryStr)
       const sinceClaimsMatch = /(?:^|&)since_claims=([^&]*)/.exec(queryStr)
-      const sinceSeq = sinceSeqMatch ? decodeURIComponent(sinceSeqMatch[1]) : null
-      const sinceClaims = sinceClaimsMatch ? decodeURIComponent(sinceClaimsMatch[1]) : null
+      const sinceSeq = sinceSeqMatch && /^[0-9]+$/.test(sinceSeqMatch[1]) ? sinceSeqMatch[1] : null
+      const sinceClaims = sinceClaimsMatch ? (/^[0-9]+$/.test(sinceClaimsMatch[1]) ? sinceClaimsMatch[1] : 'invalid') : null
       const clientHasCorpus =
         Boolean(currentState.connected) &&
         sinceSeq !== null &&
