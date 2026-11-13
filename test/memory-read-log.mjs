@@ -1,7 +1,7 @@
 // Per-seat read log (nvoy #390): one line per reader wake/query/get with the returned fact keys and no text; the viewer is
 // skipped; the file is 0640; retention drops old lines and obeys the size cap; a failing log never fails a read.
 import assert from 'node:assert/strict'
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
@@ -169,6 +169,38 @@ await test('retention: old lines and damaged lines go, new ones stay, mode stays
   assert.throws(() => new ReadLog({ path, retentionDays: 0 }), /retention/)
   assert.throws(() => new ReadLog({ path, maxBytes: 10 }), /size cap/)
   rmSync(tmp, { recursive: true, force: true })
+})
+
+await test('symlinks are never followed: at the log path (refused), and beside it where the old prune named its temp file', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'nvoy-read-log-link-'))
+  const victim = join(tmp, 'victim.txt')
+  writeFileSync(victim, 'DO-NOT-TOUCH\n')
+  try {
+    // a symlink planted at the log path stops the daemon's log from opening at all
+    const planted = join(tmp, 'planted.ndjson')
+    symlinkSync(victim, planted)
+    assert.throws(() => new ReadLog({ path: planted }), /not a regular file/)
+    assert.equal(readFileSync(victim, 'utf8'), 'DO-NOT-TOUCH\n')
+    // a symlink swapped in after start: the append is refused and counted, and the target is untouched
+    const path = join(tmp, 'reads.ndjson')
+    const rl = new ReadLog({ path, retentionDays: 30, now: () => 1_800_000_000, log: () => {} })
+    assert.equal(rl.record({ seat: 'dennis', op: 'wake', keys: ['a'] }), true)
+    rmSync(path)
+    symlinkSync(victim, path)
+    assert.equal(rl.record({ seat: 'dennis', op: 'wake', keys: ['a'] }), false)
+    assert.equal(readFileSync(victim, 'utf8'), 'DO-NOT-TOUCH\n')
+    rmSync(path)
+    // predictable temp names (the old <path>.tmp-<pid>) planted as symlinks are not opened by a rewrite
+    writeFileSync(path, [JSON.stringify({ at: 1, seat: 'x', op: 'wake', n: 0, d: [], truncated: false }), JSON.stringify({ at: 1_800_000_000, seat: 'y', op: 'wake', n: 0, d: [], truncated: false })].join('\n') + '\n')
+    chmodSync(path, 0o640)
+    symlinkSync(victim, `${path}.tmp-${process.pid}`)
+    const rl2 = new ReadLog({ path, retentionDays: 30, now: () => 1_800_000_000, log: () => {} })
+    assert.equal(rl2.failures, 0)
+    assert.deepEqual(lines(path).map(l => l.seat), ['y'], 'the old line was pruned')
+    assert.equal(readFileSync(victim, 'utf8'), 'DO-NOT-TOUCH\n', 'the planted symlink was not followed')
+    assert.equal(statSync(path).mode & 0o777, 0o640, 'the rewrite keeps 0640')
+    assert.deepEqual(readdirSync(tmp).filter(f => f.includes('.tmp-')), [`reads.ndjson.tmp-${process.pid}`], 'no temp file left behind but the planted one')
+  } finally { rmSync(tmp, { recursive: true, force: true }) }
 })
 
 await test('a reply with more records than the key cap is logged truncated, with the true count', async () => {

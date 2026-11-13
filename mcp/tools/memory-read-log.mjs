@@ -15,7 +15,8 @@
 // a day limit plus a size cap, applied at start and then at most once an hour by an atomic rewrite that keeps the mode.
 // A failed append never fails the read: the miss is counted, the first of each run is logged, and `failures` is exposed
 // so a gap in the log is visible instead of silent.
-import { appendFileSync, chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeSync } from 'node:fs'
+import { chmodSync, closeSync, constants, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
 import { dirname } from 'node:path'
 
 export const READ_LOG_MAX_KEYS = 500
@@ -37,9 +38,23 @@ export class ReadLog {
     this.failures = 0
     this.lastPrune = 0
     mkdirSync(dirname(path), { recursive: true, mode: 0o750 })
-    if (!existsSync(path)) closeSync(openSync(path, 'a', 0o640))
+    this.#ensureRegular(true)
     chmodSync(path, 0o640)
     this.prune()
+  }
+
+  // The log must be a plain file this process made or already owns: a symlink (or anything else) planted at the path is refused,
+  // never followed, so the daemon cannot be steered into appending to or truncating another file. `create` makes a missing file.
+  #ensureRegular(create) {
+    let st = null
+    try { st = lstatSync(this.path) } catch (e) { if (e.code !== 'ENOENT') throw e }
+    if (!st) {
+      if (!create) throw new Error('read log file is missing')
+      closeSync(openSync(this.path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o640))
+      return
+    }
+    if (!st.isFile() || st.isSymbolicLink()) throw new Error('read log path is not a regular file')
+    if (typeof process.getuid === 'function' && st.uid !== process.getuid()) throw new Error('read log file is not owned by this service')
   }
 
   // Appends one entry; returns true when written. Never throws.
@@ -49,7 +64,9 @@ export class ReadLog {
       const all = (Array.isArray(keys) ? keys : []).filter(k => typeof k === 'string' && k)
       const at = this.now()
       const entry = { at, seat, op, n: Number.isSafeInteger(count) && count >= all.length ? count : all.length, d: all.slice(0, READ_LOG_MAX_KEYS), truncated: all.length > READ_LOG_MAX_KEYS }
-      appendFileSync(this.path, `${JSON.stringify(entry)}\n`, { mode: 0o640 })
+      this.#ensureRegular(false)
+      const fd = openSync(this.path, constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW)
+      try { writeSync(fd, `${JSON.stringify(entry)}\n`) } finally { closeSync(fd) }
       if (at - this.lastPrune >= PRUNE_EVERY_SEC) this.prune()
       return true
     } catch (e) {
@@ -63,31 +80,38 @@ export class ReadLog {
   prune() {
     const nowSec = this.now()
     this.lastPrune = nowSec
+    let tmp = null
     try {
-      const size = statSync(this.path).size
+      this.#ensureRegular(false)
       const cutoff = nowSec - Math.floor(this.retentionDays * 86400)
-      const raw = size ? readFileSync(this.path, 'utf8') : ''
-      let lines = raw ? raw.split('\n').filter(Boolean) : []
-      const keep = lines.filter(l => {
+      const raw = readFileSync(this.path, 'utf8')
+      const before = raw.split('\n').filter(Boolean)
+      let lines = before.filter(l => {
         try { return Number(JSON.parse(l).at) >= cutoff } catch { return false }   // an unparseable line is damage, not evidence
       })
-      lines = keep
       let bytes = lines.reduce((n, l) => n + Buffer.byteLength(l) + 1, 0)
       if (bytes > this.maxBytes) {
         const target = Math.floor(this.maxBytes * 0.8)
         while (lines.length && bytes > target) bytes -= Buffer.byteLength(lines.shift()) + 1
       }
-      if (lines.length === raw.split('\n').filter(Boolean).length && bytes === Buffer.byteLength(raw)) return false
-      const tmp = `${this.path}.tmp-${process.pid}`
-      const fd = openSync(tmp, 'w', 0o640)
+      if (lines.length === before.length && bytes === Buffer.byteLength(raw)) return false
+      // An unpredictable name made with O_EXCL: an existing file or symlink of any name is never opened, so nothing planted
+      // beside the log can be followed or truncated. The data is synced, renamed over the log, and the directory synced so the
+      // rename itself survives a crash.
+      tmp = `${this.path}.tmp-${process.pid}-${randomBytes(6).toString('hex')}`
+      const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o640)
       try {
         writeSync(fd, lines.length ? `${lines.join('\n')}\n` : '')
         fsyncSync(fd)
       } finally { closeSync(fd) }
       chmodSync(tmp, 0o640)
       renameSync(tmp, this.path)
+      tmp = null
+      const dfd = openSync(dirname(this.path), constants.O_RDONLY)
+      try { fsyncSync(dfd) } finally { closeSync(dfd) }
       return true
     } catch (e) {
+      if (tmp) { try { unlinkSync(tmp) } catch { /* nothing to clean */ } }
       this.failures += 1
       this.log(`hive-memory: read log prune failed (${e.code || e.message}); the log is left as it was`)
       return false
