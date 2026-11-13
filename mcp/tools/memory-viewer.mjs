@@ -7607,6 +7607,9 @@ export function renderViewerHtml(initialState) {
         var stateKey =
           String(s.connected) + ':' +
           String(s.error || '') + ':' +
+          String(s.reader || '') + ':' +
+          String(s.reader_pubkey || '') + ':' +
+          String(s.corpus_digest || '') + ':' +
           String(st.state || '') + ':' +
           String(st.write_seq ?? '') + ':' +
           String(st.current_claims ?? '') + ':' +
@@ -7704,8 +7707,8 @@ export function renderViewerHtml(initialState) {
           String(st.write_seq ?? '') + ':' +
           String(st.current_claims ?? '') + ':' +
           String(latestRecords.length) + ':' +
-          String(latestRecords[0] ? latestRecords[0].event_id : '') + ':' +
-          String(latestRecords.length > 1 ? latestRecords[latestRecords.length - 1].event_id : '');
+          String(s.corpus_digest || '') + ':' +
+          latestRecords.map(function (r) { return r && (r.event_id || (r.author_pubkey + ':' + r.d)); }).join(',');
         var corpusChanged = !graphReady || corpusSig !== lastRenderedCorpusSig;
         if (corpusChanged) {
           renderRecords(latestRecords, nowSec);
@@ -7722,17 +7725,30 @@ export function renderViewerHtml(initialState) {
         graphReady = true;
       }
 
+      var initialCorpusDigest = '';
       resize();
       try {
         var initJson = el('initial-state').textContent;
-        if (initJson) renderState(JSON.parse(initJson));
+        if (initJson) {
+          var parsedInit = JSON.parse(initJson);
+          if (parsedInit && typeof parsedInit.corpus_digest === 'string') initialCorpusDigest = parsedInit.corpus_digest;
+          renderState(parsedInit);
+        }
       } catch (_) {}
       requestAnimationFrame(frame);
 
       if (typeof EventSource !== 'undefined') {
         var initSeq = latestStoreState && latestStoreState.write_seq != null ? latestStoreState.write_seq : '';
         var initClaims = latestStoreState && latestStoreState.current_claims != null ? latestStoreState.current_claims : '';
-        var esUrl = '/events' + (initSeq !== '' ? ('?since_seq=' + encodeURIComponent(initSeq) + '&since_claims=' + encodeURIComponent(initClaims)) : '');
+        var esUrl =
+          '/events' +
+          (initSeq !== ''
+            ? '?since_seq=' +
+              encodeURIComponent(initSeq) +
+              '&since_claims=' +
+              encodeURIComponent(initClaims) +
+              (initialCorpusDigest ? '&since_digest=' + encodeURIComponent(initialCorpusDigest) : '')
+            : '');
         var es = new EventSource(esUrl);
         var sseBadge = el('sse-badge');
         es.onopen = function () {
@@ -9049,9 +9065,27 @@ export async function startMemoryViewer({
     return cachedMobileState
   }
 
+  function hashCorpusKeyHex(str) {
+    let h1 = 0x811c9dc5
+    let h2 = 0x01000193
+    for (let i = 0; i < str.length; i++) {
+      const c = str.charCodeAt(i)
+      h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0
+      h2 = Math.imul(h2 ^ (c + (i & 0xff)), 0x85ebca6b) >>> 0
+    }
+    return h1.toString(16).padStart(8, '0') + h2.toString(16).padStart(8, '0')
+  }
+
   function computeCorpusBroadcastKey(state) {
     const ss = state.store_state || {}
-    return `${state.connected}:${state.error || ''}:${state.reader || ''}:${state.reader_pubkey || ''}:${ss.state || ''}:${ss.write_seq ?? ''}:${ss.current_claims ?? ''}:${state.records?.length ?? 0}`
+    const recs = Array.isArray(state.records) ? state.records : []
+    const recIds =
+      cachedCorpus?.records === recs && typeof cachedCorpus?.recordIdsSig === 'string'
+        ? cachedCorpus.recordIdsSig
+        : recs.map(r => r?.event_id || `${r?.author_pubkey || ''}:${r?.d || ''}:${r?.created_at || 0}`).join(',')
+    const connGen = cachedCorpus?.connGen ?? 0
+    const scopeSig = cachedCorpus?.scopeSig ?? ''
+    return `${state.connected}:${state.error || ''}:${state.reader || ''}:${state.reader_pubkey || ''}:${ss.state || ''}:${ss.write_seq ?? ''}:${ss.current_claims ?? ''}:${recs.length}:${connGen}:${scopeSig}:${recIds}`
   }
 
   function computeBroadcastKey(state, corpusKey) {
@@ -9125,6 +9159,7 @@ export async function startMemoryViewer({
         wakeConnGen,
         wake?.counts || null,
         wake?.topic_directory || null,
+        Array.isArray(wake?.records) ? wake.records.map(r => `${r?.event_id || ''}:${r?.scope || ''}:${r?.d || ''}`) : null,
       ])
       const canReuseCorpus =
         !forceFull &&
@@ -9230,6 +9265,9 @@ export async function startMemoryViewer({
             return [p.topic, rest]
           })
         )
+        const recordIdsSig = records
+          .map(r => r?.event_id || `${r?.author_pubkey || ''}:${r?.d || ''}:${r?.created_at || 0}`)
+          .join(',')
         cachedCorpus = {
           writeSeq: wakeSeq ?? firstQuery?.store_state?.write_seq ?? null,
           currentClaims: wakeCurrentClaims ?? firstQuery?.store_state?.current_claims ?? null,
@@ -9237,6 +9275,7 @@ export async function startMemoryViewer({
           readerPubkey: wakeReaderPubkey,
           connGen: wakeConnGen,
           scopeSig: wakeScopeSig,
+          recordIdsSig,
           atMs: nowMs,
           records,
           historyRecords,
@@ -9536,11 +9575,13 @@ export async function startMemoryViewer({
       eventLog.push(d)
       if (eventLog.length > MAX_EVENT_LOG) eventLog.shift()
     }
+    const nextCorpusKey = computeCorpusBroadcastKey( nextSnapshot )
+    const nextCorpusDigest = hashCorpusKeyHex(nextCorpusKey)
     currentState = {
       ...nextSnapshot,
+      corpus_digest: nextCorpusDigest,
       event_log: [...eventLog],
     }
-    const nextCorpusKey = computeCorpusBroadcastKey(currentState)
     const nextBroadcastKey = computeBroadcastKey(currentState, nextCorpusKey)
     const changed = nextBroadcastKey !== lastBroadcastKey || diffs.length > 0
     currentCorpusKey = nextCorpusKey
@@ -9624,14 +9665,17 @@ export async function startMemoryViewer({
       }
       const sinceSeqMatch = /(?:^|&)since_seq=([^&]*)/.exec(queryStr)
       const sinceClaimsMatch = /(?:^|&)since_claims=([^&]*)/.exec(queryStr)
+      const sinceDigestMatch = /(?:^|&)since_digest=([^&]*)/.exec(queryStr)
       const sinceSeq = sinceSeqMatch && /^[0-9]+$/.test(sinceSeqMatch[1]) ? sinceSeqMatch[1] : null
       const sinceClaims = sinceClaimsMatch ? (/^[0-9]+$/.test(sinceClaimsMatch[1]) ? sinceClaimsMatch[1] : 'invalid') : null
+      const sinceDigest = sinceDigestMatch ? (/^[0-9a-f]+$/i.test(sinceDigestMatch[1]) ? sinceDigestMatch[1].toLowerCase() : 'invalid') : null
       const clientHasCorpus =
         Boolean(currentState.connected) &&
         sinceSeq !== null &&
         sinceSeq !== '' &&
         sinceSeq === String(currentState.store_state?.write_seq ?? '') &&
-        (sinceClaims === null || sinceClaims === '' || sinceClaims === String(currentState.store_state?.current_claims ?? ''))
+        (sinceClaims === null || sinceClaims === '' || sinceClaims === String(currentState.store_state?.current_claims ?? '')) &&
+        (sinceDigest !== null ? sinceDigest === String(currentState.corpus_digest || '') : (cachedCorpus?.connGen ?? 0) <= 1)
       registerSseClient(sseClients, req, res, clientHasCorpus ? currentCorpusKey : null)
       const initialClientState = buildClientViewerState(currentState, { includeCorpus: !clientHasCorpus })
       writeToSseClient(sseClients, res, `data: ${JSON.stringify(initialClientState)}\n\n`, {

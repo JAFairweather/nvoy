@@ -2753,6 +2753,110 @@ await test('nvoy #383 regression: SSE suppresses unchanged polls, sends compact 
     assert.equal(Array.isArray(fullFrames[2].records), true)
     assert.equal(fullFrames[2].records.length, 2)
 
+    // 5b. Same-count visible record change at unchanged write_seq / current_claims / reader_pubkey must broadcast full corpus (corpus_unchanged: false)
+    const roomA = '11111111-2222-4333-8444-555555555555'
+    const roomB = '66666666-7777-4888-8999-aaaaaaaaaaaa'
+    daemon.store.setConfig(
+      validateAndResolveConfig({
+        memoryGlobalChannelId: room,
+        ownerPubkey: ownerPk,
+        maxUnbackedSec: 3600,
+        globalWriters: [ownerPk],
+        canonWriters: [ownerPk],
+        readers: { viewer: viewerPk, biggy: peerPk },
+        writers: { james: { pubkey: ownerPk, perHour: 30 }, biggy: { pubkey: peerPk, perHour: 30 } },
+        rooms: {
+          [room]: { members: [ownerPk, peerPk, viewerPk], writers: [ownerPk, peerPk] },
+          [roomA]: { members: [ownerPk, peerPk, viewerPk], writers: [ownerPk, peerPk] },
+          [roomB]: { members: [ownerPk, peerPk], writers: [ownerPk, peerPk] },
+        },
+      })
+    )
+    nowSec += 3
+    const roomAEv = finalizeEvent(buildClaimTemplate({
+      pubkey: peerPk,
+      scope: `room:${roomA}`,
+      slug: 'room-a-only-claim',
+      topic: 'nvoy',
+      claim: 'Room A claim visible before membership swap',
+      because: 'Regression fixture',
+      evidence: ['PR #384'],
+      asOfGit: 'nvoy@45ec9a9',
+      memoryGlobalChannelId: room,
+      nowSec,
+    }), peerSk)
+    const roomBEv = finalizeEvent(buildClaimTemplate({
+      pubkey: peerPk,
+      scope: `room:${roomB}`,
+      slug: 'room-b-only-claim',
+      topic: 'nvoy',
+      claim: 'Room B claim visible after membership swap',
+      because: 'Regression fixture',
+      evidence: ['PR #384'],
+      asOfGit: 'nvoy@45ec9a9',
+      memoryGlobalChannelId: room,
+      nowSec: nowSec + 1,
+    }), peerSk)
+    assert.equal(daemon.store.submit({ writer: 'biggy', event: roomAEv, nowSec }).accepted, true)
+    assert.equal(daemon.store.submit({ writer: 'biggy', event: roomBEv, nowSec: nowSec + 1 }).accepted, true)
+    nowSec += 3
+    await viewer.pollOnce({ forceFull: false })
+    for (let i = 0; i < 20 && fullFrames.length < 4; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(fullFrames.length, 4)
+    assert.equal(fullFrames[3].corpus_unchanged, false)
+    assert.equal(fullFrames[3].records.length, 3)
+    assert(fullFrames[3].records.some(r => r.event_id === roomAEv.id), 'room A claim initially visible')
+    assert(!fullFrames[3].records.some(r => r.event_id === roomBEv.id), 'room B claim initially hidden')
+    const preSwapState = viewer.getState()
+
+    // Swap viewerPk membership from roomA to roomB without any new writes: write_seq, current_claims, reader_pubkey, and records.length stay identical!
+    daemon.store.setConfig(
+      validateAndResolveConfig({
+        memoryGlobalChannelId: room,
+        ownerPubkey: ownerPk,
+        maxUnbackedSec: 3600,
+        globalWriters: [ownerPk],
+        canonWriters: [ownerPk],
+        readers: { viewer: viewerPk, biggy: peerPk },
+        writers: { james: { pubkey: ownerPk, perHour: 30 }, biggy: { pubkey: peerPk, perHour: 30 } },
+        rooms: {
+          [room]: { members: [ownerPk, peerPk, viewerPk], writers: [ownerPk, peerPk] },
+          [roomA]: { members: [ownerPk, peerPk], writers: [ownerPk, peerPk] },
+          [roomB]: { members: [ownerPk, peerPk, viewerPk], writers: [ownerPk, peerPk] },
+        },
+      })
+    )
+    nowSec += 3
+    await viewer.pollOnce({ forceFull: false })
+    for (let i = 0; i < 20 && fullFrames.length < 5; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(fullFrames.length, 5, 'same-count visible record swap must broadcast SSE update')
+    assert.equal(fullFrames[4].store_state.write_seq, preSwapState.store_state.write_seq, 'write_seq is unchanged')
+    assert.equal(fullFrames[4].store_state.current_claims, preSwapState.store_state.current_claims, 'visible current_claims count is unchanged')
+    assert.equal(
+      fullFrames[4].corpus_unchanged,
+      false,
+      'same-count visible record swap at unchanged write_seq must send full corpus (corpus_unchanged: false), never delta'
+    )
+    assert.equal(Array.isArray(fullFrames[4].records), true)
+    assert.equal(fullFrames[4].records.length, 3)
+    assert(!fullFrames[4].records.some(r => r.event_id === roomAEv.id), 'revoked room A claim must be removed from SSE records')
+    assert(fullFrames[4].records.some(r => r.event_id === roomBEv.id), 'newly visible room B claim must be present in SSE records')
+
+    // Connecting with stale since_digest at matching since_seq & since_claims also receives full corpus
+    const staleDigestFrames = connectSse(
+      `/events?since_seq=${preSwapState.store_state.write_seq}&since_claims=${preSwapState.store_state.current_claims}&since_digest=${preSwapState.corpus_digest}`
+    )
+    for (let i = 0; i < 20 && staleDigestFrames.length < 1; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(staleDigestFrames.length, 1)
+    assert.equal(staleDigestFrames[0].corpus_unchanged, false, 'stale since_digest at matching since_seq must receive full corpus')
+    assert.equal(Array.isArray(staleDigestFrames[0].records), true)
+
     // 6. Slow-client backpressure coalescing and max buffer enforcement
     const mockMap = new Map()
     const written = []
