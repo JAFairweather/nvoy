@@ -157,6 +157,15 @@ function readIds() {
   return ids
 }
 
+// A reply (new or already queued) is handled work: record the envelope read so it stops being announced. The
+// reply itself is already queued, so a failed read-log write is logged, not returned.
+function markReadByReply(envelope) {
+  try {
+    appendFileSync(readPath, JSON.stringify({ version: 1, instance: manifest.id, envelope, read_at: Date.now(), by: 'reply' }) + '\n', { mode: 0o600 })
+    chmodSync(readPath, 0o600)
+  } catch (error) { console.error(`nvoy-claude-channel: reply queued but ${envelope} not marked read: ${error.message}`) }
+}
+
 function toolResult(value, isError = false) {
   return { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }], ...(isError ? { isError: true } : {}) }
 }
@@ -315,7 +324,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async request => {
   if (refused.code) return toolResult(refused, true)
   try {
     const prior = lines(replyPath, 'Desktop reply queue').map(line => { try { return JSON.parse(line) } catch { throw new Error('Desktop reply queue contains malformed JSON') } })
-    if (prior.some(item => item?.receipt === envelope)) return toolResult({ code: 'NVOY_ALREADY_REPLIED', envelope }, true)
+    // Already answered, yet unread: an earlier reply was queued before its read mark was written (a runtime from
+    // before replies marked envelopes read, or a lost read log). Mark it read now, or the answered envelope is
+    // re-announced every renotifyMs for good and a second reply can never clear it (mc-claude, 13 Nov).
+    if (prior.some(item => item?.receipt === envelope)) {
+      if (!read) markReadByReply(envelope)
+      return toolResult({ code: 'NVOY_ALREADY_REPLIED', envelope }, true)
+    }
     const record = { version: 1, type: 'reply-request', id: randomBytes(16).toString('hex'),
       instance: manifest.id, receipt: envelope, content, ...(mention.length ? { mention } : {}) }
     appendFileSync(replyPath, JSON.stringify(record) + '\n', { mode: 0o640 })
@@ -324,12 +339,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async request => {
     // reach the agent in another envelope's context). Only a read stops the re-announce, so an
     // answered envelope that was never read was announced every renotifyMs for good (mc-claude,
     // 47c7ab2f, 11 Nov). The reply is already queued, so a failed read-log write is logged, not returned.
-    if (!read) {
-      try {
-        appendFileSync(readPath, JSON.stringify({ version: 1, instance: manifest.id, envelope, read_at: Date.now(), by: 'reply' }) + '\n', { mode: 0o600 })
-        chmodSync(readPath, 0o600)
-      } catch (error) { console.error(`nvoy-claude-channel: reply queued but ${envelope} not marked read: ${error.message}`) }
-    }
+    if (!read) markReadByReply(envelope)
     return toolResult({ queued: true, envelope, request: record.id, ...(mention.length ? { mention } : {}), ...notMentioned(allowed.mayPost, unresolved, room) })
   } catch (error) { return toolResult({ code: 'NVOY_REPLY_QUEUE_FAILED', message: error.message }, true) }
 })
