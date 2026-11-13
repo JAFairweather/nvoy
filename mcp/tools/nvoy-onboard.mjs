@@ -28,6 +28,8 @@ import { MAX_AGE_S, requestD, SETUP_KIND, OnboardRefusal } from './onboard_reque
 import { onboard, WRITERS_D, WRITERS_KIND } from './onboard_run.mjs'
 import { readInstallDetails, readRunnerConfig, WRITER_RELAY } from './onboard_receipt.mjs'
 import { readPages, watchTick } from './onboard_watch.mjs'
+import { readOnboardGrants } from './onboard_delegate.mjs'
+import { scopeHash } from './grant_fold.mjs'
 import { pairInstance } from './instance-pair.mjs'
 import { readManifest } from './runtime_manifest.mjs'
 import { makeBunkerSigner } from './nip46-signer.mjs'
@@ -51,19 +53,23 @@ async function readAll(urls, filter, read = queryRelay) {
   if (!reads.some(read => read.answered)) throw new OnboardRefusal('ONBOARD_NO_RELAY', 'no relay answered')
   return [...new Map(reads.flatMap(read => read.events).map(event => [event.id, event])).values()]
 }
-const fetchEvents = ({ relays, owners, name }) =>
-  readAll(readUrls(relays), { kinds: [SETUP_KIND], authors: owners, '#d': [requestD(name, 'add_agent'), requestD(name, 'bind_runtime')] })
+const fetchEvents = ({ relays, owners, name, delegates = [] }) =>
+  readAll(readUrls(relays), { kinds: [SETUP_KIND], authors: [...new Set([...owners, ...delegates])], '#d': [requestD(name, 'add_agent'), requestD(name, 'bind_runtime')] })
 // Every request kind from the trusted owners, paged back over the window a request stays valid, so
 // newer owner events never push an unfinished add out of a fixed window; watch keeps the add_agent
 // ones by their d tag.
-const fetchAll = async ({ relays, owners }) => {
+const fetchAll = async ({ relays, owners, delegates = [] }) => {
   const incomplete = []
   const events = await readAll(readUrls(relays),
-    { kinds: [SETUP_KIND], authors: owners, since: Math.floor(Date.now() / 1000) - MAX_AGE_S - 600 },
+    { kinds: [SETUP_KIND], authors: [...new Set([...owners, ...delegates])], since: Math.floor(Date.now() / 1000) - MAX_AGE_S - 600 },
     async (url, filter) => { const read = await readPages(queryRelay, url, filter); if (read.answered && !read.complete) incomplete.push(url); return read })
   return { events, incomplete }
 }
 const verify = event => { try { return verifyEvent(JSON.parse(JSON.stringify(event))) } catch { return false } }
+// The owners' live `onboard` grants (DESIGN_ONBOARDING_DELEGATE), paged in full from every grant relay,
+// fail closed: fewer than a quorum of complete reads is "unknown", and unknown reads no delegate.
+const readDelegates = ({ relays, owners }) => readOnboardGrants({ urls: readUrls(relays), grantors: owners, verify, scopeHash,
+  read: (url, filter) => readPages(queryRelay, url, filter) })
 // The owner's newest writer lists on the server's relay, for the relay writer step in run and watch.
 const writersFrom = relay => async ({ owners }) => queryRelay(relay, { kinds: [WRITERS_KIND], authors: owners, '#d': [WRITERS_D] })
 
@@ -109,7 +115,7 @@ async function watch(runner) {
       const urls = [...new Set([...runner.relays, ...readUrls([])])]
       return Promise.all(urls.map(url => publishRelay(url, event)))
     }
-    const tick = await watchTick({ root, out, stateDir, runner, fetchAll, fetchEvents, runTool, joinWith, pair, readWriters: writersFrom(runner.writerRelay),
+    const tick = await watchTick({ root, out, stateDir, runner, fetchAll, fetchEvents, runTool, joinWith, pair, readWriters: writersFrom(runner.writerRelay), readDelegates,
       publish, signer, verify,
       installFor: name => readInstallDetails({ instance: name, sshTarget: runner.sshTarget }) })
     const { ran, incomplete } = tick
@@ -128,7 +134,7 @@ if (!named) {
 }
 
 try {
-  const { receipts } = await onboard({ command, name, fetchEvents, runTool, joinWith, verify, readWriters: writersFrom(flag('--writer-relay') || WRITER_RELAY),
+  const { receipts } = await onboard({ command, name, fetchEvents, runTool, joinWith, verify, readDelegates, readWriters: writersFrom(flag('--writer-relay') || WRITER_RELAY),
     root, out, stateDir, keysPath: flag('--authorized-keys'), giversRedeploy: argv.includes('--givers-redeploy') })
   process.exit(receipts.some(row => row.state === 'refused') ? 1 : receipts.every(row => row.state === 'done') ? 0 : command === 'show' ? 0 : 4)
 } catch (error) {

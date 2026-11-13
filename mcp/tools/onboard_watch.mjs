@@ -10,6 +10,7 @@ import { join } from 'node:path'
 import { OnboardRefusal, SETUP_KIND, SETUP_PREFIX } from './onboard_request.mjs'
 import { installed, onboard } from './onboard_run.mjs'
 import { latestSteps, makeSealer, receiptBody } from './onboard_receipt.mjs'
+import { delegateAuthors } from './onboard_delegate.mjs'
 
 const ADD = new RegExp(`^${SETUP_PREFIX.replace(/[/]/g, '\\/')}([a-z0-9][a-z0-9._-]{1,63})\\/add_agent$`, 'i')
 // An unchanged receipt is still republished this often, so the page can tell a live runner from one
@@ -73,7 +74,7 @@ const refusedIds = stateDir => {
 }
 
 export async function watchTick({ root, out, stateDir, runner, fetchAll, fetchEvents, runTool, joinWith, pair, readWriters,
-  publish, signer, verify, installFor, now = () => Date.now(), log = console.log }) {
+  publish, signer, verify, installFor, readDelegates = null, now = () => Date.now(), log = console.log }) {
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
   const manifests = installed(root)
   const owners = [...new Set([...manifests.values()].flatMap(manifest => manifest.grantors))]
@@ -82,7 +83,11 @@ export async function watchTick({ root, out, stateDir, runner, fetchAll, fetchEv
   const finished = new Set(rows(join(stateDir, 'requests.jsonl')).filter(row => row.finished).map(row => row.id))
   // fetchAll hands back the events, or { events, incomplete } naming the relays whose read did not reach
   // the end of the window. Say so: a request on such a relay may be missing from the queue.
-  const read = await fetchAll({ relays, owners })
+  // Delegate discovery (DESIGN_ONBOARDING_DELEGATE): the owners' live `onboard` grants, read cold each
+  // tick. Their grantees' requests are fetched too; an unknown grant state adds no one, and says so.
+  const delegates = readDelegates ? await readDelegates({ relays, owners }) : null
+  if (delegates && !delegates.known) log(`warning  grant state unknown (${delegates.reason}); no delegate request is read this tick`)
+  const read = await fetchAll({ relays, owners, delegates: delegateAuthors(delegates) })
   const incomplete = Array.isArray(read) ? [] : read.incomplete || []
   for (const url of incomplete) log(`warning  ${url} gave an incomplete read of the owner's events (more in one second than a page, or it stopped answering); an unfinished request may not be listed`)
   const queue = pendingRequests(Array.isArray(read) ? read : read.events, { verify, finished, refused: refusedIds(stateDir) })
@@ -113,7 +118,7 @@ export async function watchTick({ root, out, stateDir, runner, fetchAll, fetchEv
     }
     try {
       const result = await onboard({ command: 'run', name, root, out, stateDir, keysPath: runner.authorizedKeys, giversRedeploy: false,
-        fetchEvents, runTool, joinWith, now, log, pair, report, readWriters, verify })
+        fetchEvents, runTool, joinWith, now, log, pair, report, readWriters, verify, readDelegates })
       ran.push({ name, id, receipts: result.receipts })
     } catch (error) {
       // A crash, or no relay answering, leaves everything as it was for the next tick.

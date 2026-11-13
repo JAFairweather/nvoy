@@ -138,6 +138,21 @@ Today the step is a fixed pending line. With nave.pub #157 it is:
 The page signs that list; the runner only reads it. An operator's `run` reads it the same way, from
 relay.nave.pub or `--writer-relay`.
 
+## Delegate grants (discovery only)
+
+An owner may grant a delegate key the right to ask for new agents, with one kind 440 `da-cap onboard`
+(scoped to the owner's own key) and revoke it with one 441 (waggle `docs/DESIGN_ONBOARDING_DELEGATE.md`).
+`onboard_delegate.mjs` reads those grants cold from the grant relays at every tick and at every `run`:
+- A 441 from the grant's own grantor revokes it whatever either `created_at` says.
+- Fewer than a quorum of complete relay reads is "grant state unknown". It reads no delegate, and the
+  tick logs it.
+- Grants count only from complete reads; a 441 from any relay that answered still revokes.
+- Live delegates are added to the authors both fetch paths read setup requests from.
+
+A delegate's request is not accepted yet. Authorization (consent, the template allowlist, no giver,
+the daily cap, the mandatory staged key) is the next change, so until then such a request is refused
+`ONBOARD_NOT_OWNER` like any other non-grantor's.
+
 ## Failure and replay
 
 - A request id is run once to completion. The ledger's `finished` row stops every later tick. It is
