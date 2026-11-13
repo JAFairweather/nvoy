@@ -149,9 +149,20 @@ An owner may grant a delegate key the right to ask for new agents, with one kind
 - Grants count only from complete reads; a 441 from any relay that answered still revokes.
 - Live delegates are added to the authors both fetch paths read setup requests from.
 
-A delegate's request is not accepted yet. Authorization (consent, the template allowlist, no giver,
-the daily cap, the mandatory staged key) is the next change, so until then such a request is refused
-`ONBOARD_NOT_OWNER` like any other non-grantor's.
+A delegate's request is accepted only within the owner's limits (`parseSetupRequest`, `delegation`):
+- It must hold a live grant from a grantor of the template. It is recorded with that grantor as `owner`
+  and itself as `signer`, and receipts stay sealed to the owner.
+- `like` must be in the runner config's `onboard_templates`. Absent or empty means none, so every
+  delegate request is refused.
+- `consent` must name that grant. The request carries no `policy` or `age` of its own; they come from
+  the grant, which must carry both.
+- The grant's `policy` must equal the terms the hive serves now, read fresh from the template's hive
+  relay. Unreadable terms are `ONBOARD_TERMS_UNKNOWN`, which the watcher retries.
+- It names no `giver`.
+- The delegate adds at most 1 new name in any 24 hours, counted from the ledger's `signer`.
+- A delegate's `bind_runtime` seats nothing unless the staged key from the agent's box exists and
+  matches it.
+- The hive step opens a delegate's sealed invite as sealed by the delegate.
 
 ## Failure and replay
 
