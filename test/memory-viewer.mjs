@@ -3780,7 +3780,21 @@ await test('tailnet:any stands alone, and admits tailnet devices except the view
     assert.equal(await selfId(), 'nHostCNTRL')
     const before = seen
     assert.equal(await selfId(), 'nHostCNTRL')
-    assert.equal(seen, before, 'self ID is asked once')
+    assert.equal(seen, before + 1, 'self ID is asked afresh, never memoized')
+
+    // My Dude's PR 400 finding: the host is re-enrolled while the viewer runs, so status and whois both move to a
+    // new self ID. A request from the new self ID must still be refused.
+    let whoisId = 'nOldCNTRL'
+    answer = { Self: { ID: 'nOldCNTRL' } }
+    const gate = createPeerGate({
+      allowed: ['tailnet:any'],
+      whois: async () => ({ stableId: whoisId, tags: [], name: 'herd-cloud.', shared: false }),
+      selfId: createTailscaleSelf({ socketPath: sock }),
+    })
+    assert.equal((await gate('fd7a::10', 1)).status, 403)
+    answer = { Self: { ID: 'nNewCNTRL' } }
+    whoisId = 'nNewCNTRL'
+    assert.deepEqual(await gate('fd7a::11', 1), { ok: false, status: 403, reason: 'the viewer host itself is not admitted' })
   } finally {
     await new Promise(r => fake.close(r))
     rmSync(dir, { recursive: true, force: true })

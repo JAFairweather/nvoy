@@ -73,16 +73,15 @@ function localApi(socketPath, path, timeoutMs) {
 }
 
 // The viewer host's own stable node ID, from tailscaled's status (LocalAPI `status?peers=false`, field Self.ID).
-// Asked once; a failure is not remembered, so the next request asks again.
+// Asked afresh for every peer verdict, never memoized: a host re-enrolled while the viewer runs gets a new ID, and a
+// remembered old one would then admit the host itself. Verdicts are cached per caller for cacheMs, so this costs one
+// LocalAPI call per fresh verdict.
 export function createTailscaleSelf({ socketPath = DEFAULT_TAILSCALE_SOCKET, timeoutMs = 3000 } = {}) {
-  let known
   return async function selfId() {
-    if (known) return known
     const { status, body } = await localApi(socketPath, '/localapi/v0/status?peers=false', timeoutMs)
     if (status !== 200) throw new Error(`tailscaled status answered ${status}`)
     const id = body && body.Self && typeof body.Self.ID === 'string' ? body.Self.ID : ''
     if (!id) throw new Error('tailscaled status names no self node')
-    known = id
     return id
   }
 }
