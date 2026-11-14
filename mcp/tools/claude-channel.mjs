@@ -164,13 +164,15 @@ function readIds() {
 function markReadByReply(envelope) {
   try {
     appendFileSync(readPath, JSON.stringify({ version: 1, instance: manifest.id, envelope, read_at: Date.now(), by: 'reply' }) + '\n', { mode: 0o600 })
-    chmodSync(readPath, 0o600)
-    return null
   } catch (error) {
     console.error(`nvoy-claude-channel: reply queued but ${envelope} not marked read: ${error.message}`)
     return { read_mark_failed: String(error.code || error.message || error).slice(0, 120),
       read_mark_note: 'The reply is queued, but this envelope could not be marked read, so it will keep being announced. Report this read-log failure to an operator; nvoy_channel_read will name the error too.' }
   }
+  // The mark is written, so the re-announce stops. Only tightening the log's mode failed: that is an operator
+  // matter for stderr, not a reason to tell the agent its envelope is still unread (Murphy, PR 403 review).
+  try { chmodSync(readPath, 0o600) } catch (error) { console.error(`nvoy-claude-channel: ${envelope} marked read, but read log mode not set: ${error.message}`) }
+  return null
 }
 
 function toolResult(value, isError = false) {
