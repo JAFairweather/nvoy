@@ -1,8 +1,8 @@
 // test/memory-viewer.mjs — Unit and integration tests for mcp/tools/memory-viewer.mjs.
 
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { request as httpRequest } from 'node:http'
+import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { createServer as createPlainHttpServer, request as httpRequest } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
@@ -39,6 +39,7 @@ import {
   escapeHtml,
   parseListenTarget,
   parseViewerFlags,
+  readAllowedNodesFile,
   renderMobileViewerHtml,
   renderViewerHtml,
   resolveDreamDisplayMode,
@@ -46,6 +47,7 @@ import {
   sanitizeActivity,
   startMemoryViewer,
 } from '../mcp/tools/memory-viewer.mjs'
+import { createPeerGate, createTailscaleSelf, createTailscaleWhois, parseAllowedNodes, whoisAddr } from '../mcp/tools/viewer-peer-gate.mjs'
 
 const SNAP_ID = 'c'.repeat(64)
 
@@ -82,7 +84,7 @@ function httpGet(port, path, method = 'GET') {
 console.log('=== Hive Shared Memory Viewer Tests ===')
 
 await test('parseViewerFlags and parseListenTarget validate socket, host/port, and bracketed IPv6', () => {
-  const parsed1 = parseViewerFlags(['--socket', '/run/hive-memory/viewer.sock', '--host', '127.0.0.1', '--port', '8787'])
+  const parsed1 = parseViewerFlags(['--socket', '/run/hive-memory/viewer.sock', '--host', '127.0.0.1', '--port', '8787', '--insecure-no-peer-gate'])
   assert.equal(parsed1.socketPath, '/run/hive-memory/viewer.sock')
   assert.equal(parsed1.host, '127.0.0.1')
   assert.equal(parsed1.port, 8787)
@@ -95,6 +97,7 @@ await test('parseViewerFlags and parseListenTarget validate socket, host/port, a
     '[fd7a:115c:a1e0::ab36:5615]:8788',
     '--poll-ms',
     '1500',
+    '--insecure-no-peer-gate',
   ])
   assert.equal(parsed2.host, 'fd7a:115c:a1e0::ab36:5615')
   assert.equal(parsed2.port, 8788)
@@ -949,7 +952,7 @@ await test('live integration: memory-viewer polls memory-daemon viewer socket, s
     const overrideStatePath = join(tmp, 'custom-curator-state.json')
     process.env.HIVE_MEMORY_CURATOR_STATE_FILE = overrideStatePath
     try {
-      const parsedFlags = parseViewerFlags(['--socket', join(sockDir, 'viewer.sock'), '--state-file', overrideStatePath, '--listen', '127.0.0.1:0'])
+      const parsedFlags = parseViewerFlags(['--socket', join(sockDir, 'viewer.sock'), '--state-file', overrideStatePath, '--listen', '127.0.0.1:0', '--insecure-no-peer-gate'])
       assert.equal(parsedFlags.stateFile, overrideStatePath)
 
       const { writeCuratorStateFile } = await import('../mcp/tools/memory-curate.mjs')
@@ -3596,6 +3599,252 @@ await test('nvoy #385 regression: per-write SSE deltas, first-load slimming, /ap
     if (viewer) await viewer.stop()
     await daemon.close()
     rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+// --- Frontier A4: the viewer refuses a request from any device not on its allowlist ---
+
+await test('viewer flags require a device allowlist unless the insecure test flag is given', () => {
+  const base = ['--socket', '/run/hive-memory/viewer.sock', '--listen', '127.0.0.1:8787']
+  assert.throws(() => parseViewerFlags(base), /--allow-nodes-file <absolute-path> is required/)
+  assert.throws(() => parseViewerFlags([...base, '--allow-nodes-file', 'rel/allowed']), /absolute/)
+  assert.throws(() => parseViewerFlags([...base, '--allow-nodes-file', '/a', '--insecure-no-peer-gate']), /exclusive/)
+  assert.throws(() => parseViewerFlags([...base, '--allow-nodes-file', '/a', '--allow-nodes-file', '/b']), /only one --allow-nodes-file/)
+  assert.throws(() => parseViewerFlags([...base, '--allow-nodes-file', '/a', '--tailscale-socket', 'ts.sock']), /absolute/)
+  const gated = parseViewerFlags([...base, '--allow-nodes-file', '/etc/hive-memory-viewer/allowed-nodes'])
+  assert.equal(gated.allowNodesFile, '/etc/hive-memory-viewer/allowed-nodes')
+  assert.equal(gated.tailscaleSocket, '/var/run/tailscale/tailscaled.sock')
+  const open = parseViewerFlags([...base, '--insecure-no-peer-gate'])
+  assert.equal(open.allowNodesFile, undefined)
+})
+
+await test('parseAllowedNodes takes stable node IDs and tags only, and refuses an empty list', () => {
+  assert.deepEqual(parseAllowedNodes('# phone\nn8DEpXwyZg11CNTRL\n\ntag:vpn-mac  # Mac\nn8DEpXwyZg11CNTRL\n'), ['n8DEpXwyZg11CNTRL', 'tag:vpn-mac'])
+  assert.throws(() => parseAllowedNodes('# nothing\n\n'), /admit no one/)
+  assert.throws(() => parseAllowedNodes('james.a.fairweather@gmail.com'), /line 1/)
+  assert.throws(() => parseAllowedNodes('n8DEpXwyZg11CNTRL\n100.64.0.1'), /line 2/)
+  assert.throws(() => parseAllowedNodes('tag:'), /line 1/)
+  assert.throws(() => parseAllowedNodes('*'), /line 1/)
+})
+
+await test('readAllowedNodesFile refuses a link or a group/other-writable file', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'viewer-allow-'))
+  try {
+    const f = join(dir, 'allowed-nodes')
+    writeFileSync(f, 'tag:vpn-mac\n')
+    chmodSync(f, 0o644)
+    assert.deepEqual(readAllowedNodesFile(f), ['tag:vpn-mac'])
+    chmodSync(f, 0o664)
+    assert.throws(() => readAllowedNodesFile(f), /writable by group or others/)
+    chmodSync(f, 0o644)
+    const link = join(dir, 'link')
+    symlinkSync(f, link)
+    assert.throws(() => readAllowedNodesFile(link), /not a regular file/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await test('peer gate admits listed devices and tags, refuses others, and fails closed on lookup errors', async () => {
+  assert.equal(whoisAddr('::ffff:127.0.0.1', 5000), '127.0.0.1:5000')
+  assert.equal(whoisAddr('fd7a::1', 443), '[fd7a::1]:443')
+  assert.throws(() => createPeerGate({ allowed: [], whois: async () => null }), /at least one/)
+  const nodes = {
+    'fd7a::1': { stableId: 'nPhone1CNTRL', tags: [], name: 'phone' },
+    'fd7a::2': { stableId: 'nMac22CNTRL', tags: ['tag:vpn-mac'], name: 'mac' },
+    'fd7a::3': { stableId: 'nFleet3CNTRL', tags: [], name: 'nvoy-fleet' },
+  }
+  let calls = 0
+  let clock = 1000
+  const gate = createPeerGate({
+    allowed: ['nPhone1CNTRL', 'tag:vpn-mac'],
+    whois: async addr => {
+      calls++
+      const ip = addr.replace(/^\[/, '').replace(/\]:\d+$/, '')
+      if (ip === 'fd7a::9') throw new Error('socket refused')
+      return nodes[ip] || null
+    },
+    cacheMs: 30_000,
+    now: () => clock,
+  })
+  assert.equal((await gate('fd7a::1', 1)).ok, true)
+  assert.equal((await gate('fd7a::2', 1)).ok, true)
+  const fleet = await gate('fd7a::3', 1)
+  assert.deepEqual([fleet.ok, fleet.status], [false, 403])
+  const stranger = await gate('fd7a::4', 1)
+  assert.deepEqual([stranger.ok, stranger.status], [false, 403])
+  const broken = await gate('fd7a::9', 1)
+  assert.deepEqual([broken.ok, broken.status], [false, 503])
+  assert.equal((await gate('', 1)).ok, false)
+  const before = calls
+  await gate('fd7a::1', 2)
+  assert.equal(calls, before, 'a verdict is cached per caller IP')
+  await gate('fd7a::9', 2)
+  assert.equal(calls, before + 1, 'a lookup error is not cached')
+  clock += 31_000
+  await gate('fd7a::1', 3)
+  assert.equal(calls, before + 2, 'the cache expires')
+})
+
+await test('tailscale whois reads the LocalAPI over its Unix socket and fails closed on bad answers', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'viewer-ts-'))
+  const sock = join(dir, 'tailscaled.sock')
+  const seen = []
+  const fake = createPlainHttpServer((req, res) => {
+    seen.push({ url: req.url, host: req.headers.host })
+    const addr = new URL(req.url, 'http://x').searchParams.get('addr')
+    if (addr === '[fd7a::1]:7') {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ Node: { StableID: 'nPhone1CNTRL', Name: 'phone.', Tags: null }, UserProfile: { LoginName: 'j@example' } }))
+    } else if (addr === '[fd7a::2]:7') {
+      res.writeHead(200)
+      res.end('not json')
+    } else if (addr === '[fd7a::3]:7') {
+      res.writeHead(200)
+      res.end(JSON.stringify({ Node: {} }))
+    } else if (addr === '[fd7a::6]:7') {
+      res.writeHead(200)
+      res.end(JSON.stringify({ Node: { StableID: 'nGuestCNTRL', Name: 'guest.', Sharer: 4242 } }))
+    } else if (addr === '[fd7a::5]:7') {
+      res.writeHead(500)
+      res.end('boom')
+    } else {
+      res.writeHead(404)
+      res.end('no match for IP:port')
+    }
+  })
+  await new Promise(r => fake.listen(sock, r))
+  try {
+    const whois = createTailscaleWhois({ socketPath: sock, timeoutMs: 2000 })
+    assert.deepEqual(await whois('[fd7a::1]:7'), { stableId: 'nPhone1CNTRL', tags: [], name: 'phone.', shared: false })
+    assert.equal((await whois('[fd7a::6]:7')).shared, true)
+    assert.equal(seen[0].host, 'local-tailscaled.sock')
+    assert(seen[0].url.startsWith('/localapi/v0/whois?addr='))
+    assert.equal(await whois('[fd7a::4]:7'), null)
+    await assert.rejects(whois('[fd7a::2]:7'), /not JSON/)
+    await assert.rejects(whois('[fd7a::3]:7'), /names no node/)
+    await assert.rejects(whois('[fd7a::5]:7'), /answered 500/)
+    await assert.rejects(createTailscaleWhois({ socketPath: join(dir, 'absent.sock') })('[fd7a::1]:7'))
+  } finally {
+    await new Promise(r => fake.close(r))
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await test('tailnet:any stands alone, and admits tailnet devices except the viewer host and shared-in nodes', async () => {
+  assert.deepEqual(parseAllowedNodes('# James, 14 Nov: any device on Tailscale\ntailnet:any\n'), ['tailnet:any'])
+  assert.throws(() => parseAllowedNodes('tailnet:any\nn8DEpXwyZg11CNTRL'), /only allowed-nodes entry/)
+  assert.throws(() => parseAllowedNodes('tailnet:all'), /line 1/)
+  assert.throws(() => createPeerGate({ allowed: ['tailnet:any', 'tag:x'], whois: async () => null, selfId: async () => 'x' }), /only allowed/)
+  assert.throws(() => createPeerGate({ allowed: ['tailnet:any'], whois: async () => null }), /own node ID/)
+  const nodes = {
+    'fd7a::1': { stableId: 'nPhoneCNTRL', tags: [], name: 'phone.', shared: false },
+    'fd7a::2': { stableId: 'nR1CNTRL', tags: ['tag:r1'], name: 'r1.', shared: false },
+    'fd7a::3': { stableId: 'nHostCNTRL', tags: ['tag:herd'], name: 'herd-cloud.', shared: false },
+    'fd7a::4': { stableId: 'nGuestCNTRL', tags: [], name: 'guest.', shared: true },
+  }
+  let selfFails = false
+  const gate = createPeerGate({
+    allowed: ['tailnet:any'],
+    whois: async addr => nodes[addr.replace(/^\[|\]:\d+$/g, '')] ?? null,
+    selfId: async () => { if (selfFails) throw new Error('status refused'); return 'nHostCNTRL' },
+  })
+  assert.equal((await gate('fd7a::1', 1)).ok, true)
+  assert.equal((await gate('fd7a::2', 1)).ok, true)
+  assert.deepEqual(await gate('fd7a::3', 1), { ok: false, status: 403, reason: 'the viewer host itself is not admitted' })
+  assert.deepEqual(await gate('fd7a::4', 1), { ok: false, status: 403, reason: 'device is shared in from another tailnet' })
+  assert.equal((await gate('fd7a::9', 1)).status, 403)
+  selfFails = true
+  nodes['fd7a::5'] = nodes['fd7a::1']
+  assert.equal((await gate('fd7a::5', 1)).status, 503, 'a failed self lookup refuses, it does not admit')
+  selfFails = false
+  assert.equal((await gate('fd7a::5', 1)).ok, true, 'a 503 is not cached')
+
+  const dir = mkdtempSync(join(tmpdir(), 'viewer-ts-self-'))
+  const sock = join(dir, 'tailscaled.sock')
+  let answer = { Self: { ID: 'nHostCNTRL' } }, seen = 0
+  const fake = createPlainHttpServer((req, res) => {
+    seen++
+    assert(req.url.startsWith('/localapi/v0/status'))
+    res.writeHead(answer ? 200 : 500)
+    res.end(JSON.stringify(answer || {}))
+  })
+  await new Promise(r => fake.listen(sock, r))
+  try {
+    answer = null
+    await assert.rejects(createTailscaleSelf({ socketPath: sock })(), /answered 500/)
+    answer = { Self: {} }
+    await assert.rejects(createTailscaleSelf({ socketPath: sock })(), /no self node/)
+    answer = { Self: { ID: 'nHostCNTRL' } }
+    const selfId = createTailscaleSelf({ socketPath: sock })
+    assert.equal(await selfId(), 'nHostCNTRL')
+    const before = seen
+    assert.equal(await selfId(), 'nHostCNTRL')
+    assert.equal(seen, before + 1, 'self ID is asked afresh, never memoized')
+
+    // My Dude's PR 400 finding: the host is re-enrolled while the viewer runs, so status and whois both move to a
+    // new self ID. A request from the new self ID must still be refused.
+    let whoisId = 'nOldCNTRL'
+    answer = { Self: { ID: 'nOldCNTRL' } }
+    const gate = createPeerGate({
+      allowed: ['tailnet:any'],
+      whois: async () => ({ stableId: whoisId, tags: [], name: 'herd-cloud.', shared: false }),
+      selfId: createTailscaleSelf({ socketPath: sock }),
+    })
+    assert.equal((await gate('fd7a::10', 1)).status, 403)
+    answer = { Self: { ID: 'nNewCNTRL' } }
+    whoisId = 'nNewCNTRL'
+    assert.deepEqual(await gate('fd7a::11', 1), { ok: false, status: 403, reason: 'the viewer host itself is not admitted' })
+  } finally {
+    await new Promise(r => fake.close(r))
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await test('a gated viewer serves an allowed device and refuses everything else before any route', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'viewer-gated-'))
+  let verdict = { ok: false, status: 403, reason: 'device not on the viewer allowlist' }
+  const asked = []
+  let viewer
+  try {
+    viewer = await startMemoryViewer({
+      socketPath: join(dir, 'absent-viewer.sock'),
+      host: '127.0.0.1',
+      port: 0,
+      pollMs: 300_000,
+      peerGate: async (addr, port) => {
+        asked.push([addr, port])
+        if (verdict === 'throw') throw new Error('gate exploded')
+        return verdict
+      },
+    })
+    for (const path of ['/', '/api/state', '/api/records', '/mobile', '/events', '/no-such-page']) {
+      for (const method of ['GET', 'HEAD']) {
+        const r = await httpGet(viewer.port, path, method)
+        assert.equal(r.status, 403, `${method} ${path} must be refused`)
+        assert.equal(r.headers['cache-control'], 'no-store')
+        assert(!r.body.includes('Hive Shared Memory'))
+      }
+    }
+    const post = await httpGet(viewer.port, '/', 'POST')
+    assert.equal(post.status, 403, 'the gate runs before the method check')
+    assert(asked.length > 0 && asked.every(([a, p]) => typeof a === 'string' && Number.isInteger(p)), 'the gate sees the caller address and port')
+
+    verdict = { ok: false, status: 503, reason: 'device check unavailable' }
+    assert.equal((await httpGet(viewer.port, '/api/state')).status, 503)
+    verdict = 'throw'
+    assert.equal((await httpGet(viewer.port, '/api/state')).status, 503)
+    verdict = undefined
+    assert.equal((await httpGet(viewer.port, '/api/state')).status, 403, 'a gate that returns nothing is a refusal')
+
+    verdict = { ok: true, node: { stableId: 'nPhone1CNTRL', tags: [] } }
+    const page = await httpGet(viewer.port, '/')
+    assert.equal(page.status, 200)
+    assert(page.body.includes('Hive Shared Memory'))
+    assert.equal((await httpGet(viewer.port, '/api/state')).status, 200)
+  } finally {
+    if (viewer) await viewer.stop()
+    rmSync(dir, { recursive: true, force: true })
   }
 })
 
