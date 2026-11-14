@@ -262,7 +262,7 @@ ok('the Desktop adapter gives each admitted envelope a stable app-server user-me
   /clientUserMessageId: userMessageId\(task\)/.test(codexDesktopSource) &&
   /clientUserMessageId/.test(codexTransportSource))
 const daemonSource = readFileSync('mcp/tools/instance-broker-daemon.mjs', 'utf8')
-ok('the broker daemon rate-limits retries after transient policy failures', /retryAfter\.get\(key\)/.test(daemonSource) && /const key = `\$\{item\.native \? 'buzz:' : ''\}\$\{item\.envelope\}`/.test(daemonSource) && /Date\.now\(\) \+ 5000/.test(daemonSource))
+ok('the broker daemon rate-limits retries after transient policy failures, backing off per key', /const retryAfter = createBackoff\(\)/.test(daemonSource) && /!retryAfter\.ready\(key\)/.test(daemonSource) && /retryAfter\.fail\(key\)/.test(daemonSource) && /retryAfter\.ok\(key\)/.test(daemonSource) && /const key = `\$\{item\.native \? 'buzz:' : ''\}\$\{item\.envelope\}`/.test(daemonSource))
 ok('broker restart requeues only interrupted inflight markers and prioritizes the newest opaque observation', /\.inflight/.test(daemonSource) && /\.pending/.test(daemonSource) && /marker\.observed_at/.test(daemonSource) && /b\.observed - a\.observed/.test(daemonSource) && /setInterval\(drain, 1000\)/.test(daemonSource))
 mkdirSync(manifest.state_dir, { recursive: true })
 const terminalReplies = join(manifest.state_dir, 'terminal-replies.jsonl')
