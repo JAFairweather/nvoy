@@ -71,8 +71,12 @@ ok('the actuator reports which actuator applies rather than leaving the daemon t
 
 // --- the daemon: acts on the actuator's verdict, and only the permissive one is narrow ---------
 const daemonSource = readFileSync('mcp/tools/instance-broker-daemon.mjs', 'utf8')
+// The reply attempt (prepare, then direct only on the permissive verdict) lives in reply_attempt.mjs,
+// which the daemon drives for every queued reply (nvoy#401).
+const replyAttemptSource = readFileSync('mcp/tools/reply_attempt.mjs', 'utf8')
 ok('the daemon enacts directly only when the actuator reports a channel reply needing no approval',
-  /verdict\?\.approval_required === false && \['nostr-private-reply', 'buzz-channel-reply'\]\.includes\(verdict\?\.action\)/.test(daemonSource))
+  /verdict\?\.approval_required === false && \['nostr-private-reply', 'buzz-channel-reply'\]\.includes\(verdict\?\.action\)/.test(replyAttemptSource) &&
+  /attemptReply\(\{ key, backoff: proposalRetryAfter, prepare: actuator\('--prepare'\), direct: actuator\('--direct'\)/.test(daemonSource))
 
 ok('the daemon still announces and waits for anything else',
   /awaiting discrete approval/.test(daemonSource))
