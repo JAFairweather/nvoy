@@ -62,15 +62,19 @@ export function makeBunkerSigner(uriText, clientNsec, options = {}) {
   })
   // A refused connect is tolerated: a client the Bunker already knows may be refused a repeat connect
   // (a spent pairing secret) and still be served. But when a later call then fails, the refusal is the
-  // likely cause (an unpaired client gets 'Unknown client'), so that call's error names it.
+  // likely cause (an unpaired client gets 'Unknown client'), so that call's error names it. Only the
+  // fact is kept, never the Bunker's own rejection text: a reply may echo the pairing secret it refused.
   let connectRefusal
   const ready = () => (connected ??= (connectRefusal = undefined,
-    rpc('connect', [pubkey, secret], 15000).catch(error => { connectRefusal = error?.message || String(error); return 'active' })))
+    rpc('connect', [pubkey, secret], 15000).catch(error => {
+      connectRefusal = /^nip46 connect timed out$/.test(error?.message || '') ? 'connect got no answer from the Bunker' : 'the Bunker refused connect'
+      return 'active'
+    })))
   const call = async (method, params) => {
     await ready()
     try { return await rpc(method, params) } catch (error) {
       if (!connectRefusal) throw error
-      throw new Error(`${error?.message || error} (the Bunker also refused connect: ${connectRefusal}; this client may not be paired, so re-pair it)`)
+      throw new Error(`${error?.message || error} (${connectRefusal} too; this client may not be paired, so re-pair it)`)
     }
   }
   const close = () => {

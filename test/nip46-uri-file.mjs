@@ -77,8 +77,16 @@ try {
   try { await unpaired.getPublicKey() } catch (error) { unpairedError = error.message }
   unpaired.close()
   check('an unpaired client\'s error names both the call\'s refusal and the refused connect',
-    /Unknown client/.test(unpairedError) && /refused connect: bunker: invalid secret/.test(unpairedError) && /re-pair/.test(unpairedError))
+    /Unknown client/.test(unpairedError) && /the Bunker refused connect too/.test(unpairedError) && /re-pair/.test(unpairedError))
   check('the refused-connect error never quotes the pairing secret', unpairedError !== '' && !unpairedError.includes('spent'))
+  // A Bunker whose rejection echoes the secret it refused: none of that text may reach the error.
+  const echoing = makeBunkerSigner(spentUri, nip19.nsecEncode(clientSk), { idleMs: 5,
+    pool: bunkerAnswering(method => method === 'connect' ? { error: 'invalid secret: spent' } : { error: 'Unknown client' }) })
+  let echoError = ''
+  try { await echoing.getPublicKey() } catch (error) { echoError = error.message }
+  echoing.close()
+  check('a connect rejection that echoes the pairing secret never reaches the error',
+    /the Bunker refused connect too/.test(echoError) && !echoError.includes('spent') && !echoError.includes('invalid secret'))
   const known = makeBunkerSigner(spentUri, nip19.nsecEncode(clientSk), { idleMs: 5,
     pool: bunkerAnswering(method => method === 'connect' ? { error: 'invalid secret' } : { result: bunkerPub }) })
   check('a known client refused only a repeat connect is still served', await known.getPublicKey() === bunkerPub)
