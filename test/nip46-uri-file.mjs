@@ -55,6 +55,34 @@ try {
   const firstSubscriptions = fake.subscriptions
   check('the signer reconnects after idle close for a later operation', await signer.getPublicKey() === bunkerPub && fake.subscriptions > firstSubscriptions)
   signer.close()
+
+  // A refused connect: a Bunker that does not know this client (a pairing secret that expired before
+  // the first connect) refuses connect and answers every later call 'Unknown client'. The later error
+  // must name the refused connect. A known client refused only a repeat connect is still served.
+  const bunkerAnswering = answers => ({ handler: null,
+    subscribeMany(_relays, _filter, callbacks) { this.handler = callbacks.onevent; return { close() {} } },
+    publish(_relays, event) {
+      const request = JSON.parse(nip44.v2.decrypt(event.content, conversation))
+      const reply = answers(request.method)
+      const response = finalizeEvent({ kind: 24133, created_at: 1, tags: [['p', clientPub]],
+        content: nip44.v2.encrypt(JSON.stringify({ id: request.id, ...reply }), conversation) }, bunkerSk)
+      queueMicrotask(() => this.handler(response))
+      return [Promise.resolve('ok')]
+    },
+    close() {} })
+  const spentUri = `bunker://${bunkerPub}?relay=wss%3A%2F%2Frelay.invalid&secret=spent`
+  const unpaired = makeBunkerSigner(spentUri, nip19.nsecEncode(clientSk), { idleMs: 5,
+    pool: bunkerAnswering(method => method === 'connect' ? { error: 'invalid secret' } : { error: 'Unknown client' }) })
+  let unpairedError = ''
+  try { await unpaired.getPublicKey() } catch (error) { unpairedError = error.message }
+  unpaired.close()
+  check('an unpaired client\'s error names both the call\'s refusal and the refused connect',
+    /Unknown client/.test(unpairedError) && /refused connect: bunker: invalid secret/.test(unpairedError) && /re-pair/.test(unpairedError))
+  check('the refused-connect error never quotes the pairing secret', unpairedError !== '' && !unpairedError.includes('spent'))
+  const known = makeBunkerSigner(spentUri, nip19.nsecEncode(clientSk), { idleMs: 5,
+    pool: bunkerAnswering(method => method === 'connect' ? { error: 'invalid secret' } : { result: bunkerPub }) })
+  check('a known client refused only a repeat connect is still served', await known.getPublicKey() === bunkerPub)
+  known.close()
 } finally { rmSync(dir, { recursive: true, force: true }) }
 
 if (failed) process.exit(1)
