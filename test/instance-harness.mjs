@@ -186,7 +186,8 @@ ok('the rule never asks the agent to read memory it has no tool for', !/memory_q
   ok('a missing instructions file is created with the defaults and the rule', ensureInstructions(fresh, rememberer) && readFileSync(fresh, 'utf8') === instructionsUpdate(null, rememberer))
   const outside = join(root, 'outside.md'), linked = join(dir, 'linked'), link = join(linked, 'CLAUDE.md')
   mkdirSync(linked, { recursive: true })
-  writeFileSync(outside, own, { mode: 0o644 }); symlinkSync(outside, link)
+  // writeFileSync's mode is filtered by the caller's umask (the agent seat uses 077).
+  writeFileSync(outside, own, { mode: 0o644 }); chmodSync(outside, 0o644); symlinkSync(outside, link)
   ok('a symlinked instructions file is left alone, and its target is never written or chmodded', !ensureInstructions(link, rememberer) &&
     readFileSync(outside, 'utf8') === own && (statSync(outside).mode & 0o777) === 0o644 && lstatSync(link).isSymbolicLink())
   const dangling = join(dir, 'dangling'); mkdirSync(dangling, { recursive: true }); symlinkSync(join(root, 'nowhere.md'), join(dangling, 'CLAUDE.md'))

@@ -69,13 +69,17 @@ and [`examples/claude-desktop.json`](examples/claude-desktop.json).
 ## Tests
 
 ```
-npm test              # build + smoke + ledger + conformance + nopersist + accept + egress
+npm test              # build + all offline test/*.mjs suites, including the commands below
 npm run smoke         # protocol smoke, in-memory (smoke:live = real relays) + observer view
 npm run ledger        # console↔MCP cross-impl: signer-issued grants parse via mcp/dist
 npm run conformance   # MCP SDK client against the built server, BOTH transports
 npm run nopersist     # fs/log interception: zero scope plaintext leaves memory
 npm run accept        # §7 M4 acceptance: granted → relinquished → rotated arc
 npm run egress        # zero-egress: console + MCP reach only relays / esm.sh
+npm run consent       # consent request, signer and publish fixtures
+npm run nip46         # signer and URI-file fixtures
+npm run capgrants     # capability grants and task authority
+npm run regrant       # renewed grants and redelegation enforcement
 ```
 
 The `mcp/` tarball is **not published to npm** (it depends on a draft
