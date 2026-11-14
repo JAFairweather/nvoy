@@ -47,7 +47,7 @@ import {
   sanitizeActivity,
   startMemoryViewer,
 } from '../mcp/tools/memory-viewer.mjs'
-import { createPeerGate, createTailscaleWhois, parseAllowedNodes, whoisAddr } from '../mcp/tools/viewer-peer-gate.mjs'
+import { createPeerGate, createTailscaleSelf, createTailscaleWhois, parseAllowedNodes, whoisAddr } from '../mcp/tools/viewer-peer-gate.mjs'
 
 const SNAP_ID = 'c'.repeat(64)
 
@@ -3702,6 +3702,9 @@ await test('tailscale whois reads the LocalAPI over its Unix socket and fails cl
     } else if (addr === '[fd7a::3]:7') {
       res.writeHead(200)
       res.end(JSON.stringify({ Node: {} }))
+    } else if (addr === '[fd7a::6]:7') {
+      res.writeHead(200)
+      res.end(JSON.stringify({ Node: { StableID: 'nGuestCNTRL', Name: 'guest.', Sharer: 4242 } }))
     } else if (addr === '[fd7a::5]:7') {
       res.writeHead(500)
       res.end('boom')
@@ -3713,7 +3716,8 @@ await test('tailscale whois reads the LocalAPI over its Unix socket and fails cl
   await new Promise(r => fake.listen(sock, r))
   try {
     const whois = createTailscaleWhois({ socketPath: sock, timeoutMs: 2000 })
-    assert.deepEqual(await whois('[fd7a::1]:7'), { stableId: 'nPhone1CNTRL', tags: [], name: 'phone.' })
+    assert.deepEqual(await whois('[fd7a::1]:7'), { stableId: 'nPhone1CNTRL', tags: [], name: 'phone.', shared: false })
+    assert.equal((await whois('[fd7a::6]:7')).shared, true)
     assert.equal(seen[0].host, 'local-tailscaled.sock')
     assert(seen[0].url.startsWith('/localapi/v0/whois?addr='))
     assert.equal(await whois('[fd7a::4]:7'), null)
@@ -3721,6 +3725,62 @@ await test('tailscale whois reads the LocalAPI over its Unix socket and fails cl
     await assert.rejects(whois('[fd7a::3]:7'), /names no node/)
     await assert.rejects(whois('[fd7a::5]:7'), /answered 500/)
     await assert.rejects(createTailscaleWhois({ socketPath: join(dir, 'absent.sock') })('[fd7a::1]:7'))
+  } finally {
+    await new Promise(r => fake.close(r))
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await test('tailnet:any stands alone, and admits tailnet devices except the viewer host and shared-in nodes', async () => {
+  assert.deepEqual(parseAllowedNodes('# James, 14 Nov: any device on Tailscale\ntailnet:any\n'), ['tailnet:any'])
+  assert.throws(() => parseAllowedNodes('tailnet:any\nn8DEpXwyZg11CNTRL'), /only allowed-nodes entry/)
+  assert.throws(() => parseAllowedNodes('tailnet:all'), /line 1/)
+  assert.throws(() => createPeerGate({ allowed: ['tailnet:any', 'tag:x'], whois: async () => null, selfId: async () => 'x' }), /only allowed/)
+  assert.throws(() => createPeerGate({ allowed: ['tailnet:any'], whois: async () => null }), /own node ID/)
+  const nodes = {
+    'fd7a::1': { stableId: 'nPhoneCNTRL', tags: [], name: 'phone.', shared: false },
+    'fd7a::2': { stableId: 'nR1CNTRL', tags: ['tag:r1'], name: 'r1.', shared: false },
+    'fd7a::3': { stableId: 'nHostCNTRL', tags: ['tag:herd'], name: 'herd-cloud.', shared: false },
+    'fd7a::4': { stableId: 'nGuestCNTRL', tags: [], name: 'guest.', shared: true },
+  }
+  let selfFails = false
+  const gate = createPeerGate({
+    allowed: ['tailnet:any'],
+    whois: async addr => nodes[addr.replace(/^\[|\]:\d+$/g, '')] ?? null,
+    selfId: async () => { if (selfFails) throw new Error('status refused'); return 'nHostCNTRL' },
+  })
+  assert.equal((await gate('fd7a::1', 1)).ok, true)
+  assert.equal((await gate('fd7a::2', 1)).ok, true)
+  assert.deepEqual(await gate('fd7a::3', 1), { ok: false, status: 403, reason: 'the viewer host itself is not admitted' })
+  assert.deepEqual(await gate('fd7a::4', 1), { ok: false, status: 403, reason: 'device is shared in from another tailnet' })
+  assert.equal((await gate('fd7a::9', 1)).status, 403)
+  selfFails = true
+  nodes['fd7a::5'] = nodes['fd7a::1']
+  assert.equal((await gate('fd7a::5', 1)).status, 503, 'a failed self lookup refuses, it does not admit')
+  selfFails = false
+  assert.equal((await gate('fd7a::5', 1)).ok, true, 'a 503 is not cached')
+
+  const dir = mkdtempSync(join(tmpdir(), 'viewer-ts-self-'))
+  const sock = join(dir, 'tailscaled.sock')
+  let answer = { Self: { ID: 'nHostCNTRL' } }, seen = 0
+  const fake = createPlainHttpServer((req, res) => {
+    seen++
+    assert(req.url.startsWith('/localapi/v0/status'))
+    res.writeHead(answer ? 200 : 500)
+    res.end(JSON.stringify(answer || {}))
+  })
+  await new Promise(r => fake.listen(sock, r))
+  try {
+    answer = null
+    await assert.rejects(createTailscaleSelf({ socketPath: sock })(), /answered 500/)
+    answer = { Self: {} }
+    await assert.rejects(createTailscaleSelf({ socketPath: sock })(), /no self node/)
+    answer = { Self: { ID: 'nHostCNTRL' } }
+    const selfId = createTailscaleSelf({ socketPath: sock })
+    assert.equal(await selfId(), 'nHostCNTRL')
+    const before = seen
+    assert.equal(await selfId(), 'nHostCNTRL')
+    assert.equal(seen, before, 'self ID is asked once')
   } finally {
     await new Promise(r => fake.close(r))
     rmSync(dir, { recursive: true, force: true })

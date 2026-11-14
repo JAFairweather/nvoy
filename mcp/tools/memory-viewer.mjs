@@ -22,7 +22,7 @@ import { createConnection } from 'node:net'
 import { isAbsolute, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
-import { DEFAULT_TAILSCALE_SOCKET, createPeerGate, createTailscaleWhois, parseAllowedNodes } from './viewer-peer-gate.mjs'
+import { DEFAULT_TAILSCALE_SOCKET, createPeerGate, createTailscaleSelf, createTailscaleWhois, parseAllowedNodes } from './viewer-peer-gate.mjs'
 import {
   DEFAULT_DREAM_INTERVAL_SEC,
   DEFAULT_TOPIC_PRESSURE_THRESHOLD,
@@ -11017,7 +11017,7 @@ async function main() {
   if (flags.allowNodesFile) {
     try {
       const allowed = readAllowedNodesFile(flags.allowNodesFile)
-      peerGate = createPeerGate({ allowed, whois: createTailscaleWhois({ socketPath: flags.tailscaleSocket }) })
+      peerGate = createPeerGate({ allowed, whois: createTailscaleWhois({ socketPath: flags.tailscaleSocket }), selfId: createTailscaleSelf({ socketPath: flags.tailscaleSocket }) })
       console.log(`memory-viewer: serving ${allowed.length} allowed tailnet device(s) from ${flags.allowNodesFile}`)
     } catch (err) {
       console.error(`memory-viewer: ${err.message}`)
