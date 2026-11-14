@@ -60,15 +60,31 @@ export function makeBunkerSigner(uriText, clientNsec, options = {}) {
     try { void Promise.allSettled(pool.publish(relays, event)) }
     catch (error) { clearTimeout(timer); pending.delete(id); reject(error); idleClose() }
   })
-  const ready = () => (connected ??= rpc('connect', [pubkey, secret], 15000).catch(() => 'active'))
+  // A refused connect is tolerated: a client the Bunker already knows may be refused a repeat connect
+  // (a spent pairing secret) and still be served. But when a later call then fails, the refusal is the
+  // likely cause (an unpaired client gets 'Unknown client'), so that call's error names it. Only the
+  // fact is kept, never the Bunker's own rejection text: a reply may echo the pairing secret it refused.
+  let connectRefusal
+  const ready = () => (connected ??= (connectRefusal = undefined,
+    rpc('connect', [pubkey, secret], 15000).catch(error => {
+      connectRefusal = /^nip46 connect timed out$/.test(error?.message || '') ? 'connect got no answer from the Bunker' : 'the Bunker refused connect'
+      return 'active'
+    })))
+  const call = async (method, params) => {
+    await ready()
+    try { return await rpc(method, params) } catch (error) {
+      if (!connectRefusal) throw error
+      throw new Error(`${error?.message || error} (${connectRefusal} too; this client may not be paired, so re-pair it)`)
+    }
+  }
   const close = () => {
     closed = true
     for (const { reject, timer } of pending.values()) { clearTimeout(timer); reject(new Error('nip46 signer closed')) }
     pending.clear()
     disconnect()
   }
-  return Object.freeze({ pubkey, close, async getPublicKey() { await ready(); return rpc('get_public_key', []) },
-    async nip44Decrypt(peer, ciphertext) { await ready(); return rpc('nip44_decrypt', [peer, ciphertext]) },
-    async nip44Encrypt(peer, plaintext) { await ready(); return rpc('nip44_encrypt', [peer, plaintext]) },
-    async signEvent(event) { await ready(); return JSON.parse(await rpc('sign_event', [JSON.stringify(event)])) } })
+  return Object.freeze({ pubkey, close, async getPublicKey() { return call('get_public_key', []) },
+    async nip44Decrypt(peer, ciphertext) { return call('nip44_decrypt', [peer, ciphertext]) },
+    async nip44Encrypt(peer, plaintext) { return call('nip44_encrypt', [peer, plaintext]) },
+    async signEvent(event) { return JSON.parse(await call('sign_event', [JSON.stringify(event)])) } })
 }
