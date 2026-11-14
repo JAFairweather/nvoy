@@ -135,6 +135,17 @@ try {
     }
     return lab
   }
+  // The fail-fast above keys on SimplePool's wording for a relay it could not reach. nostr-tools is a caret
+  // dependency, so check the real library still says it (a refused local port; no network), or the fail-fast
+  // would silently fall back to the 60 s wait.
+  {
+    const { SimplePool } = await import('nostr-tools/pool')
+    const real = new SimplePool()
+    const [outcome] = await Promise.allSettled(real.publish(['ws://127.0.0.1:9'], finalizeEvent({ kind: 1, created_at: 1, tags: [], content: 'x' }, clientSk)))
+    try { real.close(['ws://127.0.0.1:9']) } catch { /* best effort */ }
+    check("nostr-tools still resolves an unreachable relay's publish with 'connection failure'",
+      outcome.status === 'fulfilled' && typeof outcome.value === 'string' && outcome.value.startsWith('connection failure'))
+  }
   const labUri = `bunker://${bunkerPub}?relay=wss%3A%2F%2Frelay.invalid&secret=test`
   {
     const lab = relayLab({ publishOutcome: () => 'ok' })
