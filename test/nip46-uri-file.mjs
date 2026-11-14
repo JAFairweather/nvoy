@@ -113,6 +113,61 @@ try {
   retrying.close()
   check('a failed get_public_key is not cached: the next call asks the Bunker again',
     /busy/.test(firstError) && second === bunkerPub && flaky.seen.get_public_key === 2)
+
+  // A4 (14 Nov): a throttled curator's reconnect failed, its subscription silently held no relay, and
+  // SimplePool resolves an unreachable relay's publish with 'connection failure: ...', so sign_event waited out
+  // the full 60 s. A dropped subscription must be re-made, and a request no relay took must fail at once.
+  const relayLab = ({ publishOutcome }) => {
+    const lab = { handler: null, onclose: null, subscriptions: 0, outcome: publishOutcome,
+      subscribeMany(_r, _f, callbacks) { this.handler = callbacks.onevent; this.onclose = callbacks.onclose; this.subscriptions++; return { close() {} } },
+      publish(_r, event) {
+        const request = JSON.parse(nip44.v2.decrypt(event.content, conversation))
+        const answer = () => this.handler(finalizeEvent({ kind: 24133, created_at: 1, tags: [['p', clientPub]],
+          content: nip44.v2.encrypt(JSON.stringify({ id: request.id, result: request.method === 'get_public_key' ? bunkerPub : 'ack' }), conversation) }, bunkerSk))
+        const o = this.outcome(request.method)
+        if (o === 'ok') { queueMicrotask(answer); return [Promise.resolve('')] }
+        if (o === 'unreachable') return [Promise.resolve('connection failure: connection timed out')]
+        if (o === 'refused') return [Promise.reject(new Error('blocked: not allowed'))]
+        if (o === 'slow') { setTimeout(answer, 50); return [Promise.reject(new Error('publish timed out'))] }
+        throw new Error('unexpected outcome')
+      },
+      close() {},
+    }
+    return lab
+  }
+  const labUri = `bunker://${bunkerPub}?relay=wss%3A%2F%2Frelay.invalid&secret=test`
+  {
+    const lab = relayLab({ publishOutcome: () => 'ok' })
+    const s = makeBunkerSigner(labUri, nip19.nsecEncode(clientSk), { idleMs: 60000, pool: lab })
+    await s.getPublicKey()
+    const before = lab.subscriptions
+    lab.onclose?.(['relay connection closed'])
+    check('a subscription every relay dropped is re-made by the next call',
+      await s.nip44Encrypt(bunkerPub, 'x') === 'ack' && lab.subscriptions === before + 1)
+    s.close()
+  }
+  for (const [outcome, label] of [['unreachable', 'an unreachable relay'], ['refused', 'a relay that refused it']]) {
+    let state = 'ok'
+    const lab = relayLab({ publishOutcome: () => state })
+    const s = makeBunkerSigner(labUri, nip19.nsecEncode(clientSk), { idleMs: 60000, pool: lab })
+    await s.getPublicKey()
+    state = outcome
+    const t0 = Date.now(); let err = ''
+    try { await s.signEvent({ kind: 1, created_at: 1, tags: [], content: 'x' }) } catch (error) { err = error.message }
+    check(`a request only ${label} saw fails at once, not after the 60 s timeout`,
+      /no relay took the request/.test(err) && Date.now() - t0 < 2000)
+    s.close()
+  }
+  {
+    let state = 'ok'
+    const lab = relayLab({ publishOutcome: () => state })
+    const s = makeBunkerSigner(labUri, nip19.nsecEncode(clientSk), { idleMs: 60000, pool: lab })
+    await s.getPublicKey()
+    state = 'slow'
+    check('a publish timeout is not taken as lost: a late answer still resolves the call',
+      await s.nip44Encrypt(bunkerPub, 'x') === 'ack')
+    s.close()
+  }
 } finally { rmSync(dir, { recursive: true, force: true }) }
 
 if (failed) process.exit(1)
