@@ -8,6 +8,7 @@ import { appendFileSync, existsSync, readdirSync, renameSync, readFileSync, lsta
 import { resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { createBackoff } from './retry_backoff.mjs'
+import { attemptReply } from './reply_attempt.mjs'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { isTerminalReplyFailure, loadTerminalReplyIds, recordTerminalReply, terminalReplyReason } from './reply_retry.mjs'
 import { childVerdict } from './broker_verdict.mjs'
@@ -128,50 +129,29 @@ function drain() {
         if (announcedProposals.has(key)) continue
         if (terminalReplyIds.has(request)) continue
         if (!proposalRetryAfter.ready(key)) continue
-        const proposed = spawnSync(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-reply.mjs'),
-          '--instance', manifest.id, '--request', request, '--source', source, '--prepare'], { env: childEnv, encoding: 'utf8', timeout: 90000 })
-        if (proposed.status !== 0) {
-          const stderr = String(proposed.stderr || '').trim()
-          if (isTerminalReplyFailure(stderr)) {
-            try {
-              if (recordTerminalReply(terminalRepliesPath, terminalReplyIds, request, stderr))
-                console.error(`instance-broker-daemon: ${source} reply proposal ${request.slice(0, 12)}… terminal (${terminalReplyReason(stderr)})`)
-            } catch (e) { console.error(`instance-broker-daemon: cannot record terminal reply ${request.slice(0, 12)}…: ${e.message || e}`) }
-            continue
-          }
-          proposalRetryAfter.fail(key)
-          console.error(`instance-broker-daemon: ${source} reply proposal ${request.slice(0, 12)}… held: ${stderr}`)
-          continue
-        }
-        proposalRetryAfter.ok(key)
+        const actuator = mode => () => spawnSync(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-reply.mjs'),
+          '--instance', manifest.id, '--request', request, '--source', source, mode], { env: childEnv, encoding: 'utf8', timeout: 90000 })
         // The actuator decides which path applies and says so; the daemon never infers it from the
         // manifest or the instance name. A public event waits for a discrete approval. A private
         // channel-carry reply is enacted now, on the live grant chain that already admitted it —
         // and `--direct` re-checks that for itself, so a wrong answer here cannot open the signer.
-        let verdict = null
-        try { verdict = JSON.parse(String(proposed.stdout || '')) } catch { verdict = null }
-        if (verdict?.approval_required === false && ['nostr-private-reply', 'buzz-channel-reply'].includes(verdict?.action)) {
-          const enacted = spawnSync(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-reply.mjs'),
-            '--instance', manifest.id, '--request', request, '--source', source, '--direct'], { env: childEnv, encoding: 'utf8', timeout: 90000 })
-          if (enacted.status !== 0) {
-            const stderr = String(enacted.stderr || '').trim()
-            if (isTerminalReplyFailure(stderr)) {
-              try {
-                if (recordTerminalReply(terminalRepliesPath, terminalReplyIds, request, stderr))
-                  console.error(`instance-broker-daemon: ${source} reply ${request.slice(0, 12)}… terminal (${terminalReplyReason(stderr)})`)
-              } catch (e) { console.error(`instance-broker-daemon: cannot record terminal reply ${request.slice(0, 12)}…: ${e.message || e}`) }
-            } else {
-              proposalRetryAfter.fail(key)
-              console.error(`instance-broker-daemon: ${source} reply ${request.slice(0, 12)}… held for retry: ${stderr}`)
-            }
-            continue
-          }
+        // The retry wait resets only once the reply is enacted or awaiting approval (reply_attempt.mjs).
+        const outcome = attemptReply({ key, backoff: proposalRetryAfter, prepare: actuator('--prepare'), direct: actuator('--direct'),
+          isTerminal: stderr => isTerminalReplyFailure(stderr),
+          onTerminal: (stderr, phase) => {
+            try {
+              if (recordTerminalReply(terminalRepliesPath, terminalReplyIds, request, stderr))
+                console.error(`instance-broker-daemon: ${source} reply ${phase === 'proposal' ? 'proposal ' : ''}${request.slice(0, 12)}… terminal (${terminalReplyReason(stderr)})`)
+            } catch (e) { console.error(`instance-broker-daemon: cannot record terminal reply ${request.slice(0, 12)}…: ${e.message || e}`) }
+          },
+          log: line => console.error(`instance-broker-daemon: ${source} reply ${request.slice(0, 12)}… ${line}`) })
+        if (outcome === 'enacted') {
           announcedProposals.add(key)
           console.log(`instance-broker-daemon: ${source} reply ${request.slice(0, 12)}… enacted on its live grant chain`)
-          continue
+        } else if (outcome === 'proposed') {
+          announcedProposals.add(key)
+          console.log(`instance-broker-daemon: ${source} reply proposal ${request.slice(0, 12)}… awaiting discrete approval`)
         }
-        announcedProposals.add(key)
-        console.log(`instance-broker-daemon: ${source} reply proposal ${request.slice(0, 12)}… awaiting discrete approval`)
       }
     } catch (e) { if (e.code !== 'ENOENT') console.error(`instance-broker-daemon: ${source} reply queue unavailable: ${e.message}`) }
   }
