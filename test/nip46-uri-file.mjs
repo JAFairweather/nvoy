@@ -40,7 +40,7 @@ try {
     subscribeMany(_relays, _filter, callbacks) { this.handler = callbacks.onevent; this.subscriptions++; return { close: () => { this.closes++ } } },
     publish(_relays, event) {
       const request = JSON.parse(nip44.v2.decrypt(event.content, conversation))
-      const result = request.method === 'get_public_key' ? bunkerPub : 'ack'
+      const result = request.method === 'get_public_key' ? bunkerPub : request.method === 'ping' ? 'pong' : 'ack'
       const response = finalizeEvent({ kind: 24133, created_at: 1, tags: [['p', clientPub]],
         content: nip44.v2.encrypt(JSON.stringify({ id: request.id, result }), conversation) }, bunkerSk)
       queueMicrotask(() => this.handler(response))
@@ -50,11 +50,43 @@ try {
   }
   const signer = makeBunkerSigner(`bunker://${bunkerPub}?relay=wss%3A%2F%2Frelay.invalid&secret=test`, nip19.nsecEncode(clientSk), { pool: fake, idleMs: 5 })
   check('the injected Bunker protocol still resolves the configured identity', await signer.getPublicKey() === bunkerPub)
+  check('the injected Bunker protocol answers a real ping', await signer.ping() === true)
   await new Promise(resolveWait => setTimeout(resolveWait, 20))
   check('a settled one-shot signer closes its subscription and relay pool while idle', fake.closes >= 2)
   const firstSubscriptions = fake.subscriptions
   check('the signer reconnects after idle close for a later operation', await signer.getPublicKey() === bunkerPub && fake.subscriptions > firstSubscriptions)
   signer.close()
+
+  // The health check needs a response for this request and this Bunker, not a
+  // healthy relay socket or an old/foreign event delivered by the relay.
+  for (const mismatch of ['id', 'signer']) {
+    const otherSk = generateSecretKey()
+    const badPool = { handler: null,
+      subscribeMany(_relays, _filter, callbacks) { this.handler = callbacks.onevent; return { close() {} } },
+      publish(_relays, event) {
+        const request = JSON.parse(nip44.v2.decrypt(event.content, conversation))
+        if (request.method === 'ping') {
+          const response = mismatch === 'id'
+            ? finalizeEvent({ kind: 24133, created_at: 1, tags: [['p', clientPub]],
+              content: nip44.v2.encrypt(JSON.stringify({ id: 'old-request', result: 'pong' }), conversation) }, bunkerSk)
+            : finalizeEvent({ kind: 24133, created_at: 1, tags: [['p', clientPub]],
+              content: nip44.v2.encrypt(JSON.stringify({ id: request.id, result: 'pong' }),
+                nip44.v2.utils.getConversationKey(otherSk, clientPub)) }, otherSk)
+          queueMicrotask(() => this.handler(response))
+        } else {
+          const response = finalizeEvent({ kind: 24133, created_at: 1, tags: [['p', clientPub]],
+            content: nip44.v2.encrypt(JSON.stringify({ id: request.id, result: 'ack' }), conversation) }, bunkerSk)
+          queueMicrotask(() => this.handler(response))
+        }
+        return [Promise.resolve('ok')]
+      }, close() {} }
+    const watched = makeBunkerSigner(`bunker://${bunkerPub}?relay=wss%3A%2F%2Frelay.invalid`, nip19.nsecEncode(clientSk),
+      { pool: badPool, pingTimeoutMs: 50, idleMs: 5 })
+    let error = ''
+    try { await watched.ping() } catch (caught) { error = caught.message }
+    watched.close()
+    check(`ping ignores a response with a different ${mismatch}`, /nip46 ping timed out/.test(error))
+  }
 
   // A refused connect: a Bunker that does not know this client (a pairing secret that expired before
   // the first connect) refuses connect and answers every later call 'Unknown client'. The later error

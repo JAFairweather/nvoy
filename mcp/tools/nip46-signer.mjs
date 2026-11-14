@@ -22,6 +22,8 @@ export function makeBunkerSigner(uriText, clientNsec, options = {}) {
   const conversation = nip44.v2.utils.getConversationKey(clientKey, pubkey)
   const pool = options.pool || new SimplePool(), pending = new Map()
   const idleMs = Number.isSafeInteger(options.idleMs) && options.idleMs >= 0 ? options.idleMs : 250
+  const pingTimeoutMs = Number.isSafeInteger(options.pingTimeoutMs) && options.pingTimeoutMs > 0 && options.pingTimeoutMs <= 30000
+    ? options.pingTimeoutMs : 10000
   let subscribed = false, subscription, connected, idleTimer, closed = false
   const disconnect = () => {
     clearTimeout(idleTimer); idleTimer = undefined
@@ -70,9 +72,9 @@ export function makeBunkerSigner(uriText, clientNsec, options = {}) {
       connectRefusal = /^nip46 connect timed out$/.test(error?.message || '') ? 'connect got no answer from the Bunker' : 'the Bunker refused connect'
       return 'active'
     })))
-  const call = async (method, params) => {
+  const call = async (method, params, timeout) => {
     await ready()
-    try { return await rpc(method, params) } catch (error) {
+    try { return await rpc(method, params, timeout) } catch (error) {
       if (!connectRefusal) throw error
       throw new Error(`${error?.message || error} (${connectRefusal} too; this client may not be paired, so re-pair it)`)
     }
@@ -84,6 +86,10 @@ export function makeBunkerSigner(uriText, clientNsec, options = {}) {
     disconnect()
   }
   return Object.freeze({ pubkey, close, async getPublicKey() { return call('get_public_key', []) },
+    async ping() {
+      if (await call('ping', [], pingTimeoutMs) !== 'pong') throw new Error('nip46 ping invalid response')
+      return true
+    },
     async nip44Decrypt(peer, ciphertext) { return call('nip44_decrypt', [peer, ciphertext]) },
     async nip44Encrypt(peer, plaintext) { return call('nip44_encrypt', [peer, plaintext]) },
     async signEvent(event) { return JSON.parse(await call('sign_event', [JSON.stringify(event)])) } })
