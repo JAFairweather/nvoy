@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto'
-import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync, readdirSync } from 'node:fs'
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
@@ -376,6 +376,36 @@ try {
 } catch (error) {
   ok(`an already-answered envelope stops its re-announce (threw: ${error.message})`, false)
 } finally { try { await againClient.close() } catch { /* already gone */ } }
+
+// A read log that cannot be written (crystalclaude, 14 Nov): the reply is still queued, but the agent must be told
+// the envelope was not marked read. Before, the reply said only `queued: true` and the answered envelope went on
+// being announced for hours with nothing pointing at the cause.
+const lockedRuntime = join(root, 'locked-runtime'), lockedId = 'claude-locked-test', lockedPubkey = randomBytes(32).toString('hex')
+mkdirSync(lockedRuntime); mkdirSync(join(lockedRuntime, 'claude-channel-state'))
+writeFileSync(join(manifests, `${lockedId}.json`), JSON.stringify({ ...manifest, id: lockedId, pubkey: lockedPubkey, runtime_dir: lockedRuntime,
+  state_dir: join(root, 'locked-state'), spool_dir: join(root, 'locked-spool') }))
+const lockedEnvelope = '7'.repeat(64)
+writeFileSync(join(lockedRuntime, 'admitted-tasks.jsonl'), JSON.stringify({ ...task, instance: lockedId, envelope: lockedEnvelope,
+  authority: { ...task.authority, scope_subject: lockedPubkey } }) + '\n', { mode: 0o600 })
+writeFileSync(join(lockedRuntime, 'reply-requests.jsonl'), '', { mode: 0o640 })
+const lockedClient = new Client({ name: 'claude-channel-locked', version: '0.1.0' })
+const lockedState = join(lockedRuntime, 'claude-channel-state')
+try {
+  await lockedClient.connect(new StdioClientTransport({ command: process.execPath,
+    args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', lockedId, '--poll-ms', '250', '--renotify-ms', '1000'],
+    env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stderr: 'pipe' }))
+  await lockedClient.callTool({ name: 'nvoy_channel_list', arguments: {} })
+  chmodSync(lockedState, 0o500)   // the channel holds its lock; now no new file can be made in its state dir
+  const answered = JSON.parse((await lockedClient.callTool({ name: 'nvoy_channel_reply', arguments: { envelope: lockedEnvelope, text: 'handled' } })).content[0].text)
+  ok('a reply whose read mark cannot be written is still queued, and says the envelope was not marked read',
+    answered.queued === true && /EACCES|permission/i.test(answered.read_mark_failed || '') &&
+    readFileSync(join(lockedRuntime, 'reply-requests.jsonl'), 'utf8').includes(lockedEnvelope))
+  const again = JSON.parse((await lockedClient.callTool({ name: 'nvoy_channel_reply', arguments: { envelope: lockedEnvelope, text: 'again' } })).content[0].text)
+  ok('a second reply to it is refused as already replied and names the read-mark failure too',
+    again.code === 'NVOY_ALREADY_REPLIED' && Boolean(again.read_mark_failed))
+} catch (error) {
+  ok(`a reply whose read mark fails says so (threw: ${error.message})`, false)
+} finally { try { chmodSync(lockedState, 0o700) } catch { /* best effort */ } try { await lockedClient.close() } catch { /* already gone */ } }
 
 // The `!task` arm of the read guard, which nothing above drives. Dropping it — the tempting
 // `if (!(read || notifiedThisRun.has(envelope) || listedThisRun.has(envelope)))` — passes the rest
