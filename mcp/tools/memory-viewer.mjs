@@ -10,15 +10,19 @@
 //      escapes all HTML and JSON payloads, renders no markdown, follows or creates no links (`<a>`),
 //      and sets a strict Content-Security-Policy (`default-src 'none'`).
 //   4. Listen address and port come from CLI flags (`--host <addr> --port <port>` or `--listen <addr>:<port>`).
-//   5. The viewer's memory_wake also carries the daemon's metadata-only activity ring and agent roster, which
+//   5. Every request passes a device check first (viewer-peer-gate.mjs, Frontier A4): tailscaled names the calling
+//      tailnet device and only devices on --allow-nodes-file are served. Without that file the viewer refuses to
+//      start unless --insecure-no-peer-gate says otherwise (tests and local development only).
+//   6. The viewer's memory_wake also carries the daemon's metadata-only activity ring and agent roster, which
 //      drive the cortex canvas and live Merkle Dreaming & 3-Trigger Curation telemetry.
 
-import { readFileSync, realpathSync } from 'node:fs'
+import { lstatSync, readFileSync, realpathSync } from 'node:fs'
 import { createServer as createHttpServer } from 'node:http'
 import { createConnection } from 'node:net'
 import { isAbsolute, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
+import { DEFAULT_TAILSCALE_SOCKET, createPeerGate, createTailscaleWhois, parseAllowedNodes } from './viewer-peer-gate.mjs'
 import {
   DEFAULT_DREAM_INTERVAL_SEC,
   DEFAULT_TOPIC_PRESSURE_THRESHOLD,
@@ -697,6 +701,8 @@ export function parseViewerFlags(argv) {
   const countFlag = name => args.filter(a => a === name).length
   if (countFlag('--socket') > 1) throw new Error('only one --socket may be specified')
   if (countFlag('--state-file') > 1) throw new Error('only one --state-file may be specified')
+  if (countFlag('--allow-nodes-file') > 1) throw new Error('only one --allow-nodes-file may be specified')
+  if (countFlag('--tailscale-socket') > 1) throw new Error('only one --tailscale-socket may be specified')
   const getFlag = name => {
     const idx = args.indexOf(name)
     return idx < 0 ? '' : String(args[idx + 1] ?? '')
@@ -720,13 +726,32 @@ export function parseViewerFlags(argv) {
   if (!Number.isInteger(pollMs) || pollMs < 100 || pollMs > 300_000) {
     throw new Error('--poll-ms must be an integer between 100 and 300000')
   }
+  const allowRaw = getFlag('--allow-nodes-file')
+  const noGate = args.includes('--insecure-no-peer-gate')
+  if (allowRaw && noGate) throw new Error('--allow-nodes-file and --insecure-no-peer-gate are exclusive')
+  if (!allowRaw && !noGate) {
+    throw new Error('--allow-nodes-file <absolute-path> is required (or --insecure-no-peer-gate for local testing)')
+  }
+  if (allowRaw && !isAbsolute(allowRaw)) throw new Error('--allow-nodes-file <absolute-path> must be an absolute path')
+  const tsRaw = getFlag('--tailscale-socket')
+  if (tsRaw && !isAbsolute(tsRaw)) throw new Error('--tailscale-socket <absolute-path> must be an absolute path')
   return {
     socketPath: resolve(socketRaw),
     ...(stateFileRaw ? { stateFile: resolve(stateFileRaw) } : {}),
     host,
     port,
     pollMs,
+    ...(allowRaw ? { allowNodesFile: resolve(allowRaw), tailscaleSocket: tsRaw ? resolve(tsRaw) : DEFAULT_TAILSCALE_SOCKET } : {}),
   }
+}
+
+// The allowlist file is root's statement of which devices may look: a regular file, not a link, that nobody but
+// its owner can rewrite.
+export function readAllowedNodesFile(path) {
+  const st = lstatSync(path)
+  if (!st.isFile()) throw new Error(`${path} is not a regular file`)
+  if (st.mode & 0o022) throw new Error(`${path} is writable by group or others`)
+  return parseAllowedNodes(readFileSync(path, 'utf8'))
 }
 
 export function sanitizeMemoryRecord(rec) {
@@ -9839,6 +9864,8 @@ export async function startMemoryViewer({
   host,
   port,
   pollMs = DEFAULT_POLL_MS,
+  // check(remoteAddress, remotePort) from viewer-peer-gate.mjs; when set, nothing is served until it says yes.
+  peerGate = undefined,
   // Clock in epoch seconds for poll timestamps and trend windows; tests inject a fixed clock.
   now = () => Math.floor(Date.now() / 1000),
 } = {}) {
@@ -10594,7 +10621,25 @@ export async function startMemoryViewer({
     'Cache-Control': 'no-store',
   }
 
+  const refuse = (res, status, text) => {
+    res.writeHead(status, { ...securityHeaders, 'Content-Type': 'text/plain; charset=utf-8' })
+    res.end(text)
+  }
   const httpServer = createHttpServer((req, res) => {
+    if (!peerGate) return serve(req, res)
+    Promise.resolve()
+      .then(() => peerGate(req.socket.remoteAddress, req.socket.remotePort))
+      .then(
+        v => {
+          if (v && v.ok === true) return serve(req, res)
+          if (v && v.status === 503) return refuse(res, 503, 'The device check is unavailable; nothing is served until it works.\n')
+          return refuse(res, 403, 'This device is not allowed to view Hive memory.\n')
+        },
+        () => refuse(res, 503, 'The device check is unavailable; nothing is served until it works.\n')
+      )
+  })
+
+  function serve(req, res) {
     const method = req.method || 'GET'
     if (method !== 'GET' && method !== 'HEAD') {
       res.writeHead(405, { ...securityHeaders, Allow: 'GET, HEAD', 'Content-Type': 'text/plain; charset=utf-8' })
@@ -10911,7 +10956,7 @@ export async function startMemoryViewer({
 
     res.writeHead(404, { ...securityHeaders, 'Content-Type': 'text/plain; charset=utf-8' })
     res.end('Not Found\n')
-  })
+  }
 
   await new Promise((resolveListen, rejectListen) => {
     httpServer.once('error', rejectListen)
@@ -10968,8 +11013,22 @@ async function main() {
     process.exit(1)
   }
 
+  let peerGate
+  if (flags.allowNodesFile) {
+    try {
+      const allowed = readAllowedNodesFile(flags.allowNodesFile)
+      peerGate = createPeerGate({ allowed, whois: createTailscaleWhois({ socketPath: flags.tailscaleSocket }) })
+      console.log(`memory-viewer: serving ${allowed.length} allowed tailnet device(s) from ${flags.allowNodesFile}`)
+    } catch (err) {
+      console.error(`memory-viewer: ${err.message}`)
+      process.exit(1)
+    }
+  } else {
+    console.error('memory-viewer: WARNING --insecure-no-peer-gate: every caller is served')
+  }
+
   try {
-    const viewer = await startMemoryViewer(flags)
+    const viewer = await startMemoryViewer({ ...flags, peerGate })
     const fmtHost = viewer.host.includes(':') ? `[${viewer.host}]` : viewer.host
     console.log(`memory-viewer: listening on http://${fmtHost}:${viewer.port} (socket ${flags.socketPath})`)
     const shutdown = async () => {
