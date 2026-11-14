@@ -83,7 +83,12 @@ export function makeBunkerSigner(uriText, clientNsec, options = {}) {
     pending.clear()
     disconnect()
   }
-  return Object.freeze({ pubkey, close, async getPublicKey() { return call('get_public_key', []) },
+  // One get_public_key per session: callers ask before every action (and openBuzzSession asks again),
+  // and each ask is a Bunker request. A successful answer is kept; a failure is not, so the next call
+  // asks again.
+  let publicKey
+  const askPublicKey = () => (publicKey ??= call('get_public_key', []).catch(error => { publicKey = undefined; throw error }))
+  return Object.freeze({ pubkey, close, getPublicKey: askPublicKey,
     async nip44Decrypt(peer, ciphertext) { return call('nip44_decrypt', [peer, ciphertext]) },
     async nip44Encrypt(peer, plaintext) { return call('nip44_encrypt', [peer, plaintext]) },
     async signEvent(event) { return JSON.parse(await call('sign_event', [JSON.stringify(event)])) } })

@@ -53,7 +53,7 @@ try {
   await new Promise(resolveWait => setTimeout(resolveWait, 20))
   check('a settled one-shot signer closes its subscription and relay pool while idle', fake.closes >= 2)
   const firstSubscriptions = fake.subscriptions
-  check('the signer reconnects after idle close for a later operation', await signer.getPublicKey() === bunkerPub && fake.subscriptions > firstSubscriptions)
+  check('the signer reconnects after idle close for a later operation', await signer.nip44Encrypt(bunkerPub, 'x') === 'ack' && fake.subscriptions > firstSubscriptions)
   signer.close()
 
   // A refused connect: a Bunker that does not know this client (a pairing secret that expired before
@@ -91,6 +91,28 @@ try {
     pool: bunkerAnswering(method => method === 'connect' ? { error: 'invalid secret' } : { result: bunkerPub }) })
   check('a known client refused only a repeat connect is still served', await known.getPublicKey() === bunkerPub)
   known.close()
+
+  // One get_public_key per session (14 Nov: about 140k Bunker actions in a day, mostly get_public_key).
+  // A success is kept for the session's life; a failure is not, so the next call asks again.
+  const counted = (fail = 0) => { const seen = { get_public_key: 0, connect: 0 }; let left = fail
+    return { seen, pool: bunkerAnswering(method => { seen[method] = (seen[method] || 0) + 1
+      if (method === 'get_public_key' && left > 0) { left--; return { error: 'busy' } }
+      return method === 'get_public_key' ? { result: bunkerPub } : { result: 'ack' } }) } }
+  const once = counted()
+  const cached = makeBunkerSigner(spentUri, nip19.nsecEncode(clientSk), { idleMs: 5, pool: once.pool })
+  const answers = [await cached.getPublicKey(), await cached.getPublicKey(), await cached.getPublicKey()]
+  const concurrent = await Promise.all([cached.getPublicKey(), cached.getPublicKey()])
+  cached.close()
+  check('get_public_key is asked once per signer, however often callers ask',
+    once.seen.get_public_key === 1 && [...answers, ...concurrent].every(pk => pk === bunkerPub))
+  const flaky = counted(1)
+  const retrying = makeBunkerSigner(spentUri, nip19.nsecEncode(clientSk), { idleMs: 5, pool: flaky.pool })
+  let firstError = ''
+  try { await retrying.getPublicKey() } catch (error) { firstError = error.message }
+  const second = await retrying.getPublicKey()
+  retrying.close()
+  check('a failed get_public_key is not cached: the next call asks the Bunker again',
+    /busy/.test(firstError) && second === bunkerPub && flaky.seen.get_public_key === 2)
 } finally { rmSync(dir, { recursive: true, force: true }) }
 
 if (failed) process.exit(1)

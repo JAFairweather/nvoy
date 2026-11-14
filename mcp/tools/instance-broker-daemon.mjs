@@ -7,6 +7,8 @@
 import { appendFileSync, existsSync, readdirSync, renameSync, readFileSync, lstatSync, rmSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
+import { createBackoff } from './retry_backoff.mjs'
+import { attemptReply } from './reply_attempt.mjs'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { isTerminalReplyFailure, loadTerminalReplyIds, recordTerminalReply, terminalReplyReason } from './reply_retry.mjs'
 import { childVerdict } from './broker_verdict.mjs'
@@ -32,8 +34,8 @@ const broker = resolve(new URL('.', import.meta.url).pathname, 'instance-broker.
 const nativeBroker = resolve(new URL('.', import.meta.url).pathname, 'instance-broker-native.mjs')
 const childEnv = { PATH: process.env.PATH || '', NVOY_INSTANCE_ROOT: root, NVOY_BROKER_CREDENTIAL: process.env.NVOY_BROKER_CREDENTIAL,
   ...(process.env.NVOY_BUNKER_URI_FILE ? { NVOY_BUNKER_URI_FILE: process.env.NVOY_BUNKER_URI_FILE } : {}) }
-const retryAfter = new Map()
-const proposalRetryAfter = new Map()
+const retryAfter = createBackoff()
+const proposalRetryAfter = createBackoff()
 const announcedProposals = new Set()
 // Agent-initiated posts (nvoy_channel_post). A refusal by the manifest or the hourly cap is final:
 // recorded by id, with no content, so the queue is not re-proposed every tick or after a restart.
@@ -56,6 +58,7 @@ try {
 const isTerminalMemory = stderr => /memory refused:|memory request has an invalid|memory record does not bind/.test(stderr)
 const profileDone = new Set()
 const profileRetryAfter = new Map()
+const profileBackoff = createBackoff()
 let profileActive = null
 // Public relays still pending are tried again on a slow clock, across restarts.
 const PROFILE_PUBLIC_RETRY_MS = 10 * 60 * 1000
@@ -95,16 +98,16 @@ function drain() {
   }).sort((a, b) => b.observed - a.observed || a.envelope.localeCompare(b.envelope))
   for (const item of pending) {
     const key = `${item.native ? 'buzz:' : ''}${item.envelope}`
-    if ((retryAfter.get(key) || 0) > Date.now()) continue
+    if (!retryAfter.ready(key)) continue
     const args = item.native ? [nativeBroker, 'deliver', '--instance', manifest.id, '--event', item.envelope]
       : [broker, 'deliver', '--instance', manifest.id, '--envelope', item.envelope]
     const r = spawnSync(process.execPath, args, { env: childEnv, encoding: 'utf8', timeout: 90000 })
     const verdict = childVerdict(r)
     if (r.status !== 0) {
-      retryAfter.set(key, Date.now() + 5000)
+      retryAfter.fail(key)
       console.error(`instance-broker-daemon: ${item.envelope.slice(0, 12)}… held for retry: ${verdict.join(' | ') || `exit ${r.status ?? 'signal'}: ${String(r.stderr || '').trim().slice(0, 240)}`}`)
     } else {
-      retryAfter.delete(key)
+      retryAfter.ok(key)
       // The funnel's only record of what became of a heard message: admitted, or why not.
       for (const line of verdict) console.log(`instance-broker-daemon: ${line}`)
     }
@@ -125,51 +128,30 @@ function drain() {
         const key = `${source}:${request}`
         if (announcedProposals.has(key)) continue
         if (terminalReplyIds.has(request)) continue
-        if ((proposalRetryAfter.get(key) || 0) > Date.now()) continue
-        const proposed = spawnSync(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-reply.mjs'),
-          '--instance', manifest.id, '--request', request, '--source', source, '--prepare'], { env: childEnv, encoding: 'utf8', timeout: 90000 })
-        if (proposed.status !== 0) {
-          const stderr = String(proposed.stderr || '').trim()
-          if (isTerminalReplyFailure(stderr)) {
-            try {
-              if (recordTerminalReply(terminalRepliesPath, terminalReplyIds, request, stderr))
-                console.error(`instance-broker-daemon: ${source} reply proposal ${request.slice(0, 12)}… terminal (${terminalReplyReason(stderr)})`)
-            } catch (e) { console.error(`instance-broker-daemon: cannot record terminal reply ${request.slice(0, 12)}…: ${e.message || e}`) }
-            continue
-          }
-          proposalRetryAfter.set(key, Date.now() + 5000)
-          console.error(`instance-broker-daemon: ${source} reply proposal ${request.slice(0, 12)}… held: ${stderr}`)
-          continue
-        }
-        proposalRetryAfter.delete(key)
+        if (!proposalRetryAfter.ready(key)) continue
+        const actuator = mode => () => spawnSync(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-reply.mjs'),
+          '--instance', manifest.id, '--request', request, '--source', source, mode], { env: childEnv, encoding: 'utf8', timeout: 90000 })
         // The actuator decides which path applies and says so; the daemon never infers it from the
         // manifest or the instance name. A public event waits for a discrete approval. A private
         // channel-carry reply is enacted now, on the live grant chain that already admitted it —
         // and `--direct` re-checks that for itself, so a wrong answer here cannot open the signer.
-        let verdict = null
-        try { verdict = JSON.parse(String(proposed.stdout || '')) } catch { verdict = null }
-        if (verdict?.approval_required === false && ['nostr-private-reply', 'buzz-channel-reply'].includes(verdict?.action)) {
-          const enacted = spawnSync(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-reply.mjs'),
-            '--instance', manifest.id, '--request', request, '--source', source, '--direct'], { env: childEnv, encoding: 'utf8', timeout: 90000 })
-          if (enacted.status !== 0) {
-            const stderr = String(enacted.stderr || '').trim()
-            if (isTerminalReplyFailure(stderr)) {
-              try {
-                if (recordTerminalReply(terminalRepliesPath, terminalReplyIds, request, stderr))
-                  console.error(`instance-broker-daemon: ${source} reply ${request.slice(0, 12)}… terminal (${terminalReplyReason(stderr)})`)
-              } catch (e) { console.error(`instance-broker-daemon: cannot record terminal reply ${request.slice(0, 12)}…: ${e.message || e}`) }
-            } else {
-              proposalRetryAfter.set(key, Date.now() + 5000)
-              console.error(`instance-broker-daemon: ${source} reply ${request.slice(0, 12)}… held for retry: ${stderr}`)
-            }
-            continue
-          }
+        // The retry wait resets only once the reply is enacted or awaiting approval (reply_attempt.mjs).
+        const outcome = attemptReply({ key, backoff: proposalRetryAfter, prepare: actuator('--prepare'), direct: actuator('--direct'),
+          isTerminal: stderr => isTerminalReplyFailure(stderr),
+          onTerminal: (stderr, phase) => {
+            try {
+              if (recordTerminalReply(terminalRepliesPath, terminalReplyIds, request, stderr))
+                console.error(`instance-broker-daemon: ${source} reply ${phase === 'proposal' ? 'proposal ' : ''}${request.slice(0, 12)}… terminal (${terminalReplyReason(stderr)})`)
+            } catch (e) { console.error(`instance-broker-daemon: cannot record terminal reply ${request.slice(0, 12)}…: ${e.message || e}`) }
+          },
+          log: line => console.error(`instance-broker-daemon: ${source} reply ${request.slice(0, 12)}… ${line}`) })
+        if (outcome === 'enacted') {
           announcedProposals.add(key)
           console.log(`instance-broker-daemon: ${source} reply ${request.slice(0, 12)}… enacted on its live grant chain`)
-          continue
+        } else if (outcome === 'proposed') {
+          announcedProposals.add(key)
+          console.log(`instance-broker-daemon: ${source} reply proposal ${request.slice(0, 12)}… awaiting discrete approval`)
         }
-        announcedProposals.add(key)
-        console.log(`instance-broker-daemon: ${source} reply proposal ${request.slice(0, 12)}… awaiting discrete approval`)
       }
     } catch (e) { if (e.code !== 'ENOENT') console.error(`instance-broker-daemon: ${source} reply queue unavailable: ${e.message}`) }
   }
@@ -184,11 +166,11 @@ function drainPosts() {
   } catch (e) { if (e.code !== 'ENOENT') console.error(`instance-broker-daemon: post queue unavailable: ${e.message}`); return }
   for (const request of ids) {
     const key = `post:${request}`
-    if (postDone.has(request) || (proposalRetryAfter.get(key) || 0) > Date.now()) continue
+    if (postDone.has(request) || !proposalRetryAfter.ready(key)) continue
     const r = spawnSync(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-post.mjs'),
       '--instance', manifest.id, '--request', request], { env: childEnv, encoding: 'utf8', timeout: 90000 })
     const stderr = String(r.stderr || '').trim()
-    if (r.status === 0) { postDone.add(request); proposalRetryAfter.delete(key); if (/^instance-broker-post: posted/.test(r.stdout)) console.log(r.stdout.trim()); continue }
+    if (r.status === 0) { postDone.add(request); proposalRetryAfter.ok(key); if (/^instance-broker-post: posted/.test(r.stdout)) console.log(r.stdout.trim()); continue }
     if (isTerminalPost(stderr)) {
       postDone.add(request)
       try { appendFileSync(terminalPostsPath, JSON.stringify({ version: 1, type: 'terminal-post', id: request, at: Date.now() }) + '\n', { mode: 0o600 }) }
@@ -196,7 +178,7 @@ function drainPosts() {
       console.error(`instance-broker-daemon: post ${request.slice(0, 12)}… terminal: ${stderr.replace(/^instance-broker-post: /, '')}`)
       continue
     }
-    proposalRetryAfter.set(key, Date.now() + 5000)
+    proposalRetryAfter.fail(key)
     console.error(`instance-broker-daemon: post ${request.slice(0, 12)}… held for retry: ${stderr}`)
   }
 }
@@ -241,12 +223,12 @@ function drainMemory() {
     if (!MEMORY_REQUEST_FILE.test(name)) continue
     const request = name.slice(0, 32), key = `memory:${request}`
     if (memoryDone.has(request)) { unlink(name); continue }
-    if ((proposalRetryAfter.get(key) || 0) > Date.now()) continue
+    if (!proposalRetryAfter.ready(key)) continue
     const r = spawnSync(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-memory.mjs'),
       '--instance', manifest.id, '--request', request], { env: childEnv, encoding: 'utf8', timeout: 90000 })
     const stderr = String(r.stderr || '').trim()
     if (r.status === 0) {
-      memoryDone.add(request); proposalRetryAfter.delete(key); unlink(name)
+      memoryDone.add(request); proposalRetryAfter.ok(key); unlink(name)
       if (/^instance-broker-memory: (claimed|withdrew)/.test(r.stdout)) console.log(r.stdout.trim())
       continue
     }
@@ -258,7 +240,7 @@ function drainMemory() {
       console.error(`instance-broker-daemon: memory ${request.slice(0, 12)}… terminal: ${stderr.replace(/^instance-broker-memory: /, '')}`)
       continue
     }
-    proposalRetryAfter.set(key, Date.now() + 5000)
+    proposalRetryAfter.fail(key)
     console.error(`instance-broker-daemon: memory ${request.slice(0, 12)}… held for retry: ${stderr}`)
   }
 }
@@ -287,13 +269,13 @@ function drainProfiles() {
       profileActive = null
       if (code === 0) {
         profileDone.add(request)
-        profileRetryAfter.delete(request)
+        profileRetryAfter.delete(request); profileBackoff.ok(request)
         console.log(`instance-broker-daemon: profile ${request.slice(0, 12)}… complete`)
       } else if (code === PROFILE_PUBLIC_RETRY_EXIT) {
         profileRetryAfter.set(request, Date.now() + PROFILE_PUBLIC_RETRY_MS)
         console.log(`instance-broker-daemon: profile ${request.slice(0, 12)}… on Buzz; public relays pending, retrying in 10 min`)
       } else {
-        profileRetryAfter.set(request, Date.now() + 5000)
+        profileRetryAfter.set(request, Date.now() + profileBackoff.fail(request))
         console.error(`instance-broker-daemon: profile ${request.slice(0, 12)}… held for retry: ${String(error?.message || stderr || `exit ${code}`).trim().slice(0, 240)}`)
       }
     }
