@@ -60,7 +60,7 @@ const clientConfig = (value, mode = 0o600) => secretFile(join(mkdtempSync(join(r
 const fakeBin = join(root, 'bin')
 mkdirSync(fakeBin, { mode: 0o700 })
 const launcherEnv = { ...process.env, HOME: own, PATH: `${fakeBin}:${process.env.PATH}`, HARNESS_WATCH_MS: '50', HARNESS_RETRY_MS: '100', OPENAI_API_KEY: 'sk-proj-live-value',
-  HARNESS_TERMINAL: 'tmux', HARNESS_HERDR_BIN: '/nonexistent/herdr' }
+  HARNESS_TERMINAL: 'tmux', HARNESS_HERDR_BIN: '/nonexistent/herdr', HERDR_PANE_ID: '' }
 const refused = (value, pattern, mode) => {
   const r = spawnSync(process.execPath, ['mcp/tools/pi-harness.mjs', '--instance', 'pd-test', '--config', clientConfig(value, mode)], { cwd: resolve('.'), encoding: 'utf8', env: launcherEnv, timeout: 10000 })
   return r.status === 1 && pattern.test(r.stderr) && !/PRIVATE-KEY|CHATGPT-TOKEN|sk-proj-live/.test(r.stdout + r.stderr)
@@ -230,6 +230,7 @@ function fakePi() {
   pi.sendUserMessage = (text, options) => pi.sent.push({ text, options })
   pi.ctx = { hasUI: true, ui: { setStatus: (key, text) => pi.statuses.push(`${key}=${text}`) } }
   pi.start = () => pi.handlers.get('session_start')({ type: 'session_start', reason: 'startup' }, pi.ctx)
+  pi.beforeStart = (event = { type: 'before_agent_start' }) => pi.handlers.get('before_agent_start')?.(event, pi.ctx)
   pi.stop = () => pi.handlers.get('session_shutdown')({ type: 'session_shutdown', reason: 'quit' }, pi.ctx)
   return pi
 }
@@ -350,6 +351,91 @@ for (const [how, config] of [['the local bridge', localConfig], ['ssh with the r
   harness.stop()
 }
 ok('the ssh reader is reached with the read key and nothing else', readText(join(root, 'ssh-args.log')).split('\n').some(line => line.includes(`-i ${readKey} pd-test@hive.example`) && line.includes(`UserKnownHostsFile=${knownHosts}`)))
+{
+  // Per-session startup wake digest for Pi (q-197): runs at session_start on the seat reader, injects once on before_agent_start, surfaces errors.
+  const wakeDir = mkdtempSync(join(root, 'pi-wake-'))
+  const wakeLogPath = join(wakeDir, 'read-log.ndjson'), wakeModePath = join(wakeDir, 'mode')
+  const wakeReader = secretFile(join(wakeDir, 'wake-reader'), `#!${process.execPath}
+const { appendFileSync, existsSync, readFileSync } = require('node:fs')
+const mode = existsSync(${JSON.stringify(wakeModePath)}) ? readFileSync(${JSON.stringify(wakeModePath)}, 'utf8').trim() : 'ok'
+if (mode === 'exit255') { process.stderr.write('Connection refused by hive-memory\\n'); process.exit(255) }
+if (mode === 'secret') { process.stderr.write('leak sk-proj-synthetic-secret-value-1234567890\\n'); process.exit(1) }
+let buf = ''
+process.stdin.on('data', chunk => {
+  buf += chunk
+  let nl
+  while ((nl = buf.indexOf('\\n')) >= 0) {
+    const m = JSON.parse(buf.slice(0, nl)); buf = buf.slice(nl + 1)
+    if (m.id === undefined) continue
+    if (m.method === 'initialize') {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: { protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'stub', version: '1' } } }) + '\\n')
+      continue
+    }
+    appendFileSync(${JSON.stringify(wakeLogPath)}, JSON.stringify({ seat: 'pd-test', op: m.params.name, args: m.params.arguments }) + '\\n')
+    const payload = mode === 'nocanon'
+      ? { store_state: { state: 'READY' }, counts: { canon_shown: 0, ops_shown: 2 }, digest: 'no canon' }
+      : { store_state: { state: 'READY' }, counts: { canon_shown: 2, ops_shown: 4 }, digest: '=== HIVE WAKE DIGEST ===\\n- [canon] keep seat reader' }
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: { content: [{ type: 'text', text: JSON.stringify(payload) }] } }) + '\\n')
+  }
+})
+`, 0o700)
+  const wakeRows = () => readText(wakeLogPath).trim().split('\n').filter(Boolean).map(JSON.parse)
+  const wakeStateDir = join(wakeDir, 'st')
+  const wakeCfg = readPiClientConfig(clientConfig({ ...client, state_dir: wakeStateDir, recall: 'local' }), 'pd-test', own, { bridge: wakeReader })
+  const wPi = fakePi(), wLogs = []
+  const wHarness = createPiHarness({ pi: wPi, config: wakeCfg, ssh: fakeSsh, log: line => wLogs.push(line) })
+  wPi.on('session_start', (_e, ctx) => wHarness.start(ctx))
+  wPi.on('before_agent_start', e => wHarness.beforeAgentStart(e))
+  wPi.on('session_shutdown', () => wHarness.stop())
+  ok('before session_start, Pi recall runs no wake', wakeRows().length === 0)
+  wPi.start()
+  ok('session_start immediately calls memory_wake on the seat reader and logs readiness without touching the channel',
+    await waitFor(() => wakeRows().length === 1 && wLogs.some(l => /memory wake ready \(canon=2, ops=4\)/.test(l))) &&
+    wakeRows()[0].op === 'memory_wake' && wakeRows()[0].args.max_chars === 3500 && wHarness.channel.spawned() === 0)
+  const skippedCustom = await wPi.beforeStart({ type: 'before_agent_start', messageType: 'custom' })
+  const injected1 = await wPi.beforeStart({ type: 'before_agent_start' })
+  const injected2 = await wPi.beforeStart({ type: 'before_agent_start' })
+  ok('before_agent_start skips custom messages, injects the hidden wake digest once on the first turn, and leaves later turns untouched',
+    skippedCustom === undefined && injected1?.message?.customType === 'hive-memory' && injected1?.message?.display === false &&
+    /Hive memory wake digest[\s\S]*keep seat reader/.test(injected1?.message?.content || '') && injected2 === undefined && wakeRows().length === 1)
+  wPi.stop()
+  await waitFor(() => !existsSync(lockPath), 5000)
+
+  // A fresh session runs a fresh wake; when the reader fails, startup proceeds and surfaces the error in logs, UI status and context.
+  writeFileSync(wakeModePath, 'exit255')
+  wPi.start()
+  ok('when the Pi recall reader fails on a fresh session, startup proceeds and surfaces the error in logs and UI status',
+    await waitFor(() => wLogs.some(l => /memory wake FAILED: .*Connection refused/.test(l)) && wPi.statuses.some(s => /listening \(memory wake failed\)/.test(s))))
+  const errTurn = await wPi.beforeStart({ type: 'before_agent_start' })
+  ok('a failed Pi startup wake injects the failure notice instructing a report to @Neil',
+    /Hive memory wake FAILED at session start/.test(errTurn?.message?.content || '') && /mentioning @Neil/.test(errTurn?.message?.content || ''))
+  wPi.stop()
+  await waitFor(() => !existsSync(lockPath), 5000)
+
+  writeFileSync(wakeModePath, 'secret')
+  wPi.start()
+  await waitFor(() => wLogs.filter(l => /memory wake FAILED/.test(l)).length >= 2)
+  const redactedTurn = await wPi.beforeStart({ type: 'before_agent_start' })
+  ok('secret-like text in a failed Pi wake error is redacted from logs and session context',
+    /\[redacted secret-like error text\]/.test(redactedTurn?.message?.content || '') &&
+    !/sk-proj-synthetic-secret-value/.test(wLogs.join('\n') + JSON.stringify(redactedTurn)))
+  wPi.stop()
+  await waitFor(() => !existsSync(lockPath), 5000)
+
+  // Also verify nvoyPiHarness over SSH read-key records wake at session_start.
+  const sshStateDir = join(wakeDir, 'st-ssh')
+  const sshWakeConfigPath = clientConfig({ ...client, state_dir: sshStateDir, recall: recallObject })
+  process.env.NVOY_PI_HARNESS_CONFIG = sshWakeConfigPath
+  const sshPi = fakePi()
+  const sshHarness = await nvoyPiHarness(sshPi)
+  sshPi.start()
+  const sshTurn = await sshPi.beforeStart({ type: 'before_agent_start' })
+  ok('nvoyPiHarness over SSH read-key runs memory_wake at session_start and injects the reader digest on first turn',
+    /Hive memory wake digest[\s\S]*reader via-ssh memory_wake \{"max_chars":3500\}/.test(sshTurn?.message?.content || '') &&
+    sshHarness.channel.spawned() === 0)
+  sshHarness.dispose()
+  await waitFor(() => !existsSync(lockPath), 5000)
+}
 process.env.NVOY_PI_HARNESS_CONFIG = configPath
 
 rmSync(root, { recursive: true, force: true })

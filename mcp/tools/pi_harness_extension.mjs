@@ -26,6 +26,7 @@ import { instanceId } from './runtime_manifest.mjs'
 import { memoryToolBase } from './agent_memory.mjs'
 import { MEMORY_TOOL_SPECS } from './memory.mjs'
 import { codexTurnText, RECALL_TOOLS } from './harness_session.mjs'
+import { runSessionWakeCall, WAKE_MAX_CHARS } from './recall-wake.mjs'
 import { feedCursor, followWakeFeed } from './wake_feed_client.mjs'
 
 // Mirrors codex-channel-mcp.mjs's tools/list, which is what the fleet enforces. pi validates tool
@@ -223,17 +224,45 @@ export function createPiHarness({ pi, config, ssh = SSH, log: logLine }) {
     // Idempotent: a reload or session switch shuts the old run down before the next one starts.
     start(ctx) {
       if (run) return
-      const current = run = { stopping: false }
-      const status = text => { if (ctx?.hasUI) ctx.ui.setStatus('nvoy', `nvoy ${config.id}: ${text}`) }
+      let wakeFailed = false, lastState = 'connecting'
+      const current = run = { stopping: false, wake: null, wakeOutcome: null, wakeInjected: false }
+      const status = text => {
+        lastState = text
+        if (ctx?.hasUI) ctx.ui.setStatus('nvoy', `nvoy ${config.id}: ${text}${wakeFailed ? ' (memory wake failed)' : ''}`)
+      }
       const delivered = new Set(existsSync(deliveredPath)
         ? readFileSync(deliveredPath, 'utf8').split('\n').filter(Boolean).map(line => { try { return JSON.parse(line).envelope } catch { return '' } }) : [])
       const cursor = feedCursor(resolve(privateDir, 'feed-cursor.json'), config.id)
       status('connecting')
+      if (reader) {
+        current.wake = runSessionWakeCall(args => reader.call('memory_wake', args), { maxChars: WAKE_MAX_CHARS }).then(outcome => {
+          if (current.stopping) return outcome
+          current.wakeOutcome = outcome
+          if (outcome.ok) {
+            log(`memory wake ready (${outcome.summary})`)
+          } else {
+            wakeFailed = true
+            log(`memory wake FAILED: ${outcome.error}`)
+            status(lastState)
+          }
+          return outcome
+        })
+      }
       followWakeFeed({ config, cursor, ssh, env, children, stopping: () => current.stopping,
         log: message => { log(message); if (message === 'wake feed connected') status('listening'); else if (/reconnecting/.test(message)) status('reconnecting') },
         onAdmitted: row => inject(row, delivered, cursor),
         onConnected: n => { if (n > 1) channel.reset('the wake feed reconnected') } })
       log(`${config.id} session ready; admitted messages will be injected into it`)
+    },
+    beforeAgentStart(event) {
+      if (!run || !reader || run.wakeInjected || event?.messageType === 'custom') return undefined
+      const active = run
+      active.wakeInjected = true
+      const format = outcome => outcome?.context
+        ? { message: { customType: 'hive-memory', content: outcome.context, display: false } }
+        : undefined
+      if (active.wakeOutcome) return format(active.wakeOutcome)
+      return active.wake ? active.wake.then(format) : undefined
     },
     stop() {
       if (run) run.stopping = true
@@ -262,6 +291,7 @@ export default async function nvoyPiHarness(pi) {
   }
   // Session shutdown is restartable: only dispose ends it for good.
   detach.push(pi.on('session_start', (_event, ctx) => { if (!disposed) harness.start(ctx) }))
+  detach.push(pi.on('before_agent_start', event => { if (!disposed) return harness.beforeAgentStart(event) }))
   detach.push(pi.on('session_shutdown', () => harness.stop()))
   return harness
 }
