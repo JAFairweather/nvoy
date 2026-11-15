@@ -91,6 +91,7 @@ ok('a changed row no longer matches its record', !postPublished(state, { ...norm
 ok('a malformed id reads nothing', !postPublished(state, { ...normal[0], id: '../x' }) && !replyFinished(state, { ...replied[0], id: '../x' }))
 ok('a reply whose receipt was used is done', replied.every(r => replyFinished(state, r)))
 ok('a reply still holding its receipt is not done', !replyFinished(state, replyPending))
+ok('a reply whose receipt is spelled in capitals is not done, as the child would look for another file', !replyFinished(state, { ...replied[0], receipt: replied[0].receipt.toUpperCase() }))
 ok('a reply with a malformed receipt is not done', !replyFinished(state, { ...replied[0], receipt: '../../x' }))
 const firsts = firstRows(readFileSync(join(run, 'post-requests.jsonl'), 'utf8'))
 ok('the first row of a repeated id is the one kept, and a partial line is skipped', firsts.size === posts.length && firsts.get(normal[0].id).content === 'hello')

@@ -57,7 +57,8 @@ export function postPublished(stateDir, row) {
 }
 
 export function replyFinished(stateDir, row) {
-  const id = row?.id, receipt = typeof row?.receipt === 'string' ? row.receipt.toLowerCase() : ''
+  // The receipt exactly as queued, as the child builds its path: an id it would spell differently is not done.
+  const id = row?.id, receipt = typeof row?.receipt === 'string' ? row.receipt : ''
   if (typeof id !== 'string' || !REQUEST.test(id) || !RECEIPT.test(receipt)) return false
   return Boolean(regularFile(resolve(stateDir, 'receipts', `${receipt}.${id}.used`)))
 }
