@@ -11,9 +11,11 @@ let failures = 0
 const ok = (label, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${label}`); if (!value) failures++ }
 const repo = resolve('.')
 const work = mkdtempSync(join(tmpdir(), 'nvoy-release-'))
-const instances = join(work, 'instances'), state = join(work, 'state'), bin = join(work, 'bin')
+const instances = join(work, 'instances'), state = join(work, 'state'), bin = join(work, 'bin'), proc = join(work, 'proc')
 const calls = join(work, 'calls.log')
-mkdirSync(instances); mkdirSync(state); mkdirSync(bin)
+mkdirSync(instances); mkdirSync(state); mkdirSync(bin); mkdirSync(proc)
+writeFileSync(join(proc, 'loadavg'), '1.00 1.00 1.00 1/100 1\n')
+writeFileSync(join(proc, 'meminfo'), 'MemAvailable:    8388608 kB\n')
 for (const name of ['state-a', 'run-a', 'spool-a', 'state-b', 'run-b', 'spool-b']) mkdirSync(join(work, name))
 
 const base = {
@@ -100,11 +102,26 @@ const invoke = (sha, extra = {}) => spawnSync('python3', ['deploy/runtime-deploy
     NVOY_TEST_RELEASE_SHA: sha,
     NVOY_INSTANCE_ROOT: instances, NVOY_DEPLOY_STATE: state, NVOY_DEPLOY_HUB: repo,
     NVOY_DOCKER: join(bin, 'fake-docker'), NVOY_GIT: join(bin, 'fake-git'), NVOY_NPM: join(bin, 'fake-npm'),
+    NVOY_TEST_PROC_ROOT: proc,
     NVOY_BOUNDARY_TEST: join(work, 'boundary.py'), NVOY_SETTLE_MS: '0', NVOY_RETRY_AFTER_S: '0',
     FAKE_GIT_ORDER: [sha1, sha2, sha3, 'origin/main'].join(' '), FAKE_GIT_HEAD: head, ...extra },
 })
 
 try {
+  writeFileSync(join(proc, 'meminfo'), 'MemAvailable:    1048576 kB\n')
+  const pressured = invoke(sha1)
+  ok('a release waits before checkout or Compose when host memory is low',
+    pressured.status === 0 && /host pressure/.test(pressured.stdout) &&
+    !existsSync(join(state, 'DEPLOYED_SHA')) && !/checkout|docker compose .* up -d/.test(readFileSync(calls, 'utf8')))
+  writeFileSync(join(proc, 'meminfo'), 'MemAvailable:    8388608 kB\n')
+  writeFileSync(join(proc, 'loadavg'), '1000.00 1.00 1.00 1/100 1\n')
+  writeFileSync(calls, '')
+  const overloaded = invoke(sha1)
+  ok('a release waits before checkout or Compose when host load is high',
+    overloaded.status === 0 &&
+    !existsSync(join(state, 'DEPLOYED_SHA')) && !/checkout|docker compose .* up -d/.test(readFileSync(calls, 'utf8')))
+  writeFileSync(join(proc, 'loadavg'), '1.00 1.00 1.00 1/100 1\n')
+  writeFileSync(calls, '')
   const first = invoke(sha1)
   if (first.status !== 0) console.error(first.stdout, first.stderr)
   ok('a successful exact-SHA release exits cleanly', first.status === 0 && /deploy OK/.test(first.stdout))

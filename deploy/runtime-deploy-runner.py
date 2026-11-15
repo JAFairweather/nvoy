@@ -35,7 +35,12 @@ WORKFLOW = ENV.get("NVOY_RELEASE_WORKFLOW", "publish-runtime-images.yml")
 DOCKER = ENV.get("NVOY_DOCKER", "docker")
 GIT = ENV.get("NVOY_GIT", "git")
 DRY_RUN = ENV.get("DRY_RUN") == "1"
-SETTLE_MS = int(ENV.get("NVOY_SETTLE_MS", "3000"))
+SETTLE_MS = int(ENV.get("NVOY_SETTLE_MS", "15000"))
+# A candidate is deferred while the host is already saturated. This does not cap a container;
+# it prevents a release from starting another fleet-wide recreation wave during host pressure.
+PROC = Path(ENV.get("NVOY_TEST_PROC_ROOT", "/proc") if os.geteuid() != 0 else "/proc")
+MIN_AVAILABLE_KIB = 4 * 1024 * 1024
+MAX_LOAD_PER_CPU = 2
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 IMAGE_REF = re.compile(r"^[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$", re.I)
 # The timer ticks every 30 s. A full release lookup still happens at least this often, so a re-run
@@ -270,6 +275,19 @@ def settle() -> None:
     time.sleep(SETTLE_MS / 1000)
 
 
+def host_ready() -> tuple[bool, str]:
+    load = float((PROC / "loadavg").read_text().split()[0])
+    available = next(
+        int(line.split()[1]) for line in (PROC / "meminfo").read_text().splitlines()
+        if line.startswith("MemAvailable:")
+    )
+    logical = os.cpu_count() or 1
+    if load > MAX_LOAD_PER_CPU * logical or available < MIN_AVAILABLE_KIB:
+        return False, (f"host pressure: load {load:.2f}/{logical} CPU, "
+                       f"MemAvailable {available // 1024} MiB; waiting for a timer retry")
+    return True, ""
+
+
 def atomic_write(path: Path, value: str) -> None:
     temporary = path.with_name(f"{path.name}.tmp-{os.getpid()}")
     temporary.write_text(value)
@@ -351,6 +369,11 @@ def main() -> None:
         if failed.get("attempt") == attempt and time.time() - float(failed.get("at", 0)) < RETRY_AFTER_S:
             outcome(f"held {attempt}", f"{sha[:12]} with these manifests failed at {time.strftime('%H:%M:%S', time.localtime(float(failed['at'])))}"
                     f" — retrying after {RETRY_AFTER_S}s, or at once on a manifest edit or a new release")
+            return
+
+        ready, reason = host_ready()
+        if not ready:
+            outcome(f"pressure {sha}", reason)
             return
 
         run([GIT, "-C", str(HUB), "fetch", "--quiet", "origin", "main"])
