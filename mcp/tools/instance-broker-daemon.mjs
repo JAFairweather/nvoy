@@ -34,8 +34,10 @@ try { terminalReplyIds = loadTerminalReplyIds(terminalRepliesPath) }
 catch (e) { die(`cannot load terminal reply log: ${e.message || e}`) }
 const broker = resolve(new URL('.', import.meta.url).pathname, 'instance-broker.mjs')
 const nativeBroker = resolve(new URL('.', import.meta.url).pathname, 'instance-broker-native.mjs')
+const buzzSessionSock = manifest.buzz ? resolve(manifest.stateDir, 'buzz-session.sock') : ''
 const childEnv = { PATH: process.env.PATH || '', NVOY_INSTANCE_ROOT: root, NVOY_BROKER_CREDENTIAL: process.env.NVOY_BROKER_CREDENTIAL,
-  ...(process.env.NVOY_BUNKER_URI_FILE ? { NVOY_BUNKER_URI_FILE: process.env.NVOY_BUNKER_URI_FILE } : {}) }
+  ...(process.env.NVOY_BUNKER_URI_FILE ? { NVOY_BUNKER_URI_FILE: process.env.NVOY_BUNKER_URI_FILE } : {}),
+  ...(buzzSessionSock ? { NVOY_BUZZ_SESSION_SOCK: buzzSessionSock } : {}) }
 const retryAfter = createBackoff()
 const proposalRetryAfter = createBackoff()
 const announcedProposals = new Set()
@@ -299,16 +301,30 @@ function drainProfiles() {
 // The keyless Buzz watcher can log in only through this oracle, and the status keeper puts the
 // native 👀/💬 on admitted Buzz messages. Both are supervised here, beside the drain, so they run as
 // the broker and hold the same credential; a crash is restarted with backoff.
+const supervised = new Set()
+let stopping = false
 function supervise(script, label, delay = 1000) {
+  if (stopping) return
   const child = spawn(process.execPath, [resolve(new URL('.', import.meta.url).pathname, script), '--instance', manifest.id],
     { env: childEnv, stdio: ['ignore', 'inherit', 'inherit'] })
+  supervised.add(child)
   const started = Date.now()
   child.on('exit', code => {
+    supervised.delete(child)
+    if (stopping) return
     const next = Date.now() - started > 60000 ? 1000 : Math.min(delay * 2, 60000)
     console.error(`instance-broker-daemon: ${label} exited (${code ?? 'signal'}); restarting in ${next / 1000}s`)
     setTimeout(() => supervise(script, label, next), next).unref?.()
   })
 }
+const stop = () => {
+  if (stopping) return
+  stopping = true
+  for (const child of supervised) { try { child.kill('SIGTERM') } catch { /* gone */ } }
+  process.exit(0)
+}
+process.on('SIGTERM', stop)
+process.on('SIGINT', stop)
 // The agent card is checked at start and hourly; the child re-signs only when the card is due.
 function publishCard() {
   const child = spawn(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-card.mjs'), '--instance', manifest.id],
@@ -343,11 +359,12 @@ function refreshRooms() {
   child.on('exit', complete)
 }
 recover()
+if (manifest.buzz) supervise('instance-broker-buzz.mjs', 'Buzz session')
+if (manifest.buzz) supervise('instance-broker-auth.mjs', 'AUTH oracle')
+if (manifest.buzz?.statusReactions) supervise('instance-broker-status.mjs', 'status keeper')
 if (manifest.mayPost?.mentionRooms) { refreshRooms(); setInterval(refreshRooms, 5 * 60 * 1000) }
 if (manifest.agentCard) { publishCard(); setInterval(publishCard, 60 * 60 * 1000) }
 publishPresence(); setInterval(publishPresence, 30 * 1000)
-if (manifest.buzz) supervise('instance-broker-auth.mjs', 'AUTH oracle')
-if (manifest.buzz?.statusReactions) supervise('instance-broker-status.mjs', 'status keeper')
 drain()
 setInterval(drain, 1000)
 if (manifest.mayPost) { drainPosts(); setInterval(drainPosts, 1000) }
