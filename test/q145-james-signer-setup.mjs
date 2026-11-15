@@ -22,6 +22,10 @@ test('options: herd-memory defaults, overrides, and no connection on argv', () =
   assert.match(DEFAULT_CLIENT_FILE, /\.nvoy-harness\/credentials\/james-bunker-client$/)
   assert.equal(options(['--uri-file', '/x/u', '--new-uri'])['uri-file'], '/x/u')
   assert.throws(() => options([URI]), error => /never put the Bunker connection on the command line/.test(error.message) && !error.message.includes(SECRET))
+  // A connection pasted as an option value is refused before it can become a path (My Dude, PR 421 lead read).
+  for (const argv of [['--uri-file', URI], ['--client-file', URI], ['--uri-file', '/ok', '--client-file', `/x/${URI}`], ['--new-uri', URI.replace('bunker://', 'BUNKER://')], ['--uri-file', `nostrconnect://${'e'.repeat(64)}?secret=${SECRET}`]]) {
+    assert.throws(() => options(argv), error => /never put the Bunker connection on the command line/.test(error.message) && !error.message.includes(SECRET) && !error.message.includes('e'.repeat(64)))
+  }
   assert.throws(() => options(['--uri-file']), /needs a path/)
   assert.throws(() => options(['--nope']), /unknown option/)
   assert.throws(() => options(['--uri-file', '/a', '--client-file', '/a']), /must differ/)
@@ -123,6 +127,20 @@ test('readHidden: no echo from a terminal, one line from a pipe, Ctrl-C stops', 
   const piped = readHidden('p', pipe, new PassThrough())
   pipe.end(`${URI}\nsecond line\n`)
   assert.equal(await piped, URI)
+})
+
+test('run with a connection pasted as a path creates nothing and quotes nothing', async () => {
+  const dir = tmp(), cwd = process.cwd()
+  process.chdir(dir)
+  try {
+    let opened = 0, asked = 0
+    for (const argv of [['--uri-file', URI], ['--client-file', `sub/${URI}`]]) {
+      await assert.rejects(() => run(argv, { ask: async () => { asked++; return URI }, openSigner: (...a) => { opened++; return signerAs(JAMES)(...a) }, log() {} }),
+        error => /never put the Bunker connection/.test(error.message) && !error.message.includes(SECRET))
+    }
+    assert.equal(opened + asked, 0)
+    assert.deepEqual(readdirSync(dir), [])
+  } finally { process.chdir(cwd) }
 })
 
 test('pasteLines quotes paths with spaces and quotes', () => {

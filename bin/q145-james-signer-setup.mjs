@@ -25,10 +25,11 @@ const VERIFY_MS = 60000
 
 export function options(argv) {
   const out = { 'uri-file': DEFAULT_URI_FILE, 'client-file': DEFAULT_CLIENT_FILE, 'new-uri': false }
+  // Every argument, flag or value, is checked before any is used, so a connection pasted as a path
+  // never reaches mkdir, the filesystem or an error. It is already in shell history; say so without quoting it.
+  if (argv.some(arg => /bunker:|nostrconnect:|secret=/i.test(String(arg)))) throw new Error('never put the Bunker connection on the command line; paste it only at the hidden prompt, and clear it from your shell history')
   for (let i = 0; i < argv.length; i++) {
     const key = argv[i]
-    // A pasted connection on the command line is already in shell history; say so without quoting it.
-    if (/bunker:\/\//i.test(key)) throw new Error('never put the Bunker connection on the command line; paste it only at the hidden prompt, and clear it from your shell history')
     if (key === '--new-uri') out['new-uri'] = true
     else if (key === '--uri-file' || key === '--client-file') {
       const value = argv[++i]
