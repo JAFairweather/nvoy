@@ -428,8 +428,11 @@ try {
   const proj = JSON.parse(jsonRaw)
 
   ok('projection coarse_state is ready and not withheld', proj.coarse_state === 'ready' && proj.withheld === false)
-  ok('projection is strictly aggregate-only with no chosen_claims prose field',
-    !('chosen_claims' in proj) && proj.withheld_fields.includes('claim_prose'))
+  ok('projection is strictly aggregate-only with no chosen_claims prose or withheld_claims side-channel count',
+    !('chosen_claims' in proj) &&
+    !('withheld_claims' in proj.counts) &&
+    proj.withheld_fields.includes('claim_prose') &&
+    proj.withheld_fields.includes('quarantined_row_counts'))
   ok('projection contains ONLY allowlisted scopes',
     JSON.stringify(proj.scopes.map(s => s.scope)) === JSON.stringify(['hive:canon', 'room:public-demo']))
   ok('projection contains ONLY curated allowlisted topics',
@@ -443,9 +446,16 @@ try {
     proj.topics.find(t => t.topic === 'hive-memory')?.active_claims === 2 &&
     proj.topics.find(t => t.topic === 'nvoy')?.active_claims === 0,
     JSON.stringify(proj.counts))
-  // 7 secret-bearing rows + 1 tampered-sig row + 1 tampered SQLite topic row = 9 withheld rows.
-  ok('secret, signature-tampered and SQLite-topic-tampered rows are quarantined in withheld_claims',
-    proj.counts.withheld_claims === 9, `got ${proj.counts.withheld_claims}`)
+  // 7 secret-bearing rows + 1 tampered-sig row + 1 tampered SQLite topic row = 9 quarantined rows (local return only, never in public JSON).
+  const directChosenRes = projectOfflinePublicCortex({
+    dbPath: seededDbPath,
+    allowlist,
+    outDir: join(root, 'out-chosen-direct'),
+    nowSec: projectedAt,
+  })
+  ok('secret, signature-tampered and SQLite-topic-tampered chosen rows are quarantined locally without public count leak',
+    directChosenRes.quarantinedClaims === 9 && !('withheld_claims' in directChosenRes.projection.counts),
+    `got ${directChosenRes.quarantinedClaims}`)
 
   // Negative Control 1: EVERY claim's prose (even chosen canon/room claims!), outside scopes, withdrawn, expired, superseded, IDs & keys are absent.
   const absentCanaries = [
@@ -534,21 +544,129 @@ try {
   const aggHtml = readFileSync(join(aggOutDir, 'index.html'), 'utf8')
   const aggParsed = JSON.parse(aggJson)
   // Valid active rows in allowlisted scopes: canonChosen + canonUnchosen + 5 boundaryLeakCases (7 in hive:canon)
-  // + roomSourceA + roomCuratedChosen + roomUnlistedTopic (3 in room:public-demo) = 10 active, 9 withheld (7 secrets + 1 bad sig + 1 SQL topic tamper).
-  ok('scope-level aggregate mode exits 0 with exact aggregate counts and quarantined tampered SQLite topic',
+  // + roomSourceA + roomCuratedChosen + roomUnlistedTopic (3 in room:public-demo) = 10 active; 9 quarantined locally, never in public JSON.
+  ok('scope-level aggregate mode exits 0 with exact aggregate counts and no public withheld_claims count',
     aggRes.status === 0 &&
     !('chosen_claims' in aggParsed) &&
+    !('withheld_claims' in aggParsed.counts) &&
     aggParsed.counts.active_claims === 10 &&
     aggParsed.counts.durable_decisions === 8 &&
     aggParsed.counts.ephemeral_claims === 2 &&
-    aggParsed.counts.unlisted_topic_claims === 1 &&
-    aggParsed.counts.withheld_claims === 9,
+    aggParsed.counts.unlisted_topic_claims === 1,
     JSON.stringify(aggParsed.counts))
   ok('scope-level aggregate mode emits zero claim prose, paths or hostnames in JSON and HTML',
     !aggJson.includes('CANARY_') &&
     !aggHtml.includes('CANARY_') &&
     !aggJson.includes('/mnt/snapshots') &&
     !aggJson.includes('bunker.nave.pub'))
+
+  // --- 4b. Private-to-public count side-channel & unsigned SQLite metadata tamper controls ---
+  const canonOnlyAllow = { scopes: ['hive:canon'], topics: ['hive-memory', 'nvoy'] }
+  const canonOnlyAllowPath = join(root, 'allowlist-canon-only.json')
+  writeFileSync(canonOnlyAllowPath, JSON.stringify(canonOnlyAllow))
+
+  const baseCanonOut = join(root, 'out-canon-baseline')
+  const baseCanonCli = await runCli(['--db', snapDbPath, '--allowlist', canonOnlyAllowPath, '--out', baseCanonOut, '--now', String(projectedAt)])
+  const baseCanonDirect = projectOfflinePublicCortex({
+    dbPath: snapDbPath,
+    allowlist: canonOnlyAllow,
+    outDir: join(root, 'out-canon-baseline-direct'),
+    nowSec: projectedAt,
+  })
+  const baseCanonJson = readFileSync(join(baseCanonOut, 'cortex-public.json'), 'utf8')
+  const baseCanonHtml = readFileSync(join(baseCanonOut, 'index.html'), 'utf8')
+
+  // Tamper unsigned SQLite scope/d/scope_type/topic on signed hive:ops, private room, and self rows to 'hive:canon',
+  // plus insert a corrupt raw_json row claiming 'hive:canon'. Public JSON, HTML, CLI stdout, and quarantinedClaims must not budge.
+  const tamperedPrivateDbPath = join(snapDir, 'tampered-private-scope.sqlite')
+  writeFileSync(tamperedPrivateDbPath, readFileSync(snapDbPath))
+  const tpDb = new DatabaseSync(tamperedPrivateDbPath)
+  tpDb.prepare('UPDATE events SET scope = ?, scope_type = ?, room_id = NULL, d = ?, topic = ? WHERE id = ?')
+    .run('hive:canon', 'hive:canon', 'hive-memory:hive:canon:ops-secret-schedule', 'nvoy', opsOutside.id)
+  tpDb.prepare('UPDATE events SET scope = ?, scope_type = ?, room_id = NULL, d = ?, topic = ? WHERE id = ?')
+    .run('hive:canon', 'hive:canon', 'hive-memory:hive:canon:private-room-plan', 'nvoy', privateRoomOutside.id)
+  tpDb.prepare(`
+    INSERT INTO events (
+      id, pubkey, kind, created_at, d, scope, scope_type, room_id, topic,
+      status, retention, as_of_git, as_of_evt, exp, raw_json, ingested_at, is_current
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+  `).run(
+    selfEv.id, selfEv.pubkey, selfEv.kind, selfEv.created_at, 'hive-memory:hive:canon:self-disguised',
+    'hive:canon', 'hive:canon', null, 'nvoy', 'active', 'decision',
+    '37ae9a5', null, null, JSON.stringify(selfEv), selfEv.created_at
+  )
+  tpDb.prepare(`
+    INSERT INTO events (
+      id, pubkey, kind, created_at, d, scope, scope_type, room_id, topic,
+      status, retention, as_of_git, as_of_evt, exp, raw_json, ingested_at, is_current
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+  `).run(
+    'f'.repeat(64), opsWriter.pk, MEMORY_KIND, T0 + 130, 'hive-memory:hive:canon:corrupt-raw-json',
+    'hive:canon', 'hive:canon', null, 'nvoy', 'active', 'decision',
+    '37ae9a5', null, null, '{corrupt', T0 + 130
+  )
+  tpDb.close()
+
+  const tamperedCanonOut = join(root, 'out-canon-tampered-private')
+  const tamperedCanonCli = await runCli(['--db', tamperedPrivateDbPath, '--allowlist', canonOnlyAllowPath, '--out', tamperedCanonOut, '--now', String(projectedAt)])
+  const tamperedCanonDirect = projectOfflinePublicCortex({
+    dbPath: tamperedPrivateDbPath,
+    allowlist: canonOnlyAllow,
+    outDir: join(root, 'out-canon-tampered-private-direct'),
+    nowSec: projectedAt,
+  })
+  ok('signed hive:ops, private-room and self rows with tampered unsigned SQLite scope=hive:canon produce byte-identical public JSON, HTML and CLI output',
+    baseCanonCli.status === 0 &&
+    tamperedCanonCli.status === 0 &&
+    readFileSync(join(tamperedCanonOut, 'cortex-public.json'), 'utf8') === baseCanonJson &&
+    readFileSync(join(tamperedCanonOut, 'index.html'), 'utf8') === baseCanonHtml &&
+    tamperedCanonCli.stdout === baseCanonCli.stdout)
+  ok('out-of-allowlist signed rows with tampered unsigned SQLite scope=hive:canon leave quarantinedClaims at 0',
+    baseCanonDirect.quarantinedClaims === 0 && tamperedCanonDirect.quarantinedClaims === 0,
+    `got ${tamperedCanonDirect.quarantinedClaims}`)
+
+  // Unchosen secret-bearing canon row when allowlist.claims selects only cortex-architecture -> zero public or diagnostic leak.
+  const singleClaimAllow = {
+    scopes: ['hive:canon'],
+    topics: ['hive-memory', 'nvoy'],
+    claims: ['hive-memory:hive:canon:cortex-architecture'],
+  }
+  const singleClaimBase = projectOfflinePublicCortex({
+    dbPath: snapDbPath,
+    allowlist: singleClaimAllow,
+    outDir: join(root, 'out-single-claim-base'),
+    nowSec: projectedAt,
+  })
+  const singleClaimSeeded = projectOfflinePublicCortex({
+    dbPath: seededDbPath,
+    allowlist: singleClaimAllow,
+    outDir: join(root, 'out-single-claim-seeded'),
+    nowSec: projectedAt,
+  })
+  ok('unchosen secret-bearing rows in allowlisted scope do not alter projection or quarantinedClaims under allowlist.claims',
+    JSON.stringify(singleClaimSeeded.projection) === JSON.stringify(singleClaimBase.projection) &&
+    singleClaimSeeded.quarantinedClaims === 0)
+
+  // Symmetric tamper (signed hive:canon row with tampered unsigned scope='hive:ops') & NIP-01 is_current resurrection tamper:
+  // both must be quarantined and must never resurrect a withdrawn/superseded claim or accept mismatched metadata.
+  const resurrectDbPath = join(snapDir, 'tampered-resurrect.sqlite')
+  writeFileSync(resurrectDbPath, readFileSync(snapDbPath))
+  const resDb = new DatabaseSync(resurrectDbPath)
+  resDb.prepare('UPDATE events SET is_current = 0 WHERE id = ?').run(canonWithdrawn.id)
+  resDb.prepare('UPDATE events SET is_current = 1 WHERE id = ?').run(canonToWithdraw.id)
+  resDb.prepare('UPDATE events SET scope = ?, scope_type = ? WHERE id = ?').run('hive:ops', 'hive:ops', canonUnchosen.id)
+  resDb.close()
+  const resurrectRes = projectOfflinePublicCortex({
+    dbPath: resurrectDbPath,
+    allowlist: canonOnlyAllow,
+    outDir: join(root, 'out-canon-resurrect'),
+    nowSec: projectedAt,
+  })
+  // Baseline had 7 active hive:canon claims (canonChosen + canonUnchosen + 5 boundaryLeakCases).
+  // Resurrected canonToWithdraw is quarantined (+1) rather than counted, and scope-tampered canonUnchosen is quarantined (+1) -> 6 active, 2 quarantined.
+  ok('flipping unsigned is_current cannot resurrect a withdrawn claim and tampering signed canon scope to hive:ops quarantines the row',
+    resurrectRes.projection.counts.active_claims === 6 && resurrectRes.quarantinedClaims === 2,
+    `${JSON.stringify(resurrectRes.projection.counts)} q=${resurrectRes.quarantinedClaims}`)
 
   // --- 5. Defense-in-depth second-layer output sanitiser negative controls (secrets, paths, unrecognized hosts/URLs) ---
   for (const [label, poison] of [
@@ -561,7 +679,7 @@ try {
       generated_at: '2026-11-15T03:30:00Z',
       coarse_state: 'ready',
       withheld: false,
-      counts: { active_claims: 1, durable_decisions: 1, ephemeral_claims: 0, curated_syntheses: 0, unlisted_topic_claims: 0, withheld_claims: 0 },
+      counts: { active_claims: 1, durable_decisions: 1, ephemeral_claims: 0, curated_syntheses: 0, unlisted_topic_claims: 0 },
       scopes: [{ scope: poison, active_claims: 1, durable_decisions: 1, ephemeral_claims: 0 }],
       topics: [{ topic: 'nvoy', active_claims: 1, durable_decisions: 1 }],
       withheld_fields: [],
@@ -580,7 +698,7 @@ try {
     generated_at: '2026-11-15T03:30:00Z',
     coarse_state: 'ready',
     withheld: false,
-    counts: { active_claims: 1, durable_decisions: 1, ephemeral_claims: 0, curated_syntheses: 0, unlisted_topic_claims: 0, withheld_claims: 0 },
+    counts: { active_claims: 1, durable_decisions: 1, ephemeral_claims: 0, curated_syntheses: 0, unlisted_topic_claims: 0 },
     scopes: [{ scope: '<img src=x onerror=alert(1)>', active_claims: 1, durable_decisions: 1, ephemeral_claims: 0 }],
     topics: [{ topic: 'nvoy', active_claims: 1, durable_decisions: 1 }],
     withheld_fields: ['claim_prose'],

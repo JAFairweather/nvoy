@@ -35,6 +35,7 @@ import {
   FALLBACK_MEMORY_KIND,
   MEMORY_KIND,
   checkMemorySecrets,
+  nip01Newer,
   normalizeMemoryTopic,
   parseFactKey,
   parseScope,
@@ -46,6 +47,7 @@ export const PROJECTION_VERSION = 1
 
 export const WITHHELD_PUBLIC_FIELDS = Object.freeze([
   'claim_prose',
+  'quarantined_row_counts',
   'event_ids',
   'fact_keys_and_slugs',
   'author_identities',
@@ -358,7 +360,6 @@ export function buildPublicProjectionFromDb(db, rawAllowlist, { nowSec = Math.fl
   const rows = db.prepare(`
     SELECT id, pubkey, kind, created_at, d, scope, scope_type, room_id, topic, status, retention, exp, raw_json, is_current
     FROM events
-    WHERE is_current = 1
     ORDER BY scope ASC, d ASC, id ASC
   `).all()
 
@@ -366,12 +367,12 @@ export function buildPublicProjectionFromDb(db, rawAllowlist, { nowSec = Math.fl
   let durableDecisions = 0
   let ephemeralClaims = 0
   let curatedSyntheses = 0
-  let withheldClaims = 0
+  let quarantinedClaims = 0
   let unlistedTopicClaims = 0
-  let inferredGlobalChannelId = allowlist.memoryGlobalChannelId
+  const groups = new Map()
 
   for (const row of rows) {
-    if (!row || row.is_current !== 1) continue
+    if (!row) continue
 
     let ev = null
     let parseOk = false
@@ -381,48 +382,23 @@ export function buildPublicProjectionFromDb(db, rawAllowlist, { nowSec = Math.fl
     } catch {
       parseOk = false
     }
+    if (!parseOk) continue
 
-    const evScope = parseOk && typeof tagValue(ev, 's') === 'string' ? tagValue(ev, 's') : ''
-    const rowScopeAllowed = allowlist.scopeMap.has(row.scope)
-    const evScopeAllowed = Boolean(evScope && allowlist.scopeMap.has(evScope))
+    const sTags = Array.isArray(ev.tags) ? ev.tags.filter(t => Array.isArray(t) && t[0] === 's') : []
+    const dTags = Array.isArray(ev.tags) ? ev.tags.filter(t => Array.isArray(t) && t[0] === 'd') : []
+    const evScope = sTags.length === 1 && typeof sTags[0][1] === 'string' ? sTags[0][1] : ''
+    const evD = dTags.length === 1 && typeof dTags[0][1] === 'string' ? dTags[0][1] : ''
 
-    // Strictly ignore rows whose stored scope AND signed scope are both outside allowlist.scopes (zero side-channels).
-    if (!rowScopeAllowed && !evScopeAllowed) continue
+    // Gate allowlist membership strictly on the signed event tags, never on unsigned SQLite metadata,
+    // so non-allowlisted scopes and unchosen claims cannot influence any public or diagnostic count.
+    if (!evScope || !allowlist.scopeMap.has(evScope)) continue
+    if (allowlist.hasClaimFilter && (!evD || !allowlist.chosenClaims.has(evD))) continue
 
-    // If raw_json is malformed or stored scope diverges from signed event scope, quarantine into withheld_claims.
-    if (!parseOk || !rowScopeAllowed || !evScopeAllowed || row.scope !== evScope) {
-      withheldClaims += 1
-      continue
-    }
     const scopeInfo = allowlist.scopeMap.get(evScope)
-
-    if (checkMemorySecrets(row.topic) || checkMemorySecrets(row.d)) {
-      withheldClaims += 1
-      continue
-    }
-
-    if (String(ev.id || '').toLowerCase() !== String(row.id || '').toLowerCase() ||
-        String(ev.pubkey || '').toLowerCase() !== String(row.pubkey || '').toLowerCase() ||
-        Number(row.kind) !== ev.kind ||
-        tagValue(ev, 'd') !== row.d) {
-      withheldClaims += 1
-      continue
-    }
-
-    let candidateGlobalCh = inferredGlobalChannelId || ''
-    let eventGlobalH = null
-    if (scopeInfo.type === 'hive:canon' || scopeInfo.type === 'hive:ops') {
+    let candidateGlobalCh = allowlist.memoryGlobalChannelId || ''
+    if (!candidateGlobalCh && (scopeInfo.type === 'hive:canon' || scopeInfo.type === 'hive:ops')) {
       const h = String(tagValue(ev, 'h') || '').toLowerCase()
-      if (!UUID.test(h)) {
-        withheldClaims += 1
-        continue
-      }
-      if (candidateGlobalCh && h !== candidateGlobalCh) {
-        withheldClaims += 1
-        continue
-      }
-      eventGlobalH = h
-      if (!candidateGlobalCh) candidateGlobalCh = h
+      if (UUID.test(h)) candidateGlobalCh = h
     }
 
     const v = validateMemoryEvent(ev, {
@@ -430,16 +406,54 @@ export function buildPublicProjectionFromDb(db, rawAllowlist, { nowSec = Math.fl
       allowedKinds: [MEMORY_KIND, FALLBACK_MEMORY_KIND],
       verifySignature: true,
     })
-    if (!v.ok) {
-      withheldClaims += 1
+
+    const evPubkey = String(ev.pubkey || '').toLowerCase()
+    const groupKey = `${evPubkey}\0${evD || String(ev.id || '')}`
+    let group = groups.get(groupKey)
+    if (!group) {
+      group = { scopeInfo, entries: [] }
+      groups.set(groupKey, group)
+    }
+    group.entries.push({ row, ev, v })
+  }
+
+  for (const { scopeInfo, entries } of groups.values()) {
+    const currentEntries = entries.filter(e => Number(e.row.is_current) === 1)
+    if (currentEntries.length === 0) continue
+
+    let trueSignedHead = null
+    for (const entry of entries) {
+      if (!entry.v.ok) continue
+      if (!trueSignedHead || nip01Newer(entry.ev, trueSignedHead.ev)) {
+        trueSignedHead = entry
+      }
+    }
+
+    if (currentEntries.length > 1) {
+      quarantinedClaims += currentEntries.length
+      continue
+    }
+
+    const { row, ev, v } = currentEntries[0]
+    if (!v.ok || !trueSignedHead || trueSignedHead.ev.id !== ev.id) {
+      quarantinedClaims += 1
+      continue
+    }
+
+    if (checkMemorySecrets(row.topic) || checkMemorySecrets(row.d)) {
+      quarantinedClaims += 1
       continue
     }
 
     // Verify stored SQLite metadata columns against the cryptographically verified Nostr event so unsigned
-    // columns can never relabel signed topics, retention classes, expiry or status.
+    // columns can never relabel signed topics, scopes, retention classes, expiry or status.
     const expectedStoredTopic = normalizeMemoryTopic(v.topic) ?? v.topic
     const rowExp = row.exp == null ? null : Number(row.exp)
-    if (Number(row.created_at) !== v.createdAt ||
+    if (String(ev.id || '').toLowerCase() !== String(row.id || '').toLowerCase() ||
+        v.pubkey !== String(row.pubkey || '').toLowerCase() ||
+        Number(row.kind) !== ev.kind ||
+        Number(row.created_at) !== v.createdAt ||
+        row.d !== v.d ||
         row.scope !== v.scope ||
         row.scope_type !== v.scopeType ||
         (row.room_id ?? null) !== (v.roomId ?? null) ||
@@ -447,20 +461,12 @@ export function buildPublicProjectionFromDb(db, rawAllowlist, { nowSec = Math.fl
         row.status !== v.status ||
         row.retention !== v.retention ||
         rowExp !== (v.expiresAt ?? null)) {
-      withheldClaims += 1
+      quarantinedClaims += 1
       continue
-    }
-
-    // Pin inferred global channel only AFTER cryptographic signature and SQLite-column verification pass.
-    if (eventGlobalH && !inferredGlobalChannelId) {
-      inferredGlobalChannelId = eventGlobalH
     }
 
     if (v.status !== 'active') continue
     if (v.expiresAt != null && v.expiresAt <= effectiveNow) continue
-
-    // Optional allowlist.claims filters which allowlisted claims contribute to aggregate counts; prose is never emitted.
-    if (allowlist.hasClaimFilter && !allowlist.chosenClaims.has(v.d)) continue
 
     // Derive canonical topic strictly from the verified signed event, never from unsigned SQLite metadata.
     const normTopic = normalizeMemoryTopic(v.topic)
@@ -497,14 +503,13 @@ export function buildPublicProjectionFromDb(db, rawAllowlist, { nowSec = Math.fl
       ephemeral_claims: ephemeralClaims,
       curated_syntheses: curatedSyntheses,
       unlisted_topic_claims: unlistedTopicClaims,
-      withheld_claims: withheldClaims,
     },
     scopes: [...scopeStats.values()],
     topics: [...topicStats.values()],
     withheld_fields: [...WITHHELD_PUBLIC_FIELDS],
   }
 
-  return finalisePublicProjection(candidate)
+  return { ...finalisePublicProjection(candidate), quarantinedClaims }
 }
 
 const escHtml = s => String(s ?? '')
@@ -688,6 +693,7 @@ export function projectOfflinePublicCortex({ dbPath, allowlist, outDir, nowSec }
   return {
     projection,
     findings,
+    quarantinedClaims: built.quarantinedClaims,
     jsonPath,
     htmlPath,
     allowedScopes: [...validatedAllowlist.scopeMap.values()].map(s => s.publicLabel),

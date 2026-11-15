@@ -76,7 +76,6 @@ try {
     scopes: Array.isArray(projection.scopes) ? projection.scopes.length : 0,
     topics: Array.isArray(projection.topics) ? projection.topics.length : 0,
     active_claims: projection.counts?.active_claims ?? 0,
-    withheld_claims: projection.counts?.withheld_claims ?? 0,
   }))
   if (projection.withheld) process.exit(1)
 } catch (e) {
