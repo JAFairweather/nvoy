@@ -1356,6 +1356,11 @@ unrecorded so the runner alarms rather than silently accepting a partial release
 with the same manifests is retried after `NVOY_RETRY_AFTER_S` (default 600 s); a manifest edit or a
 newer release retries at once.
 
+The Compose template limits watcher memory to 192 MiB, broker to 384 MiB, adapter to 256 MiB,
+and door and notifier to 128 MiB each. These caps use a single fleet Docker sample from
+15 November 2026 at 22:45 UTC (Buzz event `07d20474`). That sample is a floor, not a peak;
+worker, harness, and initializer remain uncapped until their role-specific use is measured.
+
 Deploys are event-driven, with no three-minute wait:
 
 - **A manifest edit.** `nvoy-runtime-deploy.path` starts the runner as soon as anything under
@@ -1369,8 +1374,12 @@ Deploys are event-driven, with no three-minute wait:
   a GitHub API call. The runner asks the Actions API for a release only while `main` sits on a
   commit whose release run hasn't finished yet (a commit outside the workflow's paths gets no run
   and stops being asked about after 120 s). It also asks every 10 minutes regardless, so a re-run
-  workflow is still found. So a merge deploys within about 30 s of its images being published,
-  well inside the unauthenticated 60-requests-per-hour API limit.
+  workflow is still found. When the host is ready, the next tick begins the deploy within about
+  30 s of image publication, inside the unauthenticated 60-requests-per-hour API limit. The runner
+  defers a release before checkout while one-minute load exceeds two per logical CPU or
+  `MemAvailable` is below 4 GiB; a later timer tick retries it. It waits 15 s after reconciling
+  each identity before checking that identity. These thresholds pace a release; they do not
+  guarantee a completion time or cap total fleet use.
 
 A tick that finds nothing to do logs only when its outcome changes, so the journal doesn't gain a
 line every 30 s.
