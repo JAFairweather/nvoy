@@ -21,11 +21,70 @@ Buzz seats. Those are host configuration changes, not 440/441 signing. They
 need their own reviewed herd-infra change and host read-back; none of the three
 signing batches completes them.
 
+## One-time set-up: James's signer files
+
+The runner signs through a Bunker46 connection for James's own key, which needs
+two files on the Mac. James makes them once.
+
+### 1. In Bunker46
+
+Create a connection for his own key (the bunker:// flow). Under permissions:
+- Leave every "all kinds" toggle **off**, including the encrypt and decrypt
+  methods.
+- Use "Add kind" to add `sign_event` kind `440`, then `sign_event` kind `441`.
+  Add nothing else.
+
+Bunker46 then refuses to sign any other kind. Source, at
+dsbaars/bunker46@1a9c6c3:
+- `apps/server/src/bunker/bunker-rpc.handler.ts:157-164`: sign_event is denied
+  unless a granted permission matches.
+- `packages/shared-types/src/permissions.ts:54-61`: a permission with a kind
+  matches only that kind; one with no kind matches every kind.
+- `apps/web/src/views/ConnectionsView.vue:135-143`: the per-kind picker. It
+  adds no kind while an all-kinds sign_event grant is set.
+
+Kinds a client asks for when it connects are only recorded as pending, and they
+grant nothing until approved (`bunker-rpc.handler.ts:80-89, 110-126`), so
+approve nothing more. Reading the public key needs no permission
+(`bunker-rpc.handler.ts:139-142`).
+
+Copy the bunker:// connection.
+
+### 2. On the Mac
+
+From the checkout (`npm ci` done), run:
+
+```sh
+node bin/q145-james-signer-setup.mjs
+```
+
+1. It makes `~/.nvoy-harness/credentials/james-bunker-client`, a 64-hex NIP-46
+   client key, mode 0600 (directory 0700). It never prints the key, and keeps
+   an existing file.
+2. It asks for the connection at a hidden prompt; paste it there. The
+   connection is never echoed and never read from argv, so it stays out of
+   shell history.
+3. It asks the Bunker only for its public key, and refuses unless that is
+   James's. It signs nothing.
+4. Only after that check does it store the connection in
+   `~/.nvoy-harness/credentials/james-bunker-uri`, mode 0600.
+5. It prints the dry-run line and the three lines below, with both paths
+   filled in.
+
+These are the paths herd-infra `mac/bin/herd-memory --bunker` reads. Use
+`--uri-file` and `--client-file` to choose others, and `--new-uri` to replace a
+stored connection.
+
+The client file is what can sign through the connection. With the kinds
+limited as above, it can sign only grants (440) and revokes (441) as James. When
+the q-145 batches are done, remove the connection in Bunker46 and delete both
+files.
+
 ## The three paste lines
 
 From a checkout of the merged runner (`npm ci` done), James pastes these one at
-a time, in this order. Replace the two paths with the paths to his existing
-Bunker URI and NIP-46 client files. Paste **paths**, never file contents.
+a time, in this order. The set-up script prints them with his two paths filled
+in. Paste **paths**, never file contents.
 
 ```sh
 node bin/q145-grants.mjs --apply --batch revokes --bunker-uri-file /path/to/james.bunker-uri --bunker-client-file /path/to/james.nip46-client
