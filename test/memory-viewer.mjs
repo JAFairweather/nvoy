@@ -25,6 +25,7 @@ import {
   diffViewerSnapshots,
   FIRST_LOAD_HTML_BUDGET_BYTES,
   INITIAL_STATE_RECORDS_LIMIT,
+  internRecord,
   MAX_CORPUS_HISTORY,
   MAX_SSE_CLIENT_BUFFER_BYTES,
   MOBILE_HTML_BUDGET_BYTES,
@@ -1158,6 +1159,74 @@ await test('the health check status shows saving off, partly off, stale or unrea
     assert.equal(diffViewerSnapshots({ ...base, watch: open }, { ...base, watch: open }, now).filter((e) => e.kind === 'alert').length, 0)
     assert.match(renderViewerHtml({ ...base, watch: off }), /id="alert-banner"/)
   } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+await test('q-131: internRecord reuses an unchanged record object and keeps a changed one', () => {
+  const a = { event_id: 'e1', claim: 'x', evidence: ['a'] }
+  const prev = new Map([['e1', a]])
+  const same = { event_id: 'e1', claim: 'x', evidence: ['a'] }
+  assert.equal(internRecord(same, prev), a, 'an equal record must be the previous object')
+  const changed = { event_id: 'e1', claim: 'x', evidence: ['a'], status: 'withdrawn' }
+  assert.equal(internRecord(changed, prev), changed, 'a changed record must be the fresh object')
+  const fresh = { event_id: 'e2', claim: 'y' }
+  assert.equal(internRecord(fresh, prev), fresh)
+  assert.equal(internRecord(null, prev), null)
+  assert.equal(internRecord(same, null), same)
+  const noId = { claim: 'x' }
+  assert.equal(internRecord(noId, new Map([[undefined, a]])), noId)
+})
+
+await test('q-131: a write re-fetch reuses unchanged record objects, so corpus history shares them', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'viewer-intern-'))
+  const dbPath = join(tmp, 'memory.sqlite')
+  const ledgerPath = join(tmp, 'accepted-ledger.jsonl')
+  const receiptPath = join(tmp, 'last-verified-backup.json')
+  const socketDir = join(tmp, 'sockets')
+  const ownerSk = generateSecretKey()
+  const ownerPk = getPublicKey(ownerSk)
+  const viewerPk = getPublicKey(generateSecretKey())
+  const room = 'a8186b53-537d-46ad-a7e7-b6486c58970e'
+  const nowSec = Math.floor(Date.now() / 1000)
+  initEmptyStore({ dbPath, ledgerPath })
+  recordVerifiedBackup({ receiptPath, snapshotId: SNAP_ID, writeSeq: 1, at: nowSec })
+  const daemon = await startMemoryDaemon({
+    dbPath, ledgerPath, receiptPath,
+    config: {
+      memoryGlobalChannelId: room, ownerPubkey: ownerPk, maxUnbackedSec: 3600,
+      globalWriters: [ownerPk], canonWriters: [ownerPk], readers: { viewer: viewerPk },
+      writers: { james: { pubkey: ownerPk, perHour: 30 } },
+      rooms: { [room]: { members: [ownerPk, viewerPk], writers: [ownerPk] } },
+    },
+    readers: 'viewer', writers: 'james', socketDir, log: () => {},
+  })
+  const put = (slug, at) => daemon.store.submit({
+    writer: 'james',
+    event: finalizeEvent(buildClaimTemplate({
+      pubkey: ownerPk, scope: `room:${room}`, slug, memoryGlobalChannelId: room, topic: 'hive-memory',
+      claim: `Claim ${slug} for the q-131 interning test.`, because: 'q-131 test',
+      evidence: ['nvoy@f737db95:mcp/tools/memory-viewer.mjs'], asOfGit: 'f737db9500000000000000000000000000000000',
+      ttlSec: 86400 * 14, nowSec: at,
+    }), ownerSk),
+    expectedPriorId: null, nowSec: at,
+  })
+  for (let i = 0; i < 5; i++) assert.equal(put(`q131-seed-${i}`, nowSec - 60 + i).accepted, true)
+  let viewer = null
+  try {
+    viewer = await startMemoryViewer({ socketPath: join(socketDir, 'viewer.sock'), host: '127.0.0.1', port: 0, pollMs: 60000 })
+    const s1 = await viewer.pollOnce({ forceFull: false })
+    const before = new Map(s1.records.map(r => [r.event_id, r]))
+    assert.equal(before.size, 5)
+    assert.equal(put('q131-new', nowSec - 30).accepted, true)
+    const s2 = await viewer.pollOnce({ forceFull: false })
+    assert.equal(s2.records.length, 6, 'the write must trigger a re-fetch that sees the new claim')
+    let shared = 0
+    for (const r of s2.records) if (before.get(r.event_id) === r) shared += 1
+    assert.equal(shared, 5, 'each unchanged record must be the same object as before the write, not a fresh copy')
+  } finally {
+    if (viewer) await viewer.stop()
+    await daemon.close()
     rmSync(tmp, { recursive: true, force: true })
   }
 })

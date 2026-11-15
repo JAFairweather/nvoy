@@ -153,6 +153,20 @@ function compactCuratorStateForClient(curatorState, { initialLoad = false } = {}
   }
 }
 
+// q-131 (15 Nov 2026): every write re-fetches the whole corpus, and every incremental write pushes a
+// snapshot into corpusHistory (up to MAX_CORPUS_HISTORY). With a fresh object per record per poll, 64
+// snapshots of ~2,100 records held ~300 MiB, past the unit's MemoryHigh=256M, and the kernel throttled
+// the process into uninterruptible reclaim instead of killing it: the viewer wedged with no OOM and no
+// restart. Reusing the previous poll's object when the sanitized record is unchanged lets snapshots
+// share records, so history costs per changed record, not per poll. Safe because sanitized records are
+// never mutated, and buildCorpusDelta compares records by JSON, not by identity.
+export function internRecord(clean, prevByEventId) {
+  if (!clean || !clean.event_id || !(prevByEventId instanceof Map)) return clean
+  const prev = prevByEventId.get(clean.event_id)
+  if (!prev || prev === clean) return clean
+  return JSON.stringify(prev) === JSON.stringify(clean) ? prev : clean
+}
+
 export function buildCorpusDelta(fromSnap, toSnap) {
   const upsertedRecords = []
   const removedEventIds = []
@@ -10170,6 +10184,8 @@ export async function startMemoryViewer({
         topicPages = cachedCorpus.topicPages
       } else {
         const byKey = new Map()
+        // q-131: the previous poll's records, so unchanged ones are reused, not copied (see internRecord).
+        const prevByEventId = cachedCorpus?.byEventId instanceof Map ? cachedCorpus.byEventId : null
         byEventId = new Map()
         firstQuery = null
         let cursor = '0'
@@ -10183,7 +10199,7 @@ export async function startMemoryViewer({
           })
           if (!firstQuery) firstQuery = page
           for (const r of Array.isArray(page?.records) ? page.records : []) {
-            const clean = sanitizeMemoryRecord(r)
+            const clean = internRecord(sanitizeMemoryRecord(r), prevByEventId)
             if (!clean) continue
             if (clean.event_id) byEventId.set(clean.event_id, clean)
             if (clean.is_current && clean.status !== 'withdrawn' && clean.verification === 'accepted') {
@@ -10195,7 +10211,7 @@ export async function startMemoryViewer({
         }
         // Since Phase 2 wake records are bare references (no claim); only full records are shown.
         for (const r of Array.isArray(wake?.records) ? wake.records.filter(x => typeof x?.claim === 'string') : []) {
-          const clean = sanitizeMemoryRecord(r)
+          const clean = internRecord(sanitizeMemoryRecord(r), prevByEventId)
           if (clean && !byKey.has(`${clean.author_pubkey}:${clean.d}`)) {
             byKey.set(`${clean.author_pubkey}:${clean.d}`, clean)
             if (clean.event_id && !byEventId.has(clean.event_id)) byEventId.set(clean.event_id, clean)
