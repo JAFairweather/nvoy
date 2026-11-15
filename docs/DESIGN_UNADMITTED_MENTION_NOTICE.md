@@ -25,8 +25,16 @@ if (!grant) finish(`author … holds no live task grant; heard as data only [...
 The two reviews were found an hour later in Hive memory, by chance. The same
 silent drop applies to these other `finish()` refusals:
 - a DM from someone other than the owner (line 110);
-- the hop limit and the per-sender hourly limit (line 133);
-- the carried path's own no-grant drop, `mcp/tools/instance-broker.mjs:85-93`, which logs the same line.
+- the hop limit and the per-sender hourly limit (line 133).
+
+**Scope: native Buzz mentions only** (`instance-broker-native.mjs`). The carried
+path (`instance-broker.mjs:85-93`) logs the same no-grant line but is out of
+scope. There, `attention.mjs` has already reduced `dataOnly` to `{from, at}`,
+so the broker holds no verified `source_event` or `channel` to record. And a
+carry that does authenticate already becomes a `verified-channel-activity`
+notice through `verifyChannelDataCarry`. A carried design needs its own
+provenance step, and must not duplicate that notice; that is a separate
+proposal (My Dude, PR 423 review at c0acc0b).
 
 "Heard as data only" names the intended behaviour, but the broker hears nothing:
 the words are discarded.
@@ -38,15 +46,26 @@ its text, or grants any capability.
 
 ### 1. A durable refusal record (always on)
 
-Before `finish()` for any of the refusals above, the broker appends one row to
+Before `finish()` for any of the three native refusals above, the broker appends one row to
 `stateDir/unadmitted-mentions.jsonl` (mode 0600, broker-owned, beside
 `channel-source-admissions.jsonl`):
 
 ```json
 {"version":1,"source_event":"<64hex>","author":"<64hex>","channel":"<uuid>",
- "reason":"no-grant|dm-not-owner|hop-limit|rate-limit","verdict":"<noGrantVerdict text>","at":1794772317000}
+ "reason":"no-grant","grant_lookup":{"suspect":false,"relays":"relay.nave.pub=0 nos.lol=0"},"at":1794772317000}
 ```
 
+- `reason` is one of `no-grant`, `no-grant-suspect`, `dm-not-owner`,
+  `hop-limit` or `rate-limit`.
+- `grant_lookup` appears only on the two no-grant reasons. It copies
+  `grantLookup()`'s `suspect` flag and relay summary (`grant_evidence.mjs`),
+  whose labels already hide address literals. The other reasons carry no grant
+  verdict, because none was taken: the DM check exits before any grant lookup,
+  and the two brakes are not grant answers.
+- `no-grant-suspect` keeps the existing distinction: every relay that answered
+  returned no grant events, although some relay held this identity's grants
+  before. That is the 10-19 eviction shape, and the row must not read as a
+  sound "no".
 - It holds no content and no tags beyond the four ids.
 - It lives in the `broker_state` volume, so a container recreate keeps it.
 - The rows are deduped on `source_event`, like the source index.
@@ -69,6 +88,14 @@ alongside `verified-notification` (`mcp/tools/verified_notification.mjs`):
            "source_channel":"<uuid>","reason":"no-grant","observed_at":1794772317}}
 ```
 
+- `reason` is a fixed status: `no-grant`, `no-grant-suspect` or `dm-not-owner`.
+  The notice never states more than the lookup supports. `no-grant` means the
+  relays read held no grant for this author. `no-grant-suspect` means the
+  lookup itself is in doubt.
+- A suspect notice is still sent, under the same caps: an evicting relay drops
+  every mention, so that is when the seat most needs to know. The reader renders
+  it as "grant lookup unreliable", never as "holds no grant".
+
 - It carries no body, no receipt and no `authority`. `nvoy_channel_reply`
   refuses it, as it refuses any record that is not an `admitted-task` today
   (`claude-channel.mjs`, `NVOY_REPLY_REQUIRES_ONE_SENDER`). The reader shows it
@@ -85,8 +112,10 @@ alongside `verified-notification` (`mcp/tools/verified_notification.mjs`):
   on loops, and a notice would wake the agent the brake exists to stop.
 
 This turns the drop into an interop gap the agent can report the same turn:
-"neil mentioned me at 18:51:57 and holds no grant for me". The person who can
-fix it (James, for a grant) can then be asked.
+"neil mentioned me at 18:51:57; the relays read held no grant for him". The
+person who can fix it (James, for a grant) can then be asked. On a suspect
+notice, the report is "grant lookup unreliable", which goes to whoever runs
+the relays.
 
 The cost is that an ungranted room member can wake the seat up to once an hour.
 The per-seat cap bounds the total, and the notice has no text an injection
@@ -124,6 +153,12 @@ limits.
   refuses a notice with any extra key, as `validateVerifiedNotification` does.
 - `nvoy_channel_reply` on an `unadmitted-mention` envelope is refused.
 - A full refusal file is trimmed and never grows past the cap.
+- A lookup with `suspect: true` writes `reason: no-grant-suspect`, in both the
+  row and the notice. A sound empty lookup writes `no-grant`.
+- A `dm-not-owner` row has no `grant_lookup`, and the grant check is never run
+  for it.
+- The carried broker (`instance-broker.mjs`) writes neither a row nor this
+  notice.
 
 ## Open questions for James
 
