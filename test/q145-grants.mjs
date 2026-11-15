@@ -1,8 +1,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools'
 import { anchorGapsAreRecoverable, brokerGapsAreSafeOrRecoverable, deliveryPlan, JAMES, missingBrokerGrantsAreEnded, parseCorrections, pendingCorrections, publishAndReadBack, assertSignerOwner, signCorrection, signingOrder, unsignedCorrection } from '../bin/q145-grants.mjs'
-import { scopeHash } from '../mcp/tools/grant_fold.mjs'
+import { foldGrants, scopeHash } from '../mcp/tools/grant_fold.mjs'
 
 const TARGET = 'a'.repeat(64)
 const HOLDER = 'b'.repeat(64)
@@ -127,6 +128,24 @@ test('unrelated live broker gap still blocks signing', () => {
 
 test('unrelated broker-only event blocks signing', () => {
   assert.equal(anchorGapsAreRecoverable(new Set(), [grant('grant-task', 'unrelated')], []), false)
+})
+
+test('real grant fold recovers a signed broker-only 440 by its grant ID', async () => {
+  const key = generateSecretKey(), grantor = getPublicKey(key)
+  const correction = row('grant-task')
+  const signed = finalizeEvent(unsignedCorrection(correction, Math.floor(Date.now() / 1000), 'abcd'), key)
+  const realFold = (events, options) => foldGrants(events, { ...options, grantors: [grantor] })
+  const anchor = relay(), broker = relay([signed])
+  const anchorEvents = [...anchor.events.values()], brokerEvents = [...broker.events.values()]
+  const anchorPending = pendingCorrections([correction], anchorEvents, brokerEvents, realFold).includes(correction)
+  const brokerPending = pendingCorrections([correction], brokerEvents, brokerEvents, realFold).includes(correction)
+  assert.equal(anchorPending, true)
+  assert.equal(brokerPending, false)
+  const plan = deliveryPlan(correction, anchorPending, brokerPending, anchorEvents, brokerEvents, realFold)
+  assert.equal(plan.signed.id, signed.id)
+  await publishAndReadBack(plan.signed, [anchor, broker], plan.needAnchor, plan.needBroker)
+  assert.equal(anchor.events.has(signed.id), true)
+  assert.equal(broker.calls.length, 0)
 })
 
 test('broker gaps are safe only when every absent event is an ended grant', () => {

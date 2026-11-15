@@ -211,6 +211,10 @@ async function main() {
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) main().catch(error => {
   if (!process.argv.includes('--apply')) console.error(`q145-grants dry-run failed: ${error?.message || error}`)
-  else console.error('q145-grants stopped. No further events were signed. Inspect the relay/Bunker and rerun; dry-run is the default.')
+  else {
+    const message = String(error?.message || '')
+    const safe = /^(Bunker signer is not James|Bunker changed the reviewed correction|signed correction was not readable from anchor and broker relays|cannot recover signed correction for |grant relay returned \d+ events; possible result cap|anchor is missing a grant or revoke|broker relay union is missing a live grant or revoke|--apply requires an interactive terminal|apply confirmation did not match|relay\.nave\.pub returned fewer than the audited 200 events)/.test(message)
+    console.error(`q145-grants stopped. No further events were signed. ${safe ? message : 'Inspect the relay/Bunker for the failure.'} Rerun the dry-run before apply.`)
+  }
   process.exitCode = 1
 })

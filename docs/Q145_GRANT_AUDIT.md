@@ -67,7 +67,9 @@ resume safely if interrupted. It must never receive James's signing key.
 The runner folds the anchor and broker relay union separately. If an interrupted
 publish left a signed 440 or 441 on only one side, a rerun republishes that
 same event to the missing side and reads it back from both sides before marking
-the row complete. Apply stops if an unrelated event is missing from the anchor
+the row complete. Broker-side readback requires at least one of the three
+configured broker grant relays. Apply stops if an unrelated event is missing
+from the anchor
 or a live event is missing from every broker relay. It also stops on a possible
 relay result cap, orders grants before revokes, and requires a typed pending
 count before opening the Bunker signer.
