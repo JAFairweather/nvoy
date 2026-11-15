@@ -3,24 +3,37 @@
 // Invariants (docs/frontier-review/PLAN.md E1 & Hive decision-hive-memory-buzz-cortex-publication-boundary):
 //   1. Strictly offline and read-only: opens an offline SQLite snapshot with `{ readOnly: true }`, imports
 //      no networking, IPC or child-process modules, and refuses live store, socket and publication paths.
-//   2. Explicit allowlist only: only scopes listed in `allowlist.scopes` are read (`self:<pubkey>` is
-//      always refused, and `room:<uuid>` scopes require an explicit public label so room UUIDs never
-//      appear in output). Topics are restricted to `allowlist.topics`. Claim prose is excluded by default
-//      and emitted only for fact keys explicitly opted in via `allowlist.claims`.
-//   3. Two-layer fail-closed secret & boundary guard: every active candidate event must pass full Nostr
-//      signature and schema verification (`validateMemoryEvent` + `checkMemorySecrets`), any opted-in
-//      chosen claim must also pass `publicBoundaryHit` (excluding paths, internal hosts, IPs, UUIDs,
-//      64-hex ids and Nostr identifiers), and the entire output object + static HTML must pass
-//      `publicProjectionFindings` before a byte is written.
+//   2. Strictly aggregate-only explicit allowlist: only scopes listed in `allowlist.scopes` are read
+//      (`self:<pubkey>` is always refused, and `room:<uuid>` scopes require an explicit public label so
+//      room UUIDs never appear in output). Topics are restricted to `allowlist.topics`. When optional
+//      `allowlist.claims` is supplied, only those allowlisted fact keys contribute to aggregate counts.
+//      Claim prose, raw IDs/slugs, identities, paths and network details are never emitted.
+//   3. Two-layer fail-closed secret & boundary guard: every candidate event must pass full Nostr signature
+//      and schema verification (`validateMemoryEvent` + `checkClaimPayloadSecrets`) AND match its stored
+//      SQLite metadata columns (so unsigned SQLite columns can never relabel signed event topics or counts),
+//      and the entire output object + static HTML must pass `publicProjectionFindings` before a byte is
+//      written via exclusive non-symlink-following atomic temp files.
 
-import { lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
+import {
+  closeSync,
+  constants,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import {
   DECISION_RETENTION,
   FALLBACK_MEMORY_KIND,
   MEMORY_KIND,
-  checkClaimPayloadSecrets,
   checkMemorySecrets,
   normalizeMemoryTopic,
   parseFactKey,
@@ -32,12 +45,12 @@ import { sanitiserFindings } from './status_snapshot.mjs'
 export const PROJECTION_VERSION = 1
 
 export const WITHHELD_PUBLIC_FIELDS = Object.freeze([
+  'claim_prose',
   'event_ids',
   'fact_keys_and_slugs',
   'author_identities',
   'room_uuids',
   'unallowlisted_scopes',
-  'unchosen_claim_prose',
   'because_and_evidence',
   'filesystem_paths',
   'network_addresses_and_hosts',
@@ -63,8 +76,8 @@ const BOUNDARY_PATTERNS = Object.freeze([
   ['a full 64-hex key or id', /(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])/i],
   ['an IPv4 address', /(?<![\d.])\d{1,3}(?:\.\d{1,3}){3}(?![\d.])/],
   ['an IPv6 address', /\[[0-9a-f:.]*:[0-9a-f:.]*\]|(?<![0-9a-z:])(?:[0-9a-f]{1,4}:){4,7}[0-9a-f]{1,4}(?![0-9a-z:])|(?<![0-9a-z:])[0-9a-f]{0,4}::(?:[0-9a-f]{1,4})?(?![0-9a-z])/i],
-  ['a filesystem path', /(?<![A-Za-z0-9_:])\/(?:Users|home|etc|var|opt|srv|run|tmp|root|usr|proc|sys)(?:\/|\b)|(?<![A-Za-z0-9])~\//],
-  ['an internal hostname', /\b(?:herd-cloud|nvoy-fleet|waggle-box|pointbeachlab[a-z0-9-]*|[a-z0-9-]+\.ts\.net|localhost)\b/i],
+  ['a filesystem path', /(?<![A-Za-z0-9_<:/])\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*|(?<![A-Za-z0-9])~\/|(?<![A-Za-z0-9.])\.\.?\/[A-Za-z0-9._-]+|\b[A-Za-z]:\\[A-Za-z0-9._\\-]+/],
+  ['a network URI or hostname', /\b[a-z][a-z0-9+.-]*:\/\/\S+|\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}\b|\b(?:herd-cloud|nvoy-fleet|waggle-box|pointbeachlab[a-z0-9-]*|localhost)\b|\b[a-z][a-z0-9-]{1,62}:\d{2,5}(?![0-9a-z%])/i],
 ])
 
 const isObj = v => v !== null && typeof v === 'object' && !Array.isArray(v)
@@ -259,8 +272,9 @@ export function validateProjectionAllowlist(raw) {
     topics.push(norm)
   }
 
+  const hasClaimFilter = raw.claims !== undefined
   const chosenClaims = new Set()
-  if (raw.claims !== undefined) {
+  if (hasClaimFilter) {
     if (!Array.isArray(raw.claims)) throw new Error('allowlist.claims must be an array of fact keys')
     for (const d of raw.claims) {
       if (typeof d !== 'string') throw new Error('allowlist.claims entries must be strings')
@@ -281,7 +295,14 @@ export function validateProjectionAllowlist(raw) {
     memoryGlobalChannelId = ch
   }
 
-  return Object.freeze({ scopeMap, topics: Object.freeze(topics), topicSet, chosenClaims, memoryGlobalChannelId })
+  return Object.freeze({
+    scopeMap,
+    topics: Object.freeze(topics),
+    topicSet,
+    hasClaimFilter,
+    chosenClaims,
+    memoryGlobalChannelId,
+  })
 }
 
 export function coarseIsoMinute(nowSec = Math.floor(Date.now() / 1000)) {
@@ -348,33 +369,42 @@ export function buildPublicProjectionFromDb(db, rawAllowlist, { nowSec = Math.fl
   let withheldClaims = 0
   let unlistedTopicClaims = 0
   let inferredGlobalChannelId = allowlist.memoryGlobalChannelId
-  const chosenOut = []
 
   for (const row of rows) {
     if (!row || row.is_current !== 1) continue
-    if (row.scope_type === 'self') continue
-    const scopeInfo = allowlist.scopeMap.get(row.scope)
-    // Strictly ignore any scope outside the explicit allowlist (zero counts, zero side-channels).
-    if (!scopeInfo) continue
-    if (row.status !== 'active') continue
-    if (row.exp != null && Number(row.exp) <= effectiveNow) continue
 
-    // Guard stored columns as well as raw_json in case a test or tampered DB altered SQLite columns directly.
+    let ev = null
+    let parseOk = false
+    try {
+      ev = JSON.parse(String(row.raw_json || ''))
+      parseOk = isObj(ev)
+    } catch {
+      parseOk = false
+    }
+
+    const evScope = parseOk && typeof tagValue(ev, 's') === 'string' ? tagValue(ev, 's') : ''
+    const rowScopeAllowed = allowlist.scopeMap.has(row.scope)
+    const evScopeAllowed = Boolean(evScope && allowlist.scopeMap.has(evScope))
+
+    // Strictly ignore rows whose stored scope AND signed scope are both outside allowlist.scopes (zero side-channels).
+    if (!rowScopeAllowed && !evScopeAllowed) continue
+
+    // If raw_json is malformed or stored scope diverges from signed event scope, quarantine into withheld_claims.
+    if (!parseOk || !rowScopeAllowed || !evScopeAllowed || row.scope !== evScope) {
+      withheldClaims += 1
+      continue
+    }
+    const scopeInfo = allowlist.scopeMap.get(evScope)
+
     if (checkMemorySecrets(row.topic) || checkMemorySecrets(row.d)) {
       withheldClaims += 1
       continue
     }
 
-    let ev
-    try {
-      ev = JSON.parse(String(row.raw_json || ''))
-    } catch {
-      withheldClaims += 1
-      continue
-    }
-    if (!isObj(ev) || String(ev.id || '').toLowerCase() !== String(row.id || '').toLowerCase() ||
+    if (String(ev.id || '').toLowerCase() !== String(row.id || '').toLowerCase() ||
         String(ev.pubkey || '').toLowerCase() !== String(row.pubkey || '').toLowerCase() ||
-        tagValue(ev, 'd') !== row.d || tagValue(ev, 's') !== row.scope) {
+        Number(row.kind) !== ev.kind ||
+        tagValue(ev, 'd') !== row.d) {
       withheldClaims += 1
       continue
     }
@@ -400,46 +430,41 @@ export function buildPublicProjectionFromDb(db, rawAllowlist, { nowSec = Math.fl
       allowedKinds: [MEMORY_KIND, FALLBACK_MEMORY_KIND],
       verifySignature: true,
     })
-    if (!v.ok || v.status !== 'active') {
+    if (!v.ok) {
       withheldClaims += 1
       continue
     }
-    // Pin inferred global channel only AFTER cryptographic signature and schema verification pass.
+
+    // Verify stored SQLite metadata columns against the cryptographically verified Nostr event so unsigned
+    // columns can never relabel signed topics, retention classes, expiry or status.
+    const expectedStoredTopic = normalizeMemoryTopic(v.topic) ?? v.topic
+    const rowExp = row.exp == null ? null : Number(row.exp)
+    if (Number(row.created_at) !== v.createdAt ||
+        row.scope !== v.scope ||
+        row.scope_type !== v.scopeType ||
+        (row.room_id ?? null) !== (v.roomId ?? null) ||
+        row.topic !== expectedStoredTopic ||
+        row.status !== v.status ||
+        row.retention !== v.retention ||
+        rowExp !== (v.expiresAt ?? null)) {
+      withheldClaims += 1
+      continue
+    }
+
+    // Pin inferred global channel only AFTER cryptographic signature and SQLite-column verification pass.
     if (eventGlobalH && !inferredGlobalChannelId) {
       inferredGlobalChannelId = eventGlobalH
     }
+
+    if (v.status !== 'active') continue
     if (v.expiresAt != null && v.expiresAt <= effectiveNow) continue
 
-    let body
-    try {
-      body = JSON.parse(String(ev.content || ''))
-    } catch {
-      withheldClaims += 1
-      continue
-    }
-    if (checkClaimPayloadSecrets({ claim: body.claim, because: body.because, evidence: body.evidence, tags: ev.tags })) {
-      withheldClaims += 1
-      continue
-    }
+    // Optional allowlist.claims filters which allowlisted claims contribute to aggregate counts; prose is never emitted.
+    if (allowlist.hasClaimFilter && !allowlist.chosenClaims.has(v.d)) continue
 
-    const isChosen = allowlist.chosenClaims.has(row.d)
-    const normTopic = normalizeMemoryTopic(row.topic || v.topic)
+    // Derive canonical topic strictly from the verified signed event, never from unsigned SQLite metadata.
+    const normTopic = normalizeMemoryTopic(v.topic)
     const curatedTopic = normTopic && allowlist.topicSet.has(normTopic) ? normTopic : null
-
-    if (isChosen) {
-      const prose = String(v.claim || '').trim()
-      // Chosen claims must additionally clear the strict public boundary (no paths, hosts, IPs, UUIDs, 64-hex or npubs).
-      if (!prose || publicBoundaryHit(prose)) {
-        withheldClaims += 1
-        continue
-      }
-      chosenOut.push({
-        scope: scopeInfo.publicLabel,
-        topic: curatedTopic || 'other',
-        retention: v.retention === DECISION_RETENTION ? 'decision' : 'ephemeral',
-        claim: prose,
-      })
-    }
 
     const isDecision = v.retention === DECISION_RETENTION
     activeClaims += 1
@@ -476,7 +501,6 @@ export function buildPublicProjectionFromDb(db, rawAllowlist, { nowSec = Math.fl
     },
     scopes: [...scopeStats.values()],
     topics: [...topicStats.values()],
-    chosen_claims: chosenOut,
     withheld_fields: [...WITHHELD_PUBLIC_FIELDS],
   }
 
@@ -525,9 +549,6 @@ export function renderPublicProjectionHtml(projection) {
   const topicRows = (Array.isArray(projection.topics) ? projection.topics : []).map(t =>
     `<tr><td><code>${escHtml(t.topic)}</code></td><td>${Number(t.active_claims) || 0}</td><td>${Number(t.durable_decisions) || 0}</td></tr>`
   ).join('\n      ')
-  const claimItems = (Array.isArray(projection.chosen_claims) ? projection.chosen_claims : []).map(item =>
-    `<li><span class="badge">${escHtml(item.scope)}</span> <span class="badge">${escHtml(item.topic)}</span> <span class="badge">${escHtml(item.retention)}</span><p>${escHtml(item.claim)}</p></li>`
-  ).join('\n    ')
   const withheldList = (Array.isArray(projection.withheld_fields) ? projection.withheld_fields : [])
     .map(f => `<code>${escHtml(f)}</code>`).join(', ')
 
@@ -546,7 +567,6 @@ export function renderPublicProjectionHtml(projection) {
   .card strong { display: block; font-size: 1.4rem; }
   table { width: 100%; border-collapse: collapse; background: #ffffff; margin-bottom: 1.5rem; }
   th, td { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid #e5e7eb; }
-  .badge { display: inline-block; background: #eef2ff; color: #3730a3; padding: 0.1rem 0.45rem; border-radius: 0.25rem; font-size: 0.8rem; margin-right: 0.25rem; }
   .foot { font-size: 0.875rem; color: #4b5563; border-top: 1px solid #e5e7eb; padding-top: 1rem; margin-top: 2rem; }
 </style>
 </head>
@@ -573,7 +593,6 @@ export function renderPublicProjectionHtml(projection) {
       ${topicRows}
     </tbody>
   </table>
-  ${claimItems ? `<h2>Allowlisted Chosen Claims</h2>\n  <ul>\n    ${claimItems}\n  </ul>` : ''}
   <p class="foot">Excluded by publication boundary: ${withheldList}.</p>
 </body>
 </html>
@@ -581,9 +600,43 @@ export function renderPublicProjectionHtml(projection) {
 }
 
 function writeAtomically(targetPath, content) {
-  const tmp = `${targetPath}.${process.pid}.tmp`
-  writeFileSync(tmp, content, { mode: 0o644 })
-  renameSync(tmp, targetPath)
+  let targetStat = null
+  try {
+    targetStat = lstatSync(targetPath)
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e
+  }
+  if (targetStat && (targetStat.isSymbolicLink() || !targetStat.isFile())) {
+    throw new Error('refusing to overwrite non-regular file or symlink in --out')
+  }
+
+  const tmp = `${targetPath}.${process.pid}.${randomBytes(16).toString('hex')}.tmp`
+  const openFlags = constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | (constants.O_NOFOLLOW || 0)
+  const fd = openSync(tmp, openFlags, 0o644)
+  let closed = false
+  try {
+    writeFileSync(fd, Buffer.from(String(content), 'utf8'))
+    fsyncSync(fd)
+    closeSync(fd)
+    closed = true
+
+    let recheck = null
+    try {
+      recheck = lstatSync(targetPath)
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e
+    }
+    if (recheck && (recheck.isSymbolicLink() || !recheck.isFile())) {
+      throw new Error('refusing to overwrite non-regular file or symlink in --out')
+    }
+    renameSync(tmp, targetPath)
+  } catch (e) {
+    if (!closed) {
+      try { closeSync(fd) } catch {}
+    }
+    try { unlinkSync(tmp) } catch {}
+    throw e
+  }
 }
 
 export function projectOfflinePublicCortex({ dbPath, allowlist, outDir, nowSec }) {

@@ -182,7 +182,7 @@ try {
   const canonChosen = mkClaim(canonWriter, 'hive:canon', 'cortex-architecture', {
     topic: 'hive-memory',
     ttlSec: 0,
-    claim: 'Cortex is the canonical memory store; public snapshots are generated offline from allowlisted scopes.',
+    claim: 'CANARY_CHOSEN_CANON_PROSE_900 Cortex is the canonical memory store; public snapshots are generated offline.',
     supersedes: [canonOld.id],
     nowSec: T0 + 20,
   })
@@ -196,7 +196,7 @@ try {
   const canonUnchosen = mkClaim(owner, 'hive:canon', 'internal-canon-note', {
     topic: 'nvoy',
     ttlSec: 0,
-    claim: 'CANARY_UNCHOSEN_CANON_PROSE_904 stays out of chosen_claims.',
+    claim: 'CANARY_UNCHOSEN_CANON_PROSE_904 internal canon claim.',
     nowSec: T0 + 25,
   })
   ok('submit unchosen canon claim', store.submit({ writer: 'owner', event: canonUnchosen, nowSec: T0 + 25 }).accepted === true)
@@ -237,7 +237,7 @@ try {
     ttlSec: 0,
     supersedes: [roomSourceA.id],
     merkleSources: merkleRoot,
-    claim: 'Offline projections carry coarse counts, curated topics, and explicitly chosen public summaries.',
+    claim: 'CANARY_CHOSEN_ROOM_PROSE_916 Offline projections carry coarse counts and curated topics only.',
     nowSec: T0 + 45,
   })
   ok('submit curated room chosen decision', store.submit({ writer: 'agenta', event: roomCuratedChosen, nowSec: T0 + 45 }).accepted === true)
@@ -249,6 +249,16 @@ try {
     nowSec: T0 + 50,
   })
   ok('submit room claim on uncurated topic', store.submit({ writer: 'agentb', event: roomUnlistedTopic, nowSec: T0 + 50 }).accepted === true)
+
+  // Signed claim on 'private-subproject' whose unsigned SQLite topic column will be tampered to 'nvoy' in the snapshot.
+  const roomTamperedTopic = mkClaim(agentB, `room:${ROOM_PUBLIC}`, 'sql-topic-relabel-attempt', {
+    topic: 'private-subproject',
+    ttlSec: 3600,
+    claim: 'CANARY_SQL_TOPIC_RELABEL_917 signed under private-subproject.',
+    nowSec: T0 + 52,
+  })
+  ok('submit room claim for unsigned SQLite topic relabel test',
+    store.submit({ writer: 'agentb', event: roomTamperedTopic, nowSec: T0 + 52 }).accepted === true)
 
   const roomExpired = mkClaim(agentB, `room:${ROOM_PUBLIC}`, 'expired-room-claim', {
     topic: 'nvoy',
@@ -275,17 +285,17 @@ try {
   })
   ok('submit unallowlisted private room claim', store.submit({ writer: 'agentb', event: privateRoomOutside, nowSec: T0 + 65 }).accepted === true)
 
-  // Chosen claims that violate the public boundary (paths, internal hosts, npubs, 64-hex) even though valid internally.
+  // Claims whose prose mentions paths, hosts, domains, URIs, npubs, and 64-hex (valid internally, must never leak in aggregate-only output).
   const boundaryLeakCases = [
-    ['leak-path', 'Config lives at /etc/hive-memory/config.json CANARY_LEAK_PATH_910'],
-    ['leak-home', 'Checkout is ~/nest/ops/queue.tsv CANARY_LEAK_HOME_911'],
-    ['leak-host', 'Service runs on herd-cloud and box.tail1943d6.ts.net CANARY_LEAK_HOST_912'],
+    ['leak-path', 'Config lives at /mnt/snapshots/config.json and /data/cortex.sqlite CANARY_LEAK_PATH_910'],
+    ['leak-home', 'Checkout is ~/nest/ops/queue.tsv and ./local/path CANARY_LEAK_HOME_911'],
+    ['leak-host', 'Service runs on herd-cloud, bunker.nave.pub and unrecognized.host.invalid CANARY_LEAK_HOST_912'],
     ['leak-npub', `Maintainer key is ${BOUNDARY_NPUB} CANARY_LEAK_NPUB_913`],
     ['leak-hex64', `Raw event id ${BOUNDARY_HEX64} CANARY_LEAK_HEX64_914`],
   ]
   for (const [slug, text] of boundaryLeakCases) {
     const ev = mkClaim(owner, 'hive:canon', slug, { topic: 'nvoy', ttlSec: 0, claim: text })
-    ok(`submit boundary-test canon claim (${slug})`, store.submit({ writer: 'owner', event: ev, nowSec: ev.created_at }).accepted === true)
+    ok(`submit boundary-bearing internal canon claim (${slug})`, store.submit({ writer: 'owner', event: ev, nowSec: ev.created_at }).accepted === true)
   }
 
   // Snapshot the test store offline via snapshotStore (exact offline workflow), then close the store.
@@ -296,9 +306,9 @@ try {
   await snapshotStore({ dbPath, ledgerPath, snapshotPath: snapDbPath, ledgerCutPath: snapLedgerPath })
   store.close()
 
-  // Seed direct SQLite rows into a copy of the offline snapshot to test Negative Control 2:
-  // secret-shaped strings (nsec, sk-proj, ghp_, bunker://, AKIA, high-entropy token), a tampered signature,
-  // and a personal self:<pubkey> row (even if pre-guard or injected directly into SQLite).
+  // Seed direct SQLite rows/mutations into a copy of the offline snapshot to test Negative Control 2:
+  // secret-shaped strings (nsec, sk-proj, ghp_, bunker://, AKIA, high-entropy token, IP literals),
+  // a tampered signature, tampered unsigned SQLite topic/retention metadata, and a personal self:<pubkey> row.
   const seededDbPath = join(snapDir, 'seeded-snapshot.sqlite')
   writeFileSync(seededDbPath, readFileSync(snapDbPath))
   const seedDb = new DatabaseSync(seededDbPath)
@@ -308,6 +318,9 @@ try {
       status, retention, as_of_git, as_of_evt, exp, raw_json, ingested_at, is_current
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
   `)
+
+  // Tamper unsigned SQLite topic column on a signed 'private-subproject' event -> must be quarantined, NOT counted under 'nvoy'.
+  seedDb.prepare('UPDATE events SET topic = ? WHERE id = ?').run('nvoy', roomTamperedTopic.id)
 
   const signRawSecretEvent = (slug, secretText) => {
     const d = `hive-memory:hive:canon:${slug}`
@@ -383,6 +396,7 @@ try {
   seedDb.close()
 
   // --- 3. Run the offline CLI against the seeded test store and check positive + negative controls ---
+  // Explicit allowlist.claims restricts WHICH claims are counted in aggregate counts while still emitting ZERO prose.
   const allowlist = {
     scopes: [
       'hive:canon',
@@ -392,8 +406,7 @@ try {
     claims: [
       'hive-memory:hive:canon:cortex-architecture',
       `hive-memory:room:${ROOM_PUBLIC}:curated-public-note`,
-      // Explicitly opt in every boundary-leaking and secret-bearing slug too, proving even opted-in claims are blocked!
-      ...boundaryLeakCases.map(([slug]) => `hive-memory:hive:canon:${slug}`),
+      `hive-memory:room:${ROOM_PUBLIC}:sql-topic-relabel-attempt`,
       ...secretCases.map(([slug]) => `hive-memory:hive:canon:${slug}`),
       'hive-memory:hive:canon:aaa-tampered-sig',
     ],
@@ -415,28 +428,29 @@ try {
   const proj = JSON.parse(jsonRaw)
 
   ok('projection coarse_state is ready and not withheld', proj.coarse_state === 'ready' && proj.withheld === false)
+  ok('projection is strictly aggregate-only with no chosen_claims prose field',
+    !('chosen_claims' in proj) && proj.withheld_fields.includes('claim_prose'))
   ok('projection contains ONLY allowlisted scopes',
     JSON.stringify(proj.scopes.map(s => s.scope)) === JSON.stringify(['hive:canon', 'room:public-demo']))
   ok('projection contains ONLY curated allowlisted topics',
     JSON.stringify(proj.topics.map(t => t.topic)) === JSON.stringify(['hive-memory', 'nvoy']))
-  ok('allowlisted scope counts reflect only valid active non-expired rows',
-    proj.counts.active_claims === 5 &&
-    proj.counts.durable_decisions === 3 &&
-    proj.counts.ephemeral_claims === 2 &&
+  ok('allowlist.claims counts only valid chosen claims and unsigned SQLite topic relabel does not increment nvoy',
+    proj.counts.active_claims === 2 &&
+    proj.counts.durable_decisions === 2 &&
+    proj.counts.ephemeral_claims === 0 &&
     proj.counts.curated_syntheses === 1 &&
-    proj.counts.unlisted_topic_claims === 1)
-  // 6 boundary-leak chosen claims + 6 secret-bearing rows + 1 tampered-sig row = 13 withheld rows.
-  ok('secret, boundary-violating and tampered rows are quarantined in withheld_claims',
-    proj.counts.withheld_claims === 13, `got ${proj.counts.withheld_claims}`)
-  ok('only clean explicitly chosen claims appear in chosen_claims',
-    proj.chosen_claims.length === 2 &&
-    proj.chosen_claims[0].scope === 'hive:canon' &&
-    proj.chosen_claims[0].claim.includes('Cortex is the canonical memory store') &&
-    proj.chosen_claims[1].scope === 'room:public-demo' &&
-    proj.chosen_claims[1].claim.includes('Offline projections carry coarse counts'))
+    proj.counts.unlisted_topic_claims === 0 &&
+    proj.topics.find(t => t.topic === 'hive-memory')?.active_claims === 2 &&
+    proj.topics.find(t => t.topic === 'nvoy')?.active_claims === 0,
+    JSON.stringify(proj.counts))
+  // 7 secret-bearing rows + 1 tampered-sig row + 1 tampered SQLite topic row = 9 withheld rows.
+  ok('secret, signature-tampered and SQLite-topic-tampered rows are quarantined in withheld_claims',
+    proj.counts.withheld_claims === 9, `got ${proj.counts.withheld_claims}`)
 
-  // Negative Control 1: every claim outside allowlist.scopes, unchosen claim prose, withdrawn, expired and superseded claim is absent.
+  // Negative Control 1: EVERY claim's prose (even chosen canon/room claims!), outside scopes, withdrawn, expired, superseded, IDs & keys are absent.
   const absentCanaries = [
+    'CANARY_CHOSEN_CANON_PROSE_900',
+    'CANARY_CHOSEN_ROOM_PROSE_916',
     'CANARY_OUTSIDE_OPS_901',
     'CANARY_OUTSIDE_PRIVATE_ROOM_902',
     'CANARY_OUTSIDE_SELF_903',
@@ -446,6 +460,7 @@ try {
     'CANARY_SUPERSEDED_CLAIM_907',
     'CANARY_ROOM_UNCHOSEN_908',
     'CANARY_UNLISTED_TOPIC_PROSE_909',
+    'CANARY_SQL_TOPIC_RELABEL_917',
     'CANARY_INTERNAL_BECAUSE_PROSE',
     'private-subproject',
     'hive:ops',
@@ -463,7 +478,7 @@ try {
     'curated-public-note',
   ]
   for (const needle of absentCanaries) {
-    ok(`non-allowlisted / internal artifact absent from all output (${needle.slice(0, 28)})`, !combinedOut.includes(needle))
+    ok(`claim prose / non-allowlisted / internal artifact absent from all output (${needle.slice(0, 28)})`, !combinedOut.includes(needle))
   }
 
   // Negative Control 2: every secret-shaped string and boundary-violating string is absent from JSON, HTML, stdout and stderr.
@@ -491,9 +506,11 @@ try {
     'CANARY_LEAK_IP_915',
     '100.88.14.92',
     'fd7a:115c:a1e0::42',
-    '/etc/hive-memory',
+    '/mnt/snapshots',
+    '/data/cortex.sqlite',
     'herd-cloud',
-    'tail1943d6.ts.net',
+    'bunker.nave.pub',
+    'unrecognized.host.invalid',
   ]
   for (const secret of absentSecretsAndLeaks) {
     ok(`secret or boundary marker absent from all output (${secret.slice(0, 16)}…)`, !combinedOut.includes(secret))
@@ -505,7 +522,7 @@ try {
   ok('static HTML contains no script tags, fetch, EventSource or anchor links',
     !/<script\b|fetch\s*\(|EventSource|<a\b/i.test(htmlRaw))
 
-  // --- 4. Default aggregate-only mode (no claims allowlist) emits zero claim prose ---
+  // --- 4. Scope-level aggregate mode (no allowlist.claims) counts all valid active claims in allowlisted scopes with zero prose ---
   const aggAllowlistPath = join(root, 'allowlist-agg.json')
   writeFileSync(aggAllowlistPath, JSON.stringify({
     scopes: ['hive:canon', { scope: `room:${ROOM_PUBLIC}`, label: 'public-demo' }],
@@ -516,68 +533,90 @@ try {
   const aggJson = readFileSync(join(aggOutDir, 'cortex-public.json'), 'utf8')
   const aggHtml = readFileSync(join(aggOutDir, 'index.html'), 'utf8')
   const aggParsed = JSON.parse(aggJson)
-  ok('aggregate-only mode exits 0 with empty chosen_claims', aggRes.status === 0 && aggParsed.chosen_claims.length === 0)
-  ok('aggregate-only mode omits even clean canon claim prose from JSON and HTML',
-    !aggJson.includes('Cortex is the canonical memory store') && !aggHtml.includes('Cortex is the canonical memory store'))
+  // Valid active rows in allowlisted scopes: canonChosen + canonUnchosen + 5 boundaryLeakCases (7 in hive:canon)
+  // + roomSourceA + roomCuratedChosen + roomUnlistedTopic (3 in room:public-demo) = 10 active, 9 withheld (7 secrets + 1 bad sig + 1 SQL topic tamper).
+  ok('scope-level aggregate mode exits 0 with exact aggregate counts and quarantined tampered SQLite topic',
+    aggRes.status === 0 &&
+    !('chosen_claims' in aggParsed) &&
+    aggParsed.counts.active_claims === 10 &&
+    aggParsed.counts.durable_decisions === 8 &&
+    aggParsed.counts.ephemeral_claims === 2 &&
+    aggParsed.counts.unlisted_topic_claims === 1 &&
+    aggParsed.counts.withheld_claims === 9,
+    JSON.stringify(aggParsed.counts))
+  ok('scope-level aggregate mode emits zero claim prose, paths or hostnames in JSON and HTML',
+    !aggJson.includes('CANARY_') &&
+    !aggHtml.includes('CANARY_') &&
+    !aggJson.includes('/mnt/snapshots') &&
+    !aggJson.includes('bunker.nave.pub'))
 
-  // --- 5. Defense-in-depth second-layer output sanitiser negative control ---
-  const poisonedCandidate = {
+  // --- 5. Defense-in-depth second-layer output sanitiser negative controls (secrets, paths, unrecognized hosts/URLs) ---
+  for (const [label, poison] of [
+    ['secret and 64-hex', `leaked ${SECRET_GHP} and ${BOUNDARY_HEX64}`],
+    ['ordinary /mnt and /data paths', 'mounted at /mnt/snapshots and /data/cortex.sqlite'],
+    ['external relays and unrecognized hosts', 'connects to bunker.nave.pub, relay.nsec.app and https://unrecognized.host.invalid/v1'],
+  ]) {
+    const poisonedCandidate = {
+      version: 1,
+      generated_at: '2026-11-15T03:30:00Z',
+      coarse_state: 'ready',
+      withheld: false,
+      counts: { active_claims: 1, durable_decisions: 1, ephemeral_claims: 0, curated_syntheses: 0, unlisted_topic_claims: 0, withheld_claims: 0 },
+      scopes: [{ scope: poison, active_claims: 1, durable_decisions: 1, ephemeral_claims: 0 }],
+      topics: [{ topic: 'nvoy', active_claims: 1, durable_decisions: 1 }],
+      withheld_fields: [],
+    }
+    const finalised = finalisePublicProjection(poisonedCandidate)
+    const withheldHtml = renderPublicProjectionHtml(finalised.projection)
+    ok(`second-layer output sanitiser withholds candidate poisoned with ${label}`,
+      finalised.projection.withheld === true && finalised.projection.coarse_state === 'withheld' && finalised.findings.length >= 1)
+    ok(`withheld notice and HTML omit poisoned ${label}`,
+      !JSON.stringify(finalised.projection).includes(poison) && !withheldHtml.includes(poison))
+  }
+
+  // HTML escaping check against untrusted characters in rendered projection fields.
+  const rawHtmlEsc = renderPublicProjectionHtml({
     version: 1,
     generated_at: '2026-11-15T03:30:00Z',
     coarse_state: 'ready',
     withheld: false,
     counts: { active_claims: 1, durable_decisions: 1, ephemeral_claims: 0, curated_syntheses: 0, unlisted_topic_claims: 0, withheld_claims: 0 },
-    scopes: [{ scope: 'hive:canon', active_claims: 1, durable_decisions: 1, ephemeral_claims: 0 }],
+    scopes: [{ scope: '<img src=x onerror=alert(1)>', active_claims: 1, durable_decisions: 1, ephemeral_claims: 0 }],
     topics: [{ topic: 'nvoy', active_claims: 1, durable_decisions: 1 }],
-    chosen_claims: [{ scope: 'hive:canon', topic: 'nvoy', retention: 'decision', claim: `leaked ${SECRET_GHP} and ${BOUNDARY_HEX64}` }],
-    withheld_fields: [],
-  }
-  const finalised = finalisePublicProjection(poisonedCandidate)
-  const withheldHtml = renderPublicProjectionHtml(finalised.projection)
-  ok('second-layer output sanitiser withholds a poisoned projection object',
-    finalised.projection.withheld === true && finalised.projection.coarse_state === 'withheld' && finalised.findings.length >= 2)
-  ok('withheld notice and HTML contain zero bytes of the poisoned secret or 64-hex id',
-    !JSON.stringify(finalised.projection).includes(SECRET_GHP) &&
-    !JSON.stringify(finalised.projection).includes(BOUNDARY_HEX64) &&
-    !withheldHtml.includes(SECRET_GHP) &&
-    !withheldHtml.includes(BOUNDARY_HEX64))
+    withheld_fields: ['claim_prose'],
+  })
+  ok('HTML renderer escapes angle brackets and quotes in rendered fields',
+    !rawHtmlEsc.includes('<img src=x') && rawHtmlEsc.includes('&lt;img src=x onerror=alert(1)&gt;'))
 
-  // HTML escaping check against untrusted characters in chosen claim prose.
-  const xssClaim = mkClaim(owner, 'hive:canon', 'html-escape-check', {
-    topic: 'nvoy',
-    ttlSec: 0,
-    claim: 'Safe math 2 < 3 & 5 > 4 with "quotes" and <img src=x onerror=alert(1)> escaped.',
-    nowSec: T0 + 130,
+  // Preplanted symlink defense in --out (both predictable .pid.tmp symlinks and target file symlinks).
+  const sentinelPath = join(root, 'sentinel.txt')
+  const sentinelContent = 'SENTINEL_MUST_NOT_BE_OVERWRITTEN'
+  writeFileSync(sentinelPath, sentinelContent)
+
+  const outPreplantedTmp = join(root, 'out-preplanted-tmp')
+  mkdirSync(outPreplantedTmp)
+  symlinkSync(sentinelPath, join(outPreplantedTmp, `cortex-public.json.${process.pid}.tmp`))
+  symlinkSync(sentinelPath, join(outPreplantedTmp, `index.html.${process.pid}.tmp`))
+  projectOfflinePublicCortex({
+    dbPath: snapDbPath,
+    allowlist: { scopes: ['hive:canon'], topics: ['nvoy'] },
+    outDir: outPreplantedTmp,
+    nowSec: projectedAt,
   })
-  const escStoreDir = join(root, 'esc-store')
-  mkdirSync(escStoreDir)
-  initEmptyStore({ dbPath: join(escStoreDir, 'm.sqlite'), ledgerPath: join(escStoreDir, 'l.jsonl'), nowSec: T0 })
-  recordVerifiedBackup({ receiptPath: join(escStoreDir, 'r.json'), snapshotId: SNAP_ID, writeSeq: 1, at: T0 })
-  const escStore = new HiveMemoryStore({
-    dbPath: join(escStoreDir, 'm.sqlite'),
-    ledgerPath: join(escStoreDir, 'l.jsonl'),
-    receiptPath: join(escStoreDir, 'r.json'),
-    config: cfg,
-  })
-  escStore.start()
-  escStore.submit({ writer: 'owner', event: xssClaim, nowSec: T0 + 130 })
-  const escSnap = join(escStoreDir, 'snap.sqlite')
-  await snapshotStore({
-    dbPath: join(escStoreDir, 'm.sqlite'),
-    ledgerPath: join(escStoreDir, 'l.jsonl'),
-    snapshotPath: escSnap,
-    ledgerCutPath: join(escStoreDir, 'cut.jsonl'),
-  })
-  escStore.close()
-  const escOut = projectOfflinePublicCortex({
-    dbPath: escSnap,
-    allowlist: { scopes: ['hive:canon'], topics: ['nvoy'], claims: ['hive-memory:hive:canon:html-escape-check'] },
-    outDir: join(root, 'out-esc'),
-    nowSec: T0 + 140,
-  })
-  const escHtmlRaw = readFileSync(escOut.htmlPath, 'utf8')
-  ok('HTML renderer escapes angle brackets and quotes in chosen claims',
-    !escHtmlRaw.includes('<img src=x') && escHtmlRaw.includes('&lt;img src=x onerror=alert(1)&gt;'))
+  ok('atomic temp write never follows preplanted .pid.tmp symlinks and leaves sentinel untouched',
+    readFileSync(sentinelPath, 'utf8') === sentinelContent &&
+    existsSync(join(outPreplantedTmp, 'cortex-public.json')))
+
+  const outPreplantedTarget = join(root, 'out-preplanted-target')
+  mkdirSync(outPreplantedTarget)
+  symlinkSync(sentinelPath, join(outPreplantedTarget, 'cortex-public.json'))
+  ok('refuses preplanted target symlink in --out and leaves sentinel untouched',
+    throwsMsg(() => projectOfflinePublicCortex({
+      dbPath: snapDbPath,
+      allowlist: { scopes: ['hive:canon'], topics: ['nvoy'] },
+      outDir: outPreplantedTarget,
+      nowSec: projectedAt,
+    }), /symlink/) && readFileSync(sentinelPath, 'utf8') === sentinelContent)
 
   // --- 6. Allowlist and live-path refusal controls ---
   ok('refuses personal self:<pubkey> scope in allowlist',
@@ -638,16 +677,25 @@ try {
   ok('CLI rejects unsafe allowlist topic without echoing secret bytes',
     badCliTopic.status !== 0 && !badCliTopic.stderr.includes(SECRET_OPENAI) && !badCliTopic.stdout.includes(SECRET_OPENAI))
 
-  ok('publicBoundaryHit flags credentials, paths, internal hosts, IPs, npubs, UUIDs and 64-hex ids',
+  ok('publicBoundaryHit flags credentials, arbitrary paths, URIs, domains, hosts, IPs, npubs, UUIDs and 64-hex ids',
     publicBoundaryHit(SECRET_NSEC) !== null &&
     publicBoundaryHit('/Users/fairwja/keys') === 'a filesystem path' &&
-    publicBoundaryHit('herd-cloud') === 'an internal hostname' &&
+    publicBoundaryHit('/mnt/snapshots') === 'a filesystem path' &&
+    publicBoundaryHit('/data/cortex.sqlite') === 'a filesystem path' &&
+    publicBoundaryHit('./local/path') === 'a filesystem path' &&
+    publicBoundaryHit('../parent/path') === 'a filesystem path' &&
+    publicBoundaryHit('herd-cloud') === 'a network URI or hostname' &&
+    publicBoundaryHit('bunker.nave.pub') === 'a network URI or hostname' &&
+    publicBoundaryHit('relay.nsec.app') === 'a network URI or hostname' &&
+    publicBoundaryHit('unrecognized.host.invalid') === 'a network URI or hostname' &&
+    publicBoundaryHit('https://example.org/x') === 'a network URI or hostname' &&
+    publicBoundaryHit('service:8795') === 'a network URI or hostname' &&
     publicBoundaryHit('100.88.14.92') !== null &&
     publicBoundaryHit('fd7a:115c:a1e0::42') !== null &&
     publicBoundaryHit(BOUNDARY_NPUB) === 'a Nostr public or event identifier' &&
     publicBoundaryHit(ROOM_PUBLIC) === 'a raw UUID' &&
     publicBoundaryHit(BOUNDARY_HEX64) === 'a full 64-hex key or id' &&
-    publicBoundaryHit('Clean coarse summary of 12 decisions.') === null)
+    publicBoundaryHit('Clean coarse summary of 12 decisions') === null)
 } finally {
   rmSync(root, { recursive: true, force: true })
 }

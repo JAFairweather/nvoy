@@ -3,10 +3,11 @@
 //
 //   node bin/hive-memory-project.mjs --db <snapshot.sqlite> --allowlist <allowlist.json> --out <dir> [--now <unix-sec>]
 //
-// Reads an offline SQLite snapshot read-only, filters strictly to allowlisted scopes, topics and
-// opted-in chosen claims, enforces the two-layer secret & publication-boundary sanitiser, and writes
-// static `cortex-public.json` + `index.html` into `--out`. Opens no sockets or network connections and
-// refuses live store, daemon socket and live publication paths.
+// Reads an offline SQLite snapshot read-only, filters strictly to allowlisted scopes and curated
+// topics (with optional allowlist.claims count filtering, never emitting claim prose), enforces the
+// two-layer secret & publication-boundary sanitiser, and writes static `cortex-public.json` +
+// `index.html` into `--out`. Opens no sockets or network connections and refuses live store, daemon
+// socket and live publication paths.
 
 import {
   assertOfflineProjectionPaths,
@@ -74,7 +75,7 @@ try {
     generated_at: projection.generated_at,
     scopes: Array.isArray(projection.scopes) ? projection.scopes.length : 0,
     topics: Array.isArray(projection.topics) ? projection.topics.length : 0,
-    chosen_claims: Array.isArray(projection.chosen_claims) ? projection.chosen_claims.length : 0,
+    active_claims: projection.counts?.active_claims ?? 0,
     withheld_claims: projection.counts?.withheld_claims ?? 0,
   }))
   if (projection.withheld) process.exit(1)
