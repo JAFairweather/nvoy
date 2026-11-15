@@ -3,7 +3,7 @@
 // cost grew with every envelope it had ever received (nvoy-fleet, 15 Nov 2026). The cache must parse
 // each line once and still fail closed exactly as a full re-read would.
 import assert from 'node:assert/strict'
-import { appendFileSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync, readFileSync } from 'node:fs'
+import { appendFileSync, lstatSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { jsonlCache } from '../mcp/tools/jsonl_cache.mjs'
@@ -73,6 +73,27 @@ assert.throws(() => jsonlCache(join(dir, 'big.jsonl'), 'queue', { parse, maxByte
 // A file that disappears reads as missing again.
 rmSync(file)
 assert.throws(() => read(), /queue is missing/)
+
+// Grown past the bound between the lstat and the open: the opened file is checked again, nothing is parsed and
+// no prefix of the oversized file is returned, on this poll or the next.
+{
+  const grown = join(dir, 'grown.jsonl')
+  writeFileSync(grown, '{"n":1}\n')
+  const small = lstatSync(grown)
+  writeFileSync(grown, '{"n":1}\n' + '{"n":2}\n'.repeat(200))
+  const before = parsed
+  const stale = jsonlCache(grown, 'queue', { parse, maxBytes: 1000, lstat: () => small })
+  assert.throws(() => stale(), /exceeds its/)
+  assert.throws(() => stale(), /exceeds its/)
+  assert.equal(parsed, before, 'an oversized opened file is refused before any line is parsed')
+  // Appended past the bound after a good first read: the earlier records are not returned either.
+  const live = join(dir, 'live.jsonl')
+  writeFileSync(live, '{"n":1}\n')
+  const liveRead = jsonlCache(live, 'queue', { parse, maxBytes: 1000, lstat: path => Object.assign(lstatSync(path), { size: 8 + 1 }) })
+  assert.deepEqual(jsonlCache(live, 'queue', { parse, maxBytes: 1000 })(), [1])
+  appendFileSync(live, '{"n":2}\n'.repeat(200))
+  assert.throws(() => liveRead(), /exceeds its/)
+}
 
 // The channel uses the cache for both polled files, not a whole-file re-read.
 const channel = readFileSync(new URL('../mcp/tools/claude-channel.mjs', import.meta.url), 'utf8')

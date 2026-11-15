@@ -19,7 +19,9 @@ import { StringDecoder } from 'node:string_decoder'
 
 const CHUNK = 1024 * 1024
 
-export function jsonlCache(path, label, { parse, required = true, maxBytes = 64 * 1024 * 1024 } = {}) {
+// `lstat` is a test seam only: it lets a test present a stale first stat, as a file that grows or is swapped
+// between the lstat and the open would.
+export function jsonlCache(path, label, { parse, required = true, maxBytes = 64 * 1024 * 1024, lstat = lstatSync } = {}) {
   if (typeof parse !== 'function') throw new Error('jsonlCache needs a parse function')
   let ino = null, dev = null, offset = 0, partial = '', decoder = new StringDecoder('utf8'), items = [], failure = null
   const restart = st => {
@@ -28,7 +30,7 @@ export function jsonlCache(path, label, { parse, required = true, maxBytes = 64 
   }
   return function read() {
     let st
-    try { st = lstatSync(path) } catch (error) {
+    try { st = lstat(path) } catch (error) {
       if (error.code !== 'ENOENT') throw error
       restart(null)
       if (required) throw new Error(`${label} is missing`)
@@ -44,7 +46,12 @@ export function jsonlCache(path, label, { parse, required = true, maxBytes = 64 
         const opened = fstatSync(fd)
         // The path was swapped between the lstat and the open: start again on the next call.
         if (opened.ino !== ino || opened.dev !== dev) { restart(null); throw new Error(`${label} changed while it was being read`) }
-        const size = Math.min(opened.size, maxBytes), chunk = Buffer.alloc(Math.min(CHUNK, Math.max(1, size - offset)))
+        // The bound and the file type are checked again on the file that was actually opened. It may have grown past
+        // the bound since the lstat; reading only a prefix of it would return records from an oversized file for
+        // this poll (My Dude, PR 407 lead read). Refuse before parsing anything.
+        if (!opened.isFile()) throw new Error(`${label} must be a regular non-symlink file`)
+        if (opened.size > maxBytes) throw new Error(`${label} exceeds its ${Math.round(maxBytes / 1024 / 1024)} MiB bound`)
+        const size = opened.size, chunk = Buffer.alloc(Math.min(CHUNK, Math.max(1, size - offset)))
         while (offset < size) {
           const n = readSync(fd, chunk, 0, Math.min(chunk.length, size - offset), offset)
           if (n <= 0) break
