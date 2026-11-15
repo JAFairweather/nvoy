@@ -4,10 +4,12 @@
 //   1. Strictly offline and read-only: opens an offline SQLite snapshot with `{ readOnly: true }`, imports
 //      no networking, IPC or child-process modules, and refuses live store, socket and publication paths.
 //   2. Strictly aggregate-only explicit allowlist: only scopes listed in `allowlist.scopes` are read
-//      (`self:<pubkey>` is always refused, and `room:<uuid>` scopes require an explicit public label so
-//      room UUIDs never appear in output). Topics are restricted to `allowlist.topics`. When optional
-//      `allowlist.claims` is supplied, only those allowlisted fact keys contribute to aggregate counts.
-//      Claim prose, raw IDs/slugs, identities, paths and network details are never emitted.
+//      (`self:<pubkey>` is always refused, `room:<uuid>` scopes require an explicit public label so room
+//      UUIDs never appear in output, and `hive:canon` / `hive:ops` scopes require an explicit
+//      `allowlist.memory_global_channel_id` so foreign-channel events are never accepted). Topics are
+//      restricted to `allowlist.topics`. When optional `allowlist.claims` is supplied, only those
+//      allowlisted fact keys contribute to aggregate counts. Claim prose, raw IDs/slugs, identities,
+//      paths and network details are never emitted.
 //   3. Two-layer fail-closed secret & boundary guard: every candidate event must pass full Nostr signature
 //      and schema verification (`validateMemoryEvent` + `checkClaimPayloadSecrets`) AND match its stored
 //      SQLite metadata columns (so unsigned SQLite columns can never relabel signed event topics or counts),
@@ -83,7 +85,6 @@ const BOUNDARY_PATTERNS = Object.freeze([
 ])
 
 const isObj = v => v !== null && typeof v === 'object' && !Array.isArray(v)
-const tagValue = (ev, name) => (Array.isArray(ev?.tags) ? ev.tags : []).find(t => t?.[0] === name)?.[1]
 
 function underForbiddenPrefix(p) {
   const norm = resolve(p)
@@ -290,11 +291,17 @@ export function validateProjectionAllowlist(raw) {
     }
   }
 
+  const hasGlobalScope = [...scopeMap.values()].some(
+    s => s.type === 'hive:canon' || s.type === 'hive:ops'
+  )
   let memoryGlobalChannelId = null
   if (raw.memory_global_channel_id !== undefined) {
-    const ch = String(raw.memory_global_channel_id || '').toLowerCase()
-    if (!UUID.test(ch)) throw new Error('allowlist.memory_global_channel_id must be a lowercase UUID')
-    memoryGlobalChannelId = ch
+    if (typeof raw.memory_global_channel_id !== 'string' || !UUID.test(raw.memory_global_channel_id)) {
+      throw new Error('allowlist.memory_global_channel_id must be a lowercase UUID')
+    }
+    memoryGlobalChannelId = raw.memory_global_channel_id
+  } else if (hasGlobalScope) {
+    throw new Error('allowlist.memory_global_channel_id is required when allowlist.scopes includes hive:canon or hive:ops')
   }
 
   return Object.freeze({
@@ -395,14 +402,8 @@ export function buildPublicProjectionFromDb(db, rawAllowlist, { nowSec = Math.fl
     if (allowlist.hasClaimFilter && (!evD || !allowlist.chosenClaims.has(evD))) continue
 
     const scopeInfo = allowlist.scopeMap.get(evScope)
-    let candidateGlobalCh = allowlist.memoryGlobalChannelId || ''
-    if (!candidateGlobalCh && (scopeInfo.type === 'hive:canon' || scopeInfo.type === 'hive:ops')) {
-      const h = String(tagValue(ev, 'h') || '').toLowerCase()
-      if (UUID.test(h)) candidateGlobalCh = h
-    }
-
     const v = validateMemoryEvent(ev, {
-      memoryGlobalChannelId: candidateGlobalCh,
+      memoryGlobalChannelId: allowlist.memoryGlobalChannelId || '',
       allowedKinds: [MEMORY_KIND, FALLBACK_MEMORY_KIND],
       verifySignature: true,
     })

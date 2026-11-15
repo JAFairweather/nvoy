@@ -82,6 +82,7 @@ const agentA = key()
 const agentB = key()
 
 const GLOBAL_CH = '11111111-2222-4333-8444-555555555555'
+const FOREIGN_GLOBAL_CH = '99999999-8888-4777-8666-555555555555'
 const ROOM_PUBLIC = 'a8186b53-537d-46ad-a7e7-b6486c58970e'
 const ROOM_PRIVATE = 'b9297c64-648e-47be-b8f8-c7597d69081f'
 const T0 = 1794710400
@@ -398,6 +399,7 @@ try {
   // --- 3. Run the offline CLI against the seeded test store and check positive + negative controls ---
   // Explicit allowlist.claims restricts WHICH claims are counted in aggregate counts while still emitting ZERO prose.
   const allowlist = {
+    memory_global_channel_id: GLOBAL_CH,
     scopes: [
       'hive:canon',
       { scope: `room:${ROOM_PUBLIC}`, label: 'public-demo' },
@@ -535,6 +537,7 @@ try {
   // --- 4. Scope-level aggregate mode (no allowlist.claims) counts all valid active claims in allowlisted scopes with zero prose ---
   const aggAllowlistPath = join(root, 'allowlist-agg.json')
   writeFileSync(aggAllowlistPath, JSON.stringify({
+    memory_global_channel_id: GLOBAL_CH,
     scopes: ['hive:canon', { scope: `room:${ROOM_PUBLIC}`, label: 'public-demo' }],
     topics: ['hive-memory', 'nvoy'],
   }))
@@ -561,7 +564,11 @@ try {
     !aggJson.includes('bunker.nave.pub'))
 
   // --- 4b. Private-to-public count side-channel & unsigned SQLite metadata tamper controls ---
-  const canonOnlyAllow = { scopes: ['hive:canon'], topics: ['hive-memory', 'nvoy'] }
+  const canonOnlyAllow = {
+    memory_global_channel_id: GLOBAL_CH,
+    scopes: ['hive:canon'],
+    topics: ['hive-memory', 'nvoy'],
+  }
   const canonOnlyAllowPath = join(root, 'allowlist-canon-only.json')
   writeFileSync(canonOnlyAllowPath, JSON.stringify(canonOnlyAllow))
 
@@ -627,6 +634,7 @@ try {
 
   // Unchosen secret-bearing canon row when allowlist.claims selects only cortex-architecture -> zero public or diagnostic leak.
   const singleClaimAllow = {
+    memory_global_channel_id: GLOBAL_CH,
     scopes: ['hive:canon'],
     topics: ['hive-memory', 'nvoy'],
     claims: ['hive-memory:hive:canon:cortex-architecture'],
@@ -667,6 +675,72 @@ try {
   ok('flipping unsigned is_current cannot resurrect a withdrawn claim and tampering signed canon scope to hive:ops quarantines the row',
     resurrectRes.projection.counts.active_claims === 6 && resurrectRes.quarantinedClaims === 2,
     `${JSON.stringify(resurrectRes.projection.counts)} q=${resurrectRes.quarantinedClaims}`)
+
+  // Foreign global channel negative control: valid signed hive:canon claims from a different global channel (both sorting
+  // before and sorting after intended claims) must never increment active_claims or alter public JSON, HTML, or CLI output.
+  const foreignGlobalDbPath = join(snapDir, 'foreign-global-channel.sqlite')
+  writeFileSync(foreignGlobalDbPath, readFileSync(snapDbPath))
+  const fgDb = new DatabaseSync(foreignGlobalDbPath)
+  const fgInsert = fgDb.prepare(`
+    INSERT INTO events (
+      id, pubkey, kind, created_at, d, scope, scope_type, room_id, topic,
+      status, retention, as_of_git, as_of_evt, exp, raw_json, ingested_at, is_current
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+  `)
+  for (const [signer, slug, claimText] of [
+    [canonWriter, '000-foreign-canon-first', 'CANARY_FOREIGN_GLOBAL_930 valid signed canon from foreign channel sorting first'],
+    [owner, 'zzz-foreign-canon-last', 'CANARY_FOREIGN_GLOBAL_931 valid signed canon from foreign channel sorting last'],
+  ]) {
+    const foreignEv = finalizeEvent(buildClaimTemplate({
+      pubkey: signer.pk,
+      scope: 'hive:canon',
+      slug,
+      topic: 'nvoy',
+      claim: claimText,
+      because: 'foreign global channel negative control',
+      evidence: ['foreign-channel-fixture'],
+      asOfGit: '37ae9a55581100fbcee9522b2c2a701df8973c9d',
+      ttlSec: 0,
+      memoryGlobalChannelId: FOREIGN_GLOBAL_CH,
+      nowSec: T0 + 140 + (++tick),
+    }), signer.sk)
+    fgInsert.run(
+      foreignEv.id, foreignEv.pubkey, foreignEv.kind, foreignEv.created_at,
+      `hive-memory:hive:canon:${slug}`, 'hive:canon', 'hive:canon', null, 'nvoy',
+      'active', DECISION_RETENTION, '37ae9a55581100fbcee9522b2c2a701df8973c9d', null, null,
+      JSON.stringify(foreignEv), foreignEv.created_at
+    )
+  }
+  fgDb.close()
+
+  const foreignCanonOut = join(root, 'out-canon-foreign-global')
+  const foreignCanonCli = await runCli(['--db', foreignGlobalDbPath, '--allowlist', canonOnlyAllowPath, '--out', foreignCanonOut, '--now', String(projectedAt)])
+  const foreignCanonJson = readFileSync(join(foreignCanonOut, 'cortex-public.json'), 'utf8')
+  const foreignCanonHtml = readFileSync(join(foreignCanonOut, 'index.html'), 'utf8')
+  ok('valid signed hive:canon claims from a foreign global channel never increment active_claims and leave public JSON, HTML and CLI output byte-identical',
+    foreignCanonCli.status === 0 &&
+    foreignCanonJson === baseCanonJson &&
+    foreignCanonHtml === baseCanonHtml &&
+    foreignCanonCli.stdout === baseCanonCli.stdout &&
+    !foreignCanonJson.includes(FOREIGN_GLOBAL_CH) &&
+    !foreignCanonHtml.includes(FOREIGN_GLOBAL_CH) &&
+    !foreignCanonJson.includes('CANARY_FOREIGN_GLOBAL_'))
+
+  // Room-only allowlist without memory_global_channel_id remains valid and counts only the pinned room
+  // (in snapDbPath: roomSourceA + roomCuratedChosen + roomUnlistedTopic + roomTamperedTopic = 4 active; roomExpired is expired).
+  const roomOnlyRes = projectOfflinePublicCortex({
+    dbPath: snapDbPath,
+    allowlist: {
+      scopes: [{ scope: `room:${ROOM_PUBLIC}`, label: 'public-demo' }],
+      topics: ['hive-memory', 'nvoy'],
+    },
+    outDir: join(root, 'out-room-only'),
+    nowSec: projectedAt,
+  })
+  ok('room-only allowlist omits memory_global_channel_id and counts only active claims in that pinned room',
+    roomOnlyRes.projection.counts.active_claims === 4 &&
+    roomOnlyRes.projection.scopes.length === 1 &&
+    roomOnlyRes.projection.scopes[0].scope === 'room:public-demo')
 
   // --- 5. Defense-in-depth second-layer output sanitiser negative controls (secrets, paths, unrecognized hosts/URLs) ---
   for (const [label, poison] of [
@@ -717,7 +791,7 @@ try {
   symlinkSync(sentinelPath, join(outPreplantedTmp, `index.html.${process.pid}.tmp`))
   projectOfflinePublicCortex({
     dbPath: snapDbPath,
-    allowlist: { scopes: ['hive:canon'], topics: ['nvoy'] },
+    allowlist: { memory_global_channel_id: GLOBAL_CH, scopes: ['hive:canon'], topics: ['nvoy'] },
     outDir: outPreplantedTmp,
     nowSec: projectedAt,
   })
@@ -731,12 +805,22 @@ try {
   ok('refuses preplanted target symlink in --out and leaves sentinel untouched',
     throwsMsg(() => projectOfflinePublicCortex({
       dbPath: snapDbPath,
-      allowlist: { scopes: ['hive:canon'], topics: ['nvoy'] },
+      allowlist: { memory_global_channel_id: GLOBAL_CH, scopes: ['hive:canon'], topics: ['nvoy'] },
       outDir: outPreplantedTarget,
       nowSec: projectedAt,
     }), /symlink/) && readFileSync(sentinelPath, 'utf8') === sentinelContent)
 
   // --- 6. Allowlist and live-path refusal controls ---
+  ok('refuses hive:canon allowlist lacking memory_global_channel_id',
+    throwsMsg(() => validateProjectionAllowlist({ scopes: ['hive:canon'], topics: ['nvoy'] }), /memory_global_channel_id is required/))
+  ok('refuses hive:ops allowlist lacking memory_global_channel_id',
+    throwsMsg(() => validateProjectionAllowlist({ scopes: ['hive:ops'], topics: ['nvoy'] }), /memory_global_channel_id is required/))
+  ok('refuses non-lowercase-UUID memory_global_channel_id',
+    throwsMsg(() => validateProjectionAllowlist({
+      memory_global_channel_id: '11111111-2222-4333-8444-55555555555A',
+      scopes: ['hive:canon'],
+      topics: ['nvoy'],
+    }), /lowercase UUID/))
   ok('refuses personal self:<pubkey> scope in allowlist',
     throwsMsg(() => validateProjectionAllowlist({ scopes: [`self:${agentA.pk}`], topics: ['nvoy'] }), /self scopes/))
   ok('refuses raw room:<uuid> scope without a public label',
@@ -745,6 +829,7 @@ try {
     throwsMsg(() => validateProjectionAllowlist({ scopes: [], topics: ['nvoy'] }), /non-empty/))
   ok('refuses allowlist.claims outside allowlist.scopes',
     throwsMsg(() => validateProjectionAllowlist({
+      memory_global_channel_id: GLOBAL_CH,
       scopes: ['hive:canon'],
       topics: ['nvoy'],
       claims: ['hive-memory:hive:ops:ops-secret-schedule'],
@@ -790,10 +875,16 @@ try {
     badCliJson.status !== 0 && !badCliJson.stderr.includes(SECRET_GHP) && !badCliJson.stdout.includes(SECRET_GHP))
 
   const badTopicAllow = join(root, 'bad-topic-allow.json')
-  writeFileSync(badTopicAllow, JSON.stringify({ scopes: ['hive:canon'], topics: [SECRET_OPENAI] }))
+  writeFileSync(badTopicAllow, JSON.stringify({ memory_global_channel_id: GLOBAL_CH, scopes: ['hive:canon'], topics: [SECRET_OPENAI] }))
   const badCliTopic = await runCli(['--db', seededDbPath, '--allowlist', badTopicAllow, '--out', join(root, 'never-topic')])
   ok('CLI rejects unsafe allowlist topic without echoing secret bytes',
     badCliTopic.status !== 0 && !badCliTopic.stderr.includes(SECRET_OPENAI) && !badCliTopic.stdout.includes(SECRET_OPENAI))
+
+  const badGlobalChAllow = join(root, 'bad-global-ch-allow.json')
+  writeFileSync(badGlobalChAllow, JSON.stringify({ memory_global_channel_id: SECRET_OPENAI, scopes: ['hive:canon'], topics: ['nvoy'] }))
+  const badCliGlobalCh = await runCli(['--db', seededDbPath, '--allowlist', badGlobalChAllow, '--out', join(root, 'never-global-ch')])
+  ok('CLI rejects secret-stuffed memory_global_channel_id without echoing secret bytes',
+    badCliGlobalCh.status !== 0 && !badCliGlobalCh.stderr.includes(SECRET_OPENAI) && !badCliGlobalCh.stdout.includes(SECRET_OPENAI))
 
   ok('publicBoundaryHit flags credentials, arbitrary paths, URIs, domains, hosts, IPs, npubs, UUIDs and 64-hex ids',
     publicBoundaryHit(SECRET_NSEC) !== null &&
