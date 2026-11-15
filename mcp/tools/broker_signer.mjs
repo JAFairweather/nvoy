@@ -57,6 +57,6 @@ export function brokerSigner(die, options = {}) {
   }
   let sk
   try { sk = secretKey(raw, `broker credential ${credential}`) } catch (error) { die(error.message) }
-  return { signer: { getPublicKey: async () => getPublicKey(sk), signEvent: async event => finalizeEvent(event, sk) },
+  return { signer: { getPublicKey: async () => getPublicKey(sk), signEvent: async event => finalizeEvent({ ...event }, sk) },
     attentionEnv: { NVOY_NSEC: raw } }
 }

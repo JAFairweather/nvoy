@@ -17,7 +17,7 @@ import { spawnSync } from 'node:child_process'
 import { getEventHash, verifyEvent } from 'nostr-tools/pure'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { brokerSigner } from './broker_signer.mjs'
-import { channelPost, openBuzzSession } from './buzz_native.mjs'
+import { BUZZ_FRESH_WINDOW_SEC, channelPost, isStaleTimestampRefusal, isTransientBuzzError, openBuzzSession } from './buzz_native.mjs'
 import { replyRequestDigest } from './outbound_record.mjs'
 import { countInWindow } from './agent_limits.mjs'
 import { POST_ONLY_REPLY, offList, postQueuePath, recordMentionGrants, validatePostRequest, withMentionGrants } from './agent_post.mjs'
@@ -125,12 +125,62 @@ if (!record.event) {
   record.event = ev
   persist()
 }
+const resignPost = async (now = Math.floor(Date.now() / 1000)) => {
+  const unsignedEvent = { pubkey: manifest.pubkey, ...channelPost({ channel: request.channel, content: request.content, mentions: request.mention, now }) }
+  const fingerprint = getEventHash(unsignedEvent)
+  let ev
+  try { ev = await signer.signEvent({ ...unsignedEvent }) } catch (e) { die(`signer refused the post: ${e.message}`) }
+  if (ev?.id !== fingerprint || getEventHash(ev) !== fingerprint || !verifyEvent(JSON.parse(JSON.stringify(ev)))) die('signer changed or invalidly signed the frozen post')
+  record = { version: 1, request_id: requestId, request_digest: digest, fingerprint, unsigned_event: unsignedEvent, event: ev, published: false }
+  persist()
+}
+const alreadyPosted = async (s, eventId) => {
+  if (!eventId) return false
+  const found = await s.fetch({ ids: [eventId], kinds: [9], '#h': [request.channel] })
+  return Array.isArray(found) && found.some(ev => ev?.id === eventId && ev.pubkey === manifest.pubkey && verifyEvent(JSON.parse(JSON.stringify(ev))))
+}
 let accepted = 0
 try {
   session ??= await openBuzzSession({ relay: manifest.buzz.relay, signer })
-  try { const r = await session.publishSigned(record.event); if (r.accepted) accepted = 1; else console.error(`instance-broker-post: Buzz refused the post: ${r.message}`) }
-  finally { session.close(); session = null }
-} catch (e) { console.error(`instance-broker-post: Buzz relay unavailable: ${e.message}`) }
+  try {
+    if (Math.abs(Math.floor(Date.now() / 1000) - record.unsigned_event.created_at) >= BUZZ_FRESH_WINDOW_SEC) {
+      if (await alreadyPosted(session, record.event?.id)) accepted = 1
+      else await resignPost()
+    }
+    if (!accepted) {
+      let r = await session.publishSigned(record.event)
+      if (!r.accepted && isStaleTimestampRefusal(r.message)) {
+        console.error(`instance-broker-post: refreshing stale post timestamp (${r.message})`)
+        await resignPost()
+        r = await session.publishSigned(record.event)
+      }
+      if (r.accepted) accepted = 1
+      else console.error(`instance-broker-post: Buzz refused the post: ${r.message}`)
+    }
+  } finally { session.close(); session = null }
+} catch (e) {
+  if (isTransientBuzzError(e)) {
+    console.error(`instance-broker-post: Buzz relay closed (${e.message}); retrying once with a re-signed post`)
+    try {
+      const retry = await openBuzzSession({ relay: manifest.buzz.relay, signer })
+      try {
+        if (roomDerived.length) {
+          let absent
+          try { absent = await confirmMembers({ session: retry, room: request.channel, keys: roomDerived, relaySigner: manifest.buzz.relaySigner }) }
+          catch (err) { die(`room member list unavailable: ${err.message}; held for retry`) }
+          if (absent !== undefined) die(`post refused: ${absent.slice(0, 8)} is not on may_post.mention or in room ${request.channel}`)
+        }
+        if (e?.buzzMeta?.sent !== false && await alreadyPosted(retry, record.event?.id)) accepted = 1
+        else {
+          await resignPost()
+          const r2 = await retry.publishSigned(record.event)
+          if (r2.accepted) accepted = 1
+          else console.error(`instance-broker-post: Buzz refused the post: ${r2.message}`)
+        }
+      } finally { retry.close() }
+    } catch (e2) { console.error(`instance-broker-post: Buzz relay unavailable: ${e2.message}`) }
+  } else console.error(`instance-broker-post: Buzz relay unavailable: ${e.message}`)
+}
 if (!accepted) die('the Buzz relay did not accept the persisted post; it remains retryable')
 record.published = true; record.published_at = Date.now(); record.accepted = accepted
 persist()

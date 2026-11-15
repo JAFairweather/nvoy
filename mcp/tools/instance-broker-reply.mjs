@@ -17,7 +17,7 @@ import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest
 import { makeBunkerSigner } from './nip46-signer.mjs'
 import { secretKey } from './secret_key.mjs'
 import { verifyOutboundApproval } from './outbound_approval.mjs'
-import { channelReply, openBuzzSession, validChannel } from './buzz_native.mjs'
+import { BUZZ_FRESH_WINDOW_SEC, channelReply, isStaleTimestampRefusal, isTransientBuzzError, openBuzzSession, validChannel } from './buzz_native.mjs'
 import { recordStatusReplied } from './buzz_status.mjs'
 import { countInWindow, nextHop } from './agent_limits.mjs'
 import { offList, recordMentionGrants, replyMentionShape, validateReplyMention, withMentionGrants } from './agent_post.mjs'
@@ -128,7 +128,7 @@ if (bunkerUri) {
 } else {
   let sk
   try { sk = secretKey(raw, `broker credential ${credential}`) } catch (error) { die(error.message) }
-  signer = { getPublicKey: async () => getPublicKey(sk), signEvent: async event => finalizeEvent(event, sk),
+  signer = { getPublicKey: async () => getPublicKey(sk), signEvent: async event => finalizeEvent({ ...event }, sk),
     nip44Encrypt: async (peer, text) => nip44.encrypt(text, nip44.getConversationKey(sk, peer)) }
 }
 if (await signer.getPublicKey() !== manifest.pubkey) die('signer does not match manifest pubkey')
@@ -321,21 +321,69 @@ async function publish(url) {
 let accepted = 0
 if (buzzNative) {
   // The community relay is the only place this reply means anything; its refusal is reported verbatim.
+  // Direct channel replies carry live grant authority (rechecked above), so on a transient socket close
+  // or stale timestamp (q-144, q-150) we re-sign with a fresh created_at after checking the relay has
+  // not already stored the prior id. Discrete approvals keep their exact frozen fingerprint.
+  const resignDirectNativeReply = async (now = Math.floor(Date.now() / 1000)) => {
+    const parent = { id: receipt.source_event, pubkey: receipt.sender,
+      tags: receipt.reply_root !== receipt.source_event ? [['e', receipt.reply_root, '', 'root']] : [] }
+    const unsignedEvent = { pubkey: manifest.pubkey, ...channelReply({ channel: receipt.reply_channel, parent, content: request.content, hop: nextHop(receipt.hop), mentions: request.mention || [], now }) }
+    const fingerprint = getEventHash(unsignedEvent)
+    const ev = await signer.signEvent({ ...unsignedEvent })
+    if (ev?.id !== fingerprint || getEventHash(ev) !== fingerprint || !verifyEvent(JSON.parse(JSON.stringify(ev))))
+      die('signer changed or invalidly signed the frozen channel reply')
+    record = { version: 3, request_digest: digest, request_id: requestId,
+      fingerprint, unsigned_event: unsignedEvent, event: ev, enactment: 'buzz-native-direct', published: false }
+    const tmp = `${recordPath}.${process.pid}.resigned.tmp`
+    try { writeFileSync(tmp, JSON.stringify(record), { mode: 0o600 }); renameSync(tmp, recordPath) }
+    catch (e) { die(`cannot persist approved outbound record: ${e.message}`) }
+  }
+  const alreadyOnBuzz = async (s, eventId) => {
+    if (!eventId) return false
+    const found = await s.fetch({ ids: [eventId], kinds: [9], '#h': [receipt.reply_channel] })
+    return Array.isArray(found) && found.some(ev => ev?.id === eventId && ev.pubkey === manifest.pubkey && verifyEvent(JSON.parse(JSON.stringify(ev))))
+  }
+  const checkVerdict = verdict => {
+    if (verdict.accepted) { accepted = 1; return }
+    console.error(`instance-broker-reply: Buzz refused the reply: ${verdict.message}`)
+    // The event is frozen, so a NIP-01 `invalid:` verdict on it is final — a gone parent, or a
+    // timestamp that only grows staler. Only one stamped in the future can become valid by waiting.
+    if (/^invalid:/.test(String(verdict.message || '')) && record.event.created_at <= Math.floor(Date.now() / 1000))
+      die('Buzz rejected the frozen channel reply as invalid; no retry can change it')
+  }
   try {
     const session = await openBuzzSession({ relay: manifest.buzz.relay, signer })
     try {
       if (roomDerived.length) await confirmRoom(session)
-      const ok = await session.publishSigned(record.event)
-      if (ok.accepted) accepted = 1
-      else {
-        console.error(`instance-broker-reply: Buzz refused the reply: ${ok.message}`)
-        // The event is frozen, so a NIP-01 `invalid:` verdict on it is final — a gone parent, or a
-        // timestamp that only grows staler. Only one stamped in the future can become valid by waiting.
-        if (/^invalid:/.test(String(ok.message || '')) && record.event.created_at <= Math.floor(Date.now() / 1000))
-          die('Buzz rejected the frozen channel reply as invalid; no retry can change it')
+      if (direct && !record.approval_id && Math.abs(Math.floor(Date.now() / 1000) - record.unsigned_event.created_at) >= BUZZ_FRESH_WINDOW_SEC) {
+        if (await alreadyOnBuzz(session, record.event?.id)) accepted = 1
+        else await resignDirectNativeReply()
+      }
+      if (!accepted) {
+        const ok = await session.publishSigned(record.event)
+        if (!ok.accepted && direct && !record.approval_id && isStaleTimestampRefusal(ok.message)) {
+          console.error(`instance-broker-reply: refreshing stale reply timestamp (${ok.message})`)
+          await resignDirectNativeReply()
+          checkVerdict(await session.publishSigned(record.event))
+        } else checkVerdict(ok)
       }
     } finally { session.close() }
-  } catch (e) { console.error(`instance-broker-reply: Buzz relay unavailable: ${e.message}`) }
+  } catch (e) {
+    if (direct && !record.approval_id && isTransientBuzzError(e)) {
+      console.error(`instance-broker-reply: Buzz relay closed (${e.message}); retrying once with a re-signed reply`)
+      try {
+        const retry = await openBuzzSession({ relay: manifest.buzz.relay, signer })
+        try {
+          if (roomDerived.length) await confirmRoom(retry)
+          if (e?.buzzMeta?.sent !== false && await alreadyOnBuzz(retry, record.event?.id)) accepted = 1
+          else {
+            await resignDirectNativeReply()
+            checkVerdict(await retry.publishSigned(record.event))
+          }
+        } finally { retry.close() }
+      } catch (e2) { console.error(`instance-broker-reply: Buzz relay unavailable: ${e2.message}`) }
+    } else console.error(`instance-broker-reply: Buzz relay unavailable: ${e.message}`)
+  }
   if (!accepted) die('the Buzz relay did not accept the persisted channel reply; it remains retryable')
 } else {
   for (const relay of manifest.relays) if (await publish(relay)) accepted++
