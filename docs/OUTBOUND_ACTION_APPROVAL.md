@@ -94,14 +94,24 @@ authorization; there is no second act for a human to approve. Two routes qualify
 | Route | Receipt | Chain rechecked live | What is frozen and signed | `enactment` |
 |---|---|---|---|---|
 | Channel carry | v2, `mode: channel-carry` | author's `task` grant + carrier's `task-relay` grant, same source event and channel | the kind-13 seal of a NIP-17 reply to the carrier, tagged with the receipt's channel | `channel-carry-direct` |
-| Native Buzz | v3, `mode: buzz-native` | author's own `task`/`task+act` grant, same grant id | the kind-9 reply itself: one `h` tag (the receipt's channel, which must be in the manifest's `buzz.channels`), `e` root/reply to the source event, `p` to its author | `buzz-native-direct` |
+| Native Buzz | v3, `mode: buzz-native` | author's own `task`/`task+act` grant (same grant id), plus any dynamic `mention` grants and live room membership for mentioned peers | the kind-9 reply itself: one `h` tag (the receipt's channel, which must be in the manifest's `buzz.channels`), `e` root/reply to the source event, `p` to its author | `buzz-native-direct` |
 
 The actuator, not its caller, decides which route applies: `--prepare` reports `approval_required:
 false` with action `nostr-private-reply` or `buzz-channel-reply`, and `--direct` refuses anything
 else. A public event is permanent and world-readable, so it always keeps its discrete approval.
 Every enacted record names exactly one of `approval_id` or `enactment`, never both and never
-neither. As with the seal, the native kind:9 is frozen before the signer opens, its event id is the
-fingerprint, and a retry republishes that identical event to the community relay.
+neither.
+
+Proposals bound to a discrete `approval_id`, `channel-carry-direct` NIP-17 seals, and standalone
+`nvoy_channel_post` records keep one immutable frozen event ID across retries and never mint a
+second signature. For `buzz-native-direct` channel replies only, the frozen `kind:9` is republished
+unchanged while fresh (`< 900s`), and if a transient community-relay disconnect or stale-timestamp
+refusal prevents confirmation, the broker may sign a replacement `kind:9` (identical channel, parent
+tags, hop, mentions, and content with a fresh `created_at`) only after checking on the authenticated
+Buzz session that the prior event ID was not stored and re-verifying the complete live grant chain
+(sender `task`/`task+act` grant, dynamic `mention` grants, and room-derived membership) immediately
+before opening the signer. If any link in that live authority was revoked or left the room in the
+interval, replacement signing fails closed before `signEvent` is called.
 
 ## Direct MCP tools
 

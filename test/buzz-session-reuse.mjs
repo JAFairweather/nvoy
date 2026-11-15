@@ -13,6 +13,7 @@ import { randomBytes } from 'node:crypto'
 import { finalizeEvent, generateSecretKey, getEventHash, getPublicKey, verifyEvent } from 'nostr-tools/pure'
 import { nsecEncode } from 'nostr-tools/nip19'
 import { channelPost, channelReply, formatBuzzPhase, openBuzzSession, serveBuzzSession } from '../mcp/tools/buzz_native.mjs'
+import { STALE_POST_TERMINAL_LINE } from '../mcp/tools/agent_post.mjs'
 import { scopeHash } from '../mcp/tools/grant_fold.mjs'
 import { MEMBERS_KIND } from '../mcp/tools/room_roster.mjs'
 import { replyRequestDigest, validateOutboundRecord } from '../mcp/tools/outbound_record.mjs'
@@ -33,6 +34,7 @@ const agentSk = generateSecretKey(), agent = getPublicKey(agentSk)
 const grantorSk = generateSecretKey(), grantor = getPublicKey(grantorSk)
 const humanSk = generateSecretKey(), human = getPublicKey(humanSk)
 const roomPeerSk = generateSecretKey(), roomPeer = getPublicKey(roomPeerSk)
+const extPeerSk = generateSecretKey(), extPeer = getPublicKey(extPeerSk)
 const relaySignerSk = generateSecretKey(), relaySigner = getPublicKey(relaySignerSk)
 
 const localSigner = (sk, counts = null) => ({
@@ -47,12 +49,15 @@ const localSigner = (sk, counts = null) => ({
 const relayState = {
   connections: 0,
   authOk: 0,
+  publishAttempts: 0,
   stored: [],
   lists: [],
   profiles: [],
   sockets: new Set(),
   dropNextPublish: false,
   storeThenDropNextPublish: false,
+  staleRefuseNextPublish: false,
+  onPublishAttempt: null,
   refuseParentIds: new Set(),
   enforceTimestampWindow: true,
 }
@@ -106,6 +111,12 @@ wss.on('connection', ws => {
       const ev = m[1]
       if (!authed || ev.pubkey !== authed || !verifyEvent(ev))
         return ws.send(JSON.stringify(['OK', ev.id, false, 'restricted']))
+      relayState.publishAttempts++
+      if (typeof relayState.onPublishAttempt === 'function') {
+        const hook = relayState.onPublishAttempt
+        relayState.onPublishAttempt = null
+        hook(ev, ws)
+      }
       if (relayState.dropNextPublish) {
         relayState.dropNextPublish = false
         return ws.terminate()
@@ -114,6 +125,10 @@ wss.on('connection', ws => {
         relayState.storeThenDropNextPublish = false
         if (!relayState.stored.some(s => s.id === ev.id)) relayState.stored.push(ev)
         return ws.terminate()
+      }
+      if (relayState.staleRefuseNextPublish) {
+        relayState.staleRefuseNextPublish = false
+        return ws.send(JSON.stringify(['OK', ev.id, false, 'invalid: event timestamp too far from server time']))
       }
       const replyParent = (ev.tags || []).find(t => t[0] === 'e' && t[3] === 'reply')?.[1]
       if (replyParent && relayState.refuseParentIds.has(replyParent))
@@ -169,12 +184,21 @@ const taskGrant = finalizeEvent({
   kind: 440, created_at: now() - 30, content: '',
   tags: [['p', human], ['da-scope', scopeHash(agent, grantSalt), grantSalt], ['da-cap', 'task']],
 }, grantorSk)
+const extMentionGrant = finalizeEvent({
+  kind: 440, created_at: now() - 30, content: '',
+  tags: [['p', extPeer], ['da-scope', scopeHash(agent, grantSalt), grantSalt], ['da-cap', 'mention'], ['name', 'extpeer']],
+}, grantorSk)
+const grantEvents = [taskGrant]
 const grantServer = createTlsServer({ key: readFileSync(join(certDir, 'key.pem')), cert: readFileSync(join(certDir, 'cert.pem')) }, (q, r) => { r.writeHead(404); r.end() })
 await new Promise(done => grantServer.listen(0, '127.0.0.1', done))
 new WebSocketServer({ server: grantServer }).on('connection', ws => ws.on('message', raw => {
   const m = JSON.parse(raw.toString())
   if (m[0] === 'REQ') {
-    if (m.slice(2).some(f => !f.kinds || f.kinds.includes(440))) ws.send(JSON.stringify(['EVENT', m[1], taskGrant]))
+    for (const ev of grantEvents) {
+      if (m.slice(2).some(f => (!f.kinds || f.kinds.includes(ev.kind)) && (!f.authors || f.authors.includes(ev.pubkey)))) {
+        ws.send(JSON.stringify(['EVENT', m[1], ev]))
+      }
+    }
     ws.send(JSON.stringify(['EOSE', m[1]]))
   }
 }))
@@ -324,13 +348,13 @@ const makeReceipt = msgContent => {
   }), { mode: 0o600 })
   return src
 }
-const appendReplyRequest = (id, receipt, content) => {
-  const row = { version: 1, type: 'reply-request', id, instance: 'seat', receipt, content }
+const appendReplyRequest = (id, receipt, content, mention = undefined) => {
+  const row = { version: 1, type: 'reply-request', id, instance: 'seat', receipt, content, ...(mention ? { mention } : {}) }
   writeFileSync(join(run, 'reply-requests.jsonl'), readFileSync(join(run, 'reply-requests.jsonl'), 'utf8') + JSON.stringify(row) + '\n')
   return row
 }
-const appendPostRequest = (id, content) => {
-  const row = { version: 1, type: 'post-request', id, instance: 'seat', channel: CH, mention: [human], content, requested_at: Date.now() }
+const appendPostRequest = (id, content, mention = [human]) => {
+  const row = { version: 1, type: 'post-request', id, instance: 'seat', channel: CH, mention, content, requested_at: Date.now() }
   writeFileSync(join(run, 'post-requests.jsonl'), readFileSync(join(run, 'post-requests.jsonl'), 'utf8') + JSON.stringify(row) + '\n')
   return row
 }
@@ -361,23 +385,33 @@ const appendPostRequest = (id, content) => {
     res.status === 0 && landed.length === 1, `count=${landed.length} stderr=${res.stderr}`)
 }
 
-// 3c) Post closed mid-publish -> immediate re-sign & retry succeeds; store-then-close does not duplicate
+// 3c) Post closed mid-publish holds frozen event for retry over shared session, and refuses retry if mention grant is revoked
 {
   const postCloseId = hex(16)
   appendPostRequest(postCloseId, 'post survives transient close')
   relayState.dropNextPublish = true
   const res1 = await runBroker(['mcp/tools/instance-broker-post.mjs', '--instance', 'seat', '--request', postCloseId])
+  const frozenRec = JSON.parse(readFileSync(join(state, 'posts', `${postCloseId}.json`), 'utf8'))
+  const res1Retry = await runBroker(['mcp/tools/instance-broker-post.mjs', '--instance', 'seat', '--request', postCloseId])
   const landed1 = relayState.stored.filter(e => e.content === 'post survives transient close')
-  ok('post closed mid-publish reconnects, re-signs, and lands in the same run',
-    res1.status === 0 && landed1.length === 1, res1.stderr)
+  ok('post closed mid-publish holds its frozen event id and republishes identically on retry over the shared session',
+    res1.status === 1 && /remains retryable/.test(res1.stderr) &&
+    res1Retry.status === 0 && landed1.length === 1 && landed1[0].id === frozenRec.event.id,
+    `${res1.stderr} | ${res1Retry.stderr}`)
 
-  const postDupId = hex(16)
-  appendPostRequest(postDupId, 'post never duplicates after store-then-close')
-  relayState.storeThenDropNextPublish = true
-  const res2 = await runBroker(['mcp/tools/instance-broker-post.mjs', '--instance', 'seat', '--request', postDupId])
-  const landed2 = relayState.stored.filter(e => e.content === 'post never duplicates after store-then-close')
-  ok('post stored just before socket close is detected on reconnect and never double-published',
-    res2.status === 0 && landed2.length === 1, `count=${landed2.length} stderr=${res2.stderr}`)
+  grantEvents.push(extMentionGrant)
+  const postRevokeId = hex(16)
+  appendPostRequest(postRevokeId, 'post refused after mention grant revoked', [extPeer])
+  relayState.dropNextPublish = true
+  const resDrop = await runBroker(['mcp/tools/instance-broker-post.mjs', '--instance', 'seat', '--request', postRevokeId])
+  const revokeExt = finalizeEvent({ kind: 441, created_at: now(), content: '', tags: [['e', extMentionGrant.id]] }, grantorSk)
+  grantEvents.push(revokeExt)
+  const resRevoked = await runBroker(['mcp/tools/instance-broker-post.mjs', '--instance', 'seat', '--request', postRevokeId])
+  const landedRevoked = relayState.stored.filter(e => e.content === 'post refused after mention grant revoked')
+  ok('post held across transient close refuses terminally on retry when its dynamic mention grant was revoked',
+    resDrop.status === 1 && resRevoked.status === 1 && /post refused: .* is not on may_post\.mention/.test(resRevoked.stderr) &&
+    landedRevoked.length === 0, `${resDrop.stderr} | ${resRevoked.stderr}`)
+  grantEvents.length = 1 // restore [taskGrant]
 }
 
 // 3d) q-144: stale frozen direct reply (>15 min old) re-signs with fresh created_at instead of dying invalid-frozen-reply
@@ -401,21 +435,23 @@ const appendPostRequest = (id, content) => {
     res.stderr)
 }
 
-// 3e) Stale frozen post (>15 min old) also refreshes and publishes cleanly
+// 3e) q-169 compatibility: stale frozen post (>=30 min old) stays strictly frozen and fails terminally without re-signing
 {
   const postStaleId = hex(16)
-  const row = appendPostRequest(postStaleId, 'q-144 stale post cured')
-  const staleAt = now() - 1200
+  const row = appendPostRequest(postStaleId, 'q-169 stale post stays frozen')
+  const staleAt = now() - 2100
   const staleUnsigned = { pubkey: agent, ...channelPost({ channel: CH, content: row.content, mentions: row.mention, now: staleAt }) }
   const staleSigned = finalizeEvent({ ...staleUnsigned }, agentSk)
-  writeFileSync(join(state, 'posts', `${postStaleId}.json`), JSON.stringify({
+  const beforeBytes = JSON.stringify({
     version: 1, request_id: postStaleId, request_digest: replyRequestDigest(row),
     fingerprint: getEventHash(staleUnsigned), unsigned_event: staleUnsigned, event: staleSigned, published: false,
-  }), { mode: 0o600 })
+  })
+  writeFileSync(join(state, 'posts', `${postStaleId}.json`), beforeBytes, { mode: 0o600 })
   const res = await runBroker(['mcp/tools/instance-broker-post.mjs', '--instance', 'seat', '--request', postStaleId])
-  const landed = relayState.stored.filter(e => e.content === 'q-144 stale post cured')
-  ok('a 20-minute-old unpublished Buzz post re-signs with fresh timestamp and publishes cleanly',
-    res.status === 0 && landed.length === 1 && landed[0].id !== staleSigned.id && Math.abs(landed[0].created_at - now()) < 30,
+  const landed = relayState.stored.filter(e => e.content === 'q-169 stale post stays frozen')
+  ok('a 35-minute-old frozen Buzz post is never re-signed and fails terminally with STALE_POST_TERMINAL_LINE',
+    res.status === 1 && res.stderr.includes(STALE_POST_TERMINAL_LINE) && landed.length === 0 &&
+    readFileSync(join(state, 'posts', `${postStaleId}.json`), 'utf8') === beforeBytes,
     res.stderr)
 }
 
@@ -429,6 +465,81 @@ const appendPostRequest = (id, content) => {
   ok('a deleted parent (invalid: reply parent not found) still fails terminally as parent-gone',
     res.status === 1 && /Buzz rejected the frozen channel reply as invalid/.test(res.stderr) &&
     terminalReplyReason(res.stderr) === 'parent-gone', res.stderr)
+}
+
+// 3g) q-179: sender task grant revoked mid-invocation before replacement signature refuses without signing or publishing
+{
+  const src = makeReceipt('q-179 sender grant revoked mid-flight'), reqId = hex(16)
+  appendReplyRequest(reqId, src.id, 'must not re-sign after task grant revocation')
+  await runBroker(['mcp/tools/instance-broker-reply.mjs', '--instance', 'seat', '--request', reqId, '--prepare'])
+  const attemptsBefore = relayState.publishAttempts
+  let firstAttemptId = ''
+  relayState.dropNextPublish = true
+  relayState.onPublishAttempt = ev => {
+    firstAttemptId = ev.id
+    grantEvents.push(finalizeEvent({ kind: 441, created_at: now(), content: '', tags: [['e', taskGrant.id]] }, grantorSk))
+  }
+  const res = await runBroker(['mcp/tools/instance-broker-reply.mjs', '--instance', 'seat', '--request', reqId, '--direct'])
+  grantEvents.length = 1 // restore [taskGrant]
+  const landed = relayState.stored.filter(e => e.content === 'must not re-sign after task grant revocation')
+  const afterRec = JSON.parse(readFileSync(join(state, 'outbound', `${reqId}.json`), 'utf8'))
+  ok('q-179: revoking the sender task grant mid-invocation blocks replacement signing and fails terminally as grant-no-longer-live',
+    res.status === 1 && /admission receipt no longer has a live matching grant chain/.test(res.stderr) &&
+    terminalReplyReason(res.stderr) === 'grant-no-longer-live' &&
+    relayState.publishAttempts - attemptsBefore === 1 && landed.length === 0 &&
+    afterRec.published === false && afterRec.event?.id === firstAttemptId,
+    `status=${res.status} attempts=${relayState.publishAttempts - attemptsBefore} landed=${landed.length} stderr=${res.stderr}`)
+}
+
+// 3h) q-179: dynamic mention grant revoked mid-invocation before stale-timestamp replacement signature refuses without signing
+{
+  grantEvents.push(extMentionGrant)
+  const src = makeReceipt('q-179 dynamic mention grant revoked mid-flight'), reqId = hex(16)
+  appendReplyRequest(reqId, src.id, 'must not re-sign after mention grant revocation', [extPeer])
+  await runBroker(['mcp/tools/instance-broker-reply.mjs', '--instance', 'seat', '--request', reqId, '--prepare'])
+  const attemptsBefore = relayState.publishAttempts
+  let firstAttemptId = ''
+  relayState.staleRefuseNextPublish = true
+  relayState.onPublishAttempt = ev => {
+    firstAttemptId = ev.id
+    grantEvents.push(finalizeEvent({ kind: 441, created_at: now(), content: '', tags: [['e', extMentionGrant.id]] }, grantorSk))
+  }
+  const res = await runBroker(['mcp/tools/instance-broker-reply.mjs', '--instance', 'seat', '--request', reqId, '--direct'])
+  grantEvents.length = 1 // restore [taskGrant]
+  const landed = relayState.stored.filter(e => e.content === 'must not re-sign after mention grant revocation')
+  const afterRec = JSON.parse(readFileSync(join(state, 'outbound', `${reqId}.json`), 'utf8'))
+  ok('q-179: revoking a dynamic mention grant mid-invocation blocks replacement signing and refuses terminally',
+    res.status === 1 && /reply refused: .* is not on may_post\.mention/.test(res.stderr) &&
+    relayState.publishAttempts - attemptsBefore === 1 && landed.length === 0 &&
+    afterRec.published === false && afterRec.event?.id === firstAttemptId,
+    `status=${res.status} attempts=${relayState.publishAttempts - attemptsBefore} landed=${landed.length} stderr=${res.stderr}`)
+}
+
+// 3i) q-179: room-derived mention peer leaving room mid-invocation before stale-timestamp replacement signature refuses without signing
+{
+  const src = makeReceipt('q-179 room peer leaves mid-flight'), reqId = hex(16)
+  appendReplyRequest(reqId, src.id, 'must not re-sign after room member leaves', [roomPeer])
+  await runBroker(['mcp/tools/instance-broker-reply.mjs', '--instance', 'seat', '--request', reqId, '--prepare'])
+  const savedLists = relayState.lists
+  const attemptsBefore = relayState.publishAttempts
+  let firstAttemptId = ''
+  relayState.staleRefuseNextPublish = true
+  relayState.onPublishAttempt = ev => {
+    firstAttemptId = ev.id
+    relayState.lists = [finalizeEvent({
+      kind: MEMBERS_KIND, created_at: now() + 1, content: '',
+      tags: [['d', CH], ['h', CH], ['p', agent], ['p', human]],
+    }, relaySignerSk)]
+  }
+  const res = await runBroker(['mcp/tools/instance-broker-reply.mjs', '--instance', 'seat', '--request', reqId, '--direct'])
+  relayState.lists = savedLists
+  const landed = relayState.stored.filter(e => e.content === 'must not re-sign after room member leaves')
+  const afterRec = JSON.parse(readFileSync(join(state, 'outbound', `${reqId}.json`), 'utf8'))
+  ok('q-179: room-derived mention leaving the room mid-invocation blocks replacement signing and refuses terminally',
+    res.status === 1 && /reply refused: .* is not on may_post\.mention or in room/.test(res.stderr) &&
+    relayState.publishAttempts - attemptsBefore === 1 && landed.length === 0 &&
+    afterRec.published === false && afterRec.event?.id === firstAttemptId,
+    `status=${res.status} attempts=${relayState.publishAttempts - attemptsBefore} landed=${landed.length} stderr=${res.stderr}`)
 }
 
 sharedServer.close()

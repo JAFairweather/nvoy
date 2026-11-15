@@ -44,6 +44,10 @@ import {
 const DEFAULT_POLL_MS = 3000
 const MAX_EVENT_LOG = 60
 export const CORPUS_CACHE_TTL_MS = 300_000
+// q-173 (15 Nov 2026): the topic eigenvector pass costs 2-4 s of synchronous CPU for about 1,500 records, and it ran
+// on every poll that saw a write, so the event loop stalled and page and API requests waited up to 20 s live. A
+// scheduled poll now reuses the previous pass for this long; a forced poll (startup, tests) always recomputes.
+export const SPECTRAL_REFRESH_MS = 60_000
 export const MAX_SSE_CLIENT_BUFFER_BYTES = 4 * 1024 * 1024
 export const SSE_KEEPALIVE_INTERVAL_MS = 30_000
 export const MAX_CORPUS_HISTORY = 64
@@ -51,8 +55,27 @@ export const INITIAL_STATE_RECORDS_LIMIT = 18
 export const FIRST_LOAD_HTML_BUDGET_BYTES = 262_144
 export const MOBILE_HTML_BUDGET_BYTES = 40_000
 // One version for the page and the live snapshot: the page reloads whenever they differ.
-const VIEWER_VERSION = '2026-11-13-v21'
+const VIEWER_VERSION = '2026-11-15-v22'
 const ACTIVITY_KINDS = new Set(['wake', 'query', 'lookup', 'submit', 'refused'])
+
+// q-173: whether a scheduled poll may reuse the previous topic eigenvector pass instead of recomputing it. Keyed on
+// the reader binding only: the wake's scope signature carries counts and record ids, so it changes on every write.
+export function canReuseSpectral(cached, { forceFull = true, aclSig, nowMs, refreshMs = SPECTRAL_REFRESH_MS } = {}) {
+  return Boolean(
+    !forceFull &&
+      cached &&
+      cached.spectral &&
+      cached.aclSig === aclSig &&
+      Number.isFinite(nowMs) &&
+      nowMs >= cached.atMs &&
+      nowMs - cached.atMs < refreshMs
+  )
+}
+
+// Resolves on the next turn of the event loop, after pending I/O callbacks (such as queued HTTP requests) have run.
+export function yieldToEventLoop() {
+  return new Promise(resolve => setImmediate(resolve))
+}
 
 export function compactTopicPagesForClient(topicPages) {
   if (!topicPages || typeof topicPages !== 'object') return {}
@@ -4117,6 +4140,7 @@ export function renderViewerHtml(initialState) {
         <span>Latest Memory Claims</span>
         <span id="records-count" class="badge">0 records</span>
       </h2>
+      <div id="corpus-loading" class="empty" hidden>Loading the full memory corpus; showing the latest claims meanwhile.</div>
       <div id="records-list" class="record-list"></div>
     </section>
 
@@ -4208,6 +4232,7 @@ export function renderViewerHtml(initialState) {
       var needsFullResync = false;
       var fetchedTopics = {};
       var resyncInFlight = false;
+      var resyncQueued = false;
       var searchFetchTimer = null;
       var prevByEventId = {};
       var lastRenderedCorpusSig = null;
@@ -4334,38 +4359,66 @@ export function renderViewerHtml(initialState) {
         renderInspector();
       }
 
+      function setCorpusLoading(on) {
+        var line = el('corpus-loading');
+        if (line) line.hidden = !on;
+      }
+
+      // q-173: one full-corpus fetch at a time. A delta that arrives while it is in flight queues one more fetch
+      // instead of discarding the answer on its way, so a slow load still lands and paints.
+      function finishCorpusResync() {
+        resyncInFlight = false;
+        if (resyncQueued) {
+          resyncQueued = false;
+          forceFullCorpusResync();
+          return;
+        }
+        setCorpusLoading(false);
+      }
+
       function forceFullCorpusResync() {
         needsFullResync = true;
         if (typeof fetch !== 'function') return;
+        if (resyncInFlight) {
+          resyncQueued = true;
+          return;
+        }
         var reqGen = corpusResetGen;
         var reqSeq = ++resyncRequestSeq;
         resyncInFlight = true;
+        setCorpusLoading(true);
         fetch('/api/records?include_corpus=1')
           .then(function (r) { return r.ok ? r.json() : null; })
           .then(function (data) {
-            if (reqSeq !== resyncRequestSeq || reqGen !== corpusResetGen) return;
-            resyncInFlight = false;
-            if (!data || !Array.isArray(data.records) || data.connected === false) return;
-            if (data.store_state && data.store_state.state !== 'READY') return;
-            if (currentAclDigest && data.acl_digest && data.acl_digest !== currentAclDigest) return;
-            if (currentCorpusEpoch != null && data.corpus_epoch != null && data.corpus_epoch !== currentCorpusEpoch) return;
-            if (typeof data.poll_seq === 'number' && lastSsePollSeq > 0 && data.poll_seq < lastSsePollSeq) {
-              if (targetServerDigest && data.corpus_digest !== targetServerDigest) {
-                forceFullCorpusResync();
-              }
+            if (reqSeq !== resyncRequestSeq) return;
+            if (reqGen !== corpusResetGen) {
+              resyncQueued = true;
+              finishCorpusResync();
+              return;
+            }
+            if (!data || !Array.isArray(data.records) || data.connected === false ||
+                (data.store_state && data.store_state.state !== 'READY') ||
+                (currentAclDigest && data.acl_digest && data.acl_digest !== currentAclDigest) ||
+                (currentCorpusEpoch != null && data.corpus_epoch != null && data.corpus_epoch !== currentCorpusEpoch)) {
+              finishCorpusResync();
               return;
             }
             var respDigest = typeof data.corpus_digest === 'string' ? data.corpus_digest : '';
-            if (!respDigest || (targetServerDigest && respDigest !== targetServerDigest && (typeof data.poll_seq !== 'number' || data.poll_seq <= lastSsePollSeq))) {
+            if (!respDigest) {
+              finishCorpusResync();
               return;
             }
-            needsFullResync = false;
+            // The answer is one consistent snapshot. Paint it even when the store has moved on since; if it has,
+            // fetch once more rather than leave the page on the partial first screen.
+            var behindTarget = Boolean(targetServerDigest && respDigest !== targetServerDigest);
+            if (behindTarget) resyncQueued = true;
+            needsFullResync = behindTarget;
             fetchedTopics = {};
             latestRecords = data.records;
             totalStoreRecords = typeof data.total_records === 'number' ? data.total_records : data.records.length;
             recordsTruncated = Boolean(data.next_offset !== null && latestRecords.length < totalStoreRecords);
             currentCorpusDigest = respDigest;
-            targetServerDigest = respDigest;
+            if (!behindTarget) targetServerDigest = respDigest;
             if (typeof data.acl_digest === 'string' && data.acl_digest) {
               currentAclDigest = data.acl_digest;
             }
@@ -4400,9 +4453,10 @@ export function renderViewerHtml(initialState) {
               recent_activity: latestRecentActivity
             }, graphReady, true);
             renderInspector();
+            finishCorpusResync();
           })
           .catch(function () {
-            if (reqSeq === resyncRequestSeq) resyncInFlight = false;
+            if (reqSeq === resyncRequestSeq) finishCorpusResync();
           });
       }
 
@@ -8534,6 +8588,8 @@ export function renderViewerHtml(initialState) {
           corpusResetGen += 1;
           resyncRequestSeq += 1;
           resyncInFlight = false;
+          resyncQueued = false;
+          setCorpusLoading(false);
           needsFullResync = false;
           fetchedTopics = {};
           latestRecords = s.records;
@@ -8665,6 +8721,8 @@ export function renderViewerHtml(initialState) {
         }
       } catch (_) {}
       requestAnimationFrame(frame);
+      // q-173: the page paints from the embedded first screen; the full corpus loads behind it.
+      if (recordsTruncated) setTimeout(forceFullCorpusResync, 0);
 
       if (typeof EventSource !== 'undefined') {
         var initSeq = latestStoreState && latestStoreState.write_seq != null ? latestStoreState.write_seq : '';
@@ -9948,6 +10006,7 @@ export async function startMemoryViewer({
   let pollInFlight = null
   let pollTimer = null
   let cachedCorpus = null
+  let cachedSpectral = null
   let cachedHtmlKey = null
   let cachedHtmlContentKey = null
   let cachedHtmlTemplateStr = null
@@ -10222,7 +10281,15 @@ export async function startMemoryViewer({
         )
         historyRecords = [...byEventId.values()]
         historyComplete = cursor === null
-        spectral = computeTopicEigenvectors(records, { maxComponents: 7, nowSec })
+        // q-173: let waiting page and API requests run before the heavy passes, and between them.
+        await yieldToEventLoop()
+        if (canReuseSpectral(cachedSpectral, { forceFull, aclSig: wakeAclSig, nowMs })) {
+          spectral = cachedSpectral.spectral
+        } else {
+          spectral = computeTopicEigenvectors(records, { maxComponents: 7, nowSec })
+          cachedSpectral = { spectral, atMs: nowMs, aclSig: wakeAclSig }
+          await yieldToEventLoop()
+        }
         previewPlan = planMerkleDream({ records, nowSec, spectral })
         consolidatedSources = {}
         for (const r of records) {
@@ -10543,6 +10610,7 @@ export async function startMemoryViewer({
       }
     } catch (err) {
       cachedCorpus = null
+      cachedSpectral = null
       nextSnapshot = {
         ...currentState,
         connected: false,

@@ -153,12 +153,15 @@ const checkEnv = { HOME: manifest.stateDir, PATH: process.env.PATH || '', NVOY_R
   GRANTORS: manifest.grantors.join(','), NVOY_TASK_CARRIERS: JSON.stringify(manifest.carriers) }
 if (bunkerUri) { checkEnv.NVOY_BUNKER_URI = bunkerUri; checkEnv.NVOY_NIP46_CLIENT_NSEC = raw } else checkEnv.NVOY_NSEC = raw
 // A native receipt has no wrap to re-open: the author signed the channel message itself. What must
-// still hold is the same thing admission required — the author's own task grant, live now.
-const checked = spawnSync(process.execPath, [attention, ...(buzzNative ? ['--policy-only'] : ['--json', '--envelope', receipt.envelope])],
-  { env: checkEnv, encoding: 'utf8', timeout: 60000 })
-if (![0, 10].includes(checked.status)) die('could not recheck live grant policy')
-let policy; try { policy = JSON.parse(checked.stdout) } catch { die('live grant policy result is invalid') }
-if (buzzNative) {
+// still hold is the same thing admission required — the author's own task grant, live now — and
+// whenever a direct native reply re-signs after a transient relay drop or stale timestamp, this
+// entire chain (task grant, dynamic mention grants, and room-derived membership) is re-verified
+// immediately before opening the signer.
+async function verifyLiveNativePolicy(activeSession = null) {
+  const checked = spawnSync(process.execPath, [attention, '--policy-only'],
+    { env: checkEnv, encoding: 'utf8', timeout: 60000 })
+  if (![0, 10].includes(checked.status)) die('could not recheck live grant policy')
+  let policy; try { policy = JSON.parse(checked.stdout) } catch { die('live grant policy result is invalid') }
   const live = (Array.isArray(policy.grants) ? policy.grants : []).find(g => g?.pubkey === receipt.sender &&
     g.grant_id === receipt.grant_id && ['task', 'task+act'].includes(g.cap) && manifest.grantors.includes(g.grantor))
   recordMentionGrants(manifest, policy)
@@ -167,20 +170,36 @@ if (buzzNative) {
     const allowed = withMentionGrants(manifest, policy.mentions)
     try { validateReplyMention(request.mention, allowed, receipt.reply_channel) } catch (e) { die(e.message) }
     roomDerived = manifest.mayPost.mentionRooms ? offList(allowed, request.mention) : []
-    // Before the claim, so a member who has left costs neither the receipt nor the post budget.
+    // Before the claim (or before any replacement signature), so a member who has left is never tagged.
     if (roomDerived.length) {
-      let check
-      try { check = await openBuzzSession({ relay: manifest.buzz.relay, signer }) } catch (e) { die(`room member list unavailable: ${e.message}; held for retry`) }
-      try { await confirmRoom(check) } finally { check.close() }
+      if (activeSession) await confirmRoom(activeSession)
+      else {
+        let check
+        try { check = await openBuzzSession({ relay: manifest.buzz.relay, signer }) } catch (e) { die(`room member list unavailable: ${e.message}; held for retry`) }
+        try { await confirmRoom(check) } finally { check.close() }
+      }
     }
+  } else roomDerived = []
+  if (receiptPath === receiptInflight) {
+    receipt.revalidated_at = Date.now()
+    receipt.expires_at = receipt.revalidated_at + 5 * 60 * 1000
+    try { writeFileSync(receiptPath, JSON.stringify(receipt), { mode: 0o600 }) }
+    catch (e) { die(`cannot record receipt revalidation: ${e.message}`) }
   }
 }
-const current = Array.isArray(policy.admissions) ? policy.admissions : []
-const liveAdmission = current.length === 1 ? current[0] : null
-if (!buzzNative && (!policy.policyUsable || !liveAdmission || liveAdmission.from !== receipt.sender || liveAdmission.grant_id !== receipt.grant_id ||
-  (channelCarry && (liveAdmission.mode !== 'channel-carry' || liveAdmission.carrier !== receipt.carrier ||
-    liveAdmission.carrier_grant_id !== receipt.carrier_grant_id || liveAdmission.reply_channel !== receipt.reply_channel ||
-    liveAdmission.source_event !== receipt.source_event)))) die('admission receipt no longer has a live matching grant chain')
+if (buzzNative) await verifyLiveNativePolicy()
+else {
+  const checked = spawnSync(process.execPath, [attention, '--json', '--envelope', receipt.envelope],
+    { env: checkEnv, encoding: 'utf8', timeout: 60000 })
+  if (![0, 10].includes(checked.status)) die('could not recheck live grant policy')
+  let policy; try { policy = JSON.parse(checked.stdout) } catch { die('live grant policy result is invalid') }
+  const current = Array.isArray(policy.admissions) ? policy.admissions : []
+  const liveAdmission = current.length === 1 ? current[0] : null
+  if (!policy.policyUsable || !liveAdmission || liveAdmission.from !== receipt.sender || liveAdmission.grant_id !== receipt.grant_id ||
+    (channelCarry && (liveAdmission.mode !== 'channel-carry' || liveAdmission.carrier !== receipt.carrier ||
+      liveAdmission.carrier_grant_id !== receipt.carrier_grant_id || liveAdmission.reply_channel !== receipt.reply_channel ||
+      liveAdmission.source_event !== receipt.source_event))) die('admission receipt no longer has a live matching grant chain')
+}
 // A mention spends the post budget. Counted before the claim, so a refusal leaves the receipt
 // answerable without one; the count is per request, so a retry of a frozen reply is a repeat.
 if (request.mention !== undefined && !existsSync(resolve(manifest.stateDir, 'outbound', `${requestId}.json`))) {
@@ -283,7 +302,9 @@ if (direct) {
   } catch (e) { die(e.message) }
   if (record.approval_id && record.approval_id !== approval.eventId) die('outbound proposal is already bound to another approval')
 }
-if (buzzNative && !record.event) {
+const directStaleUnsigned = buzzNative && direct && !record.approval_id &&
+  Math.abs(Math.floor(Date.now() / 1000) - record.unsigned_event.created_at) >= BUZZ_FRESH_WINDOW_SEC
+if (buzzNative && !record.event && !directStaleUnsigned) {
   const ev = await signer.signEvent(record.unsigned_event)
   if (ev.id !== record.fingerprint || getEventHash(ev) !== record.fingerprint || !verifyEvent(JSON.parse(JSON.stringify(ev)))) die('signer changed or invalidly signed the frozen channel reply')
   record.event = ev
@@ -321,13 +342,17 @@ async function publish(url) {
 let accepted = 0
 if (buzzNative) {
   // The community relay is the only place this reply means anything; its refusal is reported verbatim.
-  // Direct channel replies carry live grant authority (rechecked above), so on a transient socket close
-  // or stale timestamp (q-144, q-150) we re-sign with a fresh created_at after checking the relay has
-  // not already stored the prior id. Discrete approvals keep their exact frozen fingerprint.
-  const resignDirectNativeReply = async (now = Math.floor(Date.now() / 1000)) => {
+  // Direct channel replies carry live grant authority, so on a transient socket close or stale timestamp
+  // (q-144, q-150, q-179) we check that the relay has not already stored the prior id, re-verify the
+  // entire live grant chain (task grant, dynamic mention grants, and room-derived membership) immediately
+  // before opening the signer, and only then sign a fresh created_at. Discrete approvals keep their exact
+  // frozen fingerprint.
+  const resignDirectNativeReply = async (activeSession, now = null) => {
+    await verifyLiveNativePolicy(activeSession)
+    const signedAt = now ?? Math.floor(Date.now() / 1000)
     const parent = { id: receipt.source_event, pubkey: receipt.sender,
       tags: receipt.reply_root !== receipt.source_event ? [['e', receipt.reply_root, '', 'root']] : [] }
-    const unsignedEvent = { pubkey: manifest.pubkey, ...channelReply({ channel: receipt.reply_channel, parent, content: request.content, hop: nextHop(receipt.hop), mentions: request.mention || [], now }) }
+    const unsignedEvent = { pubkey: manifest.pubkey, ...channelReply({ channel: receipt.reply_channel, parent, content: request.content, hop: nextHop(receipt.hop), mentions: request.mention || [], now: signedAt }) }
     const fingerprint = getEventHash(unsignedEvent)
     const ev = await signer.signEvent({ ...unsignedEvent })
     if (ev?.id !== fingerprint || getEventHash(ev) !== fingerprint || !verifyEvent(JSON.parse(JSON.stringify(ev))))
@@ -354,16 +379,15 @@ if (buzzNative) {
   try {
     const session = await openBuzzSession({ relay: manifest.buzz.relay, signer })
     try {
-      if (roomDerived.length) await confirmRoom(session)
-      if (direct && !record.approval_id && Math.abs(Math.floor(Date.now() / 1000) - record.unsigned_event.created_at) >= BUZZ_FRESH_WINDOW_SEC) {
+      if (direct && !record.approval_id && (!record.event || Math.abs(Math.floor(Date.now() / 1000) - record.unsigned_event.created_at) >= BUZZ_FRESH_WINDOW_SEC)) {
         if (await alreadyOnBuzz(session, record.event?.id)) accepted = 1
-        else await resignDirectNativeReply()
-      }
+        else await resignDirectNativeReply(session)
+      } else if (roomDerived.length) await confirmRoom(session)
       if (!accepted) {
         const ok = await session.publishSigned(record.event)
         if (!ok.accepted && direct && !record.approval_id && isStaleTimestampRefusal(ok.message)) {
           console.error(`instance-broker-reply: refreshing stale reply timestamp (${ok.message})`)
-          await resignDirectNativeReply()
+          await resignDirectNativeReply(session)
           checkVerdict(await session.publishSigned(record.event))
         } else checkVerdict(ok)
       }
@@ -374,10 +398,9 @@ if (buzzNative) {
       try {
         const retry = await openBuzzSession({ relay: manifest.buzz.relay, signer })
         try {
-          if (roomDerived.length) await confirmRoom(retry)
           if (e?.buzzMeta?.sent !== false && await alreadyOnBuzz(retry, record.event?.id)) accepted = 1
           else {
-            await resignDirectNativeReply()
+            await resignDirectNativeReply(retry)
             checkVerdict(await retry.publishSigned(record.event))
           }
         } finally { retry.close() }
