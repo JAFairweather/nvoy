@@ -92,7 +92,9 @@ const mention = ev(director, 440, [['p', dennis.pk], ['da-scope', scopeHash(agen
 ok('a mention grant is live unrevoked', fold([mention]).mentions.length === 1)
 ok('a backdated revocation revokes a mention grant', fold([mention, revoke(director, mention.id, now() - 1000)]).mentions.length === 0)
 ok('a backdated revocation from a stranger still revokes nothing', fold([granted, revoke(stranger, granted.id, now() - 1000)]).live.has(dennis.pk))
-const forgedRevoke = { ...revoke(director, granted.id, now() - 1000), sig: '00'.repeat(64) }
+// Through JSON, like the forged shadow above: a spread copy keeps nostr-tools' cached verified mark whenever the test
+// and admission.mjs load the same nostr-tools copy (one install), and the forged 441 would then pass as signed.
+const forgedRevoke = JSON.parse(JSON.stringify({ ...revoke(director, granted.id, now() - 1000), sig: '00'.repeat(64) }))
 r = fold([granted, forgedRevoke])
 ok('a backdated revocation with a bad signature revokes nothing, and is counted rejected', r.live.has(dennis.pk) && r.rejected === 1)
 ok('a revocation of another grant leaves this one live', fold([granted, revoke(director, own.id, now() - 1000)]).live.has(dennis.pk))
