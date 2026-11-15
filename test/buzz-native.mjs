@@ -150,6 +150,13 @@ try {
   ok('a forged reply in the agent\'s thread is not addressed', nativeMention({ ...verdict, content: 'tampered' }, { ...opts, threads }) === null)
   ok('a reply in the agent\'s thread from another channel is not addressed',
     nativeMention(finalizeEvent({ kind: 9, created_at: now(), content: 'x', tags: [['h', OTHER], ['e', asked.id, '', 'root']] }, humanSk), { me: agent, channels: [CH, OTHER], threads }) === null)
+  // Buzz counts a reply only by a marked `reply` tag (NIP-CW); a root-only reference does not answer in the thread.
+  const rootOnly = finalizeEvent({ kind: 9, created_at: now(), content: 'x', tags: [['h', CH], ['e', asked.id, '', 'root']] }, humanSk)
+  ok('a root-only reference to the agent\'s thread, with no reply tag or mention, is not addressed', nativeMention(rootOnly, { ...opts, threads }) === null)
+  const unmarked = finalizeEvent({ kind: 9, created_at: now(), content: 'x', tags: [['h', CH], ['e', asked.id]] }, humanSk)
+  ok('an unmarked e tag to the agent\'s thread is not addressed', nativeMention(unmarked, { ...opts, threads }) === null)
+  ok('a direct reply to the agent\'s root, marked reply only, is addressed', nativeMention(finalizeEvent({ kind: 9, created_at: now(), content: 'x',
+    tags: [['h', CH], ['e', asked.id, '', 'reply']] }, humanSk), { ...opts, threads })?.addressed === 'own-thread')
   const top2 = finalizeEvent({ kind: 9, created_at: now(), content: 'x', tags: [['h', CH]] }, humanSk)
   ok('a thread root is never its own reply', nativeMention(top2, { ...opts, threads: [{ id: top2.id, channel: CH }] }) === null)
   ok('a top-level message signed by someone else, or forged, is not the agent\'s thread',

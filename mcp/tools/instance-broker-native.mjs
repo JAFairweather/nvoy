@@ -22,7 +22,7 @@ import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest
 import { claimChannelSource, completeChannelSource } from './channel_source_dedup.mjs'
 import { claimBrokerLock } from './broker_lock.mjs'
 import { brokerSigner } from './broker_signer.mjs'
-import { channelContext, contextFilters, dmChannels, dmNoticeFilter, nativeGrant, nativeMention, openBuzzSession, ownRoots, threadRoot } from './buzz_native.mjs'
+import { channelContext, contextFilters, dmChannels, dmNoticeFilter, isReply, mentionsOf, nativeGrant, nativeMention, openBuzzSession, ownRoots, threadRoot } from './buzz_native.mjs'
 import { recordStatusAdmission } from './buzz_status.mjs'
 import { grantLookup, noGrantVerdict } from './grant_evidence.mjs'
 import { admissionLimit, hopOf } from './agent_limits.mjs'
@@ -81,8 +81,9 @@ try {
     dms = dmChannels(await session.fetch(dmNoticeFilter(me)), { me }).filter(ch => !manifest.buzz.channels.includes(ch))
     source = (await session.fetch({ ids: [eventId], kinds: [9], '#h': [...manifest.buzz.channels, ...dms] })).find(ev => ev?.id === eventId)
     // A reply in a thread this identity started is addressed to it, mention or not (#280); the
-    // root's own signature says whose thread it is.
-    const root = source && threadRoot(source)
+    // root's own signature says whose thread it is. A direct mention is addressed already, so it never
+    // waits on this lookup, and a failed lookup cannot requeue it (Murphy's Law, PR 281 review).
+    const root = source && !mentionsOf(source, me) && isReply(source) && threadRoot(source)
     if (root && root !== eventId) threads = ownRoots(await session.fetch({ ids: [root], kinds: [9], '#h': manifest.buzz.channels }), { me, channels: manifest.buzz.channels })
     const filters = source && contextFilters(source)
     if (filters) {

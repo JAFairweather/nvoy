@@ -96,6 +96,12 @@ export function channelPost({ channel, content, mentions = [], now = Math.floor(
   return { kind: 9, created_at: now, content, tags: [['h', channel], ...mentions.map(p => ['p', p]), [HOP_TAG, '1']] }
 }
 
+// A reply, as Buzz classifies one (NIP-CW, Top-level Classification): a marked `reply` e tag. A tag marked `root`
+// alone, or an unmarked one, only refers to a thread; it does not answer in it (Murphy's Law, PR 281 review).
+export const isReply = ev => (Array.isArray(ev?.tags) ? ev.tags : []).some(t => t?.[0] === 'e' && t[3] === 'reply' && HEX64.test(String(t[1])))
+// Desktop tags an off-channel mention ["mention", pk] instead of ["p", pk]; both count.
+export const mentionsOf = (ev, me) => [...tagValues(ev, 'p'), ...tagValues(ev, 'mention')].includes(me)
+
 export const threadRoot = ev => {
   const marked = marker => (ev.tags || []).find(t => t?.[0] === 'e' && t[3] === marker && HEX64.test(String(t[1])))?.[1]
   return marked('root') || marked('reply') || ev.id
@@ -111,8 +117,8 @@ export function nativeMention(ev, { me, channels, threads = [], now = Math.floor
   if (!Number.isSafeInteger(ev.created_at) || ev.created_at > now + 900) return null
   const h = tagValues(ev, 'h')
   if (h.length !== 1 || !channels.includes(h[0])) return null
-  const addressed = [...tagValues(ev, 'p'), ...tagValues(ev, 'mention')].includes(me) ? 'mention'
-    : threadRoot(ev) !== ev.id && threads.some(t => t.id === threadRoot(ev) && t.channel === h[0]) ? 'own-thread' : null
+  const addressed = mentionsOf(ev, me) ? 'mention'
+    : isReply(ev) && threadRoot(ev) !== ev.id && threads.some(t => t.id === threadRoot(ev) && t.channel === h[0]) ? 'own-thread' : null
   if (!addressed || !verified(ev, verify)) return null
   return { channel: h[0], author: ev.pubkey, event_id: ev.id, created_at: ev.created_at, addressed }
 }

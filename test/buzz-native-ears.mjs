@@ -30,6 +30,8 @@ const local = sk => ({ getPublicKey: async () => getPublicKey(sk), signEvent: as
 
 // --- a Buzz-shaped relay with live subscriptions ---
 const members = new Set([agent, human, third]), stored = [], sockets = []
+// Event ids whose lookup by id the stub relay refuses, to stand for a failed root read.
+const refuseIds = new Set()
 const matches = (f, ev) => {
   const vals = n => ev.tags.filter(t => t[0] === n).map(t => t[1])
   return f['#h'].some(h => vals('h').includes(h)) && (!f.ids || f.ids.includes(ev.id)) && (!f.kinds || f.kinds.includes(ev.kind)) &&
@@ -66,6 +68,7 @@ server.on('connection', ws => {
       if (!authed) return ws.send(JSON.stringify(['CLOSED', m[1], 'auth-required: authenticate first']))
       const filters = m.slice(2)
       if (filters.some(f => !f['#h'])) return ws.send(JSON.stringify(['EOSE', m[1]]))
+      if (filters.some(f => (f.ids || []).some(id => refuseIds.has(id)))) return ws.send(JSON.stringify(['CLOSED', m[1], 'error: lookup refused']))
       for (const ev of stored) if (filters.some(f => matches(f, ev))) ws.send(JSON.stringify(['EVENT', m[1], ev]))
       live.set(m[1], filters)
       return ws.send(JSON.stringify(['EOSE', m[1]]))
@@ -230,6 +233,19 @@ ok('no receipt exists before a grant was seen', !existsSync(join(root, 'state', 
 ok('the broker lock is released on exit', !existsSync(join(root, 'state', 'broker.lock')))
 r = await deliver('ears', verdict.id)
 ok('a reply in the agent\'s own thread is addressed, and goes on to the author\'s grant', r.status === 75 && /policy unavailable|policy check failed/.test(r.stderr) && existsSync(pendingFor(verdict.id)))
+const rootOnly = await post(humanSk, { kind: 9, content: 'see above', tags: [['h', CH], ['e', asked.id, '', 'root']] })
+plant(rootOnly.id)
+r = await deliver('ears', rootOnly.id)
+ok('a root-only reference to the agent\'s thread, with no reply tag or mention, is terminal, not a task', r.status === 0 && /not a signed mention/.test(r.stderr))
+// A direct mention never waits on the thread root: a failed root read cannot requeue it.
+const directInThread = await post(humanSk, { kind: 9, content: 'over to you', tags: [...inThread(asked, aside), ['p', agent]] })
+refuseIds.add(asked.id); plant(directInThread.id)
+r = await deliver('ears', directInThread.id)
+ok('a direct mention in a thread goes on to its grant even when the root read fails', r.status === 75 && /policy unavailable|policy check failed/.test(r.stderr) && !/Buzz relay unavailable/.test(r.stderr))
+plant(verdict.id)
+r = await deliver('ears', verdict.id)
+ok('a reply with no mention, whose root read fails, is requeued rather than dropped', r.status === 75 && /Buzz relay unavailable/.test(r.stderr) && existsSync(pendingFor(verdict.id)))
+refuseIds.clear()
 plant(notOurs.id)
 r = await deliver('ears', notOurs.id)
 ok('a reply in a thread the agent did not start is terminal, not a task', r.status === 0 && /not a signed mention/.test(r.stderr))
