@@ -373,8 +373,18 @@ process.stdin.on('data', chunk => {
     }
     appendFileSync(${JSON.stringify(wakeLogPath)}, JSON.stringify({ seat: 'pd-test', op: m.params.name, args: m.params.arguments }) + '\\n')
     const payload = mode === 'nocanon'
-      ? { store_state: { state: 'READY' }, counts: { canon_shown: 0, ops_shown: 2 }, digest: 'no canon' }
-      : { store_state: { state: 'READY' }, counts: { canon_shown: 2, ops_shown: 4 }, digest: '=== HIVE WAKE DIGEST ===\\n- [canon] keep seat reader' }
+      ? { record_type: 'memory-wake-digest', store_state: { state: 'READY' }, counts: { canon_shown: 0, ops_shown: 2 }, digest: 'no canon' }
+      : { record_type: 'memory-wake-digest', store_state: { state: 'READY' }, counts: { canon_shown: 2, ops_shown: 4 }, digest: '=== HIVE WAKE DIGEST ===\\n- [canon] keep seat reader' }
+    if (mode === 'hang-call') {
+      setInterval(() => {}, 1000)
+      continue
+    }
+    if (mode === 'delay') {
+      setTimeout(() => {
+        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: { content: [{ type: 'text', text: JSON.stringify({ ...payload, digest: '=== HIVE WAKE DIGEST ===\\n- [canon] stale session A' }) }] } }) + '\\n')
+      }, 250)
+      continue
+    }
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: { content: [{ type: 'text', text: JSON.stringify(payload) }] } }) + '\\n')
   }
 })
@@ -422,18 +432,64 @@ process.stdin.on('data', chunk => {
   wPi.stop()
   await waitFor(() => !existsSync(lockPath), 5000)
 
+  // Session-generation fencing: if session A shuts down while its wake promise is in flight, its pending before_agent_start
+  // callback resolves to undefined and never leaks into session B.
+  writeFileSync(wakeModePath, 'delay')
+  wPi.start()
+  const pendingSessionATurn = wPi.beforeStart({ type: 'before_agent_start' })
+  await wait(40)
+  wPi.stop()
+  await waitFor(() => !existsSync(lockPath), 5000)
+  writeFileSync(wakeModePath, 'ok')
+  wPi.start()
+  const staleResult = await pendingSessionATurn
+  const freshSessionBTurn = await wPi.beforeStart({ type: 'before_agent_start' })
+  ok('a pending before_agent_start wake from a stopped session resolves undefined and does not cross into the next session',
+    staleResult === undefined &&
+    /Hive memory wake digest[\s\S]*keep seat reader/.test(freshSessionBTurn?.message?.content || '') &&
+    !/stale session A/.test(JSON.stringify(freshSessionBTurn)))
+  wPi.stop()
+  await waitFor(() => !existsSync(lockPath), 5000)
+
+  // Startup wake timeout bound: even when initialize succeeds and tools/call hangs, HARNESS_WAKE_TIMEOUT_MS bounds the total wait
+  // instead of stacking two channelProxy request timeouts, resets the hung reader, and injects the @Neil failure notice.
+  process.env.HARNESS_WAKE_TIMEOUT_MS = '800'
+  writeFileSync(wakeModePath, 'hang-call')
+  const t0 = Date.now()
+  wPi.start()
+  const timedOutTurn = await wPi.beforeStart({ type: 'before_agent_start' })
+  const timeoutElapsed = Date.now() - t0
+  delete process.env.HARNESS_WAKE_TIMEOUT_MS
+  writeFileSync(wakeModePath, 'ok')
+  const recoveredQuery = await wPi.tools.get('memory_query')?.execute('q-after-timeout', { topic: 'nvoy' })
+  ok('a hung Pi startup wake times out within HARNESS_WAKE_TIMEOUT_MS (without waiting two channelProxy stages), surfaces @Neil failure context, and resets the reader',
+    timeoutElapsed < 3000 &&
+    /Hive memory wake FAILED at session start[\s\S]*did not answer within 1s[\s\S]*mentioning @Neil/.test(timedOutTurn?.message?.content || '') &&
+    wLogs.some(l => /memory wake FAILED: the Hive memory reader did not answer within 1s/.test(l)) &&
+    /keep seat reader/.test(recoveredQuery?.content?.[0]?.text || ''))
+  wPi.stop()
+  await waitFor(() => !existsSync(lockPath), 5000)
+
   // Also verify nvoyPiHarness over SSH read-key records wake at session_start.
+  const sshWakeReadKey = secretFile(join(wakeDir, 'ssh-wake-read-key'), 'PRIVATE-KEY-MUST-NEVER-PRINT\n')
+  const sshWakeWrapper = secretFile(join(wakeDir, 'ssh-wake'), `#!/bin/sh
+echo "$@" >> ${join(root, 'ssh-args.log')}
+case "$*" in *"-i ${sshWakeReadKey} "*) exec ${wakeReader} via-ssh ;; esac
+exec ${fakeSsh} "$@"
+`, 0o700)
   const sshStateDir = join(wakeDir, 'st-ssh')
-  const sshWakeConfigPath = clientConfig({ ...client, state_dir: sshStateDir, recall: recallObject })
+  const sshWakeConfigPath = clientConfig({ ...client, state_dir: sshStateDir, recall: { identity_file: sshWakeReadKey, known_hosts_file: knownHosts, ssh_target: 'pd-test@hive.example' } })
   process.env.NVOY_PI_HARNESS_CONFIG = sshWakeConfigPath
+  process.env.NVOY_HARNESS_SSH = sshWakeWrapper
   const sshPi = fakePi()
   const sshHarness = await nvoyPiHarness(sshPi)
   sshPi.start()
   const sshTurn = await sshPi.beforeStart({ type: 'before_agent_start' })
-  ok('nvoyPiHarness over SSH read-key runs memory_wake at session_start and injects the reader digest on first turn',
-    /Hive memory wake digest[\s\S]*reader via-ssh memory_wake \{"max_chars":3500\}/.test(sshTurn?.message?.content || '') &&
+  ok('nvoyPiHarness over SSH read-key runs memory_wake at session_start and injects the verified reader digest on first turn',
+    /Hive memory wake digest[\s\S]*keep seat reader/.test(sshTurn?.message?.content || '') &&
     sshHarness.channel.spawned() === 0)
   sshHarness.dispose()
+  process.env.NVOY_HARNESS_SSH = fakeSsh
   await waitFor(() => !existsSync(lockPath), 5000)
 }
 process.env.NVOY_PI_HARNESS_CONFIG = configPath

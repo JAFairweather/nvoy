@@ -10,7 +10,7 @@ import { join, resolve } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { sshChannelEntry } from '../mcp/tools/channel_client.mjs'
 import { fakeHerdr } from './fake-herdr.mjs'
-import { CODEX_CHANNEL_TOOLS, channelProcessUp, classifyPane, claudeArgs, claudeRecallHookCommand, codexConfigToml, codexTurnText, defaultInstructions, ensureInstructions, hasPriorSession, instructionsUpdate, reconnectingEntry, RECONNECT_PROXY, channelState, MEMORY_FAILURE_RULE_MARKER, memoryFailureRule, MEMORY_RULE_MARKER, mcpConfig, RECALL_HOOK_TIMEOUT_SEC, RECALL_RULE_MARKER, RECALL_WAKE_SCRIPT, TURN_RULE_MARKER, pendingEnvelopes, seedClaudeJson, seedSettings, serverName } from '../mcp/tools/harness_session.mjs'
+import { CLAUDE_SESSION_START_MATCHER, CODEX_CHANNEL_TOOLS, channelProcessUp, classifyPane, claudeArgs, claudeRecallHookCommand, codexConfigToml, codexTurnText, defaultInstructions, ensureInstructions, hasPriorSession, instructionsUpdate, reconnectingEntry, RECONNECT_PROXY, channelState, MEMORY_FAILURE_RULE_MARKER, memoryFailureRule, MEMORY_RULE_MARKER, mcpConfig, RECALL_HOOK_TIMEOUT_SEC, RECALL_RULE_MARKER, RECALL_WAKE_SCRIPT, TURN_RULE_MARKER, pendingEnvelopes, seedClaudeJson, seedSettings, serverName } from '../mcp/tools/harness_session.mjs'
 
 let fails = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); if (!value) fails++ }
@@ -137,12 +137,17 @@ ok('recall allows the two read tools by name, never the whole server', JSON.stri
     SessionStart: [{ hooks: [{ type: 'command', command: '/opt/operator-hook' }] }] } }, 'nvoy-mc-test',
     { recall: true, mcpConfigPath: quotedMcp, recallLogPath: quotedLog })
   const expectedCmd = claudeRecallHookCommand({ mcpConfigPath: quotedMcp, recallLogPath: quotedLog })
-  ok('recall seeds an idempotent SessionStart wake hook beside operator hooks, quoting single quotes and keeping timeout=40',
+  ok('recall seeds an idempotent SessionStart wake hook beside operator hooks, matching startup|resume|clear, quoting single quotes, and keeping timeout=40',
     RECALL_WAKE_SCRIPT.endsWith('/recall-wake.mjs') && expectedCmd.includes("'\\''") &&
+    CLAUDE_SESSION_START_MATCHER === 'startup|resume|clear' &&
     withHook.hooks.PreToolUse.length === 1 && withHook.hooks.SessionStart.length === 2 &&
     withHook.hooks.SessionStart[0].hooks[0].command === '/opt/operator-hook' &&
-    JSON.stringify(withHook.hooks.SessionStart[1]) === JSON.stringify({ hooks: [{ type: 'command', command: expectedCmd, timeout: RECALL_HOOK_TIMEOUT_SEC }] }) &&
+    JSON.stringify(withHook.hooks.SessionStart[1]) === JSON.stringify({ matcher: CLAUDE_SESSION_START_MATCHER, hooks: [{ type: 'command', command: expectedCmd, timeout: RECALL_HOOK_TIMEOUT_SEC }] }) &&
     JSON.stringify(seedSettings(withHook, 'nvoy-mc-test', { recall: true, mcpConfigPath: quotedMcp, recallLogPath: quotedLog })) === JSON.stringify(withHook))
+  const upgradedUnmatched = seedSettings({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: expectedCmd, timeout: RECALL_HOOK_TIMEOUT_SEC }] }] } },
+    'nvoy-mc-test', { recall: true, mcpConfigPath: quotedMcp, recallLogPath: quotedLog })
+  ok('re-seeding upgrades a legacy unmatched recall SessionStart group to carry the startup|resume|clear matcher',
+    upgradedUnmatched.hooks.SessionStart.length === 1 && upgradedUnmatched.hooks.SessionStart[0].matcher === CLAUDE_SESSION_START_MATCHER)
   const updatedHook = seedSettings(withHook, 'nvoy-mc-test', { recall: true, mcpConfigPath: '/new/mcp.json', recallLogPath: '/new/recall.log' })
   ok('re-seeding updates the managed SessionStart wake hook in place without duplicating it',
     updatedHook.hooks.SessionStart.length === 2 && updatedHook.hooks.SessionStart[1].hooks[0].command.includes("'/new/mcp.json'"))
@@ -441,7 +446,10 @@ mkdirSync(saved, { recursive: true }); writeFileSync(saved + '/fake.jsonl', '{}\
 if (existsSync(process.env.HOME + '/.fake/ignoreterm')) process.on('SIGTERM', () => {})
 const settingsFile = process.env.HOME + '/.claude/settings.json'
 if (existsSync(settingsFile)) {
-  const hookCmd = (JSON.parse(readFileSync(settingsFile, 'utf8')).hooks?.SessionStart || [])[0]?.hooks?.[0]?.command
+  const source = args.includes('--continue') ? 'resume' : 'startup'
+  const group = (JSON.parse(readFileSync(settingsFile, 'utf8')).hooks?.SessionStart || [])[0]
+  const matcherOk = !group?.matcher || new RegExp('^(?:' + group.matcher + ')$').test(source)
+  const hookCmd = matcherOk ? group?.hooks?.[0]?.command : ''
   if (hookCmd) {
     const readerCtl = process.env.HOME + '/.fake/reader'
     if (existsSync(readerCtl)) {
@@ -450,8 +458,8 @@ if (existsSync(settingsFile)) {
       mcpDoc.mcpServers['hive-memory'] = { command: process.execPath, args: [readFileSync(readerCtl, 'utf8').trim()] }
       writeFileSync(mcpPath, JSON.stringify(mcpDoc), { mode: 0o600 }); chmodSync(mcpPath, 0o600)
     }
-    const hr = require('node:child_process').spawnSync('/bin/sh', ['-c', hookCmd], { encoding: 'utf8', input: '{"session_id":"s1"}\\n', env: process.env })
-    writeFileSync(process.env.HOME + '/hook-run.json', JSON.stringify({ status: hr.status, stdout: hr.stdout, stderr: hr.stderr }))
+    const hr = require('node:child_process').spawnSync('/bin/sh', ['-c', hookCmd], { encoding: 'utf8', input: JSON.stringify({ session_id: 's1', hook_event_name: 'SessionStart', source }) + '\\n', env: process.env })
+    writeFileSync(process.env.HOME + '/hook-run.json', JSON.stringify({ source, matcher: group?.matcher || '', status: hr.status, stdout: hr.stdout, stderr: hr.stderr }))
   }
 }
 // The entry is the reconnecting proxy over ssh; run the real proxy, with the fake ssh in ssh's place.
@@ -649,11 +657,16 @@ ok('the LaunchAgent installer refuses a config the supervisor would refuse', spa
 {
   const wakeDir = mkdtempSync(join(remoteDir, 'wake-'))
   const wakeCallsPath = join(wakeDir, 'wake-calls.jsonl'), wakeModePath = join(wakeDir, 'mode')
-  const fakeWakeReader = secretFile(join(wakeDir, 'fake-wake-reader.cjs'), `const { appendFileSync, existsSync, readFileSync } = require('node:fs')
+  const fakeWakeReader = secretFile(join(wakeDir, 'fake-wake-reader.cjs'), `const { appendFileSync, existsSync, readFileSync, writeFileSync } = require('node:fs')
 const mode = existsSync(${JSON.stringify(wakeModePath)}) ? readFileSync(${JSON.stringify(wakeModePath)}, 'utf8').trim() : 'ok'
 if (mode === 'exit255') { process.stderr.write('Permission denied (publickey).\\n'); process.exit(255) }
 if (mode === 'secret') { process.stderr.write('leak sk-ant-oat01-synthetic-secret-value-123456\\n'); process.exit(1) }
-if (mode === 'hang') { setInterval(() => {}, 1000); return }
+if (mode === 'hang') {
+  process.on('SIGTERM', () => {})
+  writeFileSync(${JSON.stringify(join(wakeDir, 'hung.pid'))}, String(process.pid))
+  setInterval(() => {}, 1000)
+  return
+}
 let buf = ''
 process.stdin.on('data', chunk => {
   buf += chunk
@@ -669,20 +682,22 @@ process.stdin.on('data', chunk => {
     const payloads = {
       ok: { record_type: 'memory-wake-digest', store_state: { state: 'READY' }, counts: { canon_shown: 2, ops_shown: 5 }, digest: '=== HIVE WAKE DIGEST ===\\n- [hive-canon] standing rule' },
       unknown: { answer: 'unknown', answer_reason: 'reader-not-configured', digest: 'reader not configured; claims withheld' },
-      fenced: { store_state: { state: 'FENCED' }, counts: { canon_shown: 0, ops_shown: 0 }, digest: 'store not ready' },
-      nocanon: { store_state: { state: 'READY' }, counts: { canon_shown: 0, ops_shown: 3 }, digest: 'missing canon' },
-      budget: { store_state: { state: 'READY' }, budget_exceeded: true, code: 'HIVE_MEMORY_WAKE_OVER_BUDGET', message: 'over budget' },
+      fenced: { record_type: 'memory-wake-digest', store_state: { state: 'FENCED' }, counts: { canon_shown: 0, ops_shown: 0 }, digest: 'store not ready' },
+      nocanon: { record_type: 'memory-wake-digest', store_state: { state: 'READY' }, counts: { canon_shown: 0, ops_shown: 3 }, digest: 'missing canon' },
+      budget: { record_type: 'memory-wake-digest', store_state: { state: 'READY' }, budget_exceeded: true, code: 'HIVE_MEMORY_WAKE_OVER_BUDGET', message: 'over budget' },
+      emptyobj: {},
+      errstr: { error: 'reader unavailable' },
     }
     const isError = mode === 'iserror'
-    const text = isError ? 'reader tool failure' : JSON.stringify(payloads[mode] || payloads.ok)
+    const text = isError ? 'reader tool failure' : (mode === 'truncated' ? '{"record_type":"memory-wake' : JSON.stringify(payloads[mode] || payloads.ok))
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: { content: [{ type: 'text', text }], ...(isError ? { isError: true } : {}) } }) + '\\n')
   }
 })
 `, 0o700)
   const hookMcp = secretFile(join(wakeDir, 'mcp.json'), JSON.stringify({ mcpServers: { 'hive-memory': { command: process.execPath, args: [fakeWakeReader, 'via-reader'] } } }))
   const hookLog = join(wakeDir, 'recall.log')
-  const runHook = (extraEnv = {}, mcpPath = hookMcp) => spawnSync(process.execPath, ['mcp/tools/recall-wake.mjs', '--claude-hook', mcpPath, '--log', hookLog],
-    { cwd: resolve('.'), encoding: 'utf8', input: '{"session_id":"test"}\n', env: { ...process.env, ...extraEnv }, timeout: 5000 })
+  const runHook = (extraEnv = {}, mcpPath = hookMcp, source = 'startup') => spawnSync(process.execPath, ['mcp/tools/recall-wake.mjs', '--claude-hook', mcpPath, '--log', hookLog],
+    { cwd: resolve('.'), encoding: 'utf8', input: JSON.stringify({ session_id: 'test', hook_event_name: 'SessionStart', source }) + '\n', env: { ...process.env, ...extraEnv }, timeout: 5000 })
   const hOk = runHook()
   const parsedOk = JSON.parse(hOk.stdout || '{}')
   const calls1 = readText(wakeCallsPath).trim().split('\n').filter(Boolean).map(JSON.parse)
@@ -691,6 +706,17 @@ process.stdin.on('data', chunk => {
     parsedOk.hookSpecificOutput?.hookEventName === 'SessionStart' &&
     /Hive memory wake digest[\s\S]*standing rule/.test(parsedOk.hookSpecificOutput?.additionalContext || '') &&
     (statSync(hookLog).mode & 0o777) === 0o600 && /memory wake ready \(canon=2, ops=5\)/.test(readText(hookLog)))
+  const hResume = runHook({}, hookMcp, 'resume')
+  const hClear = runHook({}, hookMcp, 'clear')
+  const hCompact = runHook({}, hookMcp, 'compact')
+  const hFork = runHook({}, hookMcp, 'fork')
+  const callsAfterCadence = readText(wakeCallsPath).trim().split('\n').filter(Boolean).map(JSON.parse)
+  ok('SessionStart cadence runs memory_wake on startup, resume, and clear, and skips mid-session compact and fork',
+    hResume.status === 0 && /Hive memory wake digest/.test(JSON.parse(hResume.stdout).hookSpecificOutput?.additionalContext || '') &&
+    hClear.status === 0 && /Hive memory wake digest/.test(JSON.parse(hClear.stdout).hookSpecificOutput?.additionalContext || '') &&
+    hCompact.status === 0 && hCompact.stdout.trim() === '{}' &&
+    hFork.status === 0 && hFork.stdout.trim() === '{}' &&
+    callsAfterCadence.length === 3)
 
   for (const [mode, expected] of [
     ['unknown', /reader-not-configured/],
@@ -698,15 +724,24 @@ process.stdin.on('data', chunk => {
     ['nocanon', /0 hive:canon records/],
     ['budget', /HIVE_MEMORY_WAKE_OVER_BUDGET/],
     ['iserror', /reader tool failure/],
+    ['truncated', /invalid JSON/],
+    ['emptyobj', /store_state=missing/],
+    ['errstr', /reader unavailable/],
     ['exit255', /closed \(255\): Permission denied/],
     ['hang', /did not answer within 1s/],
     ['secret', /\[redacted secret-like error text\]/],
   ]) {
     writeFileSync(wakeModePath, mode)
-    const hr = runHook(mode === 'hang' ? { HARNESS_WAKE_TIMEOUT_MS: '250' } : {})
+    const hr = runHook(mode === 'hang' ? { HARNESS_WAKE_TIMEOUT_MS: '1000' } : {})
     const ctx = JSON.parse(hr.stdout || '{}').hookSpecificOutput?.additionalContext || ''
-    ok(`SessionStart wake failure (${mode}) exits 0, instructs reporting to @Neil, and never leaks secrets`,
-      hr.status === 0 && /Hive memory wake FAILED at session start/.test(ctx) && /mentioning @Neil/.test(ctx) &&
+    let reaped = true
+    if (mode === 'hang') {
+      const hungPid = Number(readText(join(wakeDir, 'hung.pid')).trim())
+      if (!(hungPid > 0)) reaped = false
+      else { try { process.kill(hungPid, 0); reaped = false } catch { reaped = true } }
+    }
+    ok(`SessionStart wake failure (${mode}) exits 0, reaps stuck readers, instructs reporting to @Neil, and never leaks secrets`,
+      hr.status === 0 && reaped && /Hive memory wake FAILED at session start/.test(ctx) && /mentioning @Neil/.test(ctx) &&
       expected.test(ctx) && !/sk-ant-oat/.test(ctx + readText(hookLog)))
   }
   const missingServerMcp = secretFile(join(wakeDir, 'no-recall.json'), JSON.stringify({ mcpServers: { 'nvoy-mac-test': { command: 'node', args: [] } } }))
@@ -734,11 +769,13 @@ process.stdin.on('data', chunk => {
     Object.keys(initialMcp.mcpServers || {}).join() === 'nvoy-mac-test,hive-memory' &&
     initialMcp.mcpServers['hive-memory'].args.includes(realpathSync(readKey)) &&
     !initialMcp.mcpServers['hive-memory'].args.includes(realpathSync(keyFile)) &&
+    hookRun1.source === 'startup' && hookRun1.matcher === 'startup|resume|clear' &&
     hookRun1.status === 0 && /Hive memory wake digest/.test(hookRun1.stdout || ''))
   writeFileSync(wakeModePath, 'exit255')
   for (const pid of proxiesOf(keyFile)) process.kill(pid, 'SIGKILL')
-  ok('when the recall reader fails on a new session, the session still reaches ready and the supervisor surfaces the error on stderr',
+  ok('when the recall reader fails on a resumed (--continue) session, the session still reaches ready and the supervisor surfaces the error on stderr',
     await waitFor(() => /memory wake FAILED: .*Permission denied/.test(recallErr) && (recallOut.match(/mac-test session ready/g) || []).length >= 2, 15000) &&
+    JSON.parse(readText(join(recallHome, 'hook-run.json')) || '{}').source === 'resume' &&
     !/PRIVATE-KEY|sk-ant-oat/.test(recallOut + recallErr))
   recallSup.kill('SIGTERM'); await recallExited
 }

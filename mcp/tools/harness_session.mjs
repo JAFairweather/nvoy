@@ -6,7 +6,9 @@ import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, re
 import { basename, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { recallServerEntry, sshChannelEntry } from './channel_client.mjs'
+import { CLAUDE_SESSION_START_MATCHER } from './recall-wake.mjs'
 
+export { CLAUDE_SESSION_START_MATCHER }
 export const serverName = manifest => `nvoy-${manifest.id}`
 
 // An instance with a recall block reads Hive memory through its own reader: the gateway's forced command binds the
@@ -100,8 +102,13 @@ export function seedSettings(existing, server, { recall = false, dreamVerify = f
 
   const existingHooks = out.hooks && typeof out.hooks === 'object' && !Array.isArray(out.hooks) ? { ...out.hooks } : null
   const sessionStart = Array.isArray(existingHooks?.SessionStart) ? existingHooks.SessionStart : []
+  // Match startup, --continue resume, and /clear so every fresh or resumed session context gets one wake,
+  // while mid-session compaction and transcript forks do not re-run the reader or re-inject the digest.
   const managedGroup = recall && mcpConfigPath
-    ? { hooks: [{ type: 'command', command: claudeRecallHookCommand({ mcpConfigPath, recallLogPath, node, script: wakeScript }), timeout: RECALL_HOOK_TIMEOUT_SEC }] }
+    ? {
+        matcher: CLAUDE_SESSION_START_MATCHER,
+        hooks: [{ type: 'command', command: claudeRecallHookCommand({ mcpConfigPath, recallLogPath, node, script: wakeScript }), timeout: RECALL_HOOK_TIMEOUT_SEC }],
+      }
     : null
   let placed = false
   const nextSessionStart = []

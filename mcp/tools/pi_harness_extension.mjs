@@ -26,7 +26,7 @@ import { instanceId } from './runtime_manifest.mjs'
 import { memoryToolBase } from './agent_memory.mjs'
 import { MEMORY_TOOL_SPECS } from './memory.mjs'
 import { codexTurnText, RECALL_TOOLS } from './harness_session.mjs'
-import { runSessionWakeCall, WAKE_MAX_CHARS } from './recall-wake.mjs'
+import { DEFAULT_WAKE_TIMEOUT_MS, runSessionWakeCall, WAKE_MAX_CHARS } from './recall-wake.mjs'
 import { feedCursor, followWakeFeed } from './wake_feed_client.mjs'
 
 // Mirrors codex-channel-mcp.mjs's tools/list, which is what the fleet enforces. pi validates tool
@@ -126,6 +126,21 @@ function piLogin(path, own) {
   return { piHome: home, provider }
 }
 
+function terminateDetachedChild(child, graceMs = 200) {
+  if (!child?.pid) return
+  const signalGroup = sig => {
+    try { process.kill(-child.pid, sig) } catch {}
+    try { child.kill(sig) } catch {}
+  }
+  signalGroup('SIGTERM')
+  if (child.exitCode === null && child.signalCode === null) {
+    const t = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) signalGroup('SIGKILL')
+    }, graceMs)
+    t.unref?.()
+  }
+}
+
 // One ssh child speaking newline-delimited JSON-RPC to the fleet's channel MCP. A call that gets no
 // answer within HARNESS_CHANNEL_CALL_MS ends the child, so a dead carrier cannot hang a turn.
 // The same carrier serves the Hive memory reader: `entry` and `what` name another server.
@@ -168,7 +183,7 @@ export function channelProxy({ config, ssh = SSH, env, log = () => {}, entry = n
     conn.request = (method, params, signal) => new Promise((done, reject) => {
       if (closed) return reject(new Error(`${what} is closed`))
       const id = nextId++
-      const timer = setTimeout(() => { pending.delete(id); drop(); reject(new Error(`${what} did not answer within ${Math.round(CALL_MS / 1000)}s`)); child.kill('SIGTERM') }, CALL_MS)
+      const timer = setTimeout(() => { pending.delete(id); drop(); reject(new Error(`${what} did not answer within ${Math.round(CALL_MS / 1000)}s`)); terminateDetachedChild(child) }, CALL_MS)
       pending.set(id, { resolve: done, reject, timer })
       signal?.addEventListener?.('abort', () => { if (pending.delete(id)) { clearTimeout(timer); reject(new Error('the tool call was aborted')) } }, { once: true })
       child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n')
@@ -191,8 +206,8 @@ export function channelProxy({ config, ssh = SSH, env, log = () => {}, entry = n
       return { content: [{ type: 'text', text }], details: undefined }
     },
     // The adapter was recreated: the child's ssh is into a container that no longer exists.
-    reset(why) { if (current) { log(`dropping the channel child (${why}); the next call starts a new one`); try { current.child.kill('SIGTERM') } catch {} current = null } },
-    close() { if (current) try { current.child.kill('SIGTERM') } catch {} current = null },
+    reset(why) { if (current) { log(`dropping the channel child (${why}); the next call starts a new one`); terminateDetachedChild(current.child); current = null } },
+    close() { if (current) terminateDetachedChild(current.child); current = null },
   }
 }
 
@@ -221,6 +236,7 @@ export function createPiHarness({ pi, config, ssh = SSH, log: logLine }) {
   }
   return {
     channel,
+    reader,
     // Idempotent: a reload or session switch shuts the old run down before the next one starts.
     start(ctx) {
       if (run) return
@@ -235,8 +251,25 @@ export function createPiHarness({ pi, config, ssh = SSH, log: logLine }) {
       const cursor = feedCursor(resolve(privateDir, 'feed-cursor.json'), config.id)
       status('connecting')
       if (reader) {
-        current.wake = runSessionWakeCall(args => reader.call('memory_wake', args), { maxChars: WAKE_MAX_CHARS }).then(outcome => {
-          if (current.stopping) return outcome
+        // Bound the entire session-start wake (initialize + tools/call combined) to HARNESS_WAKE_TIMEOUT_MS
+        // (default 25s, matching Claude), rather than letting two 30s channelProxy request stages stack to ~60s.
+        const wakeTimeoutMs = Number(process.env.HARNESS_WAKE_TIMEOUT_MS || DEFAULT_WAKE_TIMEOUT_MS)
+        const callWakeBounded = args => {
+          const controller = new AbortController()
+          let timer = null
+          const callPromise = reader.call('memory_wake', args, controller.signal)
+          callPromise.catch(() => {})
+          const timeoutPromise = new Promise((_, reject) => {
+            timer = setTimeout(() => {
+              controller.abort()
+              if (!current.stopping && run === current) reader.reset('memory wake timed out')
+              reject(new Error(`the Hive memory reader did not answer within ${Math.max(1, Math.round(wakeTimeoutMs / 1000))}s`))
+            }, wakeTimeoutMs)
+          })
+          return Promise.race([callPromise, timeoutPromise]).finally(() => clearTimeout(timer))
+        }
+        current.wake = runSessionWakeCall(callWakeBounded, { maxChars: WAKE_MAX_CHARS }).then(outcome => {
+          if (current.stopping || run !== current) return outcome
           current.wakeOutcome = outcome
           if (outcome.ok) {
             log(`memory wake ready (${outcome.summary})`)
@@ -255,12 +288,13 @@ export function createPiHarness({ pi, config, ssh = SSH, log: logLine }) {
       log(`${config.id} session ready; admitted messages will be injected into it`)
     },
     beforeAgentStart(event) {
-      if (!run || !reader || run.wakeInjected || event?.messageType === 'custom') return undefined
+      if (!run || run.stopping || !reader || run.wakeInjected || event?.messageType === 'custom') return undefined
       const active = run
       active.wakeInjected = true
-      const format = outcome => outcome?.context
-        ? { message: { customType: 'hive-memory', content: outcome.context, display: false } }
-        : undefined
+      const format = outcome => {
+        if (active.stopping || run !== active || !outcome?.context) return undefined
+        return { message: { customType: 'hive-memory', content: outcome.context, display: false } }
+      }
       if (active.wakeOutcome) return format(active.wakeOutcome)
       return active.wake ? active.wake.then(format) : undefined
     },
