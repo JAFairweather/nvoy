@@ -402,11 +402,225 @@ try {
   ok('double failure during rollback retains .deploy-lock with UNSAFE warning and leaks zero secrets',
     unsafeRes.status !== 0 &&
     /UNSAFE: rollback incomplete/.test(unsafeRes.stderr) &&
+    !/restored original files/.test(unsafeRes.stderr) &&
     noLeak(unsafeRes) &&
     existsSync(join(state, '.deploy-lock')) &&
     readFileSync(join(instances, 'dj-codex.json'), 'utf8') === preRollbackManifest &&
     readFileSync(join(creds, 'dj-codex.bunker-uri'), 'utf8') === preRollbackBunker)
   rmSync(join(state, '.deploy-lock'), { recursive: true, force: true })
+
+  // 9. Post-os.replace directory-fsync fault injection across credential, manifest, and DEPLOYED_MANIFESTS.json.
+  const faultHookDir = join(work, 'fault-hook')
+  mkdirSync(faultHookDir, { mode: 0o700 })
+  writeFileSync(join(faultHookDir, 'sitecustomize.py'), `
+import errno
+import json
+import os
+from pathlib import Path
+
+_TARGET = os.environ.get("NVOY_TEST_FAULT_TARGET", "")
+_MODE = os.environ.get("NVOY_TEST_FAULT_MODE", "")
+_OBS = os.environ.get("NVOY_TEST_FAULT_OBS", "")
+_ORIG = Path(_TARGET).read_bytes() if _TARGET and Path(_TARGET).exists() else b""
+
+_real_open = os.open
+_real_close = os.close
+_real_replace = os.replace
+_real_fsync = os.fsync
+
+_dir_fds = {}
+_armed_fds = set()
+_calls = 0
+
+def _open(path, flags, *args, **kwargs):
+    fd = _real_open(path, flags, *args, **kwargs)
+    if (flags & getattr(os, "O_DIRECTORY", 0)) and kwargs.get("dir_fd") is None:
+        try:
+            _dir_fds[fd] = str(Path(os.fsdecode(path)).resolve())
+        except Exception:
+            pass
+    return fd
+
+def _close(fd):
+    _dir_fds.pop(fd, None)
+    _armed_fds.discard(fd)
+    return _real_close(fd)
+
+def _replace(src, dst, *args, **kwargs):
+    res = _real_replace(src, dst, *args, **kwargs)
+    dst_dir_fd = kwargs.get("dst_dir_fd")
+    if dst_dir_fd in _dir_fds and _TARGET:
+        candidate = str(Path(_dir_fds[dst_dir_fd]) / os.fsdecode(dst))
+        if candidate == str(Path(_TARGET).resolve()):
+            _armed_fds.add(dst_dir_fd)
+    return res
+
+def _fsync(fd):
+    global _calls
+    if fd in _armed_fds:
+        _armed_fds.discard(fd)
+        _calls += 1
+        cur = Path(_TARGET).read_bytes()
+        obs = {}
+        if _OBS and Path(_OBS).exists():
+            try:
+                obs = json.loads(Path(_OBS).read_text("utf-8"))
+            except Exception:
+                obs = {}
+        obs["post_replace_calls"] = _calls
+        if _calls == 1:
+            obs["mutated_at_first_fault"] = (cur != _ORIG)
+        if _OBS:
+            Path(_OBS).write_text(json.dumps(obs), "utf-8")
+        if _MODE == "once" and _calls == 1:
+            raise OSError(errno.EIO, "injected post-replace dir fsync fault")
+        if _MODE == "always":
+            raise OSError(errno.EIO, "injected persistent post-replace dir fsync fault")
+        if _MODE == "corrupt_restore":
+            if _calls == 1:
+                raise OSError(errno.EIO, "injected post-replace dir fsync fault")
+            if _calls == 2:
+                res = _real_fsync(fd)
+                Path(_TARGET).write_bytes(cur + b" ")
+                os.chmod(_TARGET, 0o600 if _TARGET.endswith(".bunker-uri") else 0o644)
+                return res
+    return _real_fsync(fd)
+
+if _TARGET and _MODE:
+    os.open = _open
+    os.close = _close
+    os.replace = _replace
+    os.fsync = _fsync
+`, { mode: 0o600 })
+
+  const restoreCleanSnapshot = () => {
+    writeFileSync(join(instances, 'dj-codex.json'), preRollbackManifest, { mode: 0o644 })
+    writeFileSync(join(creds, 'dj-codex.bunker-uri'), preRollbackBunker, { mode: 0o600 })
+    chmodSync(join(creds, 'dj-codex.bunker-uri'), 0o600)
+    writeFileSync(join(state, 'DEPLOYED_MANIFESTS.json'), preRollbackRecorded, { mode: 0o644 })
+    rmSync(join(state, '.deploy-lock'), { recursive: true, force: true })
+  }
+
+  const runFaultCase = (targetPath, mode) => {
+    const obsPath = join(work, `fault-obs-${Date.now()}-${Math.random().toString(16).slice(2)}.json`)
+    const existingPyPath = process.env.PYTHONPATH ? `${faultHookDir}:${process.env.PYTHONPATH}` : faultHookDir
+    const res = runReplace(
+      ['--instance', 'dj-codex', '--from-relay', 'wss://relay.nave.pub', '--to-relay', 'wss://relay.ditto.pub', '--apply'],
+      {
+        PYTHONPATH: existingPyPath,
+        NVOY_TEST_FAULT_TARGET: targetPath,
+        NVOY_TEST_FAULT_MODE: mode,
+        NVOY_TEST_FAULT_OBS: obsPath,
+      },
+    )
+    const obs = existsSync(obsPath) ? JSON.parse(readFileSync(obsPath, 'utf8')) : {}
+    return { res, obs }
+  }
+
+  // 9a. Credential post-replace dir-fsync fault (transient -> restored; persistent -> lock retained).
+  {
+    const { res, obs } = runFaultCase(join(creds, 'dj-codex.bunker-uri'), 'once')
+    ok('credential post-replace fsync fault (once) restores mutated 0600 credential, reports restored truthfully, and clears lock',
+      res.status !== 0 &&
+      obs.mutated_at_first_fault === true &&
+      obs.post_replace_calls === 2 &&
+      /restored original files/.test(res.stderr) &&
+      !/UNSAFE: rollback incomplete/.test(res.stderr) &&
+      noLeak(res) &&
+      !existsSync(join(state, '.deploy-lock')) &&
+      readFileSync(join(creds, 'dj-codex.bunker-uri'), 'utf8') === preRollbackBunker &&
+      (lstatSync(join(creds, 'dj-codex.bunker-uri')).mode & 0o777) === 0o600 &&
+      readFileSync(join(instances, 'dj-codex.json'), 'utf8') === preRollbackManifest &&
+      readFileSync(join(state, 'DEPLOYED_MANIFESTS.json'), 'utf8') === preRollbackRecorded,
+      res.stderr)
+  }
+  {
+    const { res, obs } = runFaultCase(join(creds, 'dj-codex.bunker-uri'), 'always')
+    ok('credential post-replace fsync fault (persistent) retains .deploy-lock, omits restored message, and leaks zero secrets',
+      res.status !== 0 &&
+      obs.mutated_at_first_fault === true &&
+      /UNSAFE: rollback incomplete/.test(res.stderr) &&
+      !/restored original files/.test(res.stderr) &&
+      noLeak(res) &&
+      existsSync(join(state, '.deploy-lock')),
+      res.stderr)
+    restoreCleanSnapshot()
+  }
+
+  // 9b. Manifest post-replace dir-fsync fault (transient -> restored; persistent -> lock retained).
+  {
+    const { res, obs } = runFaultCase(join(instances, 'dj-codex.json'), 'once')
+    ok('manifest post-replace fsync fault (once) restores mutated manifest and prior credential, reports restored truthfully, and clears lock',
+      res.status !== 0 &&
+      obs.mutated_at_first_fault === true &&
+      obs.post_replace_calls === 2 &&
+      /restored original files/.test(res.stderr) &&
+      !/UNSAFE: rollback incomplete/.test(res.stderr) &&
+      noLeak(res) &&
+      !existsSync(join(state, '.deploy-lock')) &&
+      readFileSync(join(instances, 'dj-codex.json'), 'utf8') === preRollbackManifest &&
+      readFileSync(join(creds, 'dj-codex.bunker-uri'), 'utf8') === preRollbackBunker &&
+      readFileSync(join(state, 'DEPLOYED_MANIFESTS.json'), 'utf8') === preRollbackRecorded,
+      res.stderr)
+  }
+  {
+    const { res, obs } = runFaultCase(join(instances, 'dj-codex.json'), 'always')
+    ok('manifest post-replace fsync fault (persistent) retains .deploy-lock and omits restored message',
+      res.status !== 0 &&
+      obs.mutated_at_first_fault === true &&
+      /UNSAFE: rollback incomplete/.test(res.stderr) &&
+      !/restored original files/.test(res.stderr) &&
+      noLeak(res) &&
+      existsSync(join(state, '.deploy-lock')),
+      res.stderr)
+    restoreCleanSnapshot()
+  }
+
+  // 9c. DEPLOYED_MANIFESTS.json post-replace dir-fsync fault (transient -> restored; persistent -> lock retained).
+  {
+    writeFileSync(calls, '')
+    const { res, obs } = runFaultCase(join(state, 'DEPLOYED_MANIFESTS.json'), 'once')
+    const upCount = (readFileSync(calls, 'utf8').match(/dj-codex\.compose\.yml up -d/g) || []).length
+    ok('DEPLOYED_MANIFESTS post-replace fsync fault (once) restores record, manifest, credential, and compose stack cleanly',
+      res.status !== 0 &&
+      obs.mutated_at_first_fault === true &&
+      obs.post_replace_calls === 2 &&
+      upCount === 2 &&
+      /restored original files/.test(res.stderr) &&
+      !/UNSAFE: rollback incomplete/.test(res.stderr) &&
+      noLeak(res) &&
+      !existsSync(join(state, '.deploy-lock')) &&
+      readFileSync(join(state, 'DEPLOYED_MANIFESTS.json'), 'utf8') === preRollbackRecorded &&
+      readFileSync(join(instances, 'dj-codex.json'), 'utf8') === preRollbackManifest &&
+      readFileSync(join(creds, 'dj-codex.bunker-uri'), 'utf8') === preRollbackBunker,
+      res.stderr)
+  }
+  {
+    const { res, obs } = runFaultCase(join(state, 'DEPLOYED_MANIFESTS.json'), 'always')
+    ok('DEPLOYED_MANIFESTS post-replace fsync fault (persistent) retains .deploy-lock and omits restored message',
+      res.status !== 0 &&
+      obs.mutated_at_first_fault === true &&
+      /UNSAFE: rollback incomplete/.test(res.stderr) &&
+      !/restored original files/.test(res.stderr) &&
+      noLeak(res) &&
+      existsSync(join(state, '.deploy-lock')),
+      res.stderr)
+    restoreCleanSnapshot()
+  }
+
+  // 9d. Post-rollback byte verification catches silent restore drift even when rollback write itself did not raise.
+  {
+    const { res } = runFaultCase(join(creds, 'dj-codex.bunker-uri'), 'corrupt_restore')
+    ok('post-rollback byte verification retains .deploy-lock and omits restored message on unverified disk bytes',
+      res.status !== 0 &&
+      /UNSAFE: rollback incomplete/.test(res.stderr) &&
+      /restored bytes mismatch/.test(res.stderr) &&
+      !/restored original files/.test(res.stderr) &&
+      noLeak(res) &&
+      existsSync(join(state, '.deploy-lock')),
+      res.stderr)
+    restoreCleanSnapshot()
+  }
 } finally {
   rmSync(work, { recursive: true, force: true })
 }

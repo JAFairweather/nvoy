@@ -27,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -176,6 +177,7 @@ def atomic_write_nofollow(
     expected_stat: os.stat_result | None,
     temp_stem: str,
     label: str,
+    on_before_replace: Callable[[], None] | None = None,
 ) -> None:
     if not path.is_absolute():
         fail(f"{label}: expected an absolute path")
@@ -190,6 +192,7 @@ def atomic_write_nofollow(
         fail(f"{label}: parent directory cannot be opened safely")
     tmp_name = f".{temp_stem}.nvoy-relay-{os.getpid()}-{time.time_ns()}"
     tmp_created = False
+    active_exc = False
     try:
         if expected_stat is not None:
             try:
@@ -215,26 +218,48 @@ def atomic_write_nofollow(
         except OSError:
             fail(f"{label}: cannot create temporary file")
         try:
-            os.fchmod(fd, mode)
-            if os.geteuid() == 0:
-                os.fchown(fd, uid, gid)
-            view = memoryview(data)
-            written = 0
-            while written < len(data):
-                written += os.write(fd, view[written:])
-            os.fsync(fd)
+            try:
+                os.fchmod(fd, mode)
+                if os.geteuid() == 0:
+                    os.fchown(fd, uid, gid)
+                view = memoryview(data)
+                written = 0
+                while written < len(data):
+                    written += os.write(fd, view[written:])
+                os.fsync(fd)
+            except OSError:
+                fail(f"{label}: failed staging temporary file")
         finally:
-            os.close(fd)
-        os.replace(tmp_name, path.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            try:
+                os.close(fd)
+            except OSError:
+                if sys.exc_info()[1] is None:
+                    fail(f"{label}: failed closing temporary file")
+        if on_before_replace is not None:
+            on_before_replace()
+        try:
+            os.replace(tmp_name, path.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except OSError:
+            fail(f"{label}: failed replacing target file")
         tmp_created = False
-        os.fsync(dir_fd)
+        try:
+            os.fsync(dir_fd)
+        except OSError:
+            fail(f"{label}: failed syncing parent directory after replace")
+    except BaseException:
+        active_exc = True
+        raise
     finally:
         if tmp_created:
             try:
                 os.unlink(tmp_name, dir_fd=dir_fd)
             except OSError:
                 pass
-        os.close(dir_fd)
+        try:
+            os.close(dir_fd)
+        except OSError:
+            if not active_exc:
+                fail(f"{label}: failed closing parent directory")
 
 
 def dedup_relays(relays: list[str], label: str) -> list[str]:
@@ -491,7 +516,7 @@ def build_plans(
     return plans
 
 
-def read_deployed_state() -> tuple[str, str, dict[str, str]]:
+def read_deployed_state() -> tuple[str, str, dict[str, str], bytes, os.stat_result]:
     sha_bytes, _ = open_regular_nofollow(
         STATE / "DEPLOYED_SHA",
         max_bytes=256,
@@ -512,7 +537,7 @@ def read_deployed_state() -> tuple[str, str, dict[str, str]]:
     if not IMAGE_REF_RE.fullmatch(image):
         fail("DEPLOYED_RUNTIME_IMAGE does not contain a digest-pinned image reference")
 
-    manifests_bytes, _ = open_regular_nofollow(
+    manifests_bytes, manifests_stat = open_regular_nofollow(
         STATE / "DEPLOYED_MANIFESTS.json",
         max_bytes=MAX_MANIFEST_BYTES,
         secret_mode=False,
@@ -526,7 +551,7 @@ def read_deployed_state() -> tuple[str, str, dict[str, str]]:
         isinstance(k, str) and isinstance(v, str) for k, v in recorded.items()
     ):
         fail("DEPLOYED_MANIFESTS.json must map seat ids to sha256 digests")
-    return sha, image, recorded
+    return sha, image, recorded, manifests_bytes, manifests_stat
 
 
 def validate_staged_estate(
@@ -645,7 +670,9 @@ def verify_stack_running(compose_path: Path, shape: dict) -> None:
         fail(f"{shape['id']}: init container did not exit 0")
 
 
-def write_private_backup(backup_dir: Path, plans: list[SeatPlan]) -> None:
+def write_private_backup(
+    backup_dir: Path, plans: list[SeatPlan], deployed_manifests_orig: bytes
+) -> None:
     BACKUP_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
     root_info = BACKUP_ROOT.lstat()
     if (
@@ -660,6 +687,16 @@ def write_private_backup(backup_dir: Path, plans: list[SeatPlan]) -> None:
     c_dir = backup_dir / "credentials"
     m_dir.mkdir(mode=0o700)
     c_dir.mkdir(mode=0o700)
+    atomic_write_nofollow(
+        backup_dir / "DEPLOYED_MANIFESTS.json",
+        deployed_manifests_orig,
+        mode=0o600,
+        uid=os.geteuid(),
+        gid=os.getegid(),
+        expected_stat=None,
+        temp_stem="DEPLOYED_MANIFESTS.json",
+        label="DEPLOYED_MANIFESTS.json backup",
+    )
     for plan in plans:
         if not plan.any_change:
             continue
@@ -686,24 +723,66 @@ def write_private_backup(backup_dir: Path, plans: list[SeatPlan]) -> None:
             )
 
 
-def update_deployed_manifests(recorded: dict[str, str], touched: list[SeatPlan]) -> None:
+def update_deployed_manifests(
+    recorded: dict[str, str],
+    touched: list[SeatPlan],
+    expected_stat: os.stat_result,
+    on_before_replace: Callable[[], None],
+) -> None:
     updated = dict(recorded)
     for plan in touched:
         if plan.manifest_changed:
             updated[plan.seat] = hashlib.sha256(plan.manifest_next).hexdigest()
     payload = (json.dumps(updated, indent=2, sort_keys=True) + "\n").encode("utf-8")
     target = STATE / "DEPLOYED_MANIFESTS.json"
-    st = target.lstat()
     atomic_write_nofollow(
         target,
         payload,
-        mode=stat.S_IMODE(st.st_mode),
-        uid=st.st_uid,
-        gid=st.st_gid,
-        expected_stat=None,
+        mode=stat.S_IMODE(expected_stat.st_mode),
+        uid=expected_stat.st_uid,
+        gid=expected_stat.st_gid,
+        expected_stat=expected_stat,
         temp_stem="DEPLOYED_MANIFESTS.json",
         label="DEPLOYED_MANIFESTS.json",
+        on_before_replace=on_before_replace,
     )
+
+
+def verify_restored_files(
+    touched: list[SeatPlan],
+    deployed_manifests_orig: bytes,
+    deployed_manifests_stat: os.stat_result,
+) -> None:
+    dm_bytes, dm_stat = open_regular_nofollow(
+        STATE / "DEPLOYED_MANIFESTS.json",
+        max_bytes=MAX_MANIFEST_BYTES,
+        secret_mode=False,
+        label="DEPLOYED_MANIFESTS.json post-rollback check",
+    )
+    if dm_bytes != deployed_manifests_orig or stat.S_IMODE(dm_stat.st_mode) != stat.S_IMODE(
+        deployed_manifests_stat.st_mode
+    ):
+        fail("DEPLOYED_MANIFESTS.json post-rollback check: restored bytes or mode mismatch")
+    for plan in touched:
+        m_bytes, m_stat = open_regular_nofollow(
+            plan.manifest_path,
+            max_bytes=MAX_MANIFEST_BYTES,
+            secret_mode=False,
+            label=f"{plan.seat} manifest post-rollback check",
+        )
+        if m_bytes != plan.manifest_orig or stat.S_IMODE(m_stat.st_mode) != stat.S_IMODE(
+            plan.manifest_stat.st_mode
+        ):
+            fail(f"{plan.seat} manifest post-rollback check: restored bytes or mode mismatch")
+        if plan.bunker_path is not None and plan.bunker_orig is not None:
+            b_bytes, _ = open_regular_nofollow(
+                plan.bunker_path,
+                max_bytes=MAX_CREDENTIAL_BYTES,
+                secret_mode=True,
+                label=f"{plan.seat} credential post-rollback check",
+            )
+            if b_bytes != plan.bunker_orig:
+                fail(f"{plan.seat} credential post-rollback check: restored bytes mismatch")
 
 
 def apply_changes(
@@ -722,7 +801,13 @@ def apply_changes(
 
     retain_lock = False
     try:
-        deployed_sha, runtime_image, recorded = read_deployed_state()
+        (
+            deployed_sha,
+            runtime_image,
+            recorded,
+            deployed_manifests_orig,
+            deployed_manifests_stat,
+        ) = read_deployed_state()
         plans = build_plans(target_seats, from_relay, to_relay)
         plans_by_seat = {p.seat: p for p in plans}
         touched = [p for p in plans if p.any_change]
@@ -747,11 +832,17 @@ def apply_changes(
 
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"-{os.getpid()}"
         backup_dir = BACKUP_ROOT / stamp
-        write_private_backup(backup_dir, touched)
+        write_private_backup(backup_dir, touched, deployed_manifests_orig)
 
-        written_bunkers: list[SeatPlan] = []
-        written_manifests: list[SeatPlan] = []
+        attempted_bunkers: list[SeatPlan] = []
+        attempted_manifests: list[SeatPlan] = []
         recreated: list[SeatPlan] = []
+        attempted_deployed_manifests = False
+
+        def mark_deployed_manifests() -> None:
+            nonlocal attempted_deployed_manifests
+            attempted_deployed_manifests = True
+
         try:
             # 1. Write Bunker credentials first so any recreate reads updated URI pointers.
             for plan in touched:
@@ -770,8 +861,8 @@ def apply_changes(
                         expected_stat=plan.bunker_stat,
                         temp_stem=plan.bunker_path.name,
                         label=f"{plan.seat} bunker credential",
+                        on_before_replace=lambda plan=plan: attempted_bunkers.append(plan),
                     )
-                    written_bunkers.append(plan)
 
             # 2. Write manifest JSON files second via hidden non-.json temp names.
             for plan in touched:
@@ -785,8 +876,8 @@ def apply_changes(
                         expected_stat=plan.manifest_stat,
                         temp_stem=plan.manifest_path.name,
                         label=f"{plan.seat} manifest",
+                        on_before_replace=lambda plan=plan: attempted_manifests.append(plan),
                     )
-                    written_manifests.append(plan)
 
             # 3. Recreate only touched seats (volume-preserving: never `down` or `-v`).
             for plan in touched:
@@ -799,10 +890,27 @@ def apply_changes(
                 verify_stack_running(compose_paths[plan.seat], shapes[plan.seat])
 
             # 4. Record new manifest digests so nvoy-runtime-deploy.path sees clean convergence.
-            update_deployed_manifests(recorded, touched)
+            if any(plan.manifest_changed for plan in touched):
+                update_deployed_manifests(
+                    recorded,
+                    touched,
+                    deployed_manifests_stat,
+                    on_before_replace=mark_deployed_manifests,
+                )
         except BaseException as apply_err:
             try:
-                for plan in reversed(written_manifests):
+                if attempted_deployed_manifests:
+                    atomic_write_nofollow(
+                        STATE / "DEPLOYED_MANIFESTS.json",
+                        deployed_manifests_orig,
+                        mode=stat.S_IMODE(deployed_manifests_stat.st_mode),
+                        uid=deployed_manifests_stat.st_uid,
+                        gid=deployed_manifests_stat.st_gid,
+                        expected_stat=None,
+                        temp_stem="DEPLOYED_MANIFESTS.json",
+                        label="DEPLOYED_MANIFESTS.json rollback",
+                    )
+                for plan in reversed(attempted_manifests):
                     atomic_write_nofollow(
                         plan.manifest_path,
                         plan.manifest_orig,
@@ -813,7 +921,7 @@ def apply_changes(
                         temp_stem=plan.manifest_path.name,
                         label=f"{plan.seat} manifest rollback",
                     )
-                for plan in reversed(written_bunkers):
+                for plan in reversed(attempted_bunkers):
                     assert (
                         plan.bunker_path is not None
                         and plan.bunker_orig is not None
@@ -836,6 +944,7 @@ def apply_changes(
                     )
                     settle()
                     verify_stack_running(compose_paths[plan.seat], shapes[plan.seat])
+                verify_restored_files(touched, deployed_manifests_orig, deployed_manifests_stat)
             except BaseException as rb_err:
                 retain_lock = True
                 detail = str(rb_err) if isinstance(rb_err, SafeError) else rb_err.__class__.__name__
@@ -905,7 +1014,7 @@ def dry_run(
     from_relay: str,
     to_relay: str,
 ) -> dict:
-    deployed_sha, runtime_image, _ = read_deployed_state()
+    deployed_sha, runtime_image, _, _, _ = read_deployed_state()
     plans = build_plans(target_seats, from_relay, to_relay)
     if any(p.any_change for p in plans):
         validate_staged_estate(estate_seats, {p.seat: p for p in plans}, runtime_image)
