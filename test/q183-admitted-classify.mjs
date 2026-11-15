@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readdirSync, statSync, utimesSync, writeFileSyn
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { classify, collect, jsonl, options, run } from '../bin/q183-admitted-classify.mjs'
+import { classify, collect, jsonl, options, run, safeError } from '../bin/q183-admitted-classify.mjs'
 
 const hex = (n, len = 64) => n.toString(16).padStart(len, '0')
 const env = n => hex(n)
@@ -44,6 +44,10 @@ test('options parses, and refuses what it does not know', () => {
   assert.throws(() => options(['--write']), /unknown option --write/)
   assert.throws(() => options(['--root']), /needs a value/)
   assert.throws(() => options(['--ids', 'x']), /whole number/)
+  // Dennis, PR 422: a huge digit string must not become Infinity and unbound the id lists.
+  assert.throws(() => options(['--ids', '9'.repeat(400)]), /0 to 1000/)
+  assert.throws(() => options(['--ids', '1001']), /0 to 1000/)
+  assert.equal(options(['--ids', '1000']).ids, 1000)
   assert.throws(() => options(['--harness-home', 'a=rel']), /absolute/)
 })
 
@@ -102,4 +106,17 @@ test('run prints counts and ids, never content, and writes nothing', () => {
   assert.deepEqual(seats.gone, { error: 'no manifest for gone' })
   const after = JSON.stringify([m.runtimeDir, m.stateDir, m.spoolDir].map(d => readdirSync(d).map(f => [f, statSync(join(d, f)).mtimeMs])))
   assert.equal(after, before)
+})
+
+test('a seat error never quotes what the parser read (Neil and Dennis, PR 422)', () => {
+  const root = mkdtempSync(join(tmpdir(), 'q183-root-'))
+  writeFileSync(join(root, 'leaky.json'), '{"id":"leaky","secret_fragment_here": oops}')
+  const printed = []
+  const seats = run(['--root', root], { log: line => printed.push(line), now: 0 })
+  assert.equal(seats.leaky.error, 'manifest is not valid JSON')
+  assert.ok(!printed.join('\n').includes('secret_fragment_here'))
+  assert.ok(!printed.join('\n').includes('oops'))
+  assert.equal(safeError(Object.assign(new Error('x: y'), { code: 'EACCES' })), 'cannot read (EACCES)')
+  assert.equal(safeError(new Error('Unexpected token "s" in {"k":"v"}')), 'unreadable (details withheld)')
+  assert.equal(safeError(new Error('manifest id does not match requested instance')), 'manifest id does not match requested instance')
 })
