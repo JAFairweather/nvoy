@@ -86,12 +86,30 @@ mkdirSync(privateDir, { recursive: true, mode: 0o700 })
 mkdirSync(resolve(home, '.claude'), { recursive: true, mode: 0o700 })
 writePrivate(resolve(home, '.claude.json'), JSON.stringify(seedClaudeJson(readJson(resolve(home, '.claude.json')), workdir), null, 2))
 const settingsPath = resolve(home, '.claude', 'settings.json')
+const recallLogPath = resolve(privateDir, 'recall.log')
 const dreamVerify = manifest.id === 'curator' && existsSync(LOCAL_DREAM_VERIFY)
-const settings = seedSettings(readJson(settingsPath), server, { recall: Boolean(manifest.recall), dreamVerify })
-writePrivate(settingsPath, JSON.stringify(settings, null, 2))
 const sessionMcp = mcpConfig({ manifest, root, remote, dreamVerify })
 writePrivate(mcpConfigPath, JSON.stringify(sessionMcp, null, 2))
+const settings = seedSettings(readJson(settingsPath), server, { recall: Boolean(manifest.recall), dreamVerify, mcpConfigPath, recallLogPath })
+writePrivate(settingsPath, JSON.stringify(settings, null, 2))
 ensureInstructions(resolve(workdir, 'CLAUDE.md'), manifest)
+let recallLogOffset = (() => { try { return readFileSync(recallLogPath).length } catch { return 0 } })()
+function drainRecallLog() {
+  if (!manifest.recall) return
+  let buf
+  try { buf = readFileSync(recallLogPath) } catch { return }
+  if (buf.length < recallLogOffset) recallLogOffset = 0
+  const nl = buf.lastIndexOf(0x0a)
+  if (nl < recallLogOffset) return
+  const chunk = buf.subarray(recallLogOffset, nl + 1).toString('utf8')
+  recallLogOffset = nl + 1
+  for (const raw of chunk.split('\n')) {
+    const line = raw.trim()
+    if (!line) continue
+    if (/memory wake FAILED/.test(line)) console.error(`instance-harness: ${line}`)
+    else log(line)
+  }
+}
 // The channel lock lives on the runtime volume, so it outlives the container whose channel wrote it.
 // PIDs restart with the container, so its PID can name a live process here and the new channel
 // refuses to start, leaving a "ready" session with no ears (MC Claude, 2026-09-25 01:44 UTC).
@@ -219,9 +237,11 @@ while (!stopping) {
   const startedAt = Date.now()
   try {
     await start()
+    drainRecallLog()
     let link = channelNow()?.link || '', linkSince = Date.now(), heldAt = Date.now()
     while (!stopping) {
       await sleep(WATCH_MS)
+      drainRecallLog()
       term.named()
       const { dead, status } = term.dead()
       if (dead) { log(`session exited (status ${status}); restarting`); break }
@@ -239,6 +259,7 @@ while (!stopping) {
     }
     if (Date.now() - startedAt > RETRY_MAX_MS) delay = RETRY_MS
   } catch (error) {
+    drainRecallLog()
     console.error(`instance-harness: ${error.message}`)
   }
   if (stopping) break
