@@ -429,8 +429,9 @@ Neither tool exposes the signing credential.
   (`<state>/agent-limits/posts.json`) *before* the event exists, freezes a top-level kind:9
   (`h`, one `p` per mention, no `e`), and then signs, publishes and logs
   `posted <event 12>… in <channel>`, never the text. A retry republishes the frozen event; a policy
-  or cap refusal, or Buzz's deterministic stale-timestamp invalidation of a past frozen event, is
-  terminal (`<state>/terminal-posts.jsonl`), while transient relay errors remain retryable.
+  or cap refusal, or Buzz's deterministic stale-timestamp invalidation once the frozen event is at
+  least 30 minutes old (`STALE_POST_MIN_AGE_SEC`, keeping fresh posts retryable across lagging relay
+  clocks), is terminal (`<state>/terminal-posts.jsonl`), while transient relay errors remain retryable.
 - **`nvoy_channel_reply {envelope, text, mention?}`** may bring someone else into the thread it
   answers, on the same allowlist. The tool resolves the names and refuses at once without
   `may_post` (`NVOY_REPLY_MENTION_NOT_PERMITTED`) or off it (`NVOY_REPLY_MENTION_REFUSED`). The row

@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { finalizeEvent, generateSecretKey, getEventHash, getPublicKey, verifyEvent } from 'nostr-tools/pure'
 import {
+  STALE_POST_MIN_AGE_SEC,
   STALE_POST_TERMINAL_LINE,
   isStalePostTimestampRefusal,
   isTerminalPostFailure,
@@ -40,10 +41,15 @@ const hex = n => randomBytes(n).toString('hex')
 
 // --- 1. pure terminal-classification rules ---
 const nowSec = 1_794_760_000
-ok('exact stale-timestamp refusal on a past frozen post is terminal',
-  isStalePostTimestampRefusal('invalid: event timestamp too far from server time', nowSec - 72_000, nowSec))
-ok('exact stale-timestamp refusal at current second is terminal',
-  isStalePostTimestampRefusal('invalid: event timestamp too far from server time', nowSec, nowSec))
+ok('exact stale-timestamp refusal on a post at or past STALE_POST_MIN_AGE_SEC (1800s) is terminal',
+  STALE_POST_MIN_AGE_SEC === 1800 &&
+  isStalePostTimestampRefusal('invalid: event timestamp too far from server time', nowSec - 72_000, nowSec) &&
+  isStalePostTimestampRefusal('invalid: event timestamp too far from server time', nowSec - STALE_POST_MIN_AGE_SEC, nowSec))
+ok('fresh frozen posts (e.g. now, now - 60s, now - 900s, now - 1799s) are NOT terminal so a lagging relay clock can catch up',
+  !isStalePostTimestampRefusal('invalid: event timestamp too far from server time', nowSec, nowSec) &&
+  !isStalePostTimestampRefusal('invalid: event timestamp too far from server time', nowSec - 60, nowSec) &&
+  !isStalePostTimestampRefusal('invalid: event timestamp too far from server time', nowSec - 900, nowSec) &&
+  !isStalePostTimestampRefusal('invalid: event timestamp too far from server time', nowSec - (STALE_POST_MIN_AGE_SEC - 1), nowSec))
 ok('future-stamped frozen post is NOT terminal (waiting can bring server clock into range)',
   !isStalePostTimestampRefusal('invalid: event timestamp too far from server time', nowSec + 60, nowSec))
 ok('other Buzz refusals and transient relay errors are NOT stale-timestamp terminal',
@@ -94,6 +100,11 @@ buzz.on('connection', ws => {
       const cCount = (contentAttempts.get(ev.content) || 0) + 1
       contentAttempts.set(ev.content, cCount)
 
+      // Simulate a lagging relay clock on attempt 1 of a fresh post (created_at = local now - 60s),
+      // which Buzz rejects with the same symmetric ±900s timestamp message before its clock catches up:
+      if (ev.content === 'CANARY_FRESH_SLOW_RELAY_ONCE' && cCount === 1) {
+        return ws.send(JSON.stringify(['OK', ev.id, false, 'invalid: event timestamp too far from server time']))
+      }
       // Deterministic stale-timestamp refusal as Buzz emits for old frozen events:
       if (Math.abs(Math.floor(Date.now() / 1000) - ev.created_at) > 900) {
         return ws.send(JSON.stringify(['OK', ev.id, false, 'invalid: event timestamp too far from server time']))
@@ -198,10 +209,38 @@ const rateLimitRow = {
   content: 'CANARY_FRESH_RATELIMIT_ONCE',
   requested_at: Date.now(),
 }
+const slowRelayFreshSec = Math.floor(Date.now() / 1000) - 60
+const slowRelayRow = {
+  version: 1,
+  type: 'post-request',
+  id: 'c'.repeat(32),
+  instance: 'curator',
+  channel: CH,
+  mention: [],
+  content: 'CANARY_FRESH_SLOW_RELAY_ONCE',
+  requested_at: slowRelayFreshSec * 1000,
+}
+{
+  const unsignedEvent = {
+    pubkey: agent,
+    ...channelPost({ channel: CH, content: slowRelayRow.content, mentions: slowRelayRow.mention }),
+    created_at: slowRelayFreshSec,
+  }
+  const signed = finalizeEvent({ ...unsignedEvent }, agentSk)
+  writeFileSync(join(state, 'posts', `${slowRelayRow.id}.json`), JSON.stringify({
+    version: 1,
+    request_id: slowRelayRow.id,
+    request_digest: replyRequestDigest(slowRelayRow),
+    fingerprint: getEventHash(unsignedEvent),
+    unsigned_event: unsignedEvent,
+    event: signed,
+    published: false,
+  }), { mode: 0o600 })
+}
 
 writeFileSync(
   join(run, 'post-requests.jsonl'),
-  [...staleRows.map(s => s.row), dropRow, rateLimitRow].map(r => JSON.stringify(r)).join('\n') + '\n',
+  [...staleRows.map(s => s.row), dropRow, rateLimitRow, slowRelayRow].map(r => JSON.stringify(r)).join('\n') + '\n',
   { mode: 0o640 },
 )
 
@@ -238,13 +277,14 @@ try {
   daemon.stdout.on('data', c => { daemonOut += c })
   daemon.stderr.on('data', c => { daemonErr += c })
 
-  // Wait until all 4 stale records are marked terminal AND both transient fresh posts retry and publish (backoff first step is 5s).
+  // Wait until all 4 stale records are marked terminal AND all 3 retryable fresh posts publish (backoff first step is 5s).
   const converged = await until(
     () =>
       existsSync(join(state, 'terminal-posts.jsonl')) &&
       readFileSync(join(state, 'terminal-posts.jsonl'), 'utf8').trim().split('\n').filter(Boolean).length === 4 &&
       postPublished(state, dropRow) &&
-      postPublished(state, rateLimitRow),
+      postPublished(state, rateLimitRow) &&
+      postPublished(state, slowRelayRow),
     25000,
   )
   // Wait 2.5s more (two additional drainPosts ticks) to prove none of the 4 stale records retry.
@@ -252,12 +292,13 @@ try {
   try { process.kill(-daemon.pid, 'SIGKILL') } catch { /* gone */ }
   await sleep(300)
 
-  ok('daemon marks all 4 stale posts terminal and publishes both retryable fresh posts', converged, daemonErr)
+  ok('daemon marks all 4 stale posts terminal and publishes all 3 retryable fresh posts (including lagging-relay fresh post)', converged, daemonErr)
 
   const terminalRaw = existsSync(join(state, 'terminal-posts.jsonl')) ? readFileSync(join(state, 'terminal-posts.jsonl'), 'utf8') : ''
   const terminalRows = terminalRaw.trim().split('\n').filter(Boolean).map(l => JSON.parse(l))
-  ok('terminal-posts.jsonl records exactly the 4 stale ids with stale-event-timestamp reason and zero message bodies',
+  ok('terminal-posts.jsonl records ONLY the 4 genuinely stale ids (never the now-60s slow-relay post) and zero message bodies',
     terminalRows.length === 4 &&
+    !terminalRows.some(t => t.id === slowRelayRow.id) &&
     staleRows.every(s => terminalRows.some(t => t.type === 'terminal-post' && t.id === s.row.id && t.reason === 'stale-event-timestamp')) &&
     !terminalRaw.includes('CANARY_'))
 
@@ -267,19 +308,22 @@ try {
   ok('all 4 frozen post records in state/posts/<id>.json remain intact and unpublished for audit',
     staleRows.every(s => readFileSync(join(state, 'posts', `${s.row.id}.json`), 'utf8') === s.rawRecord && !postPublished(state, s.row)))
 
-  ok('transient relay disconnect and rate-limited refusal stayed retryable (held for retry) and published on retry',
+  ok('transient disconnect, rate-limited refusal, and fresh now-60s post on a lagging relay ALL stayed retryable and published on retry',
     contentAttempts.get('CANARY_FRESH_DROP_ONCE') === 2 &&
     contentAttempts.get('CANARY_FRESH_RATELIMIT_ONCE') === 2 &&
+    contentAttempts.get('CANARY_FRESH_SLOW_RELAY_ONCE') === 2 &&
     stored.some(ev => ev.content === 'CANARY_FRESH_DROP_ONCE') &&
     stored.some(ev => ev.content === 'CANARY_FRESH_RATELIMIT_ONCE') &&
+    stored.some(ev => ev.content === 'CANARY_FRESH_SLOW_RELAY_ONCE') &&
     new RegExp(`post ${dropRow.id.slice(0, 12)}… held for retry:`).test(daemonErr) &&
-    new RegExp(`post ${rateLimitRow.id.slice(0, 12)}… held for retry:`).test(daemonErr))
+    new RegExp(`post ${rateLimitRow.id.slice(0, 12)}… held for retry:`).test(daemonErr) &&
+    new RegExp(`post ${slowRelayRow.id.slice(0, 12)}… held for retry:`).test(daemonErr))
 
   ok('daemon audit logs record terminal disposition for all 4 stale ids without leaking post content',
     staleRows.every(s => new RegExp(`post ${s.row.id.slice(0, 12)}… terminal:.*stale timestamp`).test(daemonErr)) &&
     !`${daemonOut}\n${daemonErr}`.includes('CANARY_'))
 
-  // Restart daemon over the resulting state: zero children should spawn for the 4 terminal posts or 2 published posts!
+  // Restart daemon over the resulting state: zero children should spawn for the 4 terminal posts or 3 published posts!
   writeFileSync(spawnLog, '')
   let restartErr = ''
   const daemon2 = spawn(process.execPath, ['--import', hook, 'mcp/tools/instance-broker-daemon.mjs', '--instance', 'curator'], {
@@ -297,8 +341,8 @@ try {
   try { process.kill(-daemon2.pid, 'SIGKILL') } catch { /* gone */ }
   await sleep(300)
 
-  ok('across daemon restart, zero post children spawn for the 4 terminal stale records or 2 published posts',
-    [...staleRows.map(s => s.row.id), dropRow.id, rateLimitRow.id].every(id => postSpawnsFor(id) === 0),
+  ok('across daemon restart, zero post children spawn for the 4 terminal stale records or 3 published posts',
+    [...staleRows.map(s => s.row.id), dropRow.id, rateLimitRow.id, slowRelayRow.id].every(id => postSpawnsFor(id) === 0),
     restartErr)
 } finally {
   buzz.close()

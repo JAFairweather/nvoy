@@ -297,13 +297,18 @@ export function queuePost(manifest, args, now = Date.now()) {
   } catch (error) { return { error: { code: 'NVOY_POST_QUEUE_FAILED', message: error.message } } }
 }
 
-// A frozen post keeps its original created_at across retries (instance-broker-post.mjs). Once the
-// Buzz relay rejects that timestamp as too far from server time and the event is not in the future,
-// republishing the same signed record can never succeed (q-169).
+// A frozen post keeps its original created_at across retries (instance-broker-post.mjs). Buzz uses
+// the same symmetric ±900 s refusal ("invalid: event timestamp too far from server time") for both
+// past and future skew, so a fresh post (e.g. local now - 60 s) can hit that refusal if the relay
+// clock lags and then succeed once the relay catches up. Only classify the refusal as irrevocably
+// stale once local age reaches 1800 s (900 s Buzz window + 900 s clock-skew margin, q-169).
+export const STALE_POST_MIN_AGE_SEC = 1800
 export const STALE_POST_TERMINAL_LINE = 'Buzz rejected the frozen post as stale timestamp; no retry can change it'
 export function isStalePostTimestampRefusal(message, createdAtSec, nowSec = Math.floor(Date.now() / 1000)) {
   return /^invalid:\s*event timestamp too far from server time(?:\b|$)/i.test(String(message || '').trim()) &&
-    Number.isSafeInteger(createdAtSec) && createdAtSec <= nowSec
+    Number.isSafeInteger(createdAtSec) &&
+    Number.isSafeInteger(nowSec) &&
+    nowSec - createdAtSec >= STALE_POST_MIN_AGE_SEC
 }
 export function isTerminalPostFailure(stderr) {
   const text = String(stderr || '')
