@@ -4,6 +4,7 @@
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { randomBytes } from 'node:crypto'
+import { createInterface } from 'node:readline/promises'
 import { verifyEvent } from 'nostr-tools'
 import { LiveRelay } from '../lib/liverelay.mjs'
 import { GRANT_RELAYS } from '../mcp/tools/grant_relays.mjs'
@@ -14,6 +15,7 @@ export const JAMES = '4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b28
 const HEX = /^[0-9a-f]{64}$/
 const CORRECTIONS = fileURLToPath(new URL('../docs/Q145_GRANT_CORRECTIONS.tsv', import.meta.url))
 const FIELD = ['operation', 'target', 'target_pubkey', 'holder', 'holder_pubkey', 'grant_id']
+const RELAY_RESULT_CAP = 500
 
 export function parseCorrections(text) {
   const lines = text.replace(/\r?\n$/, '').split(/\r?\n/).map(line => line.split('\t'))
@@ -38,12 +40,12 @@ export function missingBrokerGrantsAreEnded(anchor, brokerIds) {
   const missing = anchor.filter(e => !brokerIds.has(e.id))
   return { missing: missing.map(e => e.id), safe: missing.every(e => e.kind === 440 && ended.has(e.id)) }
 }
-export function pendingCorrections(rows, events) {
+export function pendingCorrections(rows, events, sourceEvents = events, foldEvents = foldGrants) {
   const revokedIds = revoked(events)
-  const eventById = new Map(events.map(e => [e.id, e]))
+  const eventById = new Map(sourceEvents.map(e => [e.id, e]))
   const folds = new Map()
   const fold = target => {
-    if (!folds.has(target)) folds.set(target, foldGrants(events, { me: target, grantors: [JAMES] }))
+    if (!folds.has(target)) folds.set(target, foldEvents(events, { me: target, grantors: [JAMES] }))
     return folds.get(target)
   }
   return rows.filter(row => {
@@ -59,6 +61,71 @@ export function pendingCorrections(rows, events) {
     if (row.operation === 'grant-task') return !effective.live.get(row.holder_pubkey)?.has('task')
     return !effective.mentions.some(m => m.pubkey === row.holder_pubkey)
   })
+}
+
+// The two sides must be folded separately. A signed event on only one side is
+// work to deliver, not a completed correction or permission to sign again.
+export function deliveryPlan(row, anchorPending, brokerPending, anchor, broker, fold = foldGrants) {
+  if (!anchorPending && !brokerPending) return null
+  const completedSide = anchorPending ? broker : anchor
+  let signed
+  if (row.operation === 'revoke-task') {
+    signed = completedSide.find(e => e.kind === 441 && e.pubkey === JAMES && e.tags.some(t => t[0] === 'e' && t[1] === row.grant_id))
+  } else {
+    const cap = row.operation === 'grant-task' ? 'task' : 'mention'
+    const effective = fold(completedSide, { me: row.target_pubkey, grantors: [JAMES] })
+    const id = cap === 'task' ? effective.live.get(row.holder_pubkey)?.get('task')?.grantId
+      : effective.mentions.find(m => m.pubkey === row.holder_pubkey && m.name === row.holder.split(':').at(-1))?.grantId
+    signed = completedSide.find(e => e.id === id)
+  }
+  // A one-sided completed row must have the signed event that completed it.
+  if (anchorPending !== brokerPending && !signed) throw new Error(`cannot recover signed correction for ${row.operation} ${row.holder} -> ${row.target}`)
+  return { row, signed, needAnchor: anchorPending, needBroker: brokerPending }
+}
+
+export function brokerGapsAreSafeOrRecoverable(anchor, missingIds, plans) {
+  const ended = revoked(anchor)
+  const recoverable = new Set(plans.filter(p => p.needBroker && p.signed).map(p => p.signed.id))
+  const anchorById = new Map(anchor.map(e => [e.id, e]))
+  return missingIds.every(id =>
+    (anchorById.get(id)?.kind === 440 && ended.has(id)) || recoverable.has(id))
+}
+
+export function anchorGapsAreRecoverable(anchorIds, broker, plans) {
+  const recoverable = new Set(plans.filter(p => p.needAnchor && p.signed).map(p => p.signed.id))
+  return broker.filter(e => !anchorIds.has(e.id)).every(e => recoverable.has(e.id))
+}
+
+export async function publishAndReadBack(signed, relays, needAnchor, needBroker, isValid = verifyEvent) {
+  const destinations = relays.map((relay, i) => ({ relay, i })).filter(({ i }) => i === 0 ? needAnchor : needBroker)
+  await Promise.allSettled(destinations.map(({ relay }) => relay.publish(signed)))
+  const reads = await Promise.allSettled(relays.map(relay => relay.query({ ids: [signed.id], limit: 1 })))
+  const has = reads.map(result => result.status === 'fulfilled' && result.value.some(e => e.id === signed.id && isValid(e)))
+  if (!has[0] || !has.slice(1).some(Boolean)) throw new Error('signed correction was not readable from anchor and broker relays')
+}
+
+export function signingOrder(plans) {
+  return [...plans].sort((a, b) => Number(a.row.operation === 'revoke-task') - Number(b.row.operation === 'revoke-task'))
+}
+
+export async function assertSignerOwner(signer) {
+  if (await signer.getPublicKey() !== JAMES) throw new Error('Bunker signer is not James')
+}
+
+export async function signCorrection(row, signer, isValid = verifyEvent) {
+  const draft = unsignedCorrection(row)
+  const signed = await signer.signEvent(draft)
+  if (!isValid(signed) || signed.pubkey !== JAMES || signed.kind !== draft.kind || signed.created_at !== draft.created_at || signed.content !== draft.content || JSON.stringify(signed.tags) !== JSON.stringify(draft.tags)) throw new Error('Bunker changed the reviewed correction')
+  return signed
+}
+
+export async function confirmApply(count, input = process.stdin, output = process.stdout) {
+  if (!input.isTTY) throw new Error('--apply requires an interactive terminal')
+  const prompt = createInterface({ input, output })
+  try {
+    const answer = await prompt.question(`Type APPLY ${count} to deliver ${count} pending signed events: `)
+    if (answer !== `APPLY ${count}`) throw new Error('apply confirmation did not match')
+  } finally { prompt.close() }
 }
 
 export function unsignedCorrection(row, at = Math.floor(Date.now() / 1000), salt = randomBytes(16).toString('hex')) {
@@ -83,6 +150,7 @@ function options(argv) {
 
 async function readEvents(relay) {
   const events = await relay.query({ kinds: [440, 441], authors: [JAMES], limit: 1000 })
+  if (events.length >= RELAY_RESULT_CAP) throw new Error(`grant relay returned ${events.length} events; possible result cap, refusing incomplete fold`)
   return events.filter(e => e.pubkey === JAMES && (e.kind === 440 || e.kind === 441) && verifyEvent(e))
 }
 
@@ -97,29 +165,44 @@ async function main() {
     if (anchor.length < 200) throw new Error('relay.nave.pub returned fewer than the audited 200 events')
     const brokerIds = new Set(brokerReads.flat().map(e => e.id))
     const brokerGap = missingBrokerGrantsAreEnded(anchor, brokerIds)
-    const events = [...new Map([...anchor, ...brokerReads.flat()].map(e => [e.id, e])).values()]
-    const pending = pendingCorrections(rows, events)
+    const broker = brokerReads.flat()
+    const sourceEvents = [...new Map([...anchor, ...broker].map(e => [e.id, e])).values()]
+    const anchorPending = new Set(pendingCorrections(rows, anchor, sourceEvents))
+    const brokerPending = new Set(pendingCorrections(rows, broker, sourceEvents))
+    const pending = rows.filter(row => anchorPending.has(row) || brokerPending.has(row))
+    const plans = signingOrder(pending.filter(row => !row.operation.startsWith('respond-to-'))
+      .map(row => deliveryPlan(row, anchorPending.has(row), brokerPending.has(row), anchor, broker)))
+    const brokerGapsSafeOrRecoverable = brokerGapsAreSafeOrRecoverable(anchor, brokerGap.missing, plans)
+    const anchorIds = new Set(anchor.map(e => e.id))
+    const brokerOnly = broker.filter(e => !anchorIds.has(e.id)).map(e => e.id)
+    const anchorGapsRecoverable = anchorGapsAreRecoverable(anchorIds, broker, plans)
     const counts = pending.reduce((out, row) => { out[row.operation] = (out[row.operation] || 0) + 1; return out }, {})
-    console.log(JSON.stringify({ anchor_events: anchor.length, broker_relay_events: brokerReads.map(x => x.length), missing_on_all_broker_relays: brokerGap.missing, missing_broker_events_are_revoked_grants: brokerGap.safe, pending: counts, first: pending[0] && `${pending[0].holder} -> ${pending[0].target}` }, null, 2))
+    console.log(JSON.stringify({ anchor_events: anchor.length, broker_relay_events: brokerReads.map(x => x.length), missing_on_all_broker_relays: brokerGap.missing, missing_broker_events_are_revoked_grants: brokerGap.safe, broker_gaps_safe_or_recoverable: brokerGapsSafeOrRecoverable, missing_on_anchor: brokerOnly, anchor_gaps_recoverable: anchorGapsRecoverable, pending: counts, signed_events_to_republish: plans.filter(p => p.signed).length, first: pending[0] && `${pending[0].holder} -> ${pending[0].target}` }, null, 2))
     if (!opts.apply) return
-    if (!brokerGap.safe) throw new Error('broker relay union is missing a live grant or revoke; repair relays before signing')
-    signer = makeBunkerSigner(readFileSync(opts['bunker-uri-file'], 'utf8').trim(), readFileSync(opts['bunker-client-file'], 'utf8').trim(), { idleMs: 30000 })
-    if (await signer.getPublicKey() !== JAMES) throw new Error('Bunker signer is not James')
-    let signedCount = 0
-    for (const row of pending) {
-      if (row.operation.startsWith('respond-to-')) continue
-      const draft = unsignedCorrection(row)
-      const signed = await signer.signEvent(draft)
-      if (!verifyEvent(signed) || signed.pubkey !== JAMES || signed.kind !== draft.kind || signed.created_at !== draft.created_at || signed.content !== draft.content || JSON.stringify(signed.tags) !== JSON.stringify(draft.tags)) throw new Error('Bunker changed the reviewed correction')
-      // Each event must reach the anchor and a relay the fleet actually reads.
-      const published = await Promise.allSettled(relays.map(relay => relay.publish(signed)))
-      if (published[0].status !== 'fulfilled' || published.slice(1).every(p => p.status !== 'fulfilled')) throw new Error('the correction did not reach anchor and broker relays')
-      const reads = await Promise.all(relays.map(relay => relay.query({ ids: [signed.id], limit: 1 })))
-      if (!reads[0].some(e => e.id === signed.id && verifyEvent(e)) || reads.slice(1).every(v => !v.some(e => e.id === signed.id && verifyEvent(e)))) throw new Error('signed correction was not readable from anchor and broker relays')
-      signedCount++
-      console.log(`${signedCount}: ${row.operation} ${row.holder} -> ${row.target} read back as ${signed.id}`)
+    if (!brokerGapsSafeOrRecoverable) throw new Error('broker relay union is missing a live grant or revoke outside the reviewed corrections; repair relays before signing')
+    if (!anchorGapsRecoverable) throw new Error('anchor is missing a grant or revoke outside the reviewed corrections; repair relays before signing')
+    if (!plans.length) {
+      console.log('No signed-event deliveries remain; host config operations stay separate.')
+      return
     }
-    console.log(JSON.stringify({ signed: signedCount, host_config_operations: pending.filter(r => r.operation.startsWith('respond-to-')).length, result: 'signed events read back; host config remains separate' }))
+    console.log(`Pending signed-event deliveries: ${plans.length}; new signatures: ${plans.filter(p => !p.signed).length}; recovered signed events: ${plans.filter(p => p.signed).length}`)
+    await confirmApply(plans.length)
+    signer = makeBunkerSigner(readFileSync(opts['bunker-uri-file'], 'utf8').trim(), readFileSync(opts['bunker-client-file'], 'utf8').trim(), { idleMs: 30000 })
+    await assertSignerOwner(signer)
+    let deliveredCount = 0
+    let newlySigned = 0
+    for (const plan of plans) {
+      const { row } = plan
+      let { signed } = plan
+      if (!signed) {
+        signed = await signCorrection(row, signer)
+        newlySigned++
+      }
+      await publishAndReadBack(signed, relays, plan.needAnchor, plan.needBroker)
+      deliveredCount++
+      console.log(`${deliveredCount}: ${row.operation} ${row.holder} -> ${row.target} read back as ${signed.id}`)
+    }
+    console.log(JSON.stringify({ delivered: deliveredCount, newly_signed: newlySigned, host_config_operations: pending.filter(r => r.operation.startsWith('respond-to-')).length, result: 'signed events read back; host config remains separate' }))
   } finally {
     try { signer?.close?.() } catch {}
     for (const relay of relays) relay.close()

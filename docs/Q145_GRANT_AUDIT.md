@@ -23,6 +23,8 @@ Neil → DJ Codex. The snapshot gives these counts:
 | Add Buzz `respond_to` entries | 41 | reviewed config/deploy change; no signed grant row |
 | Remove LukeDog from Buzz `respond_to` | 2 | reviewed config/deploy change |
 
+The correction table has 213 data rows (214 lines including its header).
+
 There are nine active fleet targets and five active Buzz seats. The expected
 direct task matrix for fleet targets has 126 edges: every other active seat
 and James. Dead Rabbit's live shadow of James supplies its reach without a
@@ -62,6 +64,13 @@ NIP-46 Bunker signer to sign only still-missing rows. It should check the
 signer's public key is James's, publish to the four grant relays, read back
 each signed event from the anchor and broker relay set, and
 resume safely if interrupted. It must never receive James's signing key.
+The runner folds the anchor and broker relay union separately. If an interrupted
+publish left a signed 440 or 441 on only one side, a rerun republishes that
+same event to the missing side and reads it back from both sides before marking
+the row complete. Apply stops if an unrelated event is missing from the anchor
+or a live event is missing from every broker relay. It also stops on a possible
+relay result cap, orders grants before revokes, and requires a typed pending
+count before opening the Bunker signer.
 
 The Buzz `respond_to` changes need a separate reviewed herd-infra config
 change and live readback by the host owner. They cannot be fixed by signing
