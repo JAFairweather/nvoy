@@ -9,7 +9,9 @@
 //
 // Each check mirrors the replay exit the child itself takes, and only that one:
 // - a post is done when posts/<id>.json is a regular file bound to this exact queue row (version,
-//   request id, request digest) and says published (instance-broker-post.mjs);
+//   request id, request digest), whose frozen unsigned event hashes to its fingerprint, whose signed
+//   event, if any, is that event with a valid signature, and which says published: every condition
+//   the child checks before its own replay exit (instance-broker-post.mjs; My Dude, PR 410 review);
 // - a reply is done when its one-use receipt has been renamed to <receipt>.<id>.used, which the reply
 //   actuator does only after publishing (instance-broker-reply.mjs).
 // Anything else, including an unreadable or unbound record, answers false: the child runs, as before,
@@ -17,6 +19,7 @@
 
 import { lstatSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { getEventHash, verifyEvent } from 'nostr-tools/pure'
 import { replyRequestDigest } from './outbound_record.mjs'
 
 const REQUEST = /^[0-9a-f]{32}$/, RECEIPT = /^[0-9a-f]{64}$/
@@ -43,7 +46,14 @@ export function postPublished(stateDir, row) {
   const path = resolve(stateDir, 'posts', `${id}.json`), st = regularFile(path)
   if (!st || st.size > MAX_RECORD_BYTES) return false
   let record; try { record = JSON.parse(readFileSync(path, 'utf8')) } catch { return false }
-  return record?.version === 1 && record.request_id === id && record.request_digest === replyRequestDigest(row) && record.published === true
+  if (record?.version !== 1 || record.request_id !== id || record.request_digest !== replyRequestDigest(row) || record.published !== true) return false
+  const ev = record.unsigned_event
+  try {
+    if (!ev || getEventHash(ev) !== record.fingerprint) return false
+    // Through JSON, as the child does, so no cached verification mark on the object is trusted.
+    if (record.event && (record.event.id !== record.fingerprint || !verifyEvent(JSON.parse(JSON.stringify(record.event))))) return false
+  } catch { return false }
+  return true
 }
 
 export function replyFinished(stateDir, row) {

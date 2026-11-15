@@ -10,7 +10,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, symlinkSy
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomBytes } from 'node:crypto'
-import { generateSecretKey, getEventHash, getPublicKey } from 'nostr-tools/pure'
+import { finalizeEvent, generateSecretKey, getEventHash, getPublicKey } from 'nostr-tools/pure'
 import { replyRequestDigest } from '../mcp/tools/outbound_record.mjs'
 import { firstRows, postPublished, replyFinished } from '../mcp/tools/broker_done.mjs'
 
@@ -52,7 +52,24 @@ const linked = postRow([listed]); publish(linked)
 const linkedPath = join(state, 'posts', `${linked.id}.json`), aside = join(root, 'aside.json')
 writeFileSync(aside, readFileSync(linkedPath)); writeFileSync(linkedPath, '');
 await import('node:fs').then(fs => { fs.rmSync(linkedPath); symlinkSync(aside, linkedPath) })
-const posts = [...normal, ...offListed, pending, unbound, linked]
+// Bound and marked published, but not a record the child would replay (My Dude, PR 410 review): the
+// daemon must not call any of these done; the child refuses each as not binding its request.
+const signedPost = postRow([listed]); publish(signedPost)
+{ const p = join(state, 'posts', `${signedPost.id}.json`), r = JSON.parse(readFileSync(p, 'utf8'))
+  writeFileSync(p, JSON.stringify({ ...r, event: finalizeEvent({ ...r.unsigned_event }, agentSk) })) }
+const malformed = {
+  'no unsigned event': [postRow([listed]), r => ({ ...r, unsigned_event: null })],
+  'a fingerprint that is not its hash': [postRow([listed]), r => ({ ...r, fingerprint: 'cd'.repeat(32) })],
+  'a signed event with a bad signature': [postRow([listed]), r => ({ ...r, event: { ...finalizeEvent({ ...r.unsigned_event }, agentSk), sig: '00'.repeat(64) } })],
+  'a signed event that is another event': [postRow([listed]), r => ({ ...r, event: finalizeEvent({ ...r.unsigned_event, content: 'other' }, agentSk) })],
+}
+for (const [row, change] of Object.values(malformed)) {
+  publish(row)
+  const p = join(state, 'posts', `${row.id}.json`)
+  writeFileSync(p, JSON.stringify(change(JSON.parse(readFileSync(p, 'utf8')))))
+}
+const malformedRows = Object.values(malformed).map(([row]) => row)
+const posts = [...normal, ...offListed, pending, unbound, linked, signedPost, ...malformedRows]
 // A repeated id: the child takes the first line, and so does the daemon.
 writeFileSync(join(run, 'post-requests.jsonl'), [...posts, { ...normal[0], content: 'a later line for the same id' }].map(r => JSON.stringify(r)).join('\n') + '\n{"id":')
 
@@ -68,6 +85,8 @@ ok('an unpublished post is not done', !postPublished(state, pending))
 ok('a record bound to another row is not done', !postPublished(state, unbound))
 ok('a symlinked record is not done', !postPublished(state, linked))
 ok('a record for a different id is not done', !postPublished(state, { ...normal[0], id: hex(16) }))
+ok('a published record carrying its valid signed event is done', postPublished(state, signedPost))
+for (const [what, [row]] of Object.entries(malformed)) ok(`a bound, published record with ${what} is not done`, !postPublished(state, row))
 ok('a changed row no longer matches its record', !postPublished(state, { ...normal[0], content: 'edited' }))
 ok('a malformed id reads nothing', !postPublished(state, { ...normal[0], id: '../x' }) && !replyFinished(state, { ...replied[0], id: '../x' }))
 ok('a reply whose receipt was used is done', replied.every(r => replyFinished(state, r)))
@@ -98,6 +117,7 @@ async function restart(round) {
   daemon.stdout.on('data', c => { log += c }); daemon.stderr.on('data', c => { log += c })
   // Round 1 must also reach the reply still pending; it ends terminal (no receipt), so round 2 does not.
   const started = await until(() => childrenFor('instance-broker-post.mjs', pending.id) >= 1 &&
+    (round > 1 || malformedRows.every(r => childrenFor('instance-broker-post.mjs', r.id) >= 1)) &&
     (round > 1 || childrenFor('instance-broker-reply.mjs', replyPending.id) >= 1))
   await sleep(2500)                                      // two more drain ticks over the same queues
   try { process.kill(-daemon.pid, 'SIGKILL') } catch { /* gone */ }  // the daemon and its supervised children
@@ -113,8 +133,13 @@ for (const round of [1, 2]) {
   ok(`restart ${round}: zero post children for ${N} published posts with an off-list mention`, offListed.every(r => childrenFor('instance-broker-post.mjs', r.id) === 0))
   ok(`restart ${round}: no attention policy child at all`, !spawned().some(a => a[0].endsWith('attention.mjs')))
   ok(`restart ${round}: zero reply children for ${N} published replies`, replied.every(r => childrenFor('instance-broker-reply.mjs', r.id) === 0))
-  if (round === 1) ok('restart 1: an unbound or symlinked record still goes to the child, which decides',
-    childrenFor('instance-broker-post.mjs', unbound.id) >= 1 && childrenFor('instance-broker-post.mjs', linked.id) >= 1)
+  ok(`restart ${round}: zero post children for a published record with its signed event`, childrenFor('instance-broker-post.mjs', signedPost.id) === 0)
+  if (round === 1) {
+    ok('restart 1: an unbound or symlinked record still goes to the child, which decides',
+      childrenFor('instance-broker-post.mjs', unbound.id) >= 1 && childrenFor('instance-broker-post.mjs', linked.id) >= 1)
+    ok('restart 1: every bound, published record the child would not replay goes to the child',
+      malformedRows.every(r => childrenFor('instance-broker-post.mjs', r.id) >= 1))
+  }
   else {
     // The child refused the unbound record as terminal, durably; the symlink is only held for retry.
     ok('restart 2: the unbound record, refused as terminal, stays refused with no child', childrenFor('instance-broker-post.mjs', unbound.id) === 0)
