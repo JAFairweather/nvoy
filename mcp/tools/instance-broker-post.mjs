@@ -52,10 +52,6 @@ const digest = replyRequestDigest(request)
 const postsDir = resolve(manifest.stateDir, 'posts')
 mkdirSync(postsDir, { recursive: true, mode: 0o700 })
 const recordPath = resolve(postsDir, `${requestId}.json`)
-const persist = () => {
-  const tmp = `${recordPath}.${process.pid}.tmp`
-  try { writeFileSync(tmp, JSON.stringify(record), { mode: 0o600 }); renameSync(tmp, recordPath) } catch (e) { die(`cannot persist post record: ${e.message}`) }
-}
 let record
 if (existsSync(recordPath)) {
   const st = lstatSync(recordPath)
@@ -82,6 +78,11 @@ try { validatePostRequest(request, allowed) } catch (e) { die(e.message) }
 // Again here, where the signer is: a client that writes the queue without the tool skips the tool's check.
 const leaked = credentialIn(request.content)
 if (leaked) die(`post refused: ${withheldMessage(leaked)} [post sha256 ${contentHash(request.content)}] instance ${manifest.id}`)
+// Nothing is written for this request before the refusals above.
+const persist = () => {
+  const tmp = `${recordPath}.${process.pid}.tmp`
+  try { writeFileSync(tmp, JSON.stringify(record), { mode: 0o600 }); renameSync(tmp, recordPath) } catch (e) { die(`cannot persist post record: ${e.message}`) }
+}
 // With mention_rooms on, a key neither the manifest nor a live grant covers can only be room-derived
 // (#321). The file the channel MCPs resolved it from is never authority: on every attempt, retries of
 // a signed post included, the relay's own member list is read fresh before counting, signing or
