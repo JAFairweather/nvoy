@@ -39,8 +39,16 @@ const isolatedManifest = (base, id, overrides = {}) => {
     broker_adapter_gid: 45000 + n * 2, worker_handoff_gid: 45000 + n * 2 + 1,
     key_ref: credential(base.key_ref, 'nsec'), bunker_uri_ref: credential(base.bunker_uri_ref, 'bunker-uri'),
     bunker_client_ref: credential(base.bunker_client_ref, 'nip46-client'),
-    worker_credential_ref: credential(base.worker_credential_ref, 'provider'), ...overrides }
+    worker_credential_ref: credential(base.worker_credential_ref, 'provider'),
+    // The SSH identity is a credential too (assertNoCollisions refuses one shared across instances), and the
+    // runtime checks it is a real 0600 file, so each sibling gets its own copy.
+    ...(base.ssh_identity_file ? { ssh_identity_file: ownCopy(base.ssh_identity_file, `ssh-${id}`) } : {}),
+    ...(base.harness?.credential_ref ? { harness: { ...base.harness, credential_ref: credential(base.harness.credential_ref, 'harness') } } : {}),
+    ...(base.wake_webhook ? { wake_webhook: { ...base.wake_webhook, url_ref: credential(base.wake_webhook.url_ref, 'wake-url'), headers_ref: credential(base.wake_webhook.headers_ref, 'wake-headers') } } : {}),
+    ...(base.channel_door?.token_hash_ref ? { channel_door: { ...base.channel_door, token_hash_ref: credential(base.channel_door.token_hash_ref, 'door-token') } } : {}),
+    ...overrides }
 }
+const ownCopy = (from, name) => { const to = join(root, name); writeFileSync(to, readFileSync(from), { mode: 0o600 }); return to }
 writeFileSync(manifestFile, JSON.stringify(manifest))
 const cli = (...args) => spawnSync(process.execPath, ['mcp/tools/instance-runtime.mjs', ...args], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
 
@@ -477,6 +485,29 @@ ok('a filesystem root cannot be reused under another runtime role', pathCollisio
 writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolated, service_user: manifest.service_user }))
 const userCollision = cli('describe', '--instance', 'codex-test')
 ok('a named service user cannot be shared by two participant instances', userCollision.status !== 0 && /service user collision/.test(userCollision.stderr))
+// Every credential path a manifest can name is one class across instances, not only the Nostr and provider
+// refs (My Dude, PR 366 review): the harness credential, the wake webhook pair, the channel door token and the
+// SSH identity. Each case names another instance's credential under a field that instance does not use for it.
+const notifyOnly = { ...isolated, worker_enabled: false, worker_image: '', worker_runner: '', worker_credential_ref: '', delivery_mode: 'notify_only' }
+const own = ref => `/etc/nvoy/credentials/collision.${ref}`
+const notifyCases = [
+  ['the harness credential', { harness: { runner: 'claude', credential_ref: manifest.worker_credential_ref } }],
+  ['a wake webhook reference', { wake_webhook: { url_ref: manifest.key_ref, headers_ref: own('wake-headers') } }],
+  ['the channel door token', { channel_door: { token_hash_ref: manifest.bunker_client_ref, network: 'proxy' } }],
+]
+writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...notifyOnly, harness: { runner: 'claude', credential_ref: own('harness') },
+  wake_webhook: { url_ref: own('wake-url'), headers_ref: own('wake-headers') }, channel_door: { token_hash_ref: own('door'), network: 'proxy' } }))
+const notifyOwn = cli('describe', '--instance', 'codex-test')
+ok('NEGATIVE CONTROL: a notify-only sibling with its own harness, webhook and door credentials is accepted', notifyOwn.status === 0)
+for (const [what, fields] of notifyCases) {
+  writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...notifyOnly, ...fields }))
+  const r = cli('describe', '--instance', 'codex-test')
+  ok(`${what} cannot name another instance's credential`, r.status !== 0 && /credential reference collision/.test(r.stderr))
+}
+writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolatedManifest(desktopManifest, 'collision', { pubkey: '0'.repeat(64) }),
+  ssh_identity_file: desktopManifest.ssh_identity_file }))
+const sshShared = cli('describe', '--instance', 'codex-test')
+ok('an SSH identity file cannot be shared by two instances', sshShared.status !== 0 && /credential reference collision/.test(sshShared.stderr))
 // Keep the manifest set valid for the independent spool-root collision case below.
 writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify(isolated))
 

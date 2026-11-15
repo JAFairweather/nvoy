@@ -322,7 +322,8 @@ try {
 // answered envelope was re-announced every renotifyMs for good (mc-claude, 47c7ab2f, 11 Nov).
 const repliedRuntime = join(root, 'replied-runtime'), repliedId = 'claude-replied-test', repliedPubkey = randomBytes(32).toString('hex')
 mkdirSync(repliedRuntime); mkdirSync(join(repliedRuntime, 'claude-channel-state'))
-writeFileSync(join(manifests, `${repliedId}.json`), JSON.stringify({ ...manifest, id: repliedId, pubkey: repliedPubkey, runtime_dir: repliedRuntime,
+const repliedRoot = aloneRoot(repliedId)
+writeFileSync(join(repliedRoot, `${repliedId}.json`), JSON.stringify({ ...manifest, id: repliedId, pubkey: repliedPubkey, runtime_dir: repliedRuntime,
   state_dir: join(root, 'replied-state'), spool_dir: join(root, 'replied-spool') }))
 const repliedEnvelope = 'c'.repeat(64)
 writeFileSync(join(repliedRuntime, 'admitted-tasks.jsonl'), JSON.stringify({ ...task, instance: repliedId, envelope: repliedEnvelope,
@@ -334,7 +335,7 @@ repliedClient.setNotificationHandler(Channel, note => { if (note.params?.meta?.e
 try {
   const repliedTransport = new StdioClientTransport({ command: process.execPath,
     args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', repliedId, '--poll-ms', '250', '--renotify-ms', '1000'],
-    env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stderr: 'pipe' })
+    env: { ...process.env, NVOY_INSTANCE_ROOT: repliedRoot }, stderr: 'pipe' })
   let repliedStderr = ''
   repliedTransport.stderr?.on('data', d => { repliedStderr += d })
   globalThis.repliedStderr = () => repliedStderr
@@ -356,7 +357,8 @@ try {
 // it is announced for good and nothing the agent does clears it (mc-claude, 13 Nov).
 const againRuntime = join(root, 'again-runtime'), againId = 'claude-again-test', againPubkey = randomBytes(32).toString('hex')
 mkdirSync(againRuntime); mkdirSync(join(againRuntime, 'claude-channel-state'))
-writeFileSync(join(manifests, `${againId}.json`), JSON.stringify({ ...manifest, id: againId, pubkey: againPubkey, runtime_dir: againRuntime,
+const againRoot = aloneRoot(againId)
+writeFileSync(join(againRoot, `${againId}.json`), JSON.stringify({ ...manifest, id: againId, pubkey: againPubkey, runtime_dir: againRuntime,
   state_dir: join(root, 'again-state'), spool_dir: join(root, 'again-spool') }))
 const againEnvelope = 'd'.repeat(64)
 writeFileSync(join(againRuntime, 'admitted-tasks.jsonl'), JSON.stringify({ ...task, instance: againId, envelope: againEnvelope,
@@ -369,7 +371,7 @@ againClient.setNotificationHandler(Channel, note => { if (note.params?.meta?.env
 try {
   await againClient.connect(new StdioClientTransport({ command: process.execPath,
     args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', againId, '--poll-ms', '250', '--renotify-ms', '1000'],
-    env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stderr: 'pipe' }))
+    env: { ...process.env, NVOY_INSTANCE_ROOT: againRoot }, stderr: 'pipe' }))
   const until = async (test, ms) => { const end = Date.now() + ms; while (!test() && Date.now() < end) await new Promise(done => setTimeout(done, 50)); return test() }
   ok('an answered but unread envelope is still announced on the interval', await until(() => againWakes.length >= 2, 5000))
   const again = await againClient.callTool({ name: 'nvoy_channel_reply', arguments: { envelope: againEnvelope, text: 'clearing a repeat' } })
@@ -388,7 +390,8 @@ try {
 // being announced for hours with nothing pointing at the cause.
 const lockedRuntime = join(root, 'locked-runtime'), lockedId = 'claude-locked-test', lockedPubkey = randomBytes(32).toString('hex')
 mkdirSync(lockedRuntime); mkdirSync(join(lockedRuntime, 'claude-channel-state'))
-writeFileSync(join(manifests, `${lockedId}.json`), JSON.stringify({ ...manifest, id: lockedId, pubkey: lockedPubkey, runtime_dir: lockedRuntime,
+const lockedRoot = aloneRoot(lockedId)
+writeFileSync(join(lockedRoot, `${lockedId}.json`), JSON.stringify({ ...manifest, id: lockedId, pubkey: lockedPubkey, runtime_dir: lockedRuntime,
   state_dir: join(root, 'locked-state'), spool_dir: join(root, 'locked-spool') }))
 const lockedEnvelope = '7'.repeat(64)
 writeFileSync(join(lockedRuntime, 'admitted-tasks.jsonl'), JSON.stringify({ ...task, instance: lockedId, envelope: lockedEnvelope,
@@ -399,7 +402,7 @@ const lockedState = join(lockedRuntime, 'claude-channel-state')
 try {
   await lockedClient.connect(new StdioClientTransport({ command: process.execPath,
     args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', lockedId, '--poll-ms', '250', '--renotify-ms', '1000'],
-    env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stderr: 'pipe' }))
+    env: { ...process.env, NVOY_INSTANCE_ROOT: lockedRoot }, stderr: 'pipe' }))
   await lockedClient.callTool({ name: 'nvoy_channel_list', arguments: {} })
   chmodSync(lockedState, 0o500)   // the channel holds its lock; now no new file can be made in its state dir
   const answered = JSON.parse((await lockedClient.callTool({ name: 'nvoy_channel_reply', arguments: { envelope: lockedEnvelope, text: 'handled' } })).content[0].text)
