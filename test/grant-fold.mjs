@@ -72,6 +72,32 @@ ok('a grant from the second grantor is voiced only by that grantor\'s shadow', !
   fold([task(second, second.pk), shadow(second, voice.pk)]).live.get(voice.pk)?.get('task')?.grantor === second.pk)
 ok('a grant scoped to another agent is still not a grant here, for the grantor or its voice', !fold([task(director, director.pk, 'task', { subject: other }), sh]).live.size)
 
+// --- a revocation applies whatever its created_at (CAPABILITY-GRANTS.md §5, fixture cap-441-revoke-task-backdated) ---
+// A 441 names its target by id, which commits to the target's created_at, so it cannot predate it. Before this, the
+// fold sorted by created_at and dropped only grants it had already seen, so a 441 stamped earlier than its 440 (clock
+// skew, or a backdated signer) was skipped and the revoked grant stayed live.
+const granted = task(director, dennis.pk, 'task', { at: now() - 100 })
+const backdated = revoke(director, granted.id, now() - 1000)
+r = fold([granted, backdated])
+ok('a backdated revocation still revokes its grant', !r.live.has(dennis.pk))
+ok('and records the grantee as revoked', r.ended.get(dennis.pk) === 'revoked')
+ok('in either array order', !fold([backdated, granted]).live.has(dennis.pk))
+for (const cap of ['task+act', 'task-relay']) {
+  const g = task(director, dennis.pk, cap, { at: now() - 100 })
+  ok(`a backdated revocation revokes a ${cap} grant`, !fold([g, revoke(director, g.id, now() - 1000)]).live.has(dennis.pk))
+}
+const shOld = shadow(director, voice2.pk, { at: now() - 100 })
+ok('a backdated revocation revokes a shadow grant', !fold([own, shOld, revoke(director, shOld.id, now() - 1000)]).live.has(voice2.pk))
+const mention = ev(director, 440, [['p', dennis.pk], ['da-scope', scopeHash(agent, salt), salt], ['da-cap', 'mention'], ['name', 'dennis']], now() - 100)
+ok('a mention grant is live unrevoked', fold([mention]).mentions.length === 1)
+ok('a backdated revocation revokes a mention grant', fold([mention, revoke(director, mention.id, now() - 1000)]).mentions.length === 0)
+ok('a backdated revocation from a stranger still revokes nothing', fold([granted, revoke(stranger, granted.id, now() - 1000)]).live.has(dennis.pk))
+const forgedRevoke = { ...revoke(director, granted.id, now() - 1000), sig: '00'.repeat(64) }
+r = fold([granted, forgedRevoke])
+ok('a backdated revocation with a bad signature revokes nothing, and is counted rejected', r.live.has(dennis.pk) && r.rejected === 1)
+ok('a revocation of another grant leaves this one live', fold([granted, revoke(director, own.id, now() - 1000)]).live.has(dennis.pk))
+ok('a later re-grant after a revocation is live', fold([granted, backdated, task(director, dennis.pk, 'task', { at: now() - 10 })]).live.has(dennis.pk))
+
 // --- attention --policy-only, as every broker and the reply recheck call it ---
 const grants = [own, sh, task(director, dennis.pk), shadow(stranger, voice2.pk)]
 const http = createServer((req, res) => { res.writeHead(404); res.end() })

@@ -64,12 +64,27 @@ export function foldGrantsWith(events, { me, grantors, scopeHash }) {
     for (const [pk, s] of voices) if (s.grantId === id) { voices.delete(pk); ended.set(pk, why) }
     named.delete(id)
   }
-  for (const ev of [...events].sort((a, b) => (a.created_at || 0) - (b.created_at || 0))) {
+  const sorted = [...events].sort((a, b) => (a.created_at || 0) - (b.created_at || 0))
+  const checked = new Map()
+  const verified = ev => {
+    if (!checked.has(ev)) { let ok = false; try { ok = verifyEvent(ev) } catch { ok = false } checked.set(ev, ok) }
+    return checked.get(ev)
+  }
+  // Revocations first. A 441 names its target by id, and that id commits to the target's created_at, so a 441 cannot
+  // predate its target; but its own created_at can say it does (clock skew, a backdated signer). Folding in created_at
+  // order then met the 441 before the grant and left a revoked grant live. A valid 441 revokes its target whatever
+  // either timestamp says (CAPABILITY-GRANTS.md §5; fixture cap-441-revoke-task-backdated).
+  const revoked = new Set()
+  for (const ev of sorted) {
+    if (ev.kind !== 441 || !by.includes(String(ev.pubkey || '').toLowerCase()) || !verified(ev)) continue
+    const id = tag(ev, 'e')?.[1]
+    if (id) revoked.add(id)
+  }
+  for (const ev of sorted) {
     const author = String(ev.pubkey || '').toLowerCase()
     if (!by.includes(author)) continue
-    let ok = false; try { ok = verifyEvent(ev) } catch { ok = false }
-    if (!ok) { rejected++; continue }
-    if (ev.kind === 441) { const id = tag(ev, 'e')?.[1]; if (id) drop(id, 'revoked'); continue }
+    if (!verified(ev)) { rejected++; continue }
+    if (ev.kind === 441) continue
     if (ev.kind !== 440) continue
     const grantee = String(tag(ev, 'p')?.[1] || '').toLowerCase(), scope = tag(ev, 'da-scope'), cap = tag(ev, 'da-cap')?.[1]
     if (!grantee || !scope || !cap) continue
@@ -85,7 +100,8 @@ export function foldGrantsWith(events, { me, grantors, scopeHash }) {
       if (!live.has(grantee)) live.set(grantee, new Map())
       live.get(grantee).set(cap, { grantId: ev.id, grantor: author, cap })
     }
-    if (grantExpired(ev)) drop(ev.id, 'expired')
+    if (revoked.has(ev.id)) drop(ev.id, 'revoked')
+    else if (grantExpired(ev)) drop(ev.id, 'expired')
   }
   // Resolved after the fold, so a shadow older than its grantor's grant still sees it, and from the
   // grantors' own grants only, so a voice of a voice inherits nothing.
