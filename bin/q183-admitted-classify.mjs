@@ -168,12 +168,14 @@ export function collect(manifest, harnessHome) {
   return { input: { admitted, consumed, delivered, answered, terminalRequests, replyRequests, markers }, sources }
 }
 
-// A seat error is printed as a fixed reason only: a parser message (for example a manifest that is
-// not valid JSON) can quote the file it read, and this runs as root over every seat.
-export function safeError(error) {
-  if (typeof error?.code === 'string' && /^E[A-Z]+$/.test(error.code)) return `cannot read (${error.code})`
-  const head = String(error?.message || '').split(':')[0]
-  return /^[a-z][a-z0-9 ,._/()-]{0,119}$/i.test(head) ? head : 'unreadable (details withheld)'
+// A seat error is printed as a fixed reason only, chosen from the stage that failed and an allowlisted
+// errno code; no exception text is ever printed. A parser message (a manifest that is not valid JSON)
+// can quote the file it read, and this runs as root over every seat.
+const ERRNO = new Set(['ENOENT', 'EACCES', 'EPERM', 'ENOTDIR', 'EISDIR', 'ELOOP', 'EMFILE', 'EIO'])
+export function safeError(error, stage = 'seat') {
+  if (ERRNO.has(error?.code)) return `${stage} unreadable (${error.code})`
+  if (stage === 'manifest' && String(error?.message || '').startsWith('manifest is not valid JSON')) return 'manifest is not valid JSON'
+  return `${stage} refused (details withheld)`
 }
 
 function instanceIds(root) {
@@ -185,12 +187,15 @@ export function run(argv, { log = line => console.log(line), now = Date.now(), r
   const ids = opts.instances.length ? opts.instances : instanceIds(opts.root)
   const seats = {}
   for (const id of ids) {
+    let stage = 'manifest'
     try {
       const manifest = readSeat(opts.root, id)
+      stage = 'seat files'
       const { input, sources } = collectSeat(manifest, opts.harnessHomes[id])
+      stage = 'classify'
       seats[id] = { harness: manifest.harness?.runner || null, delivery_mode: manifest.deliveryMode || null, ...classify({ ...input, now, ids: opts.ids }), sources }
     } catch (error) {
-      seats[id] = { error: safeError(error) }
+      seats[id] = { error: safeError(error, stage) }
     }
   }
   log(JSON.stringify({ read_at: new Date(now).toISOString(), root: opts.root, read_only: true, seats }, null, 2))

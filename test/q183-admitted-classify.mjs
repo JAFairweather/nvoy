@@ -103,7 +103,7 @@ test('run prints counts and ids, never content, and writes nothing', () => {
   assert.equal(parsed.seats.seat.harness, 'claude')
   assert.equal(parsed.seats.seat.delivery_mode, 'notify_only')
   assert.deepEqual(parsed.seats.seat.classes.unconsumed.envelopes, [env(5)])
-  assert.deepEqual(seats.gone, { error: 'no manifest for gone' })
+  assert.deepEqual(seats.gone, { error: 'manifest refused (details withheld)' })
   const after = JSON.stringify([m.runtimeDir, m.stateDir, m.spoolDir].map(d => readdirSync(d).map(f => [f, statSync(join(d, f)).mtimeMs])))
   assert.equal(after, before)
 })
@@ -116,7 +116,20 @@ test('a seat error never quotes what the parser read (Neil and Dennis, PR 422)',
   assert.equal(seats.leaky.error, 'manifest is not valid JSON')
   assert.ok(!printed.join('\n').includes('secret_fragment_here'))
   assert.ok(!printed.join('\n').includes('oops'))
-  assert.equal(safeError(Object.assign(new Error('x: y'), { code: 'EACCES' })), 'cannot read (EACCES)')
-  assert.equal(safeError(new Error('Unexpected token "s" in {"k":"v"}')), 'unreadable (details withheld)')
-  assert.equal(safeError(new Error('manifest id does not match requested instance')), 'manifest id does not match requested instance')
+  assert.equal(safeError(Object.assign(new Error('x: y'), { code: 'EACCES' }), 'manifest'), 'manifest unreadable (EACCES)')
+  assert.equal(safeError(new Error('Unexpected token "s" in {"k":"v"}'), 'manifest'), 'manifest refused (details withheld)')
+  assert.equal(safeError(new Error('manifest is not valid JSON: oops'), 'seat files'), 'seat files refused (details withheld)')
+  assert.equal(safeError(Object.assign(new Error('sample confidential text'), { code: 'ESECRET' }), 'seat files'), 'seat files refused (details withheld)')
+})
+
+test('a colon-free message is never printed either (Neil, PR 422 at 02e257d)', () => {
+  for (const stage of ['manifest', 'seat files', 'classify']) assert.equal(safeError(new Error('sample confidential text'), stage), `${stage} refused (details withheld)`)
+  const printed = []
+  const seats = run(['--instance', 'a', '--instance', 'b'], {
+    log: line => printed.push(line), now: 0,
+    readSeat: (_root, id) => { if (id === 'a') throw new Error('sample confidential text'); return { runtimeDir: '/x', stateDir: '/x', spoolDir: '/x' } },
+    collectSeat: () => { throw new Error('sample confidential text') },
+  })
+  assert.deepEqual(seats, { a: { error: 'manifest refused (details withheld)' }, b: { error: 'seat files refused (details withheld)' } })
+  assert.ok(!printed.join('\n').includes('confidential'))
 })
