@@ -34,7 +34,9 @@ This dry-run opens no signer. It reads James's signed 440/441 events from
 `relay.primal.net` (the broker set), then folds the anchor and broker union
 separately.
 
-For the manual console steps below, James must verify the console signer
+For the manual steps, use the existing Nvoy console or start the checkout's
+console with `npm run console` and open `http://localhost:4443/` (see
+`README.md`). James must verify the console signer
 reports his public key
 `4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b287ea84d`.
 The runner checks that identity itself before its `--apply` signs anything.
@@ -52,8 +54,9 @@ count to force if the live fold changes.
 
 ## Operator sequence with today's tools
 
-1. **Revokes.** In the Nvoy console ledger, find each of the six external
-   grants by its full `grant_id` in the TSV. Check the grantee and `task`
+1. **Revokes.** In the Nvoy console Ledger, paste each of the six full
+   `grant_id` values from the TSV into the search field and open that external
+   grant. Check the grantee and `task`
    capability against the row before James confirms *Revoke*. The console
    builds a public 441 against that ID. Do one row at a time. After each, run
    the read-only command above. Continue only after `revoke-task` falls by one
