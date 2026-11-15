@@ -132,4 +132,10 @@ test('a colon-free message is never printed either (Neil, PR 422 at 02e257d)', (
   })
   assert.deepEqual(seats, { a: { error: 'manifest refused (details withheld)' }, b: { error: 'seat files refused (details withheld)' } })
   assert.ok(!printed.join('\n').includes('confidential'))
+  // Dennis, PR 422 at 02e257d: nostr-tools quotes a bad npub from the real readManifest path.
+  const root = mkdtempSync(join(tmpdir(), 'q183-npub-'))
+  writeFileSync(join(root, 'bad.json'), JSON.stringify({ id: 'bad', pubkey: 'npub1qqqqqqqq' }))
+  const out = []
+  assert.deepEqual(run(['--root', root], { log: line => out.push(line), now: 0 }), { bad: { error: 'manifest refused (details withheld)' } })
+  assert.ok(!out.join('\n').includes('npub1'))
 })
