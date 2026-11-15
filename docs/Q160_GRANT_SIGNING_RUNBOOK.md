@@ -36,9 +36,10 @@ separately.
 
 For the manual steps, use the existing Nvoy console or start the checkout's
 console with `npm run console` and open `http://localhost:4443/` (see
-`README.md`). James must verify the console signer
-reports his public key
-`4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b287ea84d`.
+`README.md`). James must click the **signed-in npub pill** in the console
+title bar, copy its full value, and compare it exactly with
+`npub1gqg2csuzqmwpqqvts99786spefkf90xz96t3n6zp6fqnk2r74pxs4tcgrg`.
+The static footer identity is not proof of the current sign-in.
 The runner checks that identity itself before its `--apply` signs anything.
 
 **Before the first 441, check the console's actual relay configuration.** Open
