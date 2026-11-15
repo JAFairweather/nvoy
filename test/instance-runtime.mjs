@@ -1,8 +1,8 @@
 // Multi-instance runtime contract (#44): a public manifest names exactly one identity and
 // isolated state. This drives the real CLI, rather than duplicating its validation in a unit.
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlinkSync, unlinkSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlinkSync, unlinkSync, linkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { spawn } from 'node:child_process'
 import net from 'node:net'
@@ -508,6 +508,29 @@ writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolated
   ssh_identity_file: desktopManifest.ssh_identity_file }))
 const sshShared = cli('describe', '--instance', 'codex-test')
 ok('an SSH identity file cannot be shared by two instances', sshShared.status !== 0 && /credential reference collision/.test(sshShared.stderr))
+// The same file under another spelling is the same credential (My Dude, PR 366 reread): a lexical alias across two
+// manifests, and a symlink or hard link to another instance's file where the broker can stat it.
+const [kDir, kFile] = [dirname(manifest.key_ref), basename(manifest.key_ref)]
+for (const [what, alias] of [['a `..` alias', `${kDir}/../${basename(kDir)}/${kFile}`], ['a `//` alias', `/${manifest.key_ref}`],
+  ['a `.` alias', `${kDir}/./${kFile}`], ['a trailing-slash alias', `${manifest.key_ref}/`]]) {
+  writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolated, key_ref: alias }))
+  const r = cli('describe', '--instance', 'codex-test')
+  ok(`${what} of another instance's key_ref is a credential collision`, r.status !== 0 && /credential reference collision/.test(r.stderr))
+}
+writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolated, state_dir: `${manifest.runtime_dir}/../${basename(manifest.runtime_dir)}` }))
+const pathAlias = cli('describe', '--instance', 'codex-test')
+ok('a `..` alias of another instance\'s filesystem root is a collision', pathAlias.status !== 0 && /filesystem root collision/.test(pathAlias.stderr))
+const sshLink = join(root, 'ssh-identity-link'), sshHard = join(root, 'ssh-identity-hard')
+symlinkSync(desktopManifest.ssh_identity_file, sshLink); linkSync(desktopManifest.ssh_identity_file, sshHard)
+for (const [what, path] of [['a symlink to', sshLink], ['a hard link to', sshHard]]) {
+  writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolatedManifest(desktopManifest, 'collision', { pubkey: '0'.repeat(64) }),
+    ssh_identity_file: path }))
+  const r = cli('describe', '--instance', 'codex-test')
+  ok(`${what} another instance's SSH identity is a credential collision`, r.status !== 0 && /credential reference collision/.test(r.stderr))
+}
+writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolatedManifest(desktopManifest, 'collision', { pubkey: '0'.repeat(64) }) }))
+const sshOwn = cli('describe', '--instance', 'codex-test')
+ok('NEGATIVE CONTROL: a sibling with its own copy of an SSH identity is accepted', sshOwn.status === 0)
 // Keep the manifest set valid for the independent spool-root collision case below.
 writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify(isolated))
 

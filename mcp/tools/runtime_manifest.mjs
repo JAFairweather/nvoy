@@ -5,7 +5,7 @@
 // supervisor-owned directory.  Tests may supply a different root, but every caller still gets
 // the same structural validation and duplicate-identity check.
 
-import { lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs'
+import { lstatSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { resolve, dirname, isAbsolute, relative, sep } from 'node:path'
 import { decode } from 'nostr-tools/nip19'
 import { codexThreadId as validCodexThreadId, localControlSocket } from './codex_app_server.mjs'
@@ -340,6 +340,16 @@ export function credentialRefs(m) {
     m.wakeWebhook?.urlRef, m.wakeWebhook?.headersRef, m.channelDoor?.tokenHashRef, m.sshIdentityFile].filter(Boolean)
 }
 
+// A path names one file however it is spelled: `/a/../a/x`, `//a/x` and `/a/x/` are `/a/x` to the kernel and to
+// a compose mount, so the cross-instance comparison uses the lexically normal form (My Dude, PR 366 reread).
+const normalPath = p => resolve('/', String(p))
+// And a file reached through a symlink or a hard link is the same file under another name. Where this process can
+// stat it, its device and inode are compared too. This only adds collisions: a path it cannot stat (another
+// broker's credential directory, a host path absent in a container) is still compared by its normal form.
+function fileIdentity(p) {
+  try { const st = statSync(p); return st.isFile() ? `${st.dev}:${st.ino}` : '' } catch { return '' }
+}
+
 export function assertNoCollisions(root, candidate) {
   const canonicalRoot = realpathSync(root)
   const seen = new Map()
@@ -354,10 +364,10 @@ export function assertNoCollisions(root, candidate) {
     // credential path a manifest can name is one class, whichever field names it.
     const resources = [
       ['pubkey', 'pubkey', m.pubkey], ['service user', 'service-user', m.serviceUser],
-      ['filesystem root', 'path', m.stateDir], ['filesystem root', 'path', m.runtimeDir], ['filesystem root', 'path', m.spoolDir],
+      ...[m.stateDir, m.runtimeDir, m.spoolDir].map(dir => ['filesystem root', 'path', dir && normalPath(dir)]),
       ['service UID', 'uid', m.watcherUid], ['service UID', 'uid', m.brokerUid], ['service UID', 'uid', m.adapterUid], ['service UID', 'uid', m.workerUid],
       ['service GID', 'gid', m.brokerAdapterGid], ['service GID', 'gid', m.workerHandoffGid], ['service GID', 'gid', m.mayRecall?.gatewayGid],
-      ...credentialRefs(m).map(ref => ['credential reference', 'credential', ref]),
+      ...credentialRefs(m).flatMap(ref => [['credential reference', 'credential', normalPath(ref)], ['credential reference', 'credential-file', fileIdentity(ref)]]),
     ]
     for (const [label, kind, value] of resources) {
       if (value === '' || value == null) continue
