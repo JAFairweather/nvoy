@@ -44,6 +44,13 @@ ok(fold([g, revoke(owner, g.id, now - 10_000)]).live.size === 0, 'a 441 dated be
 ok(fold([revoke(owner, g.id, now + 10_000), g]).live.size === 0, 'and the order the events arrive in does not matter')
 ok(fold([g, revoke(other, g.id)], [ownerHex, otherHex]).live.size === 1, "another owner's 441 cannot revoke this owner's grant")
 const g2 = grant(owner, delegate, { at: now - 10 })
+const revokeAll = (key, ids, at = now - 50) => finalizeEvent({ kind: 441, created_at: at, content: '', tags: ids.map(id => ['e', id]) }, key)
+{
+  const ga = grant(owner, delegate), gb = grant(owner, delegate2, { at: now - 90 })
+  ok(fold([ga, gb, revokeAll(owner, [ga.id, gb.id])]).live.size === 0, 'a 441 naming two onboard grants revokes both (CAPABILITY-GRANTS.md §1.1, neg-441-multi-e)')
+  ok(!fold([gb, revokeAll(owner, [ga.id, gb.id])]).live.has(delegate2), 'a grant named second in a 441 is revoked')
+  ok(fold([ga, gb, revokeAll(other, [ga.id, gb.id])], [ownerHex, otherHex]).live.size === 2, "another owner's multi-target 441 revokes neither")
+}
 r = fold([g, g2, revoke(owner, g.id)])
 ok(r.live.get(delegate).length === 1 && r.live.get(delegate)[0].grantId === g2.id, 'revoking one grant leaves a second live one')
 r = fold([g, g2])
