@@ -4,29 +4,45 @@
 // 3. Pending Pi beforeAgentStart wake callback is fenced to its session generation across shutdown/restart.
 // 4. Truncated, empty, legacy-unverified, or error-shaped payloads fail loudly and never log ready.
 
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { homedir, tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, parse, resolve } from 'node:path'
 import { appendRecallLog, callMcpEntryOnce, CLAUDE_SESSION_START_MATCHER, CLAUDE_WAKE_SOURCES, MAX_WAKE_DIGEST_CHARS, parseWakeToolText, shouldWakeClaudeSessionStart } from '../mcp/tools/recall-wake.mjs'
 import { seedSettings } from '../mcp/tools/harness_session.mjs'
-import { createPiHarness } from '../mcp/tools/pi_harness_extension.mjs'
+import { channelProxy, createPiHarness } from '../mcp/tools/pi_harness_extension.mjs'
 
 let fails = 0
 const ok = (name, cond) => { console.log(`${cond ? 'ok  ' : 'FAIL'} — ${name}`); if (!cond) fails++ }
 const wait = ms => new Promise(done => setTimeout(done, ms))
 const pidAlive = pid => { try { process.kill(pid, 0); return true } catch { return false } }
 
-function safeParentBase() {
-  for (const candidate of [tmpdir(), homedir()]) {
-    try {
-      const st = lstatSync(candidate)
-      const stickyRoot = st.uid === 0 && (st.mode & 0o1000) !== 0
-      const uid = typeof process.getuid === 'function' ? process.getuid() : 0
-      if (st.isDirectory() && !st.isSymbolicLink() && (st.uid === 0 || st.uid === uid) && ((st.mode & 0o022) === 0 || stickyRoot)) {
-        return candidate
+function chainPassesFixedPath(candidate) {
+  try {
+    if (!candidate) return false
+    const supplied = lstatSync(candidate)
+    if (supplied.isSymbolicLink() || !supplied.isDirectory()) return false
+    let dir = realpathSync(candidate)
+    const rootDir = parse(dir).root
+    const allowedOwners = new Set([0, typeof process.getuid === 'function' ? process.getuid() : 0])
+    for (;;) {
+      const parent = lstatSync(dir)
+      const stickyRoot = parent.uid === 0 && (parent.mode & 0o1000) !== 0
+      if (!parent.isDirectory() || parent.isSymbolicLink() || !allowedOwners.has(parent.uid) ||
+          ((parent.mode & 0o022) !== 0 && !stickyRoot)) {
+        return false
       }
-    } catch {}
+      if (dir === rootDir) return true
+      dir = dirname(dir)
+    }
+  } catch {
+    return false
+  }
+}
+
+function safeParentBase() {
+  for (const candidate of [tmpdir(), '/tmp', homedir(), resolve('.')]) {
+    if (chainPassesFixedPath(candidate)) return realpathSync(candidate)
   }
   return tmpdir()
 }
@@ -63,6 +79,80 @@ wait "$sub"
   }
   ok('TERM-ignoring reader and its child are escalated to SIGKILL and reaped before timeout rejection settles',
     /did not answer within 1s/.test(timeoutErr) && recordedPids.reader > 0 && recordedPids.sub > 0 && !stillAliveAfter)
+
+  // 1b. Leader exits promptly on SIGTERM (or before timeout / on normal completion) while a TERM-ignoring descendant
+  //     with stdio ignored remains in the process group: callMcpEntryOnce still SIGKILLs and reaps the descendant.
+  const killPair = pair => {
+    if (!pair) return
+    if (pair.reader > 1) { try { process.kill(-pair.reader, 'SIGKILL') } catch {}; try { process.kill(pair.reader, 'SIGKILL') } catch {} }
+    if (pair.sub > 1) { try { process.kill(pair.sub, 'SIGKILL') } catch {} }
+  }
+  const leaderExitPidsFile = join(root, 'leader-exit-descendant.pids')
+  const leaderExitReader = join(root, 'leader-exit-reader.cjs')
+  writeFileSync(leaderExitReader, `
+const { spawn } = require('node:child_process')
+const { writeFileSync } = require('node:fs')
+const mode = process.argv[2] || 'hang-leader-dies-on-term'
+const sub = spawn(process.execPath, ['-e', 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+sub.unref()
+writeFileSync(${JSON.stringify(leaderExitPidsFile)}, JSON.stringify({ reader: process.pid, sub: sub.pid }))
+if (mode === 'exit-early') process.exit(1)
+let buf = ''
+process.stdin.on('data', chunk => {
+  buf += chunk
+  let nl
+  while ((nl = buf.indexOf('\\n')) >= 0) {
+    const m = JSON.parse(buf.slice(0, nl)); buf = buf.slice(nl + 1)
+    if (m.id === undefined) continue
+    if (m.method === 'initialize') {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: { protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'stub', version: '1' } } }) + '\\n')
+      continue
+    }
+    if (mode === 'complete-with-orphan') {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: { content: [{ type: 'text', text: '{"ok":true}' }] } }) + '\\n', () => process.exit(0))
+      return
+    }
+  }
+})
+setInterval(() => {}, 1000)
+`, { mode: 0o700 })
+
+  // Variant A: timeout where leader accepts default SIGTERM and exits immediately, leaving TERM-ignoring descendant.
+  rmSync(leaderExitPidsFile, { force: true })
+  let leaderTermErr = ''
+  try {
+    await callMcpEntryOnce({ command: process.execPath, args: [leaderExitReader, 'hang-leader-dies-on-term'] }, 'memory_wake', { max_chars: 3500 }, { timeoutMs: 700, killGraceMs: 80 })
+  } catch (err) {
+    leaderTermErr = err.message
+  }
+  const pairA = existsSync(leaderExitPidsFile) ? JSON.parse(readFileSync(leaderExitPidsFile, 'utf8')) : { reader: 0, sub: 0 }
+  const aliveA = (pairA.reader > 0 && pidAlive(pairA.reader)) || (pairA.sub > 0 && pidAlive(pairA.sub))
+  if (aliveA) killPair(pairA)
+  ok('callMcpEntryOnce escalates process-group SIGKILL even when leader exits on SIGTERM and descendant ignores SIGTERM',
+    /did not answer within 1s/.test(leaderTermErr) && pairA.reader > 0 && pairA.sub > 0 && !aliveA)
+
+  // Variant B: leader exits early (exit 1) leaving TERM-ignoring descendant with stdio ignored.
+  rmSync(leaderExitPidsFile, { force: true })
+  let earlyExitErr = ''
+  try {
+    await callMcpEntryOnce({ command: process.execPath, args: [leaderExitReader, 'exit-early'] }, 'memory_wake', { max_chars: 3500 }, { timeoutMs: 2000, killGraceMs: 80 })
+  } catch (err) {
+    earlyExitErr = err.message
+  }
+  const pairB = existsSync(leaderExitPidsFile) ? JSON.parse(readFileSync(leaderExitPidsFile, 'utf8')) : { reader: 0, sub: 0 }
+  const aliveB = (pairB.reader > 0 && pidAlive(pairB.reader)) || (pairB.sub > 0 && pidAlive(pairB.sub))
+  if (aliveB) killPair(pairB)
+  ok('callMcpEntryOnce reaps TERM-ignoring descendant when leader exits early before answering',
+    /closed \(1\)/.test(earlyExitErr) && pairB.reader > 0 && pairB.sub > 0 && !aliveB)
+
+  // Variant C: normal completion where leader answers tools/call and exits 0 leaving TERM-ignoring descendant.
+  rmSync(leaderExitPidsFile, { force: true })
+  const completedRes = await callMcpEntryOnce({ command: process.execPath, args: [leaderExitReader, 'complete-with-orphan'] }, 'memory_wake', { max_chars: 3500 }, { timeoutMs: 2000, killGraceMs: 80 })
+  const pairC = existsSync(leaderExitPidsFile) ? JSON.parse(readFileSync(leaderExitPidsFile, 'utf8')) : { reader: 0, sub: 0 }
+  const aliveC = (pairC.reader > 0 && pidAlive(pairC.reader)) || (pairC.sub > 0 && pidAlive(pairC.sub))
+  if (aliveC) killPair(pairC)
+  ok('callMcpEntryOnce reaps TERM-ignoring descendant on normal tools/call completion before resolving',
+    completedRes?.content?.[0]?.text === '{"ok":true}' && pairC.reader > 0 && pairC.sub > 0 && !aliveC)
 
   // 2. FIFO recall log path is rejected without blocking appendRecallLog or the Claude SessionStart CLI hook.
   const fifoPath = join(root, 'recall.fifo')
@@ -331,6 +421,91 @@ process.stdin.on('data', chunk => {
     else process.env.HARNESS_WAKE_TIMEOUT_MS = prevWakeTimeout
     if (prevChanTimeout === undefined) delete process.env.HARNESS_CHANNEL_CALL_MS
     else process.env.HARNESS_CHANNEL_CALL_MS = prevChanTimeout
+  }
+
+  // 7. Pi channelProxy + startup wake: when leader exits on SIGTERM (or early) leaving a TERM-ignoring descendant
+  //    with stdio ignored, process-group cleanup still SIGKILLs and reaps the descendant across timeout, reset, and close.
+  const piOrphanPidsFile = join(root, 'pi-orphan.pids')
+  const piOrphanModeFile = join(root, 'pi-orphan.mode')
+  const piOrphanReader = join(root, 'pi-orphan-reader.cjs')
+  writeFileSync(piOrphanReader, `
+const { spawn } = require('node:child_process')
+const { readFileSync, writeFileSync } = require('node:fs')
+const mode = readFileSync(${JSON.stringify(piOrphanModeFile)}, 'utf8').trim()
+const sub = spawn(process.execPath, ['-e', 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+sub.unref()
+writeFileSync(${JSON.stringify(piOrphanPidsFile)}, JSON.stringify({ reader: process.pid, sub: sub.pid }))
+if (mode === 'exit-early') process.exit(1)
+let buf = ''
+process.stdin.on('data', chunk => {
+  buf += chunk
+  let nl
+  while ((nl = buf.indexOf('\\n')) >= 0) {
+    const m = JSON.parse(buf.slice(0, nl)); buf = buf.slice(nl + 1)
+    if (m.id === undefined) continue
+    if (m.method === 'initialize') {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: { protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'stub', version: '1' } } }) + '\\n')
+      continue
+    }
+    if (mode === 'hang-call') return
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: { content: [{ type: 'text', text: '{"answer":"found"}' }] } }) + '\\n')
+  }
+})
+setInterval(() => {}, 1000)
+`, { mode: 0o700 })
+
+  const prevCallMs = process.env.HARNESS_CHANNEL_CALL_MS
+  process.env.HARNESS_CHANNEL_CALL_MS = '700'
+  try {
+    const proxy = channelProxy({
+      config: piCfg,
+      env: { PATH: process.env.PATH || '/usr/bin:/bin', HOME: root },
+      entry: { command: process.execPath, args: [piOrphanReader] },
+      what: 'the Hive memory reader',
+    })
+
+    // 7a. Direct channelProxy call timeout (700ms): leader dies on SIGTERM, TERM-ignoring descendant is SIGKILLed.
+    writeFileSync(piOrphanModeFile, 'hang-call')
+    rmSync(piOrphanPidsFile, { force: true })
+    const proxyTimeoutErr = await proxy.call('memory_wake', { max_chars: 3500 }).then(() => '', err => err.message)
+    const pPair1 = existsSync(piOrphanPidsFile) ? JSON.parse(readFileSync(piOrphanPidsFile, 'utf8')) : { reader: 0, sub: 0 }
+    const pAlive1 = (pPair1.reader > 0 && pidAlive(pPair1.reader)) || (pPair1.sub > 0 && pidAlive(pPair1.sub))
+    if (pAlive1) killPair(pPair1)
+    ok('Pi channelProxy timeout reaps TERM-ignoring descendant even when leader exits on SIGTERM',
+      /did not answer within 1s/.test(proxyTimeoutErr) && pPair1.reader > 0 && pPair1.sub > 0 && !pAlive1)
+
+    // 7b. Leader exits early (exit 1) leaving TERM-ignoring descendant: channelProxy close handler reaps descendant.
+    writeFileSync(piOrphanModeFile, 'exit-early')
+    rmSync(piOrphanPidsFile, { force: true })
+    const proxyEarlyErr = await proxy.call('memory_wake', { max_chars: 3500 }).then(() => '', err => err.message)
+    const pPair2 = existsSync(piOrphanPidsFile) ? JSON.parse(readFileSync(piOrphanPidsFile, 'utf8')) : { reader: 0, sub: 0 }
+    const pAlive2 = (pPair2.reader > 0 && pidAlive(pPair2.reader)) || (pPair2.sub > 0 && pidAlive(pPair2.sub))
+    if (pAlive2) killPair(pPair2)
+    ok('Pi channelProxy reaps TERM-ignoring descendant when leader exits early',
+      /closed \(1\)/.test(proxyEarlyErr) && pPair2.reader > 0 && pPair2.sub > 0 && !pAlive2)
+
+    // 7c. Healthy call followed by reset() and close(): TERM-ignoring descendant spawned by live leader is reaped.
+    writeFileSync(piOrphanModeFile, 'ok')
+    rmSync(piOrphanPidsFile, { force: true })
+    await proxy.call('memory_query', { topic: 'nvoy' })
+    await proxy.reset('test-reset')
+    const pPair3 = existsSync(piOrphanPidsFile) ? JSON.parse(readFileSync(piOrphanPidsFile, 'utf8')) : { reader: 0, sub: 0 }
+    const pAlive3 = (pPair3.reader > 0 && pidAlive(pPair3.reader)) || (pPair3.sub > 0 && pidAlive(pPair3.sub))
+    if (pAlive3) killPair(pPair3)
+    ok('Pi channelProxy reset() reaps TERM-ignoring descendant after leader exits on SIGTERM',
+      pPair3.reader > 0 && pPair3.sub > 0 && !pAlive3)
+
+    rmSync(piOrphanPidsFile, { force: true })
+    await proxy.call('memory_query', { topic: 'nvoy' })
+    await proxy.close()
+    const pPair4 = existsSync(piOrphanPidsFile) ? JSON.parse(readFileSync(piOrphanPidsFile, 'utf8')) : { reader: 0, sub: 0 }
+    const pAlive4 = (pPair4.reader > 0 && pidAlive(pPair4.reader)) || (pPair4.sub > 0 && pidAlive(pPair4.sub))
+    if (pAlive4) killPair(pPair4)
+    ok('Pi channelProxy close() reaps TERM-ignoring descendant after leader exits on SIGTERM',
+      pPair4.reader > 0 && pPair4.sub > 0 && !pAlive4)
+  } finally {
+    if (prevCallMs === undefined) delete process.env.HARNESS_CHANNEL_CALL_MS
+    else process.env.HARNESS_CHANNEL_CALL_MS = prevCallMs
   }
 } finally {
   rmSync(root, { recursive: true, force: true })

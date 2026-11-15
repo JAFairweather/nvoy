@@ -26,7 +26,7 @@ import { instanceId } from './runtime_manifest.mjs'
 import { memoryToolBase } from './agent_memory.mjs'
 import { MEMORY_TOOL_SPECS } from './memory.mjs'
 import { codexTurnText, RECALL_TOOLS } from './harness_session.mjs'
-import { DEFAULT_WAKE_TIMEOUT_MS, runSessionWakeCall, WAKE_MAX_CHARS } from './recall-wake.mjs'
+import { DEFAULT_WAKE_TIMEOUT_MS, processGroupAlive, reapDetachedProcessGroup, runSessionWakeCall, WAKE_MAX_CHARS } from './recall-wake.mjs'
 import { feedCursor, followWakeFeed } from './wake_feed_client.mjs'
 
 // Mirrors codex-channel-mcp.mjs's tools/list, which is what the fleet enforces. pi validates tool
@@ -126,26 +126,13 @@ function piLogin(path, own) {
   return { piHome: home, provider }
 }
 
-function terminateDetachedChild(child, graceMs = 200) {
-  if (!child?.pid) return
-  const signalGroup = sig => {
-    try { process.kill(-child.pid, sig) } catch {}
-    try { child.kill(sig) } catch {}
-  }
-  signalGroup('SIGTERM')
-  if (child.exitCode === null && child.signalCode === null) {
-    const t = setTimeout(() => {
-      if (child.exitCode === null && child.signalCode === null) signalGroup('SIGKILL')
-    }, graceMs)
-    t.unref?.()
-  }
-}
-
 // One ssh child speaking newline-delimited JSON-RPC to the fleet's channel MCP. A call that gets no
-// answer within HARNESS_CHANNEL_CALL_MS ends the child, so a dead carrier cannot hang a turn.
+// answer within HARNESS_CHANNEL_CALL_MS ends the child and its entire process group, so neither a
+// dead carrier nor a TERM-ignoring descendant can survive across calls or turns.
 // The same carrier serves the Hive memory reader: `entry` and `what` name another server.
 export function channelProxy({ config, ssh = SSH, env, log = () => {}, entry = null, what = 'the channel to the fleet' }) {
   const CALL_MS = Number(process.env.HARNESS_CHANNEL_CALL_MS || 30000)
+  const KILL_GRACE_MS = Math.min(120, Math.max(30, Math.floor(CALL_MS / 6)))
   entry ||= { ...sshChannelEntry({ identity: config.identity, knownHosts: config.knownHosts, target: config.target }), command: ssh }
   let current = null, spawned = 0
 
@@ -162,7 +149,12 @@ export function channelProxy({ config, ssh = SSH, env, log = () => {}, entry = n
     child.on('error', error => { drop(); fail(new Error(`${what} did not start: ${error.code || error.message}`)) })
     child.on('close', code => {
       drop()
-      fail(new Error(`${what} closed (${code})${stderr.trim() ? `: ${stderr.trim().split('\n').at(-1).slice(0, 300)}` : ''}`))
+      const err = new Error(`${what} closed (${code})${stderr.trim() ? `: ${stderr.trim().split('\n').at(-1).slice(0, 300)}` : ''}`)
+      if (processGroupAlive(child.pid)) {
+        reapDetachedProcessGroup(child, { graceMs: KILL_GRACE_MS }).finally(() => fail(err))
+      } else {
+        fail(err)
+      }
     })
     child.stdin.on('error', () => {})
     child.stderr.on('data', data => { stderr = (stderr + String(data)).slice(-600) })
@@ -183,7 +175,13 @@ export function channelProxy({ config, ssh = SSH, env, log = () => {}, entry = n
     conn.request = (method, params, signal) => new Promise((done, reject) => {
       if (closed) return reject(new Error(`${what} is closed`))
       const id = nextId++
-      const timer = setTimeout(() => { pending.delete(id); drop(); reject(new Error(`${what} did not answer within ${Math.round(CALL_MS / 1000)}s`)); terminateDetachedChild(child) }, CALL_MS)
+      const timer = setTimeout(() => {
+        pending.delete(id)
+        drop()
+        reapDetachedProcessGroup(child, { graceMs: KILL_GRACE_MS }).finally(() => {
+          reject(new Error(`${what} did not answer within ${Math.round(CALL_MS / 1000)}s`))
+        })
+      }, CALL_MS)
       pending.set(id, { resolve: done, reject, timer })
       signal?.addEventListener?.('abort', () => { if (pending.delete(id)) { clearTimeout(timer); reject(new Error('the tool call was aborted')) } }, { once: true })
       child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n')
@@ -205,9 +203,20 @@ export function channelProxy({ config, ssh = SSH, env, log = () => {}, entry = n
       if (result?.isError) throw new Error(text || `${name} failed`)
       return { content: [{ type: 'text', text }], details: undefined }
     },
-    // The adapter was recreated: the child's ssh is into a container that no longer exists.
-    reset(why) { if (current) { log(`dropping the channel child (${why}); the next call starts a new one`); terminateDetachedChild(current.child); current = null } },
-    close() { if (current) terminateDetachedChild(current.child); current = null },
+    // The adapter was recreated or a wake timed out: reap the entire process group independently of leader exit.
+    reset(why) {
+      if (!current) return Promise.resolve()
+      const prev = current
+      current = null
+      log(`dropping the channel child (${why}); the next call starts a new one`)
+      return reapDetachedProcessGroup(prev.child, { graceMs: KILL_GRACE_MS })
+    },
+    close() {
+      if (!current) return Promise.resolve()
+      const prev = current
+      current = null
+      return reapDetachedProcessGroup(prev.child, { graceMs: KILL_GRACE_MS })
+    },
   }
 }
 
@@ -254,20 +263,35 @@ export function createPiHarness({ pi, config, ssh = SSH, log: logLine }) {
         // Bound the entire session-start wake (initialize + tools/call combined) to HARNESS_WAKE_TIMEOUT_MS
         // (default 25s, matching Claude), rather than letting two 30s channelProxy request stages stack to ~60s.
         const wakeTimeoutMs = Number(process.env.HARNESS_WAKE_TIMEOUT_MS || DEFAULT_WAKE_TIMEOUT_MS)
-        const callWakeBounded = args => {
+        const callWakeBounded = args => new Promise((resolveWake, rejectWake) => {
           const controller = new AbortController()
-          let timer = null
-          const callPromise = reader.call('memory_wake', args, controller.signal)
-          callPromise.catch(() => {})
-          const timeoutPromise = new Promise((_, reject) => {
-            timer = setTimeout(() => {
-              controller.abort()
-              if (!current.stopping && run === current) reader.reset('memory wake timed out')
-              reject(new Error(`the Hive memory reader did not answer within ${Math.max(1, Math.round(wakeTimeoutMs / 1000))}s`))
-            }, wakeTimeoutMs)
-          })
-          return Promise.race([callPromise, timeoutPromise]).finally(() => clearTimeout(timer))
-        }
+          let settled = false
+          const timer = setTimeout(() => {
+            if (settled) return
+            settled = true
+            controller.abort()
+            const cleanup = (!current.stopping && run === current)
+              ? reader.reset('memory wake timed out')
+              : Promise.resolve()
+            cleanup.finally(() => {
+              rejectWake(new Error(`the Hive memory reader did not answer within ${Math.max(1, Math.round(wakeTimeoutMs / 1000))}s`))
+            })
+          }, wakeTimeoutMs)
+          reader.call('memory_wake', args, controller.signal).then(
+            value => {
+              if (settled) return
+              settled = true
+              clearTimeout(timer)
+              resolveWake(value)
+            },
+            err => {
+              if (settled) return
+              settled = true
+              clearTimeout(timer)
+              rejectWake(err)
+            },
+          )
+        })
         current.wake = runSessionWakeCall(callWakeBounded, { maxChars: WAKE_MAX_CHARS }).then(outcome => {
           if (current.stopping || run !== current) return outcome
           current.wakeOutcome = outcome

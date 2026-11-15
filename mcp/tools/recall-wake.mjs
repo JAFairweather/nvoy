@@ -130,15 +130,63 @@ export async function runSessionWakeCall(callWake, { maxChars = WAKE_MAX_CHARS, 
   }
 }
 
-function signalProcessGroup(child, sig) {
-  if (!child?.pid) return
-  try { process.kill(-child.pid, sig) } catch {}
-  try { child.kill(sig) } catch {}
+export function processGroupAlive(pgid) {
+  if (!Number.isInteger(pgid) || pgid <= 1) return false
+  try {
+    process.kill(-pgid, 0)
+    return true
+  } catch (err) {
+    return err?.code === 'EPERM'
+  }
+}
+
+function signalProcessGroup(pgid, child, sig) {
+  if (Number.isInteger(pgid) && pgid > 1) {
+    try { process.kill(-pgid, sig) } catch {}
+  }
+  try { child?.kill(sig) } catch {}
+}
+
+// Reaps a detached child's entire process group (-child.pid) independently of whether the group leader
+// has already exited or exits early on SIGTERM while a TERM-ignoring descendant stays alive.
+export async function reapDetachedProcessGroup(child, { graceMs = 120 } = {}) {
+  const pgid = child?.pid
+  if (!Number.isInteger(pgid) || pgid <= 1) return
+  try { child.stdin?.end() } catch {}
+  try { child.stdout?.destroy() } catch {}
+  try { child.stderr?.destroy() } catch {}
+  const leaderDead = () => child.exitCode !== null || child.signalCode !== null
+  const allGone = () => leaderDead() && !processGroupAlive(pgid)
+  if (allGone()) return
+
+  const waitGoneBounded = ms => new Promise(res => {
+    if (allGone()) { res(true); return }
+    let done = false
+    const settle = val => {
+      if (done) return
+      done = true
+      clearInterval(poll)
+      clearTimeout(deadline)
+      child.removeListener('exit', onExit)
+      res(val)
+    }
+    const onExit = () => { if (allGone()) settle(true) }
+    child.on('exit', onExit)
+    const poll = setInterval(() => { if (allGone()) settle(true) }, 10)
+    const deadline = setTimeout(() => settle(allGone()), Math.max(10, ms))
+  })
+
+  signalProcessGroup(pgid, child, 'SIGTERM')
+  const goneAfterTerm = await waitGoneBounded(graceMs)
+  if (!goneAfterTerm || !allGone()) {
+    signalProcessGroup(pgid, child, 'SIGKILL')
+    await waitGoneBounded(Math.max(50, graceMs))
+  }
 }
 
 // One-shot MCP stdio call against a seat's configured recall server entry ({ command, args, env? }).
-// Spawns the reader in its own process group and enforces bounded SIGTERM -> SIGKILL teardown before
-// settling, so a TERM-ignoring or hung reader cannot accumulate across session starts.
+// Spawns the reader in its own process group and enforces bounded SIGTERM -> SIGKILL teardown across
+// the entire process group (-child.pid) independently of leader exit before settling.
 export function callMcpEntryOnce(entry, name, args = {}, {
   timeoutMs = Number(process.env.HARNESS_WAKE_TIMEOUT_MS || DEFAULT_WAKE_TIMEOUT_MS),
   killGraceMs = Math.min(200, Math.max(40, Math.floor(Number(process.env.HARNESS_WAKE_TIMEOUT_MS || DEFAULT_WAKE_TIMEOUT_MS) / 5))),
@@ -155,36 +203,15 @@ export function callMcpEntryOnce(entry, name, args = {}, {
       LANG: env.LANG || 'C.UTF-8',
       ...(entry.env && typeof entry.env === 'object' && !Array.isArray(entry.env) ? entry.env : {}),
     }
-    let child = null, settled = false, exited = false, out = '', stderr = '', initialized = false
-    const exitWaiters = new Set()
-    const notifyExited = () => {
-      exited = true
-      for (const fn of exitWaiters) fn()
-      exitWaiters.clear()
-    }
-    const waitExitBounded = ms => exited
-      ? Promise.resolve(true)
-      : new Promise(res => {
-          const onExit = () => { clearTimeout(t); res(true) }
-          const t = setTimeout(() => { exitWaiters.delete(onExit); res(exited) }, ms)
-          exitWaiters.add(onExit)
-        })
+    let child = null, settled = false, out = '', stderr = '', initialized = false
 
     const finish = (err, value) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
       ;(async () => {
-        if (child && !exited) {
-          try { child.stdin?.end() } catch {}
-          try { child.stdout?.destroy() } catch {}
-          try { child.stderr?.destroy() } catch {}
-          signalProcessGroup(child, 'SIGTERM')
-          const stoppedOnTerm = await waitExitBounded(killGraceMs)
-          if (!stoppedOnTerm && !exited) {
-            signalProcessGroup(child, 'SIGKILL')
-            await waitExitBounded(Math.max(50, killGraceMs))
-          }
+        if (child?.pid) {
+          await reapDetachedProcessGroup(child, { graceMs: killGraceMs })
         }
         err ? reject(err) : done(value)
       })()
@@ -195,17 +222,13 @@ export function callMcpEntryOnce(entry, name, args = {}, {
     try {
       child = spawn(entry.command, entry.args, { stdio: ['pipe', 'pipe', 'pipe'], env: childEnv, detached: true })
     } catch (err) {
-      exited = true
       finish(new Error(`the Hive memory reader did not start: ${err.code || err.message}`))
       return
     }
-    child.on('exit', () => notifyExited())
     child.on('error', err => {
-      notifyExited()
       finish(new Error(`the Hive memory reader did not start: ${err.code || err.message}`))
     })
     child.on('close', code => {
-      notifyExited()
       const tail = stderr.trim() ? `: ${stderr.trim().split('\n').at(-1).slice(0, 240)}` : ''
       finish(new Error(`the Hive memory reader closed (${code})${tail}`))
     })
