@@ -41,6 +41,17 @@ reports his public key
 `4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b287ea84d`.
 The runner checks that identity itself before its `--apply` signs anything.
 
+**Before the first 441, check the console's actual relay configuration.** Open
+Settings → Relays on that device. Its list must include all four grant relays,
+spelled exactly `wss://relay.nave.pub`, `wss://relay.ditto.pub`,
+`wss://nos.lol`, and `wss://relay.primal.net`. The four are defaults, but this
+device may have a saved override. If any is absent, use *Restore defaults* or
+add it and *Save & reload*, then reopen Settings and check the loaded list.
+Stop before signing until the four are present. Keep this configuration for
+the manual revoke and task-grant batches; run the fresh dry-run after each
+signature as below. The console can report a successful publish after one
+relay acknowledges, so its success message alone is never the read-back.
+
 Before any batch, require `broker_gaps_safe_or_recoverable: true`,
 `anchor_gaps_recoverable: true`, and inspect `missing_on_anchor` and
 `missing_on_all_broker_relays`. A missing event is acceptable only when the
