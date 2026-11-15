@@ -296,3 +296,26 @@ export function queuePost(manifest, args, now = Date.now()) {
     return { ok: { queued: true, request: row.id, channel: row.channel, mention: row.mention, ...notMentioned(manifest.mayPost, resolved.unresolved, resolved.channel) } }
   } catch (error) { return { error: { code: 'NVOY_POST_QUEUE_FAILED', message: error.message } } }
 }
+
+// A frozen post keeps its original created_at across retries (instance-broker-post.mjs). Once the
+// Buzz relay rejects that timestamp as too far from server time and the event is not in the future,
+// republishing the same signed record can never succeed (q-169).
+export const STALE_POST_TERMINAL_LINE = 'Buzz rejected the frozen post as stale timestamp; no retry can change it'
+export function isStalePostTimestampRefusal(message, createdAtSec, nowSec = Math.floor(Date.now() / 1000)) {
+  return /^invalid:\s*event timestamp too far from server time(?:\b|$)/i.test(String(message || '').trim()) &&
+    Number.isSafeInteger(createdAtSec) && createdAtSec <= nowSec
+}
+export function isTerminalPostFailure(stderr) {
+  const text = String(stderr || '')
+  return /post refused:|post request has an invalid|post record does not bind/.test(text) ||
+    text.includes(STALE_POST_TERMINAL_LINE)
+}
+export function terminalPostReason(stderr) {
+  const text = String(stderr || '')
+  return text.includes(STALE_POST_TERMINAL_LINE) ? 'stale-event-timestamp'
+    : text.includes('withheld: ') ? 'withheld-credential'
+    : text.includes('over the hourly cap') ? 'post-cap'
+    : text.includes('post record does not bind') ? 'unbound-record'
+    : text.includes('post request has an invalid') ? 'invalid-request'
+    : 'post-refused'
+}

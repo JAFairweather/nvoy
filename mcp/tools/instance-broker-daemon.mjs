@@ -14,6 +14,7 @@ import { isTerminalReplyFailure, loadTerminalReplyIds, recordTerminalReply, term
 import { childVerdict } from './broker_verdict.mjs'
 import { finishedProfileRequests, PROFILE_PUBLIC_RETRY_EXIT } from './agent_profile.mjs'
 import { MEMORY_REQUEST_FILE, memoryQueueDir } from './agent_memory.mjs'
+import { isTerminalPostFailure, terminalPostReason } from './agent_post.mjs'
 import { firstRows, postPublished, replyFinished } from './broker_done.mjs'
 
 const die = m => { console.error(`instance-broker-daemon: ${m}`); process.exit(1) }
@@ -47,7 +48,6 @@ try {
     try { const x = JSON.parse(line); if (x?.type === 'terminal-post' && /^[0-9a-f]{32}$/.test(String(x.id))) postDone.add(x.id) } catch { /* partial line */ }
   }
 } catch (e) { if (e.code !== 'ENOENT') die(`cannot load terminal post log: ${e.message}`) }
-const isTerminalPost = stderr => /post refused:|post request has an invalid|post record does not bind/.test(stderr)
 // Agent memory writes (memory_claim, memory_withdraw), terminal on the same terms as posts.
 const terminalMemoryPath = resolve(manifest.stateDir, 'terminal-memory.jsonl')
 const memoryDone = new Set()
@@ -175,11 +175,19 @@ function drainPosts() {
       '--instance', manifest.id, '--request', request], { env: childEnv, encoding: 'utf8', timeout: 90000 })
     const stderr = String(r.stderr || '').trim()
     if (r.status === 0) { postDone.add(request); proposalRetryAfter.ok(key); if (/^instance-broker-post: posted/.test(r.stdout)) console.log(r.stdout.trim()); continue }
-    if (isTerminalPost(stderr)) {
-      postDone.add(request)
-      try { appendFileSync(terminalPostsPath, JSON.stringify({ version: 1, type: 'terminal-post', id: request, at: Date.now() }) + '\n', { mode: 0o600 }) }
-      catch (e) { console.error(`instance-broker-daemon: cannot record terminal post ${request.slice(0, 12)}…: ${e.message}`) }
-      console.error(`instance-broker-daemon: post ${request.slice(0, 12)}… terminal: ${stderr.replace(/^instance-broker-post: /, '')}`)
+    if (isTerminalPostFailure(stderr)) {
+      const reason = terminalPostReason(stderr)
+      try {
+        appendFileSync(terminalPostsPath, JSON.stringify({ version: 1, type: 'terminal-post', id: request, reason, at: Date.now() }) + '\n', { mode: 0o600 })
+        postDone.add(request)
+        proposalRetryAfter.ok(key)
+      } catch (e) {
+        proposalRetryAfter.fail(key)
+        console.error(`instance-broker-daemon: cannot record terminal post ${request.slice(0, 12)}…: ${e.message}`)
+        continue
+      }
+      const audit = stderr.split('\n').map(l => l.replace(/^instance-broker-post:\s*/, '').trim()).filter(Boolean).join(' | ')
+      console.error(`instance-broker-daemon: post ${request.slice(0, 12)}… terminal: ${audit}`)
       continue
     }
     proposalRetryAfter.fail(key)

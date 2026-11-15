@@ -20,7 +20,7 @@ import { brokerSigner } from './broker_signer.mjs'
 import { channelPost, openBuzzSession } from './buzz_native.mjs'
 import { replyRequestDigest } from './outbound_record.mjs'
 import { countInWindow } from './agent_limits.mjs'
-import { POST_ONLY_REPLY, offList, postQueuePath, recordMentionGrants, validatePostRequest, withMentionGrants } from './agent_post.mjs'
+import { POST_ONLY_REPLY, STALE_POST_TERMINAL_LINE, isStalePostTimestampRefusal, offList, postQueuePath, recordMentionGrants, validatePostRequest, withMentionGrants } from './agent_post.mjs'
 import { confirmMembers, readRooms, recordMentionRooms } from './room_roster.mjs'
 import { contentHash, credentialIn, withheldMessage } from './outbound_secrets.mjs'
 
@@ -125,12 +125,20 @@ if (!record.event) {
   record.event = ev
   persist()
 }
-let accepted = 0
+let accepted = 0, staleRefusal = false
 try {
   session ??= await openBuzzSession({ relay: manifest.buzz.relay, signer })
-  try { const r = await session.publishSigned(record.event); if (r.accepted) accepted = 1; else console.error(`instance-broker-post: Buzz refused the post: ${r.message}`) }
+  try {
+    const r = await session.publishSigned(record.event)
+    if (r.accepted) accepted = 1
+    else {
+      console.error(`instance-broker-post: Buzz refused the post: ${r.message}`)
+      staleRefusal = isStalePostTimestampRefusal(r.message, record.event.created_at)
+    }
+  }
   finally { session.close(); session = null }
 } catch (e) { console.error(`instance-broker-post: Buzz relay unavailable: ${e.message}`) }
+if (!accepted && staleRefusal) die(STALE_POST_TERMINAL_LINE)
 if (!accepted) die('the Buzz relay did not accept the persisted post; it remains retryable')
 record.published = true; record.published_at = Date.now(); record.accepted = accepted
 persist()
