@@ -207,6 +207,11 @@ const readSocket = '/run/nvoy-recall-gw/socket'
 writeFileSync(join(recallInstances, 'door-ok.json'), JSON.stringify(manifest('door-ok', { service_user: 'nvoy_door_ok', may_recall: { read: { socket: readSocket }, gateway_gid: gid + 20 } })))
 const withRecall = render(recallInstances, 'door-ok'), recallRoot = realpathSync(recallInstances)
 const service = (out, name) => (out.split(new RegExp(`^  ${name}:$`, 'm'))[1] || '').split(/^  [a-z_-]+:$|^  #|^[a-z]/m)[0].trimEnd()
+ok('rendered seat services carry the sampled fleet memory caps',
+  withDoor.status === 0 && withoutDoor.status === 0 &&
+  Object.entries({ watcher: '192m', broker: '384m', adapter: '256m', door: '128m' })
+    .every(([name, limit]) => service(withDoor.stdout, name).includes(`mem_limit: ${limit}`)) &&
+  !/^  door:$/m.test(withoutDoor.stdout))
 const sources = chunk => [...chunk.matchAll(/^\s+source: (.+)$/gm)].map(x => x[1])
 const recallService = service(withRecall.stdout, 'recall')
 ok('a may_recall manifest renders the recall forwarder as the broker UID', withRecall.status === 0 &&

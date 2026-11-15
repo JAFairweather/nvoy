@@ -7,6 +7,9 @@
 # mounts source credentials only into the root-only initializer. It creates
 # role-owned copies in separate private volumes: Bunker credentials for the broker, and,
 # on a worker-enabled instance only, the model-provider credential for the worker.
+# The limits below use one 22:45 UTC Docker sample on 15 Nov 2026 (Buzz event 07d20474).
+# That sample is a floor, not a peak. Optional session roles and init had no
+# role-specific measurement, so they receive no arbitrary memory cap here.
 
 # Renderer binds this Compose project name to the immutable instance ID. Named volumes are then
 # namespaced per identity even when every rendered file is launched from the same directory.
@@ -109,6 +112,8 @@ services:
 
   watcher:
     image: ${NVOY_IMAGE:?set NVOY_IMAGE}
+    # 22:45 UTC fleet sample: 11 watchers, max 72 MiB. Allow >2x the observed use.
+    mem_limit: 192m
     user: "${WATCHER_UID:?}:${BROKER_ADAPTER_GID:?}"
     read_only: true
     cap_drop: [ALL]
@@ -132,6 +137,8 @@ services:
 
   broker:
     image: ${NVOY_IMAGE:?set NVOY_IMAGE}
+    # 22:45 UTC fleet sample: 11 brokers, max 152 MiB. Leave replay headroom.
+    mem_limit: 384m
     user: "${BROKER_UID:?}:${BROKER_ADAPTER_GID:?}"
     read_only: true
     cap_drop: [ALL]
@@ -175,6 +182,8 @@ services:
 
   adapter:
     image: ${NVOY_IMAGE:?set NVOY_IMAGE}
+    # 22:45 UTC fleet sample: 11 adapters, max 107 MiB.
+    mem_limit: 256m
     # Declared, not derived. The installed channel forced command must `docker exec` this exact
     # name, so it comes from the manifest rather than Compose's project/service/index rule (#154).
     container_name: ${ADAPTER_CONTAINER:?}
@@ -280,6 +289,8 @@ services:
   # no model login. Outbound HTTPS goes over the stack's default network.
   notifier:
     image: ${NVOY_IMAGE:?set NVOY_IMAGE}
+    # 22:45 UTC fleet sample: notifiers used 21 MiB each.
+    mem_limit: 128m
     user: "${WORKER_UID:?}:${WORKER_HANDOFF_GID:?}"
     init: true
     read_only: true
@@ -321,6 +332,8 @@ services:
   # reverse proxy's network, which terminates TLS and reaches it as <container_name>:8790.
   door:
     image: ${NVOY_IMAGE:?set NVOY_IMAGE}
+    # 22:45 UTC fleet sample: doors used 29 MiB each.
+    mem_limit: 128m
     container_name: nvoy-${INSTANCE_ID:?}-door
     user: "${WORKER_UID:?}:${WORKER_HANDOFF_GID:?}"
     init: true
