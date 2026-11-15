@@ -66,11 +66,15 @@ count to force if the live fold changes.
 
 ## Operator sequence with today's tools
 
-1. **Revokes.** In the Nvoy console Ledger, paste each of the six full
-   `grant_id` values from the TSV into the search field and open that external
-   grant. Check the grantee and `task`
-   capability against the row before James confirms *Revoke*. The console
-   builds a public 441 against that ID. Do one row at a time. After each, run
+1. **Revokes.** In the Nvoy console Ledger, paste one full 64-hex `grant_id`
+   from the TSV into the search field and require **1 shown**. Expand the
+   collapsed **Agents** or **Holds a grant · not registered** section, then
+   expand its grantee row to reveal the single **Tasking authority** (`task`)
+   card. Check the grantee against the TSV row while the full-ID search and
+   **1 shown** remain visible, then click **Revoke now** and confirm. The card
+   header abbreviates the ID, so never revoke by browsing a grantee's group
+   without that active full-ID filter. The console builds a public 441 against
+   the filtered grant ID. Do one row at a time. After each, run
    the read-only command above. Continue only after `revoke-task` falls by one
    on both folded sides; after all six, it must be absent from `pending`.
    A console success message alone proves only its publish call, so the fresh
@@ -78,11 +82,15 @@ count to force if the live fold changes.
    sequence. Do not sign a replacement: the runner can find the same signed
    event, but its present `--apply` would also sign the other pending batches.
 
-2. **Fleet task grants.** The console's task-authority screen can sign a
-   prefilled `task` grant for one instructor and target at a time. Use the
-   `holder_pubkey` as sender and `target_pubkey` as agent from each
-   `grant-task` row; start with Neil → DJ Codex. Check the displayed pair and
-   capability before James signs. Re-run the read-only command after each
+2. **Fleet task grants.** In the console, open **Agents**, click a registered
+   agent card, then under **Actions granted** click **＋ Give task authority…**
+   to open the drawer. A query prefill alone does not open it. For each
+   `grant-task` row, enter the raw 64-hex `holder_pubkey` in **May task** and
+   the raw 64-hex `target_pubkey` in **Agent**; the card used to open the drawer
+   need not be that target. Set **Can do** to **Task — wake and reply**. Start
+   with Neil → DJ Codex. Check both full keys and the capability against the
+   TSV, click **Review and sign authority**, then check the browser's confirm
+   dialog before James signs. Re-run the read-only command after each
    small group and require `grant-task` to decrease; when all 97 are done, it
    must be absent from `pending`. If a grant reached only one side, stop this
    manual sequence; it needs delivery of its existing signed event, not a
