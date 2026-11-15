@@ -49,9 +49,9 @@ export function foldOnboardGrants(events, { grantors, verify, scopeHash, nowSec 
     try { ok = verify(JSON.parse(JSON.stringify(ev))) === true } catch { ok = false }
     if (!ok) { rejected++; continue }
     if (ev.kind === REVOKE_KIND) {
-      // Kept with its author: only the grant's own grantor can revoke it.
-      const id = one(ev, 'e')
-      if (id) revoked.add(`${author}:${id}`)
+      // Kept with its author: only the grant's own grantor can revoke it. Every target it names, not
+      // only the first (CAPABILITY-GRANTS.md §1.1, neg-441-multi-e).
+      for (const t of ev.tags || []) if (t?.[0] === 'e' && typeof t[1] === 'string' && t[1]) revoked.add(`${author}:${t[1]}`)
       continue
     }
     if (one(ev, 'da-cap') !== ONBOARD_CAP) continue

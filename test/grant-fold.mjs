@@ -7,7 +7,7 @@ import { mkdirSync, mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
-import { foldGrants, scopeHash } from '../mcp/tools/grant_fold.mjs'
+import { foldGrants, foldMemoryGrants, scopeHash } from '../mcp/tools/grant_fold.mjs'
 
 let fails = 0, passes = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); value ? passes++ : fails++ }
@@ -97,6 +97,25 @@ r = fold([granted, forgedRevoke])
 ok('a backdated revocation with a bad signature revokes nothing, and is counted rejected', r.live.has(dennis.pk) && r.rejected === 1)
 ok('a revocation of another grant leaves this one live', fold([granted, revoke(director, own.id, now() - 1000)]).live.has(dennis.pk))
 ok('a later re-grant after a revocation is live', fold([granted, backdated, task(director, dennis.pk, 'task', { at: now() - 10 })]).live.has(dennis.pk))
+
+// --- one 441 naming several grants revokes every one (CAPABILITY-GRANTS.md §1.1, fixture neg-441-multi-e) ---
+// Before this, each fold read only the first `e` tag, so a grant named second stayed live after its revocation.
+const multi = (signer, ids, at = now() - 50) => ev(signer, 441, ids.map(id => ['e', id]), at)
+const ga = task(director, dennis.pk, 'task'), gb = task(director, voice2.pk, 'task+act')
+r = fold([ga, gb, multi(director, [ga.id, gb.id])])
+ok('a 441 naming two grants revokes the first', !r.live.has(dennis.pk) && r.ended.get(dennis.pk) === 'revoked')
+ok('and the second', !r.live.has(voice2.pk) && r.ended.get(voice2.pk) === 'revoked')
+ok('a 441 naming another grant first still revokes the one named second', !fold([ga, multi(director, [own.id, ga.id])]).live.has(dennis.pk))
+ok("a stranger's multi-target 441 revokes none of them", fold([ga, gb, multi(stranger, [ga.id, gb.id])]).live.size === 2)
+const forgedMulti = JSON.parse(JSON.stringify({ ...multi(director, [ga.id]), tags: [['e', ga.id], ['e', gb.id]] }))
+r = fold([ga, gb, forgedMulti])
+ok('an e tag added after signing revokes nothing', r.live.has(dennis.pk) && r.live.has(voice2.pk) && r.rejected === 1)
+const ma = shadow(director, voice.pk), mb = shadow(director, voice2.pk)
+const mem = events => foldMemoryGrants(events, { owner: director.pk })
+ok('the memory fold sees both shadow grants unrevoked', mem([ma, mb]).writers.size === 2)
+r = mem([ma, mb, multi(director, [ma.id, mb.id])])
+ok('a 441 naming two memory grants revokes both', r.writers.size === 0 && r.ended.get(voice.pk) === 'revoked' && r.ended.get(voice2.pk) === 'revoked')
+ok('the memory fold honors a target named second', !mem([mb, multi(director, [ma.id, mb.id])]).writers.has(voice2.pk))
 
 // --- attention --policy-only, as every broker and the reply recheck call it ---
 const grants = [own, sh, task(director, dennis.pk), shadow(stranger, voice2.pk)]

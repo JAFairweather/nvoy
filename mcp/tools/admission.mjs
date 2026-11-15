@@ -49,6 +49,9 @@ export function nativeGrant({ author, dm, grants, grantors }) {
 }
 
 const tag = (ev, name) => (ev.tags || []).find(t => t[0] === name)
+// Every target a 441 names. A revocation that names two grants revokes both: honoring only the first
+// would leave a revoked grant live (CAPABILITY-GRANTS.md §1.1, fixture neg-441-multi-e).
+export const revokedIds = ev => (Array.isArray(ev?.tags) ? ev.tags : []).filter(t => t?.[0] === 'e' && typeof t[1] === 'string' && t[1]).map(t => t[1])
 
 // foldGrants without node:crypto: the caller supplies scopeHash(subjectHex, saltHex), so a browser can
 // fold with the same code the broker runs. grant_fold.mjs binds the node implementation.
@@ -77,8 +80,7 @@ export function foldGrantsWith(events, { me, grantors, scopeHash }) {
   const revoked = new Set()
   for (const ev of sorted) {
     if (ev.kind !== 441 || !by.includes(String(ev.pubkey || '').toLowerCase()) || !verified(ev)) continue
-    const id = tag(ev, 'e')?.[1]
-    if (id) revoked.add(id)
+    for (const id of revokedIds(ev)) revoked.add(id)
   }
   for (const ev of sorted) {
     const author = String(ev.pubkey || '').toLowerCase()
@@ -177,11 +179,12 @@ export function foldMemoryGrantsWith(events, {
   }
 
   for (const rev of revocations) {
-    const id = tag(rev, 'e')?.[1]
-    const held = id ? activeById.get(id) : null
-    if (held) {
-      activeById.delete(id)
-      markEnded(held.grantee, 'revoked')
+    for (const id of revokedIds(rev)) {
+      const held = activeById.get(id)
+      if (held) {
+        activeById.delete(id)
+        markEnded(held.grantee, 'revoked')
+      }
     }
   }
 
