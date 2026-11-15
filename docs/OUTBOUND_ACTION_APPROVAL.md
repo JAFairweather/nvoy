@@ -104,14 +104,25 @@ neither.
 
 Proposals bound to a discrete `approval_id`, `channel-carry-direct` NIP-17 seals, and standalone
 `nvoy_channel_post` records keep one immutable frozen event ID across retries and never mint a
-second signature. For `buzz-native-direct` channel replies only, the frozen `kind:9` is republished
-unchanged while fresh (`< 900s`), and if a transient community-relay disconnect or stale-timestamp
-refusal prevents confirmation, the broker may sign a replacement `kind:9` (identical channel, parent
-tags, hop, mentions, and content with a fresh `created_at`) only after checking on the authenticated
-Buzz session that the prior event ID was not stored and re-verifying the complete live grant chain
-(sender `task`/`task+act` grant, dynamic `mention` grants, and room-derived membership) immediately
-before opening the signer. If any link in that live authority was revoked or left the room in the
-interval, replacement signing fails closed before `signEvent` is called.
+second signature. For `buzz-native-direct` channel replies only, the frozen `kind:9` is published
+unchanged while younger than the proactive refresh threshold (`BUZZ_FRESH_WINDOW_SEC = 600s`). A
+replacement `kind:9` (identical channel, parent tags, hop, mentions, and content with a fresh
+`created_at`) may be signed only in three bounded cases:
+- **Proactive refresh (`|now - created_at| >= 600s`):** if a prior signed event ID exists on disk,
+  the broker first queries the authenticated Buzz session and skips signing if that ID is already
+  stored; an unsigned stale record has no prior ID on the relay and signs once.
+- **Ambiguous mid-publish disconnect / timeout:** if the prior event may already have left the
+  socket (`sent !== false` and a signed event ID exists), the broker reconnects and queries the
+  authenticated Buzz session first, skipping replacement if the prior ID is already stored.
+- **Explicit stale-timestamp refusal (`OK ... false "invalid: ... timestamp ..."`):** the community
+  relay's `OK false` verdict directly confirms that the attempted event was rejected and not stored,
+  so the broker refreshes without a redundant prior-ID lookup.
+
+In every replacement case above, `verifyLiveNativePolicy()` re-verifies the complete live grant
+chain (sender `task`/`task+act` grant, dynamic `mention` grants, and room-derived membership on the
+active Buzz session) immediately before opening the signer. If any link in that live authority was
+revoked or left the room in the interval, replacement signing fails closed before `signEvent` is
+called.
 
 ## Direct MCP tools
 
