@@ -141,10 +141,14 @@ def open_regular_nofollow(
             fail(f"{label}: must be a regular non-symlink file")
         if st.st_uid != os.geteuid():
             fail(f"{label}: unexpected file owner")
-        if secret_mode and (st.st_mode & 0o077) != 0:
-            fail(f"{label}: credential file must be mode 0600 (no group/world access)")
-        if not secret_mode and (st.st_mode & 0o022) != 0:
-            fail(f"{label}: manifest file must not be group/world-writable")
+        file_mode = stat.S_IMODE(st.st_mode)
+        if secret_mode and file_mode not in (0o400, 0o600):
+            fail(
+                f"{label}: credential file must be mode 0600 or 0400 "
+                "(owner-only, no execute or group/world access)"
+            )
+        if not secret_mode and ((file_mode & 0o022) != 0 or (file_mode & 0o400) == 0):
+            fail(f"{label}: manifest file must be owner-readable and not group/world-writable")
         if st.st_size <= 0 or st.st_size > max_bytes:
             fail(f"{label}: unexpected file size")
         chunks: list[bytes] = []
@@ -201,6 +205,9 @@ def atomic_write_nofollow(
                 fail(f"{label}: target disappeared before write")
             if (
                 not stat.S_ISREG(cur.st_mode)
+                or stat.S_IMODE(cur.st_mode) != stat.S_IMODE(expected_stat.st_mode)
+                or cur.st_uid != expected_stat.st_uid
+                or cur.st_gid != expected_stat.st_gid
                 or cur.st_dev != expected_stat.st_dev
                 or cur.st_ino != expected_stat.st_ino
                 or cur.st_size != expected_stat.st_size
@@ -211,7 +218,7 @@ def atomic_write_nofollow(
             fd = os.open(
                 tmp_name,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-                mode,
+                0o600,
                 dir_fd=dir_fd,
             )
             tmp_created = True
@@ -219,13 +226,13 @@ def atomic_write_nofollow(
             fail(f"{label}: cannot create temporary file")
         try:
             try:
-                os.fchmod(fd, mode)
-                if os.geteuid() == 0:
-                    os.fchown(fd, uid, gid)
                 view = memoryview(data)
                 written = 0
                 while written < len(data):
                     written += os.write(fd, view[written:])
+                os.fchmod(fd, mode)
+                if os.geteuid() == 0:
+                    os.fchown(fd, uid, gid)
                 os.fsync(fd)
             except OSError:
                 fail(f"{label}: failed staging temporary file")
@@ -759,8 +766,11 @@ def verify_restored_files(
         secret_mode=False,
         label="DEPLOYED_MANIFESTS.json post-rollback check",
     )
-    if dm_bytes != deployed_manifests_orig or stat.S_IMODE(dm_stat.st_mode) != stat.S_IMODE(
-        deployed_manifests_stat.st_mode
+    if (
+        dm_bytes != deployed_manifests_orig
+        or stat.S_IMODE(dm_stat.st_mode) != stat.S_IMODE(deployed_manifests_stat.st_mode)
+        or dm_stat.st_uid != deployed_manifests_stat.st_uid
+        or dm_stat.st_gid != deployed_manifests_stat.st_gid
     ):
         fail("DEPLOYED_MANIFESTS.json post-rollback check: restored bytes or mode mismatch")
     for plan in touched:
@@ -770,19 +780,30 @@ def verify_restored_files(
             secret_mode=False,
             label=f"{plan.seat} manifest post-rollback check",
         )
-        if m_bytes != plan.manifest_orig or stat.S_IMODE(m_stat.st_mode) != stat.S_IMODE(
-            plan.manifest_stat.st_mode
+        if (
+            m_bytes != plan.manifest_orig
+            or stat.S_IMODE(m_stat.st_mode) != stat.S_IMODE(plan.manifest_stat.st_mode)
+            or m_stat.st_uid != plan.manifest_stat.st_uid
+            or m_stat.st_gid != plan.manifest_stat.st_gid
         ):
             fail(f"{plan.seat} manifest post-rollback check: restored bytes or mode mismatch")
         if plan.bunker_path is not None and plan.bunker_orig is not None:
-            b_bytes, _ = open_regular_nofollow(
+            assert plan.bunker_stat is not None
+            b_bytes, b_stat = open_regular_nofollow(
                 plan.bunker_path,
                 max_bytes=MAX_CREDENTIAL_BYTES,
                 secret_mode=True,
                 label=f"{plan.seat} credential post-rollback check",
             )
-            if b_bytes != plan.bunker_orig:
-                fail(f"{plan.seat} credential post-rollback check: restored bytes mismatch")
+            if (
+                b_bytes != plan.bunker_orig
+                or stat.S_IMODE(b_stat.st_mode) != stat.S_IMODE(plan.bunker_stat.st_mode)
+                or b_stat.st_uid != plan.bunker_stat.st_uid
+                or b_stat.st_gid != plan.bunker_stat.st_gid
+            ):
+                fail(
+                    f"{plan.seat} credential post-rollback check: restored bytes or mode mismatch"
+                )
 
 
 def apply_changes(
@@ -855,7 +876,7 @@ def apply_changes(
                     atomic_write_nofollow(
                         plan.bunker_path,
                         plan.bunker_next,
-                        mode=0o600,
+                        mode=stat.S_IMODE(plan.bunker_stat.st_mode),
                         uid=plan.bunker_stat.st_uid,
                         gid=plan.bunker_stat.st_gid,
                         expected_stat=plan.bunker_stat,
@@ -930,7 +951,7 @@ def apply_changes(
                     atomic_write_nofollow(
                         plan.bunker_path,
                         plan.bunker_orig,
-                        mode=0o600,
+                        mode=stat.S_IMODE(plan.bunker_stat.st_mode),
                         uid=plan.bunker_stat.st_uid,
                         gid=plan.bunker_stat.st_gid,
                         expected_stat=None,

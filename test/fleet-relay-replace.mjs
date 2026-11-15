@@ -481,8 +481,15 @@ def _fsync(fd):
                 raise OSError(errno.EIO, "injected post-replace dir fsync fault")
             if _calls == 2:
                 res = _real_fsync(fd)
-                Path(_TARGET).write_bytes(cur + b" ")
                 os.chmod(_TARGET, 0o600 if _TARGET.endswith(".bunker-uri") else 0o644)
+                Path(_TARGET).write_bytes(cur + b" ")
+                return res
+        if _MODE == "drift_mode_restore":
+            if _calls == 1:
+                raise OSError(errno.EIO, "injected post-replace dir fsync fault")
+            if _calls == 2:
+                res = _real_fsync(fd)
+                os.chmod(_TARGET, 0o600)
                 return res
     return _real_fsync(fd)
 
@@ -495,6 +502,9 @@ if _TARGET and _MODE:
 
   const restoreCleanSnapshot = () => {
     writeFileSync(join(instances, 'dj-codex.json'), preRollbackManifest, { mode: 0o644 })
+    if (existsSync(join(creds, 'dj-codex.bunker-uri'))) {
+      chmodSync(join(creds, 'dj-codex.bunker-uri'), 0o600)
+    }
     writeFileSync(join(creds, 'dj-codex.bunker-uri'), preRollbackBunker, { mode: 0o600 })
     chmodSync(join(creds, 'dj-codex.bunker-uri'), 0o600)
     writeFileSync(join(state, 'DEPLOYED_MANIFESTS.json'), preRollbackRecorded, { mode: 0o644 })
@@ -614,11 +624,86 @@ if _TARGET and _MODE:
     ok('post-rollback byte verification retains .deploy-lock and omits restored message on unverified disk bytes',
       res.status !== 0 &&
       /UNSAFE: rollback incomplete/.test(res.stderr) &&
-      /restored bytes mismatch/.test(res.stderr) &&
+      /restored bytes or mode mismatch/.test(res.stderr) &&
       !/restored original files/.test(res.stderr) &&
       noLeak(res) &&
       existsSync(join(state, '.deploy-lock')),
       res.stderr)
+    restoreCleanSnapshot()
+  }
+
+  // 9e. Accepted 0400 credential mode is preserved across rollback (manifest fault after credential write).
+  {
+    chmodSync(join(creds, 'dj-codex.bunker-uri'), 0o400)
+    const { res, obs } = runFaultCase(join(instances, 'dj-codex.json'), 'once')
+    ok('accepted 0400 credential mode is preserved across rollback and verified before clearing .deploy-lock',
+      res.status !== 0 &&
+      obs.mutated_at_first_fault === true &&
+      obs.post_replace_calls === 2 &&
+      /restored original files/.test(res.stderr) &&
+      !/UNSAFE: rollback incomplete/.test(res.stderr) &&
+      noLeak(res) &&
+      !existsSync(join(state, '.deploy-lock')) &&
+      readFileSync(join(creds, 'dj-codex.bunker-uri'), 'utf8') === preRollbackBunker &&
+      (lstatSync(join(creds, 'dj-codex.bunker-uri')).mode & 0o777) === 0o400 &&
+      readFileSync(join(instances, 'dj-codex.json'), 'utf8') === preRollbackManifest,
+      res.stderr)
+    restoreCleanSnapshot()
+  }
+
+  // 9f. Post-rollback mode verification retains .deploy-lock if a 0400 credential drifts to 0600 on restore.
+  {
+    chmodSync(join(creds, 'dj-codex.bunker-uri'), 0o400)
+    const { res } = runFaultCase(join(creds, 'dj-codex.bunker-uri'), 'drift_mode_restore')
+    ok('post-rollback mode verification retains .deploy-lock and omits restored message when 0400 credential drifts to 0600',
+      res.status !== 0 &&
+      /UNSAFE: rollback incomplete/.test(res.stderr) &&
+      /restored bytes or mode mismatch/.test(res.stderr) &&
+      !/restored original files/.test(res.stderr) &&
+      noLeak(res) &&
+      existsSync(join(state, '.deploy-lock')),
+      res.stderr)
+    restoreCleanSnapshot()
+  }
+
+  // 9g. Non-standard credential mode (e.g. 0700) is rejected before writing any files.
+  {
+    chmodSync(join(creds, 'dj-codex.bunker-uri'), 0o700)
+    const badMode = runReplace([
+      '--instance', 'dj-codex',
+      '--from-relay', 'wss://relay.nave.pub',
+      '--to-relay', 'wss://relay.ditto.pub',
+      '--apply',
+    ])
+    ok('0700 executable credential mode is rejected safely before mutating files',
+      badMode.status !== 0 &&
+      /credential file must be mode 0600 or 0400/.test(badMode.stderr) &&
+      noLeak(badMode) &&
+      !existsSync(join(state, '.deploy-lock')) &&
+      readFileSync(join(creds, 'dj-codex.bunker-uri'), 'utf8') === preRollbackBunker &&
+      readFileSync(join(instances, 'dj-codex.json'), 'utf8') === preRollbackManifest,
+      badMode.stderr)
+    restoreCleanSnapshot()
+  }
+
+  // 9h. Accepted 0400 credential mode is preserved across a successful --apply rewrite.
+  {
+    chmodSync(join(creds, 'dj-codex.bunker-uri'), 0o400)
+    const ok0400 = runReplace([
+      '--instance', 'dj-codex',
+      '--from-relay', 'wss://relay.nave.pub',
+      '--to-relay', 'wss://relay.ditto.pub',
+      '--apply',
+    ])
+    const summary0400 = ok0400.status === 0 ? JSON.parse(ok0400.stdout) : null
+    ok('accepted 0400 credential mode is preserved as 0400 across successful --apply rewrite',
+      ok0400.status === 0 &&
+      summary0400?.changed_count === 1 &&
+      noLeak(ok0400) &&
+      !existsSync(join(state, '.deploy-lock')) &&
+      (lstatSync(join(creds, 'dj-codex.bunker-uri')).mode & 0o777) === 0o400 &&
+      readFileSync(join(creds, 'dj-codex.bunker-uri'), 'utf8').includes('relay.ditto.pub'),
+      ok0400.stderr || ok0400.stdout)
     restoreCleanSnapshot()
   }
 } finally {
