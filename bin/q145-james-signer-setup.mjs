@@ -28,6 +28,8 @@ export function options(argv) {
   // Every argument, flag or value, is checked before any is used, so a connection pasted as a path
   // never reaches mkdir, the filesystem or an error. It is already in shell history; say so without quoting it.
   if (argv.some(arg => /bunker:|nostrconnect:|secret=/i.test(String(arg)))) throw new Error('never put the Bunker connection on the command line; paste it only at the hidden prompt, and clear it from your shell history')
+  // A key pasted where a path belongs would become a file name and be printed back; refuse it the same way.
+  if (argv.some(arg => /nsec1|ncryptsec1|(^|[^0-9a-f])[0-9a-f]{64}($|[^0-9a-f])/i.test(String(arg)))) throw new Error('never put a key on the command line; pass file paths only, and clear it from your shell history')
   for (let i = 0; i < argv.length; i++) {
     const key = argv[i]
     if (key === '--new-uri') out['new-uri'] = true
@@ -35,7 +37,7 @@ export function options(argv) {
       const value = argv[++i]
       if (!value || value.startsWith('--')) throw new Error(`${key} needs a path`)
       out[key.slice(2)] = resolve(value)
-    } else throw new Error(`unknown option ${key}`)
+    } else throw new Error(/^--[a-z][a-z-]{0,30}$/.test(String(key)) ? `unknown option ${key}` : 'unknown argument (not shown)')
   }
   if (out['uri-file'] === out['client-file']) throw new Error('--uri-file and --client-file must differ')
   return out
@@ -50,6 +52,13 @@ export function checkBunkerUri(text) {
   try { uri = new URL(value) } catch { throw new Error('that bunker:// connection does not parse; nothing stored') }
   if (!uri.searchParams.getAll('relay').some(v => /^wss:\/\//.test(v))) throw new Error('that bunker:// connection names no wss relay; nothing stored')
   return value
+}
+
+// The directory holding a credential must be a real directory, owned by this user, closed to others.
+export function assertPrivateDir(path, stat = lstatSync(path), uid = process.getuid?.()) {
+  if (!stat.isDirectory()) throw new Error(`${path} is not a directory (a link is refused)`)
+  if (uid !== undefined && stat.uid !== uid) throw new Error(`${path} is not owned by you`)
+  if (stat.mode & 0o077) throw new Error(`${path} is open to others; run chmod 700 on it, then rerun`)
 }
 
 // A credential file must be a regular file (not a link), owned by this user, with no group or other access.
@@ -135,11 +144,14 @@ export async function run(argv, deps = {}) {
     ask = () => readHidden('Bunker connection for James (bunker://..., not shown)'),
     openSigner = makeBunkerSigner,
     log = line => console.log(line),
-    fs = { existsSync, readFileSync, writeExclusive, assertPrivateFile, mkdirSync, renameSync, unlinkSync },
+    fs = { existsSync, readFileSync, writeExclusive, assertPrivateFile, assertPrivateDir, mkdirSync, renameSync, unlinkSync },
     verifyMs = VERIFY_MS,
   } = deps
   const uriFile = opts['uri-file'], clientFile = opts['client-file']
-  for (const dir of new Set([dirname(uriFile), dirname(clientFile)])) fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+  for (const dir of new Set([dirname(uriFile), dirname(clientFile)])) {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+    fs.assertPrivateDir(dir)
+  }
 
   const client = ensureClientFile(clientFile, fs)
   log(`client key: ${client} ${clientFile} (mode 0600, not shown)`)
@@ -152,13 +164,18 @@ export async function run(argv, deps = {}) {
     log(`bunker connection: kept ${uriFile} (pass --new-uri to replace it)`)
   } else {
     uriText = checkBunkerUri(await ask())
-    staged = `${uriFile}.new-${process.pid}`
-    fs.writeExclusive(staged, `${uriText}\n`)
   }
   const clientText = fs.readFileSync(clientFile, 'utf8').trim()
   try {
     await proveJames(uriText, clientText, openSigner, verifyMs)
-    if (staged) { fs.renameSync(staged, uriFile); staged = undefined; log(`bunker connection: stored ${uriFile} (mode 0600, not shown)`) }
+    // Only a proven connection touches disk: staged, then renamed into place, so an interrupt during
+    // the Bunker wait leaves nothing behind.
+    if (!reuseUri) {
+      staged = `${uriFile}.new-${process.pid}`
+      fs.writeExclusive(staged, `${uriText}\n`)
+      fs.renameSync(staged, uriFile); staged = undefined
+      log(`bunker connection: stored ${uriFile} (mode 0600, not shown)`)
+    }
   } catch (error) {
     // A library error must never carry either credential to the terminal.
     const message = String(error?.message || error)

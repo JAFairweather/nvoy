@@ -1,10 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
-import { options, checkBunkerUri, assertPrivateFile, ensureClientFile, readHidden, pasteLines, proveJames, run, DEFAULT_URI_FILE, DEFAULT_CLIENT_FILE } from '../bin/q145-james-signer-setup.mjs'
+import { options, checkBunkerUri, assertPrivateFile, assertPrivateDir, ensureClientFile, readHidden, pasteLines, proveJames, run, DEFAULT_URI_FILE, DEFAULT_CLIENT_FILE } from '../bin/q145-james-signer-setup.mjs'
 import { JAMES } from '../bin/q145-grants.mjs'
 
 const SECRET = 'f00dfeedf00dfeedf00dfeed'
@@ -29,6 +29,32 @@ test('options: herd-memory defaults, overrides, and no connection on argv', () =
   assert.throws(() => options(['--uri-file']), /needs a path/)
   assert.throws(() => options(['--nope']), /unknown option/)
   assert.throws(() => options(['--uri-file', '/a', '--client-file', '/a']), /must differ/)
+})
+
+test('options refuses a key pasted on argv, and never echoes an unknown argument (Biggy, PR 421)', () => {
+  const HEXKEY = 'ab'.repeat(32), NSEC = `nsec1${'q'.repeat(58)}`, NCRYPT = `ncryptsec1${'q'.repeat(80)}`
+  for (const argv of [['--client-file', NSEC], ['--uri-file', `/x/${HEXKEY}`], [HEXKEY], ['--client-file', NCRYPT], [NSEC.toUpperCase()]]) {
+    assert.throws(() => options(argv), error => /never put a key on the command line/.test(error.message) && !error.message.includes(HEXKEY) && !error.message.includes('qqqq'))
+  }
+  assert.throws(() => options(['short-secret-value']), error => error.message === 'unknown argument (not shown)')
+  assert.throws(() => options(['--nope']), /unknown option --nope/)
+  assert.equal(options(['--uri-file', `/x/${'a'.repeat(63)}`])['uri-file'], `/x/${'a'.repeat(63)}`)
+})
+
+test('run writes no connection file while it waits on the Bunker, and refuses a loose credential directory', async () => {
+  const dir = tmp(), uri = join(dir, 'cred', 'uri'), client = join(dir, 'cred', 'client')
+  let seen
+  const watching = () => ({ getPublicKey: async () => { seen = readdirSync(join(dir, 'cred')).sort(); return JAMES }, close() {} })
+  await run(['--uri-file', uri, '--client-file', client], { ask: async () => URI, openSigner: watching, log() {} })
+  assert.deepEqual(seen, ['client'])
+  assert.deepEqual(readdirSync(join(dir, 'cred')).sort(), ['client', 'uri'])
+  const loose = join(dir, 'loose')
+  mkdirSync(loose, { mode: 0o755 }); chmodSync(loose, 0o755)
+  let opened = false
+  await assert.rejects(() => run(['--uri-file', join(loose, 'uri'), '--client-file', join(loose, 'client')], { ask: async () => URI, openSigner: () => { opened = true }, log() {} }), /open to others; run chmod 700/)
+  assert.equal(opened, false)
+  assert.deepEqual(readdirSync(loose), [])
+  assert.throws(() => assertPrivateDir(join(dir, 'cred', 'uri')), /not a directory/)
 })
 
 test('checkBunkerUri accepts the signer format and never quotes a bad value', () => {
