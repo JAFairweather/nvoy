@@ -14,6 +14,7 @@ import { isTerminalReplyFailure, loadTerminalReplyIds, recordTerminalReply, term
 import { childVerdict } from './broker_verdict.mjs'
 import { finishedProfileRequests, PROFILE_PUBLIC_RETRY_EXIT } from './agent_profile.mjs'
 import { MEMORY_REQUEST_FILE, memoryQueueDir } from './agent_memory.mjs'
+import { firstRows, postPublished, replyFinished } from './broker_done.mjs'
 
 const die = m => { console.error(`instance-broker-daemon: ${m}`); process.exit(1) }
 const flag = n => { const i = process.argv.indexOf(n); return i < 0 ? '' : process.argv[i + 1] || '' }
@@ -120,14 +121,13 @@ function drain() {
     try {
       const st = lstatSync(replyQueue)
       if (!st.isFile() || st.isSymbolicLink()) throw new Error('reply queue is not a regular file')
-      const ids = new Set()
-      for (const line of readFileSync(replyQueue, 'utf8').split('\n')) {
-        try { const x = JSON.parse(line); if (/^[0-9a-f]{32}$/.test(String(x.id || ''))) ids.add(x.id) } catch { /* trailing partial line */ }
-      }
-      for (const request of ids) {
+      const rows = firstRows(readFileSync(replyQueue, 'utf8'))
+      for (const [request, row] of rows) {
         const key = `${source}:${request}`
         if (announcedProposals.has(key)) continue
         if (terminalReplyIds.has(request)) continue
+        // Already published, by the actuator's own one-use receipt: known here, with no child (q-108).
+        if (replyFinished(manifest.stateDir, row)) { announcedProposals.add(key); continue }
         if (!proposalRetryAfter.ready(key)) continue
         const actuator = mode => () => spawnSync(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-reply.mjs'),
           '--instance', manifest.id, '--request', request, '--source', source, mode], { env: childEnv, encoding: 'utf8', timeout: 90000 })
@@ -158,15 +158,19 @@ function drain() {
 }
 function drainPosts() {
   const queue = resolve(manifest.runtimeDir, 'post-requests.jsonl')
-  let ids
+  let rows
   try {
     const st = lstatSync(queue)
     if (!st.isFile() || st.isSymbolicLink()) throw new Error('post queue is not a regular file')
-    ids = new Set(readFileSync(queue, 'utf8').split('\n').flatMap(line => { try { const x = JSON.parse(line); return /^[0-9a-f]{32}$/.test(String(x?.id)) ? [x.id] : [] } catch { return [] } }))
+    rows = firstRows(readFileSync(queue, 'utf8'))
   } catch (e) { if (e.code !== 'ENOENT') console.error(`instance-broker-daemon: post queue unavailable: ${e.message}`); return }
-  for (const request of ids) {
+  for (const [request, row] of rows) {
     const key = `post:${request}`
-    if (postDone.has(request) || !proposalRetryAfter.ready(key)) continue
+    if (postDone.has(request)) continue
+    // Already published, by the post's own bound record: known here, with no child (q-108). Only
+    // refusals are logged as terminal, so without this every restart re-spawned every id ever posted.
+    if (postPublished(manifest.stateDir, row)) { postDone.add(request); continue }
+    if (!proposalRetryAfter.ready(key)) continue
     const r = spawnSync(process.execPath, [resolve(new URL('.', import.meta.url).pathname, 'instance-broker-post.mjs'),
       '--instance', manifest.id, '--request', request], { env: childEnv, encoding: 'utf8', timeout: 90000 })
     const stderr = String(r.stderr || '').trim()
