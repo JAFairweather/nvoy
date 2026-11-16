@@ -396,7 +396,9 @@ async function poll() {
       notifiedThisRun.set(task.envelope, now)
       try {
         await mcp.notification({ method: 'notifications/claude/channel', params: {
-          content: 'A broker-admitted Nostr envelope is ready. Read it with nvoy_channel_read before deciding whether to act.',
+          // Put the opaque marker in visible content so the read call remains possible even when
+          // the client does not surface transport metadata to the model.
+          content: `Nvoy envelope ${task.envelope} is ready. Call nvoy_channel_read with this exact envelope before deciding whether to act.`,
           meta: { instance: manifest.id, envelope: task.envelope },
         } })
       } catch (error) { notifiedThisRun.delete(task.envelope); throw error }

@@ -66,6 +66,9 @@ try {
     wakes.length >= 1 && wakes.every(wake => wake?.meta?.instance === manifest.id &&
       [envelope, notificationEnvelope].includes(wake?.meta?.envelope) &&
       !JSON.stringify(wake).includes(task.messages[0].content) && !JSON.stringify(wake).includes(task.messages[0].from)))
+  ok('each wake names its exact envelope and read tool in visible content',
+    wakes.every(wake => wake.content.includes(wake.meta.envelope) &&
+      wake.content.includes('nvoy_channel_read')))
   ok('the instructions tell the agent what its manifest lets it do and which release it runs',
     /What this identity may do, from its manifest: reply to a delivered envelope/.test(client.getInstructions()) &&
     /not post: nvoy_channel_post is refused, this identity may only reply/.test(client.getInstructions()) &&
