@@ -18,6 +18,7 @@ Two U votes agree; two X votes agree but remain ambiguous, never U. Reasons
 need not match. Agreement retains the entire original/paraphrase pair with
 shared category/gold; disagreement excludes both from scoring, not the ledger.
 No adjudicator, peer reconciliation or gold re-judgment.
+paraphrase gold inherited from the base question; equivalence unverified
 
 3. Report all 100 in a 3x3 category-confusion table and exact-support agreement
 within its diagonals. Also publish a table per labeler/category: pre-filter
@@ -53,6 +54,7 @@ v3.1 scorer/denominator rules and executable source by commit/SHA-256. Validate
 all 100 paired votes, not just survivors. Required synthetic controls: support
 and category disagreements; 80/79; each minimum/below-minimum; null denominators;
 replacement refusal; all mutation states. This document is not executable proof.
+Required control: paraphrase inherits base category and gold, and the pair drops together.
 
 7. Targets only after corpus pin/question freeze into labelers' own 0660 drops;
 remove after seal/audit under authorized disposal. Dennis checks sealed digests/
