@@ -98,6 +98,13 @@ server.on('connection', ws => {
       }
       return ws.send(JSON.stringify(['EOSE', m[1]]))
     }
+    if (m[0] === 'COUNT') {
+      if (!authed) return ws.send(JSON.stringify(['CLOSED', m[1], 'auth-required: not authenticated']))
+      const f = m[2]
+      if (f.kinds?.includes(99999)) return ws.send(JSON.stringify(['COUNT', m[1], { count: 'many' }]))
+      const hits = stored.filter(ev => f['#h'].includes(ev.tags.find(t => t[0] === 'h')?.[1]) && (!f.kinds || f.kinds.includes(ev.kind)))
+      return ws.send(JSON.stringify(['COUNT', m[1], { count: hits.length }]))
+    }
   })
 })
 
@@ -172,6 +179,10 @@ try {
   ok('a filter without #h is refused locally rather than silently empty', await rejects(session.fetch({ kinds: [9] }), /#h/))
   const back = await session.fetch({ kinds: [9], '#h': [CH], ids: [posted.event.id] })
   ok('the post reads back from the relay', back.length === 1 && back[0].pubkey === agent)
+  const counted = await session.count({ kinds: [9], '#h': [CH] })
+  ok('COUNT returns the relay\'s exact count', counted.count === stored.filter(e => e.kind === 9).length && counted.approximate === undefined)
+  ok('a COUNT filter without #h is refused locally', await rejects(session.count({ kinds: [9] }), /#h/))
+  ok('a COUNT reply without an integer count is refused', await rejects(session.count({ kinds: [99999], '#h': [CH] }), /usable count/))
   ok('a channel event without an h tag is refused before sending',
     await rejects(session.publish({ kind: 9, created_at: now(), content: 'x', tags: [] }), /h tag/))
   session.close()
