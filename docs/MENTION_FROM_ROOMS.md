@@ -69,8 +69,9 @@ Trust: the room list counts only when all of these hold.
 - Its signature verifies.
 - It has exactly one `d` tag, equal to R, and any `h` tag equals R.
 
-Any other event is ignored. If no event passes, the room has no roster: an empty roster, never the
-last one carried over. The shared read takes the pinned key as an argument. `onboard_join` passes the
+Any other event is ignored. If no event passes, the room has no verified roster. The broker holds a
+room-derived mention for retry, and the discovery file keeps its last list. A valid event with no
+member `p` tags is an empty roster and clears that room's discovery list. The shared read takes the pinned key as an argument. `onboard_join` passes the
 signer from the configuration it writes the new manifest from.
 
 The broker drops itself from the roster. A member with no usable key is skipped.
@@ -104,8 +105,10 @@ The broker refreshes the file:
 - in the hourly card run.
 
 A failed read keeps the last good file, and logs it. `recordMentionRooms` merges: a room not read this
-time (it failed, or a single-room refresh in the post path skipped it) keeps its last list, and when
-the profiles can't be read a member keeps the name it last had. The pre-signing read in §4 records
+time (it failed, or a single-room refresh in the post path skipped it) keeps its last list. A member
+still in a verified roster keeps its last name when that refresh returns no verified profile for its
+key. A verified profile with no usable name clears the old name; collisions between carried and fresh
+names leave both keys name-free. The pre-signing read in §4 records
 what it read even when it then refuses the post. The agent card reads the file and never refreshes
 it. That file is for **discovery** only: what the
 channel MCPs show and resolve `@name` against. The broker never signs a room-derived mention on the
@@ -183,7 +186,7 @@ flag.
   - the newest 39002 wins;
   - each of these is ignored: a bad signature, an author other than the pinned signer, a `d` that
     is not the room, two `d` tags, and an `h` that is not the room;
-  - with no event passing, the roster is empty;
+  - with no event passing, the roster is unavailable; a valid empty list is empty;
   - a failed read keeps the last good discovery file.
 - **Manifest:** `mention_rooms: true` without a valid `buzz.relay_signer` is refused.
 - **Broker post and reply paths:**

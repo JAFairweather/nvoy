@@ -73,7 +73,11 @@ export function namesFrom(events, wanted, verify = verifyEvent) {
 export async function readRooms({ session, rooms, relaySigner, me }) {
   const read = {}, failed = []
   for (const room of rooms) {
-    try { read[room] = (await readRoster(session, room, relaySigner) || []).filter(p => p !== me) }
+    try {
+      const roster = await readRoster(session, room, relaySigner)
+      if (roster === null) { failed.push({ room, reason: 'no verified member list' }); continue }
+      read[room] = roster.filter(p => p !== me)
+    }
     catch (e) { failed.push({ room, reason: e.message }) }
   }
   const everyone = [...new Set(Object.values(read).flat())]
@@ -87,7 +91,8 @@ export async function readRooms({ session, rooms, relaySigner, me }) {
   const holders = new Map()
   for (const [pubkey, name] of names) if (name) holders.set(fold(name), [...(holders.get(fold(name)) || []), pubkey])
   const nameOf = pubkey => { const n = names.get(pubkey); return n && holders.get(fold(n)).length === 1 ? n : null }
-  return { rooms: Object.fromEntries(Object.entries(read).map(([room, keys]) => [room, keys.map(pubkey => ({ pubkey, name: nameOf(pubkey) }))])), failed }
+  return { rooms: Object.fromEntries(Object.entries(read).map(([room, keys]) => [room, keys.map(pubkey => ({ pubkey, name: nameOf(pubkey) }))])),
+    failed, profiled: [...names.keys()] }
 }
 
 // --- The discovery file: broker-owned, worker-group readable, provisioned beside mention-grants.json. ---
@@ -106,15 +111,26 @@ export function readMentionRooms(manifest) {
 }
 // A room not read this time (one that failed, or one a single-room refresh skipped) keeps its last
 // good list. True only when the file now holds exactly this body.
-// When the profiles could not be read, a member keeps the name it last had: a subset of a list that
-// was clash-free when written, so no clash comes back.
-export function recordMentionRooms(manifest, { rooms, failed = [] }, now = Date.now()) {
+// A still-present member keeps its last name when no verified profile was returned this refresh.
+// A verified profile with an unusable name clears that name. Recheck collisions after merging with
+// retained rooms: a newly named member can collide with an older carried name.
+export function recordMentionRooms(manifest, { rooms, profiled = [] }, now = Date.now()) {
   if (!manifest.mayPost?.mentionRooms) return false
   const last = readMentionRooms(manifest) || {}
   const lastName = new Map(Object.values(last).flat().filter(e => e.name).map(e => [e.pubkey, e.name]))
-  const noProfiles = failed.some(f => f.room === null)
-  const fresh = list => noProfiles ? list.map(e => ({ pubkey: e.pubkey, name: e.name ?? lastName.get(e.pubkey) ?? null })) : list
+  const verifiedProfile = new Set(profiled)
+  const fresh = list => list.map(e => ({ pubkey: e.pubkey,
+    name: e.name ?? (verifiedProfile.has(e.pubkey) ? null : lastName.get(e.pubkey) ?? null) }))
   const merged = Object.fromEntries(manifest.mayPost.channels.filter(c => rooms[c] || last[c]).map(c => [c, rooms[c] ? fresh(rooms[c]) : last[c]]))
+  const holders = new Map()
+  for (const e of Object.values(merged).flat()) if (e.name) {
+    const key = fold(e.name)
+    if (!holders.has(key)) holders.set(key, new Set())
+    holders.get(key).add(e.pubkey)
+  }
+  for (const list of Object.values(merged)) for (const e of list) {
+    if (e.name && holders.get(fold(e.name)).size !== 1) e.name = null
+  }
   const body = JSON.stringify({ version: 1, instance: manifest.id, read_at: Math.floor(now / 1000), rooms: merged }) + '\n'
   let fd
   try {
