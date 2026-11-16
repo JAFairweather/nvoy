@@ -78,6 +78,109 @@ export function projectionChanged(prevPayload, nextPayload) {
   return keys(prevPayload) !== keys(nextPayload)
 }
 
+// ----------------------------------------------------------------- publishing
+//
+// WHY THE DECISION IS A TESTED FUNCTION AND NOT AN `if` INSIDE THE BUTTON HANDLER.
+//
+// Republishing the projection is a ROTATION, not a second publish: it bumps the generation, mints a
+// new scope key, and must re-grant every current holder under that new key. Miss a holder and you
+// have silently revoked a runtime's view of the roster — and the symptom of THAT is Nact quietly
+// losing the ability to check, which presents as exactly the bug this projection exists to fix, now
+// caused by the fix. A wrong survivor list is therefore not a cosmetic slip; it is the original
+// defect, re-entering through its own remedy. So the decision is pure, and the caller does no
+// branching of its own: it mints, publishes, records, and reports what this returned.
+
+/** Where the publish record lives on the delegator's Grant Index. */
+export const REGISTRY_PROJECTION_FIELD = 'nvoy_registry_projection'
+
+/**
+ * Decide what publishing the projection means right now. Returns exactly one of:
+ *
+ *   { action: 'publish', generation: 1, grantees: [] }   never published — the caller mints a scope id
+ *   { action: 'rotate', scopeId, from, to, grantees }    roster changed — re-grant exactly these
+ *   { action: 'none', why }                              nothing to do, said out loud
+ *   { action: 'blocked', why }                            cannot be done safely — the caller must not guess
+ *
+ * `blocked` is a real outcome, not an error to swallow. If the recorded projection names a scope the
+ * index holds no issued entry for, the scope KEY is unrecoverable: a rotation could still publish, but
+ * it could not re-grant the holders, so it would cut every runtime off while reporting success.
+ * Refusing is the only honest move, and saying which of the two it is matters to whoever fixes it.
+ *
+ * The generation is taken from the ISSUED ENTRY rather than from the publish record, because the
+ * issued entry is what holds the key and what `addGrantee` reads. If the two ever disagree, the one
+ * carrying the key is the one a rotation must be ordered against.
+ */
+export function planProjectionPublish(index, payload) {
+  const prev = index?.[REGISTRY_PROJECTION_FIELD] || null
+  if (!prev) return { action: 'publish', generation: 1, grantees: [] }
+
+  const scopeId = typeof prev.scopeId === 'string' && prev.scopeId ? prev.scopeId : null
+  if (!scopeId) {
+    return { action: 'blocked', why: 'your Grant Index records a published projection with no scope id, '
+      + 'so there is nothing a rotation could be ordered against. Nothing was signed.' }
+  }
+
+  const unchanged = !projectionChanged(prev.payload, payload)
+  // An UNVERIFIED publish (the relay accepted it, no read-back) with an unchanged roster must not be a
+  // dead end: refusing here would leave the operator told to "publish again" with the button disabled.
+  // The retry is a read-back only. It signs nothing, rotates nothing and re-grants no one; it needs the
+  // issued entry only for the scope key and generation to read with.
+  if (unchanged && prev.verified === false) {
+    const entry = (Array.isArray(index?.issued) ? index.issued : []).find(e => e?.scope === scopeId)
+    const gen = Number(entry?.v)
+    if (!entry?.key || !Number.isFinite(gen) || gen < 1) {
+      return { action: 'blocked', why: `the projection scope ${scopeId} did not read back, and its issued entry has no `
+        + 'usable key and generation to check it with, so it cannot be re-verified. Nothing was signed.' }
+    }
+    return { action: 'reverify', scopeId, generation: gen,
+      why: 'the roster has not changed, but the last publish never read back. Checking again signs nothing.' }
+  }
+  if (unchanged) {
+    return { action: 'none', why: 'the roster has not changed. Republishing rotates the scope key and '
+      + 'costs every holder a re-delivery, so it is refused rather than done quietly.' }
+  }
+
+  const issued = (Array.isArray(index?.issued) ? index.issued : []).find(e => e?.scope === scopeId)
+  if (!issued) {
+    return { action: 'blocked', why: `the projection scope ${scopeId} is not in your issued list, so its `
+      + 'key cannot be recovered and its holders could not be re-granted. Nothing was signed.' }
+  }
+
+  const from = Number(issued.v)
+  if (!Number.isFinite(from) || from < 1) {
+    return { action: 'blocked', why: `the issued entry for ${scopeId} carries no usable generation, so a `
+      + 'rotation could not be ordered after it. Nothing was signed.' }
+  }
+
+  return { action: 'rotate', scopeId, from, to: from + 1, grantees: granteesOf(issued) }
+}
+
+/**
+ * What the publish button says and whether it may be pressed, decided from the plan so the click handler
+ * and the markup cannot disagree. An unverified publish must offer a way forward (a read-back only);
+ * a refused plan stays disabled and says why.
+ */
+export function registryButton(plan, published) {
+  if (plan?.action === 'reverify') return { label: 'Check read-back', disabled: false, title: plan.why }
+  if (plan?.action === 'none' || plan?.action === 'blocked') {
+    return { label: published ? 'Republish projection' : 'Publish projection', disabled: true, title: plan.why }
+  }
+  return { label: published ? 'Republish projection' : 'Publish projection', disabled: false, title: '' }
+}
+
+/**
+ * The holders of an issued scope, normalised to the join key.
+ *
+ * Malformed entries are DROPPED rather than passed through, because every consumer of this list either
+ * re-grants to it or renders it, and a non-key in that list would become a failed delivery mid-rotation
+ * — after some holders had already been re-granted and some had not.
+ */
+export function granteesOf(issuedEntry) {
+  return [...new Set((Array.isArray(issuedEntry?.grantees) ? issuedEntry.grantees : [])
+    .filter(p => typeof p === 'string' && HEX64.test(p.toLowerCase()))
+    .map(p => p.toLowerCase()))].sort()
+}
+
 /**
  * THE DIVERGENCE ROWS. Given the registry's key set and a runtime's key set, say who is where.
  *

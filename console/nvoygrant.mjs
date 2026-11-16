@@ -97,14 +97,30 @@ export async function sendRevocationNotice(relay, delegator, granteePubkey, { sc
  * is a key event, not a renegotiation.
  * `survivors`: [{ pub, terms }] — terms null/undefined re-grants vanilla.
  */
-export async function rotateWithTerms(relay, delegator, { scopeId, generation, payload, scopeName, survivors, relayHint = '' }) {
+export async function rotateWithTerms(relay, delegator, { scopeId, generation, payload, scopeName, survivors, relayHint = '', onPublished }) {
   const scopeKey = newScopeKey()
   const next = generation + 1
   await publishScope(relay, delegator, { scopeId, generation: next, scopeKey, payload })
-  for (const s of survivors)
-    await grantWithTerms(relay, delegator, s.pub, {
-      scopeId, generation: next, scopeKey, scopeName, relayHint, terms: s.terms ?? undefined,
-    })
+  // From here the new generation REPLACES the old one on the relay, and the key exists only in this
+  // function. Anything fallible after this point must not be allowed to strand it, so the caller gets
+  // the key through `onPublished` BEFORE the first grant (to record it), and a failure carries it out
+  // on `error.rotation` together with who was and was not re-granted.
+  const regranted = []
+  try {
+    if (onPublished) await onPublished({ scopeKey, generation: next })
+    for (const s of survivors) {
+      await grantWithTerms(relay, delegator, s.pub, {
+        scopeId, generation: next, scopeKey, scopeName, relayHint, terms: s.terms ?? undefined,
+      })
+      regranted.push(s.pub)
+    }
+  } catch (error) {
+    error.rotation = {
+      scopeKey, generation: next, regranted: [...regranted],
+      pending: survivors.map(s => s.pub).filter(pub => !regranted.includes(pub)),
+    }
+    throw error
+  }
   return { scopeKey, generation: next }
 }
 
