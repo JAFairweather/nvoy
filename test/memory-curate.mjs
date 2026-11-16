@@ -2421,10 +2421,23 @@ await test('q-225: initial history and full curator cycle stay snapshot-coherent
       }
       assert.equal(daemon.store.storeState(curatorPk, nowSec + 20).write_seq, 11)
 
-      // 1. Direct invalid/mismatched snapshot parameters on store.query fail closed as 'unknown'.
-      assert.equal(daemon.store.query({ readerPubkey: curatorPk, snapshotRowid: 999999, nowSec: nowSec + 20 }).answer, 'unknown')
-      assert.equal(daemon.store.query({ readerPubkey: curatorPk, snapshotRowid: -1, nowSec: nowSec + 20 }).answer, 'unknown')
-      assert.equal(daemon.store.query({ readerPubkey: curatorPk, expectedPurgeSeq: 99, nowSec: nowSec + 20 }).answer_reason, 'snapshot-purged')
+      // 1. Direct invalid, partial, or mismatched snapshot parameters on store.query fail closed as 'unknown'.
+      const checkUnknown = (qArgs, expectedReason) => {
+        const res = daemon.store.query({ readerPubkey: curatorPk, nowSec: clockSec, ...qArgs })
+        assert.equal(res.answer, 'unknown')
+        assert.equal(res.answer_reason, expectedReason)
+      }
+      checkUnknown({ snapshotRowid: 5 }, 'invalid-snapshot-anchor')
+      checkUnknown({ expectedPurgeSeq: 0 }, 'invalid-snapshot-anchor')
+      checkUnknown({ snapshotAt: clockSec }, 'invalid-snapshot-anchor')
+      checkUnknown({ snapshotRowid: 5, expectedPurgeSeq: 0 }, 'invalid-snapshot-anchor')
+      checkUnknown({ snapshotRowid: 5, snapshotAt: clockSec }, 'invalid-snapshot-anchor')
+      checkUnknown({ expectedPurgeSeq: 0, snapshotAt: clockSec }, 'invalid-snapshot-anchor')
+      checkUnknown({ snapshotRowid: -1, expectedPurgeSeq: 0, snapshotAt: clockSec }, 'invalid-snapshot-anchor')
+      checkUnknown({ snapshotRowid: 5, expectedPurgeSeq: -1, snapshotAt: clockSec }, 'invalid-snapshot-anchor')
+      checkUnknown({ snapshotRowid: 5, expectedPurgeSeq: 0, snapshotAt: clockSec + 120 }, 'invalid-snapshot-anchor')
+      checkUnknown({ snapshotRowid: 999999, expectedPurgeSeq: 0, snapshotAt: clockSec }, 'invalid-snapshot-rowid')
+      checkUnknown({ snapshotRowid: 5, expectedPurgeSeq: 99, snapshotAt: clockSec }, 'snapshot-purged')
 
       // 2. Wrap a real socket reader and inject 5 accepted writes (supersede, withdraw, and 3 new claims)
       //    across page boundaries during readInitialHistory(pageSize = 3).
@@ -2546,6 +2559,153 @@ await test('q-225: initial history and full curator cycle stay snapshot-coherent
         assert.match(exhaustedErr.message, /#1 .*snapshot_purged/)
         assert.equal(Array.isArray(exhaustedErr.attempts), true)
         assert.equal(exhaustedErr.attempts.length, 3)
+
+        //    3c. Daemon socket refuses partial/non-integer snapshot anchors AND refuses pre-purge rowid across purge+VACUUM.
+        for (const badArgs of [
+          { snapshot_rowid: 3 },
+          { expected_purge_seq: 0 },
+          { snapshot_at: clockSec },
+          { snapshot_rowid: 3, snapshot_at: clockSec },
+          { snapshot_rowid: false, expected_purge_seq: 0, snapshot_at: clockSec },
+          { snapshot_rowid: '', expected_purge_seq: 0, snapshot_at: clockSec },
+        ]) {
+          const badRes = await rawReader.callReadTool('memory_query', { limit: 5, format: 'full', ...badArgs })
+          assert.equal(badRes.answer, 'unknown')
+          assert.equal(badRes.answer_reason, 'invalid-snapshot-anchor')
+          assert.equal(badRes.records.length, 0)
+        }
+
+        const preVacuumPage = await rawReader.callReadTool('memory_query', { limit: 3, format: 'full', include_history: true })
+        const preVacuumSnap = preVacuumPage.snapshot
+        assert(preVacuumSnap && Number.isSafeInteger(preVacuumSnap.max_event_rowid))
+        // Delete an early row so SQLite VACUUM compacts/renumbers rowids, then append a new post-purge claim
+        // whose renumbered rowid falls <= preVacuumSnap.max_event_rowid!
+        daemon.store.hardDelete({ d: `hive-memory:room:${ROOM_ID}:alpha-metric-95`, nowSec: nowSec + 65 })
+        recordVerifiedBackup({
+          receiptPath,
+          snapshotId: SNAP_ID,
+          writeSeq: daemon.store.storeState(ownerPk, nowSec + 66).write_seq,
+          at: nowSec + 66,
+          nowSec: nowSec + 66,
+        })
+        const postVacuumClaim = signClaim(bobSk, bobPk, 'post-vacuum-renumbered-item', 'nvoy', 'Post-VACUUM claim at compacted rowid', 67)
+        assert.equal(daemon.store.submit({ writer: 'bob', event: postVacuumClaim, expectedPriorId: null, nowSec: nowSec + 67 }).accepted, true)
+
+        const partialAfterVacuum = await rawReader.callReadTool('memory_query', {
+          limit: 50,
+          format: 'full',
+          include_history: true,
+          snapshot_rowid: preVacuumSnap.max_event_rowid,
+          snapshot_at: preVacuumSnap.as_of_sec,
+        })
+        assert.equal(partialAfterVacuum.answer, 'unknown', 'partial anchor without expected_purge_seq must fail closed after VACUUM')
+        assert.equal(partialAfterVacuum.answer_reason, 'invalid-snapshot-anchor')
+        assert.equal(partialAfterVacuum.records.length, 0)
+
+        const fullAfterVacuum = await rawReader.callReadTool('memory_query', {
+          limit: 50,
+          format: 'full',
+          include_history: true,
+          snapshot_rowid: preVacuumSnap.max_event_rowid,
+          expected_purge_seq: preVacuumSnap.last_purge_seq,
+          snapshot_at: preVacuumSnap.as_of_sec,
+        })
+        assert.equal(fullAfterVacuum.answer, 'unknown', 'full pre-purge anchor detects last_purge_seq change after VACUUM')
+        assert.equal(fullAfterVacuum.answer_reason, 'snapshot-purged')
+        assert.equal(fullAfterVacuum.records.length, 0)
+
+        //    3d. Snapshot coherence for #lineage (`supersedes_of`) and `#consolidatedBy` (both post-snapshot curations and withdrawn pre-snapshot curations).
+        const linA = signClaim(aliceSk, alicePk, 'lineage-root-a', 'nvoy', 'Lineage root A', 70)
+        const linB = signClaim(aliceSk, alicePk, 'lineage-bridge-b', 'nvoy', 'Lineage bridge B', 71, { supersedes: [linA.id] })
+        const linC = signClaim(aliceSk, alicePk, 'lineage-leaf-c', 'nvoy', 'Lineage leaf C', 72, { supersedes: [linB.id] })
+        // Ingest linA and linC BEFORE snapshot S_lin (leaving bridge linB un-ingested so linC cannot reach linA at S_lin).
+        assert.equal(daemon.store.submit({ writer: 'alice', event: linA, expectedPriorId: null, nowSec: nowSec + 70 }).accepted, true)
+        assert.equal(daemon.store.submit({ writer: 'alice', event: linC, expectedPriorId: null, nowSec: nowSec + 72 }).accepted, true)
+        const sLin = (await rawReader.callReadTool('memory_query', { limit: 1, format: 'full', include_history: true })).snapshot
+        // Now ingest bridge linB AFTER S_lin (`rowid > sLin.max_event_rowid`).
+        assert.equal(daemon.store.submit({ writer: 'alice', event: linB, expectedPriorId: null, nowSec: nowSec + 73 }).accepted, true)
+
+        const liveLineage = await rawReader.callReadTool('memory_query', { limit: 10, format: 'full', supersedes_of: linA.id })
+        assert.equal(liveLineage.records.length, 2, 'live supersedes_of traverses A <- B <- C once bridge B is ingested')
+        const snapLineage = await rawReader.callReadTool('memory_query', {
+          limit: 10,
+          format: 'full',
+          supersedes_of: linA.id,
+          snapshot_rowid: sLin.max_event_rowid,
+          expected_purge_seq: sLin.last_purge_seq,
+          snapshot_at: sLin.as_of_sec,
+        })
+        assert.equal(snapLineage.records.length, 0, '#lineage must bound edge traversal to rowid <= snapshot_rowid so C does not leak through post-snapshot bridge B')
+
+        // Snapshot #consolidatedBy: curator submits a curated claim consolidating linA + linC AFTER S_lin, then withdraws it AFTER S_cur.
+        const tempCurated = finalizeEvent(buildClaimTemplate({
+          pubkey: curatorPk,
+          scope: `room:${ROOM_ID}`,
+          slug: 'curated-nvoy-lineage-pair',
+          topic: 'nvoy',
+          claim: 'Distilled lineage pair',
+          because: 'Test snapshot consolidation',
+          evidence: ['nvoy@0000070'],
+          asOfGit: 'nvoy@0000070',
+          supersedes: [linA.id, linC.id],
+          merkleSources: true,
+          memoryGlobalChannelId: GLOBAL_CH,
+          nowSec: nowSec + 74,
+        }), curatorSk)
+        assert.equal(daemon.store.submit({ writer: 'curator', event: tempCurated, expectedPriorId: null, nowSec: nowSec + 74 }).accepted, true)
+        const sCur = (await rawReader.callReadTool('memory_query', { limit: 1, format: 'full', include_history: true })).snapshot
+
+        // At S_lin (before tempCurated), linA must still be 'accepted' (not consolidated by post-snapshot tempCurated).
+        const linAAtSLin = await rawReader.callReadTool('memory_query', {
+          limit: 10,
+          format: 'full',
+          d: `hive-memory:room:${ROOM_ID}:lineage-root-a`,
+          snapshot_rowid: sLin.max_event_rowid,
+          expected_purge_seq: sLin.last_purge_seq,
+          snapshot_at: sLin.as_of_sec,
+        })
+        assert.equal(linAAtSLin.records.length, 1, 'post-snapshot curation must not hide pre-snapshot source at S_lin')
+        assert.equal(linAAtSLin.records[0].verification, 'accepted')
+
+        // Withdraw tempCurated AFTER S_cur so live query restores linA, while pinned S_cur keeps linA consolidated by tempCurated!
+        const { replacement: withdrawCuratedTpl } = buildWithdrawalTemplate({
+          pubkey: curatorPk,
+          priorEvent: tempCurated,
+          scope: `room:${ROOM_ID}`,
+          slug: 'curated-nvoy-lineage-pair',
+          because: 'Withdraw test distillation after S_cur',
+          memoryGlobalChannelId: GLOBAL_CH,
+          nowSec: nowSec + 75,
+        })
+        const withdrawCurated = finalizeEvent(withdrawCuratedTpl, curatorSk)
+        assert.equal(daemon.store.submit({ writer: 'curator', event: withdrawCurated, expectedPriorId: tempCurated.id, nowSec: nowSec + 75 }).accepted, true)
+
+        const linALiveAfterWithdraw = await rawReader.callReadTool('memory_query', {
+          limit: 10,
+          format: 'full',
+          d: `hive-memory:room:${ROOM_ID}:lineage-root-a`,
+        })
+        assert.equal(linALiveAfterWithdraw.records.length, 1, 'withdrawing curation restores source in live query')
+        const linAAtSCurDefault = await rawReader.callReadTool('memory_query', {
+          limit: 10,
+          format: 'full',
+          d: `hive-memory:room:${ROOM_ID}:lineage-root-a`,
+          snapshot_rowid: sCur.max_event_rowid,
+          expected_purge_seq: sCur.last_purge_seq,
+          snapshot_at: sCur.as_of_sec,
+        })
+        assert.equal(linAAtSCurDefault.records.length, 0, 'source stays consolidated at S_cur even after tempCurated is withdrawn later')
+        const linAAtSCurHist = await rawReader.callReadTool('memory_query', {
+          limit: 10,
+          format: 'full',
+          include_history: true,
+          d: `hive-memory:room:${ROOM_ID}:lineage-root-a`,
+          snapshot_rowid: sCur.max_event_rowid,
+          expected_purge_seq: sCur.last_purge_seq,
+          snapshot_at: sCur.as_of_sec,
+        })
+        assert.equal(linAAtSCurHist.records[0].verification, 'consolidated')
+        assert.equal(linAAtSCurHist.records[0].consolidated_by, tempCurated.id)
       } finally {
         rawReader.close()
       }
@@ -2577,7 +2737,8 @@ await test('q-225: initial history and full curator cycle stay snapshot-coherent
       })
       assert.equal(cycle.ok, true)
       assert.equal(cycle.cycle_status, 'curated')
-      assert.equal(cycle.submitted.length, 1, 'PR #700 checkpoints distilled')
+      assert.equal(cycle.submitted.length, 2, 'PR #700 and lineage clusters distilled')
+      assert(cycle.submitted.some(s => s.d.endsWith(':curated-r1-pr700')))
       assert.equal(cycle.next_curated_write_seq, preCycleSeq + cycle.submitted.length, 'uncurated concurrent peer save remains outside curated cursor')
       assert(cycle.dream_packet && cycle.dream_packet.stats.coherence.after !== null, 'readPostCycleSnapshot succeeds despite concurrent peer save')
       assert.equal(cycle.scan_diagnostics?.attempts?.length, 1)

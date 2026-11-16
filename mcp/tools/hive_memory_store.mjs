@@ -1816,20 +1816,21 @@ export class HiveMemoryStore {
     if (!this.isReady().ready) return empty('unknown', `store-not-ready:${this.state}`)
     const meta = readMeta(this.db)
     const curMaxRowid = Number(this.db.prepare('SELECT COALESCE(MAX(rowid), 0) AS r FROM events').get()?.r ?? 0)
-    if (expectedPurgeSeq !== null && expectedPurgeSeq !== undefined) {
-      if (!Number.isSafeInteger(expectedPurgeSeq) || expectedPurgeSeq < 0) return empty('unknown', 'invalid-snapshot-anchor')
-      if (meta.last_purge_seq !== expectedPurgeSeq) return empty('unknown', 'snapshot-purged')
-    }
-    const useSnapshot = snapshotRowid !== null && snapshotRowid !== undefined
+    const hasRowid = snapshotRowid !== null && snapshotRowid !== undefined
+    const hasPurgeSeq = expectedPurgeSeq !== null && expectedPurgeSeq !== undefined
+    const hasSnapAt = snapshotAt !== null && snapshotAt !== undefined
+    const useSnapshot = hasRowid || hasPurgeSeq || hasSnapAt
     if (useSnapshot) {
-      if (!Number.isSafeInteger(snapshotRowid) || snapshotRowid < 0) return empty('unknown', 'invalid-snapshot-anchor')
+      if (!hasRowid || !hasPurgeSeq || !hasSnapAt ||
+          !Number.isSafeInteger(snapshotRowid) || snapshotRowid < 0 ||
+          !Number.isSafeInteger(expectedPurgeSeq) || expectedPurgeSeq < 0 ||
+          !Number.isSafeInteger(snapshotAt) || snapshotAt < 0 || snapshotAt > nowSec + 60) {
+        return empty('unknown', 'invalid-snapshot-anchor')
+      }
+      if (meta.last_purge_seq !== expectedPurgeSeq) return empty('unknown', 'snapshot-purged')
       if (snapshotRowid > curMaxRowid) return empty('unknown', 'invalid-snapshot-rowid')
     }
-    let evalNowSec = nowSec
-    if (snapshotAt !== null && snapshotAt !== undefined) {
-      if (!Number.isSafeInteger(snapshotAt) || snapshotAt < 0 || snapshotAt > nowSec + 60) return empty('unknown', 'invalid-snapshot-anchor')
-      evalNowSec = snapshotAt
-    }
+    const evalNowSec = useSnapshot ? snapshotAt : nowSec
     const effectiveRowid = useSnapshot ? snapshotRowid : curMaxRowid
     const restoredCurrentIds = useSnapshot ? this.#snapshotRestoredHeads(snapshotRowid, curMaxRowid) : null
     const snapshotMeta = {

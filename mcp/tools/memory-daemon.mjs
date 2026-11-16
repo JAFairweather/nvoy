@@ -76,6 +76,7 @@ function mcpToolResult(payload, isError = false) {
 
 const str = v => (typeof v === 'string' ? v : null)
 const num = v => (v === undefined || v === null || v === '' ? null : Number(v))
+const snapArg = (obj, k) => (Object.hasOwn(obj, k) && obj[k] !== undefined ? (typeof obj[k] === 'number' ? obj[k] : Number.NaN) : null)
 
 // The binding a connection is checked against; a SIGHUP that changes it drops the connection.
 export function bindingSignature(config, { kind, name }) {
@@ -305,9 +306,9 @@ export function handleSocketJsonRpc({ store, binding, message, nowSec, activity 
     format: str(args.format),
     staleFiles,
     nowSec,
-    snapshotRowid: num(args.snapshot_rowid),
-    expectedPurgeSeq: num(args.expected_purge_seq),
-    snapshotAt: num(args.snapshot_at),
+    snapshotRowid: snapArg(args, 'snapshot_rowid'),
+    expectedPurgeSeq: snapArg(args, 'expected_purge_seq'),
+    snapshotAt: snapArg(args, 'snapshot_at'),
   })
   const filter = { scope: str(args.scope)?.slice(0, 120) ?? null, topic: str(args.topic)?.slice(0, 120) ?? null }
   note({ kind: 'query', count: Number.isSafeInteger(out.returned) ? out.returned : 0, refs: recordRefs(out.records), filter })
