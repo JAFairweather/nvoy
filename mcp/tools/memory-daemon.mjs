@@ -40,17 +40,24 @@ const ACTIVITY_IDS_MAX = 20
 const VIEWER_READER = 'viewer'
 const CURATOR_READER = 'curator'
 
-const withStaleFiles = t => ({
+const withDaemonReadProps = t => ({
   ...t,
   inputSchema: {
     ...t.inputSchema,
     properties: {
       ...t.inputSchema.properties,
       stale_files: { type: 'array', items: { type: 'string', maxLength: 300 }, maxItems: 200 },
+      ...(t.name === 'memory_query'
+        ? {
+            snapshot_rowid: { type: 'integer', minimum: 0 },
+            expected_purge_seq: { type: 'integer', minimum: 0 },
+            snapshot_at: { type: 'integer', minimum: 0 },
+          }
+        : {}),
     },
   },
 })
-const READER_TOOLS = Object.freeze(MEMORY_TOOL_SPECS.filter(t => t.name === 'memory_wake' || t.name === 'memory_query').map(withStaleFiles))
+const READER_TOOLS = Object.freeze(MEMORY_TOOL_SPECS.filter(t => t.name === 'memory_wake' || t.name === 'memory_query').map(withDaemonReadProps))
 const WRITER_TOOLS = Object.freeze(MEMORY_TOOL_SPECS.filter(t => t.name === 'memory_lookup_prior' || t.name === 'memory_submit'))
 
 export function parseNamesFlag(raw, label = 'reader') {
@@ -298,6 +305,9 @@ export function handleSocketJsonRpc({ store, binding, message, nowSec, activity 
     format: str(args.format),
     staleFiles,
     nowSec,
+    snapshotRowid: num(args.snapshot_rowid),
+    expectedPurgeSeq: num(args.expected_purge_seq),
+    snapshotAt: num(args.snapshot_at),
   })
   const filter = { scope: str(args.scope)?.slice(0, 120) ?? null, topic: str(args.topic)?.slice(0, 120) ?? null }
   note({ kind: 'query', count: Number.isSafeInteger(out.returned) ? out.returned : 0, refs: recordRefs(out.records), filter })

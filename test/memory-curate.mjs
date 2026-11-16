@@ -2342,5 +2342,252 @@ await test('A4: Bunker refs are read privately, pinned to the curator identity, 
   } finally { rmSync(tmp, { recursive: true, force: true }) }
 })
 
+await test('q-225: initial history and full curator cycle stay snapshot-coherent across concurrent saves, log per-attempt sequence diagnostics, and bound retries on purge churn', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'nvoy-curate-q225-'))
+  try {
+    const sockDir = join(tmp, 'sock'), dbPath = join(tmp, 'memory.sqlite'), ledgerPath = join(tmp, 'ledger.jsonl'), receiptPath = join(tmp, 'receipt.json')
+    const stateFile = join(tmp, 'state', 'curator-state.json'), packetDir = join(tmp, 'packets')
+    const ownerSk = generateSecretKey(), ownerPk = getPublicKey(ownerSk)
+    const aliceSk = generateSecretKey(), alicePk = getPublicKey(aliceSk)
+    const bobSk = generateSecretKey(), bobPk = getPublicKey(bobSk)
+    const curatorSk = generateSecretKey(), curatorPk = getPublicKey(curatorSk)
+    const nowSec = Math.floor(Date.now() / 1000)
+    let clockSec = nowSec + 100
+    initEmptyStore({ dbPath, ledgerPath, nowSec })
+    recordVerifiedBackup({ receiptPath, snapshotId: SNAP_ID, writeSeq: 1, at: nowSec, nowSec })
+    const daemon = await startMemoryDaemon({
+      dbPath,
+      ledgerPath,
+      receiptPath,
+      config: {
+        memoryGlobalChannelId: GLOBAL_CH,
+        ownerPubkey: ownerPk,
+        maxUnbackedSec: 3600,
+        globalWriters: [ownerPk, curatorPk],
+        curators: [curatorPk],
+        readers: { curator: curatorPk },
+        writers: {
+          owner: { pubkey: ownerPk, perHour: 200 },
+          alice: { pubkey: alicePk, perHour: 200 },
+          bob: { pubkey: bobPk, perHour: 200 },
+          curator: { pubkey: curatorPk, perHour: 200 },
+        },
+        rooms: {
+          [ROOM_ID]: {
+            members: [ownerPk, alicePk, bobPk, curatorPk],
+            writers: [ownerPk, alicePk, bobPk, curatorPk],
+          },
+        },
+      },
+      readers: 'curator',
+      writers: 'alice:bob:curator',
+      socketDir: sockDir,
+      now: () => clockSec,
+      log: () => {},
+    })
+    try {
+      const signClaim = (sk, pk, slug, topic, claim, at, opts = {}) =>
+        finalizeEvent(buildClaimTemplate({
+          pubkey: pk,
+          scope: `room:${ROOM_ID}`,
+          slug,
+          topic,
+          claim,
+          because: `Rationale ${slug}`,
+          evidence: [`${topic}@${String(at).padStart(7, '0')}`],
+          asOfGit: `${topic}@${String(at).padStart(7, '0')}`,
+          nowSec: nowSec + at,
+          ...opts,
+        }), sk)
+
+      // Seed 10 initial claims (write_seq advances from 1 -> 11; 4 pages at pageSize = 3).
+      // Include one claim (`expiringSoon`) whose `exp` crosses `clockSec` mid-scan to verify `snapshot_at` pinning.
+      const d1 = signClaim(aliceSk, alicePk, 'r1-pr700-wip', 'r1', 'PR #700 opened for R1 snapshot test', 1)
+      const d2 = signClaim(aliceSk, alicePk, 'r1-pr700-status', 'r1', 'PR #700 green for R1 snapshot test', 2)
+      const targetV1 = signClaim(aliceSk, alicePk, 'nvoy-live-head', 'nvoy', 'Original v1 head before scan', 3)
+      const expiringSoon = signClaim(bobSk, bobPk, 'ephemeral-boundary-item', 'buzz', 'Short TTL boundary item', 4, { ttlSec: 105 })
+      assert.equal(daemon.store.submit({ writer: 'alice', event: d1, expectedPriorId: null, nowSec: nowSec + 1 }).accepted, true)
+      assert.equal(daemon.store.submit({ writer: 'alice', event: d2, expectedPriorId: null, nowSec: nowSec + 2 }).accepted, true)
+      assert.equal(daemon.store.submit({ writer: 'alice', event: targetV1, expectedPriorId: null, nowSec: nowSec + 3 }).accepted, true)
+      assert.equal(daemon.store.submit({ writer: 'bob', event: expiringSoon, expectedPriorId: null, nowSec: nowSec + 4 }).accepted, true)
+      const seededIds = [d1.id, d2.id, targetV1.id, expiringSoon.id]
+      const distinctWords = ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot']
+      for (let i = 5; i <= 10; i++) {
+        const w = distinctWords[i - 5]
+        const top = i % 2 === 0 ? 'nvoy' : 'herd-infra'
+        const ev = signClaim(bobSk, bobPk, `${w}-metric-${i * 19}`, top, `${w.toUpperCase()} ${w}1 ${w}2 ${w}3`, i)
+        assert.equal(daemon.store.submit({ writer: 'bob', event: ev, expectedPriorId: null, nowSec: nowSec + i }).accepted, true)
+        seededIds.push(ev.id)
+      }
+      assert.equal(daemon.store.storeState(curatorPk, nowSec + 20).write_seq, 11)
+
+      // 1. Direct invalid/mismatched snapshot parameters on store.query fail closed as 'unknown'.
+      assert.equal(daemon.store.query({ readerPubkey: curatorPk, snapshotRowid: 999999, nowSec: nowSec + 20 }).answer, 'unknown')
+      assert.equal(daemon.store.query({ readerPubkey: curatorPk, snapshotRowid: -1, nowSec: nowSec + 20 }).answer, 'unknown')
+      assert.equal(daemon.store.query({ readerPubkey: curatorPk, expectedPurgeSeq: 99, nowSec: nowSec + 20 }).answer_reason, 'snapshot-purged')
+
+      // 2. Wrap a real socket reader and inject 5 accepted writes (supersede, withdraw, and 3 new claims)
+      //    across page boundaries during readInitialHistory(pageSize = 3).
+      const { createSingleSocketMcpClient } = await import('../mcp/tools/memory-viewer.mjs')
+      const rawReader = createSingleSocketMcpClient(join(sockDir, 'curator.sock'))
+      let injectedStep = 0
+      let targetV2 = null
+      try {
+        const injectingReader = {
+          async callReadTool(name, args) {
+            const out = await rawReader.callReadTool(name, args)
+            if (name === 'memory_query') {
+              injectedStep += 1
+              if (injectedStep === 1) {
+                // Advance daemon wall clock past expiringSoon.exp (nowSec + 4 + 105 = nowSec + 109) AND supersede targetV1!
+                clockSec = nowSec + 120
+                targetV2 = signClaim(aliceSk, alicePk, 'nvoy-live-head', 'nvoy', 'Mid-scan v2 replacement', 30, { priorCreatedAt: targetV1.created_at })
+                assert.equal(daemon.store.submit({ writer: 'alice', event: targetV2, expectedPriorId: targetV1.id, nowSec: nowSec + 30 }).accepted, true)
+              } else if (injectedStep === 2) {
+                // Withdraw targetV2 and add a brand-new claim from Bob after page 1
+                const { replacement } = buildWithdrawalTemplate({
+                  pubkey: alicePk,
+                  priorEvent: targetV2,
+                  scope: `room:${ROOM_ID}`,
+                  slug: 'nvoy-live-head',
+                  because: 'Mid-scan withdrawal',
+                  memoryGlobalChannelId: GLOBAL_CH,
+                  nowSec: nowSec + 31,
+                })
+                const signedWithdraw = finalizeEvent(replacement, aliceSk)
+                assert.equal(daemon.store.submit({ writer: 'alice', event: signedWithdraw, expectedPriorId: targetV2.id, nowSec: nowSec + 31 }).accepted, true)
+                const bobMid1 = signClaim(bobSk, bobPk, 'bob-mid-scan-1', 'nvoy', 'Concurrent Bob save 1', 32)
+                assert.equal(daemon.store.submit({ writer: 'bob', event: bobMid1, expectedPriorId: null, nowSec: nowSec + 32 }).accepted, true)
+              } else if (injectedStep === 3) {
+                // Add two more concurrent saves before final page
+                const bobMid2 = signClaim(bobSk, bobPk, 'bob-mid-scan-2', 'herd-infra', 'Concurrent Bob save 2', 33)
+                const bobMid3 = signClaim(bobSk, bobPk, 'bob-mid-scan-3', 'buzz', 'Concurrent Bob save 3', 34)
+                assert.equal(daemon.store.submit({ writer: 'bob', event: bobMid2, expectedPriorId: null, nowSec: nowSec + 33 }).accepted, true)
+                assert.equal(daemon.store.submit({ writer: 'bob', event: bobMid3, expectedPriorId: null, nowSec: nowSec + 34 }).accepted, true)
+              }
+            }
+            return out
+          },
+        }
+
+        const scan = await readInitialHistory(injectingReader, 20, 3, 3)
+        assert.equal(scan.historyComplete, true)
+        assert.equal(scan.wake.store_state.write_seq, 11, 'snapshot write_seq stays anchored at initial 11')
+        assert.equal(scan.historyRecords.length, 10, 'exact 10 pre-scan events returned with zero mid-scan leaks or cursor shifts')
+        assert.deepEqual(new Set(scan.historyRecords.map(r => r.event_id)), new Set(seededIds))
+        const scannedTarget = scan.records.find(r => r.event_id === targetV1.id)
+        assert(scannedTarget, 'targetV1 superseded/withdrawn mid-scan remains active in point-in-time snapshot')
+        assert.equal(scannedTarget.is_current, true)
+        assert.equal(scannedTarget.verification, 'accepted')
+        const scannedExpiring = scan.records.find(r => r.event_id === expiringSoon.id)
+        assert(scannedExpiring, 'claim expiring mid-scan stays accepted at pinned snapshot_at without shifting page order')
+        assert.equal(scannedExpiring.verification, 'accepted')
+
+        assert(scan.scanDiagnostics && Array.isArray(scan.scanDiagnostics.attempts), 'scanDiagnostics.attempts returned')
+        assert.equal(scan.scanDiagnostics.attempts.length, 1, 'snapshot scan succeeds on attempt 1 despite 5 concurrent writes')
+        const a0 = scan.scanDiagnostics.attempts[0]
+        assert.equal(a0.attempt, 1)
+        assert.equal(a0.mode, 'snapshot')
+        assert.equal(a0.snapshot_write_seq, 11)
+        assert.equal(a0.end_write_seq, 16)
+        assert.equal(a0.concurrent_writes, 5)
+        assert.equal(a0.pages, 4)
+        assert.equal(typeof a0.elapsed_ms, 'number')
+        assert.equal(a0.outcome, 'ok')
+
+        // 3. Purge invalidation during scan triggers bounded retry with per-attempt sequence diagnostics:
+        //    3a. Single purge on attempt 1 recovers cleanly on attempt 2.
+        let purgeOnceDone = false
+        const purgeOnceReader = {
+          async callReadTool(name, args) {
+            const out = await rawReader.callReadTool(name, args)
+            if (name === 'memory_query' && !args.cursor && !purgeOnceDone) {
+              purgeOnceDone = true
+              daemon.store.hardDelete({ d: `hive-memory:room:${ROOM_ID}:bob-mid-scan-3`, nowSec: nowSec + 40 })
+              recordVerifiedBackup({ receiptPath, snapshotId: SNAP_ID, writeSeq: daemon.store.storeState(ownerPk, nowSec + 41).write_seq, at: nowSec + 41, nowSec: nowSec + 41 })
+            }
+            return out
+          },
+        }
+        const recoveredAfterPurge = await readInitialHistory(purgeOnceReader, 20, 3, 3)
+        assert.equal(recoveredAfterPurge.historyComplete, true)
+        assert.equal(recoveredAfterPurge.scanDiagnostics.attempts.length, 2, 'purge mid-scan retries once and succeeds on attempt 2')
+        assert.equal(recoveredAfterPurge.scanDiagnostics.attempts[0].outcome, 'retry:snapshot_purged')
+        assert.equal(recoveredAfterPurge.scanDiagnostics.attempts[1].outcome, 'ok')
+
+        //    3b. Purges on all 3 bounded attempts exhaust retries and surface attempt sequence/timing diagnostics on the error.
+        let purgeCount = 0
+        const purgeTargets = ['bob-mid-scan-2', 'bob-mid-scan-1', 'foxtrot-metric-190']
+        const alwaysPurgingReader = {
+          async callReadTool(name, args) {
+            const out = await rawReader.callReadTool(name, args)
+            if (name === 'memory_query' && !args.cursor && purgeCount < 3) {
+              const slug = purgeTargets[purgeCount++]
+              daemon.store.hardDelete({ d: `hive-memory:room:${ROOM_ID}:${slug}`, nowSec: nowSec + 50 + purgeCount })
+              recordVerifiedBackup({
+                receiptPath,
+                snapshotId: SNAP_ID,
+                writeSeq: daemon.store.storeState(ownerPk, nowSec + 60 + purgeCount).writeSeq ?? daemon.store.storeState(ownerPk, nowSec + 60 + purgeCount).write_seq,
+                at: nowSec + 60 + purgeCount,
+                nowSec: nowSec + 60 + purgeCount,
+              })
+            }
+            return out
+          },
+        }
+        let exhaustedErr = null
+        try {
+          await readInitialHistory(alwaysPurgingReader, 20, 3, 3)
+        } catch (err) {
+          exhaustedErr = err
+        }
+        assert(exhaustedErr, '3 consecutive mid-scan purges must fail closed')
+        assert.match(exhaustedErr.message, /memory history changed during bounded read retries/)
+        assert.match(exhaustedErr.message, /#1 .*snapshot_purged/)
+        assert.equal(Array.isArray(exhaustedErr.attempts), true)
+        assert.equal(exhaustedErr.attempts.length, 3)
+      } finally {
+        rawReader.close()
+      }
+
+      // 4. Full runCuratorCycle succeeds coherently while outside saves land during the cycle,
+      //    populates dream packet post-cycle coherence, and exposes scan_diagnostics.
+      let cycleSaveCounter = 0
+      const curatorSigner = {
+        pubkey: curatorPk,
+        async signEvent(template) {
+          // Concurrent peer save arriving right before curator signs/submits!
+          cycleSaveCounter += 1
+          const peerEv = signClaim(bobSk, bobPk, `bob-during-sign-${cycleSaveCounter}`, 'nvoy', `Peer save during curator sign ${cycleSaveCounter}`, 80 + cycleSaveCounter)
+          assert.equal(daemon.store.submit({ writer: 'bob', event: peerEv, expectedPriorId: null, nowSec: nowSec + 80 + cycleSaveCounter }).accepted, true)
+          return finalizeEvent(template, curatorSk)
+        },
+      }
+      const preCycleSeq = daemon.store.storeState(curatorPk, nowSec + 100).write_seq
+      const cycle = await runCuratorCycle({
+        readerSocket: join(sockDir, 'curator.sock'),
+        writerSocket: join(sockDir, 'writers', 'curator.sock'),
+        curatorSigner,
+        memoryGlobalChannelId: GLOBAL_CH,
+        stateFile,
+        packetDir,
+        pageSize: 3,
+        force: true,
+        nowSec: nowSec + 100,
+      })
+      assert.equal(cycle.ok, true)
+      assert.equal(cycle.cycle_status, 'curated')
+      assert.equal(cycle.submitted.length, 1, 'PR #700 checkpoints distilled')
+      assert.equal(cycle.next_curated_write_seq, preCycleSeq + cycle.submitted.length, 'uncurated concurrent peer save remains outside curated cursor')
+      assert(cycle.dream_packet && cycle.dream_packet.stats.coherence.after !== null, 'readPostCycleSnapshot succeeds despite concurrent peer save')
+      assert.equal(cycle.scan_diagnostics?.attempts?.length, 1)
+    } finally {
+      await daemon.close()
+    }
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
 console.log(`\nResults: ${passed} passed, ${failed} failed`)
 if (failed > 0) process.exit(1)
