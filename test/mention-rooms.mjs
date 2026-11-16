@@ -68,6 +68,8 @@ ok('readRooms drops the broker itself and names each member it can', !(agent in 
 ok('a name two keys reduce to is kept by neither', inCH[twinA.pk] === null && inCH[twinB.pk] === null)
 ok('an unverified room is marked failed rather than replacing its last list with empty', !('not-a-room' in roomsRead.rooms) &&
   roomsRead.failed.some(f => f.room === 'not-a-room') && roomsRead.rooms[CH2].length === 1)
+const emptyRead = await readRooms({ session: session([list(CH, [], 11)]), rooms: [CH], relaySigner: relayKey.pk, me: agent })
+ok('a verified empty roster is read as empty, not failed', emptyRead.rooms[CH].length === 0 && emptyRead.failed.length === 0)
 ok('only keys with a verified profile are marked profiled', roomsRead.profiled.includes(kerouac.pk) && !roomsRead.profiled.includes(dennis.pk))
 const brokenRead = await readRooms({ session: { fetch: async f => { if (f.kinds[0] === 0) throw new Error('profiles down'); throw new Error('room down') } }, rooms: [CH], relaySigner: relayKey.pk, me: agent })
 ok('a room or the profiles that fail to read are listed as failed', brokenRead.failed.some(f => f.room === CH) && !(CH in brokenRead.rooms))
@@ -118,6 +120,8 @@ ok('a departed key and its old name leave the room', recordMentionRooms(rm,
   { rooms: { [CH]: [entry(twinA, 'twin')], [CH2]: [] }, profiled: [twinA.pk] }) &&
   readMentionRooms(rm)[CH].length === 1 && readMentionRooms(rm)[CH][0].pubkey === twinA.pk &&
   readMentionRooms(rm)[CH2].length === 0)
+ok('a verified empty roster clears the last discovery list', recordMentionRooms(rm,
+  { rooms: { [CH]: [] } }) && readMentionRooms(rm)[CH].length === 0)
 writeFileSync(roomsFile, JSON.stringify({ version: 1, instance: 'someone-else', rooms: { [CH]: [entry(dennis)] } }))
 ok('a file for another instance reads as nothing', readMentionRooms(rm) === null)
 writeFileSync(roomsFile, JSON.stringify({ version: 1, instance: 'rooms', rooms: { [CH]: [entry(kerouac, 'kerouac'), { pubkey: 'zz', name: 'x' }, entry(dennis, '-bad')], [grantor]: [entry(dennis)] } }))
