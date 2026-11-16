@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict'
 import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createServer as createPlainHttpServer, request as httpRequest } from 'node:http'
-import { createServer as createNetServer } from 'node:net'
+import { createServer as createNetServer, connect as netConnect } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
@@ -3931,6 +3931,7 @@ await test('q-192: the viewer listens and serves the pending state while its fir
   const port = probe.address().port
   await new Promise(r => probe.close(r))
   const gateAsked = []
+  const listened = []
   let viewer
   let settled = false
   const starting = startMemoryViewer({
@@ -3939,6 +3940,7 @@ await test('q-192: the viewer listens and serves the pending state while its fir
     port,
     pollMs: 300_000,
     peerGate: async addr => { gateAsked.push(addr); return { ok: true, node: { stableId: 'nTest', tags: [] } } },
+    onListening: info => { listened.push({ ...info, settledThen: settled }) },
   }).then(v => { settled = true; viewer = v; return v })
   try {
     let page = null
@@ -3958,11 +3960,58 @@ await test('q-192: the viewer listens and serves the pending state while its fir
     assert.equal(body.connected, false)
     assert.equal(body.error, 'initial poll pending')
     assert(gateAsked.length >= 3, 'the peer gate runs on every request before the first poll too')
+    assert.deepEqual(listened, [{ host: '127.0.0.1', port, settledThen: false }], 'onListening fires once, at bind, before the first poll finishes')
   } finally {
     for (const c of held) c.destroy()
     await starting.catch(() => {})
     if (viewer) await viewer.stop()
     await new Promise(r => slowDaemon.close(r))
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await test('q-192: a throwing onListening hook does not reject startup or orphan the listener', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'viewer-listen-throw-'))
+  const sock = join(dir, 'drop-viewer.sock')
+  // A daemon that drops every connection, so the first poll fails fast and startup can finish.
+  const dropDaemon = createNetServer(c => { c.on('error', () => {}); c.destroy() })
+  await new Promise(r => dropDaemon.listen(sock, r))
+  const probe = createNetServer()
+  await new Promise(r => probe.listen(0, '127.0.0.1', r))
+  const port = probe.address().port
+  await new Promise(r => probe.close(r))
+  let calls = 0
+  let viewer
+  const errors = []
+  const origError = console.error
+  console.error = (...a) => { errors.push(a.join(' ')) }
+  try {
+    viewer = await startMemoryViewer({
+      socketPath: sock,
+      host: '127.0.0.1',
+      port,
+      pollMs: 300_000,
+      peerGate: async () => ({ ok: true, node: { stableId: 'nTest', tags: [] } }),
+      onListening: () => { calls++; throw new Error('hook boom') },
+    })
+    console.error = origError
+    assert.equal(calls, 1, 'the hook ran once')
+    assert.equal(typeof viewer.stop, 'function', 'startup resolved with a stop handle despite the throw')
+    assert(errors.some(e => e.includes('onListening hook failed') && e.includes('hook boom')), 'the failure is logged')
+    assert.equal((await httpGet(port, '/api/state')).status, 200, 'the viewer serves after the hook threw')
+    await viewer.stop()
+    viewer = null
+    // A fresh TCP connect, not httpGet: the HTTP agent may reuse a pooled keep-alive socket and see a reset.
+    const after = await new Promise(resolve => {
+      const c = netConnect(port, '127.0.0.1')
+      c.on('connect', () => { c.destroy(); resolve('answered') })
+      c.on('error', err => resolve(err.code || 'error'))
+    })
+    assert.equal(after, 'ECONNREFUSED', 'no listener is left behind after stop()')
+  } finally {
+    console.error = origError
+    if (viewer) await viewer.stop()
+    await new Promise(r => dropDaemon.close(r))
     rmSync(dir, { recursive: true, force: true })
   }
 })
