@@ -392,7 +392,10 @@ export function assertNoCollisions(root, candidate) {
     for (const [label, kind, value] of resources) {
       if (value === '' || value == null) continue
       const key = `${kind}:${value}`
-      if (seen.has(key)) die(`${label} collision between ${seen.get(key)} and ${m.id}`)
+      // Only a value shared with another instance crosses the boundary. One instance may name the same value in
+      // two of its own fields, as it could before PR 366 (GrokDoggyDog's read); readManifest already requires its
+      // UIDs and GIDs to be distinct, so this skip opens nothing there.
+      if (seen.has(key) && seen.get(key) !== m.id) die(`${label} collision between ${seen.get(key)} and ${m.id}`)
       seen.set(key, m.id)
     }
     for (const dir of [m.stateDir, m.runtimeDir, m.spoolDir]) if (dir) roots.push([m.id, normalPath(dir)], [m.id, effectivePath(dir)])
