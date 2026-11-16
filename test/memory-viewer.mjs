@@ -48,6 +48,7 @@ import {
   safeJsonForScript,
   sanitizeActivity,
   startMemoryViewer,
+  snapshotPin,
 } from '../mcp/tools/memory-viewer.mjs'
 import { createPeerGate, createTailscaleSelf, createTailscaleWhois, parseAllowedNodes, whoisAddr } from '../mcp/tools/viewer-peer-gate.mjs'
 
@@ -3963,6 +3964,98 @@ await test('q-192: the viewer listens and serves the pending state while its fir
     if (viewer) await viewer.stop()
     await new Promise(r => slowDaemon.close(r))
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await test('q-192: snapshotPin turns a page snapshot into pin arguments, and refuses a partial one', async () => {
+  assert.deepEqual(snapshotPin({ snapshot: { max_event_rowid: 7, last_purge_seq: 0, as_of_sec: 1794796889, write_seq: 9 } }),
+    { snapshot_rowid: 7, expected_purge_seq: 0, snapshot_at: 1794796889 })
+  assert.equal(snapshotPin({}), null)
+  assert.equal(snapshotPin({ snapshot: { max_event_rowid: 7, last_purge_seq: 0 } }), null)
+  assert.equal(snapshotPin({ snapshot: { max_event_rowid: -1, last_purge_seq: 0, as_of_sec: 5 } }), null)
+})
+
+await test('q-192: a multi-page pull pins pages after the first, evaluates the store once, and restarts unpinned on a refused pin', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'viewer-pinned-pull-'))
+  const dbPath = join(tmp, 'memory.sqlite')
+  const ledgerPath = join(tmp, 'accepted-ledger.jsonl')
+  const receiptPath = join(tmp, 'last-verified-backup.json')
+  const socketDir = join(tmp, 'sockets')
+  const ownerSk = generateSecretKey()
+  const ownerPk = getPublicKey(ownerSk)
+  const viewerPk = getPublicKey(generateSecretKey())
+  const room = 'a8186b53-537d-46ad-a7e7-b6486c58970e'
+  const nowSec = Math.floor(Date.now() / 1000)
+  initEmptyStore({ dbPath, ledgerPath })
+  recordVerifiedBackup({ receiptPath, snapshotId: SNAP_ID, writeSeq: 1, at: nowSec - 700 })
+  const daemon = await startMemoryDaemon({
+    dbPath, ledgerPath, receiptPath,
+    config: {
+      memoryGlobalChannelId: room, ownerPubkey: ownerPk, maxUnbackedSec: 3600,
+      globalWriters: [ownerPk], canonWriters: [ownerPk], readers: { viewer: viewerPk },
+      writers: { james: { pubkey: ownerPk, perHour: 3600 } },
+      rooms: { [room]: { members: [ownerPk, viewerPk], writers: [ownerPk] } },
+    },
+    readers: 'viewer', writers: 'james', socketDir, log: () => {},
+  })
+  const N = 250
+  for (let i = 0; i < N; i++) {
+    const at = nowSec - 600 + i
+    const r = daemon.store.submit({
+      writer: 'james',
+      event: finalizeEvent(buildClaimTemplate({
+        pubkey: ownerPk, scope: `room:${room}`, slug: `q192-pin-${i}`, memoryGlobalChannelId: room, topic: 'hive-memory',
+        claim: `Claim ${i} for the q-192 pinned pull test.`, because: 'q-192 test',
+        evidence: ['nvoy@044171b0:mcp/tools/memory-viewer.mjs'], asOfGit: '044171b0ab5038aaf3c7e9dda04e2ee15113dea3',
+        ttlSec: 86400 * 14, nowSec: at,
+      }), ownerSk),
+      expectedPriorId: null, nowSec: at,
+    })
+    assert.equal(r.accepted, true, `row ${i}: ${JSON.stringify(r).slice(0, 300)}`)
+  }
+  const store = daemon.store
+  const realQuery = store.query.bind(store)
+  const calls = []
+  let refuseNextPinned = false
+  store.query = opts => {
+    calls.push(opts)
+    if (refuseNextPinned && opts.snapshotRowid != null) {
+      refuseNextPinned = false
+      return { ...realQuery({ ...opts, snapshotRowid: null, expectedPurgeSeq: null, snapshotAt: null }), answer: 'unknown', answer_reason: 'snapshot-purged', records: [], next_cursor: null }
+    }
+    return realQuery(opts)
+  }
+  let viewer = null
+  const errors = []
+  const realError = console.error
+  console.error = (...a) => { errors.push(a.join(' ')) }
+  try {
+    viewer = await startMemoryViewer({ socketPath: join(socketDir, 'viewer.sock'), host: '127.0.0.1', port: 0, pollMs: 60000 })
+    const pages = calls.filter(c => c.includeHistory)
+    assert.equal(pages.length, 3, '250 rows are three pages of 100')
+    assert.equal(pages[0].snapshotRowid, null, 'the first page is unpinned')
+    for (const c of pages.slice(1)) {
+      assert(Number.isSafeInteger(c.snapshotRowid) && c.snapshotRowid > 0, 'later pages carry the first page snapshot rowid')
+      assert.equal(c.expectedPurgeSeq, 0)
+      assert(Number.isSafeInteger(c.snapshotAt))
+    }
+    assert.equal(new Set(pages.slice(1).map(c => c.snapshotRowid)).size, 1, 'every later page names the same snapshot')
+    assert.equal(store.pageMemoSize(), 1, 'the pinned pages share one evaluated result')
+    assert.equal(viewer.getState ? viewer.getState().records.length : (await viewer.pollOnce({ forceFull: false })).records.length, N)
+
+    calls.length = 0
+    refuseNextPinned = true
+    const s2 = await viewer.pollOnce({ forceFull: true })
+    const pages2 = calls.filter(c => c.includeHistory)
+    assert.equal(pages2.length, 5, 'one unpinned page, one refused pinned page, then three unpinned pages')
+    assert.deepEqual(pages2.map(c => c.snapshotRowid != null), [false, true, false, false, false], 'after a refused pin the pull is never pinned again')
+    assert.equal(s2.records.length, N, 'the restarted pull still sees every row exactly once')
+    assert(errors.some(e => e.includes('pinned page refused (snapshot-purged)')), 'the restart is logged')
+  } finally {
+    console.error = realError
+    if (viewer) await viewer.stop()
+    await daemon.close()
+    rmSync(tmp, { recursive: true, force: true })
   }
 })
 
