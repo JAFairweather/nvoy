@@ -1,7 +1,8 @@
 // Per-seat read log (nvoy #390): one line per reader wake/query/get with the returned fact keys and no text; the viewer is
 // skipped; the file is 0640; retention drops old lines and obeys the size cap; a failing log never fails a read.
 import assert from 'node:assert/strict'
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { closeSync, chmodSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
@@ -169,6 +170,63 @@ await test('retention: old lines and damaged lines go, new ones stay, mode stays
   assert.throws(() => new ReadLog({ path, retentionDays: 0 }), /retention/)
   assert.throws(() => new ReadLog({ path, maxBytes: 10 }), /size cap/)
   rmSync(tmp, { recursive: true, force: true })
+})
+
+await test('startup pruning streams a 64 MiB log under a 64 MiB JS heap and keeps the recent half', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'nvoy-read-log-64m-'))
+  const path = join(tmp, 'reads.ndjson')
+  const size = 64 * 1024 * 1024
+  const now = 1_800_000_000
+  const entry = at => {
+    const prefix = JSON.stringify({ at, seat: 'dennis', op: 'query', n: 1, d: ['k'], truncated: false, pad: '' })
+    const line = `${prefix.slice(0, -2)}${'a'.repeat(255 - prefix.length)}"}\n`
+    assert.equal(Buffer.byteLength(line), 256)
+    return Buffer.from(line)
+  }
+  try {
+    const old = entry(now - 40 * 86400), recent = entry(now)
+    const fd = openSync(path, 'w', 0o640)
+    try {
+      const block = Buffer.allocUnsafe(1024 * 1024)
+      for (let i = 0; i < 64; i++) {
+        const line = i < 32 ? old : recent
+        for (let j = 0; j < 4096; j++) line.copy(block, j * 256)
+        writeSync(fd, block)
+      }
+    } finally { closeSync(fd) }
+    assert.equal(statSync(path).size, size)
+    const child = spawnSync(process.execPath, ['--max-old-space-size=64', '--input-type=module', '-e',
+      'const {ReadLog}=await import(process.argv[2]); const log=new ReadLog({path:process.argv[1],now:()=>1800000000}); if(log.failures) process.exit(2)',
+      path, new URL('../mcp/tools/memory-read-log.mjs', import.meta.url).href], { encoding: 'utf8', timeout: 30_000 })
+    assert.equal(child.status, 0, `bounded-heap prune failed: ${child.stderr.slice(-1000)}`)
+    assert.equal(statSync(path).size, size / 2, 'only the recent half remains')
+    assert.equal(statSync(path).mode & 0o777, 0o640)
+    const fd2 = openSync(path, 'r')
+    try {
+      const first = Buffer.alloc(256), last = Buffer.alloc(256)
+      readSync(fd2, first, 0, 256, 0)
+      readSync(fd2, last, 0, 256, size / 2 - 256)
+      assert.equal(first.toString(), recent.toString())
+      assert.equal(last.toString(), recent.toString())
+    } finally { closeSync(fd2) }
+    assert.deepEqual(readdirSync(tmp), ['reads.ndjson'], 'the atomic rewrite left no temporary file')
+  } finally { rmSync(tmp, { recursive: true, force: true }) }
+})
+
+await test('prune preserves a valid line across scan chunks and discards an oversized damaged line', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'nvoy-read-log-chunks-'))
+  const path = join(tmp, 'reads.ndjson')
+  const now = 1_800_000_000
+  const recent = { at: now, seat: 'dennis', op: 'query', n: 1, d: ['k'], truncated: false, pad: 'a'.repeat(70_000) }
+  try {
+    writeFileSync(path, `${JSON.stringify({ at: now - 40 * 86400 })}\n${JSON.stringify(recent)}\n${'x'.repeat(1024 * 1024 + 1)}\n`)
+    const rl = new ReadLog({ path, now: () => now })
+    assert.equal(rl.failures, 0)
+    assert.deepEqual(lines(path), [recent])
+    assert.equal(rl.record({ seat: 'dennis', op: 'query', keys: ['x'.repeat(1024 * 1024)] }), false, 'the daemon does not append an entry it could not later prune safely')
+    assert.equal(rl.failures, 1, 'the missing audit entry is counted')
+    assert.deepEqual(lines(path), [recent])
+  } finally { rmSync(tmp, { recursive: true, force: true }) }
 })
 
 await test('symlinks are never followed: at the log path (refused), and beside it where the old prune named its temp file', async () => {
