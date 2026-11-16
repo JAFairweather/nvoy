@@ -531,6 +531,26 @@ for (const [what, fields] of [
   const r = cli('describe', '--instance', 'codex-test')
   ok(`${what} is refused as nesting`, r.status !== 0 && /filesystem root nesting/.test(r.stderr))
 }
+// A symlink in a parent moves a root into another instance's tree even though the root itself is no symlink
+// (Murphy's PR 366 reproduction: bravo-parent -> alpha's state, bravo state at bravo-parent/inner).
+mkdirSync(manifest.state_dir, { recursive: true })
+const bravoParent = join(root, 'bravo-parent')
+symlinkSync(manifest.state_dir, bravoParent)
+writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolated, state_dir: join(bravoParent, 'inner') }))
+const ancestorLink = cli('describe', '--instance', 'codex-test')
+ok('a root under a symlinked parent that points into another instance\'s root is refused as nesting',
+  ancestorLink.status !== 0 && /filesystem root nesting/.test(ancestorLink.stderr))
+const stateParentLink = join(root, 'state-parent-link')
+symlinkSync(dirname(manifest.state_dir), stateParentLink)
+writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolated, runtime_dir: join(stateParentLink, basename(manifest.state_dir)) }))
+const ancestorEqual = cli('describe', '--instance', 'codex-test')
+ok('another instance\'s root reached through a symlinked parent is a collision',
+  ancestorEqual.status !== 0 && /filesystem root collision/.test(ancestorEqual.stderr))
+mkdirSync(join(root, 'elsewhere'))
+symlinkSync(join(root, 'elsewhere'), join(root, 'elsewhere-link'))
+writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolated, state_dir: join(root, 'elsewhere-link', 'state') }))
+const disjointLink = cli('describe', '--instance', 'codex-test')
+ok('NEGATIVE CONTROL: a symlinked parent that points somewhere disjoint is accepted', disjointLink.status === 0)
 // Disjoint control: a sibling whose root shares only a name prefix (state vs state-other) is not nested.
 writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolated, state_dir: `${manifest.state_dir}-other` }))
 const prefixOnly = cli('describe', '--instance', 'codex-test')
