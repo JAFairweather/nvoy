@@ -91,23 +91,30 @@ export async function readRooms({ session, rooms, relaySigner, me }) {
   const holders = new Map()
   for (const [pubkey, name] of names) if (name) holders.set(fold(name), [...(holders.get(fold(name)) || []), pubkey])
   const nameOf = pubkey => { const n = names.get(pubkey); return n && holders.get(fold(n)).length === 1 ? n : null }
-  return { rooms: Object.fromEntries(Object.entries(read).map(([room, keys]) => [room, keys.map(pubkey => ({ pubkey, name: nameOf(pubkey) }))])),
+  return { rooms: Object.fromEntries(Object.entries(read).map(([room, keys]) => [room, keys.map(pubkey => ({
+    pubkey, name: nameOf(pubkey), ...(names.has(pubkey) ? { candidate: names.get(pubkey) } : {})
+  }))])),
     failed, profiled: [...names.keys()] }
 }
 
 // --- The discovery file: broker-owned, worker-group readable, provisioned beside mention-grants.json. ---
 export const mentionRoomsPath = manifest => resolve(manifest.runtimeDir, 'mention-rooms.json')
-const entryOk = e => e && HEX64.test(String(e.pubkey || '')) && (e.name === null || MENTION_NAME.test(String(e.name || '')))
+const entryOk = e => e && HEX64.test(String(e.pubkey || '')) && (e.name === null || MENTION_NAME.test(String(e.name || ''))) &&
+  (e.candidate === undefined || e.candidate === null || MENTION_NAME.test(String(e.candidate)))
 // Only the identity's own may_post rooms, and only well-formed entries; null when the file cannot be read whole.
-export function readMentionRooms(manifest) {
+function readStoredMentionRooms(manifest) {
   const channels = manifest.mayPost?.channels || []
   try {
     const path = mentionRoomsPath(manifest), st = lstatSync(path)
     if (!st.isFile() || st.size > 4 * 1024 * 1024) return null
     const x = JSON.parse(readFileSync(path, 'utf8'))
     if (x?.version !== 1 || x.instance !== manifest.id || !x.rooms || typeof x.rooms !== 'object' || Array.isArray(x.rooms)) return null
-    return Object.fromEntries(channels.filter(c => Array.isArray(x.rooms[c])).map(c => [c, x.rooms[c].filter(entryOk).map(({ pubkey, name }) => ({ pubkey, name }))]))
+    return Object.fromEntries(channels.filter(c => Array.isArray(x.rooms[c])).map(c => [c, x.rooms[c].filter(entryOk).map(({ pubkey, name, candidate }) => ({ pubkey, name, candidate: candidate === undefined ? name : candidate }))]))
   } catch { return null }
+}
+export function readMentionRooms(manifest) {
+  const stored = readStoredMentionRooms(manifest)
+  return stored && Object.fromEntries(Object.entries(stored).map(([room, entries]) => [room, entries.map(({ pubkey, name }) => ({ pubkey, name }))]))
 }
 // A room not read this time (one that failed, or one a single-room refresh skipped) keeps its last
 // good list. True only when the file now holds exactly this body.
@@ -116,20 +123,23 @@ export function readMentionRooms(manifest) {
 // retained rooms: a newly named member can collide with an older carried name.
 export function recordMentionRooms(manifest, { rooms, profiled = [] }, now = Date.now()) {
   if (!manifest.mayPost?.mentionRooms) return false
-  const last = readMentionRooms(manifest) || {}
-  const lastName = new Map(Object.values(last).flat().filter(e => e.name).map(e => [e.pubkey, e.name]))
+  const last = readStoredMentionRooms(manifest) || {}
+  const lastCandidate = new Map(Object.values(last).flat().filter(e => e.candidate).map(e => [e.pubkey, e.candidate]))
   const verifiedProfile = new Set(profiled)
-  const fresh = list => list.map(e => ({ pubkey: e.pubkey,
-    name: e.name ?? (verifiedProfile.has(e.pubkey) ? null : lastName.get(e.pubkey) ?? null) }))
+  const fresh = list => list.map(e => {
+    const candidate = e.candidate !== undefined ? e.candidate :
+      e.name ?? (verifiedProfile.has(e.pubkey) ? null : lastCandidate.get(e.pubkey) ?? null)
+    return { pubkey: e.pubkey, name: candidate, candidate }
+  })
   const merged = Object.fromEntries(manifest.mayPost.channels.filter(c => rooms[c] || last[c]).map(c => [c, rooms[c] ? fresh(rooms[c]) : last[c]]))
   const holders = new Map()
-  for (const e of Object.values(merged).flat()) if (e.name) {
-    const key = fold(e.name)
+  for (const e of Object.values(merged).flat()) if (e.candidate) {
+    const key = fold(e.candidate)
     if (!holders.has(key)) holders.set(key, new Set())
     holders.get(key).add(e.pubkey)
   }
   for (const list of Object.values(merged)) for (const e of list) {
-    if (e.name && holders.get(fold(e.name)).size !== 1) e.name = null
+    e.name = e.candidate && holders.get(fold(e.candidate)).size === 1 ? e.candidate : null
   }
   const body = JSON.stringify({ version: 1, instance: manifest.id, read_at: Math.floor(now / 1000), rooms: merged }) + '\n'
   let fd

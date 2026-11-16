@@ -116,6 +116,13 @@ recordMentionRooms(rm, { rooms: { [CH]: [entry(kerouac, 'kerouac')], [CH2]: [ent
 ok('a carried name colliding with a fresh profile name is kept by neither key', recordMentionRooms(rm,
   { rooms: { [CH]: [entry(kerouac), entry(twinA, 'kerouac')] }, profiled: [twinA.pk] }) &&
   readMentionRooms(rm)[CH].every(e => e.name === null))
+ok('a second partial-profile refresh keeps the unresolved collision hidden', recordMentionRooms(rm,
+  { rooms: { [CH]: [entry(kerouac), entry(twinA, 'kerouac')] }, profiled: [twinA.pk] }) &&
+  readMentionRooms(rm)[CH].every(e => e.name === null) &&
+  JSON.parse(readFileSync(roomsFile, 'utf8')).rooms[CH].every(e => e.candidate === 'kerouac'))
+ok('a verified name change resolves the collision', recordMentionRooms(rm,
+  { rooms: { [CH]: [entry(kerouac, 'writer'), entry(twinA, 'kerouac')] }, profiled: [kerouac.pk, twinA.pk] }) &&
+  readMentionRooms(rm)[CH].map(e => e.name).join() === 'writer,kerouac')
 ok('a departed key and its old name leave the room', recordMentionRooms(rm,
   { rooms: { [CH]: [entry(twinA, 'twin')], [CH2]: [] }, profiled: [twinA.pk] }) &&
   readMentionRooms(rm)[CH].length === 1 && readMentionRooms(rm)[CH][0].pubkey === twinA.pk &&
