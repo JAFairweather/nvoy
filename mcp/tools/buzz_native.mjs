@@ -268,6 +268,7 @@ export async function openBuzzSession({
     if (m[0] === 'AUTH' && typeof m[1] === 'string') { challenge = m[1]; onChallenge?.resolve(m[1]) }
     else if (m[0] === 'OK') { const w = waiters.get(m[1]); if (w) { waiters.delete(m[1]); w.resolve({ accepted: m[2] === true, message: String(m[3] || '') }) } }
     else if (m[0] === 'EVENT') { const l = live.get(m[1]); if (l) l.onEvent(m[2]); else subs.get(m[1])?.events.push(m[2]) }
+    else if (m[0] === 'COUNT') { const s = subs.get(m[1]); if (s?.count) { subs.delete(m[1]); s.resolve(m[2]) } }
     else if (m[0] === 'EOSE') { const l = live.get(m[1]); if (l) l.onEose?.(); else { const s = subs.get(m[1]); if (s) { subs.delete(m[1]); s.resolve(s.events) } } }
     else if (m[0] === 'CLOSED') {
       const l = live.get(m[1])
@@ -390,6 +391,20 @@ export async function openBuzzSession({
         onPhase?.({ event: 'fetch_error', req_ms, close_code: closeCode, close_reason: closeReason, error: error.message })
         throw error
       } finally { if (!closedWith) try { send(['CLOSE', id]) } catch { /* closing anyway */ } }
+    },
+    // NIP-45 COUNT over the same filters as fetch: { count, approximate? } exactly as the relay sent it.
+    // Rejects on CLOSED, timeout or a reply that is not a non-negative integer count.
+    async count(...filters) {
+      if (needsChannels(filters)) throw new Error('every Buzz filter needs #h channel UUIDs — without it the relay returns nothing')
+      const id = `c${++n}`
+      phase = 'count'
+      try {
+        send(['COUNT', id, ...filters])
+        const res = await bounded(new Promise((resolve, reject) => subs.set(id, { events: [], count: true, resolve, reject })), 'COUNT')
+        if (!Number.isSafeInteger(res?.count) || res.count < 0) throw new Error('relay COUNT reply has no usable count')
+        phase = 'ready'
+        return { count: res.count, ...(res.approximate === true ? { approximate: true } : {}) }
+      } finally { subs.delete(id) }
     },
     // A subscription that stays open past EOSE. Events arrive unverified: the caller decides what
     // an event means (nativeMention verifies it) — this only routes frames.
