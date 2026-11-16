@@ -44,6 +44,10 @@ import {
 const DEFAULT_POLL_MS = 3000
 const MAX_EVENT_LOG = 60
 export const CORPUS_CACHE_TTL_MS = 300_000
+// q-192: a full pull reads at most this many 100-row pages (10,000 rows, history included). At about 65 writes an hour
+// the store reaches it around 17 Nov 2026; past it history_complete goes false. Not raised here: the corpus is held in
+// a 224 MB heap. The bound is logged once when hit, so it cannot pass unnoticed.
+export const MAX_CORPUS_PAGES = 100
 // q-173 (15 Nov 2026): the topic eigenvector pass costs 2-4 s of synchronous CPU for about 1,500 records, and it ran
 // on every poll that saw a write, so the event loop stalled and page and API requests waited up to 20 s live. A
 // scheduled poll now reuses the previous pass for this long; a forced poll (startup, tests) always recomputes.
@@ -10004,6 +10008,7 @@ export async function startMemoryViewer({
   }
 
   let pollInFlight = null
+  let corpusCapLogged = false
   let pollTimer = null
   let cachedCorpus = null
   let cachedSpectral = null
@@ -10249,7 +10254,7 @@ export async function startMemoryViewer({
         firstQuery = null
         let cursor = '0'
         let pages = 0
-        while (cursor !== null && pages < 100) {
+        while (cursor !== null && pages < MAX_CORPUS_PAGES) {
           const page = await client.callReadTool('memory_query', {
             limit: 100,
             format: 'full',
@@ -10281,6 +10286,10 @@ export async function startMemoryViewer({
         )
         historyRecords = [...byEventId.values()]
         historyComplete = cursor === null
+        if (!historyComplete && !corpusCapLogged) {
+          corpusCapLogged = true
+          console.error(`memory-viewer: corpus pull stopped at ${MAX_CORPUS_PAGES} pages (${byEventId.size} rows); history is incomplete`)
+        }
         // q-173: let waiting page and API requests run before the heavy passes, and between them.
         await yieldToEventLoop()
         if (canReuseSpectral(cachedSpectral, { forceFull, aclSig: wakeAclSig, nowMs })) {
@@ -10694,9 +10703,6 @@ export async function startMemoryViewer({
     pollTimer.unref?.()
   }
 
-  await pollOnce({ forceFull: true })
-  scheduleNextPoll()
-
   const securityHeaders = {
     'Content-Security-Policy':
       "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
@@ -11050,8 +11056,15 @@ export async function startMemoryViewer({
     })
   })
 
+  // q-192 (16 Nov 2026): listen before the first poll. A full corpus pull is about 77 sequential pages (66-99 s at
+  // 7,600 rows), and while it ran the port stayed shut: the health check needed a 120 s grace and bootstrap waited.
+  // Until the pull lands, every route serves the initial "initial poll pending" state through the same peer gate.
+  // Callers still get a polled viewer: this function resolves only after the first poll.
   const addr = httpServer.address()
   const boundPort = typeof addr === 'object' && addr ? addr.port : target.port
+
+  await pollOnce({ forceFull: true })
+  scheduleNextPoll()
 
   return {
     host: target.host,
