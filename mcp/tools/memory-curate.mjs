@@ -3053,6 +3053,10 @@ async function main() {
     process.exit(1)
   }
   curatorSigner?.close()
+  // A one-shot run ends here, whatever handle a library still holds: the curator hung "activating" three times after
+  // a finished cycle (q-310), so success exits as plainly as failure does. stdout is a pipe or the journal (synchronous
+  // on Linux), so the summary line above is already written.
+  process.exit(0)
 }
 
 function isEntrypoint() {

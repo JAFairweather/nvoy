@@ -769,6 +769,19 @@ await test('CLI bin/hive-memory-curate.mjs requires write capability to advance 
       ])
       assert.equal(outAliceRo.recent_activity_count, 0, 'ordinary reader socket never receives recent_activity telemetry')
 
+      // q-310: the unit's own entrypoint (curator-start execs mcp/tools/memory-curate.mjs) exits once a cycle succeeds,
+      // even while some library still holds the event loop. A preloaded open interval stands in for the relay socket that
+      // kept the curator "activating" after "cursor advanced"; before the fix this child never exited.
+      {
+        const entry = join(dirname(fileURLToPath(import.meta.url)), '..', 'mcp', 'tools', 'memory-curate.mjs')
+        const held = 'data:text/javascript,setInterval(()=>{},1000)'
+        const r = await execFileAsync(process.execPath, ['--import', held, entry,
+          '--reader-socket', join(sockDir, 'curator.sock'), '--state-file', join(tmp, 'state', 'exit-check.json'), '--dry-run'],
+        { encoding: 'utf8', timeout: 20000 }).catch(err => ({ failed: err }))
+        assert.ok(!r.failed, `memory-curate.mjs must exit after a successful cycle: ${r.failed?.killed ? 'killed after 20 s' : r.failed?.message}`)
+        assert.equal(JSON.parse(r.stdout).ok, true, 'the cycle itself succeeded')
+      }
+
       // 1a. Read-only CLI call without writer socket/key at write_seq = 20 MUST NOT advance cursor or consume the +20 trigger
       const outRo20 = await runCli([
         '--reader-socket', join(sockDir, 'curator.sock'),
