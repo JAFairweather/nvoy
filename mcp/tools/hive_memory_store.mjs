@@ -1664,15 +1664,18 @@ export class HiveMemoryStore {
   }
 
   // Event ids reached from `start` along supersedes edges, at most MAX_LINK_HOPS hops, both ends readable.
-  #lineage(readerPubkey, start) {
+  #lineage(readerPubkey, start, snapshotRowid = null) {
     if (this.#targetHidden(readerPubkey, start)) return new Set()
     const found = new Set()
     let frontier = [start]
-    const edge = this.db.prepare("SELECT e.* FROM links l JOIN events e ON e.id = l.from_id WHERE l.relation = 'supersedes' AND l.target = ?")
+    const edge = snapshotRowid !== null
+      ? this.db.prepare("SELECT e.* FROM links l JOIN events e ON e.id = l.from_id WHERE l.relation = 'supersedes' AND l.target = ? AND e.rowid <= ?")
+      : this.db.prepare("SELECT e.* FROM links l JOIN events e ON e.id = l.from_id WHERE l.relation = 'supersedes' AND l.target = ?")
     for (let hop = 0; hop < MAX_LINK_HOPS && frontier.length; hop++) {
       const next = []
       for (const target of frontier) {
-        for (const row of edge.all(target)) {
+        const edgeRows = snapshotRowid !== null ? edge.all(target, snapshotRowid) : edge.all(target)
+        for (const row of edgeRows) {
           if (found.has(row.id) || !canRead(readerPubkey, row, this.config)) continue
           found.add(row.id)
           next.push(row.id)
@@ -1683,6 +1686,24 @@ export class HiveMemoryStore {
     return found
   }
 
+  // Reconstructs the exact set of event ids with `rowid <= snapshotRowid` whose `is_current` was 1 at
+  // `snapshotRowid` before later `submit` transactions (`rowid > snapshotRowid`) superseded them.
+  #snapshotRestoredHeads(snapshotRowid, curMaxRowid) {
+    const restored = new Set()
+    if (curMaxRowid <= snapshotRowid) return restored
+    const postKeys = this.db.prepare('SELECT DISTINCT pubkey, d FROM events WHERE rowid > ?').all(snapshotRowid)
+    if (!postKeys.length) return restored
+    const priorStmt = this.db.prepare('SELECT id, created_at FROM events WHERE rowid <= ? AND pubkey = ? AND d = ?')
+    for (const { pubkey, d } of postKeys) {
+      let best = null
+      for (const cand of priorStmt.all(snapshotRowid, pubkey, d)) {
+        if (nip01Newer(cand, best)) best = cand
+      }
+      if (best) restored.add(best.id)
+    }
+    return restored
+  }
+
   // Gate 1 Curator Curation + Gate 7 peer workflow supersession:
   // A stored claim `s` named in `supersedes` by a live, newer claim `c` in the same scope leaves the default view
   // as 'consolidated' when `s` is a workflow checkpoint (isWorkflowSlug) OR `c` is signed by a configured Curator
@@ -1690,15 +1711,22 @@ export class HiveMemoryStore {
   // Additionally, if a Curator `curated-*` distillation `c` superseded a source claim `s` and a newer live claim `n`
   // in the same scope (`n.created_at >= c.created_at`) has since replaced `s` at `n.d = s.d` or superseded `s`/`c`,
   // `c` is immediately marked consolidated by `n` (or `n`'s consolidator) so obsolete distillations never shadow newer facts.
-  #consolidatedBy(nowSec, { excludeCuratorIds = null } = {}) {
+  #consolidatedBy(nowSec, { excludeCuratorIds = null, snapshotRowid = null, restoredCurrentIds = null } = {}) {
     const out = new Map()
     const curators = this.config?.curators || new Set()
     const excluded = excludeCuratorIds instanceof Set ? excludeCuratorIds : Array.isArray(excludeCuratorIds) ? new Set(excludeCuratorIds) : null
-    const rows = this.db.prepare(`SELECT s.id AS sid, s.d AS sd, c.id AS cid, c.pubkey AS cpubkey, c.d AS cd, c.scope AS cscope, c.created_at AS ccreated FROM links l
-      JOIN events c ON c.id = l.from_id JOIN events s ON s.id = l.target
-      WHERE l.relation = 'supersedes' AND c.is_current = 1 AND c.status = 'active' AND (c.exp IS NULL OR c.exp > ?)
-        AND c.scope = s.scope AND c.created_at >= s.created_at AND c.id <> s.id AND s.scope_type <> 'hive:canon'
-      ORDER BY c.created_at DESC, c.id`).all(nowSec)
+    const rows = snapshotRowid !== null
+      ? this.db.prepare(`SELECT s.id AS sid, s.d AS sd, c.id AS cid, c.pubkey AS cpubkey, c.d AS cd, c.scope AS cscope, c.created_at AS ccreated, c.is_current AS cis_current FROM links l
+          JOIN events c ON c.id = l.from_id JOIN events s ON s.id = l.target
+          WHERE l.relation = 'supersedes' AND c.rowid <= ? AND s.rowid <= ? AND c.status = 'active' AND (c.exp IS NULL OR c.exp > ?)
+            AND c.scope = s.scope AND c.created_at >= s.created_at AND c.id <> s.id AND s.scope_type <> 'hive:canon'
+          ORDER BY c.created_at DESC, c.id`).all(snapshotRowid, snapshotRowid, nowSec)
+          .filter(r => r.cis_current === 1 || Boolean(restoredCurrentIds?.has(r.cid)))
+      : this.db.prepare(`SELECT s.id AS sid, s.d AS sd, c.id AS cid, c.pubkey AS cpubkey, c.d AS cd, c.scope AS cscope, c.created_at AS ccreated FROM links l
+          JOIN events c ON c.id = l.from_id JOIN events s ON s.id = l.target
+          WHERE l.relation = 'supersedes' AND c.is_current = 1 AND c.status = 'active' AND (c.exp IS NULL OR c.exp > ?)
+            AND c.scope = s.scope AND c.created_at >= s.created_at AND c.id <> s.id AND s.scope_type <> 'hive:canon'
+          ORDER BY c.created_at DESC, c.id`).all(nowSec)
     const curatedById = new Map()
     const supByTarget = new Map()
     for (const r of rows) {
@@ -1720,9 +1748,21 @@ export class HiveMemoryStore {
     }
     if (curatedById.size > 0) {
       const headsByScopeD = new Map()
-      const activeHeads = this.db.prepare(
-        "SELECT id, d, scope, created_at FROM events WHERE is_current = 1 AND status = 'active' AND (exp IS NULL OR exp > ?)"
-      ).all(nowSec)
+      let activeHeads
+      if (snapshotRowid !== null) {
+        const restoredJson = restoredCurrentIds?.size ? JSON.stringify([...restoredCurrentIds]) : null
+        activeHeads = restoredJson
+          ? this.db.prepare(
+              "SELECT id, d, scope, created_at FROM events WHERE rowid <= ? AND (is_current = 1 OR id IN (SELECT value FROM json_each(?))) AND status = 'active' AND (exp IS NULL OR exp > ?)"
+            ).all(snapshotRowid, restoredJson, nowSec)
+          : this.db.prepare(
+              "SELECT id, d, scope, created_at FROM events WHERE rowid <= ? AND is_current = 1 AND status = 'active' AND (exp IS NULL OR exp > ?)"
+            ).all(snapshotRowid, nowSec)
+      } else {
+        activeHeads = this.db.prepare(
+          "SELECT id, d, scope, created_at FROM events WHERE is_current = 1 AND status = 'active' AND (exp IS NULL OR exp > ?)"
+        ).all(nowSec)
+      }
       for (const h of activeHeads) {
         if (excluded && excluded.has(h.id)) continue
         const key = `${h.scope}\0${h.d}`
@@ -1766,6 +1806,7 @@ export class HiveMemoryStore {
     readerPubkey = '', scope = null, roomId = null, topic = null, d = null, author = null, since = null, until = null, text = null,
     linkedTo = null, supersedesOf = null, includeHistory = false, limit = DEFAULT_QUERY_LIMIT, cursor = 0, staleFiles = new Set(),
     format = null, nowSec = nowSecDefault(), excludeCuratorIds = null,
+    snapshotRowid = null, expectedPurgeSeq = null, snapshotAt = null,
   } = {}) {
     const fmt = format === 'index' || format === 'full' ? format : d ? 'full' : 'index'
     const empty = (answer, reason) => ({
@@ -1773,11 +1814,46 @@ export class HiveMemoryStore {
       store_state: this.storeState(readerPubkey, nowSec),
     })
     if (!this.isReady().ready) return empty('unknown', `store-not-ready:${this.state}`)
+    const meta = readMeta(this.db)
+    const curMaxRowid = Number(this.db.prepare('SELECT COALESCE(MAX(rowid), 0) AS r FROM events').get()?.r ?? 0)
+    const hasRowid = snapshotRowid !== null && snapshotRowid !== undefined
+    const hasPurgeSeq = expectedPurgeSeq !== null && expectedPurgeSeq !== undefined
+    const hasSnapAt = snapshotAt !== null && snapshotAt !== undefined
+    const useSnapshot = hasRowid || hasPurgeSeq || hasSnapAt
+    if (useSnapshot) {
+      if (!hasRowid || !hasPurgeSeq || !hasSnapAt ||
+          !Number.isSafeInteger(snapshotRowid) || snapshotRowid < 0 ||
+          !Number.isSafeInteger(expectedPurgeSeq) || expectedPurgeSeq < 0 ||
+          !Number.isSafeInteger(snapshotAt) || snapshotAt < 0 || snapshotAt > nowSec + 60) {
+        return empty('unknown', 'invalid-snapshot-anchor')
+      }
+      if (meta.last_purge_seq !== expectedPurgeSeq) return empty('unknown', 'snapshot-purged')
+      if (snapshotRowid > curMaxRowid) return empty('unknown', 'invalid-snapshot-rowid')
+    }
+    const evalNowSec = useSnapshot ? snapshotAt : nowSec
+    const effectiveRowid = useSnapshot ? snapshotRowid : curMaxRowid
+    const restoredCurrentIds = useSnapshot ? this.#snapshotRestoredHeads(snapshotRowid, curMaxRowid) : null
+    const snapshotMeta = {
+      write_seq: meta.write_seq,
+      max_event_rowid: effectiveRowid,
+      last_purge_seq: meta.last_purge_seq,
+      as_of_sec: evalNowSec,
+      pinned: useSnapshot,
+    }
     const pageLimit = Math.min(MAX_QUERY_LIMIT, Number.isSafeInteger(Number(limit)) && Number(limit) > 0 ? Number(limit) : DEFAULT_QUERY_LIMIT)
     const startIdx = Number.isSafeInteger(Number(cursor)) && Number(cursor) >= 0 ? Number(cursor) : 0
-    const where = [includeHistory ? '1 = 1' : 'is_current = 1']
+    const where = []
     const params = []
     const add = (sql, value) => { where.push(sql); params.push(value) }
+    if (useSnapshot) add('rowid <= ?', snapshotRowid)
+    if (includeHistory) {
+      where.push('1 = 1')
+    } else if (restoredCurrentIds && restoredCurrentIds.size > 0) {
+      where.push('(is_current = 1 OR id IN (SELECT value FROM json_each(?)))')
+      params.push(JSON.stringify([...restoredCurrentIds]))
+    } else {
+      where.push('is_current = 1')
+    }
     if (scope) add('scope = ?', String(scope))
     if (roomId) add('room_id = ?', String(roomId).toLowerCase())
     if (d) add('d = ?', String(d))
@@ -1786,21 +1862,26 @@ export class HiveMemoryStore {
     if (until != null) add('created_at <= ?', Number(until))
     if (linkedTo) {
       const targetStr = String(linkedTo)
-      if (this.#targetHidden(readerPubkey, targetStr)) return empty('none', null)
+      if (this.#targetHidden(readerPubkey, targetStr)) return { ...empty('none', null), format: fmt, snapshot: snapshotMeta }
       this.#ensureDerivedTables()
       const normTarget = targetStr.toLowerCase()
       where.push("id IN (SELECT from_id FROM links WHERE target = ? UNION SELECT from_id FROM claim_edges WHERE target_ref = ? OR (edge_type || ':' || target_ref) = ?)")
       params.push(targetStr, normTarget, normTarget)
     }
-    if (supersedesOf) add('id IN (SELECT value FROM json_each(?))', JSON.stringify([...this.#lineage(readerPubkey, String(supersedesOf))]))
+    if (supersedesOf) add('id IN (SELECT value FROM json_each(?))', JSON.stringify([...this.#lineage(readerPubkey, String(supersedesOf), useSnapshot ? snapshotRowid : null)]))
     const wantTopic = topic ? normalizeMemoryTopic(topic) ?? String(topic) : null
     const excluded = excludeCuratorIds instanceof Set ? excludeCuratorIds : Array.isArray(excludeCuratorIds) ? new Set(excludeCuratorIds) : null
-    const consolidated = this.#consolidatedBy(nowSec, { excludeCuratorIds: excluded })
+    const consolidated = this.#consolidatedBy(evalNowSec, {
+      excludeCuratorIds: excluded,
+      snapshotRowid: useSnapshot ? snapshotRowid : null,
+      restoredCurrentIds,
+    })
     const rows = this.db.prepare(`SELECT * FROM events WHERE ${where.join(' AND ')}`).all(...params)
       .filter(r => (!excluded || !excluded.has(r.id)) && canRead(readerPubkey, r, this.config) && (!wantTopic || topicOf(r) === wantTopic))
       .map(r => {
-        const parsed = parseEventRaw(r)
-        return { row: r, verdict: verdictOf(r, nowSec, staleFiles, consolidated, parsed.body), body: parsed.body }
+        const effRow = restoredCurrentIds?.has(r.id) && !r.is_current ? { ...r, is_current: 1 } : r
+        const parsed = parseEventRaw(effRow)
+        return { row: effRow, verdict: verdictOf(effRow, evalNowSec, staleFiles, consolidated, parsed.body), body: parsed.body }
       })
       .filter(x => includeHistory || x.verdict.verification === 'accepted')
     const byFactKey = new Map()
@@ -1931,6 +2012,7 @@ export class HiveMemoryStore {
       unverified: 0,
       scope_counts: scopeCounts,
       store_state: this.storeState(readerPubkey, nowSec, { includeReceipt: true }),
+      snapshot: snapshotMeta,
     }
   }
 
@@ -2224,7 +2306,7 @@ const topicOf = row => normalizeMemoryTopic(row.topic) ?? row.topic
 const preview = (text, n) => { const t = String(text ?? '').replace(/\s+/g, ' ').trim(); return t.length > n ? `${t.slice(0, n - 1)}…` : t }
 
 const PARSED_EVENT_CACHE = new Map()
-const MAX_PARSED_EVENT_CACHE = 8192
+const MAX_PARSED_EVENT_CACHE = 32768
 
 function parseEventRaw(row) {
   const id = row?.id

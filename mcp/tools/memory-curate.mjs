@@ -2226,15 +2226,39 @@ export function formatCuratorBriefing({
   return lines.join('\n')
 }
 
-function completeHistoryPage(page, expectedWriteSeq, offset, expectedTotal = null) {
+function extractSnapshotAnchor(page) {
+  const snap = page?.snapshot
+  if (!snap || typeof snap !== 'object') return null
+  const maxEventRowid = Number(snap.max_event_rowid)
+  const lastPurgeSeq = Number(snap.last_purge_seq)
+  const asOfSec = Number(snap.as_of_sec)
+  const writeSeq = Number(snap.write_seq ?? page?.store_state?.write_seq)
+  if (!Number.isSafeInteger(maxEventRowid) || maxEventRowid < 0 ||
+      !Number.isSafeInteger(lastPurgeSeq) || lastPurgeSeq < 0 ||
+      !Number.isSafeInteger(asOfSec) || asOfSec < 0 ||
+      !Number.isSafeInteger(writeSeq) || writeSeq < 0) return null
+  return { maxEventRowid, lastPurgeSeq, asOfSec, writeSeq }
+}
+
+function completeHistoryPage(page, expectedWriteSeq, offset, expectedTotal = null, snapshotAnchor = null) {
+  const pageSeq = Number(page?.store_state?.write_seq)
   if (!page || !['found', 'none'].includes(page.answer) || page.answer_reason != null ||
       page.format !== 'full' || page.store_state?.state !== 'READY' ||
-      Number(page.store_state.write_seq) !== expectedWriteSeq || !Array.isArray(page.records) ||
+      !Number.isSafeInteger(pageSeq) || !Array.isArray(page.records) ||
       !Number.isSafeInteger(page.total_matched) || page.total_matched < 0 ||
       page.returned !== page.records.length ||
       (expectedTotal !== null && page.total_matched !== expectedTotal) ||
       (page.answer === 'none' && page.total_matched !== 0) ||
       (page.answer === 'found' && page.total_matched === 0)) return false
+  if (snapshotAnchor) {
+    if (!page.snapshot ||
+        Number(page.snapshot.max_event_rowid) !== snapshotAnchor.maxEventRowid ||
+        Number(page.snapshot.last_purge_seq) !== snapshotAnchor.lastPurgeSeq ||
+        Number(page.snapshot.as_of_sec) !== snapshotAnchor.asOfSec ||
+        pageSeq < snapshotAnchor.writeSeq) return false
+  } else if (pageSeq !== expectedWriteSeq) {
+    return false
+  }
   const nextOffset = offset + page.records.length
   if (nextOffset > page.total_matched) return false
   return page.next_cursor === null
@@ -2243,10 +2267,13 @@ function completeHistoryPage(page, expectedWriteSeq, offset, expectedTotal = nul
 }
 
 export async function readInitialHistory(reader, pageLimit, pageSize, maxAttempts = 3) {
+  const scanStartMs = Date.now()
+  const attempts = []
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const attemptStartMs = Date.now()
     const wake = await reader.callReadTool('memory_wake', {})
-    const writeSeq = Number(wake?.store_state?.write_seq)
-    if (wake?.store_state?.state !== 'READY' || !Number.isSafeInteger(writeSeq)) {
+    const wakeWriteSeq = Number(wake?.store_state?.write_seq)
+    if (wake?.store_state?.state !== 'READY' || !Number.isSafeInteger(wakeWriteSeq)) {
       throw new Error('memory_wake did not return a ready store state')
     }
     const records = []
@@ -2254,19 +2281,58 @@ export async function readInitialHistory(reader, pageLimit, pageSize, maxAttempt
     let cursor = '0'
     let pages = 0
     let expectedTotal = null
-    let changed = false
+    let snapshotAnchor = null
+    let snapshotWriteSeq = wakeWriteSeq
+    let lastObservedSeq = wakeWriteSeq
+    let retryReason = null
     while (cursor !== null && pages < pageLimit) {
       const page = await reader.callReadTool('memory_query', {
         limit: pageSize,
         format: 'full',
         include_history: true,
         ...(cursor !== '0' ? { cursor } : {}),
+        ...(snapshotAnchor
+          ? {
+              snapshot_rowid: snapshotAnchor.maxEventRowid,
+              expected_purge_seq: snapshotAnchor.lastPurgeSeq,
+              snapshot_at: snapshotAnchor.asOfSec,
+            }
+          : {}),
       })
-      if (!completeHistoryPage(page, writeSeq, Number(cursor), expectedTotal)) {
-        const pageSeq = Number(page?.store_state?.write_seq)
-        if (Number.isSafeInteger(pageSeq) && pageSeq !== writeSeq &&
-            completeHistoryPage(page, pageSeq, Number(cursor), null)) {
-          changed = true
+      const pageSeq = Number(page?.store_state?.write_seq)
+      if (Number.isSafeInteger(pageSeq)) lastObservedSeq = pageSeq
+      if (pages === 0) {
+        const candidateAnchor = extractSnapshotAnchor(page)
+        if (candidateAnchor) {
+          if (!completeHistoryPage(page, candidateAnchor.writeSeq, 0, null, candidateAnchor)) {
+            if (page?.answer === 'unknown' && page?.answer_reason === 'snapshot-purged' && page?.store_state?.state === 'READY') {
+              retryReason = 'snapshot_purged'
+              break
+            }
+            throw new Error('memory_query did not return a complete ready history page')
+          }
+          snapshotAnchor = candidateAnchor
+          snapshotWriteSeq = candidateAnchor.writeSeq
+        } else if (!completeHistoryPage(page, snapshotWriteSeq, 0, null, null)) {
+          if (Number.isSafeInteger(pageSeq) && pageSeq !== snapshotWriteSeq &&
+              completeHistoryPage(page, pageSeq, 0, null, null)) {
+            retryReason = 'write_seq_changed_during_scan'
+            break
+          }
+          throw new Error('memory_query did not return a complete ready history page')
+        }
+      } else if (snapshotAnchor) {
+        if (page?.answer === 'unknown' && page?.answer_reason === 'snapshot-purged' && page?.store_state?.state === 'READY') {
+          retryReason = 'snapshot_purged'
+          break
+        }
+        if (!completeHistoryPage(page, snapshotWriteSeq, Number(cursor), expectedTotal, snapshotAnchor)) {
+          throw new Error('memory_query did not return a complete ready history page')
+        }
+      } else if (!completeHistoryPage(page, snapshotWriteSeq, Number(cursor), expectedTotal, null)) {
+        if (Number.isSafeInteger(pageSeq) && pageSeq !== snapshotWriteSeq &&
+            completeHistoryPage(page, pageSeq, Number(cursor), null, null)) {
+          retryReason = 'write_seq_changed_during_scan'
           break
         }
         throw new Error('memory_query did not return a complete ready history page')
@@ -2281,16 +2347,83 @@ export async function readInitialHistory(reader, pageLimit, pageSize, maxAttempt
       cursor = typeof page.next_cursor === 'string' && page.next_cursor ? page.next_cursor : null
       pages += 1
     }
-    if (changed) continue
+    if (retryReason) {
+      attempts.push({
+        attempt: attempt + 1,
+        mode: snapshotAnchor ? 'snapshot' : 'write_seq_retry',
+        wake_write_seq: wakeWriteSeq,
+        snapshot_write_seq: snapshotWriteSeq,
+        end_write_seq: lastObservedSeq,
+        concurrent_writes: Math.max(0, lastObservedSeq - snapshotWriteSeq),
+        snapshot_rowid: snapshotAnchor ? snapshotAnchor.maxEventRowid : null,
+        expected_purge_seq: snapshotAnchor ? snapshotAnchor.lastPurgeSeq : null,
+        pages,
+        total_matched: expectedTotal,
+        elapsed_ms: Math.max(0, Date.now() - attemptStartMs),
+        outcome: `retry:${retryReason}`,
+        reason: retryReason,
+      })
+      continue
+    }
     const end = await reader.callReadTool('memory_wake', {})
     const endSeq = Number(end?.store_state?.write_seq)
     if (end?.store_state?.state !== 'READY' || !Number.isSafeInteger(endSeq)) {
       throw new Error('memory_wake did not return a ready store state')
     }
-    if (endSeq !== writeSeq) continue
-    return { wake, records, historyRecords, historyComplete: cursor === null }
+    lastObservedSeq = endSeq
+    if (!snapshotAnchor && endSeq !== snapshotWriteSeq) {
+      attempts.push({
+        attempt: attempt + 1,
+        mode: 'write_seq_retry',
+        wake_write_seq: wakeWriteSeq,
+        snapshot_write_seq: snapshotWriteSeq,
+        end_write_seq: endSeq,
+        concurrent_writes: Math.max(0, endSeq - snapshotWriteSeq),
+        snapshot_rowid: null,
+        expected_purge_seq: null,
+        pages,
+        total_matched: expectedTotal,
+        elapsed_ms: Math.max(0, Date.now() - attemptStartMs),
+        outcome: 'retry:write_seq_changed_at_end',
+        reason: 'write_seq_changed_at_end',
+      })
+      continue
+    }
+    attempts.push({
+      attempt: attempt + 1,
+      mode: snapshotAnchor ? 'snapshot' : 'write_seq_retry',
+      wake_write_seq: wakeWriteSeq,
+      snapshot_write_seq: snapshotWriteSeq,
+      end_write_seq: endSeq,
+      concurrent_writes: Math.max(0, endSeq - snapshotWriteSeq),
+      snapshot_rowid: snapshotAnchor ? snapshotAnchor.maxEventRowid : null,
+      expected_purge_seq: snapshotAnchor ? snapshotAnchor.lastPurgeSeq : null,
+      pages,
+      total_matched: expectedTotal,
+      elapsed_ms: Math.max(0, Date.now() - attemptStartMs),
+      outcome: 'ok',
+      reason: null,
+    })
+    const effectiveWake = snapshotAnchor && snapshotWriteSeq !== wakeWriteSeq
+      ? { ...wake, store_state: { ...wake.store_state, write_seq: snapshotWriteSeq } }
+      : wake
+    return {
+      wake: effectiveWake,
+      records,
+      historyRecords,
+      historyComplete: cursor === null,
+      scanDiagnostics: {
+        attempts,
+        total_elapsed_ms: Math.max(0, Date.now() - scanStartMs),
+      },
+    }
   }
-  throw new Error('memory history changed during bounded read retries')
+  const summary = attempts
+    .map(a => `#${a.attempt} mode=${a.mode} seq=${a.snapshot_write_seq}->${a.end_write_seq} pages=${a.pages} ${a.elapsed_ms}ms ${a.outcome}`)
+    .join('; ')
+  const err = new Error(`memory history changed during bounded read retries${summary ? ` (${summary})` : ''}`)
+  err.attempts = attempts
+  throw err
 }
 
 export function mergeCycleRecentActivity(priorActivity = [], postActivity = []) {
@@ -2322,20 +2455,40 @@ export async function readPostCycleSnapshot(
   { priorRecentActivity = null, priorAgentRoster = null } = {}
 ) {
   const start = await reader.callReadTool('memory_wake', {})
-  if (start?.store_state?.state !== 'READY' || Number(start.store_state.write_seq) !== expectedWriteSeq) return null
+  const startSeq = Number(start?.store_state?.write_seq)
+  if (start?.store_state?.state !== 'READY' || !Number.isSafeInteger(startSeq) || startSeq < expectedWriteSeq) return null
   const historyRecords = []
   const records = []
   let cursor = '0'
   let pages = 0
   let expectedTotal = null
+  let snapshotAnchor = null
   while (cursor !== null && pages < pageLimit) {
     const page = await reader.callReadTool('memory_query', {
       limit: pageSize,
       format: 'full',
       include_history: true,
       ...(cursor !== '0' ? { cursor } : {}),
+      ...(snapshotAnchor
+        ? {
+            snapshot_rowid: snapshotAnchor.maxEventRowid,
+            expected_purge_seq: snapshotAnchor.lastPurgeSeq,
+            snapshot_at: snapshotAnchor.asOfSec,
+          }
+        : {}),
     })
-    if (!completeHistoryPage(page, expectedWriteSeq, Number(cursor), expectedTotal)) return null
+    if (pages === 0) {
+      const candidateAnchor = extractSnapshotAnchor(page)
+      if (candidateAnchor) {
+        if (candidateAnchor.writeSeq < expectedWriteSeq ||
+            !completeHistoryPage(page, candidateAnchor.writeSeq, 0, null, candidateAnchor)) return null
+        snapshotAnchor = candidateAnchor
+      } else if (startSeq !== expectedWriteSeq || !completeHistoryPage(page, expectedWriteSeq, 0, null, null)) {
+        return null
+      }
+    } else if (!completeHistoryPage(page, snapshotAnchor ? snapshotAnchor.writeSeq : expectedWriteSeq, Number(cursor), expectedTotal, snapshotAnchor)) {
+      return null
+    }
     expectedTotal = page.total_matched
     for (const r of page.records) {
       historyRecords.push(r)
@@ -2348,7 +2501,9 @@ export async function readPostCycleSnapshot(
   }
   if (cursor !== null) return null
   const end = await reader.callReadTool('memory_wake', {})
-  if (end?.store_state?.state !== 'READY' || Number(end.store_state.write_seq) !== expectedWriteSeq) return null
+  const endSeq = Number(end?.store_state?.write_seq)
+  if (end?.store_state?.state !== 'READY' || !Number.isSafeInteger(endSeq)) return null
+  if (snapshotAnchor ? endSeq < snapshotAnchor.writeSeq : endSeq !== expectedWriteSeq) return null
   const postActivity = Array.isArray(end?.recent_activity)
     ? end.recent_activity
     : (Array.isArray(start?.recent_activity) ? start.recent_activity : [])
@@ -2356,12 +2511,15 @@ export async function readPostCycleSnapshot(
   const effectiveRoster = Array.isArray(end?.agent_roster) && end.agent_roster.length > 0
     ? end.agent_roster
     : (Array.isArray(priorAgentRoster) ? priorAgentRoster : [])
+  const effectiveStoreState = snapshotAnchor
+    ? { ...end.store_state, write_seq: snapshotAnchor.writeSeq }
+    : end.store_state
   const coherence = computeCoherence({
     records,
     history_records: historyRecords,
     agent_roster: effectiveRoster,
     recent_activity: mergedActivity,
-    store_state: end.store_state,
+    store_state: effectiveStoreState,
     now_sec: nowSec,
     history_complete: true,
   })
@@ -2408,7 +2566,7 @@ export async function runCuratorCycle({
   try {
     const pageLimit = Math.max(1, Number(maxPages) || 500)
     const effectivePageSize = Math.max(1, Math.min(200, Number(pageSize) || 100))
-    const { wake, records, historyRecords, historyComplete } = await readInitialHistory(reader, pageLimit, effectivePageSize)
+    const { wake, records, historyRecords, historyComplete, scanDiagnostics } = await readInitialHistory(reader, pageLimit, effectivePageSize)
     const storeState = wake?.store_state || {}
     const resolvedRecentActivity = Array.isArray(recentActivity)
       ? recentActivity
@@ -2725,6 +2883,7 @@ export async function runCuratorCycle({
       next_curated_write_seq: nextCuratedWriteSeq,
       coherence: resolvedCoherence,
       recent_activity_count: resolvedRecentActivity.length,
+      scan_diagnostics: scanDiagnostics || null,
       triggers: triggerEval,
       plan,
       submitted,
@@ -2884,6 +3043,7 @@ async function main() {
         plan_summary: result.plan?.summary ?? null,
         submitted_count: result.submitted.length,
         refused_count: result.refused.length,
+        scan_diagnostics: result.scan_diagnostics ?? null,
       })
     )
     if (!result.ok) { curatorSigner?.close(); process.exit(1) }
