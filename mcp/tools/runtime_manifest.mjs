@@ -353,6 +353,7 @@ function fileIdentity(p) {
 export function assertNoCollisions(root, candidate) {
   const canonicalRoot = realpathSync(root)
   const seen = new Map()
+  const roots = []
   for (const name of readdirSync(canonicalRoot)) {
     if (!name.endsWith('.json')) continue
     const id = name.slice(0, -5)
@@ -374,6 +375,16 @@ export function assertNoCollisions(root, candidate) {
       const key = `${kind}:${value}`
       if (seen.has(key)) die(`${label} collision between ${seen.get(key)} and ${m.id}`)
       seen.set(key, m.id)
+    }
+    for (const dir of [m.stateDir, m.runtimeDir, m.spoolDir]) if (dir) roots.push([m.id, normalPath(dir)])
+  }
+  // Equal roots are caught above. A root inside another instance's root crosses the boundary too: the outer
+  // instance owns the inner one's parent directory and can replace or hide it (docs/RUNTIME_SUPERVISOR.md: each
+  // instance has its own runtime tree). Roots of one instance may nest; that stays inside one boundary.
+  const within = (inner, outer) => inner.startsWith(outer === '/' ? '/' : `${outer}/`)
+  for (const [outerId, outer] of roots) {
+    for (const [innerId, inner] of roots) {
+      if (outerId !== innerId && inner !== outer && within(inner, outer)) die(`filesystem root nesting between ${outerId} and ${innerId}: ${inner} is inside ${outer}`)
     }
   }
   if (!candidate || !contained(canonicalRoot, candidate.path)) return

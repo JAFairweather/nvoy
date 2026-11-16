@@ -520,6 +520,24 @@ for (const [what, alias] of [['a `..` alias', `${kDir}/../${basename(kDir)}/${kF
 writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolated, state_dir: `${manifest.runtime_dir}/../${basename(manifest.runtime_dir)}` }))
 const pathAlias = cli('describe', '--instance', 'codex-test')
 ok('a `..` alias of another instance\'s filesystem root is a collision', pathAlias.status !== 0 && /filesystem root collision/.test(pathAlias.stderr))
+// One instance's root inside another's: the outer instance owns the inner one's parent directory (PR 366 lead read).
+for (const [what, fields] of [
+  ['a runtime root inside another instance\'s state root', { runtime_dir: join(manifest.state_dir, 'b') }],
+  ['a state root inside another instance\'s spool root', { state_dir: join(manifest.spool_dir, 'nested', 'state') }],
+  ['a spool root that contains another instance\'s runtime root', { spool_dir: dirname(manifest.runtime_dir) }],
+  ['a `..` alias that lands inside another instance\'s state root', { runtime_dir: `${manifest.state_dir}/x/../inner` }],
+]) {
+  writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolated, ...fields }))
+  const r = cli('describe', '--instance', 'codex-test')
+  ok(`${what} is refused as nesting`, r.status !== 0 && /filesystem root nesting/.test(r.stderr))
+}
+// Disjoint control: a sibling whose root shares only a name prefix (state vs state-other) is not nested.
+writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolated, state_dir: `${manifest.state_dir}-other` }))
+const prefixOnly = cli('describe', '--instance', 'codex-test')
+ok('NEGATIVE CONTROL: a sibling root that only shares a name prefix is accepted', prefixOnly.status === 0)
+writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify(isolated))
+const disjoint = cli('describe', '--instance', 'codex-test')
+ok('NEGATIVE CONTROL: disjoint sibling roots are accepted', disjoint.status === 0)
 const sshLink = join(root, 'ssh-identity-link'), sshHard = join(root, 'ssh-identity-hard')
 symlinkSync(desktopManifest.ssh_identity_file, sshLink); linkSync(desktopManifest.ssh_identity_file, sshHard)
 for (const [what, path] of [['a symlink to', sshLink], ['a hard link to', sshHard]]) {
