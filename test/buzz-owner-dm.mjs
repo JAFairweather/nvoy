@@ -162,8 +162,11 @@ const granteeDm = await say(grantee, DM_GRANTEE, 'I hold a grant')
 const channelMention = await say(stranger, CH, 'channel mention from a stranger')
 ok('a channel mention is marked for the broker exactly as before', await until(() => existsSync(pendingFor(channelMention.id))))
 await sleep(300)
-ok('a DM from another agent leaves no marker', !existsSync(pendingFor(dudeDm.id)))
-ok('a DM from a grant holder who is not the owner leaves no marker', !existsSync(pendingFor(granteeDm.id)))
+// q-198: the watcher marks a non-owner's DM too, so the broker can refuse it on its own read and record
+// the refusal; before, it was dropped here and nothing anywhere showed it (My Dude, PR 430 review).
+ok('a DM from another agent is marked for the broker to decide', existsSync(pendingFor(dudeDm.id)))
+ok('a DM from a grant holder who is not the owner is marked for the broker to decide', existsSync(pendingFor(granteeDm.id)))
+const watcherMarker = readFileSync(pendingFor(granteeDm.id), 'utf8')
 leaveDm(DM_AGENTS, agent.pk)
 ok('a removal notice drops the DM', await until(() => /and 3 DM\(s\)/.test(log.split(/and 4 DM\(s\)/).pop())))
 watcher.kill(); await sleep(100)
@@ -201,8 +204,10 @@ openDm(DM_AGENTS, [myDude.pk, agent.pk])
 const dudeAgain = await say(myDude, DM_AGENTS, 'forged marker for this one')
 let r = await deliver(dudeAgain.id)
 ok('a forged marker for another agent\'s DM is refused by the broker before any grant is consulted', refusedDm(r, dudeAgain.id))
-r = await deliver(granteeDm.id)
-ok('a forged marker for a grant holder\'s DM is refused by the broker before any grant is consulted', refusedDm(r, granteeDm.id))
+// Watcher to broker, with no planted marker: the marker the real watcher wrote is the one consumed.
+ok('q-198: the grant holder\'s DM marker is still the watcher\'s own', readFileSync(pendingFor(granteeDm.id), 'utf8') === watcherMarker)
+r = await run(['mcp/tools/instance-broker-native.mjs', 'deliver', '--instance', 'dm', '--event', granteeDm.id])
+ok('a watcher-marked DM from a grant holder is refused by the broker before any grant is consulted', refusedDm(r, granteeDm.id))
 
 // --- q-198: a refused DM is recorded, and with the switch on the seat is told, without the content ---
 const refusalsPath = join(root, 'state', 'unadmitted-mentions.jsonl')
