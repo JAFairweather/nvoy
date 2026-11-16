@@ -558,6 +558,17 @@ ok('NEGATIVE CONTROL: a sibling root that only shares a name prefix is accepted'
 writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify(isolated))
 const disjoint = cli('describe', '--instance', 'codex-test')
 ok('NEGATIVE CONTROL: disjoint sibling roots are accepted', disjoint.status === 0)
+// One instance reusing a value across its own fields stays inside its boundary and was accepted before PR 366
+// (GrokDoggyDog's PR 366 read). Only another instance's value is a collision.
+for (const [what, fields] of [
+  ['its runtime root equal to its own state root', { runtime_dir: isolated.state_dir }],
+  ['its spool root equal to its own state root', { spool_dir: isolated.state_dir }],
+  ['one of its own credential files under two fields', { worker_credential_ref: isolated.key_ref }],
+]) {
+  writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolated, ...fields }))
+  const r = cli('describe', '--instance', 'codex-test')
+  ok(`NEGATIVE CONTROL: an instance with ${what} is accepted`, r.status === 0)
+}
 const sshLink = join(root, 'ssh-identity-link'), sshHard = join(root, 'ssh-identity-hard')
 symlinkSync(desktopManifest.ssh_identity_file, sshLink); linkSync(desktopManifest.ssh_identity_file, sshHard)
 for (const [what, path] of [['a symlink to', sshLink], ['a hard link to', sshHard]]) {
