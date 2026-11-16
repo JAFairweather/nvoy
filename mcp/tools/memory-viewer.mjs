@@ -11088,7 +11088,13 @@ export async function startMemoryViewer({
   // Callers still get a polled viewer: this function resolves only after the first poll.
   const addr = httpServer.address()
   const boundPort = typeof addr === 'object' && addr ? addr.port : target.port
-  if (typeof onListening === 'function') onListening({ host: target.host, port: boundPort })
+  // The hook only reports the bind. A throw from it must not reject startup: the listener is already open, and the
+  // caller would get no stop() to close it (DJ Codex, PR 429 review).
+  if (typeof onListening === 'function') {
+    try { onListening({ host: target.host, port: boundPort }) } catch (err) {
+      console.error(`memory-viewer: onListening hook failed (${err?.message || err}); startup continues`)
+    }
+  }
 
   await pollOnce({ forceFull: true })
   scheduleNextPoll()
