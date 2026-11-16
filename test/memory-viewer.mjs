@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict'
 import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createServer as createPlainHttpServer, request as httpRequest } from 'node:http'
+import { createServer as createNetServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
@@ -3913,6 +3914,54 @@ await test('a gated viewer serves an allowed device and refuses everything else 
     assert.equal((await httpGet(viewer.port, '/api/state')).status, 200)
   } finally {
     if (viewer) await viewer.stop()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await test('q-192: the viewer listens and serves the pending state while its first poll is still running', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'viewer-listen-first-'))
+  const sock = join(dir, 'slow-viewer.sock')
+  // A daemon that accepts and never answers: the first poll stays in flight until the test drops the connection.
+  const held = []
+  const slowDaemon = createNetServer(c => { held.push(c); c.on('error', () => {}) })
+  await new Promise(r => slowDaemon.listen(sock, r))
+  const probe = createNetServer()
+  await new Promise(r => probe.listen(0, '127.0.0.1', r))
+  const port = probe.address().port
+  await new Promise(r => probe.close(r))
+  const gateAsked = []
+  let viewer
+  let settled = false
+  const starting = startMemoryViewer({
+    socketPath: sock,
+    host: '127.0.0.1',
+    port,
+    pollMs: 300_000,
+    peerGate: async addr => { gateAsked.push(addr); return { ok: true, node: { stableId: 'nTest', tags: [] } } },
+  }).then(v => { settled = true; viewer = v; return v })
+  try {
+    let page = null
+    for (let i = 0; i < 60 && !page; i++) {
+      page = await httpGet(port, '/').catch(() => null)
+      if (!page) await new Promise(r => setTimeout(r, 50))
+    }
+    assert(page, 'the port must open within 3 s, before the first poll finishes')
+    assert.equal(settled, false, 'the first poll is still in flight')
+    assert(held.length > 0, 'the viewer has connected to the daemon socket')
+    assert.equal(page.status, 200)
+    assert(page.body.includes('Hive Shared Memory'))
+    assert.equal((await httpGet(port, '/mobile')).status, 200)
+    const state = await httpGet(port, '/api/state')
+    assert.equal(state.status, 200)
+    const body = JSON.parse(state.body)
+    assert.equal(body.connected, false)
+    assert.equal(body.error, 'initial poll pending')
+    assert(gateAsked.length >= 3, 'the peer gate runs on every request before the first poll too')
+  } finally {
+    for (const c of held) c.destroy()
+    await starting.catch(() => {})
+    if (viewer) await viewer.stop()
+    await new Promise(r => slowDaemon.close(r))
     rmSync(dir, { recursive: true, force: true })
   }
 })
