@@ -15,7 +15,7 @@
 // a day limit plus a size cap, applied at start and then at most once an hour by an atomic rewrite that keeps the mode.
 // A failed append never fails the read: the miss is counted, the first of each run is logged, and `failures` is exposed
 // so a gap in the log is visible instead of silent.
-import { chmodSync, closeSync, constants, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from 'node:fs'
+import { chmodSync, closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readSync, renameSync, unlinkSync, writeSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { dirname } from 'node:path'
 
@@ -24,6 +24,56 @@ export const READ_LOG_DEFAULT_DAYS = 30
 export const READ_LOG_DEFAULT_MAX_BYTES = 64 * 1024 * 1024
 const PRUNE_EVERY_SEC = 3600
 const OPS = new Set(['wake', 'query', 'get'])
+const SCAN_BYTES = 64 * 1024
+// Entries written by record() are small. A larger line cannot be parsed without holding it all in memory;
+// treat it as a damaged line, as we do for invalid JSON.
+const MAX_LINE_BYTES = 1024 * 1024
+
+function scanLines(fd, size, visit) {
+  const chunk = Buffer.allocUnsafe(SCAN_BYTES)
+  let pending = Buffer.alloc(0)
+  let oversized = false
+  let position = 0
+  while (position < size) {
+    const n = readSync(fd, chunk, 0, Math.min(chunk.length, size - position), position)
+    if (!n) throw new Error('read log changed during prune')
+    position += n
+    let start = 0
+    for (let i = 0; i < n; i++) {
+      if (chunk[i] !== 10) continue
+      const part = chunk.subarray(start, i)
+      visit(oversized || pending.length + part.length > MAX_LINE_BYTES ? null
+        : pending.length ? Buffer.concat([pending, part]) : part)
+      pending = Buffer.alloc(0)
+      oversized = false
+      start = i + 1
+    }
+    const part = chunk.subarray(start, n)
+    if (!oversized && part.length) {
+      if (pending.length + part.length > MAX_LINE_BYTES) {
+        pending = Buffer.alloc(0)
+        oversized = true
+      } else {
+        pending = pending.length ? Buffer.concat([pending, part]) : Buffer.from(part)
+      }
+    }
+  }
+  if (pending.length || oversized) visit(oversized ? null : pending)
+}
+
+function retainedLine(line, cutoff) {
+  if (!line?.length) return null
+  const text = line.toString('utf8')
+  try {
+    if (!(Number(JSON.parse(text).at) >= cutoff)) return null
+  } catch { return null } // an unparseable line is damage, not evidence
+  return { text, bytes: Buffer.byteLength(text) + 1 }
+}
+
+function writeAll(fd, text) {
+  const bytes = Buffer.from(`${text}\n`)
+  for (let offset = 0; offset < bytes.length;) offset += writeSync(fd, bytes, offset, bytes.length - offset)
+}
 
 export class ReadLog {
   constructor({ path, retentionDays = READ_LOG_DEFAULT_DAYS, maxBytes = READ_LOG_DEFAULT_MAX_BYTES, now = () => Math.floor(Date.now() / 1000), log = () => {} } = {}) {
@@ -64,9 +114,11 @@ export class ReadLog {
       const all = (Array.isArray(keys) ? keys : []).filter(k => typeof k === 'string' && k)
       const at = this.now()
       const entry = { at, seat, op, n: Number.isSafeInteger(count) && count >= all.length ? count : all.length, d: all.slice(0, READ_LOG_MAX_KEYS), truncated: all.length > READ_LOG_MAX_KEYS }
+      const line = JSON.stringify(entry)
+      if (Buffer.byteLength(line) > MAX_LINE_BYTES) throw new Error('read log entry exceeds line limit')
       this.#ensureRegular(false)
       const fd = openSync(this.path, constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW)
-      try { writeSync(fd, `${JSON.stringify(entry)}\n`) } finally { closeSync(fd) }
+      try { writeSync(fd, `${line}\n`) } finally { closeSync(fd) }
       if (at - this.lastPrune >= PRUNE_EVERY_SEC) this.prune()
       return true
     } catch (e) {
@@ -81,29 +133,45 @@ export class ReadLog {
     const nowSec = this.now()
     this.lastPrune = nowSec
     let tmp = null
+    let source = null
     try {
       this.#ensureRegular(false)
       const cutoff = nowSec - Math.floor(this.retentionDays * 86400)
-      const raw = readFileSync(this.path, 'utf8')
-      const before = raw.split('\n').filter(Boolean)
-      let lines = before.filter(l => {
-        try { return Number(JSON.parse(l).at) >= cutoff } catch { return false }   // an unparseable line is damage, not evidence
-      })
-      let bytes = lines.reduce((n, l) => n + Buffer.byteLength(l) + 1, 0)
-      if (bytes > this.maxBytes) {
-        const target = Math.floor(this.maxBytes * 0.8)
-        while (lines.length && bytes > target) bytes -= Buffer.byteLength(lines.shift()) + 1
+      source = openSync(this.path, constants.O_RDONLY | constants.O_NOFOLLOW)
+      const initial = fstatSync(source)
+      if (!initial.isFile() || (typeof process.getuid === 'function' && initial.uid !== process.getuid())) {
+        throw new Error('read log file is not owned by this service')
       }
-      if (lines.length === before.length && bytes === Buffer.byteLength(raw)) return false
+      let bytes = 0
+      let changed = false
+      scanLines(source, initial.size, line => {
+        const kept = retainedLine(line, cutoff)
+        if (kept) {
+          bytes += kept.bytes
+          if (kept.bytes !== line.length + 1) changed = true
+        } else changed = true
+      })
+      if (!changed && bytes === initial.size && bytes <= this.maxBytes) return false
+      let dropBytes = bytes > this.maxBytes ? bytes - Math.floor(this.maxBytes * 0.8) : 0
       // An unpredictable name made with O_EXCL: an existing file or symlink of any name is never opened, so nothing planted
       // beside the log can be followed or truncated. The data is synced, renamed over the log, and the directory synced so the
       // rename itself survives a crash.
       tmp = `${this.path}.tmp-${process.pid}-${randomBytes(6).toString('hex')}`
       const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o640)
       try {
-        writeSync(fd, lines.length ? `${lines.join('\n')}\n` : '')
+        scanLines(source, initial.size, line => {
+          const kept = retainedLine(line, cutoff)
+          if (!kept) return
+          if (dropBytes > 0) { dropBytes -= kept.bytes; return }
+          writeAll(fd, kept.text)
+        })
         fsyncSync(fd)
       } finally { closeSync(fd) }
+      const current = lstatSync(this.path)
+      const after = fstatSync(source)
+      if (current.ino !== initial.ino || current.dev !== initial.dev || after.size !== initial.size || after.mtimeMs !== initial.mtimeMs) {
+        throw new Error('read log changed during prune')
+      }
       chmodSync(tmp, 0o640)
       renameSync(tmp, this.path)
       tmp = null
@@ -115,6 +183,8 @@ export class ReadLog {
       this.failures += 1
       this.log(`hive-memory: read log prune failed (${e.code || e.message}); the log is left as it was`)
       return false
+    } finally {
+      if (source !== null) closeSync(source)
     }
   }
 }
