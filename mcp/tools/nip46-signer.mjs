@@ -20,7 +20,13 @@ export function makeBunkerSigner(uriText, clientNsec, options = {}) {
   const pubkey = match[1].toLowerCase(), secret = uri.searchParams.get('secret') || ''
   const clientKey = secretKey(clientNsec, options.clientSource || 'NIP-46 client credential'), clientPubkey = getPublicKey(clientKey)
   const conversation = nip44.v2.utils.getConversationKey(clientKey, pubkey)
-  const pool = options.pool || new SimplePool(), pending = new Map()
+  // Every relay socket this signer opens is tracked and closed by disconnect(), whatever state it is in. nostr-tools'
+  // relay close() only closes a socket that is already OPEN: one still connecting (or one the pool gave up on after its
+  // connect timeout) was dropped, opened later and stayed open, so a one-shot process never exited (q-310: the curator
+  // hung "activating" after a finished cycle). A caller's own pool keeps its own sockets.
+  const sockets = new Set()
+  const pool = options.pool || new SimplePool({ websocketImplementation: trackedWebSocket(options.WebSocket || globalThis.WebSocket, sockets) })
+  const pending = new Map()
   const idleMs = Number.isSafeInteger(options.idleMs) && options.idleMs >= 0 ? options.idleMs : 250
   let subscribed = false, subscription, connected, idleTimer, closed = false
   const disconnect = () => {
@@ -28,6 +34,7 @@ export function makeBunkerSigner(uriText, clientNsec, options = {}) {
     try { subscription?.close() } catch { /* best-effort subscription cleanup */ }
     subscription = undefined; subscribed = false; connected = undefined
     try { pool.close(relays) } catch { /* best-effort socket cleanup */ }
+    for (const ws of [...sockets]) shut(ws, sockets)
   }
   const idleClose = () => {
     if (closed || pending.size || idleTimer) return
@@ -107,4 +114,22 @@ export function makeBunkerSigner(uriText, clientNsec, options = {}) {
     async nip44Decrypt(peer, ciphertext) { return call('nip44_decrypt', [peer, ciphertext]) },
     async nip44Encrypt(peer, plaintext) { return call('nip44_encrypt', [peer, plaintext]) },
     async signEvent(event) { return JSON.parse(await call('sign_event', [JSON.stringify(event)])) } })
+}
+
+// A WebSocket class that records each socket it makes in `sockets`; disconnect() closes and forgets them.
+function trackedWebSocket(Base, sockets) {
+  if (typeof Base !== 'function') return Base
+  return class TrackedWebSocket extends Base {
+    constructor(...args) { super(...args); sockets.add(this) }
+  }
+}
+
+// Close a socket in any state and forget it. A WebSocket may be closed while CONNECTING; should the platform open it
+// anyway, it is closed again the moment it opens.
+function shut(ws, sockets) {
+  sockets.delete(ws)
+  try {
+    if (ws.readyState === 0 && typeof ws.addEventListener === 'function') ws.addEventListener('open', () => { try { ws.close() } catch { /* already closing */ } })
+    if (ws.readyState === 0 || ws.readyState === 1) ws.close()
+  } catch { /* best-effort socket cleanup */ }
 }
