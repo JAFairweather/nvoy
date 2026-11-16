@@ -28,6 +28,7 @@ import { grantLookup, noGrantVerdict } from './grant_evidence.mjs'
 import { admissionLimit, hopOf } from './agent_limits.mjs'
 import { validateContext } from './admitted_task.mjs'
 import { recordMentionGrants } from './agent_post.mjs'
+import { buildNotice, limitReason, recordRefusal, takeNoticeBudget } from './unadmitted_mentions.mjs'
 
 const HEX64 = /^[0-9a-f]{64}$/
 let signer
@@ -66,6 +67,43 @@ const finish = reason => {
   console.error(`instance-broker-native: ${eventId.slice(0, 12)}… ${reason}`)
   exit(0)
 }
+// q-198: a refusal of a signed mention is recorded (layer 1) and, where a person could fix it, the seat is
+// told without the content (layer 2), before the marker is finished. Both are evidence, never a gate: a
+// failure is logged and the refusal stands. The notice never requeues the marker.
+const refuse = async (reason, { mention, refusal, lookup = null }) => {
+  const at = Date.now()
+  try {
+    recordRefusal(resolve(manifest.stateDir, 'unadmitted-mentions.jsonl'),
+      { sourceEvent: eventId, author: mention.author, channel: mention.channel, reason: refusal, lookup, at })
+  } catch (e) { console.error(`instance-broker-native: ${eventId.slice(0, 12)}… refusal row not recorded (${e.code || e.message})`) }
+  if (['no-grant', 'no-grant-suspect', 'dm-not-owner'].includes(refusal) && manifest.buzz.unadmittedNotice) {
+    let budget
+    try { budget = takeNoticeBudget(resolve(manifest.stateDir, 'unadmitted-notices.json'), { author: mention.author, sourceEvent: eventId, grantors: manifest.grantors, at }) }
+    catch (e) { budget = { allowed: false, why: `budget unreadable (${e.code || 'malformed'})` } }
+    if (budget.allowed) {
+      const sent = await sendToAdapter(buildNotice({ instance: manifest.id, sourceEvent: eventId, author: mention.author,
+        channel: mention.channel, reason: refusal, observedAt: at / 1000 }), 5000)
+      console.error(`instance-broker-native: ${eventId.slice(0, 12)}… unadmitted notice ${sent === true ? 'queued' : `not queued (${sent})`}`)
+    } else console.error(`instance-broker-native: ${eventId.slice(0, 12)}… no unadmitted notice (cap: ${budget.why})`)
+  }
+  finish(reason)
+}
+// One record to the keyless adapter. Resolves true on its acknowledgement, else a short reason; never throws.
+const sendToAdapter = (record, timeoutMs) => new Promise(done => {
+  const client = net.createConnection(resolve(manifest.runtimeDir, 'adapter.sock'))
+  let received = '', settled = false
+  const settle = value => { if (settled) return; settled = true; clearTimeout(timer); client.destroy(); done(value) }
+  const timer = setTimeout(() => settle('timed out'), timeoutMs)
+  client.on('error', e => settle(`adapter socket unavailable: ${e.code || 'error'}`))
+  client.on('close', () => settle('adapter closed without acknowledgement'))
+  client.on('connect', () => client.write(JSON.stringify(record) + '\n'))
+  client.on('data', chunk => {
+    received += chunk
+    if (!received.includes('\n')) return
+    let ack; try { ack = JSON.parse(received.split('\n')[0]) } catch { return settle('malformed acknowledgement') }
+    settle(ack?.type === 'ack' && ack.instance === manifest.id ? true : 'acknowledgement does not bind this instance')
+  })
+})
 
 let attentionEnv
 ;({ signer, attentionEnv } = brokerSigner(die, { idleMs: 30000 }))
@@ -107,7 +145,7 @@ const mention = nativeMention(source, { me, channels: [...manifest.buzz.channels
 if (!mention) finish('is not a signed mention of this identity')
 const dm = dms.includes(mention.channel)
 // Decided before any grant is consulted: no grant could change the answer.
-if (dm && !manifest.grantors.includes(mention.author)) finish(`DM author ${mention.author.slice(0, 8)} is not this identity's owner; heard as data only`)
+if (dm && !manifest.grantors.includes(mention.author)) await refuse(`DM author ${mention.author.slice(0, 8)} is not this identity's owner; heard as data only`, { mention, refusal: 'dm-not-owner' })
 
 // 2. Live policy: does the AUTHOR hold a task grant for this identity, right now?
 const attention = resolve(new URL('.', import.meta.url).pathname, 'attention.mjs')
@@ -122,7 +160,8 @@ const lookup = grantLookup(resolve(manifest.stateDir, 'grant-relays.json'), poli
 if (!policy.policyUsable) requeue(`live grant policy unavailable (relays ${lookup.summary})`)
 recordMentionGrants(manifest, policy)
 const grant = nativeGrant({ author: mention.author, dm, grants: policy.grants, grantors: manifest.grantors })
-if (!grant) finish(`author ${mention.author.slice(0, 8)} holds no live task grant; heard as data only [${noGrantVerdict(lookup)}]`)
+if (!grant) await refuse(`author ${mention.author.slice(0, 8)} holds no live task grant; heard as data only [${noGrantVerdict(lookup)}]`,
+  { mention, refusal: lookup.suspect ? 'no-grant-suspect' : 'no-grant', lookup })
 
 // 2b. The brakes on agents directing agents: a broker-signed chain past max_hops, or a non-grantor
 // sender past its hourly budget, is terminal. The words stay unread.
@@ -130,7 +169,7 @@ const hop = hopOf(source)
 let limited
 try { limited = admissionLimit({ limits: manifest.agentLimits, grantors: manifest.grantors, sender: mention.author, eventId, hop,
   path: resolve(manifest.stateDir, 'agent-limits', 'admissions.json') }) } catch (e) { die(`cannot read the admission counter: ${e.message}`) }
-if (limited) finish(limited)
+if (limited) await refuse(limited, { mention, refusal: limitReason(limited) })
 
 // 3. One signed message, one admission — across native and carried paths alike.
 const sourceIndex = resolve(manifest.stateDir, 'channel-source-admissions.jsonl')

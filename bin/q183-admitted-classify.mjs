@@ -21,6 +21,7 @@ import { lstatSync, readdirSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { readManifest } from '../mcp/tools/runtime_manifest.mjs'
+import { REFUSAL_REASONS, summarizeRefusals } from '../mcp/tools/unadmitted_mentions.mjs'
 
 const HEX64 = /^[0-9a-f]{64}$/
 const MARKER = /^([0-9a-f]{64})(\.buzz)?\.(pending|inflight|inflight\.done)$/
@@ -163,9 +164,12 @@ export function collect(manifest, harnessHome) {
     try { mtime = lstatSync(resolve(manifest.spoolDir, name)).mtimeMs } catch { continue }
     markers.push({ envelope: m[1], state: m[3], mtime: iso(mtime) })
   }
+  // q-198: mentions the native broker refused, by fixed reason. Ids and reasons only.
+  const refusals = summarizeRefusals(load('unadmitted-mentions', state('unadmitted-mentions.jsonl'),
+    row => (row?.version === 1 && REFUSAL_REASONS.includes(row.reason) ? { reason: row.reason, at: Number(row.at) } : null)))
   sources.receipts_used = answered.size
   sources.spool_markers = markers.length
-  return { input: { admitted, consumed, delivered, answered, terminalRequests, replyRequests, markers }, sources }
+  return { input: { admitted, consumed, delivered, answered, terminalRequests, replyRequests, markers }, sources, refusals }
 }
 
 // A seat error is printed as a fixed reason only, chosen from the stage that failed and an allowlisted
@@ -191,9 +195,9 @@ export function run(argv, { log = line => console.log(line), now = Date.now(), r
     try {
       const manifest = readSeat(opts.root, id)
       stage = 'seat files'
-      const { input, sources } = collectSeat(manifest, opts.harnessHomes[id])
+      const { input, sources, refusals = null } = collectSeat(manifest, opts.harnessHomes[id])
       stage = 'classify'
-      seats[id] = { harness: manifest.harness?.runner || null, delivery_mode: manifest.deliveryMode || null, ...classify({ ...input, now, ids: opts.ids }), sources }
+      seats[id] = { harness: manifest.harness?.runner || null, delivery_mode: manifest.deliveryMode || null, ...classify({ ...input, now, ids: opts.ids }), refusals, sources }
     } catch (error) {
       seats[id] = { error: safeError(error, stage) }
     }

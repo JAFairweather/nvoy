@@ -139,3 +139,20 @@ test('a colon-free message is never printed either (Neil, PR 422 at 02e257d)', (
   assert.deepEqual(run(['--root', root], { log: line => out.push(line), now: 0 }), { bad: { error: 'manifest refused (details withheld)' } })
   assert.ok(!out.join('\n').includes('npub1'))
 })
+
+test('q-198: refused mentions are counted by reason with the newest time, ids and reasons only', () => {
+  const m = seat()
+  const row = (n, reason, at) => ({ version: 1, source_event: env(n), author: env(90), channel: '3f1c2a4b-5d6e-4f70-8a91-b2c3d4e5f607', reason, at })
+  writeFileSync(join(m.stateDir, 'unadmitted-mentions.jsonl'), lines([
+    row(1, 'no-grant', 1_794_000_000), row(2, 'no-grant-suspect', 1_794_000_100), row(3, 'dm-not-owner', 1_794_000_050),
+    row(4, 'hop-limit', 1_793_000_000), row(5, 'rate-limit', 1_793_000_000), row(6, 'something-else', 1_799_000_000), '{"broken',
+  ]))
+  const { refusals, sources } = collect(m)
+  assert.deepEqual(refusals, { total: 5, by_reason: { 'no-grant': 1, 'no-grant-suspect': 1, 'dm-not-owner': 1, 'hop-limit': 1, 'rate-limit': 1 },
+    newest_at: new Date(1_794_000_100_000).toISOString() })
+  assert.deepEqual(sources['unadmitted-mentions'], { rows: 5, bad_lines: 1 })
+  const printed = []
+  run(['--instance', 'seat'], { log: line => printed.push(line), now: 0, readSeat: () => m })
+  assert.equal(JSON.parse(printed.join('\n')).seats.seat.refusals.total, 5)
+  assert.equal(collect(seat()).refusals.total, 0)
+})

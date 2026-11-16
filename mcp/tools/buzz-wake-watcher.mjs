@@ -12,8 +12,10 @@
 //
 // With --owners it also hears DMs. A Buzz DM is a private channel no manifest can list in advance,
 // so the watcher follows the relay's membership notices for this identity and adds each DM channel
-// as it appears — at start, or long after. In a DM only an owner's message is marked; the broker
-// enforces the same rule on its own read.
+// as it appears — at start, or long after. Every mention in a DM is marked, the owner's or not: the
+// keyed broker alone decides, on its own read, that only an owner is heard in a DM, and it records a
+// refused one (q-198) instead of the refusal vanishing here, unseen (My Dude, PR 430 review). A marker
+// is still only a hint, so a non-owner's DM costs one broker read, as a channel mention already does.
 
 import { appendFileSync, chmodSync, chownSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
@@ -72,7 +74,6 @@ function record(ev) {
   if (seen.has(ev.id)) return
   const mention = nativeMention(ev, { me, channels: [...channels, ...dms], threads: roots })
   if (!mention) return
-  if (!channels.includes(mention.channel) && !owners.includes(mention.author)) return
   try {
     mkdirSync(markerDir, { recursive: true, mode: 0o770 })
     const p = resolve(markerDir, `${ev.id}.buzz.pending`)
