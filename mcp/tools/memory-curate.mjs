@@ -3046,17 +3046,29 @@ async function main() {
         scan_diagnostics: result.scan_diagnostics ?? null,
       })
     )
-    if (!result.ok) { curatorSigner?.close(); process.exit(1) }
+    if (!result.ok) { curatorSigner?.close(); await exitAfterFlush(1) }
   } catch (err) {
     console.error(`memory-curate: cycle failed: ${err.message || err}`)
     curatorSigner?.close()
-    process.exit(1)
+    await exitAfterFlush(1)
   }
   curatorSigner?.close()
   // A one-shot run ends here, whatever handle a library still holds: the curator hung "activating" three times after
-  // a finished cycle (q-310), so success exits as plainly as failure does. stdout is a pipe or the journal (synchronous
-  // on Linux), so the summary line above is already written.
-  process.exit(0)
+  // a finished cycle (q-310), so success exits as plainly as failure does, once the summary is flushed.
+  await exitAfterFlush(0)
+}
+
+// Exit with `code` once stdout and stderr have handed over everything written so far. A write to a pipe is
+// asynchronous in Node, so process.exit() straight after console.log can cut a long summary at 64 KiB. An empty write
+// completes only after the writes queued before it. The wait is capped so a stalled reader cannot hold the exit.
+export async function exitAfterFlush(code, { streams = [process.stdout, process.stderr], capMs = 10000 } = {}) {
+  let cap
+  const flushed = Promise.all(streams.map(s => new Promise(resolve => {
+    try { s.write('', () => resolve()) } catch { resolve() }
+  })))
+  await Promise.race([flushed, new Promise(resolve => { cap = setTimeout(resolve, capMs) })])
+  clearTimeout(cap)
+  process.exit(code)
 }
 
 function isEntrypoint() {

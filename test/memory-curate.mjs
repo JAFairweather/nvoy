@@ -6,7 +6,7 @@ import { execFile as execFileCb, spawn } from 'node:child_process'
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
 
@@ -780,6 +780,16 @@ await test('CLI bin/hive-memory-curate.mjs requires write capability to advance 
         { encoding: 'utf8', timeout: 20000 }).catch(err => ({ failed: err }))
         assert.ok(!r.failed, `memory-curate.mjs must exit after a successful cycle: ${r.failed?.killed ? 'killed after 20 s' : r.failed?.message}`)
         assert.equal(JSON.parse(r.stdout).ok, true, 'the cycle itself succeeded')
+
+        // The forced exit flushes first: a 1 MB write through a pipe arrives whole, with a handle still holding the loop.
+        // (A bare process.exit() after the same write delivers 64 KiB.)
+        const curateUrl = pathToFileURL(entry).href
+        const big = await execFileAsync(process.execPath, ['--input-type=module', '-e',
+          `setInterval(()=>{},1000); const { exitAfterFlush } = await import(${JSON.stringify(curateUrl)}); ` +
+          `process.stdout.write('x'.repeat(1000000)); await exitAfterFlush(0)`],
+        { encoding: 'utf8', timeout: 20000, maxBuffer: 4 << 20 }).catch(err => ({ failed: err }))
+        assert.ok(!big.failed, `exitAfterFlush must exit: ${big.failed?.killed ? 'killed after 20 s' : big.failed?.message}`)
+        assert.equal(big.stdout.length, 1000000, 'exitAfterFlush delivers all of stdout through a pipe before exiting')
       }
 
       // 1a. Read-only CLI call without writer socket/key at write_seq = 20 MUST NOT advance cursor or consume the +20 trigger
