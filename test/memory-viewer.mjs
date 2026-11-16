@@ -3931,6 +3931,7 @@ await test('q-192: the viewer listens and serves the pending state while its fir
   const port = probe.address().port
   await new Promise(r => probe.close(r))
   const gateAsked = []
+  const listened = []
   let viewer
   let settled = false
   const starting = startMemoryViewer({
@@ -3939,6 +3940,7 @@ await test('q-192: the viewer listens and serves the pending state while its fir
     port,
     pollMs: 300_000,
     peerGate: async addr => { gateAsked.push(addr); return { ok: true, node: { stableId: 'nTest', tags: [] } } },
+    onListening: info => { listened.push({ ...info, settledThen: settled }) },
   }).then(v => { settled = true; viewer = v; return v })
   try {
     let page = null
@@ -3958,6 +3960,7 @@ await test('q-192: the viewer listens and serves the pending state while its fir
     assert.equal(body.connected, false)
     assert.equal(body.error, 'initial poll pending')
     assert(gateAsked.length >= 3, 'the peer gate runs on every request before the first poll too')
+    assert.deepEqual(listened, [{ host: '127.0.0.1', port, settledThen: false }], 'onListening fires once, at bind, before the first poll finishes')
   } finally {
     for (const c of held) c.destroy()
     await starting.catch(() => {})

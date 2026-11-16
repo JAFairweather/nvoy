@@ -9952,6 +9952,8 @@ export async function startMemoryViewer({
   peerGate = undefined,
   // Clock in epoch seconds for poll timestamps and trend windows; tests inject a fixed clock.
   now = () => Math.floor(Date.now() / 1000),
+  // Called once with { host, port } when the port is bound, before the first poll (q-192).
+  onListening = undefined,
 } = {}) {
   if (!socketPath || !isAbsolute(socketPath)) {
     throw new Error('--socket <absolute-path> is required')
@@ -11086,6 +11088,7 @@ export async function startMemoryViewer({
   // Callers still get a polled viewer: this function resolves only after the first poll.
   const addr = httpServer.address()
   const boundPort = typeof addr === 'object' && addr ? addr.port : target.port
+  if (typeof onListening === 'function') onListening({ host: target.host, port: boundPort })
 
   await pollOnce({ forceFull: true })
   scheduleNextPoll()
@@ -11149,9 +11152,19 @@ async function main() {
   }
 
   try {
-    const viewer = await startMemoryViewer({ ...flags, peerGate })
-    const fmtHost = viewer.host.includes(':') ? `[${viewer.host}]` : viewer.host
-    console.log(`memory-viewer: listening on http://${fmtHost}:${viewer.port} (socket ${flags.socketPath})`)
+    // q-192: log when the port opens, not when startMemoryViewer resolves after the first poll, so the journal
+    // shows the real start-to-listening time; the first poll's duration gets its own line.
+    let listenedAtMs = Date.now()
+    const viewer = await startMemoryViewer({
+      ...flags,
+      peerGate,
+      onListening: ({ host, port }) => {
+        listenedAtMs = Date.now()
+        const h = host.includes(':') ? `[${host}]` : host
+        console.log(`memory-viewer: listening on http://${h}:${port} (socket ${flags.socketPath}); first poll running`)
+      },
+    })
+    console.log(`memory-viewer: first poll done in ${((Date.now() - listenedAtMs) / 1000).toFixed(1)} s`)
     const shutdown = async () => {
       await viewer.stop()
       process.exit(0)
