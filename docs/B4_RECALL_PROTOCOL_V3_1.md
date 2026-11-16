@@ -48,8 +48,9 @@ below minimum also means STOP before retrieval, overall sensitivity INCONCLUSIVE
 and recorded deficient category/count/minimum. DJ returns that coverage shortfall
 to Curator and Dead Rabbit for a reviewed route decision; no automatic fourth-seat
 grant or replacement sampling. Resume only after any changed route is reviewed
-and pinned, and any access change is authorized by James. Freeze notes must warn
-that thin U/X can void the full-scope verdict even when A coverage is sufficient.
+and pinned, and any access change is authorized by James.
+Any changed route requires a new frozen question set and a new labeling round; existing votes are never re-scored under changed rules.
+Freeze notes must warn that thin U/X can void the full-scope verdict even when A coverage is sufficient.
 The overall sensitivity verdict is an A-ranking verdict conditional on ALL three
 coverage guards, not an assertion of U/X ranking sensitivity.
 
