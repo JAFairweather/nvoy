@@ -65,6 +65,7 @@ const roomsRead = await readRooms({ session: session([list(CH, [agent, kerouac.p
   profile(kerouac, { name: 'kerouac' }), profile(twinA, { name: 'Twin' }), profile(twinB, { display_name: 'twin' })]), rooms: [CH, CH2, 'not-a-room'], relaySigner: relayKey.pk, me: agent })
 const inCH = Object.fromEntries((roomsRead.rooms[CH] || []).map(e => [e.pubkey, e.name]))
 ok('readRooms drops the broker itself and names each member it can', !(agent in inCH) && inCH[kerouac.pk] === 'kerouac' && inCH[dennis.pk] === null)
+ok('a successful profile read identifies members whose profile was omitted', roomsRead.missingProfiles.includes(dennis.pk) && !roomsRead.missingProfiles.includes(kerouac.pk))
 ok('a name two keys reduce to is kept by neither', inCH[twinA.pk] === null && inCH[twinB.pk] === null)
 ok('an unreadable room comes back empty, never borrowed from another', roomsRead.rooms['not-a-room'].length === 0 && roomsRead.rooms[CH2].length === 1)
 const brokenRead = await readRooms({ session: { fetch: async f => { if (f.kinds[0] === 0) throw new Error('profiles down'); throw new Error('room down') } }, rooms: [CH], relaySigner: relayKey.pk, me: agent })
@@ -104,6 +105,13 @@ ok('a room not read this time keeps its last good list', recordMentionRooms(rm, 
   readMentionRooms(rm)[CH2].map(e => e.pubkey).join() === dennis.pk && readMentionRooms(rm)[CH].length === 1)
 ok('with the profiles unread, a member keeps the name it last had', recordMentionRooms(rm, { rooms: { [CH]: [entry(kerouac)] }, failed: [{ room: null, reason: 'profiles: down' }] }) &&
   readMentionRooms(rm)[CH][0].name === 'kerouac')
+ok('an omitted profile keeps the prior name for a member still in a valid roster', recordMentionRooms(rm, { rooms: { [CH]: [entry(kerouac)] }, missingProfiles: [kerouac.pk] }) &&
+  readMentionRooms(rm)[CH][0].name === 'kerouac')
+ok('a verified profile with no usable name clears the prior name', recordMentionRooms(rm, { rooms: { [CH]: [entry(kerouac)] } }) &&
+  readMentionRooms(rm)[CH][0].name === null)
+ok('a recovered name clashing with another member stays key only', recordMentionRooms(rm, { rooms: { [CH]: [entry(kerouac, 'kerouac')] } }) &&
+  recordMentionRooms(rm, { rooms: { [CH]: [entry(kerouac), entry(dennis, 'kerouac')] }, missingProfiles: [kerouac.pk] }) &&
+  readMentionRooms(rm)[CH].every(e => e.name === null))
 writeFileSync(roomsFile, JSON.stringify({ version: 1, instance: 'someone-else', rooms: { [CH]: [entry(dennis)] } }))
 ok('a file for another instance reads as nothing', readMentionRooms(rm) === null)
 writeFileSync(roomsFile, JSON.stringify({ version: 1, instance: 'rooms', rooms: { [CH]: [entry(kerouac, 'kerouac'), { pubkey: 'zz', name: 'x' }, entry(dennis, '-bad')], [grantor]: [entry(dennis)] } }))

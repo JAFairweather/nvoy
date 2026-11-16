@@ -84,10 +84,13 @@ export async function readRooms({ session, rooms, relaySigner, me }) {
       for (const [k, v] of namesFrom(await session.fetch(profileFilter(batch)), batch)) names.set(k, v)
     }
   } catch (e) { failed.push({ room: null, reason: `profiles: ${e.message}` }); names = new Map() }
+  // A successful profile query can still omit a member's kind 0. Keep that gap distinct from a
+  // verified profile whose name is unusable, so the discovery file can retain the former name.
+  const missingProfiles = everyone.filter(pubkey => !names.has(pubkey))
   const holders = new Map()
   for (const [pubkey, name] of names) if (name) holders.set(fold(name), [...(holders.get(fold(name)) || []), pubkey])
   const nameOf = pubkey => { const n = names.get(pubkey); return n && holders.get(fold(n)).length === 1 ? n : null }
-  return { rooms: Object.fromEntries(Object.entries(read).map(([room, keys]) => [room, keys.map(pubkey => ({ pubkey, name: nameOf(pubkey) }))])), failed }
+  return { rooms: Object.fromEntries(Object.entries(read).map(([room, keys]) => [room, keys.map(pubkey => ({ pubkey, name: nameOf(pubkey) }))])), failed, missingProfiles }
 }
 
 // --- The discovery file: broker-owned, worker-group readable, provisioned beside mention-grants.json. ---
@@ -106,15 +109,22 @@ export function readMentionRooms(manifest) {
 }
 // A room not read this time (one that failed, or one a single-room refresh skipped) keeps its last
 // good list. True only when the file now holds exactly this body.
-// When the profiles could not be read, a member keeps the name it last had: a subset of a list that
-// was clash-free when written, so no clash comes back.
-export function recordMentionRooms(manifest, { rooms, failed = [] }, now = Date.now()) {
+// When a profile cannot be read, a member still in the roster keeps its last name. A valid
+// name-less profile clears it. Any newly conflicting names become key-only entries.
+export function recordMentionRooms(manifest, { rooms, failed = [], missingProfiles = [] }, now = Date.now()) {
   if (!manifest.mayPost?.mentionRooms) return false
   const last = readMentionRooms(manifest) || {}
   const lastName = new Map(Object.values(last).flat().filter(e => e.name).map(e => [e.pubkey, e.name]))
   const noProfiles = failed.some(f => f.room === null)
-  const fresh = list => noProfiles ? list.map(e => ({ pubkey: e.pubkey, name: e.name ?? lastName.get(e.pubkey) ?? null })) : list
+  const missing = new Set(missingProfiles)
+  const fresh = list => list.map(e => ({ pubkey: e.pubkey,
+    name: e.name ?? ((noProfiles || missing.has(e.pubkey)) ? lastName.get(e.pubkey) ?? null : null) }))
   const merged = Object.fromEntries(manifest.mayPost.channels.filter(c => rooms[c] || last[c]).map(c => [c, rooms[c] ? fresh(rooms[c]) : last[c]]))
+  // A recovered name may now belong to another member. Keep both keys discoverable, but do not
+  // let either stale or current text silently select one of them.
+  const holders = new Map()
+  for (const e of Object.values(merged).flat()) if (e.name) holders.set(fold(e.name), new Set([...(holders.get(fold(e.name)) || []), e.pubkey]))
+  for (const list of Object.values(merged)) for (const e of list) if (e.name && holders.get(fold(e.name)).size > 1) e.name = null
   const body = JSON.stringify({ version: 1, instance: manifest.id, read_at: Math.floor(now / 1000), rooms: merged }) + '\n'
   let fd
   try {

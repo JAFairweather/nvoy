@@ -105,7 +105,9 @@ The broker refreshes the file:
 
 A failed read keeps the last good file, and logs it. `recordMentionRooms` merges: a room not read this
 time (it failed, or a single-room refresh in the post path skipped it) keeps its last list, and when
-the profiles can't be read a member keeps the name it last had. The pre-signing read in §4 records
+profiles can't be read or a successful profile query omits a member's kind 0, a member still in the
+roster keeps the name it last had. A verified profile with no usable name clears it. If an old name
+now clashes with another member's name, both entries become key-only. The pre-signing read in §4 records
 what it read even when it then refuses the post. The agent card reads the file and never refreshes
 it. That file is for **discovery** only: what the
 channel MCPs show and resolve `@name` against. The broker never signs a room-derived mention on the
