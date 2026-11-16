@@ -1468,5 +1468,72 @@ os.execv(sys.argv[3], [sys.argv[3], sys.argv[4], "--db", sys.argv[5], "--ledger"
   s.close()
 }
 
+// --- q-192: a pinned paged pull evaluates the store once; current_claims stays exact ---
+{
+  const p = setup('q192-memo')
+  const s = open(p)
+  const base = T0 + 100
+  const ids = []
+  for (let i = 0; i < 25; i++) {
+    const ev = claim(crusty, roomA, `q192-memo-${i}`, { nowSec: base + i, ttlSec: i === 0 ? 3600 : 86400 })
+    const r = s.submit({ writer: 'crusty', event: ev, expectedPriorId: null, nowSec: base + i })
+    if (r.accepted) ids.push(ev.id)
+  }
+  ok('q-192 fixture: 25 room claims accepted', ids.length === 25)
+  const at = base + 60
+  const pull = (reader, nowSec, extra = {}) => {
+    const out = []
+    let cursor = 0, pin = null
+    for (;;) {
+      const q = s.query({ readerPubkey: reader, includeHistory: true, format: 'full', limit: 10, cursor, nowSec, ...(pin || {}), ...extra })
+      if (q.answer === 'unknown') return { refused: q.answer_reason, out }
+      out.push(...q.records.map(r => r.event_id))
+      if (!pin && extra.pin !== false) pin = { snapshotRowid: q.snapshot.max_event_rowid, expectedPurgeSeq: q.snapshot.last_purge_seq, snapshotAt: q.snapshot.as_of_sec }
+      if (!q.next_cursor) return { out, pin }
+      cursor = Number(q.next_cursor)
+    }
+  }
+  const unpinned = pull(biggy.pk, at, { pin: false }).out
+  const pinned = pull(biggy.pk, at)
+  ok('q-192: a pinned paged pull returns the same rows in the same order as an unpinned one',
+    pinned.out.length === 25 && JSON.stringify(pinned.out) === JSON.stringify(unpinned))
+  ok('q-192: the pinned pages share one memo entry', s.pageMemoSize() === 1)
+
+  // A write between pinned pages: the next page is still the snapshot's, and the memo is rebuilt, not reused.
+  const pin = pinned.pin
+  const p1 = s.query({ readerPubkey: biggy.pk, includeHistory: true, format: 'full', limit: 10, cursor: 0, nowSec: at, ...pin })
+  const late = claim(crusty, roomA, 'q192-memo-late', { nowSec: base + 30 })
+  ok('q-192: a write lands mid-pull', s.submit({ writer: 'crusty', event: late, expectedPriorId: null, nowSec: base + 30 }).accepted === true)
+  const p2 = s.query({ readerPubkey: biggy.pk, includeHistory: true, format: 'full', limit: 10, cursor: 10, nowSec: at, ...pin })
+  const p3 = s.query({ readerPubkey: biggy.pk, includeHistory: true, format: 'full', limit: 10, cursor: 20, nowSec: at, ...pin })
+  const got = [...p1.records, ...p2.records, ...p3.records].map(r => r.event_id)
+  ok('q-192: after a mid-pull write the pinned pages still return exactly the snapshot rows',
+    JSON.stringify(got) === JSON.stringify(pinned.out) && !got.includes(late.id))
+  ok('q-192: the fresh unpinned pull sees the new write', pull(biggy.pk, at + 1, { pin: false }).out.includes(late.id))
+
+  // A config swap that drops biggy from the room: a cached result must not outlive the grant.
+  const pinB = pull(biggy.pk, at + 2)
+  ok('q-192: biggy reads the room before the swap', pinB.out.length === 26)
+  s.setConfig(validateAndResolveConfig(rawConfig({ rooms: { [ROOM_A]: { members: [crusty.pk, james.pk], writers: [crusty.pk] }, [ROOM_B]: { members: [crusty.pk, james.pk], writers: [crusty.pk] } } })))
+  const after = s.query({ readerPubkey: biggy.pk, includeHistory: true, format: 'full', limit: 10, cursor: 10, nowSec: at + 2, ...pinB.pin })
+  ok('q-192: after a config swap the same pinned query is re-evaluated and returns nothing to a removed member', after.records.length === 0 && after.total_matched === 0)
+  s.setConfig(CFG)
+
+  // current_claims: reused between writes, but exact across an expiry and a write.
+  const cc = nowSec => s.query({ readerPubkey: biggy.pk, limit: 1, nowSec }).store_state.current_claims
+  const before = cc(base + 100)
+  const sameAgain = cc(base + 101)
+  const pastExpiry = cc(base + 3600 + 1)
+  ok('q-192: current_claims counts every live claim, and drops by one when the 1-hour claim expires with no write',
+    before === 26 && sameAgain === 26 && pastExpiry === 25)
+  const more = claim(crusty, roomA, 'q192-memo-more', { nowSec: base + 3602 })
+  recordVerifiedBackup({ receiptPath: p.receipt, snapshotId: SNAP_ID, writeSeq: seqOf(s), at: base + 3601 })
+  const moreOut = s.submit({ writer: 'crusty', event: more, expectedPriorId: null, nowSec: base + 3602 })
+  ok('q-192: current_claims rises on the next write', moreOut.accepted === true && cc(base + 3603) === 26)
+  ok('q-192: current_claims for a reader outside the room is zero', s.query({ readerPubkey: outsider.pk, limit: 1, nowSec: base + 3603 }).store_state.current_claims === 0)
+  s.close?.()
+  rmSync(p.dir, { recursive: true, force: true })
+}
+
 console.log(`\n${passes} passed, ${fails} failed`)
 process.exit(fails ? 1 : 0)

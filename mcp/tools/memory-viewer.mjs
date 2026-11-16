@@ -48,6 +48,14 @@ export const CORPUS_CACHE_TTL_MS = 300_000
 // the store reaches it around 17 Nov 2026; past it history_complete goes false. Not raised here: the corpus is held in
 // a 224 MB heap. The bound is logged once when hit, so it cannot pass unnoticed.
 export const MAX_CORPUS_PAGES = 100
+
+// q-192: the snapshot anchor a page reports, as memory_query arguments that pin later pages to it; null when absent.
+export function snapshotPin(page) {
+  const s = page?.snapshot
+  const int = v => Number.isSafeInteger(v) && v >= 0
+  if (!s || !int(s.max_event_rowid) || !int(s.last_purge_seq) || !int(s.as_of_sec)) return null
+  return { snapshot_rowid: s.max_event_rowid, expected_purge_seq: s.last_purge_seq, snapshot_at: s.as_of_sec }
+}
 // q-173 (15 Nov 2026): the topic eigenvector pass costs 2-4 s of synchronous CPU for about 1,500 records, and it ran
 // on every poll that saw a write, so the event loop stalled and page and API requests waited up to 20 s live. A
 // scheduled poll now reuses the previous pass for this long; a forced poll (startup, tests) always recomputes.
@@ -10254,13 +10262,29 @@ export async function startMemoryViewer({
         firstQuery = null
         let cursor = '0'
         let pages = 0
+        // q-192: pages after the first are pinned to the first page's snapshot, so the daemon evaluates the store once
+        // per pull rather than once per page, and a write that lands mid-pull cannot shift rows between pages.
+        let pin = null
         while (cursor !== null && pages < MAX_CORPUS_PAGES) {
           const page = await client.callReadTool('memory_query', {
             limit: 100,
             format: 'full',
             include_history: true,
             ...(cursor !== '0' ? { cursor } : {}),
+            ...(pin && cursor !== '0' ? pin : {}),
           })
+          if (pin && cursor !== '0' && page?.answer === 'unknown') {
+            // The pin went bad mid-pull (a purge, say): start this pull over unpinned, once.
+            console.error(`memory-viewer: pinned page refused (${page?.answer_reason || 'unknown'}); restarting the pull unpinned`)
+            pin = false
+            byKey.clear()
+            byEventId = new Map()
+            firstQuery = null
+            cursor = '0'
+            pages = 0
+            continue
+          }
+          if (pin === null) pin = snapshotPin(page) || false
           if (!firstQuery) firstQuery = page
           for (const r of Array.isArray(page?.records) ? page.records : []) {
             const clean = internRecord(sanitizeMemoryRecord(r), prevByEventId)
