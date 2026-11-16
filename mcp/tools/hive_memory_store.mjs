@@ -842,6 +842,9 @@ export function migrateStoreJson({ storeJsonPath, dbPath, ledgerPath, config, re
 
 // --- the store ---
 
+export const PAGE_MEMO_ENTRIES = 2
+export const PAGE_MEMO_TTL_MS = 60_000
+
 export class HiveMemoryStore {
   constructor({ dbPath, ledgerPath, receiptPath, config = null, configError = null, requireMigratedIds = [], hooks = {}, log = () => {}, lock = true }) {
     Object.assign(this, { dbPath, ledgerPath, receiptPath, config, configError, requireMigratedIds, hooks, log, useLock: lock })
@@ -1190,7 +1193,7 @@ export class HiveMemoryStore {
     return {
       state: 'READY',
       write_seq: seq,
-      current_claims: this.#activeRows(readerPubkey, nowSec).length,
+      current_claims: this.#activeCount(readerPubkey, nowSec),
       last_backup_age_sec: receipt ? nowSec - receipt.at : null,
       unbacked_writes: receipt ? Math.max(0, seq - receipt.write_seq) : seq,
       ...(includeReceipt
@@ -1565,6 +1568,25 @@ export class HiveMemoryStore {
       .filter(r => canRead(readerPubkey, r, this.config))
   }
 
+  // q-192: storeState runs on every query page, so the count reads only the columns canRead needs, and is reused
+  // until a write, a config or database swap, or the next expiry among the rows it counted.
+  #activeCountMemo = new Map()
+  #activeCount(readerPubkey, nowSec) {
+    const { write_seq: seq, last_purge_seq: purgeSeq } = readMeta(this.db)
+    const hit = this.#activeCountMemo.get(readerPubkey)
+    if (hit && hit.db === this.db && hit.config === this.config && hit.seq === seq && hit.purgeSeq === purgeSeq && nowSec >= hit.from && nowSec < hit.until) return hit.n
+    let n = 0
+    let until = Infinity
+    for (const r of this.db.prepare("SELECT pubkey, scope_type, room_id, exp FROM events WHERE is_current = 1 AND status = 'active' AND (exp IS NULL OR exp > ?)").all(nowSec)) {
+      if (!canRead(readerPubkey, r, this.config)) continue
+      n += 1
+      if (r.exp != null && r.exp < until) until = r.exp
+    }
+    if (this.#activeCountMemo.size >= 16) this.#activeCountMemo.clear()
+    this.#activeCountMemo.set(readerPubkey, { db: this.db, config: this.config, seq, purgeSeq, from: nowSec, until, n })
+    return n
+  }
+
   #targetHidden(readerPubkey, target) {
     const raw = String(target ?? '').replace(/^(?:event|supersedes):/i, '')
     const row = HEX64.test(raw) ? this.db.prepare('SELECT pubkey, scope_type, room_id FROM events WHERE id = ?').get(raw) : null
@@ -1664,15 +1686,18 @@ export class HiveMemoryStore {
   }
 
   // Event ids reached from `start` along supersedes edges, at most MAX_LINK_HOPS hops, both ends readable.
-  #lineage(readerPubkey, start) {
+  #lineage(readerPubkey, start, snapshotRowid = null) {
     if (this.#targetHidden(readerPubkey, start)) return new Set()
     const found = new Set()
     let frontier = [start]
-    const edge = this.db.prepare("SELECT e.* FROM links l JOIN events e ON e.id = l.from_id WHERE l.relation = 'supersedes' AND l.target = ?")
+    const edge = snapshotRowid !== null
+      ? this.db.prepare("SELECT e.* FROM links l JOIN events e ON e.id = l.from_id WHERE l.relation = 'supersedes' AND l.target = ? AND e.rowid <= ?")
+      : this.db.prepare("SELECT e.* FROM links l JOIN events e ON e.id = l.from_id WHERE l.relation = 'supersedes' AND l.target = ?")
     for (let hop = 0; hop < MAX_LINK_HOPS && frontier.length; hop++) {
       const next = []
       for (const target of frontier) {
-        for (const row of edge.all(target)) {
+        const edgeRows = snapshotRowid !== null ? edge.all(target, snapshotRowid) : edge.all(target)
+        for (const row of edgeRows) {
           if (found.has(row.id) || !canRead(readerPubkey, row, this.config)) continue
           found.add(row.id)
           next.push(row.id)
@@ -1683,6 +1708,24 @@ export class HiveMemoryStore {
     return found
   }
 
+  // Reconstructs the exact set of event ids with `rowid <= snapshotRowid` whose `is_current` was 1 at
+  // `snapshotRowid` before later `submit` transactions (`rowid > snapshotRowid`) superseded them.
+  #snapshotRestoredHeads(snapshotRowid, curMaxRowid) {
+    const restored = new Set()
+    if (curMaxRowid <= snapshotRowid) return restored
+    const postKeys = this.db.prepare('SELECT DISTINCT pubkey, d FROM events WHERE rowid > ?').all(snapshotRowid)
+    if (!postKeys.length) return restored
+    const priorStmt = this.db.prepare('SELECT id, created_at FROM events WHERE rowid <= ? AND pubkey = ? AND d = ?')
+    for (const { pubkey, d } of postKeys) {
+      let best = null
+      for (const cand of priorStmt.all(snapshotRowid, pubkey, d)) {
+        if (nip01Newer(cand, best)) best = cand
+      }
+      if (best) restored.add(best.id)
+    }
+    return restored
+  }
+
   // Gate 1 Curator Curation + Gate 7 peer workflow supersession:
   // A stored claim `s` named in `supersedes` by a live, newer claim `c` in the same scope leaves the default view
   // as 'consolidated' when `s` is a workflow checkpoint (isWorkflowSlug) OR `c` is signed by a configured Curator
@@ -1690,15 +1733,22 @@ export class HiveMemoryStore {
   // Additionally, if a Curator `curated-*` distillation `c` superseded a source claim `s` and a newer live claim `n`
   // in the same scope (`n.created_at >= c.created_at`) has since replaced `s` at `n.d = s.d` or superseded `s`/`c`,
   // `c` is immediately marked consolidated by `n` (or `n`'s consolidator) so obsolete distillations never shadow newer facts.
-  #consolidatedBy(nowSec, { excludeCuratorIds = null } = {}) {
+  #consolidatedBy(nowSec, { excludeCuratorIds = null, snapshotRowid = null, restoredCurrentIds = null } = {}) {
     const out = new Map()
     const curators = this.config?.curators || new Set()
     const excluded = excludeCuratorIds instanceof Set ? excludeCuratorIds : Array.isArray(excludeCuratorIds) ? new Set(excludeCuratorIds) : null
-    const rows = this.db.prepare(`SELECT s.id AS sid, s.d AS sd, c.id AS cid, c.pubkey AS cpubkey, c.d AS cd, c.scope AS cscope, c.created_at AS ccreated FROM links l
-      JOIN events c ON c.id = l.from_id JOIN events s ON s.id = l.target
-      WHERE l.relation = 'supersedes' AND c.is_current = 1 AND c.status = 'active' AND (c.exp IS NULL OR c.exp > ?)
-        AND c.scope = s.scope AND c.created_at >= s.created_at AND c.id <> s.id AND s.scope_type <> 'hive:canon'
-      ORDER BY c.created_at DESC, c.id`).all(nowSec)
+    const rows = snapshotRowid !== null
+      ? this.db.prepare(`SELECT s.id AS sid, s.d AS sd, c.id AS cid, c.pubkey AS cpubkey, c.d AS cd, c.scope AS cscope, c.created_at AS ccreated, c.is_current AS cis_current FROM links l
+          JOIN events c ON c.id = l.from_id JOIN events s ON s.id = l.target
+          WHERE l.relation = 'supersedes' AND c.rowid <= ? AND s.rowid <= ? AND c.status = 'active' AND (c.exp IS NULL OR c.exp > ?)
+            AND c.scope = s.scope AND c.created_at >= s.created_at AND c.id <> s.id AND s.scope_type <> 'hive:canon'
+          ORDER BY c.created_at DESC, c.id`).all(snapshotRowid, snapshotRowid, nowSec)
+          .filter(r => r.cis_current === 1 || Boolean(restoredCurrentIds?.has(r.cid)))
+      : this.db.prepare(`SELECT s.id AS sid, s.d AS sd, c.id AS cid, c.pubkey AS cpubkey, c.d AS cd, c.scope AS cscope, c.created_at AS ccreated FROM links l
+          JOIN events c ON c.id = l.from_id JOIN events s ON s.id = l.target
+          WHERE l.relation = 'supersedes' AND c.is_current = 1 AND c.status = 'active' AND (c.exp IS NULL OR c.exp > ?)
+            AND c.scope = s.scope AND c.created_at >= s.created_at AND c.id <> s.id AND s.scope_type <> 'hive:canon'
+          ORDER BY c.created_at DESC, c.id`).all(nowSec)
     const curatedById = new Map()
     const supByTarget = new Map()
     for (const r of rows) {
@@ -1720,9 +1770,21 @@ export class HiveMemoryStore {
     }
     if (curatedById.size > 0) {
       const headsByScopeD = new Map()
-      const activeHeads = this.db.prepare(
-        "SELECT id, d, scope, created_at FROM events WHERE is_current = 1 AND status = 'active' AND (exp IS NULL OR exp > ?)"
-      ).all(nowSec)
+      let activeHeads
+      if (snapshotRowid !== null) {
+        const restoredJson = restoredCurrentIds?.size ? JSON.stringify([...restoredCurrentIds]) : null
+        activeHeads = restoredJson
+          ? this.db.prepare(
+              "SELECT id, d, scope, created_at FROM events WHERE rowid <= ? AND (is_current = 1 OR id IN (SELECT value FROM json_each(?))) AND status = 'active' AND (exp IS NULL OR exp > ?)"
+            ).all(snapshotRowid, restoredJson, nowSec)
+          : this.db.prepare(
+              "SELECT id, d, scope, created_at FROM events WHERE rowid <= ? AND is_current = 1 AND status = 'active' AND (exp IS NULL OR exp > ?)"
+            ).all(snapshotRowid, nowSec)
+      } else {
+        activeHeads = this.db.prepare(
+          "SELECT id, d, scope, created_at FROM events WHERE is_current = 1 AND status = 'active' AND (exp IS NULL OR exp > ?)"
+        ).all(nowSec)
+      }
       for (const h of activeHeads) {
         if (excluded && excluded.has(h.id)) continue
         const key = `${h.scope}\0${h.d}`
@@ -1762,10 +1824,34 @@ export class HiveMemoryStore {
     return names
   }
 
+  // q-192: the evaluated, sorted result of recent pinned queries; see query(). Two entries, so the viewer's pull and
+  // the curator's scan do not evict each other; each expires PAGE_MEMO_TTL_MS after its last use.
+  #pageMemo = new Map()
+  #pageMemoGet(key, writeSeq, maxRowid, purgeSeq, nowMs = Date.now()) {
+    const e = this.#pageMemo.get(key)
+    if (!e) return null
+    if (e.db !== this.db || e.config !== this.config || e.writeSeq !== writeSeq || e.maxRowid !== maxRowid ||
+        e.purgeSeq !== purgeSeq || nowMs - e.usedMs > PAGE_MEMO_TTL_MS) {
+      this.#pageMemo.delete(key)
+      return null
+    }
+    e.usedMs = nowMs
+    this.#pageMemo.delete(key)
+    this.#pageMemo.set(key, e)
+    return e
+  }
+  #pageMemoSet(key, entry, nowMs = Date.now()) {
+    this.#pageMemo.delete(key)
+    this.#pageMemo.set(key, { ...entry, db: this.db, config: this.config, usedMs: nowMs })
+    while (this.#pageMemo.size > PAGE_MEMO_ENTRIES) this.#pageMemo.delete(this.#pageMemo.keys().next().value)
+  }
+  pageMemoSize() { return this.#pageMemo.size }
+
   query({
     readerPubkey = '', scope = null, roomId = null, topic = null, d = null, author = null, since = null, until = null, text = null,
     linkedTo = null, supersedesOf = null, includeHistory = false, limit = DEFAULT_QUERY_LIMIT, cursor = 0, staleFiles = new Set(),
     format = null, nowSec = nowSecDefault(), excludeCuratorIds = null,
+    snapshotRowid = null, expectedPurgeSeq = null, snapshotAt = null,
   } = {}) {
     const fmt = format === 'index' || format === 'full' ? format : d ? 'full' : 'index'
     const empty = (answer, reason) => ({
@@ -1773,11 +1859,46 @@ export class HiveMemoryStore {
       store_state: this.storeState(readerPubkey, nowSec),
     })
     if (!this.isReady().ready) return empty('unknown', `store-not-ready:${this.state}`)
+    const meta = readMeta(this.db)
+    const curMaxRowid = Number(this.db.prepare('SELECT COALESCE(MAX(rowid), 0) AS r FROM events').get()?.r ?? 0)
+    const hasRowid = snapshotRowid !== null && snapshotRowid !== undefined
+    const hasPurgeSeq = expectedPurgeSeq !== null && expectedPurgeSeq !== undefined
+    const hasSnapAt = snapshotAt !== null && snapshotAt !== undefined
+    const useSnapshot = hasRowid || hasPurgeSeq || hasSnapAt
+    if (useSnapshot) {
+      if (!hasRowid || !hasPurgeSeq || !hasSnapAt ||
+          !Number.isSafeInteger(snapshotRowid) || snapshotRowid < 0 ||
+          !Number.isSafeInteger(expectedPurgeSeq) || expectedPurgeSeq < 0 ||
+          !Number.isSafeInteger(snapshotAt) || snapshotAt < 0 || snapshotAt > nowSec + 60) {
+        return empty('unknown', 'invalid-snapshot-anchor')
+      }
+      if (meta.last_purge_seq !== expectedPurgeSeq) return empty('unknown', 'snapshot-purged')
+      if (snapshotRowid > curMaxRowid) return empty('unknown', 'invalid-snapshot-rowid')
+    }
+    const evalNowSec = useSnapshot ? snapshotAt : nowSec
+    const effectiveRowid = useSnapshot ? snapshotRowid : curMaxRowid
+    const restoredCurrentIds = useSnapshot ? this.#snapshotRestoredHeads(snapshotRowid, curMaxRowid) : null
+    const snapshotMeta = {
+      write_seq: meta.write_seq,
+      max_event_rowid: effectiveRowid,
+      last_purge_seq: meta.last_purge_seq,
+      as_of_sec: evalNowSec,
+      pinned: useSnapshot,
+    }
     const pageLimit = Math.min(MAX_QUERY_LIMIT, Number.isSafeInteger(Number(limit)) && Number(limit) > 0 ? Number(limit) : DEFAULT_QUERY_LIMIT)
     const startIdx = Number.isSafeInteger(Number(cursor)) && Number(cursor) >= 0 ? Number(cursor) : 0
-    const where = [includeHistory ? '1 = 1' : 'is_current = 1']
+    const where = []
     const params = []
     const add = (sql, value) => { where.push(sql); params.push(value) }
+    if (useSnapshot) add('rowid <= ?', snapshotRowid)
+    if (includeHistory) {
+      where.push('1 = 1')
+    } else if (restoredCurrentIds && restoredCurrentIds.size > 0) {
+      where.push('(is_current = 1 OR id IN (SELECT value FROM json_each(?)))')
+      params.push(JSON.stringify([...restoredCurrentIds]))
+    } else {
+      where.push('is_current = 1')
+    }
     if (scope) add('scope = ?', String(scope))
     if (roomId) add('room_id = ?', String(roomId).toLowerCase())
     if (d) add('d = ?', String(d))
@@ -1786,133 +1907,153 @@ export class HiveMemoryStore {
     if (until != null) add('created_at <= ?', Number(until))
     if (linkedTo) {
       const targetStr = String(linkedTo)
-      if (this.#targetHidden(readerPubkey, targetStr)) return empty('none', null)
+      if (this.#targetHidden(readerPubkey, targetStr)) return { ...empty('none', null), format: fmt, snapshot: snapshotMeta }
       this.#ensureDerivedTables()
       const normTarget = targetStr.toLowerCase()
       where.push("id IN (SELECT from_id FROM links WHERE target = ? UNION SELECT from_id FROM claim_edges WHERE target_ref = ? OR (edge_type || ':' || target_ref) = ?)")
       params.push(targetStr, normTarget, normTarget)
     }
-    if (supersedesOf) add('id IN (SELECT value FROM json_each(?))', JSON.stringify([...this.#lineage(readerPubkey, String(supersedesOf))]))
+    if (supersedesOf) add('id IN (SELECT value FROM json_each(?))', JSON.stringify([...this.#lineage(readerPubkey, String(supersedesOf), useSnapshot ? snapshotRowid : null)]))
     const wantTopic = topic ? normalizeMemoryTopic(topic) ?? String(topic) : null
     const excluded = excludeCuratorIds instanceof Set ? excludeCuratorIds : Array.isArray(excludeCuratorIds) ? new Set(excludeCuratorIds) : null
-    const consolidated = this.#consolidatedBy(nowSec, { excludeCuratorIds: excluded })
-    const rows = this.db.prepare(`SELECT * FROM events WHERE ${where.join(' AND ')}`).all(...params)
-      .filter(r => (!excluded || !excluded.has(r.id)) && canRead(readerPubkey, r, this.config) && (!wantTopic || topicOf(r) === wantTopic))
-      .map(r => {
-        const parsed = parseEventRaw(r)
-        return { row: r, verdict: verdictOf(r, nowSec, staleFiles, consolidated, parsed.body), body: parsed.body }
-      })
-      .filter(x => includeHistory || x.verdict.verification === 'accepted')
-    const byFactKey = new Map()
-    for (const { row, verdict, body } of rows) {
-      if (verdict.verification !== 'accepted' || !row.is_current) continue
-      if (!byFactKey.has(row.d)) byFactKey.set(row.d, new Set())
-      byFactKey.get(row.d).add(body.claim)
-    }
-    const conflict = dk => (byFactKey.get(dk)?.size || 0) > 1
     const qText = text ? String(text).trim().toLowerCase() : null
+    // q-192: a pinned query's result depends only on these inputs, so a paged pull (the viewer and the curator page
+    // the whole history 100 rows at a time) evaluates the store once, not once per page. write_seq, the rowid head,
+    // the purge sequence, the config and the database handle are all checked again on every hit.
+    const memoKey = useSnapshot ? JSON.stringify([
+      readerPubkey, snapshotRowid, expectedPurgeSeq, snapshotAt, where, params, wantTopic, qText, includeHistory,
+      excluded ? [...excluded].sort() : null, staleFiles instanceof Set ? [...staleFiles].sort() : [],
+    ]) : null
+    const memo = memoKey ? this.#pageMemoGet(memoKey, meta.write_seq, curMaxRowid, meta.last_purge_seq) : null
+    let byFactKey
     let matched
-    if (!qText) {
-      matched = [...rows]
-      matched.sort((a, b) => (conflict(b.row.d) - conflict(a.row.d)) || ((a.verdict.computedRank ?? 9) - (b.verdict.computedRank ?? 9)) ||
-        (b.row.created_at - a.row.created_at) || (a.row.id < b.row.id ? -1 : 1))
+    const conflict = dk => (byFactKey.get(dk)?.size || 0) > 1
+    if (memo) {
+      byFactKey = memo.byFactKey
+      matched = memo.matched
     } else {
-      // Hybrid Retrieval: Lexical Substring/Token + SQLite FTS5 BM25 + Local Semantic Vector Cosine fused via RRF (k=60).
-      this.#ensureDerivedTables()
-      const qTokens = tokenizeForSearch(qText)
-      const qStems = qTokens.map(stemToken)
-      const qClusters = new Set()
-      for (let i = 0; i < qTokens.length; i++) {
-        for (const cIdx of TERM_TO_CLUSTERS.get(qTokens[i]) || []) qClusters.add(cIdx)
-        for (const cIdx of TERM_TO_CLUSTERS.get(qStems[i]) || []) qClusters.add(cIdx)
+      const consolidated = this.#consolidatedBy(evalNowSec, {
+        excludeCuratorIds: excluded,
+        snapshotRowid: useSnapshot ? snapshotRowid : null,
+        restoredCurrentIds,
+      })
+      const rows = this.db.prepare(`SELECT * FROM events WHERE ${where.join(' AND ')}`).all(...params)
+        .filter(r => (!excluded || !excluded.has(r.id)) && canRead(readerPubkey, r, this.config) && (!wantTopic || topicOf(r) === wantTopic))
+        .map(r => {
+          const effRow = restoredCurrentIds?.has(r.id) && !r.is_current ? { ...r, is_current: 1 } : r
+          const parsed = parseEventRaw(effRow)
+          return { row: effRow, verdict: verdictOf(effRow, evalNowSec, staleFiles, consolidated, parsed.body), body: parsed.body }
+        })
+        .filter(x => includeHistory || x.verdict.verification === 'accepted')
+      byFactKey = new Map()
+      for (const { row, verdict, body } of rows) {
+        if (verdict.verification !== 'accepted' || !row.is_current) continue
+        if (!byFactKey.has(row.d)) byFactKey.set(row.d, new Set())
+        byFactKey.get(row.d).add(body.claim)
       }
-      const qVec = computeSemanticEmbedding(qText)
-
-      const bm25RankById = new Map()
-      const ftsExpr = buildFtsMatchExpression(qText)
-      if (ftsExpr) {
-        try {
-          const ftsRows = this.db.prepare(
-            'SELECT event_id, bm25(events_fts, 0.0, 3.0, 2.5, 2.0, 1.0, 1.5) AS score FROM events_fts WHERE events_fts MATCH ? ORDER BY score ASC LIMIT 500'
-          ).all(ftsExpr)
-          for (let idx = 0; idx < ftsRows.length; idx++) {
-            if (!bm25RankById.has(ftsRows[idx].event_id)) bm25RankById.set(ftsRows[idx].event_id, idx + 1)
-          }
-        } catch { /* fallback to lexical + vector if FTS expression cannot be parsed */ }
-      }
-
-      const lexCandidates = []
-      const vecCandidates = []
-      const candidateMeta = new Map()
-
-      for (const item of rows) {
-        const { row, body } = item
-        const docText = `${row.d} ${row.topic || ''} ${body.claim || ''} ${body.because || ''} ${(body.evidence || []).join(' ')}`.toLowerCase()
-        const exactHit = docText.includes(qText)
-        let lexScore = 0
-        let matchedStems = 0
-        let sharedConcept = false
-
-        const docTokens = tokenizeForSearch(docText)
-        const docStemSet = new Set(docTokens.map(stemToken))
+      if (!qText) {
+        matched = [...rows]
+        matched.sort((a, b) => (conflict(b.row.d) - conflict(a.row.d)) || ((a.verdict.computedRank ?? 9) - (b.verdict.computedRank ?? 9)) ||
+          (b.row.created_at - a.row.created_at) || (a.row.id < b.row.id ? -1 : 1))
+      } else {
+        // Hybrid Retrieval: Lexical Substring/Token + SQLite FTS5 BM25 + Local Semantic Vector Cosine fused via RRF (k=60).
+        this.#ensureDerivedTables()
+        const qTokens = tokenizeForSearch(qText)
+        const qStems = qTokens.map(stemToken)
+        const qClusters = new Set()
         for (let i = 0; i < qTokens.length; i++) {
-          if (docText.includes(qTokens[i]) || (qStems[i].length >= 3 && docStemSet.has(qStems[i]))) {
-            matchedStems += 1
+          for (const cIdx of TERM_TO_CLUSTERS.get(qTokens[i]) || []) qClusters.add(cIdx)
+          for (const cIdx of TERM_TO_CLUSTERS.get(qStems[i]) || []) qClusters.add(cIdx)
+        }
+        const qVec = computeSemanticEmbedding(qText)
+
+        const bm25RankById = new Map()
+        const ftsExpr = buildFtsMatchExpression(qText)
+        if (ftsExpr) {
+          try {
+            const ftsRows = this.db.prepare(
+              'SELECT event_id, bm25(events_fts, 0.0, 3.0, 2.5, 2.0, 1.0, 1.5) AS score FROM events_fts WHERE events_fts MATCH ? ORDER BY score ASC LIMIT 500'
+            ).all(ftsExpr)
+            for (let idx = 0; idx < ftsRows.length; idx++) {
+              if (!bm25RankById.has(ftsRows[idx].event_id)) bm25RankById.set(ftsRows[idx].event_id, idx + 1)
+            }
+          } catch { /* fallback to lexical + vector if FTS expression cannot be parsed */ }
+        }
+
+        const lexCandidates = []
+        const vecCandidates = []
+        const candidateMeta = new Map()
+
+        for (const item of rows) {
+          const { row, body } = item
+          const docText = `${row.d} ${row.topic || ''} ${body.claim || ''} ${body.because || ''} ${(body.evidence || []).join(' ')}`.toLowerCase()
+          const exactHit = docText.includes(qText)
+          let lexScore = 0
+          let matchedStems = 0
+          let sharedConcept = false
+
+          const docTokens = tokenizeForSearch(docText)
+          const docStemSet = new Set(docTokens.map(stemToken))
+          for (let i = 0; i < qTokens.length; i++) {
+            if (docText.includes(qTokens[i]) || (qStems[i].length >= 3 && docStemSet.has(qStems[i]))) {
+              matchedStems += 1
+            }
           }
-        }
-        if (qClusters.size > 0) {
-          for (const dt of docStemSet) {
-            const cls = TERM_TO_CLUSTERS.get(dt)
-            if (cls && [...cls].some(c => qClusters.has(c))) { sharedConcept = true; break }
+          if (qClusters.size > 0) {
+            for (const dt of docStemSet) {
+              const cls = TERM_TO_CLUSTERS.get(dt)
+              if (cls && [...cls].some(c => qClusters.has(c))) { sharedConcept = true; break }
+            }
           }
+
+          if (exactHit) {
+            lexScore = 1000 + (String(row.topic || '').toLowerCase().includes(qText) ? 200 : 0) + (String(row.d || '').toLowerCase().includes(qText) ? 100 : 0)
+          } else if (qTokens.length > 0 && matchedStems === qTokens.length) {
+            lexScore = 500 + matchedStems * 25
+          } else if (qTokens.length >= 2 && matchedStems / qTokens.length >= 0.5) {
+            lexScore = 200 * (matchedStems / qTokens.length)
+          }
+
+          if (lexScore > 0) lexCandidates.push({ id: row.id, score: lexScore })
+
+          const dVec = computeSemanticEmbedding(docText)
+          const cos = cosineSimilarity(qVec, dVec)
+          if ((exactHit || matchedStems > 0 || sharedConcept) && cos >= 0.25) {
+            vecCandidates.push({ id: row.id, cos })
+          }
+          candidateMeta.set(row.id, { item, exactHit, lexScore, cos })
         }
 
-        if (exactHit) {
-          lexScore = 1000 + (String(row.topic || '').toLowerCase().includes(qText) ? 200 : 0) + (String(row.d || '').toLowerCase().includes(qText) ? 100 : 0)
-        } else if (qTokens.length > 0 && matchedStems === qTokens.length) {
-          lexScore = 500 + matchedStems * 25
-        } else if (qTokens.length >= 2 && matchedStems / qTokens.length >= 0.5) {
-          lexScore = 200 * (matchedStems / qTokens.length)
+        lexCandidates.sort((a, b) => b.score - a.score)
+        vecCandidates.sort((a, b) => b.cos - a.cos)
+        const lexRankById = new Map(lexCandidates.map((x, idx) => [x.id, idx + 1]))
+        const vecRankById = new Map(vecCandidates.map((x, idx) => [x.id, idx + 1]))
+
+        const RRF_K = 60
+        const scored = []
+        for (const [id, meta] of candidateMeta.entries()) {
+          const rLex = lexRankById.get(id)
+          const rBm25 = bm25RankById.get(id)
+          const rVec = vecRankById.get(id)
+          if (!meta.exactHit && !rLex && !rBm25 && !rVec) continue
+          const rrfScore =
+            (rLex ? 1.5 / (RRF_K + rLex) : 0) +
+            (rBm25 ? 1.2 / (RRF_K + rBm25) : 0) +
+            (rVec ? 1.0 / (RRF_K + rVec) : 0)
+          scored.push({ ...meta, rrfScore })
         }
 
-        if (lexScore > 0) lexCandidates.push({ id: row.id, score: lexScore })
-
-        const dVec = computeSemanticEmbedding(docText)
-        const cos = cosineSimilarity(qVec, dVec)
-        if ((exactHit || matchedStems > 0 || sharedConcept) && cos >= 0.25) {
-          vecCandidates.push({ id: row.id, cos })
-        }
-        candidateMeta.set(row.id, { item, exactHit, lexScore, cos })
+        scored.sort((a, b) =>
+          (Number(b.exactHit) - Number(a.exactHit)) ||
+          (conflict(b.item.row.d) - conflict(a.item.row.d)) ||
+          ((a.item.verdict.computedRank ?? 9) - (b.item.verdict.computedRank ?? 9)) ||
+          (!a.exactHit && Math.abs(b.rrfScore - a.rrfScore) > 1e-6 ? b.rrfScore - a.rrfScore : 0) ||
+          (b.item.row.created_at - a.item.row.created_at) ||
+          (a.item.row.id < b.item.row.id ? -1 : 1)
+        )
+        matched = scored.map(s => s.item)
       }
-
-      lexCandidates.sort((a, b) => b.score - a.score)
-      vecCandidates.sort((a, b) => b.cos - a.cos)
-      const lexRankById = new Map(lexCandidates.map((x, idx) => [x.id, idx + 1]))
-      const vecRankById = new Map(vecCandidates.map((x, idx) => [x.id, idx + 1]))
-
-      const RRF_K = 60
-      const scored = []
-      for (const [id, meta] of candidateMeta.entries()) {
-        const rLex = lexRankById.get(id)
-        const rBm25 = bm25RankById.get(id)
-        const rVec = vecRankById.get(id)
-        if (!meta.exactHit && !rLex && !rBm25 && !rVec) continue
-        const rrfScore =
-          (rLex ? 1.5 / (RRF_K + rLex) : 0) +
-          (rBm25 ? 1.2 / (RRF_K + rBm25) : 0) +
-          (rVec ? 1.0 / (RRF_K + rVec) : 0)
-        scored.push({ ...meta, rrfScore })
-      }
-
-      scored.sort((a, b) =>
-        (Number(b.exactHit) - Number(a.exactHit)) ||
-        (conflict(b.item.row.d) - conflict(a.item.row.d)) ||
-        ((a.item.verdict.computedRank ?? 9) - (b.item.verdict.computedRank ?? 9)) ||
-        (!a.exactHit && Math.abs(b.rrfScore - a.rrfScore) > 1e-6 ? b.rrfScore - a.rrfScore : 0) ||
-        (b.item.row.created_at - a.item.row.created_at) ||
-        (a.item.row.id < b.item.row.id ? -1 : 1)
-      )
-      matched = scored.map(s => s.item)
+      if (memoKey) this.#pageMemoSet(memoKey, { byFactKey, matched, writeSeq: meta.write_seq, maxRowid: curMaxRowid, purgeSeq: meta.last_purge_seq })
     }
     const scopeCounts = {}
     for (const { row } of matched) scopeCounts[row.scope] = (scopeCounts[row.scope] || 0) + 1
@@ -1931,6 +2072,7 @@ export class HiveMemoryStore {
       unverified: 0,
       scope_counts: scopeCounts,
       store_state: this.storeState(readerPubkey, nowSec, { includeReceipt: true }),
+      snapshot: snapshotMeta,
     }
   }
 
@@ -2224,7 +2366,7 @@ const topicOf = row => normalizeMemoryTopic(row.topic) ?? row.topic
 const preview = (text, n) => { const t = String(text ?? '').replace(/\s+/g, ' ').trim(); return t.length > n ? `${t.slice(0, n - 1)}…` : t }
 
 const PARSED_EVENT_CACHE = new Map()
-const MAX_PARSED_EVENT_CACHE = 8192
+const MAX_PARSED_EVENT_CACHE = 32768
 
 function parseEventRaw(row) {
   const id = row?.id

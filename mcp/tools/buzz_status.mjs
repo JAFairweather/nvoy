@@ -103,7 +103,7 @@ export function parseStatusRequest(line, manifest) {
 export function classifyFailure(error) {
   const m = String(error?.message || error || '')
   if (/^bunker: /.test(m)) return 'bunker-refused'
-  if (/nip46 \w+ timed out/.test(m)) return 'signer-timeout'
+  if (/nip46 \w+ timed out|AUTH sign timed out/.test(m)) return 'signer-timeout'
   if (/nip46|signer/i.test(m)) return 'signer-unavailable'
   if (/AUTH refused/.test(m)) return 'auth-refused'
   if (/timed out/.test(m)) return 'relay-timeout'

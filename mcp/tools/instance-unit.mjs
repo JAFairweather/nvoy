@@ -20,6 +20,7 @@ import { resolve, join } from 'node:path'
 import { readManifest, assertNoCollisions, instanceId } from './runtime_manifest.mjs'
 import { principalLine, principalComment, forcedCommand, verifyPrincipal, parsePrincipal, volumeLifecycle } from './participant_unit.mjs'
 import { codexComment, codexForcedCommand, verifyCodexPrincipal, codexManifestRefusal } from './principal_family.mjs'
+import { recallGatewayUnits } from './recall_gateway.mjs'
 
 const TOOL = 'instance-unit'
 const die = m => { console.error(`${TOOL}: ${m}`); process.exit(1) }
@@ -75,6 +76,7 @@ if (verb === 'render') {
   }
 
   const outDir = flag('--out-dir')
+  if (manifest.mayRecall && !outDir) die('a recall instance requires --out-dir so the host socket and service units are rendered with Compose')
   if (!outDir) {
     process.stdout.write(rendered.stdout)
     if (principal) process.stdout.write(`\n# --- channel principal (install into the channel account's authorized_keys) ---\n${principal}\n`)
@@ -84,6 +86,14 @@ if (verb === 'render') {
   const composePath = join(resolve(outDir), `${manifest.id}.compose.yml`)
   writeFileSync(composePath, rendered.stdout, { mode: 0o644 })
   const written = [composePath]
+  if (manifest.mayRecall) {
+    const units = recallGatewayUnits(manifest)
+    for (const [name, content] of [[units.socketName, units.socket], [units.serviceName, units.service]]) {
+      const path = join(resolve(outDir), name)
+      writeFileSync(path, content, { mode: 0o644 })
+      written.push(path)
+    }
+  }
   if (principal) {
     const principalPath = join(resolve(outDir), `${manifest.id}.authorized_key`)
     writeFileSync(principalPath, `${principal}\n`, { mode: 0o600 })

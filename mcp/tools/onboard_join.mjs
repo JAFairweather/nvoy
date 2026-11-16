@@ -88,7 +88,8 @@ export async function joinHive({ add, relay, signer, open, fetchImpl = globalThi
   if (hasPlainCode) {
     code = add.inviteCode.trim()
   } else {
-    try { code = await signer.nip44Decrypt(add.owner, add.invite) } catch { code = '' }
+    // Sealed by whoever signed the request: the owner, or the delegate that minted it.
+    try { code = await signer.nip44Decrypt(add.signer || add.owner, add.invite) } catch { code = '' }
     code = typeof code === 'string' ? code.trim() : ''
   }
   if (!code) return result('refused', hasPlainCode ? 'the invite code is empty' : 'the invite was not sealed to this agent')

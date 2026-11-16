@@ -20,7 +20,7 @@ import { brokerSigner } from './broker_signer.mjs'
 import { channelPost, openBuzzSession } from './buzz_native.mjs'
 import { replyRequestDigest } from './outbound_record.mjs'
 import { countInWindow } from './agent_limits.mjs'
-import { POST_ONLY_REPLY, offList, postQueuePath, recordMentionGrants, validatePostRequest, withMentionGrants } from './agent_post.mjs'
+import { POST_ONLY_REPLY, STALE_POST_TERMINAL_LINE, isStalePostTimestampRefusal, offList, postQueuePath, recordMentionGrants, validatePostRequest, withMentionGrants } from './agent_post.mjs'
 import { confirmMembers, readRooms, recordMentionRooms } from './room_roster.mjs'
 import { contentHash, credentialIn, withheldMessage } from './outbound_secrets.mjs'
 
@@ -46,6 +46,22 @@ try {
   }
 } catch (e) { die(`cannot read post request queue: ${e.message}`) }
 if (!request) die('post request is not present in this instance queue')
+// A published post is done before anything else is asked: its bound record is the replay exit, and
+// reaching it must not first start an attention policy child or open the signer (q-108).
+const digest = replyRequestDigest(request)
+const postsDir = resolve(manifest.stateDir, 'posts')
+mkdirSync(postsDir, { recursive: true, mode: 0o700 })
+const recordPath = resolve(postsDir, `${requestId}.json`)
+let record
+if (existsSync(recordPath)) {
+  const st = lstatSync(recordPath)
+  if (!st.isFile() || st.isSymbolicLink()) die('post record must be a regular non-symlink file')
+  try { record = JSON.parse(readFileSync(recordPath, 'utf8')) } catch { die('post record is invalid') }
+  const ev = record?.unsigned_event
+  if (record?.version !== 1 || record.request_id !== requestId || record.request_digest !== digest || !ev || getEventHash(ev) !== record.fingerprint ||
+      (record.event && (record.event.id !== record.fingerprint || !verifyEvent(JSON.parse(JSON.stringify(record.event)))))) die('post record does not bind this request')
+  if (record.published === true) { console.log(JSON.stringify({ request: requestId, accepted: record.accepted, replay: true })); exit(0) }
+}
 // A key off the manifest's list may hold a live mention grant, so only then is the policy asked, as
 // admission asks it. Unable to ask is not a refusal: the post is held for retry.
 let allowed = manifest
@@ -62,7 +78,11 @@ try { validatePostRequest(request, allowed) } catch (e) { die(e.message) }
 // Again here, where the signer is: a client that writes the queue without the tool skips the tool's check.
 const leaked = credentialIn(request.content)
 if (leaked) die(`post refused: ${withheldMessage(leaked)} [post sha256 ${contentHash(request.content)}] instance ${manifest.id}`)
-const digest = replyRequestDigest(request)
+// Nothing is written for this request before the refusals above.
+const persist = () => {
+  const tmp = `${recordPath}.${process.pid}.tmp`
+  try { writeFileSync(tmp, JSON.stringify(record), { mode: 0o600 }); renameSync(tmp, recordPath) } catch (e) { die(`cannot persist post record: ${e.message}`) }
+}
 // With mention_rooms on, a key neither the manifest nor a live grant covers can only be room-derived
 // (#321). The file the channel MCPs resolved it from is never authority: on every attempt, retries of
 // a signed post included, the relay's own member list is read fresh before counting, signing or
@@ -81,23 +101,6 @@ async function confirmRoom() {
   if (absent !== undefined) die(`post refused: ${absent.slice(0, 8)} is not on may_post.mention or in room ${request.channel}`)
 }
 
-const postsDir = resolve(manifest.stateDir, 'posts')
-mkdirSync(postsDir, { recursive: true, mode: 0o700 })
-const recordPath = resolve(postsDir, `${requestId}.json`)
-const persist = () => {
-  const tmp = `${recordPath}.${process.pid}.tmp`
-  try { writeFileSync(tmp, JSON.stringify(record), { mode: 0o600 }); renameSync(tmp, recordPath) } catch (e) { die(`cannot persist post record: ${e.message}`) }
-}
-let record
-if (existsSync(recordPath)) {
-  const st = lstatSync(recordPath)
-  if (!st.isFile() || st.isSymbolicLink()) die('post record must be a regular non-symlink file')
-  try { record = JSON.parse(readFileSync(recordPath, 'utf8')) } catch { die('post record is invalid') }
-  const ev = record?.unsigned_event
-  if (record?.version !== 1 || record.request_id !== requestId || record.request_digest !== digest || !ev || getEventHash(ev) !== record.fingerprint ||
-      (record.event && (record.event.id !== record.fingerprint || !verifyEvent(JSON.parse(JSON.stringify(record.event)))))) die('post record does not bind this request')
-  if (record.published === true) { console.log(JSON.stringify({ request: requestId, accepted: record.accepted, replay: true })); exit(0) }
-}
 await confirmRoom()
 if (!record) {
   // Counted before anything exists to sign, so a crash after signing can never buy an extra post.
@@ -122,12 +125,20 @@ if (!record.event) {
   record.event = ev
   persist()
 }
-let accepted = 0
+let accepted = 0, staleRefusal = false
 try {
   session ??= await openBuzzSession({ relay: manifest.buzz.relay, signer })
-  try { const r = await session.publishSigned(record.event); if (r.accepted) accepted = 1; else console.error(`instance-broker-post: Buzz refused the post: ${r.message}`) }
+  try {
+    const r = await session.publishSigned(record.event)
+    if (r.accepted) accepted = 1
+    else {
+      console.error(`instance-broker-post: Buzz refused the post: ${r.message}`)
+      staleRefusal = isStalePostTimestampRefusal(r.message, record.event.created_at)
+    }
+  }
   finally { session.close(); session = null }
 } catch (e) { console.error(`instance-broker-post: Buzz relay unavailable: ${e.message}`) }
+if (!accepted && staleRefusal) die(STALE_POST_TERMINAL_LINE)
 if (!accepted) die('the Buzz relay did not accept the persisted post; it remains retryable')
 record.published = true; record.published_at = Date.now(); record.accepted = accepted
 persist()

@@ -53,8 +53,132 @@ try {
   await new Promise(resolveWait => setTimeout(resolveWait, 20))
   check('a settled one-shot signer closes its subscription and relay pool while idle', fake.closes >= 2)
   const firstSubscriptions = fake.subscriptions
-  check('the signer reconnects after idle close for a later operation', await signer.getPublicKey() === bunkerPub && fake.subscriptions > firstSubscriptions)
+  check('the signer reconnects after idle close for a later operation', await signer.nip44Encrypt(bunkerPub, 'x') === 'ack' && fake.subscriptions > firstSubscriptions)
   signer.close()
+
+  // A refused connect: a Bunker that does not know this client (a pairing secret that expired before
+  // the first connect) refuses connect and answers every later call 'Unknown client'. The later error
+  // must name the refused connect. A known client refused only a repeat connect is still served.
+  const bunkerAnswering = answers => ({ handler: null,
+    subscribeMany(_relays, _filter, callbacks) { this.handler = callbacks.onevent; return { close() {} } },
+    publish(_relays, event) {
+      const request = JSON.parse(nip44.v2.decrypt(event.content, conversation))
+      const reply = answers(request.method)
+      const response = finalizeEvent({ kind: 24133, created_at: 1, tags: [['p', clientPub]],
+        content: nip44.v2.encrypt(JSON.stringify({ id: request.id, ...reply }), conversation) }, bunkerSk)
+      queueMicrotask(() => this.handler(response))
+      return [Promise.resolve('ok')]
+    },
+    close() {} })
+  const spentUri = `bunker://${bunkerPub}?relay=wss%3A%2F%2Frelay.invalid&secret=spent`
+  const unpaired = makeBunkerSigner(spentUri, nip19.nsecEncode(clientSk), { idleMs: 5,
+    pool: bunkerAnswering(method => method === 'connect' ? { error: 'invalid secret' } : { error: 'Unknown client' }) })
+  let unpairedError = ''
+  try { await unpaired.getPublicKey() } catch (error) { unpairedError = error.message }
+  unpaired.close()
+  check('an unpaired client\'s error names both the call\'s refusal and the refused connect',
+    /Unknown client/.test(unpairedError) && /the Bunker refused connect too/.test(unpairedError) && /re-pair/.test(unpairedError))
+  check('the refused-connect error never quotes the pairing secret', unpairedError !== '' && !unpairedError.includes('spent'))
+  // A Bunker whose rejection echoes the secret it refused: none of that text may reach the error.
+  const echoing = makeBunkerSigner(spentUri, nip19.nsecEncode(clientSk), { idleMs: 5,
+    pool: bunkerAnswering(method => method === 'connect' ? { error: 'invalid secret: spent' } : { error: 'Unknown client' }) })
+  let echoError = ''
+  try { await echoing.getPublicKey() } catch (error) { echoError = error.message }
+  echoing.close()
+  check('a connect rejection that echoes the pairing secret never reaches the error',
+    /the Bunker refused connect too/.test(echoError) && !echoError.includes('spent') && !echoError.includes('invalid secret'))
+  const known = makeBunkerSigner(spentUri, nip19.nsecEncode(clientSk), { idleMs: 5,
+    pool: bunkerAnswering(method => method === 'connect' ? { error: 'invalid secret' } : { result: bunkerPub }) })
+  check('a known client refused only a repeat connect is still served', await known.getPublicKey() === bunkerPub)
+  known.close()
+
+  // One get_public_key per session (14 Nov: about 140k Bunker actions in a day, mostly get_public_key).
+  // A success is kept for the session's life; a failure is not, so the next call asks again.
+  const counted = (fail = 0) => { const seen = { get_public_key: 0, connect: 0 }; let left = fail
+    return { seen, pool: bunkerAnswering(method => { seen[method] = (seen[method] || 0) + 1
+      if (method === 'get_public_key' && left > 0) { left--; return { error: 'busy' } }
+      return method === 'get_public_key' ? { result: bunkerPub } : { result: 'ack' } }) } }
+  const once = counted()
+  const cached = makeBunkerSigner(spentUri, nip19.nsecEncode(clientSk), { idleMs: 5, pool: once.pool })
+  const answers = [await cached.getPublicKey(), await cached.getPublicKey(), await cached.getPublicKey()]
+  const concurrent = await Promise.all([cached.getPublicKey(), cached.getPublicKey()])
+  cached.close()
+  check('get_public_key is asked once per signer, however often callers ask',
+    once.seen.get_public_key === 1 && [...answers, ...concurrent].every(pk => pk === bunkerPub))
+  const flaky = counted(1)
+  const retrying = makeBunkerSigner(spentUri, nip19.nsecEncode(clientSk), { idleMs: 5, pool: flaky.pool })
+  let firstError = ''
+  try { await retrying.getPublicKey() } catch (error) { firstError = error.message }
+  const second = await retrying.getPublicKey()
+  retrying.close()
+  check('a failed get_public_key is not cached: the next call asks the Bunker again',
+    /busy/.test(firstError) && second === bunkerPub && flaky.seen.get_public_key === 2)
+
+  // A4 (14 Nov): a throttled curator's reconnect failed, its subscription silently held no relay, and
+  // SimplePool resolves an unreachable relay's publish with 'connection failure: ...', so sign_event waited out
+  // the full 60 s. A dropped subscription must be re-made, and a request no relay took must fail at once.
+  const relayLab = ({ publishOutcome }) => {
+    const lab = { handler: null, onclose: null, subscriptions: 0, outcome: publishOutcome,
+      subscribeMany(_r, _f, callbacks) { this.handler = callbacks.onevent; this.onclose = callbacks.onclose; this.subscriptions++; return { close() {} } },
+      publish(_r, event) {
+        const request = JSON.parse(nip44.v2.decrypt(event.content, conversation))
+        const answer = () => this.handler(finalizeEvent({ kind: 24133, created_at: 1, tags: [['p', clientPub]],
+          content: nip44.v2.encrypt(JSON.stringify({ id: request.id, result: request.method === 'get_public_key' ? bunkerPub : 'ack' }), conversation) }, bunkerSk))
+        const o = this.outcome(request.method)
+        if (o === 'ok') { queueMicrotask(answer); return [Promise.resolve('')] }
+        if (o === 'unreachable') return [Promise.resolve('connection failure: connection timed out')]
+        if (o === 'refused') return [Promise.reject(new Error('blocked: not allowed'))]
+        if (o === 'slow') { setTimeout(answer, 50); return [Promise.reject(new Error('publish timed out'))] }
+        throw new Error('unexpected outcome')
+      },
+      close() {},
+    }
+    return lab
+  }
+  // The fail-fast above keys on SimplePool's wording for a relay it could not reach. nostr-tools is a caret
+  // dependency, so check the real library still says it (a refused local port; no network), or the fail-fast
+  // would silently fall back to the 60 s wait.
+  {
+    const { SimplePool } = await import('nostr-tools/pool')
+    const real = new SimplePool()
+    const [outcome] = await Promise.allSettled(real.publish(['ws://127.0.0.1:9'], finalizeEvent({ kind: 1, created_at: 1, tags: [], content: 'x' }, clientSk)))
+    try { real.close(['ws://127.0.0.1:9']) } catch { /* best effort */ }
+    check("nostr-tools still resolves an unreachable relay's publish with 'connection failure'",
+      outcome.status === 'fulfilled' && typeof outcome.value === 'string' && outcome.value.startsWith('connection failure'))
+  }
+  const labUri = `bunker://${bunkerPub}?relay=wss%3A%2F%2Frelay.invalid&secret=test`
+  {
+    const lab = relayLab({ publishOutcome: () => 'ok' })
+    const s = makeBunkerSigner(labUri, nip19.nsecEncode(clientSk), { idleMs: 60000, pool: lab })
+    await s.getPublicKey()
+    const before = lab.subscriptions
+    lab.onclose?.(['relay connection closed'])
+    check('a subscription every relay dropped is re-made by the next call',
+      await s.nip44Encrypt(bunkerPub, 'x') === 'ack' && lab.subscriptions === before + 1)
+    s.close()
+  }
+  for (const [outcome, label] of [['unreachable', 'an unreachable relay'], ['refused', 'a relay that refused it']]) {
+    let state = 'ok'
+    const lab = relayLab({ publishOutcome: () => state })
+    const s = makeBunkerSigner(labUri, nip19.nsecEncode(clientSk), { idleMs: 60000, pool: lab })
+    await s.getPublicKey()
+    state = outcome
+    const t0 = Date.now(); let err = ''
+    try { await s.signEvent({ kind: 1, created_at: 1, tags: [], content: 'x' }) } catch (error) { err = error.message }
+    check(`a request only ${label} saw fails at once, not after the 60 s timeout`,
+      /no relay took the request/.test(err) && Date.now() - t0 < 2000)
+    s.close()
+  }
+  {
+    let state = 'ok'
+    const lab = relayLab({ publishOutcome: () => state })
+    const s = makeBunkerSigner(labUri, nip19.nsecEncode(clientSk), { idleMs: 60000, pool: lab })
+    await s.getPublicKey()
+    state = 'slow'
+    check('a publish timeout is not taken as lost: a late answer still resolves the call',
+      await s.nip44Encrypt(bunkerPub, 'x') === 'ack')
+    s.close()
+  }
 } finally { rmSync(dir, { recursive: true, force: true }) }
 
 if (failed) process.exit(1)

@@ -19,6 +19,7 @@ import { profileToolSpec, profileStatusToolSpec, queueProfile, profileStatus, wa
 import { memoryToolSpec, queueMemory } from './agent_memory.mjs'
 import { DEFAULT_CURATOR_PACKET_DIR, dreamVerifyToolSpec, runDreamVerifyTool } from './memory-dream-verify.mjs'
 import { claimPidLock } from './pid_lock.mjs'
+import { jsonlCache } from './jsonl_cache.mjs'
 import { credentialIn, withheld } from './outbound_secrets.mjs'
 
 const die = message => { console.error(`nvoy-claude-channel: ${message}`); process.exit(1) }
@@ -134,27 +135,50 @@ function lines(path, label, required = true) {
   return readFileSync(path, 'utf8').split('\n').filter(Boolean)
 }
 
+// Both files are append-only and polled every second, so each is read incrementally: only new lines
+// are parsed and validated (jsonl_cache.mjs). The manifest is read once at start, so a record that
+// validated once stays valid for the life of this process. A rejected line fails every later read,
+// as a full re-read would.
+const admittedCache = jsonlCache(queuePath, 'admitted queue', { parse: line => {
+  if (Buffer.byteLength(line) > 1024 * 1024) throw new Error('admitted record exceeds its 1 MiB bound')
+  let record
+  try { record = JSON.parse(line) } catch { throw new Error('admitted queue contains malformed JSON') }
+  validateDesktopDelivery(record, { instance: manifest.id, scopeSubject: manifest.pubkey,
+    grantors: manifest.grantors, carriers: manifest.carriers, buzz: manifest.buzz })
+  return Object.freeze(record)
+} })
+const readCache = jsonlCache(readPath, 'Claude channel read log', { required: false, parse: line => {
+  let record
+  try { record = JSON.parse(line) } catch { throw new Error('Claude channel read log contains malformed JSON') }
+  if (record?.version !== 1 || record?.instance !== manifest.id || !HEX64.test(String(record?.envelope || '')) ||
+      !Number.isFinite(Number(record?.read_at))) throw new Error('Claude channel read log contains an invalid record')
+  return record.envelope
+} })
+
 function tasks() {
-  return lines(queuePath, 'admitted queue').map(line => {
-    if (Buffer.byteLength(line) > 1024 * 1024) throw new Error('admitted record exceeds its 1 MiB bound')
-    let record
-    try { record = JSON.parse(line) } catch { throw new Error('admitted queue contains malformed JSON') }
-    validateDesktopDelivery(record, { instance: manifest.id, scopeSubject: manifest.pubkey,
-      grantors: manifest.grantors, carriers: manifest.carriers, buzz: manifest.buzz })
-    return record
-  })
+  return admittedCache()
 }
 
 function readIds() {
-  const ids = new Set()
-  for (const line of lines(readPath, 'Claude channel read log', false)) {
-    let record
-    try { record = JSON.parse(line) } catch { throw new Error('Claude channel read log contains malformed JSON') }
-    if (record?.version !== 1 || record?.instance !== manifest.id || !HEX64.test(String(record?.envelope || '')) ||
-        !Number.isFinite(Number(record?.read_at))) throw new Error('Claude channel read log contains an invalid record')
-    ids.add(record.envelope)
+  return new Set(readCache())
+}
+
+// A reply (new or already queued) is handled work: record the envelope read so it stops being announced. The
+// reply itself is already queued, so a failed read-log write does not fail the reply, but it is returned with it:
+// otherwise the agent sees `queued: true` while the envelope is re-announced every renotifyMs for good, and no
+// one learns why (crystalclaude, 14 Nov: three answered envelopes re-announced for hours after a restart).
+function markReadByReply(envelope) {
+  try {
+    appendFileSync(readPath, JSON.stringify({ version: 1, instance: manifest.id, envelope, read_at: Date.now(), by: 'reply' }) + '\n', { mode: 0o600 })
+  } catch (error) {
+    console.error(`nvoy-claude-channel: reply queued but ${envelope} not marked read: ${error.message}`)
+    return { read_mark_failed: String(error.code || error.message || error).slice(0, 120),
+      read_mark_note: 'The reply is queued, but this envelope could not be marked read, so it will keep being announced. Report this read-log failure to an operator; nvoy_channel_read will name the error too.' }
   }
-  return ids
+  // The mark is written, so the re-announce stops. Only tightening the log's mode failed: that is an operator
+  // matter for stderr, not a reason to tell the agent its envelope is still unread (Murphy, PR 403 review).
+  try { chmodSync(readPath, 0o600) } catch (error) { console.error(`nvoy-claude-channel: ${envelope} marked read, but read log mode not set: ${error.message}`) }
+  return null
 }
 
 function toolResult(value, isError = false) {
@@ -315,7 +339,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async request => {
   if (refused.code) return toolResult(refused, true)
   try {
     const prior = lines(replyPath, 'Desktop reply queue').map(line => { try { return JSON.parse(line) } catch { throw new Error('Desktop reply queue contains malformed JSON') } })
-    if (prior.some(item => item?.receipt === envelope)) return toolResult({ code: 'NVOY_ALREADY_REPLIED', envelope }, true)
+    // Already answered, yet unread: an earlier reply was queued before its read mark was written (a runtime from
+    // before replies marked envelopes read, or a lost read log). Mark it read now, or the answered envelope is
+    // re-announced every renotifyMs for good and a second reply can never clear it (mc-claude, 13 Nov).
+    if (prior.some(item => item?.receipt === envelope)) {
+      const markFailure = read ? null : markReadByReply(envelope)
+      return toolResult({ code: 'NVOY_ALREADY_REPLIED', envelope, ...(markFailure || {}) }, true)
+    }
     const record = { version: 1, type: 'reply-request', id: randomBytes(16).toString('hex'),
       instance: manifest.id, receipt: envelope, content, ...(mention.length ? { mention } : {}) }
     appendFileSync(replyPath, JSON.stringify(record) + '\n', { mode: 0o640 })
@@ -324,13 +354,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async request => {
     // reach the agent in another envelope's context). Only a read stops the re-announce, so an
     // answered envelope that was never read was announced every renotifyMs for good (mc-claude,
     // 47c7ab2f, 11 Nov). The reply is already queued, so a failed read-log write is logged, not returned.
-    if (!read) {
-      try {
-        appendFileSync(readPath, JSON.stringify({ version: 1, instance: manifest.id, envelope, read_at: Date.now(), by: 'reply' }) + '\n', { mode: 0o600 })
-        chmodSync(readPath, 0o600)
-      } catch (error) { console.error(`nvoy-claude-channel: reply queued but ${envelope} not marked read: ${error.message}`) }
-    }
-    return toolResult({ queued: true, envelope, request: record.id, ...(mention.length ? { mention } : {}), ...notMentioned(allowed.mayPost, unresolved, room) })
+    const markFailure = read ? null : markReadByReply(envelope)
+    return toolResult({ queued: true, envelope, request: record.id, ...(markFailure || {}), ...(mention.length ? { mention } : {}), ...notMentioned(allowed.mayPost, unresolved, room) })
   } catch (error) { return toolResult({ code: 'NVOY_REPLY_QUEUE_FAILED', message: error.message }, true) }
 })
 

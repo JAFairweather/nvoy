@@ -282,7 +282,12 @@ Buzz relay ──kind:9 #h #p──> keyless buzz watcher ──<event>.buzz.pen
   signs a second template on the same connection.
 - **Hearing.** `instance-runtime watch` also starts `buzz-wake-watcher.mjs`. It subscribes to
   `{kinds:[9], #h: channels, #p: [self]}` and writes an opaque `<event>.buzz.pending` marker for
-  each event that `nativeMention` accepts. The marker holds `{envelope, observed_at}` only. It
+  each event that `nativeMention` accepts. It also hears a reply anywhere in a thread it started,
+  mention or not (#280). It first reads its own signed top-level messages from the last 7 days
+  (the newest 200), adds `{kinds:[9], #h: channels, #e: [those roots]}`, and reopens the
+  subscription when it starts a new thread. The broker does not trust that hint. It re-fetches the
+  thread root and counts the reply only if the root is this identity's own, in the same channel.
+  Addressed is not authorised: the author still needs a grant. The marker holds `{envelope, observed_at}` only. It
   keeps `buzz-wake-seen.log` and a `buzz-wake-since` watermark: the last moment it was known to be
   caught up. A restart therefore replays the gap it was down for, with ten minutes of overlap for
   author clock skew. A first run starts at "now" and never turns channel history into tasks.
@@ -423,8 +428,10 @@ Neither tool exposes the signing credential.
   manifest's list, and holding the post for retry if it cannot), counts the post on a durable sliding window
   (`<state>/agent-limits/posts.json`) *before* the event exists, freezes a top-level kind:9
   (`h`, one `p` per mention, no `e`), and then signs, publishes and logs
-  `posted <event 12>… in <channel>`, never the text. A retry republishes the frozen event. A refusal
-  is terminal (`<state>/terminal-posts.jsonl`).
+  `posted <event 12>… in <channel>`, never the text. A retry republishes the frozen event; a policy
+  or cap refusal, or Buzz's deterministic stale-timestamp invalidation once the frozen event is at
+  least 30 minutes old (`STALE_POST_MIN_AGE_SEC`, keeping fresh posts retryable across lagging relay
+  clocks), is terminal (`<state>/terminal-posts.jsonl`), while transient relay errors remain retryable.
 - **`nvoy_channel_reply {envelope, text, mention?}`** may bring someone else into the thread it
   answers, on the same allowlist. The tool resolves the names and refuses at once without
   `may_post` (`NVOY_REPLY_MENTION_NOT_PERMITTED`) or off it (`NVOY_REPLY_MENTION_REFUSED`). The row
@@ -1349,6 +1356,11 @@ unrecorded so the runner alarms rather than silently accepting a partial release
 with the same manifests is retried after `NVOY_RETRY_AFTER_S` (default 600 s); a manifest edit or a
 newer release retries at once.
 
+The Compose template limits watcher memory to 192 MiB, broker to 384 MiB, adapter to 256 MiB,
+and door and notifier to 128 MiB each. These caps use a single fleet Docker sample from
+15 November 2026 at 22:45 UTC (Buzz event `07d20474`). That sample is a floor, not a peak;
+worker, harness, and initializer remain uncapped until their role-specific use is measured.
+
 Deploys are event-driven, with no three-minute wait:
 
 - **A manifest edit.** `nvoy-runtime-deploy.path` starts the runner as soon as anything under
@@ -1362,8 +1374,12 @@ Deploys are event-driven, with no three-minute wait:
   a GitHub API call. The runner asks the Actions API for a release only while `main` sits on a
   commit whose release run hasn't finished yet (a commit outside the workflow's paths gets no run
   and stops being asked about after 120 s). It also asks every 10 minutes regardless, so a re-run
-  workflow is still found. So a merge deploys within about 30 s of its images being published,
-  well inside the unauthenticated 60-requests-per-hour API limit.
+  workflow is still found. When the host is ready, the next tick begins the deploy within about
+  30 s of image publication, inside the unauthenticated 60-requests-per-hour API limit. The runner
+  defers a release before checkout while one-minute load exceeds two per logical CPU or
+  `MemAvailable` is below 4 GiB; a later timer tick retries it. It waits 15 s after reconciling
+  each identity before checking that identity. These thresholds pace a release; they do not
+  guarantee a completion time or cap total fleet use.
 
 A tick that finds nothing to do logs only when its outcome changes, so the journal doesn't gain a
 line every 30 s.

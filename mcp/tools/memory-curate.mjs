@@ -17,7 +17,7 @@
 //        caller-verified git ancestry) orders one claim after the other.
 //      - Escalates ambiguous conflicts to `@james` and `@mydude` without guessing.
 
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs'
+import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs'
 import { createConnection } from 'node:net'
 import { dirname, join, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
@@ -32,6 +32,7 @@ import {
   parseFactKey,
 } from './memory.mjs'
 import { computeCoherence, createSingleSocketMcpClient } from './memory-viewer.mjs'
+import { makeBunkerSigner } from './nip46-signer.mjs'
 
 export function defaultCuratorStatePath(readerSocket) {
   if (!readerSocket || typeof readerSocket !== 'string') return null
@@ -732,14 +733,17 @@ function tokenize(text) {
   )
 }
 
-export function tokenJaccard(aText, bText) {
-  const a = tokenize(aText)
-  const b = tokenize(bText)
-  if (!a.size || !b.size) return 0
+export function tokenSetJaccard(a, b) {
+  if (!a?.size || !b?.size) return 0
   let inter = 0
-  for (const w of a) if (b.has(w)) inter += 1
+  const [smaller, larger] = a.size <= b.size ? [a, b] : [b, a]
+  for (const w of smaller) if (larger.has(w)) inter += 1
   const union = a.size + b.size - inter
   return union > 0 ? inter / union : 0
+}
+
+export function tokenJaccard(aText, bText) {
+  return tokenSetJaccard(tokenize(aText), tokenize(bText))
 }
 
 function extractWorkSubject(rec) {
@@ -1043,9 +1047,9 @@ export function computeEigenAxisProposals(
 
     const parentTokens = new Set(topic.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean))
     const topicDocFreq = new Map()
-    const localFeats = entries.map(({ rec }) => {
+    const localFeats = entries.map(({ rec, index }) => {
       const m = new Map()
-      const rawFeats = extractClaimFeatures(rec)
+      const rawFeats = rawFeaturesPerClaim[index] || extractClaimFeatures(rec)
       for (const [f, w] of rawFeats.entries()) {
         const cleanTerm = cleanLexicalTermForSubAxis(f, parentTokens)
         if (!cleanTerm) continue
@@ -1080,13 +1084,20 @@ export function computeEigenAxisProposals(
       return v
     })
 
-    const dotLocal = (i, j) => {
+    const E = entries.length
+    const dotMat = new Float64Array(E * E)
+    for (let i = 0; i < E; i++) {
+      dotMat[i * E + i] = 1
       const va = localVecs[i]
-      const vb = localVecs[j]
-      let s = 0
-      for (let li = 0; li < LF; li++) s += va[li] * vb[li]
-      return s
+      for (let j = i + 1; j < E; j++) {
+        const vb = localVecs[j]
+        let s = 0
+        for (let li = 0; li < LF; li++) s += va[li] * vb[li]
+        dotMat[i * E + j] = s
+        dotMat[j * E + i] = s
+      }
     }
+    const dotLocal = (i, j) => dotMat[i * E + j]
 
     const assignedLocal = new Set()
     const usedSubAxisNames = new Set()
@@ -1827,6 +1838,7 @@ export function planMerkleDream({
   memoryGlobalChannelId = '',
   nowSec = Math.floor(Date.now() / 1000),
   gitAncestryCheck = null,
+  spectral: precomputedSpectral = null,
 } = {}) {
   const cleanCuratorPk = String(curatorPubkey || '').toLowerCase()
   const active = (Array.isArray(records) ? records : []).filter(
@@ -1925,7 +1937,10 @@ export function planMerkleDream({
   }
 
   // 2. Stage 0: Spectral Topic Eigenvector Analysis & Topic Normalization
-  const spectral = computeTopicEigenvectors(active, { nowSec })
+  const spectral =
+    precomputedSpectral && typeof precomputedSpectral === 'object' && precomputedSpectral.topic_map
+      ? precomputedSpectral
+      : computeTopicEigenvectors(active, { nowSec })
   const resolveEigenTopic = rawTopic => {
     const trimmed = String(rawTopic || '').trim()
     return spectral.topic_map[trimmed] || normalizeMemoryTopic(trimmed) || 'hive-memory'
@@ -1953,12 +1968,18 @@ export function planMerkleDream({
   for (const { scope, topic, items } of classAByScopeTopic.values()) {
     if (items.length < 2) continue
     // Cluster items within (scope, topic) by shared work subject (e.g. pr336) or token Jaccard >= 0.42
+    // Pre-tokenize each item once per group to avoid O(N^2) regex tokenization on large topics.
+    const itemTokens = new Map()
+    for (const item of items) {
+      itemTokens.set(item, tokenize(`${item.d} ${item.claim}`))
+    }
     const clusters = []
     for (const item of items) {
       const subj = extractWorkSubject(item)
+      const iToks = itemTokens.get(item)
       let placed = false
       for (const cl of clusters) {
-        if (cl.subject === subj || cl.members.some(m => tokenJaccard(`${m.d} ${m.claim}`, `${item.d} ${item.claim}`) >= 0.42)) {
+        if (cl.subject === subj || cl.members.some(m => tokenSetJaccard(itemTokens.get(m), iToks) >= 0.42)) {
           cl.members.push(item)
           placed = true
           break
@@ -2205,15 +2226,39 @@ export function formatCuratorBriefing({
   return lines.join('\n')
 }
 
-function completeHistoryPage(page, expectedWriteSeq, offset, expectedTotal = null) {
+function extractSnapshotAnchor(page) {
+  const snap = page?.snapshot
+  if (!snap || typeof snap !== 'object') return null
+  const maxEventRowid = Number(snap.max_event_rowid)
+  const lastPurgeSeq = Number(snap.last_purge_seq)
+  const asOfSec = Number(snap.as_of_sec)
+  const writeSeq = Number(snap.write_seq ?? page?.store_state?.write_seq)
+  if (!Number.isSafeInteger(maxEventRowid) || maxEventRowid < 0 ||
+      !Number.isSafeInteger(lastPurgeSeq) || lastPurgeSeq < 0 ||
+      !Number.isSafeInteger(asOfSec) || asOfSec < 0 ||
+      !Number.isSafeInteger(writeSeq) || writeSeq < 0) return null
+  return { maxEventRowid, lastPurgeSeq, asOfSec, writeSeq }
+}
+
+function completeHistoryPage(page, expectedWriteSeq, offset, expectedTotal = null, snapshotAnchor = null) {
+  const pageSeq = Number(page?.store_state?.write_seq)
   if (!page || !['found', 'none'].includes(page.answer) || page.answer_reason != null ||
       page.format !== 'full' || page.store_state?.state !== 'READY' ||
-      Number(page.store_state.write_seq) !== expectedWriteSeq || !Array.isArray(page.records) ||
+      !Number.isSafeInteger(pageSeq) || !Array.isArray(page.records) ||
       !Number.isSafeInteger(page.total_matched) || page.total_matched < 0 ||
       page.returned !== page.records.length ||
       (expectedTotal !== null && page.total_matched !== expectedTotal) ||
       (page.answer === 'none' && page.total_matched !== 0) ||
       (page.answer === 'found' && page.total_matched === 0)) return false
+  if (snapshotAnchor) {
+    if (!page.snapshot ||
+        Number(page.snapshot.max_event_rowid) !== snapshotAnchor.maxEventRowid ||
+        Number(page.snapshot.last_purge_seq) !== snapshotAnchor.lastPurgeSeq ||
+        Number(page.snapshot.as_of_sec) !== snapshotAnchor.asOfSec ||
+        pageSeq < snapshotAnchor.writeSeq) return false
+  } else if (pageSeq !== expectedWriteSeq) {
+    return false
+  }
   const nextOffset = offset + page.records.length
   if (nextOffset > page.total_matched) return false
   return page.next_cursor === null
@@ -2222,10 +2267,13 @@ function completeHistoryPage(page, expectedWriteSeq, offset, expectedTotal = nul
 }
 
 export async function readInitialHistory(reader, pageLimit, pageSize, maxAttempts = 3) {
+  const scanStartMs = Date.now()
+  const attempts = []
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const attemptStartMs = Date.now()
     const wake = await reader.callReadTool('memory_wake', {})
-    const writeSeq = Number(wake?.store_state?.write_seq)
-    if (wake?.store_state?.state !== 'READY' || !Number.isSafeInteger(writeSeq)) {
+    const wakeWriteSeq = Number(wake?.store_state?.write_seq)
+    if (wake?.store_state?.state !== 'READY' || !Number.isSafeInteger(wakeWriteSeq)) {
       throw new Error('memory_wake did not return a ready store state')
     }
     const records = []
@@ -2233,19 +2281,58 @@ export async function readInitialHistory(reader, pageLimit, pageSize, maxAttempt
     let cursor = '0'
     let pages = 0
     let expectedTotal = null
-    let changed = false
+    let snapshotAnchor = null
+    let snapshotWriteSeq = wakeWriteSeq
+    let lastObservedSeq = wakeWriteSeq
+    let retryReason = null
     while (cursor !== null && pages < pageLimit) {
       const page = await reader.callReadTool('memory_query', {
         limit: pageSize,
         format: 'full',
         include_history: true,
         ...(cursor !== '0' ? { cursor } : {}),
+        ...(snapshotAnchor
+          ? {
+              snapshot_rowid: snapshotAnchor.maxEventRowid,
+              expected_purge_seq: snapshotAnchor.lastPurgeSeq,
+              snapshot_at: snapshotAnchor.asOfSec,
+            }
+          : {}),
       })
-      if (!completeHistoryPage(page, writeSeq, Number(cursor), expectedTotal)) {
-        const pageSeq = Number(page?.store_state?.write_seq)
-        if (Number.isSafeInteger(pageSeq) && pageSeq !== writeSeq &&
-            completeHistoryPage(page, pageSeq, Number(cursor), null)) {
-          changed = true
+      const pageSeq = Number(page?.store_state?.write_seq)
+      if (Number.isSafeInteger(pageSeq)) lastObservedSeq = pageSeq
+      if (pages === 0) {
+        const candidateAnchor = extractSnapshotAnchor(page)
+        if (candidateAnchor) {
+          if (!completeHistoryPage(page, candidateAnchor.writeSeq, 0, null, candidateAnchor)) {
+            if (page?.answer === 'unknown' && page?.answer_reason === 'snapshot-purged' && page?.store_state?.state === 'READY') {
+              retryReason = 'snapshot_purged'
+              break
+            }
+            throw new Error('memory_query did not return a complete ready history page')
+          }
+          snapshotAnchor = candidateAnchor
+          snapshotWriteSeq = candidateAnchor.writeSeq
+        } else if (!completeHistoryPage(page, snapshotWriteSeq, 0, null, null)) {
+          if (Number.isSafeInteger(pageSeq) && pageSeq !== snapshotWriteSeq &&
+              completeHistoryPage(page, pageSeq, 0, null, null)) {
+            retryReason = 'write_seq_changed_during_scan'
+            break
+          }
+          throw new Error('memory_query did not return a complete ready history page')
+        }
+      } else if (snapshotAnchor) {
+        if (page?.answer === 'unknown' && page?.answer_reason === 'snapshot-purged' && page?.store_state?.state === 'READY') {
+          retryReason = 'snapshot_purged'
+          break
+        }
+        if (!completeHistoryPage(page, snapshotWriteSeq, Number(cursor), expectedTotal, snapshotAnchor)) {
+          throw new Error('memory_query did not return a complete ready history page')
+        }
+      } else if (!completeHistoryPage(page, snapshotWriteSeq, Number(cursor), expectedTotal, null)) {
+        if (Number.isSafeInteger(pageSeq) && pageSeq !== snapshotWriteSeq &&
+            completeHistoryPage(page, pageSeq, Number(cursor), null, null)) {
+          retryReason = 'write_seq_changed_during_scan'
           break
         }
         throw new Error('memory_query did not return a complete ready history page')
@@ -2260,34 +2347,148 @@ export async function readInitialHistory(reader, pageLimit, pageSize, maxAttempt
       cursor = typeof page.next_cursor === 'string' && page.next_cursor ? page.next_cursor : null
       pages += 1
     }
-    if (changed) continue
+    if (retryReason) {
+      attempts.push({
+        attempt: attempt + 1,
+        mode: snapshotAnchor ? 'snapshot' : 'write_seq_retry',
+        wake_write_seq: wakeWriteSeq,
+        snapshot_write_seq: snapshotWriteSeq,
+        end_write_seq: lastObservedSeq,
+        concurrent_writes: Math.max(0, lastObservedSeq - snapshotWriteSeq),
+        snapshot_rowid: snapshotAnchor ? snapshotAnchor.maxEventRowid : null,
+        expected_purge_seq: snapshotAnchor ? snapshotAnchor.lastPurgeSeq : null,
+        pages,
+        total_matched: expectedTotal,
+        elapsed_ms: Math.max(0, Date.now() - attemptStartMs),
+        outcome: `retry:${retryReason}`,
+        reason: retryReason,
+      })
+      continue
+    }
     const end = await reader.callReadTool('memory_wake', {})
     const endSeq = Number(end?.store_state?.write_seq)
     if (end?.store_state?.state !== 'READY' || !Number.isSafeInteger(endSeq)) {
       throw new Error('memory_wake did not return a ready store state')
     }
-    if (endSeq !== writeSeq) continue
-    return { wake, records, historyRecords, historyComplete: cursor === null }
+    lastObservedSeq = endSeq
+    if (!snapshotAnchor && endSeq !== snapshotWriteSeq) {
+      attempts.push({
+        attempt: attempt + 1,
+        mode: 'write_seq_retry',
+        wake_write_seq: wakeWriteSeq,
+        snapshot_write_seq: snapshotWriteSeq,
+        end_write_seq: endSeq,
+        concurrent_writes: Math.max(0, endSeq - snapshotWriteSeq),
+        snapshot_rowid: null,
+        expected_purge_seq: null,
+        pages,
+        total_matched: expectedTotal,
+        elapsed_ms: Math.max(0, Date.now() - attemptStartMs),
+        outcome: 'retry:write_seq_changed_at_end',
+        reason: 'write_seq_changed_at_end',
+      })
+      continue
+    }
+    attempts.push({
+      attempt: attempt + 1,
+      mode: snapshotAnchor ? 'snapshot' : 'write_seq_retry',
+      wake_write_seq: wakeWriteSeq,
+      snapshot_write_seq: snapshotWriteSeq,
+      end_write_seq: endSeq,
+      concurrent_writes: Math.max(0, endSeq - snapshotWriteSeq),
+      snapshot_rowid: snapshotAnchor ? snapshotAnchor.maxEventRowid : null,
+      expected_purge_seq: snapshotAnchor ? snapshotAnchor.lastPurgeSeq : null,
+      pages,
+      total_matched: expectedTotal,
+      elapsed_ms: Math.max(0, Date.now() - attemptStartMs),
+      outcome: 'ok',
+      reason: null,
+    })
+    const effectiveWake = snapshotAnchor && snapshotWriteSeq !== wakeWriteSeq
+      ? { ...wake, store_state: { ...wake.store_state, write_seq: snapshotWriteSeq } }
+      : wake
+    return {
+      wake: effectiveWake,
+      records,
+      historyRecords,
+      historyComplete: cursor === null,
+      scanDiagnostics: {
+        attempts,
+        total_elapsed_ms: Math.max(0, Date.now() - scanStartMs),
+      },
+    }
   }
-  throw new Error('memory history changed during bounded read retries')
+  const summary = attempts
+    .map(a => `#${a.attempt} mode=${a.mode} seq=${a.snapshot_write_seq}->${a.end_write_seq} pages=${a.pages} ${a.elapsed_ms}ms ${a.outcome}`)
+    .join('; ')
+  const err = new Error(`memory history changed during bounded read retries${summary ? ` (${summary})` : ''}`)
+  err.attempts = attempts
+  throw err
 }
 
-export async function readPostCycleSnapshot(reader, expectedWriteSeq, pageLimit, pageSize, nowSec) {
+export function mergeCycleRecentActivity(priorActivity = [], postActivity = []) {
+  const preList = Array.isArray(priorActivity) ? priorActivity.filter(Boolean) : []
+  const postList = Array.isArray(postActivity) ? postActivity.filter(Boolean) : []
+  if (preList.length === 0) return postList
+  if (postList.length === 0) return preList
+  const postSeqs = new Set()
+  const postKeys = new Set()
+  for (const a of postList) {
+    if (Number.isSafeInteger(a.seq)) postSeqs.add(a.seq)
+    postKeys.add(`${a.actor || ''}:${a.kind || ''}:${a.at || 0}:${a.d || ''}:${a.topic || ''}`)
+  }
+  const preservedPeers = preList.filter(a => {
+    if (!a || a.actor === 'curator' || a.actor === 'viewer') return false
+    if (Number.isSafeInteger(a.seq) && postSeqs.has(a.seq)) return false
+    const key = `${a.actor || ''}:${a.kind || ''}:${a.at || 0}:${a.d || ''}:${a.topic || ''}`
+    return !postKeys.has(key)
+  })
+  return [...preservedPeers, ...postList]
+}
+
+export async function readPostCycleSnapshot(
+  reader,
+  expectedWriteSeq,
+  pageLimit,
+  pageSize,
+  nowSec,
+  { priorRecentActivity = null, priorAgentRoster = null } = {}
+) {
   const start = await reader.callReadTool('memory_wake', {})
-  if (start?.store_state?.state !== 'READY' || Number(start.store_state.write_seq) !== expectedWriteSeq) return null
+  const startSeq = Number(start?.store_state?.write_seq)
+  if (start?.store_state?.state !== 'READY' || !Number.isSafeInteger(startSeq) || startSeq < expectedWriteSeq) return null
   const historyRecords = []
   const records = []
   let cursor = '0'
   let pages = 0
   let expectedTotal = null
+  let snapshotAnchor = null
   while (cursor !== null && pages < pageLimit) {
     const page = await reader.callReadTool('memory_query', {
       limit: pageSize,
       format: 'full',
       include_history: true,
       ...(cursor !== '0' ? { cursor } : {}),
+      ...(snapshotAnchor
+        ? {
+            snapshot_rowid: snapshotAnchor.maxEventRowid,
+            expected_purge_seq: snapshotAnchor.lastPurgeSeq,
+            snapshot_at: snapshotAnchor.asOfSec,
+          }
+        : {}),
     })
-    if (!completeHistoryPage(page, expectedWriteSeq, Number(cursor), expectedTotal)) return null
+    if (pages === 0) {
+      const candidateAnchor = extractSnapshotAnchor(page)
+      if (candidateAnchor) {
+        if (candidateAnchor.writeSeq < expectedWriteSeq ||
+            !completeHistoryPage(page, candidateAnchor.writeSeq, 0, null, candidateAnchor)) return null
+        snapshotAnchor = candidateAnchor
+      } else if (startSeq !== expectedWriteSeq || !completeHistoryPage(page, expectedWriteSeq, 0, null, null)) {
+        return null
+      }
+    } else if (!completeHistoryPage(page, snapshotAnchor ? snapshotAnchor.writeSeq : expectedWriteSeq, Number(cursor), expectedTotal, snapshotAnchor)) {
+      return null
+    }
     expectedTotal = page.total_matched
     for (const r of page.records) {
       historyRecords.push(r)
@@ -2300,17 +2501,29 @@ export async function readPostCycleSnapshot(reader, expectedWriteSeq, pageLimit,
   }
   if (cursor !== null) return null
   const end = await reader.callReadTool('memory_wake', {})
-  if (end?.store_state?.state !== 'READY' || Number(end.store_state.write_seq) !== expectedWriteSeq) return null
+  const endSeq = Number(end?.store_state?.write_seq)
+  if (end?.store_state?.state !== 'READY' || !Number.isSafeInteger(endSeq)) return null
+  if (snapshotAnchor ? endSeq < snapshotAnchor.writeSeq : endSeq !== expectedWriteSeq) return null
+  const postActivity = Array.isArray(end?.recent_activity)
+    ? end.recent_activity
+    : (Array.isArray(start?.recent_activity) ? start.recent_activity : [])
+  const mergedActivity = mergeCycleRecentActivity(priorRecentActivity, postActivity)
+  const effectiveRoster = Array.isArray(end?.agent_roster) && end.agent_roster.length > 0
+    ? end.agent_roster
+    : (Array.isArray(priorAgentRoster) ? priorAgentRoster : [])
+  const effectiveStoreState = snapshotAnchor
+    ? { ...end.store_state, write_seq: snapshotAnchor.writeSeq }
+    : end.store_state
   const coherence = computeCoherence({
     records,
     history_records: historyRecords,
-    agent_roster: Array.isArray(end?.agent_roster) ? end.agent_roster : [],
-    recent_activity: Array.isArray(end?.recent_activity) ? end.recent_activity : [],
-    store_state: end.store_state,
+    agent_roster: effectiveRoster,
+    recent_activity: mergedActivity,
+    store_state: effectiveStoreState,
     now_sec: nowSec,
     history_complete: true,
   })
-  return { historyRecords, coherenceScore: Number.isFinite(coherence?.score) ? coherence.score : null }
+  return { historyRecords, coherenceScore: Number.isFinite(coherence?.score) ? coherence.score : null, coherence }
 }
 
 // Executes a full Curator Dream & Nightmare cycle over the daemon's reader and writer sockets.
@@ -2353,7 +2566,7 @@ export async function runCuratorCycle({
   try {
     const pageLimit = Math.max(1, Number(maxPages) || 500)
     const effectivePageSize = Math.max(1, Math.min(200, Number(pageSize) || 100))
-    const { wake, records, historyRecords, historyComplete } = await readInitialHistory(reader, pageLimit, effectivePageSize)
+    const { wake, records, historyRecords, historyComplete, scanDiagnostics } = await readInitialHistory(reader, pageLimit, effectivePageSize)
     const storeState = wake?.store_state || {}
     const resolvedRecentActivity = Array.isArray(recentActivity)
       ? recentActivity
@@ -2561,7 +2774,10 @@ export async function runCuratorCycle({
       if (submitted.length > 0 && resolvedPacketDir) {
         let postSnapshot = null
         try {
-          postSnapshot = await readPostCycleSnapshot(reader, postWriteSeq, pageLimit, effectivePageSize, nowSec)
+          postSnapshot = await readPostCycleSnapshot(reader, postWriteSeq, pageLimit, effectivePageSize, nowSec, {
+            priorRecentActivity: resolvedRecentActivity,
+            priorAgentRoster: Array.isArray(wake?.agent_roster) ? wake.agent_roster : [],
+          })
         } catch {
           // The packet still records known submitted changes; unknown counters remain null.
         }
@@ -2667,6 +2883,7 @@ export async function runCuratorCycle({
       next_curated_write_seq: nextCuratedWriteSeq,
       coherence: resolvedCoherence,
       recent_activity_count: resolvedRecentActivity.length,
+      scan_diagnostics: scanDiagnostics || null,
       triggers: triggerEval,
       plan,
       submitted,
@@ -2683,6 +2900,9 @@ export function parseCuratorFlags(argv = []) {
   let writerSocket = process.env.HIVE_MEMORY_WRITER_SOCKET || null
   let stateFile = process.env.HIVE_MEMORY_CURATOR_STATE_FILE || undefined
   let secretKeyFile = process.env.HIVE_MEMORY_CURATOR_SECRET_KEY_FILE || null
+  let bunkerUriFile = process.env.HIVE_MEMORY_CURATOR_BUNKER_URI_FILE || null
+  let bunkerClientFile = process.env.HIVE_MEMORY_CURATOR_BUNKER_CLIENT_FILE || null
+  let expectPubkey = process.env.HIVE_MEMORY_CURATOR_PUBKEY || null
   let memoryGlobalChannelId = process.env.HIVE_MEMORY_GLOBAL_CHANNEL_ID || 'a8186b53-537d-46ad-a7e7-b6486c58970e'
   let dreamIntervalSec = Number(process.env.HIVE_MEMORY_DREAM_INTERVAL_SEC || DEFAULT_DREAM_INTERVAL_SEC)
   let writeDeltaThreshold = Number(process.env.HIVE_MEMORY_WRITE_DELTA_THRESHOLD || DEFAULT_WRITE_DELTA_THRESHOLD)
@@ -2700,6 +2920,12 @@ export function parseCuratorFlags(argv = []) {
       stateFile = argv[++i]
     } else if (arg === '--secret-key-file' && argv[i + 1]) {
       secretKeyFile = argv[++i]
+    } else if (arg === '--bunker-uri-file' && argv[i + 1]) {
+      bunkerUriFile = argv[++i]
+    } else if (arg === '--bunker-client-file' && argv[i + 1]) {
+      bunkerClientFile = argv[++i]
+    } else if (arg === '--expect-pubkey' && argv[i + 1]) {
+      expectPubkey = argv[++i]
     } else if (arg === '--global-channel' && argv[i + 1]) {
       memoryGlobalChannelId = argv[++i]
     } else if (arg === '--dream-interval-sec' && argv[i + 1]) {
@@ -2722,6 +2948,9 @@ export function parseCuratorFlags(argv = []) {
     writerSocket,
     stateFile,
     secretKeyFile,
+    bunkerUriFile,
+    bunkerClientFile,
+    expectPubkey,
     memoryGlobalChannelId,
     dreamIntervalSec,
     writeDeltaThreshold,
@@ -2729,6 +2958,35 @@ export function parseCuratorFlags(argv = []) {
     force,
     dryRun,
   }
+}
+
+// The curator's signing key lives in James's Bunker (frontier A4, nvoy#375): the cycle signs through NIP-46 with
+// a pairing credential that can only ask, never sign. The two ref files are read once, must not be readable by
+// group or others, and the Bunker's key must be exactly the curator identity the store's config names, so a
+// mispaired Bunker signs nothing. A raw key file and Bunker refs together are refused: one signer, chosen plainly.
+const HEX64 = /^[0-9a-f]{64}$/
+function readPrivateRef(path, what) {
+  const st = lstatSync(path)
+  if (!st.isFile()) throw new Error(`${what} ${path} is not a regular file`)
+  if (st.mode & 0o077) throw new Error(`${what} ${path} is readable by group or others; make it 0600 or 0400`)
+  const text = readFileSync(path, 'utf8').trim()
+  if (!text) throw new Error(`${what} ${path} is empty`)
+  return text
+}
+export async function curatorSignerFromFlags(flags, { makeSigner = makeBunkerSigner } = {}) {
+  const wantsBunker = Boolean(flags.bunkerUriFile || flags.bunkerClientFile)
+  if (!wantsBunker) return null
+  if (flags.secretKeyFile) throw new Error('give either --secret-key-file or the Bunker refs, not both')
+  if (!flags.bunkerUriFile || !flags.bunkerClientFile) throw new Error('the Bunker needs both --bunker-uri-file and --bunker-client-file')
+  const expect = String(flags.expectPubkey || '').toLowerCase()
+  if (!HEX64.test(expect)) throw new Error('signing through the Bunker needs --expect-pubkey (the curator identity, 64 hex)')
+  const uri = readPrivateRef(flags.bunkerUriFile, 'Bunker URI file')
+  const client = readPrivateRef(flags.bunkerClientFile, 'Bunker client credential file')
+  const signer = makeSigner(uri, client, { clientSource: flags.bunkerClientFile })
+  let pubkey
+  try { pubkey = String(await signer.getPublicKey()).toLowerCase() } catch (err) { signer.close?.(); throw new Error(`the Bunker did not answer get_public_key: ${err.message || err}`) }
+  if (pubkey !== expect) { signer.close?.(); throw new Error(`the Bunker signs as ${pubkey.slice(0, 8)}…, not the curator ${expect.slice(0, 8)}…; nothing signed`) }
+  return { pubkey, signEvent: event => signer.signEvent(event), close: () => signer.close?.() }
 }
 
 async function main() {
@@ -2750,11 +3008,20 @@ async function main() {
     curatorSecretKey = Uint8Array.from(Buffer.from(rawHex, 'hex'))
   }
 
+  let curatorSigner = null
+  try {
+    curatorSigner = await curatorSignerFromFlags(flags)
+  } catch (err) {
+    console.error(`memory-curate: ${err.message || err}`)
+    process.exit(1)
+  }
+
   try {
     const result = await runCuratorCycle({
       readerSocket: flags.readerSocket,
       writerSocket: flags.writerSocket,
       curatorSecretKey,
+      curatorSigner,
       memoryGlobalChannelId: flags.memoryGlobalChannelId,
       stateFile: flags.stateFile,
       dreamIntervalSec: flags.dreamIntervalSec,
@@ -2776,13 +3043,16 @@ async function main() {
         plan_summary: result.plan?.summary ?? null,
         submitted_count: result.submitted.length,
         refused_count: result.refused.length,
+        scan_diagnostics: result.scan_diagnostics ?? null,
       })
     )
-    if (!result.ok) process.exit(1)
+    if (!result.ok) { curatorSigner?.close(); process.exit(1) }
   } catch (err) {
     console.error(`memory-curate: cycle failed: ${err.message || err}`)
+    curatorSigner?.close()
     process.exit(1)
   }
+  curatorSigner?.close()
 }
 
 function isEntrypoint() {

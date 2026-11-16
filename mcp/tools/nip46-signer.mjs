@@ -38,7 +38,12 @@ export function makeBunkerSigner(uriText, clientNsec, options = {}) {
     if (closed) throw new Error('nip46 signer closed')
     clearTimeout(idleTimer); idleTimer = undefined
     if (subscribed) return; subscribed = true
-    subscription = pool.subscribeMany(relays, { kinds: [24133], authors: [pubkey], '#p': [clientPubkey] }, { onevent(event) {
+    // When every relay drops this subscription (a connect that failed or timed out, a socket that closed), forget it,
+    // so the next call subscribes again instead of waiting on a subscription that no relay holds (A4, 14 Nov: a
+    // throttled curator's reconnect failed silently and its sign_event waited out the full 60 s).
+    const sub = subscription = pool.subscribeMany(relays, { kinds: [24133], authors: [pubkey], '#p': [clientPubkey] }, { onclose() {
+      if (subscription === sub) { subscription = undefined; subscribed = false }
+    }, onevent(event) {
       try { const m = JSON.parse(nip44.v2.decrypt(event.content, conversation)); const p = pending.get(m.id); if (!p) return
         pending.delete(m.id); clearTimeout(p.timer)
         m.error ? p.reject(new Error(`bunker: ${m.error}`)) : p.resolve(m.result)
@@ -57,18 +62,49 @@ export function makeBunkerSigner(uriText, clientNsec, options = {}) {
     pending.set(id, { resolve, reject, timer })
     const event = finalizeEvent({ kind: 24133, created_at: Math.floor(Date.now() / 1000), tags: [['p', pubkey]],
       content: nip44.v2.encrypt(JSON.stringify({ id, method, params }), conversation) }, clientKey)
-    try { void Promise.allSettled(pool.publish(relays, event)) }
-    catch (error) { clearTimeout(timer); pending.delete(id); reject(error); idleClose() }
+    const fail = error => { if (!pending.delete(id)) return; clearTimeout(timer); reject(error); idleClose() }
+    let sent
+    try { sent = pool.publish(relays, event) } catch (error) { fail(error); return }
+    // A request that reached no relay can never be answered, so say so now rather than after the full timeout.
+    // SimplePool resolves (not rejects) a relay it could not connect to, with 'connection failure: …'; a relay
+    // that answered OK false rejects. A publish timeout is not proof the event was lost, so it keeps waiting.
+    void Promise.allSettled(sent).then(results => {
+      const lost = results.map(r => r.status === 'fulfilled'
+        ? (typeof r.value === 'string' && r.value.startsWith('connection failure') ? r.value : null)
+        : (/publish timed out/.test(String(r.reason?.message || r.reason)) ? null : String(r.reason?.message || r.reason)))
+      if (lost.length && lost.every(Boolean)) fail(new Error(`nip46 ${method}: no relay took the request (${lost.join('; ').slice(0, 200)})`))
+    })
   })
-  const ready = () => (connected ??= rpc('connect', [pubkey, secret], 15000).catch(() => 'active'))
+  // A refused connect is tolerated: a client the Bunker already knows may be refused a repeat connect
+  // (a spent pairing secret) and still be served. But when a later call then fails, the refusal is the
+  // likely cause (an unpaired client gets 'Unknown client'), so that call's error names it. Only the
+  // fact is kept, never the Bunker's own rejection text: a reply may echo the pairing secret it refused.
+  let connectRefusal
+  const ready = () => (connected ??= (connectRefusal = undefined,
+    rpc('connect', [pubkey, secret], 15000).catch(error => {
+      connectRefusal = /^nip46 connect timed out$/.test(error?.message || '') ? 'connect got no answer from the Bunker' : 'the Bunker refused connect'
+      return 'active'
+    })))
+  const call = async (method, params) => {
+    await ready()
+    try { return await rpc(method, params) } catch (error) {
+      if (!connectRefusal) throw error
+      throw new Error(`${error?.message || error} (${connectRefusal} too; this client may not be paired, so re-pair it)`)
+    }
+  }
   const close = () => {
     closed = true
     for (const { reject, timer } of pending.values()) { clearTimeout(timer); reject(new Error('nip46 signer closed')) }
     pending.clear()
     disconnect()
   }
-  return Object.freeze({ pubkey, close, async getPublicKey() { await ready(); return rpc('get_public_key', []) },
-    async nip44Decrypt(peer, ciphertext) { await ready(); return rpc('nip44_decrypt', [peer, ciphertext]) },
-    async nip44Encrypt(peer, plaintext) { await ready(); return rpc('nip44_encrypt', [peer, plaintext]) },
-    async signEvent(event) { await ready(); return JSON.parse(await rpc('sign_event', [JSON.stringify(event)])) } })
+  // One get_public_key per session: callers ask before every action (and openBuzzSession asks again),
+  // and each ask is a Bunker request. A successful answer is kept; a failure is not, so the next call
+  // asks again.
+  let publicKey
+  const askPublicKey = () => (publicKey ??= call('get_public_key', []).catch(error => { publicKey = undefined; throw error }))
+  return Object.freeze({ pubkey, close, getPublicKey: askPublicKey,
+    async nip44Decrypt(peer, ciphertext) { return call('nip44_decrypt', [peer, ciphertext]) },
+    async nip44Encrypt(peer, plaintext) { return call('nip44_encrypt', [peer, plaintext]) },
+    async signEvent(event) { return JSON.parse(await call('sign_event', [JSON.stringify(event)])) } })
 }

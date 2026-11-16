@@ -1,16 +1,22 @@
 // test/memory-viewer.mjs — Unit and integration tests for mcp/tools/memory-viewer.mjs.
 
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { request as httpRequest } from 'node:http'
+import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { createServer as createPlainHttpServer, request as httpRequest } from 'node:http'
+import { createServer as createNetServer, connect as netConnect } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
-import { buildClaimTemplate } from '../mcp/tools/memory.mjs'
+import { buildClaimTemplate, buildWithdrawalTemplate } from '../mcp/tools/memory.mjs'
 import { ACTIVITY_MAX, handleSocketJsonRpc, startMemoryDaemon } from '../mcp/tools/memory-daemon.mjs'
 import { HiveMemoryStore, initEmptyStore, recordVerifiedBackup, validateAndResolveConfig } from '../mcp/tools/hive_memory_store.mjs'
 import {
+  applyClientCorpusDelta,
+  applyClientRecordsResponse,
+  buildClientViewerState,
+  buildCorpusDelta,
   buildMobileState,
+  compactTopicPagesForClient,
   computeAgentHealth,
   computeCoherence,
   computeDreamingTelemetry,
@@ -18,20 +24,33 @@ import {
   computeSynapticEfficacy,
   CORPUS_CACHE_TTL_MS,
   diffViewerSnapshots,
+  FIRST_LOAD_HTML_BUDGET_BYTES,
+  INITIAL_STATE_RECORDS_LIMIT,
+  internRecord,
+  MAX_CORPUS_HISTORY,
+  MAX_SSE_CLIENT_BUFFER_BYTES,
+  MOBILE_HTML_BUDGET_BYTES,
   readWatchStatus,
+  registerSseClient,
+  removeSseClient,
+  selectInitialScreenRecords,
   watchAlert,
   watchView,
   WATCH_STALE_SEC,
+  writeToSseClient,
   escapeHtml,
   parseListenTarget,
   parseViewerFlags,
+  readAllowedNodesFile,
   renderMobileViewerHtml,
   renderViewerHtml,
   resolveDreamDisplayMode,
   safeJsonForScript,
   sanitizeActivity,
   startMemoryViewer,
+  snapshotPin,
 } from '../mcp/tools/memory-viewer.mjs'
+import { createPeerGate, createTailscaleSelf, createTailscaleWhois, parseAllowedNodes, whoisAddr } from '../mcp/tools/viewer-peer-gate.mjs'
 
 const SNAP_ID = 'c'.repeat(64)
 
@@ -68,7 +87,7 @@ function httpGet(port, path, method = 'GET') {
 console.log('=== Hive Shared Memory Viewer Tests ===')
 
 await test('parseViewerFlags and parseListenTarget validate socket, host/port, and bracketed IPv6', () => {
-  const parsed1 = parseViewerFlags(['--socket', '/run/hive-memory/viewer.sock', '--host', '127.0.0.1', '--port', '8787'])
+  const parsed1 = parseViewerFlags(['--socket', '/run/hive-memory/viewer.sock', '--host', '127.0.0.1', '--port', '8787', '--insecure-no-peer-gate'])
   assert.equal(parsed1.socketPath, '/run/hive-memory/viewer.sock')
   assert.equal(parsed1.host, '127.0.0.1')
   assert.equal(parsed1.port, 8787)
@@ -81,6 +100,7 @@ await test('parseViewerFlags and parseListenTarget validate socket, host/port, a
     '[fd7a:115c:a1e0::ab36:5615]:8788',
     '--poll-ms',
     '1500',
+    '--insecure-no-peer-gate',
   ])
   assert.equal(parsed2.host, 'fd7a:115c:a1e0::ab36:5615')
   assert.equal(parsed2.port, 8788)
@@ -935,7 +955,7 @@ await test('live integration: memory-viewer polls memory-daemon viewer socket, s
     const overrideStatePath = join(tmp, 'custom-curator-state.json')
     process.env.HIVE_MEMORY_CURATOR_STATE_FILE = overrideStatePath
     try {
-      const parsedFlags = parseViewerFlags(['--socket', join(sockDir, 'viewer.sock'), '--state-file', overrideStatePath, '--listen', '127.0.0.1:0'])
+      const parsedFlags = parseViewerFlags(['--socket', join(sockDir, 'viewer.sock'), '--state-file', overrideStatePath, '--listen', '127.0.0.1:0', '--insecure-no-peer-gate'])
       assert.equal(parsedFlags.stateFile, overrideStatePath)
 
       const { writeCuratorStateFile } = await import('../mcp/tools/memory-curate.mjs')
@@ -1141,6 +1161,74 @@ await test('the health check status shows saving off, partly off, stale or unrea
     assert.equal(diffViewerSnapshots({ ...base, watch: open }, { ...base, watch: open }, now).filter((e) => e.kind === 'alert').length, 0)
     assert.match(renderViewerHtml({ ...base, watch: off }), /id="alert-banner"/)
   } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+await test('q-131: internRecord reuses an unchanged record object and keeps a changed one', () => {
+  const a = { event_id: 'e1', claim: 'x', evidence: ['a'] }
+  const prev = new Map([['e1', a]])
+  const same = { event_id: 'e1', claim: 'x', evidence: ['a'] }
+  assert.equal(internRecord(same, prev), a, 'an equal record must be the previous object')
+  const changed = { event_id: 'e1', claim: 'x', evidence: ['a'], status: 'withdrawn' }
+  assert.equal(internRecord(changed, prev), changed, 'a changed record must be the fresh object')
+  const fresh = { event_id: 'e2', claim: 'y' }
+  assert.equal(internRecord(fresh, prev), fresh)
+  assert.equal(internRecord(null, prev), null)
+  assert.equal(internRecord(same, null), same)
+  const noId = { claim: 'x' }
+  assert.equal(internRecord(noId, new Map([[undefined, a]])), noId)
+})
+
+await test('q-131: a write re-fetch reuses unchanged record objects, so corpus history shares them', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'viewer-intern-'))
+  const dbPath = join(tmp, 'memory.sqlite')
+  const ledgerPath = join(tmp, 'accepted-ledger.jsonl')
+  const receiptPath = join(tmp, 'last-verified-backup.json')
+  const socketDir = join(tmp, 'sockets')
+  const ownerSk = generateSecretKey()
+  const ownerPk = getPublicKey(ownerSk)
+  const viewerPk = getPublicKey(generateSecretKey())
+  const room = 'a8186b53-537d-46ad-a7e7-b6486c58970e'
+  const nowSec = Math.floor(Date.now() / 1000)
+  initEmptyStore({ dbPath, ledgerPath })
+  recordVerifiedBackup({ receiptPath, snapshotId: SNAP_ID, writeSeq: 1, at: nowSec })
+  const daemon = await startMemoryDaemon({
+    dbPath, ledgerPath, receiptPath,
+    config: {
+      memoryGlobalChannelId: room, ownerPubkey: ownerPk, maxUnbackedSec: 3600,
+      globalWriters: [ownerPk], canonWriters: [ownerPk], readers: { viewer: viewerPk },
+      writers: { james: { pubkey: ownerPk, perHour: 30 } },
+      rooms: { [room]: { members: [ownerPk, viewerPk], writers: [ownerPk] } },
+    },
+    readers: 'viewer', writers: 'james', socketDir, log: () => {},
+  })
+  const put = (slug, at) => daemon.store.submit({
+    writer: 'james',
+    event: finalizeEvent(buildClaimTemplate({
+      pubkey: ownerPk, scope: `room:${room}`, slug, memoryGlobalChannelId: room, topic: 'hive-memory',
+      claim: `Claim ${slug} for the q-131 interning test.`, because: 'q-131 test',
+      evidence: ['nvoy@f737db95:mcp/tools/memory-viewer.mjs'], asOfGit: 'f737db9500000000000000000000000000000000',
+      ttlSec: 86400 * 14, nowSec: at,
+    }), ownerSk),
+    expectedPriorId: null, nowSec: at,
+  })
+  for (let i = 0; i < 5; i++) assert.equal(put(`q131-seed-${i}`, nowSec - 60 + i).accepted, true)
+  let viewer = null
+  try {
+    viewer = await startMemoryViewer({ socketPath: join(socketDir, 'viewer.sock'), host: '127.0.0.1', port: 0, pollMs: 60000 })
+    const s1 = await viewer.pollOnce({ forceFull: false })
+    const before = new Map(s1.records.map(r => [r.event_id, r]))
+    assert.equal(before.size, 5)
+    assert.equal(put('q131-new', nowSec - 30).accepted, true)
+    const s2 = await viewer.pollOnce({ forceFull: false })
+    assert.equal(s2.records.length, 6, 'the write must trigger a re-fetch that sees the new claim')
+    let shared = 0
+    for (const r of s2.records) if (before.get(r.event_id) === r) shared += 1
+    assert.equal(shared, 5, 'each unchanged record must be the same object as before the write, not a fresh copy')
+  } finally {
+    if (viewer) await viewer.stop()
+    await daemon.close()
     rmSync(tmp, { recursive: true, force: true })
   }
 })
@@ -2549,6 +2637,1474 @@ await test('durable SQLite activity_rollups survive >80 ring overflow & daemon r
     }
   } finally {
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await test('nvoy #383 regression: SSE suppresses unchanged polls, sends compact deltas on activity-only polls, and bounds slow-client backpressure', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'viewer-sse-383-'))
+  const dbPath = join(tmp, 'memory.sqlite')
+  const ledgerPath = join(tmp, 'accepted-ledger.jsonl')
+  const receiptPath = join(tmp, 'last-verified-backup.json')
+  const socketDir = join(tmp, 'sockets')
+  const ownerSk = generateSecretKey()
+  const ownerPk = getPublicKey(ownerSk)
+  const peerSk = generateSecretKey()
+  const peerPk = getPublicKey(peerSk)
+  const viewerSk = generateSecretKey()
+  const viewerPk = getPublicKey(viewerSk)
+  const room = 'a8186b53-537d-46ad-a7e7-b6486c58970e'
+  let nowSec = 1794530000
+
+  initEmptyStore({ dbPath, ledgerPath })
+  recordVerifiedBackup({ receiptPath, snapshotId: SNAP_ID, writeSeq: 1, at: nowSec })
+  const daemon = await startMemoryDaemon({
+    dbPath,
+    ledgerPath,
+    receiptPath,
+    config: {
+      memoryGlobalChannelId: room,
+      ownerPubkey: ownerPk,
+      maxUnbackedSec: 3600,
+      globalWriters: [ownerPk],
+      canonWriters: [ownerPk],
+      readers: { viewer: viewerPk, biggy: peerPk },
+      writers: { james: { pubkey: ownerPk, perHour: 30 }, biggy: { pubkey: peerPk, perHour: 30 } },
+      rooms: { [room]: { members: [ownerPk, peerPk, viewerPk], writers: [ownerPk, peerPk] } },
+    },
+    readers: ['viewer', 'biggy'],
+    writers: ['james', 'biggy'],
+    socketDir,
+    log: () => {},
+  })
+
+  // Seed one claim so topic_pages and records are non-empty
+  const seedEv = finalizeEvent(buildClaimTemplate({
+    pubkey: peerPk,
+    scope: `room:${room}`,
+    slug: 'nvoy-viewer-sse-383-seed',
+    topic: 'nvoy',
+    claim: 'Seed claim for PR #383 SSE delta and backpressure test',
+    because: 'Regression fixture',
+    evidence: ['PR #383', 'mcp/tools/memory-viewer.mjs'],
+    asOfGit: 'nvoy@523feac',
+    memoryGlobalChannelId: room,
+    nowSec: nowSec + 1,
+  }), peerSk)
+  assert.equal(daemon.store.submit({ writer: 'biggy', event: seedEv, nowSec: nowSec + 1 }).accepted, true)
+
+  let viewer = null
+  const openReqs = []
+  function connectSse(path) {
+    const frames = []
+    const req = httpRequest({ host: '127.0.0.1', port: viewer.port, path, method: 'GET' }, res => {
+      res.setEncoding('utf8')
+      let buf = ''
+      res.on('data', chunk => {
+        buf += chunk
+        let idx
+        while ((idx = buf.indexOf('\n\n')) >= 0) {
+          const rawFrame = buf.slice(0, idx)
+          buf = buf.slice(idx + 2)
+          if (rawFrame.startsWith('data: ')) {
+            frames.push(JSON.parse(rawFrame.slice(6)))
+          }
+        }
+      })
+    })
+    req.end()
+    openReqs.push(req)
+    return frames
+  }
+
+  try {
+    viewer = await startMemoryViewer({
+      socketPath: join(socketDir, 'viewer.sock'),
+      host: '127.0.0.1',
+      port: 0,
+      pollMs: 60000,
+      now: () => nowSec,
+    })
+
+    // 1. Initial /events without since_seq sends full corpus with compacted topic_pages, while /api/state retains full topic_pages
+    const fullFrames = connectSse('/events')
+    const mobileFrames = connectSse('/mobile/events')
+    for (let i = 0; i < 20 && (fullFrames.length < 1 || mobileFrames.length < 1); i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(fullFrames.length, 1, 'initial /events connection receives 1 frame')
+    assert.equal(mobileFrames.length, 1, 'initial /mobile/events connection receives 1 frame')
+    assert.equal(fullFrames[0].corpus_unchanged, false)
+    assert.equal(Array.isArray(fullFrames[0].records), true)
+    assert.equal(fullFrames[0].records.length, 1)
+    assert.equal(fullFrames[0].topic_pages.nvoy.above_the_line, undefined, 'client topic_pages omits duplicate above_the_line claim arrays')
+    assert.equal(fullFrames[0].topic_pages.nvoy.below_the_line.active_timeline, undefined, 'client topic_pages omits duplicate active_timeline array')
+    assert(Array.isArray(fullFrames[0].topic_pages.nvoy.below_the_line.entity_links.prs), 'client topic_pages preserves entity_links')
+    assert.equal(
+      Array.isArray(viewer.getState().topic_pages.nvoy.below_the_line.active_timeline),
+      true,
+      'server state (/api/state & /topics/*.md) still retains full topic_pages'
+    )
+
+    // 2. Initial /events?since_seq=<matching>&since_claims=<matching>&since_digest=<matching> sends compact delta frame without duplicating corpus
+    const curState = viewer.getState()
+    const sinceFrames = connectSse(
+      `/events?since_seq=${curState.store_state.write_seq}&since_claims=${curState.store_state.current_claims}&since_digest=${curState.corpus_digest}`
+    )
+    for (let i = 0; i < 20 && sinceFrames.length < 1; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(sinceFrames.length, 1)
+    assert.equal(sinceFrames[0].corpus_unchanged, true, 'matching since_seq/since_claims/since_digest receives compact delta on connect')
+    assert.equal(sinceFrames[0].records, undefined, 'compact delta omits records array')
+    assert.equal(sinceFrames[0].topic_pages, undefined, 'compact delta omits topic_pages')
+    assert.equal(sinceFrames[0].consolidated_sources, undefined, 'compact delta omits consolidated_sources')
+    assert.equal(sinceFrames[0].constellation_links, undefined, 'compact delta omits constellation_links')
+
+    // 2b. Malformed percent-encoding in since_seq / since_claims (/events?since_seq=%&since_claims=%) must not throw URIError or crash viewer
+    const malformedFrames = connectSse('/events?since_seq=%&since_claims=%')
+    for (let i = 0; i < 20 && malformedFrames.length < 1; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(malformedFrames.length, 1, 'malformed since_seq=% request stays up and falls back to full corpus frame')
+    assert.equal(malformedFrames[0].corpus_unchanged, false)
+    assert.equal(Array.isArray(malformedFrames[0].records), true)
+
+    // 3. Unchanged poll broadcasts ZERO SSE frames to desktop or mobile clients
+    nowSec += 3
+    await viewer.pollOnce({ forceFull: false })
+    await new Promise(r => setTimeout(r, 40))
+    assert.equal(fullFrames.length, 1, 'unchanged poll must not broadcast redundant desktop SSE frame')
+    assert.equal(sinceFrames.length, 1, 'unchanged poll must not broadcast redundant delta SSE frame')
+    assert.equal(mobileFrames.length, 1, 'unchanged poll must not broadcast redundant mobile SSE frame')
+
+    // 4. Activity-only poll (write_seq unchanged, new recall activity) broadcasts compact delta frame (corpus_unchanged: true)
+    nowSec += 3
+    // Trigger a recall on biggy's reader socket via the daemon's socket server
+    await new Promise((resolveCall, rejectCall) => {
+      import('node:net').then(({ createConnection }) => {
+        const sock = createConnection(join(socketDir, 'biggy.sock'))
+        sock.on('error', rejectCall)
+        sock.on('connect', () => {
+          sock.write(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: 1,
+              method: 'tools/call',
+              params: { name: 'memory_query', arguments: { topic: 'nvoy' } },
+            }) + '\n'
+          )
+        })
+        sock.on('data', chunk => {
+          if (String(chunk).includes('"id":1')) {
+            sock.end()
+            resolveCall()
+          }
+        })
+      })
+    })
+    await viewer.pollOnce({ forceFull: false })
+    for (let i = 0; i < 20 && fullFrames.length < 2; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(fullFrames.length, 2, 'activity change broadcasts 1 update frame')
+    assert.equal(fullFrames[1].corpus_unchanged, true, 'activity-only update must set corpus_unchanged: true')
+    assert.equal(fullFrames[1].records, undefined, 'activity-only update must omit records array')
+    assert.equal(mobileFrames.length, 2, 'activity change updates mobile SSE client')
+
+    // 5. Store write (write_seq advances) broadcasts full corpus frame (corpus_unchanged: false)
+    nowSec += 3
+    const secondEv = finalizeEvent(buildClaimTemplate({
+      pubkey: peerPk,
+      scope: `room:${room}`,
+      slug: 'nvoy-viewer-sse-383-second',
+      topic: 'nvoy',
+      claim: 'Second claim advancing write_seq for full SSE broadcast',
+      because: 'Regression fixture',
+      evidence: ['PR #383'],
+      asOfGit: 'nvoy@523feac',
+      memoryGlobalChannelId: room,
+      nowSec,
+    }), peerSk)
+    assert.equal(daemon.store.submit({ writer: 'biggy', event: secondEv, nowSec }).accepted, true)
+    await viewer.pollOnce({ forceFull: false })
+    for (let i = 0; i < 20 && fullFrames.length < 3; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(fullFrames.length, 3, 'write_seq advance broadcasts incremental corpus_delta frame')
+    assert.equal(fullFrames[2].corpus_unchanged, false)
+    assert.equal(fullFrames[2].records, undefined, 'incremental write sends corpus_delta instead of full records')
+    assert.equal(fullFrames[2].corpus_delta?.mode, 'delta')
+    assert.equal(fullFrames[2].corpus_delta?.upserted_records?.length, 1)
+    assert.equal(fullFrames[2].corpus_delta?.upserted_records?.[0]?.event_id, secondEv.id)
+    const appliedStep5 = applyClientCorpusDelta(fullFrames[0], fullFrames[2])
+    assert.equal(appliedStep5.needs_full_resync, false)
+    assert.equal(appliedStep5.records.length, 2)
+
+    // 5b. Same-count visible record change at unchanged write_seq / current_claims / reader_pubkey must broadcast full corpus (corpus_unchanged: false)
+    const roomA = '11111111-2222-4333-8444-555555555555'
+    const roomB = '66666666-7777-4888-8999-aaaaaaaaaaaa'
+    daemon.store.setConfig(
+      validateAndResolveConfig({
+        memoryGlobalChannelId: room,
+        ownerPubkey: ownerPk,
+        maxUnbackedSec: 3600,
+        globalWriters: [ownerPk],
+        canonWriters: [ownerPk],
+        readers: { viewer: viewerPk, biggy: peerPk },
+        writers: { james: { pubkey: ownerPk, perHour: 30 }, biggy: { pubkey: peerPk, perHour: 30 } },
+        rooms: {
+          [room]: { members: [ownerPk, peerPk, viewerPk], writers: [ownerPk, peerPk] },
+          [roomA]: { members: [ownerPk, peerPk, viewerPk], writers: [ownerPk, peerPk] },
+          [roomB]: { members: [ownerPk, peerPk], writers: [ownerPk, peerPk] },
+        },
+      })
+    )
+    nowSec += 3
+    const roomAEv = finalizeEvent(buildClaimTemplate({
+      pubkey: peerPk,
+      scope: `room:${roomA}`,
+      slug: 'room-a-only-claim',
+      topic: 'nvoy',
+      claim: 'Room A claim visible before membership swap',
+      because: 'Regression fixture',
+      evidence: ['PR #384'],
+      asOfGit: 'nvoy@45ec9a9',
+      memoryGlobalChannelId: room,
+      nowSec,
+    }), peerSk)
+    const roomBEv = finalizeEvent(buildClaimTemplate({
+      pubkey: peerPk,
+      scope: `room:${roomB}`,
+      slug: 'room-b-only-claim',
+      topic: 'nvoy',
+      claim: 'Room B claim visible after membership swap',
+      because: 'Regression fixture',
+      evidence: ['PR #384'],
+      asOfGit: 'nvoy@45ec9a9',
+      memoryGlobalChannelId: room,
+      nowSec: nowSec + 1,
+    }), peerSk)
+    assert.equal(daemon.store.submit({ writer: 'biggy', event: roomAEv, nowSec }).accepted, true)
+    assert.equal(daemon.store.submit({ writer: 'biggy', event: roomBEv, nowSec: nowSec + 1 }).accepted, true)
+    nowSec += 3
+    await viewer.pollOnce({ forceFull: false })
+    for (let i = 0; i < 20 && fullFrames.length < 4; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(fullFrames.length, 4)
+    assert.equal(fullFrames[3].corpus_unchanged, false)
+    assert.equal(fullFrames[3].records.length, 3)
+    assert(fullFrames[3].records.some(r => r.event_id === roomAEv.id), 'room A claim initially visible')
+    assert(!fullFrames[3].records.some(r => r.event_id === roomBEv.id), 'room B claim initially hidden')
+    const preSwapState = viewer.getState()
+
+    // Swap viewerPk membership from roomA to roomB without any new writes: write_seq, current_claims, reader_pubkey, and records.length stay identical!
+    daemon.store.setConfig(
+      validateAndResolveConfig({
+        memoryGlobalChannelId: room,
+        ownerPubkey: ownerPk,
+        maxUnbackedSec: 3600,
+        globalWriters: [ownerPk],
+        canonWriters: [ownerPk],
+        readers: { viewer: viewerPk, biggy: peerPk },
+        writers: { james: { pubkey: ownerPk, perHour: 30 }, biggy: { pubkey: peerPk, perHour: 30 } },
+        rooms: {
+          [room]: { members: [ownerPk, peerPk, viewerPk], writers: [ownerPk, peerPk] },
+          [roomA]: { members: [ownerPk, peerPk], writers: [ownerPk, peerPk] },
+          [roomB]: { members: [ownerPk, peerPk, viewerPk], writers: [ownerPk, peerPk] },
+        },
+      })
+    )
+    nowSec += 3
+    await viewer.pollOnce({ forceFull: false })
+    for (let i = 0; i < 20 && fullFrames.length < 5; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(fullFrames.length, 5, 'same-count visible record swap must broadcast SSE update')
+    assert.equal(fullFrames[4].store_state.write_seq, preSwapState.store_state.write_seq, 'write_seq is unchanged')
+    assert.equal(fullFrames[4].store_state.current_claims, preSwapState.store_state.current_claims, 'visible current_claims count is unchanged')
+    assert.equal(
+      fullFrames[4].corpus_unchanged,
+      false,
+      'same-count visible record swap at unchanged write_seq must send full corpus (corpus_unchanged: false), never delta'
+    )
+    assert.equal(Array.isArray(fullFrames[4].records), true)
+    assert.equal(fullFrames[4].records.length, 3)
+    assert(!fullFrames[4].records.some(r => r.event_id === roomAEv.id), 'revoked room A claim must be removed from SSE records')
+    assert(fullFrames[4].records.some(r => r.event_id === roomBEv.id), 'newly visible room B claim must be present in SSE records')
+
+    // Connecting with stale since_digest at matching since_seq & since_claims also receives full corpus
+    const staleDigestFrames = connectSse(
+      `/events?since_seq=${preSwapState.store_state.write_seq}&since_claims=${preSwapState.store_state.current_claims}&since_digest=${preSwapState.corpus_digest}`
+    )
+    for (let i = 0; i < 20 && staleDigestFrames.length < 1; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(staleDigestFrames.length, 1)
+    assert.equal(staleDigestFrames[0].corpus_unchanged, false, 'stale since_digest at matching since_seq must receive full corpus')
+    assert.equal(Array.isArray(staleDigestFrames[0].records), true)
+
+    // Connecting without since_digest (e.g., pre-upgrade page reconnecting after same-count visibility swap) must also receive full corpus
+    const noDigestFrames = connectSse(
+      `/events?since_seq=${preSwapState.store_state.write_seq}&since_claims=${preSwapState.store_state.current_claims}`
+    )
+    for (let i = 0; i < 20 && noDigestFrames.length < 1; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(noDigestFrames.length, 1)
+    assert.equal(noDigestFrames[0].corpus_unchanged, false, 'no-digest reconnect at matching since_seq & since_claims must receive full corpus')
+    assert.equal(Array.isArray(noDigestFrames[0].records), true)
+    assert(!noDigestFrames[0].records.some(r => r.event_id === roomAEv.id), 'no-digest reconnect must not retain revoked room A claim')
+    assert(noDigestFrames[0].records.some(r => r.event_id === roomBEv.id), 'no-digest reconnect must receive newly visible room B claim')
+
+    // 6. Slow-client backpressure coalescing and max buffer enforcement
+    const mockMap = new Map()
+    const written = []
+    let drainHandler = null
+    let destroyed = false
+    const mockRes = {
+      destroyed: false,
+      writableEnded: false,
+      writableNeedDrain: false,
+      writableLength: 0,
+      on(ev, fn) {
+        if (ev === 'drain') drainHandler = fn
+      },
+      removeListener(ev, fn) {
+        if (ev === 'drain' && drainHandler === fn) drainHandler = null
+      },
+      write(payload) {
+        written.push(payload)
+        // Simulate TCP send buffer filling on the first write
+        this.writableNeedDrain = true
+        return false
+      },
+      destroy() {
+        destroyed = true
+        this.destroyed = true
+      },
+    }
+    const entry = registerSseClient(mockMap, { on() {} }, mockRes, 'corpus-k1')
+    // Write 1 succeeds into kernel buffer but signals backpressure (returns false)
+    assert.equal(writeToSseClient(mockMap, mockRes, 'frame-1', { corpusKey: 'corpus-k1' }), false)
+    assert.equal(entry.waitingDrain, true)
+    assert.equal(entry.sentCorpusKey, 'corpus-k1')
+    assert.equal(written.length, 1)
+
+    // While backpressured, corpus advances to 'corpus-k2' (frame-2-full), then an activity poll happens at 'corpus-k2' (frame-3).
+    // Because entry.sentCorpusKey is still 'corpus-k1' (!== 'corpus-k2'), the caller sees entry.sentCorpusKey !== 'corpus-k2'
+    // and coalesces frame-3 with corpusKey: 'corpus-k2' so the client never misses the corpus update!
+    assert.equal(writeToSseClient(mockMap, mockRes, 'frame-2-full', { corpusKey: 'corpus-k2' }), false)
+    assert.equal(entry.sentCorpusKey, 'corpus-k1', 'coalesced pending frame must not advance sentCorpusKey before write')
+    assert.equal(entry.pendingPayload, 'frame-2-full')
+    assert.equal(entry.pendingCorpusKey, 'corpus-k2')
+    // Keepalive while backpressured is dropped without overwriting pendingPayload
+    assert.equal(writeToSseClient(mockMap, mockRes, ': keepalive\n\n', { isKeepalive: true }), false)
+    assert.equal(entry.pendingPayload, 'frame-2-full', 'keepalive must not overwrite pending snapshot')
+    // Second coalesced update overwrites pendingPayload
+    assert.equal(writeToSseClient(mockMap, mockRes, 'frame-3-full', { corpusKey: 'corpus-k2' }), false)
+    assert.equal(entry.droppedFrames, 2)
+    assert.equal(written.length, 1, 'no additional res.write calls while waiting for drain')
+
+    // Drain fires -> flushes only the latest coalesced frame ('frame-3-full') and updates sentCorpusKey to 'corpus-k2'
+    mockRes.writableNeedDrain = false
+    drainHandler()
+    assert.deepEqual(written, ['frame-1', 'frame-3-full'])
+    assert.equal(entry.sentCorpusKey, 'corpus-k2')
+    assert.equal(entry.pendingPayload, null)
+
+    // Exceeding MAX_SSE_CLIENT_BUFFER_BYTES disconnects and removes wedged client
+    mockRes.writableLength = MAX_SSE_CLIENT_BUFFER_BYTES + 1
+    assert.equal(writeToSseClient(mockMap, mockRes, 'frame-overflow', { corpusKey: 'corpus-k2' }), false)
+    assert.equal(destroyed, true, 'wedged client exceeding MAX_SSE_CLIENT_BUFFER_BYTES must be destroyed')
+    assert.equal(mockMap.has(mockRes), false, 'destroyed client must be removed from clientMap')
+  } finally {
+    for (const r of openReqs) {
+      try {
+        r.destroy()
+      } catch {
+        /* ignore */
+      }
+    }
+    if (viewer) await viewer.stop()
+    await daemon.close()
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+// ── Test 18: nvoy #385 per-write SSE deltas, first-load slimming, /api/records, and 1x/2x/5x scale ──
+await test('nvoy #385 regression: per-write SSE deltas, first-load slimming, /api/records, and 1x/2x/5x scale', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'hive-viewer-385-'))
+  const dbPath = join(tmp, 'memory.sqlite')
+  const ledgerPath = join(tmp, 'events.ndjson')
+  const receiptPath = join(tmp, 'backup.json')
+  const socketDir = join(tmp, 'socks')
+  const ownerSk = generateSecretKey()
+  const ownerPk = getPublicKey(ownerSk)
+  const peerSk = generateSecretKey()
+  const peerPk = getPublicKey(peerSk)
+  const viewerSk = generateSecretKey()
+  const viewerPk = getPublicKey(viewerSk)
+  const room = 'a8186b53-537d-46ad-a7e7-b6486c58970e'
+  const secretRoom = 'b9297c64-648e-57be-b8f8-c7597d69081f'
+  let nowSec = 1794530000
+
+  initEmptyStore({ dbPath, ledgerPath })
+  recordVerifiedBackup({ receiptPath, snapshotId: SNAP_ID, writeSeq: 1, at: nowSec })
+
+  const daemon = await startMemoryDaemon({
+    dbPath,
+    ledgerPath,
+    receiptPath,
+    config: {
+      memoryGlobalChannelId: room,
+      ownerPubkey: ownerPk,
+      maxUnbackedSec: 3600,
+      globalWriters: [ownerPk],
+      canonWriters: [ownerPk],
+      readers: { viewer: viewerPk, biggy: peerPk },
+      writers: { james: { pubkey: ownerPk, perHour: 3600 }, biggy: { pubkey: peerPk, perHour: 3600 } },
+      rooms: {
+        [room]: { members: [ownerPk, peerPk, viewerPk], writers: [ownerPk, peerPk] },
+        [secretRoom]: { members: [ownerPk, peerPk, viewerPk], writers: [ownerPk, peerPk] },
+      },
+    },
+    readers: ['viewer', 'biggy'],
+    writers: ['james', 'biggy'],
+    socketDir,
+    log: () => {},
+  })
+
+  let viewer = null
+  const openReqs = new Set()
+  try {
+    // Seed 60 claims across 3 topics so total_records (60) exceeds INITIAL_STATE_RECORDS_LIMIT (48)
+    const topics = ['nvoy', 'hive-memory', 'herd-infra']
+    for (let i = 1; i <= 58; i++) {
+      const ev = finalizeEvent(buildClaimTemplate({
+        pubkey: peerPk,
+        scope: `room:${room}`,
+        slug: `claim-seed-${String(i).padStart(3, '0')}`,
+        topic: topics[i % topics.length],
+        claim: `Seed claim #${i} with realistic payload text for memory-viewer delta and first-load scaling verification.`,
+        because: `Seed fixture #${i} for nvoy #385`,
+        evidence: [`test/memory-viewer.mjs#seed-${i}`],
+        asOfGit: 'nvoy@0bf696e',
+        memoryGlobalChannelId: room,
+        nowSec: nowSec + i,
+      }), peerSk)
+      assert.equal(daemon.store.submit({ writer: 'biggy', event: ev, nowSec: nowSec + i }).accepted, true)
+    }
+    nowSec += 60
+    for (let i = 1; i <= 2; i++) {
+      const canonEv = finalizeEvent(buildClaimTemplate({
+        pubkey: ownerPk,
+        scope: 'hive:canon',
+        slug: `canon-seed-${i}`,
+        topic: 'nvoy',
+        claim: `Standing canon rule #${i} prioritized on first screen regardless of write order.`,
+        because: 'Canon seed fixture',
+        evidence: ['PR #385'],
+        asOfGit: 'nvoy@0bf696e',
+        memoryGlobalChannelId: room,
+        nowSec: nowSec + i,
+      }), ownerSk)
+      assert.equal(daemon.store.submit({ writer: 'james', event: canonEv, nowSec: nowSec + i }).accepted, true)
+    }
+    nowSec += 10
+    recordVerifiedBackup({
+      receiptPath,
+      snapshotId: SNAP_ID,
+      writeSeq: daemon.store.storeState().write_seq,
+      at: nowSec,
+    })
+
+    viewer = await startMemoryViewer({
+      socketPath: join(socketDir, 'viewer.sock'),
+      host: '127.0.0.1',
+      port: 0,
+      pollMs: 60000,
+      now: () => nowSec,
+    })
+
+    const getRaw = path =>
+      new Promise((resolve, reject) => {
+        const req = httpRequest({ host: '127.0.0.1', port: viewer.port, path, method: 'GET' }, res => {
+          const chunks = []
+          res.on('data', c => chunks.push(c))
+          res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }))
+        })
+        req.on('error', reject)
+        req.end()
+      })
+
+    const connectSse = path => {
+      const frames = []
+      const req = httpRequest({ host: '127.0.0.1', port: viewer.port, path, method: 'GET' }, res => {
+        res.setEncoding('utf8')
+        let buf = ''
+        res.on('data', chunk => {
+          buf += chunk
+          let idx
+          while ((idx = buf.indexOf('\n\n')) >= 0) {
+            const raw = buf.slice(0, idx)
+            buf = buf.slice(idx + 2)
+            for (const line of raw.split('\n')) {
+              if (line.startsWith('data: ')) {
+                frames.push(JSON.parse(line.slice(6)))
+              }
+            }
+          }
+        })
+      })
+      req.on('error', () => {})
+      req.end()
+      openReqs.add(req)
+      return frames
+    }
+
+    // 1. First-load corpus slimming on `/` and `/mobile`
+    const rootRes = await getRaw('/')
+    assert.equal(rootRes.status, 200)
+    const rootBytes = Buffer.byteLength(rootRes.body, 'utf8')
+    assert(
+      rootBytes < FIRST_LOAD_HTML_BUDGET_BYTES,
+      `expected / first-load HTML < ${FIRST_LOAD_HTML_BUDGET_BYTES} bytes, got ${rootBytes}`
+    )
+    const initMatch = rootRes.body.match(/<script id="initial-state" type="application\/json">([\s\S]*?)<\/script>/)
+    assert(initMatch, 'expected <script id="initial-state"> in / HTML')
+    const initialState = JSON.parse(initMatch[1])
+    assert.equal(initialState.records.length, INITIAL_STATE_RECORDS_LIMIT, 'first-load embeds only INITIAL_STATE_RECORDS_LIMIT records')
+    assert.equal(initialState.records_truncated, true, 'first-load marks records_truncated: true when total > limit')
+    assert.equal(initialState.total_records, 60, 'first-load preserves total_records count')
+    assert.equal(
+      initialState.records.filter(r => r.scope === 'hive:canon').length,
+      2,
+      'first-load prioritizes all hive:canon records in initial screen slice'
+    )
+
+    const mobileRes = await getRaw('/mobile')
+    assert.equal(mobileRes.status, 200)
+    const mobileBytes = Buffer.byteLength(mobileRes.body, 'utf8')
+    assert(
+      mobileBytes < MOBILE_HTML_BUDGET_BYTES,
+      `expected /mobile first-load HTML < ${MOBILE_HTML_BUDGET_BYTES} bytes, got ${mobileBytes}`
+    )
+
+    // 2. On-demand `/api/records` by topic, scope, search query, pagination, and include_corpus
+    const topicRes = await getRaw('/api/records?topic=nvoy&limit=100')
+    assert.equal(topicRes.status, 200)
+    const topicBody = JSON.parse(topicRes.body)
+    assert(topicBody.records.length > 0 && topicBody.records.every(r => r.topic === 'nvoy'))
+    assert.equal(topicBody.total_records, 60)
+
+    const canonScopeRes = await getRaw('/api/records?scope=hive:canon')
+    assert.equal(canonScopeRes.status, 200)
+    const canonScopeBody = JSON.parse(canonScopeRes.body)
+    assert.equal(canonScopeBody.total_matched, 2)
+    assert.equal(canonScopeBody.records.length, 2)
+
+    const searchRes = await getRaw('/api/records?q=claim-seed-005')
+    assert.equal(searchRes.status, 200)
+    const searchBody = JSON.parse(searchRes.body)
+    assert.equal(searchBody.total_matched, 1)
+    assert(searchBody.records[0].d.endsWith(':claim-seed-005'))
+
+    const pageRes = await getRaw(`/api/records?offset=${INITIAL_STATE_RECORDS_LIMIT}&limit=50&include_corpus=1`)
+    assert.equal(pageRes.status, 200)
+    const pageBody = JSON.parse(pageRes.body)
+    assert.equal(pageBody.records.length, 60 - INITIAL_STATE_RECORDS_LIMIT)
+    assert.equal(pageBody.next_offset, null)
+    assert(pageBody.topic_pages && typeof pageBody.topic_pages === 'object', 'include_corpus=1 returns topic_pages')
+    assert(pageBody.entity_graph_stats && typeof pageBody.entity_graph_stats === 'object', 'include_corpus=1 returns entity_graph_stats')
+
+    const badQueryRes = await getRaw('/api/records?q=%E0%A4%A')
+    assert.equal(badQueryRes.status, 400, 'malformed URI component in /api/records returns 400')
+
+    // 3. Per-write SSE deltas: add, supersede, and withdraw
+    const sseFrames = connectSse('/events')
+    for (let i = 0; i < 20 && sseFrames.length < 1; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(sseFrames.length, 1)
+    let clientState = sseFrames[0]
+    assert.equal(Array.isArray(clientState.records), true)
+    assert.equal(clientState.records.length, 60)
+    const initialFullFrameBytes = Buffer.byteLength(JSON.stringify(clientState), 'utf8')
+
+    // 3a. Single claim add -> SSE frame sends corpus_delta with 1 upserted record
+    nowSec += 5
+    const addedEv = finalizeEvent(buildClaimTemplate({
+      pubkey: peerPk,
+      scope: `room:${room}`,
+      slug: 'delta-added-claim',
+      topic: 'nvoy',
+      claim: 'Newly added claim delivered via incremental SSE corpus_delta.',
+      because: 'Testing nvoy #385 add delta',
+      evidence: ['PR #385'],
+      asOfGit: 'nvoy@0bf696e',
+      memoryGlobalChannelId: room,
+      nowSec,
+    }), peerSk)
+    assert.equal(daemon.store.submit({ writer: 'biggy', event: addedEv, nowSec }).accepted, true)
+    await viewer.pollOnce({ forceFull: false })
+    for (let i = 0; i < 20 && sseFrames.length < 2; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(sseFrames.length, 2)
+    const addDeltaFrame = sseFrames[1]
+    const addDeltaBytes = Buffer.byteLength(JSON.stringify(addDeltaFrame), 'utf8')
+    assert.equal(addDeltaFrame.records, undefined, 'add delta frame omits full records array')
+    assert.equal(addDeltaFrame.corpus_delta?.mode, 'delta')
+    assert.equal(addDeltaFrame.corpus_delta?.upserted_records?.length, 1)
+    assert.equal(addDeltaFrame.corpus_delta?.upserted_records?.[0]?.event_id, addedEv.id)
+    assert.equal(addDeltaFrame.corpus_delta?.removed_event_ids?.length, 0)
+    assert(
+      addDeltaBytes < initialFullFrameBytes * 0.45,
+      `expected single-write delta frame (${addDeltaBytes}B) << full frame (${initialFullFrameBytes}B)`
+    )
+    clientState = applyClientCorpusDelta(clientState, addDeltaFrame)
+    assert.equal(clientState.needs_full_resync, false)
+    assert.equal(clientState.records.length, 61)
+    assert(clientState.records.some(r => r.event_id === addedEv.id))
+
+    // 3b. Claim supersede -> SSE frame sends corpus_delta with new event_id in upserted_records and old event_id in removed_event_ids
+    nowSec += 5
+    const supersedeEv = finalizeEvent(buildClaimTemplate({
+      pubkey: peerPk,
+      scope: `room:${room}`,
+      slug: 'delta-added-claim',
+      topic: 'nvoy',
+      claim: 'Superseded claim text replacing delta-added-claim in place.',
+      because: 'Testing nvoy #385 supersede delta',
+      evidence: ['PR #385'],
+      asOfGit: 'nvoy@0bf696e',
+      supersedes: [addedEv.id],
+      memoryGlobalChannelId: room,
+      nowSec,
+    }), peerSk)
+    assert.equal(daemon.store.submit({ writer: 'biggy', event: supersedeEv, expectedPriorId: addedEv.id, nowSec }).accepted, true)
+    await viewer.pollOnce({ forceFull: false })
+    for (let i = 0; i < 20 && sseFrames.length < 3; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(sseFrames.length, 3)
+    const supDeltaFrame = sseFrames[2]
+    assert.equal(supDeltaFrame.records, undefined)
+    assert.equal(supDeltaFrame.corpus_delta?.mode, 'delta')
+    assert.equal(supDeltaFrame.corpus_delta?.upserted_records?.length, 1)
+    assert.equal(supDeltaFrame.corpus_delta?.upserted_records?.[0]?.event_id, supersedeEv.id)
+    assert(supDeltaFrame.corpus_delta?.removed_event_ids?.includes(addedEv.id), 'superseded event_id listed in removed_event_ids')
+    clientState = applyClientCorpusDelta(clientState, supDeltaFrame)
+    assert.equal(clientState.needs_full_resync, false)
+    assert.equal(clientState.records.length, 61)
+    assert(!clientState.records.some(r => r.event_id === addedEv.id), 'old superseded event_id removed from client records')
+    assert(clientState.records.some(r => r.event_id === supersedeEv.id), 'new superseding event_id present in client records')
+
+    // 3c. Claim withdrawal -> SSE frame sends corpus_delta removing the withdrawn claim and marking historical supersession
+    // Capture a pre-withdrawal /api/records response to verify a delayed HTTP response cannot reinsert the withdrawn claim
+    const preWithdrawFetchBody = JSON.parse((await getRaw('/api/records?topic=nvoy&limit=200')).body)
+    assert(
+      preWithdrawFetchBody.records.some(r => r.event_id === supersedeEv.id),
+      'pre-withdrawal /api/records response contains supersedeEv'
+    )
+    const preWithdrawReqGen = clientState.corpus_reset_gen
+    const preWithdrawReqDigest = clientState.corpus_digest
+
+    nowSec += 5
+    const withdrawEv = finalizeEvent(buildWithdrawalTemplate({
+      pubkey: peerPk,
+      priorEvent: supersedeEv,
+      scope: `room:${room}`,
+      slug: 'delta-added-claim',
+      because: 'Testing nvoy #385 withdrawal delta',
+      memoryGlobalChannelId: room,
+      nowSec,
+    }).replacement, peerSk)
+    assert.equal(daemon.store.submit({ writer: 'biggy', event: withdrawEv, expectedPriorId: supersedeEv.id, nowSec }).accepted, true)
+    await viewer.pollOnce({ forceFull: false })
+    for (let i = 0; i < 20 && sseFrames.length < 4; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(sseFrames.length, 4)
+    const withdrawDeltaFrame = sseFrames[3]
+    assert.equal(withdrawDeltaFrame.records, undefined)
+    assert.equal(withdrawDeltaFrame.corpus_delta?.mode, 'delta')
+    assert.equal(withdrawDeltaFrame.corpus_delta?.upserted_records?.length, 0)
+    assert(withdrawDeltaFrame.corpus_delta?.removed_event_ids?.includes(supersedeEv.id), 'withdrawn current claim event_id removed')
+    assert(
+      withdrawDeltaFrame.corpus_delta?.removed_fact_keys?.includes(`${peerPk}:hive-memory:room:${room}:delta-added-claim`),
+      'withdrawn fact_key included in removed_fact_keys'
+    )
+    clientState = applyClientCorpusDelta(clientState, withdrawDeltaFrame)
+    assert.equal(clientState.needs_full_resync, false)
+    assert.equal(clientState.records.length, 60, 'withdrawn claim cleanly removed from active client records')
+    assert(!clientState.records.some(r => String(r.d || '').endsWith(':delta-added-claim')))
+
+    // Delayed pre-withdrawal /api/records HTTP response arriving after withdrawal SSE delta must be rejected
+    const delayedPreWithdrawMerge = applyClientRecordsResponse(clientState, preWithdrawFetchBody, {
+      mode: 'merge',
+      requestCorpusGen: preWithdrawReqGen,
+      requestDigest: preWithdrawReqDigest,
+    })
+    assert.equal(delayedPreWithdrawMerge.applied, false, 'delayed pre-withdrawal /api/records response must be rejected')
+    assert.equal(delayedPreWithdrawMerge.rejected_reason, 'stale_corpus_digest')
+    assert(
+      !delayedPreWithdrawMerge.records.some(r => r.event_id === supersedeEv.id),
+      'withdrawn claim must never be reinserted by a delayed /api/records response'
+    )
+
+    // 4. Reconnect with since_seq + since_claims + since_digest within MAX_CORPUS_HISTORY receives cumulative delta
+    const checkpointState = sseFrames[0] // at write_seq 60, before add+supersede+withdraw (now at write_seq 63)
+    const reconnectDeltaFrames = connectSse(
+      `/events?since_seq=${checkpointState.store_state.write_seq}&since_claims=${checkpointState.store_state.current_claims}&since_digest=${checkpointState.corpus_digest}`
+    )
+    for (let i = 0; i < 20 && reconnectDeltaFrames.length < 1; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(reconnectDeltaFrames.length, 1)
+    assert.equal(reconnectDeltaFrames[0].records, undefined, 'reconnect within MAX_CORPUS_HISTORY receives delta frame')
+    assert.equal(reconnectDeltaFrames[0].corpus_delta?.mode, 'delta')
+    assert.equal(reconnectDeltaFrames[0].corpus_delta?.from_seq, checkpointState.store_state.write_seq)
+    assert.equal(reconnectDeltaFrames[0].corpus_delta?.to_seq, withdrawDeltaFrame.store_state.write_seq)
+    const reconnectedState = applyClientCorpusDelta(checkpointState, reconnectDeltaFrames[0])
+    assert.equal(reconnectedState.needs_full_resync, false)
+    assert.equal(reconnectedState.records.length, 60)
+
+    // 5. Client delta trust guard: mismatched from_digest or expected_current_claims flags needs_full_resync
+    const tamperedDigestDelta = {
+      ...addDeltaFrame,
+      corpus_delta: { ...addDeltaFrame.corpus_delta, from_digest: 'deadbeef00000000' },
+    }
+    assert.equal(
+      applyClientCorpusDelta(sseFrames[0], tamperedDigestDelta).needs_full_resync,
+      true,
+      'mismatched from_digest must trigger forced full resync'
+    )
+    const tamperedCountDelta = {
+      ...addDeltaFrame,
+      corpus_delta: { ...addDeltaFrame.corpus_delta, expected_current_claims: 999 },
+    }
+    assert.equal(
+      applyClientCorpusDelta(sseFrames[0], tamperedCountDelta).needs_full_resync,
+      true,
+      'post-apply count drift must trigger forced full resync'
+    )
+
+    // 5b. Delayed on-demand /api/records AND full-resync /api/records?include_corpus=1 across reader ACL revocation
+    assert(rootRes.body.includes('function canMergeFetchedPayload('), 'browser script defines canMergeFetchedPayload guard')
+    assert(rootRes.body.includes('currentAclDigest'), 'browser script tracks currentAclDigest')
+    assert(rootRes.body.includes('currentCorpusEpoch'), 'browser script tracks currentCorpusEpoch')
+    nowSec += 5
+    const secretEv = finalizeEvent(buildClaimTemplate({
+      pubkey: peerPk,
+      scope: `room:${secretRoom}`,
+      slug: 'revoked-secret-claim-385',
+      topic: 'nvoy',
+      claim: 'Sensitive claim in secretRoom that will be revoked by reader ACL change.',
+      because: 'Testing delayed /api/records race across ACL revocation',
+      evidence: ['PR #387'],
+      asOfGit: 'nvoy@0bf696e',
+      memoryGlobalChannelId: room,
+      nowSec,
+    }), peerSk)
+    assert.equal(daemon.store.submit({ writer: 'biggy', event: secretEv, nowSec }).accepted, true)
+    await viewer.pollOnce({ forceFull: false })
+    for (let i = 0; i < 20 && sseFrames.length < 5; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(sseFrames.length, 5)
+    clientState = applyClientCorpusDelta(clientState, sseFrames[4])
+    assert(clientState.records.some(r => r.event_id === secretEv.id), 'secretEv visible before ACL revocation')
+
+    // Capture in-flight partial /api/records?topic=nvoy AND full-resync /api/records?include_corpus=1 under old ACL
+    const oldAclReqGen = clientState.corpus_reset_gen
+    const oldAclResyncSeq = clientState.resync_request_seq
+    const oldAclDigest = clientState.corpus_digest
+    const stalePartialTopicResp = JSON.parse((await getRaw('/api/records?topic=nvoy&limit=200')).body)
+    const staleFullResyncResp = JSON.parse((await getRaw('/api/records?include_corpus=1')).body)
+    assert(stalePartialTopicResp.records.some(r => r.event_id === secretEv.id), 'in-flight topic fetch read secretEv under old ACL')
+    assert(staleFullResyncResp.records.some(r => r.event_id === secretEv.id), 'in-flight full resync read secretEv under old ACL')
+
+    // Revoke viewerPk from secretRoom ACL (without any new write_seq!) and poll viewer
+    daemon.store.setConfig(
+      validateAndResolveConfig({
+        memoryGlobalChannelId: room,
+        ownerPubkey: ownerPk,
+        maxUnbackedSec: 3600,
+        globalWriters: [ownerPk],
+        canonWriters: [ownerPk],
+        readers: { viewer: viewerPk, biggy: peerPk },
+        writers: { james: { pubkey: ownerPk, perHour: 3600 }, biggy: { pubkey: peerPk, perHour: 3600 } },
+        rooms: {
+          [room]: { members: [ownerPk, peerPk, viewerPk], writers: [ownerPk, peerPk] },
+          [secretRoom]: { members: [ownerPk, peerPk], writers: [ownerPk, peerPk] },
+        },
+      })
+    )
+    await viewer.pollOnce({ forceFull: false })
+    for (let i = 0; i < 20 && sseFrames.length < 6; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(sseFrames.length, 6)
+    const aclResetFrame = sseFrames[5]
+    assert.equal(Array.isArray(aclResetFrame.records), true, 'ACL change triggers full SSE scope reset')
+    assert(!aclResetFrame.records.some(r => r.event_id === secretEv.id), 'full SSE scope reset removes revoked secretEv')
+    assert.notEqual(aclResetFrame.acl_digest, stalePartialTopicResp.acl_digest, 'ACL change rotates acl_digest')
+    assert(aclResetFrame.corpus_epoch > stalePartialTopicResp.corpus_epoch, 'ACL change increments corpus_epoch')
+
+    clientState = applyClientCorpusDelta(clientState, aclResetFrame)
+    assert(!clientState.records.some(r => r.event_id === secretEv.id))
+
+    // Now deliver the delayed HTTP responses read under the old ACL (both with and without request generation tokens)
+    const rejectedPartialWithGen = applyClientRecordsResponse(clientState, stalePartialTopicResp, {
+      mode: 'merge',
+      requestCorpusGen: oldAclReqGen,
+      requestDigest: oldAclDigest,
+    })
+    assert.equal(rejectedPartialWithGen.applied, false, 'delayed partial /api/records from old ACL must be rejected (gen guard)')
+    assert(!rejectedPartialWithGen.records.some(r => r.event_id === secretEv.id), 'revoked claim must not be reinserted')
+
+    const rejectedPartialByDigest = applyClientRecordsResponse(clientState, stalePartialTopicResp, {
+      mode: 'merge',
+    })
+    assert.equal(rejectedPartialByDigest.applied, false, 'delayed partial /api/records must also fail digest/ACL comparison directly')
+    assert.equal(rejectedPartialByDigest.rejected_reason, 'stale_corpus_digest')
+    assert(!rejectedPartialByDigest.records.some(r => r.event_id === secretEv.id))
+
+    const rejectedResyncWithSeq = applyClientRecordsResponse(clientState, staleFullResyncResp, {
+      mode: 'resync',
+      requestCorpusGen: oldAclReqGen,
+      requestResyncSeq: oldAclResyncSeq,
+    })
+    assert.equal(rejectedResyncWithSeq.applied, false, 'delayed full-resync from old ACL must be rejected (gen/seq guard)')
+    assert(!rejectedResyncWithSeq.records.some(r => r.event_id === secretEv.id), 'revoked claim must not overwrite SSE reset')
+
+    const rejectedResyncByAcl = applyClientRecordsResponse(clientState, staleFullResyncResp, {
+      mode: 'resync',
+    })
+    assert.equal(rejectedResyncByAcl.applied, false, 'delayed full-resync must also fail acl_digest / corpus_epoch / poll_seq checks directly')
+    assert.equal(rejectedResyncByAcl.rejected_reason, 'stale_acl_digest')
+    assert(!rejectedResyncByAcl.records.some(r => r.event_id === secretEv.id))
+
+    // Verify a fresh /api/records fetch under the new ACL and digest is accepted
+    const freshTopicResp = JSON.parse((await getRaw('/api/records?topic=nvoy&limit=200')).body)
+    const acceptedFreshMerge = applyClientRecordsResponse(
+      { ...clientState, records: clientState.records.slice(0, 10), records_truncated: true },
+      freshTopicResp,
+      {
+        mode: 'merge',
+        requestCorpusGen: clientState.corpus_reset_gen,
+        requestDigest: clientState.corpus_digest,
+      }
+    )
+    assert.equal(acceptedFreshMerge.applied, true, 'fresh /api/records matching current digest, ACL, and epoch must merge')
+    assert(!acceptedFreshMerge.records.some(r => r.event_id === secretEv.id), 'fresh merge still excludes revoked claim')
+
+    // Clean up secretEv so store.current_claims matches viewer-visible claims for step 7
+    nowSec += 1
+    const withdrawSecretEv = finalizeEvent(buildWithdrawalTemplate({
+      pubkey: peerPk,
+      priorEvent: secretEv,
+      scope: `room:${secretRoom}`,
+      slug: 'revoked-secret-claim-385',
+      because: 'Clean up secretRoom fixture after ACL race check',
+      memoryGlobalChannelId: room,
+      nowSec,
+    }).replacement, peerSk)
+    assert.equal(daemon.store.submit({ writer: 'biggy', event: withdrawSecretEv, expectedPriorId: secretEv.id, nowSec }).accepted, true)
+
+    // 6. Advancing past MAX_CORPUS_HISTORY (64 writes) forces reconnect from old checkpoint to fall back to full corpus resync
+    for (let i = 1; i <= MAX_CORPUS_HISTORY + 2; i++) {
+      nowSec += 1
+      const burstEv = finalizeEvent(buildClaimTemplate({
+        pubkey: peerPk,
+        scope: `room:${room}`,
+        slug: `burst-claim-${i}`,
+        topic: 'nvoy',
+        claim: `Burst claim #${i} advancing write_seq beyond MAX_CORPUS_HISTORY`,
+        because: 'History window overflow test',
+        evidence: ['PR #385'],
+        asOfGit: 'nvoy@0bf696e',
+        memoryGlobalChannelId: room,
+        nowSec,
+      }), peerSk)
+      assert.equal(daemon.store.submit({ writer: 'biggy', event: burstEv, nowSec }).accepted, true)
+    }
+    await viewer.pollOnce({ forceFull: false })
+    const overflowReconnectFrames = connectSse(
+      `/events?since_seq=${checkpointState.store_state.write_seq}&since_claims=${checkpointState.store_state.current_claims}&since_digest=${checkpointState.corpus_digest}`
+    )
+    for (let i = 0; i < 20 && overflowReconnectFrames.length < 1; i++) {
+      await new Promise(r => setTimeout(r, 20))
+    }
+    assert.equal(overflowReconnectFrames.length, 1)
+    assert.equal(
+      Array.isArray(overflowReconnectFrames[0].records),
+      true,
+      'client behind by > MAX_CORPUS_HISTORY must receive full corpus resync'
+    )
+    assert.equal(overflowReconnectFrames[0].corpus_delta, undefined)
+
+    // 7. Synthetic corpus scaling benchmark at 1x (310), 2x (620), and 5x (1550) claims
+    // Verifies single-write SSE delta frame stays small & proportional to change (not corpus size),
+    // and first-load HTML for `/` (< 256 KB) and `/mobile` (< 40 KB) stays within budget at 1x, 2x, and 5x.
+    const scaleTargets = [
+      { label: '1x', targetClaims: 310 },
+      { label: '2x', targetClaims: 620 },
+      { label: '5x', targetClaims: 1550 },
+    ]
+    const scaleResults = []
+    let seededCount = daemon.store.storeState().current_claims
+
+    for (const { label, targetClaims } of scaleTargets) {
+      while (seededCount < targetClaims - 1) {
+        seededCount += 1
+        nowSec += 1
+        const scaleEv = finalizeEvent(buildClaimTemplate({
+          pubkey: peerPk,
+          scope: `room:${room}`,
+          slug: `scale-claim-${seededCount}`,
+          topic: topics[seededCount % topics.length],
+          claim: `Synthetic scale claim #${seededCount} testing viewer payload scaling at ${label} corpus size with realistic claim body text.`,
+          because: `Scale benchmark ${label} (#385)`,
+          evidence: [`nvoy#385-${label}`, `commit:0bf696e5fc7c`],
+          asOfGit: 'nvoy@0bf696e',
+          memoryGlobalChannelId: room,
+          nowSec,
+        }), peerSk)
+        assert.equal(daemon.store.submit({ writer: 'biggy', event: scaleEv, nowSec }).accepted, true)
+      }
+      recordVerifiedBackup({
+        receiptPath,
+        snapshotId: SNAP_ID,
+        writeSeq: daemon.store.storeState().write_seq,
+        at: nowSec,
+      })
+      await viewer.pollOnce({ forceFull: true })
+
+      // Connect a fresh SSE client to capture the full baseline frame at this scale, then perform 1 write
+      const scaleFrames = connectSse('/events')
+      for (let i = 0; i < 30 && scaleFrames.length < 1; i++) {
+        await new Promise(r => setTimeout(r, 20))
+      }
+      assert.equal(scaleFrames.length, 1)
+      const fullCorpusSseBytes = Buffer.byteLength(`data: ${JSON.stringify(scaleFrames[0])}\n\n`, 'utf8')
+
+      // Perform a single write at this scale
+      seededCount += 1
+      nowSec += 1
+      const singleWriteEv = finalizeEvent(buildClaimTemplate({
+        pubkey: peerPk,
+        scope: `room:${room}`,
+        slug: `scale-single-write-${label}`,
+        topic: 'nvoy',
+        claim: `Single incremental write at ${label} scale (${targetClaims} total claims).`,
+        because: `Verify O(delta) SSE broadcast at ${label}`,
+        evidence: [`nvoy#385-${label}`],
+        asOfGit: 'nvoy@0bf696e',
+        memoryGlobalChannelId: room,
+        nowSec,
+      }), peerSk)
+      assert.equal(daemon.store.submit({ writer: 'biggy', event: singleWriteEv, nowSec }).accepted, true)
+      await viewer.pollOnce({ forceFull: false })
+      for (let i = 0; i < 30 && scaleFrames.length < 2; i++) {
+        await new Promise(r => setTimeout(r, 20))
+      }
+      assert.equal(scaleFrames.length, 2, `expected incremental SSE frame at ${label}`)
+      assert.equal(scaleFrames[1].records, undefined, `single write at ${label} must omit full records`)
+      assert.equal(scaleFrames[1].corpus_delta?.mode, 'delta')
+      assert.equal(scaleFrames[1].corpus_delta?.upserted_records?.length, 1)
+      const deltaSseBytes = Buffer.byteLength(`data: ${JSON.stringify(scaleFrames[1])}\n\n`, 'utf8')
+
+      const slashHtmlRes = await getRaw('/')
+      const slashHtmlBytes = Buffer.byteLength(slashHtmlRes.body, 'utf8')
+      const mobileHtmlRes = await getRaw('/mobile')
+      const mobileHtmlBytes = Buffer.byteLength(mobileHtmlRes.body, 'utf8')
+
+      assert(
+        slashHtmlBytes < FIRST_LOAD_HTML_BUDGET_BYTES,
+        `expected / first-load HTML at ${label} < ${FIRST_LOAD_HTML_BUDGET_BYTES} bytes, got ${slashHtmlBytes}`
+      )
+      assert(
+        mobileHtmlBytes < MOBILE_HTML_BUDGET_BYTES,
+        `expected /mobile first-load HTML at ${label} < ${MOBILE_HTML_BUDGET_BYTES} bytes, got ${mobileHtmlBytes}`
+      )
+      assert(
+        deltaSseBytes < 40_000,
+        `expected single-write SSE delta frame at ${label} < 40000 bytes, got ${deltaSseBytes}`
+      )
+
+      scaleResults.push({
+        label,
+        claims: targetClaims,
+        fullCorpusSseBytes,
+        deltaSseBytes,
+        slashHtmlBytes,
+        mobileHtmlBytes,
+      })
+    }
+
+    // Verify single-write SSE delta frame does NOT scale with total claim count (5x delta stays within +15% of 1x delta)
+    assert(
+      scaleResults[2].deltaSseBytes <= scaleResults[0].deltaSseBytes * 1.15,
+      `expected 5x single-write SSE delta (${scaleResults[2].deltaSseBytes}B) to stay flat vs 1x (${scaleResults[0].deltaSseBytes}B)`
+    )
+    console.log(
+      '  #385 scale benchmark:',
+      scaleResults
+        .map(
+          r =>
+            `${r.label}(${r.claims}c): write_sse=${r.fullCorpusSseBytes}B->${r.deltaSseBytes}B, /=${r.slashHtmlBytes}B, /mobile=${r.mobileHtmlBytes}B`
+        )
+        .join(' | ')
+    )
+  } finally {
+    for (const r of openReqs) {
+      try {
+        r.destroy()
+      } catch {
+        /* ignore */
+      }
+    }
+    if (viewer) await viewer.stop()
+    await daemon.close()
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+// --- Frontier A4: the viewer refuses a request from any device not on its allowlist ---
+
+await test('viewer flags require a device allowlist unless the insecure test flag is given', () => {
+  const base = ['--socket', '/run/hive-memory/viewer.sock', '--listen', '127.0.0.1:8787']
+  assert.throws(() => parseViewerFlags(base), /--allow-nodes-file <absolute-path> is required/)
+  assert.throws(() => parseViewerFlags([...base, '--allow-nodes-file', 'rel/allowed']), /absolute/)
+  assert.throws(() => parseViewerFlags([...base, '--allow-nodes-file', '/a', '--insecure-no-peer-gate']), /exclusive/)
+  assert.throws(() => parseViewerFlags([...base, '--allow-nodes-file', '/a', '--allow-nodes-file', '/b']), /only one --allow-nodes-file/)
+  assert.throws(() => parseViewerFlags([...base, '--allow-nodes-file', '/a', '--tailscale-socket', 'ts.sock']), /absolute/)
+  const gated = parseViewerFlags([...base, '--allow-nodes-file', '/etc/hive-memory-viewer/allowed-nodes'])
+  assert.equal(gated.allowNodesFile, '/etc/hive-memory-viewer/allowed-nodes')
+  assert.equal(gated.tailscaleSocket, '/var/run/tailscale/tailscaled.sock')
+  const open = parseViewerFlags([...base, '--insecure-no-peer-gate'])
+  assert.equal(open.allowNodesFile, undefined)
+})
+
+await test('parseAllowedNodes takes stable node IDs and tags only, and refuses an empty list', () => {
+  assert.deepEqual(parseAllowedNodes('# phone\nn8DEpXwyZg11CNTRL\n\ntag:vpn-mac  # Mac\nn8DEpXwyZg11CNTRL\n'), ['n8DEpXwyZg11CNTRL', 'tag:vpn-mac'])
+  assert.throws(() => parseAllowedNodes('# nothing\n\n'), /admit no one/)
+  assert.throws(() => parseAllowedNodes('james.a.fairweather@gmail.com'), /line 1/)
+  assert.throws(() => parseAllowedNodes('n8DEpXwyZg11CNTRL\n100.64.0.1'), /line 2/)
+  assert.throws(() => parseAllowedNodes('tag:'), /line 1/)
+  assert.throws(() => parseAllowedNodes('*'), /line 1/)
+})
+
+await test('readAllowedNodesFile refuses a link or a group/other-writable file', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'viewer-allow-'))
+  try {
+    const f = join(dir, 'allowed-nodes')
+    writeFileSync(f, 'tag:vpn-mac\n')
+    chmodSync(f, 0o644)
+    assert.deepEqual(readAllowedNodesFile(f), ['tag:vpn-mac'])
+    chmodSync(f, 0o664)
+    assert.throws(() => readAllowedNodesFile(f), /writable by group or others/)
+    chmodSync(f, 0o644)
+    const link = join(dir, 'link')
+    symlinkSync(f, link)
+    assert.throws(() => readAllowedNodesFile(link), /not a regular file/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await test('peer gate admits listed devices and tags, refuses others, and fails closed on lookup errors', async () => {
+  assert.equal(whoisAddr('::ffff:127.0.0.1', 5000), '127.0.0.1:5000')
+  assert.equal(whoisAddr('fd7a::1', 443), '[fd7a::1]:443')
+  assert.throws(() => createPeerGate({ allowed: [], whois: async () => null }), /at least one/)
+  const nodes = {
+    'fd7a::1': { stableId: 'nPhone1CNTRL', tags: [], name: 'phone' },
+    'fd7a::2': { stableId: 'nMac22CNTRL', tags: ['tag:vpn-mac'], name: 'mac' },
+    'fd7a::3': { stableId: 'nFleet3CNTRL', tags: [], name: 'nvoy-fleet' },
+  }
+  let calls = 0
+  let clock = 1000
+  const gate = createPeerGate({
+    allowed: ['nPhone1CNTRL', 'tag:vpn-mac'],
+    whois: async addr => {
+      calls++
+      const ip = addr.replace(/^\[/, '').replace(/\]:\d+$/, '')
+      if (ip === 'fd7a::9') throw new Error('socket refused')
+      return nodes[ip] || null
+    },
+    cacheMs: 30_000,
+    now: () => clock,
+  })
+  assert.equal((await gate('fd7a::1', 1)).ok, true)
+  assert.equal((await gate('fd7a::2', 1)).ok, true)
+  const fleet = await gate('fd7a::3', 1)
+  assert.deepEqual([fleet.ok, fleet.status], [false, 403])
+  const stranger = await gate('fd7a::4', 1)
+  assert.deepEqual([stranger.ok, stranger.status], [false, 403])
+  const broken = await gate('fd7a::9', 1)
+  assert.deepEqual([broken.ok, broken.status], [false, 503])
+  assert.equal((await gate('', 1)).ok, false)
+  const before = calls
+  await gate('fd7a::1', 2)
+  assert.equal(calls, before, 'a verdict is cached per caller IP')
+  await gate('fd7a::9', 2)
+  assert.equal(calls, before + 1, 'a lookup error is not cached')
+  clock += 31_000
+  await gate('fd7a::1', 3)
+  assert.equal(calls, before + 2, 'the cache expires')
+})
+
+await test('tailscale whois reads the LocalAPI over its Unix socket and fails closed on bad answers', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'viewer-ts-'))
+  const sock = join(dir, 'tailscaled.sock')
+  const seen = []
+  const fake = createPlainHttpServer((req, res) => {
+    seen.push({ url: req.url, host: req.headers.host })
+    const addr = new URL(req.url, 'http://x').searchParams.get('addr')
+    if (addr === '[fd7a::1]:7') {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ Node: { StableID: 'nPhone1CNTRL', Name: 'phone.', Tags: null }, UserProfile: { LoginName: 'j@example' } }))
+    } else if (addr === '[fd7a::2]:7') {
+      res.writeHead(200)
+      res.end('not json')
+    } else if (addr === '[fd7a::3]:7') {
+      res.writeHead(200)
+      res.end(JSON.stringify({ Node: {} }))
+    } else if (addr === '[fd7a::6]:7') {
+      res.writeHead(200)
+      res.end(JSON.stringify({ Node: { StableID: 'nGuestCNTRL', Name: 'guest.', Sharer: 4242 } }))
+    } else if (addr === '[fd7a::5]:7') {
+      res.writeHead(500)
+      res.end('boom')
+    } else {
+      res.writeHead(404)
+      res.end('no match for IP:port')
+    }
+  })
+  await new Promise(r => fake.listen(sock, r))
+  try {
+    const whois = createTailscaleWhois({ socketPath: sock, timeoutMs: 2000 })
+    assert.deepEqual(await whois('[fd7a::1]:7'), { stableId: 'nPhone1CNTRL', tags: [], name: 'phone.', shared: false })
+    assert.equal((await whois('[fd7a::6]:7')).shared, true)
+    assert.equal(seen[0].host, 'local-tailscaled.sock')
+    assert(seen[0].url.startsWith('/localapi/v0/whois?addr='))
+    assert.equal(await whois('[fd7a::4]:7'), null)
+    await assert.rejects(whois('[fd7a::2]:7'), /not JSON/)
+    await assert.rejects(whois('[fd7a::3]:7'), /names no node/)
+    await assert.rejects(whois('[fd7a::5]:7'), /answered 500/)
+    await assert.rejects(createTailscaleWhois({ socketPath: join(dir, 'absent.sock') })('[fd7a::1]:7'))
+  } finally {
+    await new Promise(r => fake.close(r))
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await test('tailnet:any stands alone, and admits tailnet devices except the viewer host and shared-in nodes', async () => {
+  assert.deepEqual(parseAllowedNodes('# James, 14 Nov: any device on Tailscale\ntailnet:any\n'), ['tailnet:any'])
+  assert.throws(() => parseAllowedNodes('tailnet:any\nn8DEpXwyZg11CNTRL'), /only allowed-nodes entry/)
+  assert.throws(() => parseAllowedNodes('tailnet:all'), /line 1/)
+  assert.throws(() => createPeerGate({ allowed: ['tailnet:any', 'tag:x'], whois: async () => null, selfId: async () => 'x' }), /only allowed/)
+  assert.throws(() => createPeerGate({ allowed: ['tailnet:any'], whois: async () => null }), /own node ID/)
+  const nodes = {
+    'fd7a::1': { stableId: 'nPhoneCNTRL', tags: [], name: 'phone.', shared: false },
+    'fd7a::2': { stableId: 'nR1CNTRL', tags: ['tag:r1'], name: 'r1.', shared: false },
+    'fd7a::3': { stableId: 'nHostCNTRL', tags: ['tag:herd'], name: 'herd-cloud.', shared: false },
+    'fd7a::4': { stableId: 'nGuestCNTRL', tags: [], name: 'guest.', shared: true },
+  }
+  let selfFails = false
+  const gate = createPeerGate({
+    allowed: ['tailnet:any'],
+    whois: async addr => nodes[addr.replace(/^\[|\]:\d+$/g, '')] ?? null,
+    selfId: async () => { if (selfFails) throw new Error('status refused'); return 'nHostCNTRL' },
+  })
+  assert.equal((await gate('fd7a::1', 1)).ok, true)
+  assert.equal((await gate('fd7a::2', 1)).ok, true)
+  assert.deepEqual(await gate('fd7a::3', 1), { ok: false, status: 403, reason: 'the viewer host itself is not admitted' })
+  assert.deepEqual(await gate('fd7a::4', 1), { ok: false, status: 403, reason: 'device is shared in from another tailnet' })
+  assert.equal((await gate('fd7a::9', 1)).status, 403)
+  selfFails = true
+  nodes['fd7a::5'] = nodes['fd7a::1']
+  assert.equal((await gate('fd7a::5', 1)).status, 503, 'a failed self lookup refuses, it does not admit')
+  selfFails = false
+  assert.equal((await gate('fd7a::5', 1)).ok, true, 'a 503 is not cached')
+
+  const dir = mkdtempSync(join(tmpdir(), 'viewer-ts-self-'))
+  const sock = join(dir, 'tailscaled.sock')
+  let answer = { Self: { ID: 'nHostCNTRL' } }, seen = 0
+  const fake = createPlainHttpServer((req, res) => {
+    seen++
+    assert(req.url.startsWith('/localapi/v0/status'))
+    res.writeHead(answer ? 200 : 500)
+    res.end(JSON.stringify(answer || {}))
+  })
+  await new Promise(r => fake.listen(sock, r))
+  try {
+    answer = null
+    await assert.rejects(createTailscaleSelf({ socketPath: sock })(), /answered 500/)
+    answer = { Self: {} }
+    await assert.rejects(createTailscaleSelf({ socketPath: sock })(), /no self node/)
+    answer = { Self: { ID: 'nHostCNTRL' } }
+    const selfId = createTailscaleSelf({ socketPath: sock })
+    assert.equal(await selfId(), 'nHostCNTRL')
+    const before = seen
+    assert.equal(await selfId(), 'nHostCNTRL')
+    assert.equal(seen, before + 1, 'self ID is asked afresh, never memoized')
+
+    // My Dude's PR 400 finding: the host is re-enrolled while the viewer runs, so status and whois both move to a
+    // new self ID. A request from the new self ID must still be refused.
+    let whoisId = 'nOldCNTRL'
+    answer = { Self: { ID: 'nOldCNTRL' } }
+    const gate = createPeerGate({
+      allowed: ['tailnet:any'],
+      whois: async () => ({ stableId: whoisId, tags: [], name: 'herd-cloud.', shared: false }),
+      selfId: createTailscaleSelf({ socketPath: sock }),
+    })
+    assert.equal((await gate('fd7a::10', 1)).status, 403)
+    answer = { Self: { ID: 'nNewCNTRL' } }
+    whoisId = 'nNewCNTRL'
+    assert.deepEqual(await gate('fd7a::11', 1), { ok: false, status: 403, reason: 'the viewer host itself is not admitted' })
+  } finally {
+    await new Promise(r => fake.close(r))
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await test('a gated viewer serves an allowed device and refuses everything else before any route', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'viewer-gated-'))
+  let verdict = { ok: false, status: 403, reason: 'device not on the viewer allowlist' }
+  const asked = []
+  let viewer
+  try {
+    viewer = await startMemoryViewer({
+      socketPath: join(dir, 'absent-viewer.sock'),
+      host: '127.0.0.1',
+      port: 0,
+      pollMs: 300_000,
+      peerGate: async (addr, port) => {
+        asked.push([addr, port])
+        if (verdict === 'throw') throw new Error('gate exploded')
+        return verdict
+      },
+    })
+    for (const path of ['/', '/api/state', '/api/records', '/mobile', '/events', '/no-such-page']) {
+      for (const method of ['GET', 'HEAD']) {
+        const r = await httpGet(viewer.port, path, method)
+        assert.equal(r.status, 403, `${method} ${path} must be refused`)
+        assert.equal(r.headers['cache-control'], 'no-store')
+        assert(!r.body.includes('Hive Shared Memory'))
+      }
+    }
+    const post = await httpGet(viewer.port, '/', 'POST')
+    assert.equal(post.status, 403, 'the gate runs before the method check')
+    assert(asked.length > 0 && asked.every(([a, p]) => typeof a === 'string' && Number.isInteger(p)), 'the gate sees the caller address and port')
+
+    verdict = { ok: false, status: 503, reason: 'device check unavailable' }
+    assert.equal((await httpGet(viewer.port, '/api/state')).status, 503)
+    verdict = 'throw'
+    assert.equal((await httpGet(viewer.port, '/api/state')).status, 503)
+    verdict = undefined
+    assert.equal((await httpGet(viewer.port, '/api/state')).status, 403, 'a gate that returns nothing is a refusal')
+
+    verdict = { ok: true, node: { stableId: 'nPhone1CNTRL', tags: [] } }
+    const page = await httpGet(viewer.port, '/')
+    assert.equal(page.status, 200)
+    assert(page.body.includes('Hive Shared Memory'))
+    assert.equal((await httpGet(viewer.port, '/api/state')).status, 200)
+  } finally {
+    if (viewer) await viewer.stop()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await test('q-192: the viewer listens and serves the pending state while its first poll is still running', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'viewer-listen-first-'))
+  const sock = join(dir, 'slow-viewer.sock')
+  // A daemon that accepts and never answers: the first poll stays in flight until the test drops the connection.
+  const held = []
+  const slowDaemon = createNetServer(c => { held.push(c); c.on('error', () => {}) })
+  await new Promise(r => slowDaemon.listen(sock, r))
+  const probe = createNetServer()
+  await new Promise(r => probe.listen(0, '127.0.0.1', r))
+  const port = probe.address().port
+  await new Promise(r => probe.close(r))
+  const gateAsked = []
+  const listened = []
+  let viewer
+  let settled = false
+  const starting = startMemoryViewer({
+    socketPath: sock,
+    host: '127.0.0.1',
+    port,
+    pollMs: 300_000,
+    peerGate: async addr => { gateAsked.push(addr); return { ok: true, node: { stableId: 'nTest', tags: [] } } },
+    onListening: info => { listened.push({ ...info, settledThen: settled }) },
+  }).then(v => { settled = true; viewer = v; return v })
+  try {
+    let page = null
+    for (let i = 0; i < 60 && !page; i++) {
+      page = await httpGet(port, '/').catch(() => null)
+      if (!page) await new Promise(r => setTimeout(r, 50))
+    }
+    assert(page, 'the port must open within 3 s, before the first poll finishes')
+    assert.equal(settled, false, 'the first poll is still in flight')
+    assert(held.length > 0, 'the viewer has connected to the daemon socket')
+    assert.equal(page.status, 200)
+    assert(page.body.includes('Hive Shared Memory'))
+    assert.equal((await httpGet(port, '/mobile')).status, 200)
+    const state = await httpGet(port, '/api/state')
+    assert.equal(state.status, 200)
+    const body = JSON.parse(state.body)
+    assert.equal(body.connected, false)
+    assert.equal(body.error, 'initial poll pending')
+    assert(gateAsked.length >= 3, 'the peer gate runs on every request before the first poll too')
+    assert.deepEqual(listened, [{ host: '127.0.0.1', port, settledThen: false }], 'onListening fires once, at bind, before the first poll finishes')
+  } finally {
+    for (const c of held) c.destroy()
+    await starting.catch(() => {})
+    if (viewer) await viewer.stop()
+    await new Promise(r => slowDaemon.close(r))
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await test('q-192: a throwing onListening hook does not reject startup or orphan the listener', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'viewer-listen-throw-'))
+  const sock = join(dir, 'drop-viewer.sock')
+  // A daemon that drops every connection, so the first poll fails fast and startup can finish.
+  const dropDaemon = createNetServer(c => { c.on('error', () => {}); c.destroy() })
+  await new Promise(r => dropDaemon.listen(sock, r))
+  const probe = createNetServer()
+  await new Promise(r => probe.listen(0, '127.0.0.1', r))
+  const port = probe.address().port
+  await new Promise(r => probe.close(r))
+  let calls = 0
+  let viewer
+  const errors = []
+  const origError = console.error
+  console.error = (...a) => { errors.push(a.join(' ')) }
+  try {
+    viewer = await startMemoryViewer({
+      socketPath: sock,
+      host: '127.0.0.1',
+      port,
+      pollMs: 300_000,
+      peerGate: async () => ({ ok: true, node: { stableId: 'nTest', tags: [] } }),
+      onListening: () => { calls++; throw new Error('hook boom') },
+    })
+    console.error = origError
+    assert.equal(calls, 1, 'the hook ran once')
+    assert.equal(typeof viewer.stop, 'function', 'startup resolved with a stop handle despite the throw')
+    assert(errors.some(e => e.includes('onListening hook failed') && e.includes('hook boom')), 'the failure is logged')
+    assert.equal((await httpGet(port, '/api/state')).status, 200, 'the viewer serves after the hook threw')
+    await viewer.stop()
+    viewer = null
+    // A fresh TCP connect, not httpGet: the HTTP agent may reuse a pooled keep-alive socket and see a reset.
+    const after = await new Promise(resolve => {
+      const c = netConnect(port, '127.0.0.1')
+      c.on('connect', () => { c.destroy(); resolve('answered') })
+      c.on('error', err => resolve(err.code || 'error'))
+    })
+    assert.equal(after, 'ECONNREFUSED', 'no listener is left behind after stop()')
+  } finally {
+    console.error = origError
+    if (viewer) await viewer.stop()
+    await new Promise(r => dropDaemon.close(r))
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await test('q-192: snapshotPin turns a page snapshot into pin arguments, and refuses a partial one', async () => {
+  assert.deepEqual(snapshotPin({ snapshot: { max_event_rowid: 7, last_purge_seq: 0, as_of_sec: 1794796889, write_seq: 9 } }),
+    { snapshot_rowid: 7, expected_purge_seq: 0, snapshot_at: 1794796889 })
+  assert.equal(snapshotPin({}), null)
+  assert.equal(snapshotPin({ snapshot: { max_event_rowid: 7, last_purge_seq: 0 } }), null)
+  assert.equal(snapshotPin({ snapshot: { max_event_rowid: -1, last_purge_seq: 0, as_of_sec: 5 } }), null)
+})
+
+await test('q-192: a multi-page pull pins pages after the first, evaluates the store once, and restarts unpinned on a refused pin', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'viewer-pinned-pull-'))
+  const dbPath = join(tmp, 'memory.sqlite')
+  const ledgerPath = join(tmp, 'accepted-ledger.jsonl')
+  const receiptPath = join(tmp, 'last-verified-backup.json')
+  const socketDir = join(tmp, 'sockets')
+  const ownerSk = generateSecretKey()
+  const ownerPk = getPublicKey(ownerSk)
+  const viewerPk = getPublicKey(generateSecretKey())
+  const room = 'a8186b53-537d-46ad-a7e7-b6486c58970e'
+  const nowSec = Math.floor(Date.now() / 1000)
+  initEmptyStore({ dbPath, ledgerPath })
+  recordVerifiedBackup({ receiptPath, snapshotId: SNAP_ID, writeSeq: 1, at: nowSec - 700 })
+  const daemon = await startMemoryDaemon({
+    dbPath, ledgerPath, receiptPath,
+    config: {
+      memoryGlobalChannelId: room, ownerPubkey: ownerPk, maxUnbackedSec: 3600,
+      globalWriters: [ownerPk], canonWriters: [ownerPk], readers: { viewer: viewerPk },
+      writers: { james: { pubkey: ownerPk, perHour: 3600 } },
+      rooms: { [room]: { members: [ownerPk, viewerPk], writers: [ownerPk] } },
+    },
+    readers: 'viewer', writers: 'james', socketDir, log: () => {},
+  })
+  const N = 250
+  for (let i = 0; i < N; i++) {
+    const at = nowSec - 600 + i
+    const r = daemon.store.submit({
+      writer: 'james',
+      event: finalizeEvent(buildClaimTemplate({
+        pubkey: ownerPk, scope: `room:${room}`, slug: `q192-pin-${i}`, memoryGlobalChannelId: room, topic: 'hive-memory',
+        claim: `Claim ${i} for the q-192 pinned pull test.`, because: 'q-192 test',
+        evidence: ['nvoy@044171b0:mcp/tools/memory-viewer.mjs'], asOfGit: '044171b0ab5038aaf3c7e9dda04e2ee15113dea3',
+        ttlSec: 86400 * 14, nowSec: at,
+      }), ownerSk),
+      expectedPriorId: null, nowSec: at,
+    })
+    assert.equal(r.accepted, true, `row ${i}: ${JSON.stringify(r).slice(0, 300)}`)
+  }
+  const store = daemon.store
+  const realQuery = store.query.bind(store)
+  const calls = []
+  let refuseNextPinned = false
+  store.query = opts => {
+    calls.push(opts)
+    if (refuseNextPinned && opts.snapshotRowid != null) {
+      refuseNextPinned = false
+      return { ...realQuery({ ...opts, snapshotRowid: null, expectedPurgeSeq: null, snapshotAt: null }), answer: 'unknown', answer_reason: 'snapshot-purged', records: [], next_cursor: null }
+    }
+    return realQuery(opts)
+  }
+  let viewer = null
+  const errors = []
+  const realError = console.error
+  console.error = (...a) => { errors.push(a.join(' ')) }
+  try {
+    viewer = await startMemoryViewer({ socketPath: join(socketDir, 'viewer.sock'), host: '127.0.0.1', port: 0, pollMs: 60000 })
+    const pages = calls.filter(c => c.includeHistory)
+    assert.equal(pages.length, 3, '250 rows are three pages of 100')
+    assert.equal(pages[0].snapshotRowid, null, 'the first page is unpinned')
+    for (const c of pages.slice(1)) {
+      assert(Number.isSafeInteger(c.snapshotRowid) && c.snapshotRowid > 0, 'later pages carry the first page snapshot rowid')
+      assert.equal(c.expectedPurgeSeq, 0)
+      assert(Number.isSafeInteger(c.snapshotAt))
+    }
+    assert.equal(new Set(pages.slice(1).map(c => c.snapshotRowid)).size, 1, 'every later page names the same snapshot')
+    assert.equal(store.pageMemoSize(), 1, 'the pinned pages share one evaluated result')
+    assert.equal(viewer.getState ? viewer.getState().records.length : (await viewer.pollOnce({ forceFull: false })).records.length, N)
+
+    calls.length = 0
+    refuseNextPinned = true
+    const s2 = await viewer.pollOnce({ forceFull: true })
+    const pages2 = calls.filter(c => c.includeHistory)
+    assert.equal(pages2.length, 5, 'one unpinned page, one refused pinned page, then three unpinned pages')
+    assert.deepEqual(pages2.map(c => c.snapshotRowid != null), [false, true, false, false, false], 'after a refused pin the pull is never pinned again')
+    assert.equal(s2.records.length, N, 'the restarted pull still sees every row exactly once')
+    assert(errors.some(e => e.includes('pinned page refused (snapshot-purged)')), 'the restart is logged')
+  } finally {
+    console.error = realError
+    if (viewer) await viewer.stop()
+    await daemon.close()
+    rmSync(tmp, { recursive: true, force: true })
   }
 })
 

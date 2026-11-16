@@ -26,6 +26,7 @@ import { chmodSync, existsSync, mkdirSync, rmSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { join, resolve } from 'node:path'
 import { MEMORY_TOOL_SPECS, parseFactKey } from './memory.mjs'
+import { ReadLog, READ_LOG_DEFAULT_DAYS } from './memory-read-log.mjs'
 import {
   HiveMemoryStore, SOCKET_NAME, canRead, initEmptyStore, loadConfigFile, migrateStoreJson, validateAndResolveConfig,
 } from './hive_memory_store.mjs'
@@ -39,17 +40,24 @@ const ACTIVITY_IDS_MAX = 20
 const VIEWER_READER = 'viewer'
 const CURATOR_READER = 'curator'
 
-const withStaleFiles = t => ({
+const withDaemonReadProps = t => ({
   ...t,
   inputSchema: {
     ...t.inputSchema,
     properties: {
       ...t.inputSchema.properties,
       stale_files: { type: 'array', items: { type: 'string', maxLength: 300 }, maxItems: 200 },
+      ...(t.name === 'memory_query'
+        ? {
+            snapshot_rowid: { type: 'integer', minimum: 0 },
+            expected_purge_seq: { type: 'integer', minimum: 0 },
+            snapshot_at: { type: 'integer', minimum: 0 },
+          }
+        : {}),
     },
   },
 })
-const READER_TOOLS = Object.freeze(MEMORY_TOOL_SPECS.filter(t => t.name === 'memory_wake' || t.name === 'memory_query').map(withStaleFiles))
+const READER_TOOLS = Object.freeze(MEMORY_TOOL_SPECS.filter(t => t.name === 'memory_wake' || t.name === 'memory_query').map(withDaemonReadProps))
 const WRITER_TOOLS = Object.freeze(MEMORY_TOOL_SPECS.filter(t => t.name === 'memory_lookup_prior' || t.name === 'memory_submit'))
 
 export function parseNamesFlag(raw, label = 'reader') {
@@ -68,6 +76,7 @@ function mcpToolResult(payload, isError = false) {
 
 const str = v => (typeof v === 'string' ? v : null)
 const num = v => (v === undefined || v === null || v === '' ? null : Number(v))
+const snapArg = (obj, k) => (Object.hasOwn(obj, k) && obj[k] !== undefined ? (typeof obj[k] === 'number' ? obj[k] : Number.NaN) : null)
 
 // The binding a connection is checked against; a SIGHUP that changes it drops the connection.
 export function bindingSignature(config, { kind, name }) {
@@ -90,11 +99,11 @@ const isCuratorReader = (binding, config) =>
   (binding.name === CURATOR_READER || Boolean(config?.curators?.has(config?.readers.get(binding.name) || '')))
 
 // In-memory telemetry for the viewer only: metadata, never claim text, because, evidence or query text, and
-// never the viewer's own calls. Each ref keeps its claim's scope and author so viewerActivity can apply the
-// viewer's read ACL when it serves the ring. Durable hourly aggregate counts are also persisted in SQLite
-// (`activity_rollups`) so 24h and 7d recall totals survive ACTIVITY_MAX ring overflow and daemon restarts.
+// never the viewer's or curator reader's own snapshot/pagination calls. Each ref keeps its claim's scope and author
+// so viewerActivity can apply the viewer's read ACL when it serves the ring. Durable hourly aggregate counts are also
+// persisted in SQLite (`activity_rollups`) so 24h and 7d recall totals survive ACTIVITY_MAX ring overflow and daemon restarts.
 function noteActivity(activity, binding, nowSec, { kind, count = null, refs = [], filter = null, accepted = null, code = null }, store = null) {
-  if (isViewer(binding)) return
+  if (isViewer(binding) || (isCuratorReader(binding, store?.config) && (kind === 'wake' || kind === 'query'))) return
   let rollupOk = true
   if (store && typeof store.recordActivityRollup === 'function') {
     const retCount = Number.isSafeInteger(count) ? count : (Array.isArray(refs) ? refs.length : 0)
@@ -110,6 +119,23 @@ function noteActivity(activity, binding, nowSec, { kind, count = null, refs = []
   activity.seq += 1
   activity.events.push({ seq: activity.seq, at: nowSec, kind, actor: binding.name, count, refs, filter, accepted, code })
   if (activity.events.length > ACTIVITY_MAX) activity.events.shift()
+}
+
+// The fact keys of the records a reader was just shown, for the per-seat read log (keys only, never text). Query results carry
+// their `d`; a wake digest's records are refs with an event id and no `d`, so those are resolved from the store's own event table.
+function recordKeys(records, store) {
+  const keys = []
+  let byId = null
+  for (const r of Array.isArray(records) ? records : []) {
+    if (typeof r?.d === 'string' && r.d) { keys.push(r.d); continue }
+    if (typeof r?.event_id !== 'string') continue
+    try {
+      byId ??= store.db.prepare('SELECT d FROM events WHERE id = ?')
+      const row = byId.get(r.event_id)
+      if (typeof row?.d === 'string' && row.d) keys.push(row.d)
+    } catch { /* an unresolvable ref is simply not logged; the count in the entry still says how many were shown */ }
+  }
+  return keys
 }
 
 const recordRefs = records => (Array.isArray(records) ? records : []).map(r => ({ id: r.event_id, d: null, scope: r.scope, pubkey: r.author_pubkey }))
@@ -150,7 +176,7 @@ function agentRoster(store, nowSec) {
   return [...roster.values()]
 }
 
-export function handleSocketJsonRpc({ store, binding, message, nowSec, activity = null }) {
+export function handleSocketJsonRpc({ store, binding, message, nowSec, activity = null, readLog = null }) {
   if (!message || typeof message !== 'object' || Array.isArray(message) || message.jsonrpc !== '2.0') {
     return { jsonrpc: '2.0', id: message?.id ?? null, error: { code: -32600, message: 'Invalid Request' } }
   }
@@ -237,6 +263,7 @@ export function handleSocketJsonRpc({ store, binding, message, nowSec, activity 
       frame: o => mcpToolResult({ ...who, ...o }).content[0].text,
     })
     note({ kind: 'wake', count: Array.isArray(out.records) ? out.records.length : 0, refs: recordRefs(out.records) })
+    if (readLog && !isViewer(binding)) readLog.record({ seat: binding.name, op: 'wake', keys: recordKeys(out.records, store), count: Array.isArray(out.records) ? out.records.length : 0 })
     const includeTelemetry = isViewer(binding) || isCuratorReader(binding, store.config)
     const telemetry = activity && includeTelemetry
       ? {
@@ -252,6 +279,7 @@ export function handleSocketJsonRpc({ store, binding, message, nowSec, activity 
             rollup_write_failures: Math.max(Number(activity.rollup_write_failures || 0), Number(store.rollupWriteFailures || 0)),
             first_rollup_failure_at: activity.first_rollup_failure_at ?? store.firstRollupFailureAt ?? null,
             last_rollup_failure_at: activity.last_rollup_failure_at ?? store.lastRollupFailureAt ?? null,
+            binding_sig: bindingSignature(store.config, binding),
           },
           ...(typeof store.activityRollups === 'function'
             ? { activity_rollups: store.activityRollups({ sinceSec: Math.max(0, nowSec - 14 * 86400), nowSec }) }
@@ -278,9 +306,13 @@ export function handleSocketJsonRpc({ store, binding, message, nowSec, activity 
     format: str(args.format),
     staleFiles,
     nowSec,
+    snapshotRowid: snapArg(args, 'snapshot_rowid'),
+    expectedPurgeSeq: snapArg(args, 'expected_purge_seq'),
+    snapshotAt: snapArg(args, 'snapshot_at'),
   })
   const filter = { scope: str(args.scope)?.slice(0, 120) ?? null, topic: str(args.topic)?.slice(0, 120) ?? null }
   note({ kind: 'query', count: Number.isSafeInteger(out.returned) ? out.returned : 0, refs: recordRefs(out.records), filter })
+  if (readLog && !isViewer(binding)) readLog.record({ seat: binding.name, op: str(args.d) ? 'get' : 'query', keys: recordKeys(out.records, store), count: Array.isArray(out.records) ? out.records.length : 0 })
   return reply(mcpToolResult({ ...who, ...out }))
 }
 
@@ -310,6 +342,8 @@ export async function startMemoryDaemon({
   listenFdNames = process.env.LISTEN_FDNAMES || null,
   listenPid = process.env.LISTEN_PID ? Number(process.env.LISTEN_PID) : null,
   requireMigratedIds = [],
+  readLogPath = null,
+  readLogDays = READ_LOG_DEFAULT_DAYS,
   hooks = {},
   log = msg => console.error(msg),
   now = () => Math.floor(Date.now() / 1000),
@@ -340,6 +374,10 @@ export async function startMemoryDaemon({
 
   const store = new HiveMemoryStore({ dbPath, ledgerPath, receiptPath, config, requireMigratedIds, hooks, log })
   store.start()
+  // Optional per-seat read log (nvoy #390). Off unless a path is given; a path that cannot be opened stops the daemon, so a
+  // box that asked for the log never runs without it unnoticed.
+  let readLog = null
+  try { readLog = readLogPath ? new ReadLog({ path: readLogPath, retentionDays: readLogDays, now, log }) : null } catch (e) { store.close(); throw e }
 
   const servers = []
   const connections = new Set()
@@ -365,7 +403,7 @@ export async function startMemoryDaemon({
             continue
           }
           let resp
-          try { resp = handleSocketJsonRpc({ store, binding, message: msg, nowSec: now(), activity }) } catch (e) {
+          try { resp = handleSocketJsonRpc({ store, binding, message: msg, nowSec: now(), activity, readLog }) } catch (e) {
             log(`hive-memory: request failed on ${binding.kind} ${binding.name}: ${e.code || e.message}`)
             resp = { jsonrpc: '2.0', id: msg?.id ?? null, error: { code: -32603, message: 'Internal error' } }
           }
@@ -421,6 +459,7 @@ export async function startMemoryDaemon({
 
   return {
     store,
+    readLog,
     bindings,
     servers,
     connections,
@@ -446,6 +485,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const configPath = flag('--config')
   const socketDir = flag('--socket-dir') || null
   const requireMigratedIds = flags('--require-migrated-id')
+  const readLogPath = flag('--read-log') || null
+  const readLogDays = flag('--read-log-days') ? Number(flag('--read-log-days')) : READ_LOG_DEFAULT_DAYS
   const fatal = msg => { console.error(`hive-memory: ${msg}`); process.exit(1) }
   try {
     if (args.includes('--init-empty') || args.includes('--migrate-store-json')) {
@@ -460,7 +501,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   if (socketDir && process.env.HIVE_MEMORY_ALLOW_SOCKET_DIR !== '1') {
     fatal('--socket-dir is for local tests only (set HIVE_MEMORY_ALLOW_SOCKET_DIR=1); production requires systemd LISTEN_FDS')
   }
-  startMemoryDaemon({ dbPath, ledgerPath, receiptPath, configPath, readers: flag('--readers'), writers: flag('--writers'), socketDir, requireMigratedIds })
+  startMemoryDaemon({ dbPath, ledgerPath, receiptPath, configPath, readers: flag('--readers'), writers: flag('--writers'), socketDir, requireMigratedIds, readLogPath, readLogDays })
     .then(daemon => {
       process.on('SIGHUP', () => daemon.reload())
       const stop = () => daemon.close().then(() => process.exit(0))

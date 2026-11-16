@@ -14,6 +14,8 @@ import { joinHive, joinRooms } from './onboard_join.mjs'
 import { readStagedKey } from './onboard_stage.mjs'
 import { familyOf } from './principal_family.mjs'
 import { profileRequestIdsPath, profileResultsPath, profileStatus, queueProfile } from './agent_profile.mjs'
+import { delegateAuthors, liveGrantById } from './onboard_delegate.mjs'
+
 
 export const WRITERS_KIND = 30000, WRITERS_D = 'nave-relay-writers'
 
@@ -65,7 +67,8 @@ export function rewrite(root, id, change, { backupRoot, now }) {
 
 export async function onboard({ command, name, root, out, stateDir, keysPath = '', giversRedeploy = false,
   backupRoot = '/root', fetchEvents, runTool, joinWith, now = () => Date.now(), log = console.log,
-  pair = null, report = null, readWriters = null, verify = () => false }) {
+  pair = null, report = null, readWriters = null, verify = () => false, readDelegates = null, delegateTemplates = [], readTermsFor = null,
+  markTerminal = null, markAccepted = null }) {
   if (!['show', 'run'].includes(command)) throw new OnboardRefusal('ONBOARD_USAGE', 'command is show or run')
   const ledger = join(stateDir, 'requests.jsonl')
   const rows = lines(ledger), seen = new Set(rows.filter(row => row.finished).map(row => row.id))
@@ -73,14 +76,36 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
   let manifests = installed(root)
   const owners = [...new Set([...manifests.values()].flatMap(manifest => manifest.grantors))]
   const relays = [...new Set([...manifests.values()].flatMap(manifest => manifest.relays))]
-  const events = await fetchEvents({ relays, owners, name })
+  // Delegate discovery, a fresh cold read (DESIGN_ONBOARDING_DELEGATE): live `onboard` grantees are read
+  // as authors too. Unknown grant state adds no one. Accepting a delegate's request is parseSetupRequest's
+  // decision, not this fetch's.
+  const delegates = readDelegates ? await readDelegates({ relays, owners }) : null
+  if (delegates && !delegates.known) log(`warning  grant state unknown (${delegates.reason}); delegate requests are not read`)
+  const events = await fetchEvents({ relays, owners, name, delegates: delegateAuthors(delegates) })
   const earlier = rows.filter(row => row.op === 'add_agent' && row.name === name && row.pubkey)
-  const add = parseSetupRequest(newestRequest(events, name, 'add_agent'), { name, manifests, seen, inProgress, earlier, now: now() })
+  // A delegate's request also needs the hive's current terms, read fresh from the template's hive relay, and
+  // the fleet's onboard_templates. An owner's request reads neither.
+  const addEvent = newestRequest(events, name, 'add_agent')
+  const bindSigned = newestRequest(events, name, 'bind_runtime')
+  let terms = null
+  // Read when either request is a delegate's, so a delegate's bind is judged (and refused on a signer mismatch) rather
+  // than failing for want of terms.
+  const delegateEvent = [addEvent, bindSigned].find(ev => ev && delegateAuthors(delegates).includes(ev.pubkey))
+  if (delegateEvent) {
+    const like = (delegateEvent.tags || []).find(tag => tag[0] === 'like')?.[1]
+    const relay = manifests.get(String(like || ''))?.buzz?.relay
+    terms = relay && readTermsFor ? await readTermsFor(relay) : { ok: false, reason: relay ? 'no terms reader' : 'the template names no hive relay' }
+  }
+  const delegation = delegates ? { state: delegates, templates: delegateTemplates, terms, ledger: rows } : null
+  const add = parseSetupRequest(addEvent, { name, manifests, seen, inProgress, earlier, now: now(), delegation })
   let bind = null
   const bindEvent = newestRequest(events, name, 'bind_runtime')
   if (bindEvent) {
-    bind = parseSetupRequest(bindEvent, { name, manifests, seen, now: now() })
+    bind = parseSetupRequest(bindEvent, { name, manifests, seen, now: now(), delegation })
     if (bind.pubkey !== add.pubkey || bind.owner !== add.owner) throw new OnboardRefusal('ONBOARD_BIND_MISMATCH', 'bind_runtime names a different key or owner than add_agent')
+    // The bind must come from whoever signed the add (Murphy, PR 394 review). Otherwise an owner's add with a delegate's bind
+    // would seat a delegate-chosen key with no acceptance proof and no fresh grant check, since both gate on the add.
+    if (bind.signer !== add.signer) throw new OnboardRefusal('ONBOARD_BIND_MISMATCH', 'bind_runtime is signed by a different key than add_agent; the same signer must sign both')
     // Both signed fields must agree, exactly: the harness decides which principals are seated and `like` which template
     // the agent started like. A bind for another harness, or another template, is a different intent, not a variant.
     if (bind.harness !== add.harness) throw new OnboardRefusal('ONBOARD_BIND_MISMATCH', `bind_runtime is for a ${bind.harness} agent but add_agent is ${add.harness}`)
@@ -93,10 +118,19 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
   if (add.rooms.length) log(`  rooms ${add.rooms.join(', ')}`)
   log(`  bind_runtime: ${bind ? `${bind.channelKey.keyType} key, ${bind.id.slice(0, 12)}` : 'not yet'}`)
   if (command === 'show') return { request: add, bind, receipts: [] }
+  // A delegate's accepted request: the public acceptance proof goes out, and reads back, before any effect. If it does not,
+  // nothing is done this run and the next one tries again. A caller that cannot publish the proof (the operator's `run`,
+  // or a watch with no relay readback) never acts on a delegate's request: refused here, before the ledger or any effect.
+  if (add.delegated && !markAccepted)
+    throw new OnboardRefusal('ONBOARD_DELEGATE_NEEDS_PROOF', "a delegate's request runs only from the watch, which publishes and reads back the runner's acceptance proof; nothing was done")
+  if (add.delegated && !(await markAccepted(add))) {
+    log(`pending  ${name}: the acceptance proof for request ${add.id.slice(0, 12)} is not out yet; nothing was done, and the next run tries again`)
+    return { request: add, bind, receipts: [] }
+  }
 
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
   if (!inProgress.has(add.id)) appendFileSync(ledger, JSON.stringify({ id: add.id, name, op: 'add_agent', at: now(),
-    pubkey: add.pubkey, owner: add.owner, harness: add.harness, like: add.like }) + '\n')
+    pubkey: add.pubkey, owner: add.owner, signer: add.signer, harness: add.harness, like: add.like }) + '\n')
   const receiptPath = join(stateDir, `${add.id}.jsonl`), receipts = []
   const receipt = (step, state, detail) => {
     const row = { step, state, at: now(), detail }
@@ -114,6 +148,21 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
   }
   const isInstalled = () => manifests.has(name)
   const stagedPath = join(out, `${name}.json`), stagedFor = join(out, `${name}.request`)
+
+  // A delegate's request is re-checked before every step (DESIGN_ONBOARDING_DELEGATE, "the stop bound"): a
+  // fresh, complete read of grants and 441s, never this run's earlier answer. Unknown does nothing this step
+  // and waits; a grant that is no longer live refuses, before any effect. A refusal before the apply moves the
+  // staged manifest aside, so nothing is seated. `null` means the step may go ahead.
+  const templateGrantors = manifests.get(add.like)?.grantors || []
+  const gate = async step => {
+    if (!add.delegated) return null
+    const fresh = readDelegates ? await readDelegates({ relays, owners }) : null
+    if (!fresh?.known) return receipt(step, 'pending', `grant state unknown${fresh?.reason ? ` (${fresh.reason})` : ''}; nothing was done, and the next run checks again`)
+    if (liveGrantById(fresh, add.signer, add.grantId, templateGrantors)) return null
+    if (!isInstalled() && existsSync(stagedPath) && existsSync(stagedFor) && readFileSync(stagedFor, 'utf8').trim() === add.id)
+      renameSync(stagedPath, `${stagedPath}.revoked-${add.id.slice(0, 12)}`)
+    return receipt(step, 'refused', "delegate revoked: the onboard grant behind this request is no longer live; nothing was done")
+  }
 
   const steps = [
     ['staged', () => {
@@ -183,6 +232,8 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
       for (const role of two ? ['channel', 'feed'] : ['channel']) {
         const again = readStagedKey({ stateDir, request: add.id, instance: name, role, bound: role === 'feed' ? bind.feedKey : bind.channelKey })
         if (again?.state === 'refused') return receipt('started', 'refused', again.detail)
+        // A delegate may bind only the key the agent's own box made: the staged file is mandatory and must match.
+        if (bind.delegated && again?.state !== 'done') return receipt('started', 'refused', `a delegate's bind needs the ${role} key staged from the agent's box, and none is; nothing was seated`)
       }
       if (two) {
         if (!bind.feedKey) return receipt('started', 'refused', 'the bind carries no feed key, so a second principal cannot be seated')
@@ -295,7 +346,9 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
     if (fed) { receipt('feed_key', fed.state, fed.detail); await publish() }
   }
   try {
-    for (const [index, [, step]] of steps.entries()) {
+    for (const [index, [label, step]] of steps.entries()) {
+      // A held step stops the run: no later step runs on a grant that is unknown or gone.
+      if (await gate(label) !== null) { await publish(); break }
       const done = await step()
       await publish()
       if (!done && index < 4) break
@@ -306,6 +359,9 @@ export async function onboard({ command, name, root, out, stateDir, keysPath = '
     // operator's `run` has no runner key to seal one, so it leaves the request open for the next watch
     // tick to send the finished receipt; the steps are done, so that tick only reports.
     if (!report) log('pending  finished: every step is done; left open, so the next watch tick sends the owner the finished receipt')
+    // The public terminal marker goes out, and is read back, before the ledger says finished (piece 4's relay
+    // gate reads it). If it does not, the request stays open and the next tick tries again.
+    else if (reported && markTerminal && !(await markTerminal(add.id))) log('pending  finished: every step is done, but the terminal marker is not out yet; the next run tries again')
     else if (reported) appendFileSync(ledger, JSON.stringify({ id: add.id, name, op: 'add_agent', at: now(), finished: true }) + '\n')
     else log('pending  finished: every step is done, but the owner has not been told; the next run sends the receipt again')
   }

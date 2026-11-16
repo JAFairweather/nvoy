@@ -6,13 +6,38 @@ import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, re
 import { basename, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { recallServerEntry, sshChannelEntry } from './channel_client.mjs'
+import { CLAUDE_SESSION_START_MATCHER } from './recall-wake.mjs'
 
+export { CLAUDE_SESSION_START_MATCHER }
 export const serverName = manifest => `nvoy-${manifest.id}`
 
 // An instance with a recall block reads Hive memory through its own reader: the gateway's forced command binds the
 // key to one reader socket (or, on the store's box, the bridge binds the login to it), which serves only these two tools.
 export const RECALL_SERVER = 'hive-memory'
 export const RECALL_TOOLS = ['memory_wake', 'memory_query']
+export const RECALL_WAKE_SCRIPT = fileURLToPath(new URL('./recall-wake.mjs', import.meta.url))
+export const RECALL_HOOK_TIMEOUT_SEC = 40
+
+function shSingleQuote(value, label) {
+  const s = String(value || '')
+  if (!s.startsWith('/') || /[\x00-\x1f\x7f]/.test(s)) throw new Error(`${label} must be a clean absolute path`)
+  return `'${s.replace(/'/g, "'\\''")}'`
+}
+
+export function claudeRecallHookCommand({ mcpConfigPath, recallLogPath = '', node = process.execPath, script = RECALL_WAKE_SCRIPT }) {
+  return [
+    shSingleQuote(node, 'node executable'),
+    shSingleQuote(script, 'recall wake script'),
+    "'--claude-hook'",
+    shSingleQuote(mcpConfigPath, 'harness MCP config path'),
+    ...(recallLogPath ? ["'--log'", shSingleQuote(recallLogPath, 'recall log path')] : []),
+  ].join(' ')
+}
+
+function isManagedRecallHook(hook) {
+  return hook?.type === 'command' && typeof hook.command === 'string' &&
+    hook.command.includes('recall-wake.mjs') && hook.command.includes('--claude-hook')
+}
 
 // On herd-cloud, agent-curator's Nvoy channel runs over SSH on nave.pub, whereas Merkle Dreaming cycle packets land
 // locally in /var/lib/hive-memory-curator/packets/ (readable via curator-packet-reader). Mounting memory-dream-verify.mjs
@@ -61,7 +86,7 @@ export function seedClaudeJson(existing, workdir) {
 // Nobody is at the keyboard, so a permission prompt would stall the session for good. The channel's
 // tools are allowed; anything else is refused rather than asked about, unless the operator has
 // chosen another mode or added rules in this persistent file.
-export function seedSettings(existing, server, { recall = false, dreamVerify = false } = {}) {
+export function seedSettings(existing, server, { recall = false, dreamVerify = false, mcpConfigPath = '', recallLogPath = '', node, wakeScript } = {}) {
   const out = existing && typeof existing === 'object' && !Array.isArray(existing) ? { ...existing } : {}
   const permissions = out.permissions && typeof out.permissions === 'object' ? { ...out.permissions } : {}
   const allow = Array.isArray(permissions.allow) ? [...permissions.allow] : []
@@ -74,6 +99,43 @@ export function seedSettings(existing, server, { recall = false, dreamVerify = f
   permissions.allow = allow
   if (!permissions.defaultMode) permissions.defaultMode = 'dontAsk'
   out.permissions = permissions
+
+  const existingHooks = out.hooks && typeof out.hooks === 'object' && !Array.isArray(out.hooks) ? { ...out.hooks } : null
+  const sessionStart = Array.isArray(existingHooks?.SessionStart) ? existingHooks.SessionStart : []
+  // Match startup, --continue resume, and /clear so every fresh or resumed session context gets one wake,
+  // while mid-session compaction and transcript forks do not re-run the reader or re-inject the digest.
+  const managedGroup = recall && mcpConfigPath
+    ? {
+        matcher: CLAUDE_SESSION_START_MATCHER,
+        hooks: [{ type: 'command', command: claudeRecallHookCommand({ mcpConfigPath, recallLogPath, node, script: wakeScript }), timeout: RECALL_HOOK_TIMEOUT_SEC }],
+      }
+    : null
+  let placed = false
+  const nextSessionStart = []
+  for (const group of sessionStart) {
+    if (!group || typeof group !== 'object' || Array.isArray(group) || !Array.isArray(group.hooks)) {
+      nextSessionStart.push(group)
+      continue
+    }
+    const kept = group.hooks.filter(hook => !isManagedRecallHook(hook))
+    if (kept.length !== group.hooks.length) {
+      if (kept.length) nextSessionStart.push({ ...group, hooks: kept })
+      if (managedGroup && !placed) {
+        nextSessionStart.push(managedGroup)
+        placed = true
+      }
+    } else {
+      nextSessionStart.push(group)
+    }
+  }
+  if (managedGroup && !placed) nextSessionStart.push(managedGroup)
+  if (existingHooks || nextSessionStart.length) {
+    const hooks = existingHooks || {}
+    if (nextSessionStart.length) hooks.SessionStart = nextSessionStart
+    else delete hooks.SessionStart
+    if (Object.keys(hooks).length) out.hooks = hooks
+    else delete out.hooks
+  }
   return out
 }
 
@@ -297,7 +359,7 @@ export function hasPriorSession(home, workdir) {
 // are the only MCP server, and each is pre-approved: `approval_policy` does not cover MCP tool
 // calls, which Codex otherwise puts to the client as an elicitation the harness must decline
 // (DJ Codex, 2026-09-25). The broker still rechecks the grant before it signs any reply.
-export const CODEX_CHANNEL_TOOLS = ['nvoy_channel_list', 'nvoy_channel_read', 'nvoy_channel_reply', 'nvoy_channel_post', 'nvoy_profile_set', 'nvoy_profile_status', 'memory_claim', 'memory_withdraw']
+export const CODEX_CHANNEL_TOOLS = ['nvoy_channel_list', 'nvoy_channel_read', 'nvoy_channel_reply', 'nvoy_channel_post', 'nvoy_profile_set', 'nvoy_profile_status', 'memory_claim', 'memory_withdraw', 'memory_wake', 'memory_query']
 //
 // `auth: 'chatgpt'` is the portable harness (codex_portable_harness.mjs): Codex on its owner's
 // ChatGPT login, stored as a file in a CODEX_HOME that is the harness's own. No provider block and

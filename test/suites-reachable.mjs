@@ -46,7 +46,9 @@ const ASSERTION = new RegExp(ASSERTION_SRC)
 // Deriving the list from the test script also catches the converse, which really happened: test/lineage.mjs
 // existed, passed, and was never wired into `npm test`, so it had never run in CI once.
 const pkg = JSON.parse(readFileSync(join(dir, '..', 'package.json'), 'utf8'))
-const script = Object.values(pkg.scripts || {}).join(' && ')
+// Only npm test is the PR gate. A suite named by a side command is still absent
+// from CI unless npm test itself runs it.
+const script = pkg.scripts?.test || ''
 const wired = new Set([...script.matchAll(/test\/([\w.-]+\.mjs)/g)].map(m => m[1]))
 // Files in test/ that are NOT suites. Declared with a reason each, never inferred — an unexplained
 // exclusion list is how a real suite gets quietly dropped, which is the defect this file exists to catch.
@@ -56,6 +58,7 @@ const INFRA = new Set([
   'suites-reachable.mjs',   // this file
   'agentread.mjs',          // manual E2E driver: takes an agent + scope, played by the browser E2E
   'agenttool.mjs',          // manual E2E driver: drives one MCP tool as a given agent
+  'delegate.mjs',           // manual E2E driver: requires a live agent npub and relay
   'nvoygrant.mjs',          // a library that happens to live here, not a suite (see console/nvoygrant.mjs)
   'fake-herdr.mjs',         // a fake herdr binary the harness suites drive, not a suite
 ])

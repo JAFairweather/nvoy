@@ -7,7 +7,7 @@ import { mkdirSync, mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure'
-import { foldGrants, scopeHash } from '../mcp/tools/grant_fold.mjs'
+import { foldGrants, foldMemoryGrants, scopeHash } from '../mcp/tools/grant_fold.mjs'
 
 let fails = 0, passes = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); value ? passes++ : fails++ }
@@ -71,6 +71,53 @@ ok('revoking the shadow leaves the voice\'s direct grant live', r.live.get(voice
 ok('a grant from the second grantor is voiced only by that grantor\'s shadow', !fold([task(second, second.pk), sh]).live.has(voice.pk) &&
   fold([task(second, second.pk), shadow(second, voice.pk)]).live.get(voice.pk)?.get('task')?.grantor === second.pk)
 ok('a grant scoped to another agent is still not a grant here, for the grantor or its voice', !fold([task(director, director.pk, 'task', { subject: other }), sh]).live.size)
+
+// --- a revocation applies whatever its created_at (CAPABILITY-GRANTS.md §5, fixture cap-441-revoke-task-backdated) ---
+// A 441 names its target by id, which commits to the target's created_at, so it cannot predate it. Before this, the
+// fold sorted by created_at and dropped only grants it had already seen, so a 441 stamped earlier than its 440 (clock
+// skew, or a backdated signer) was skipped and the revoked grant stayed live.
+const granted = task(director, dennis.pk, 'task', { at: now() - 100 })
+const backdated = revoke(director, granted.id, now() - 1000)
+r = fold([granted, backdated])
+ok('a backdated revocation still revokes its grant', !r.live.has(dennis.pk))
+ok('and records the grantee as revoked', r.ended.get(dennis.pk) === 'revoked')
+ok('in either array order', !fold([backdated, granted]).live.has(dennis.pk))
+for (const cap of ['task+act', 'task-relay']) {
+  const g = task(director, dennis.pk, cap, { at: now() - 100 })
+  ok(`a backdated revocation revokes a ${cap} grant`, !fold([g, revoke(director, g.id, now() - 1000)]).live.has(dennis.pk))
+}
+const shOld = shadow(director, voice2.pk, { at: now() - 100 })
+ok('a backdated revocation revokes a shadow grant', !fold([own, shOld, revoke(director, shOld.id, now() - 1000)]).live.has(voice2.pk))
+const mention = ev(director, 440, [['p', dennis.pk], ['da-scope', scopeHash(agent, salt), salt], ['da-cap', 'mention'], ['name', 'dennis']], now() - 100)
+ok('a mention grant is live unrevoked', fold([mention]).mentions.length === 1)
+ok('a backdated revocation revokes a mention grant', fold([mention, revoke(director, mention.id, now() - 1000)]).mentions.length === 0)
+ok('a backdated revocation from a stranger still revokes nothing', fold([granted, revoke(stranger, granted.id, now() - 1000)]).live.has(dennis.pk))
+// Through JSON, like the forged shadow above: a spread copy keeps nostr-tools' cached verified mark whenever the test
+// and admission.mjs load the same nostr-tools copy (one install), and the forged 441 would then pass as signed.
+const forgedRevoke = JSON.parse(JSON.stringify({ ...revoke(director, granted.id, now() - 1000), sig: '00'.repeat(64) }))
+r = fold([granted, forgedRevoke])
+ok('a backdated revocation with a bad signature revokes nothing, and is counted rejected', r.live.has(dennis.pk) && r.rejected === 1)
+ok('a revocation of another grant leaves this one live', fold([granted, revoke(director, own.id, now() - 1000)]).live.has(dennis.pk))
+ok('a later re-grant after a revocation is live', fold([granted, backdated, task(director, dennis.pk, 'task', { at: now() - 10 })]).live.has(dennis.pk))
+
+// --- one 441 naming several grants revokes every one (CAPABILITY-GRANTS.md §1.1, fixture neg-441-multi-e) ---
+// Before this, each fold read only the first `e` tag, so a grant named second stayed live after its revocation.
+const multi = (signer, ids, at = now() - 50) => ev(signer, 441, ids.map(id => ['e', id]), at)
+const ga = task(director, dennis.pk, 'task'), gb = task(director, voice2.pk, 'task+act')
+r = fold([ga, gb, multi(director, [ga.id, gb.id])])
+ok('a 441 naming two grants revokes the first', !r.live.has(dennis.pk) && r.ended.get(dennis.pk) === 'revoked')
+ok('and the second', !r.live.has(voice2.pk) && r.ended.get(voice2.pk) === 'revoked')
+ok('a 441 naming another grant first still revokes the one named second', !fold([ga, multi(director, [own.id, ga.id])]).live.has(dennis.pk))
+ok("a stranger's multi-target 441 revokes none of them", fold([ga, gb, multi(stranger, [ga.id, gb.id])]).live.size === 2)
+const forgedMulti = JSON.parse(JSON.stringify({ ...multi(director, [ga.id]), tags: [['e', ga.id], ['e', gb.id]] }))
+r = fold([ga, gb, forgedMulti])
+ok('an e tag added after signing revokes nothing', r.live.has(dennis.pk) && r.live.has(voice2.pk) && r.rejected === 1)
+const ma = shadow(director, voice.pk), mb = shadow(director, voice2.pk)
+const mem = events => foldMemoryGrants(events, { owner: director.pk })
+ok('the memory fold sees both shadow grants unrevoked', mem([ma, mb]).writers.size === 2)
+r = mem([ma, mb, multi(director, [ma.id, mb.id])])
+ok('a 441 naming two memory grants revokes both', r.writers.size === 0 && r.ended.get(voice.pk) === 'revoked' && r.ended.get(voice2.pk) === 'revoked')
+ok('the memory fold honors a target named second', !mem([mb, multi(director, [ma.id, mb.id])]).writers.has(voice2.pk))
 
 // --- attention --policy-only, as every broker and the reply recheck call it ---
 const grants = [own, sh, task(director, dennis.pk), shadow(stranger, voice2.pk)]

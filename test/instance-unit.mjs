@@ -13,6 +13,7 @@ import { generateSecretKey, getPublicKey } from 'nostr-tools/pure'
 import * as nip19 from 'nostr-tools/nip19'
 import { readManifest } from '../mcp/tools/runtime_manifest.mjs'
 import { forcedCommand, keyFingerprint, principalLine, parsePrincipal, verifyPrincipal, volumeLifecycle } from '../mcp/tools/participant_unit.mjs'
+import { recallGatewayUnits } from '../mcp/tools/recall_gateway.mjs'
 
 let fails = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); if (!value) fails++ }
@@ -72,6 +73,34 @@ const outDir = join(root, 'out')
 mkdirSync(outDir)
 const toDisk = unit('render', '--instance', 'claude-test', '--image', IMAGE, '--public-key-file', keyFile, '--out-dir', outDir)
 ok('render writes both artifacts to disk', toDisk.status === 0 && existsSync(join(outDir, 'claude-test.compose.yml')) && existsSync(join(outDir, 'claude-test.authorized_key')))
+
+const recallRoot = join(root, 'recall-instances'), recallOut = join(root, 'recall-out')
+mkdirSync(recallRoot); mkdirSync(recallOut)
+write('recall-test', { service_user: 'nvoy_recall_test', may_recall: { read: { socket: '/run/nvoy-recall-gw/socket' }, gateway_gid: 41005 } }, recallRoot)
+const recallEnv = { ...env, NVOY_INSTANCE_ROOT: recallRoot }
+const recallUnit = (...args) => spawnSync(process.execPath, ['mcp/tools/instance-unit.mjs', ...args], { cwd: resolve('.'), encoding: 'utf8', env: recallEnv })
+ok('a recall deployment refuses Compose alone without its host units',
+  recallUnit('render', '--instance', 'recall-test', '--image', IMAGE).status !== 0)
+const recallRender = recallUnit('render', '--instance', 'recall-test', '--image', IMAGE, '--out-dir', recallOut)
+const gateway = recallGatewayUnits(readManifest(recallRoot, 'recall-test'))
+const recallCompose = readFileSync(join(recallOut, 'recall-test.compose.yml'), 'utf8')
+ok('render ties the recall Compose and both host units to one manifest', recallRender.status === 0 &&
+  readFileSync(join(recallOut, gateway.socketName), 'utf8') === gateway.socket &&
+  readFileSync(join(recallOut, gateway.serviceName), 'utf8') === gateway.service &&
+  recallCompose.includes('source: "/run/nvoy-recall-gw/recall-test"') && recallCompose.includes('group_add: ["41005"]'))
+ok('the host unit pins the per-instance key and reader, with no client-supplied command',
+  gateway.service.includes('User=nvoy_recall_test') && gateway.service.includes('StandardInput=socket') &&
+  gateway.service.includes('StandardOutput=socket') && gateway.service.includes('StandardError=journal') &&
+  gateway.service.includes('-i /etc/nvoy/recall-keys/recall-test') &&
+  gateway.service.includes('StrictHostKeyChecking=yes') && gateway.service.includes('hive-memory-gw@herd-cloud') &&
+  !gateway.service.includes('%I') && !gateway.service.includes('%i'))
+ok('the socket uses a dedicated group and four-connection limit', gateway.socket.includes('Accept=yes') &&
+  gateway.socket.includes('SocketGroup=nvoy-recall-recall-test') && gateway.socket.includes('SocketMode=0660') &&
+  gateway.socket.includes('MaxConnections=4') && gateway.service.includes('RuntimeMaxSec=25'))
+write('recall-test', { service_user: 'nvoy_recall_test', may_recall: { read: { command: ['/usr/bin/ssh', 'herd-cloud'] }, gateway_gid: 41005 } }, recallRoot)
+const oldCommand = recallUnit('render', '--instance', 'recall-test', '--image', IMAGE, '--out-dir', recallOut)
+ok('production render refuses the old SSH command inside the keyless recall container',
+  oldCommand.status !== 0 && /production may_recall requires the host gateway socket/.test(oldCommand.stderr))
 
 // ---- the generator no longer takes the container name on trust ----
 const generated = keygen('--instance', 'claude-test', '--public-key-file', keyFile)

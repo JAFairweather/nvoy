@@ -1,10 +1,14 @@
 # B4 v3.1: agreement-filtered, not adjudicated
 
-DRAFT for Curator's exact-SHA read, not freeze/execution consent. Amends v3 at
-8af534d3b04aad9ea31ec3845cb62fe04e6cc5ad. Concrete rules/minima below remain
-proposed. Existing v3 scorer is incompatible; no fictional adjudicator.
+DRAFT revision for fresh Curator/source reads, not freeze/execution consent.
+Amends historical v3 at 8af534d3b04aad9ea31ec3845cb62fe04e6cc5ad.
+For v3.1, this document supersedes v3's adjudication and pre-freeze semantic-
+equivalence review requirements; B4_RECALL_PROTOCOL.md is historical v3 reference.
+Other unchanged v3 controls remain applicable. Existing v3 scorer is incompatible;
+no fictional adjudicator. Prior method approval at d8a0b88b does not approve this
+revised text or its clarified pre-retrieval coverage-stop rule.
 
-1. Freeze 100 originals plus one equivalent paraphrase each before labeling.
+1. Freeze 100 originals plus one author-intended paraphrase each before labeling.
 No replacements or post-drop sampling. Dennis/Biggy independently label every
 base question against the pinned corpus: dated disclosures; no new target
 searches, peer votes or system results/ranks. Preserve sealed votes/reasons.
@@ -18,7 +22,10 @@ Two U votes agree; two X votes agree but remain ambiguous, never U. Reasons
 need not match. Agreement retains the entire original/paraphrase pair with
 shared category/gold; disagreement excludes both from scoring, not the ledger.
 No adjudicator, peer reconciliation or gold re-judgment.
-paraphrase gold inherited from the base question; equivalence unverified
+The frozen manifest and every result object must include paraphrase_gold_limitation
+with the exact value "paraphrase gold inherited from the base question; equivalence unverified".
+Every human-readable result line must carry that same disclosure. Labelers label
+only the base question; no independent paraphrase-equivalence review is claimed.
 
 3. Report all 100 in a 3x3 category-confusion table and exact-support agreement
 within its diagonals. Also publish a table per labeler/category: pre-filter
@@ -28,14 +35,23 @@ category), dropped=pre-filter minus survivors, agreement=survivors/pre-filter
 Cross-category drops remain in both marginal tables; no invented consensus.
 Overall agreement=retained/100; total dropped=100-retained.
 
-4. Proposed minimum survivors: A=20, U=10, X=5. Coverage guards, not confidence
+4. Minimum survivors: A=20, U=10, X=5. Coverage guards, not confidence
 intervals, SLOs or authoring quotas. No manufactured categories or relaxed
-minima after votes. Below minimum => that category INCONCLUSIVE; U/X otherwise
-REPORTED_ONLY (no ranking mutation floor); X has no correctness metric.
+minima after votes. Each category has a separate coverage status: below its
+minimum => INCONCLUSIVE; otherwise PASS. U/X have no ranking mutation floor;
+their metric status is REPORTED_ONLY after coverage passes. X has no correctness
+metric. Coverage eligibility and metric status are distinct.
 Below 80/100 total agreement => STOP before retrieval, INCONCLUSIVE with stop
 reason; Dead Rabbit batches fourth-seat grant yes/no to James. No agent adds
 access. Any changed route needs a new pre-run review/pin. At >=80, any category
-below minimum still forces overall sensitivity INCONCLUSIVE.
+below minimum also means STOP before retrieval, overall sensitivity INCONCLUSIVE,
+and recorded deficient category/count/minimum. DJ returns that coverage shortfall
+to Curator and Dead Rabbit for a reviewed route decision; no automatic fourth-seat
+grant or replacement sampling. Resume only after any changed route is reviewed
+and pinned, and any access change is authorized by James. Freeze notes must warn
+that thin U/X can void the full-scope verdict even when A coverage is sufficient.
+The overall sensitivity verdict is an A-ranking verdict conditional on ALL three
+coverage guards, not an assertion of U/X ranking sensitivity.
 
 5. Hit@1/Hit@3/MRR@10 use surviving A only; abstention/false-positive rates use
 surviving U only. Report X/exclusions separately; empty denominator => null.
@@ -52,7 +68,8 @@ accuracy claim. Minima do not remove that selection bias.
 6. Before ANY corpus/question/gold freeze or retrieval: approve and pin protocol,
 v3.1 scorer/denominator rules and executable source by commit/SHA-256. Validate
 all 100 paired votes, not just survivors. Required synthetic controls: support
-and category disagreements; 80/79; each minimum/below-minimum; null denominators;
+and category disagreements; 80/79; each minimum/below-minimum with no retrieval
+on any coverage stop; null denominators;
 replacement refusal; all mutation states. This document is not executable proof.
 Required control: paraphrase inherits base category and gold, and the pair drops together.
 

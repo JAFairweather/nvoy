@@ -51,6 +51,9 @@ if (m.mayPost) provisionFile(`${m.runtimeDir}/post-requests.jsonl`, m.workerUid,
 // unlinked by the broker once the store answers. The rate log holds ids and times only.
 if (m.mayRemember) provision(`${m.runtimeDir}/memory-requests`, m.workerUid, m.brokerAdapterGid, 0o2770, 'memory request spool')
 if (m.mayRemember) provisionFile(`${m.runtimeDir}/memory-rate.jsonl`, m.workerUid, m.workerUid, 0o600, 'memory rate log')
+// The memory recall forwarder's socket (agent_recall.mjs), for an identity opted in by may_recall: only
+// the broker UID creates it, and the setgid bit gives it the worker group, which may connect but not replace it.
+if (m.mayRecall) provision(`${m.runtimeDir}/memory-recall`, m.brokerUid, m.workerHandoffGid, 0o2750, 'memory recall socket directory')
 // The brokers' last reading of the live mention grants, for the keyless channel MCPs; worker-group readable.
 if (m.mayPost) provisionFile(`${m.runtimeDir}/mention-grants.json`, m.brokerUid, m.workerHandoffGid, 0o640, 'mention grant snapshot')
 // The broker's last reading of its rooms' members (#321), for the same readers; discovery only.

@@ -20,12 +20,25 @@ import net from 'node:net'
 import { chmodSync, chownSync, unlinkSync } from 'node:fs'
 import { verifyEvent } from 'nostr-tools/pure'
 import { HOP_TAG } from './agent_limits.mjs'
+import { credentialIn } from './outbound_secrets.mjs'
 export { nativeGrant } from './admission.mjs'
 
 const HEX64 = /^[0-9a-f]{64}$/
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '[::1]'])
 export const CHANNEL_KINDS = Object.freeze([9, 40002])
+// Buzz closes unauthenticated connections after 5s; bound AUTH signing inside that window.
+export const BUZZ_AUTH_TIMEOUT_MS = 4500
+// Refresh unpublished direct Buzz events before Buzz's ±15 min timestamp window rejects them (q-144).
+export const BUZZ_FRESH_WINDOW_SEC = 600
+export const isTransientBuzzError = error =>
+  /relay closed the connection|relay connection error|session closed|timed out|shared Buzz session/i.test(String(error?.message || error || ''))
+export const isStaleTimestampRefusal = message =>
+  /^invalid:.*(?:timestamp|created_at|too old|too far|stale|expired)/i.test(String(message || ''))
+const cleanCloseReason = raw => {
+  const s = String(raw || '').replace(/[^\x20-\x7e]/g, '').trim().slice(0, 120)
+  return s && credentialIn(s) ? '[withheld]' : s
+}
 // Relay-signed membership notices: 44100 added, 44101 removed (block/buzz NOSTR.md "Membership
 // Notifications"). They carry no channel scope, so they are the one stream read without #h.
 export const MEMBERSHIP_KINDS = Object.freeze([44100, 44101])
@@ -96,16 +109,38 @@ export function channelPost({ channel, content, mentions = [], now = Math.floor(
   return { kind: 9, created_at: now, content, tags: [['h', channel], ...mentions.map(p => ['p', p]), [HOP_TAG, '1']] }
 }
 
+// A reply, as Buzz classifies one (NIP-CW, Top-level Classification): a marked `reply` e tag. A tag marked `root`
+// alone, or an unmarked one, only refers to a thread; it does not answer in it (Murphy's Law, PR 281 review).
+export const isReply = ev => (Array.isArray(ev?.tags) ? ev.tags : []).some(t => t?.[0] === 'e' && t[3] === 'reply' && HEX64.test(String(t[1])))
+// Desktop tags an off-channel mention ["mention", pk] instead of ["p", pk]; both count.
+export const mentionsOf = (ev, me) => [...tagValues(ev, 'p'), ...tagValues(ev, 'mention')].includes(me)
+
+export const threadRoot = ev => {
+  const marked = marker => (ev.tags || []).find(t => t?.[0] === 'e' && t[3] === marker && HEX64.test(String(t[1])))?.[1]
+  return marked('root') || marked('reply') || ev.id
+}
+
 // Is this a message addressed to `me` in one of `channels`? Returns the facts admission needs,
 // or null. Desktop tags an off-channel mention ["mention", pk] instead of ["p", pk]; both count.
-export function nativeMention(ev, { me, channels, now = Math.floor(Date.now() / 1000), verify = verifyEvent }) {
+// A reply anywhere in a thread `me` started (one of `threads`, from ownRoots) is addressed too,
+// mention or not, so a reviewer's verdict reaches whoever asked (#280). Addressed is not authorised: the
+// author still needs a grant.
+export function nativeMention(ev, { me, channels, threads = [], now = Math.floor(Date.now() / 1000), verify = verifyEvent }) {
   if (!ev || !CHANNEL_KINDS.includes(ev.kind) || !HEX64.test(String(ev.pubkey)) || ev.pubkey === me) return null
   if (!Number.isSafeInteger(ev.created_at) || ev.created_at > now + 900) return null
   const h = tagValues(ev, 'h')
   if (h.length !== 1 || !channels.includes(h[0])) return null
-  if (![...tagValues(ev, 'p'), ...tagValues(ev, 'mention')].includes(me)) return null
-  if (!verified(ev, verify)) return null
-  return { channel: h[0], author: ev.pubkey, event_id: ev.id, created_at: ev.created_at }
+  const addressed = mentionsOf(ev, me) ? 'mention'
+    : isReply(ev) && threadRoot(ev) !== ev.id && threads.some(t => t.id === threadRoot(ev) && t.channel === h[0]) ? 'own-thread' : null
+  if (!addressed || !verified(ev, verify)) return null
+  return { channel: h[0], author: ev.pubkey, event_id: ev.id, created_at: ev.created_at, addressed }
+}
+
+// The threads `me` started: its own signed top-level messages in `channels`, as { id, channel }.
+export function ownRoots(events, { me, channels, verify = verifyEvent }) {
+  return (Array.isArray(events) ? events : []).filter(ev => ev?.kind === 9 && ev.pubkey === me && HEX64.test(String(ev.id)) &&
+    threadRoot(ev) === ev.id && tagValues(ev, 'h').length === 1 && channels.includes(tagValues(ev, 'h')[0]) && verified(ev, verify))
+    .map(ev => ({ id: ev.id, channel: tagValues(ev, 'h')[0] }))
 }
 
 // The conversation around an admitted message, so the agent can follow the room it was asked in
@@ -113,10 +148,6 @@ export function nativeMention(ev, { me, channels, now = Math.floor(Date.now() / 
 // channel's last messages before the source, the thread's root, and the thread's replies.
 export const CONTEXT_LIMIT = 30
 const CONTEXT_MESSAGE_BYTES = 4000, CONTEXT_BYTES = 48 * 1024
-const threadRoot = ev => {
-  const marked = marker => (ev.tags || []).find(t => t?.[0] === 'e' && t[3] === marker && HEX64.test(String(t[1])))?.[1]
-  return marked('root') || marked('reply') || ev.id
-}
 export function contextFilters(source) {
   const h = tagValues(source, 'h')
   if (h.length !== 1 || !validChannel(h[0]) || !Number.isSafeInteger(source.created_at)) return null
@@ -171,51 +202,7 @@ export function dmChannels(notices, { me, verify = verifyEvent }) {
   return [...latest].filter(([, member]) => member).map(([channel]) => channel).sort()
 }
 
-// One authenticated connection. `signer` is { getPublicKey(), signEvent(template) }; the pubkey
-// is resolved BEFORE the socket opens, both to warm a Bunker inside the 5s window and so a
-// signer that answers for a different key is caught before anything is sent. `pingMs` makes a
-// long-lived session prove it is alive: a socket that stops answering pings is terminated, so a
-// half-open connection surfaces as `closed` instead of as a quiet channel.
-export async function openBuzzSession({ relay, signer, timeoutMs = 10000, pingMs = 0, WS = WebSocket }) {
-  const url = normalizeBuzzRelay(relay)
-  const me = String(await signer.getPublicKey()).toLowerCase()
-  if (!HEX64.test(me)) throw new Error('signer returned no usable pubkey')
-  const ws = new WS(url)
-  const waiters = new Map(), subs = new Map(), live = new Map()
-  let challenge, onChallenge, closedWith, pinger, resolveClosed
-  const closed = new Promise(resolve => { resolveClosed = resolve })
-  const fail = reason => {
-    closedWith ??= reason
-    clearInterval(pinger)
-    for (const w of waiters.values()) w.reject(new Error(closedWith))
-    for (const s of subs.values()) s.reject(new Error(closedWith))
-    waiters.clear(); subs.clear(); live.clear(); onChallenge?.reject(new Error(closedWith))
-    resolveClosed(closedWith)
-  }
-  ws.on('message', raw => {
-    let m; try { m = JSON.parse(raw.toString()) } catch { return }
-    if (m[0] === 'AUTH' && typeof m[1] === 'string') { challenge = m[1]; onChallenge?.resolve(m[1]) }
-    else if (m[0] === 'OK') { const w = waiters.get(m[1]); if (w) { waiters.delete(m[1]); w.resolve({ accepted: m[2] === true, message: String(m[3] || '') }) } }
-    else if (m[0] === 'EVENT') { const l = live.get(m[1]); if (l) l.onEvent(m[2]); else subs.get(m[1])?.events.push(m[2]) }
-    else if (m[0] === 'EOSE') { const l = live.get(m[1]); if (l) l.onEose?.(); else { const s = subs.get(m[1]); if (s) { subs.delete(m[1]); s.resolve(s.events) } } }
-    else if (m[0] === 'CLOSED') {
-      const l = live.get(m[1])
-      if (l) { live.delete(m[1]); l.onClosed?.(String(m[2] || '')) }
-      else { const s = subs.get(m[1]); if (s) { subs.delete(m[1]); s.reject(new Error(`subscription closed: ${m[2] || ''}`)) } }
-    }
-  })
-  ws.on('close', () => fail('relay closed the connection'))
-  ws.on('error', e => fail(`relay connection error: ${e.message}`))
-  const bounded = (promise, what) => {
-    let timer
-    return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} timed out`)), timeoutMs) })])
-      .finally(() => clearTimeout(timer))
-  }
-  const send = frame => { if (closedWith) throw new Error(closedWith); ws.send(JSON.stringify(frame)) }
-  // Send, THEN arm the wait: a reply can only arrive on a later tick, and arming first would leave
-  // a timer behind when send throws on a closed socket — one that later rejects with no one listening.
-  const sendAndAwaitOk = (frame, id) => { send(frame); return bounded(new Promise((resolve, reject) => waiters.set(id, { resolve, reject })), 'relay OK') }
-  const close = () => { closedWith ??= 'session closed'; try { ws.close() } catch { /* already gone */ } }
+function buzzFiltersNeedChannels(filters, me) {
   // A membership-notice filter is the one exception, and only for our own notices.
   const notices = f => Array.isArray(f?.kinds) && f.kinds.length && f.kinds.every(k => MEMBERSHIP_KINDS.includes(k)) &&
     Array.isArray(f['#p']) && f['#p'].length === 1 && f['#p'][0] === me && f['#h'] === undefined
@@ -230,16 +217,118 @@ export async function openBuzzSession({ relay, signer, timeoutMs = 10000, pingMs
   const profiles = f => f && Object.keys(f).every(k => k === 'kinds' || k === 'authors') && Array.isArray(f.kinds) &&
     f.kinds.length === 1 && f.kinds[0] === 0 && Array.isArray(f.authors) && f.authors.length >= 1 && f.authors.length <= 100 &&
     f.authors.every(a => /^[0-9a-f]{64}$/.test(String(a)))
-  const needsChannels = filters => !filters.length || filters.some(f => !notices(f) && !ownProfile(f) && !ownAppData(f) && !profiles(f) &&
+  return !Array.isArray(filters) || !filters.length || filters.some(f => !notices(f) && !ownProfile(f) && !ownAppData(f) && !profiles(f) &&
     (!Array.isArray(f?.['#h']) || !f['#h'].length || !f['#h'].every(validChannel)))
+}
+
+// One authenticated connection. `signer` is { getPublicKey(), signEvent(template) }; the pubkey
+// is resolved BEFORE the socket opens, both to warm a Bunker inside the 5s window and so a
+// signer that answers for a different key is caught before anything is sent. `pingMs` makes a
+// long-lived session prove it is alive: a socket that stops answering pings is terminated, so a
+// half-open connection surfaces as `closed` instead of as a quiet channel.
+export async function openBuzzSession({
+  relay, signer, timeoutMs = 10000, authTimeoutMs = BUZZ_AUTH_TIMEOUT_MS, pingMs = 0, WS = WebSocket,
+  socketPath = process.env.NVOY_BUZZ_SESSION_SOCK || '', onPhase = null,
+}) {
+  const url = normalizeBuzzRelay(relay)
+  if (socketPath && WS === WebSocket) {
+    try {
+      return await openSharedBuzzClient({ socketPath, relay: url, signer, timeoutMs, onPhase })
+    } catch (e) {
+      if (!e?.unavailable || !signer || process.env.NVOY_BUZZ_SESSION_REQUIRED === '1') throw e
+      onPhase?.({ event: 'shared_fallback', reason: e.message })
+    }
+  }
+  const t0 = Date.now()
+  let phase = 'pubkey', closeCode = null, closeReason = ''
+  const phases = {}
+  const me = String(await signer.getPublicKey()).toLowerCase()
+  phases.pubkey_ms = Date.now() - t0
+  if (!HEX64.test(me)) throw new Error('signer returned no usable pubkey')
+  phase = 'ws_connect'
+  const wsStart = Date.now()
+  const ws = new WS(url)
+  const waiters = new Map(), subs = new Map(), live = new Map()
+  let challenge, onChallenge, closedWith, pinger, resolveClosed
+  const closed = new Promise(resolve => { resolveClosed = resolve })
+  const fail = reason => {
+    closedWith ??= reason
+    clearInterval(pinger)
+    for (const w of waiters.values()) w.reject(new Error(closedWith))
+    for (const s of subs.values()) s.reject(new Error(closedWith))
+    waiters.clear(); subs.clear(); live.clear(); onChallenge?.reject(new Error(closedWith))
+    resolveClosed(closedWith)
+  }
+  ws.on?.('open', () => {
+    phases.ws_open_ms = Date.now() - wsStart
+    if (phase === 'ws_connect') phase = 'auth_challenge'
+  })
+  ws.on('message', raw => {
+    let m; try { m = JSON.parse(raw.toString()) } catch { return }
+    if (m[0] === 'AUTH' && typeof m[1] === 'string') { challenge = m[1]; onChallenge?.resolve(m[1]) }
+    else if (m[0] === 'OK') { const w = waiters.get(m[1]); if (w) { waiters.delete(m[1]); w.resolve({ accepted: m[2] === true, message: String(m[3] || '') }) } }
+    else if (m[0] === 'EVENT') { const l = live.get(m[1]); if (l) l.onEvent(m[2]); else subs.get(m[1])?.events.push(m[2]) }
+    else if (m[0] === 'EOSE') { const l = live.get(m[1]); if (l) l.onEose?.(); else { const s = subs.get(m[1]); if (s) { subs.delete(m[1]); s.resolve(s.events) } } }
+    else if (m[0] === 'CLOSED') {
+      const l = live.get(m[1])
+      if (l) { live.delete(m[1]); l.onClosed?.(String(m[2] || '')) }
+      else { const s = subs.get(m[1]); if (s) { subs.delete(m[1]); s.reject(new Error(`subscription closed: ${m[2] || ''}`)) } }
+    }
+  })
+  ws.on('close', (code, reasonBuf) => {
+    closeCode = Number.isInteger(code) ? code : null
+    closeReason = cleanCloseReason(reasonBuf)
+    const elapsed = Date.now() - t0
+    const detail = [
+      closeCode !== null ? `code=${closeCode}` : '',
+      closeReason ? `reason=${JSON.stringify(closeReason)}` : '',
+      `phase=${phase}`,
+      `elapsed=${elapsed}ms`,
+    ].filter(Boolean).join(' ')
+    if (closedWith !== 'session closed') {
+      onPhase?.({ event: 'close', phase, close_code: closeCode, close_reason: closeReason, elapsed_ms: elapsed, ...phases })
+    }
+    fail(`relay closed the connection (${detail})`)
+  })
+  ws.on('error', e => fail(`relay connection error: ${e.message}`))
+  const boundedMs = (promise, what, limitMs = timeoutMs) => {
+    let timer
+    return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} timed out (${limitMs}ms)`)), limitMs) })])
+      .finally(() => clearTimeout(timer))
+  }
+  const bounded = (promise, what) => boundedMs(promise, what, timeoutMs)
+  const send = frame => { if (closedWith) throw new Error(closedWith); ws.send(JSON.stringify(frame)) }
+  // Send, THEN arm the wait: a reply can only arrive on a later tick, and arming first would leave
+  // a timer behind when send throws on a closed socket — one that later rejects with no one listening.
+  const sendAndAwaitOk = (frame, id) => { send(frame); return bounded(new Promise((resolve, reject) => waiters.set(id, { resolve, reject })), 'relay OK') }
+  const close = () => { closedWith ??= 'session closed'; try { ws.close() } catch { /* already gone */ } }
+  const needsChannels = filters => buzzFiltersNeedChannels(filters, me)
 
   try {
+    phase = 'auth_challenge'
+    const cStart = Date.now()
     const c = challenge ?? await bounded(new Promise((resolve, reject) => { onChallenge = { resolve, reject } }), 'AUTH challenge')
-    const auth = await signer.signEvent(authTemplate(url, c))
+    phases.challenge_ms = Date.now() - cStart
+    phase = 'auth_sign'
+    const sStart = Date.now()
+    const authLimit = Math.max(1, Math.min(timeoutMs, authTimeoutMs))
+    const auth = await boundedMs(signer.signEvent(authTemplate(url, c)), 'AUTH sign', authLimit)
+    phases.auth_sign_ms = Date.now() - sStart
     if (auth?.pubkey !== me || auth.kind !== 22242 || !verified(auth)) throw new Error('signer returned an AUTH event that is not ours')
+    phase = 'auth_ok'
+    const okStart = Date.now()
     const verdict = await sendAndAwaitOk(['AUTH', auth], auth.id)
+    phases.auth_ok_ms = Date.now() - okStart
     if (!verdict.accepted) throw new Error(`AUTH refused: ${verdict.message || '(no reason)'}`)
-  } catch (error) { close(); throw error }
+    phases.total_auth_ms = Date.now() - t0
+    phase = 'ready'
+    onPhase?.({ event: 'auth_ok', ...phases })
+  } catch (error) {
+    error.buzzMeta ??= { op: 'auth', phase, close_code: closeCode, close_reason: closeReason, elapsed_ms: Date.now() - t0, ...phases }
+    onPhase?.({ event: 'auth_error', phase, close_code: closeCode, close_reason: closeReason, elapsed_ms: Date.now() - t0, error: error.message, ...phases })
+    close()
+    throw error
+  }
 
   if (pingMs > 0) {
     let alive = true
@@ -257,7 +346,23 @@ export async function openBuzzSession({ relay, signer, timeoutMs = 10000, pingMs
   const publishSigned = async ev => {
     if (ev?.pubkey !== me || !verified(ev)) throw new Error('refusing to publish an event that is not ours')
     if (CHANNEL_KINDS.includes(ev.kind) && tagValues(ev, 'h').length !== 1) throw new Error('channel event needs exactly one h tag')
-    return { event: ev, ...(await sendAndAwaitOk(['EVENT', ev], ev.id)) }
+    const opStart = Date.now()
+    let sent = false
+    phase = 'publish'
+    try {
+      send(['EVENT', ev])
+      sent = true
+      const res = await bounded(new Promise((resolve, reject) => waiters.set(ev.id, { resolve, reject })), 'relay OK')
+      const publish_ms = Date.now() - opStart
+      phase = 'ready'
+      onPhase?.({ event: 'publish', kind: ev.kind, accepted: res.accepted, publish_ms })
+      return { event: ev, ...res, publish_ms }
+    } catch (error) {
+      const publish_ms = Date.now() - opStart
+      error.buzzMeta = { op: 'publish', kind: ev.kind, sent, publish_ms, close_code: closeCode, close_reason: closeReason, phase, ...phases }
+      onPhase?.({ event: 'publish_error', kind: ev.kind, sent, publish_ms, close_code: closeCode, close_reason: closeReason, error: error.message })
+      throw error
+    }
   }
   return Object.freeze({
     pubkey: me, relay: url, close, closed,
@@ -269,9 +374,22 @@ export async function openBuzzSession({ relay, signer, timeoutMs = 10000, pingMs
     async fetch(...filters) {
       if (needsChannels(filters)) throw new Error('every Buzz filter needs #h channel UUIDs — without it the relay returns nothing')
       const id = `q${++n}`
-      send(['REQ', id, ...filters])
-      const pending = bounded(new Promise((resolve, reject) => subs.set(id, { events: [], resolve, reject })), 'REQ')
-      try { return await pending } finally { if (!closedWith) try { send(['CLOSE', id]) } catch { /* closing anyway */ } }
+      const opStart = Date.now()
+      phase = 'req'
+      try {
+        send(['REQ', id, ...filters])
+        const pending = bounded(new Promise((resolve, reject) => subs.set(id, { events: [], resolve, reject })), 'REQ')
+        const events = await pending
+        const req_ms = Date.now() - opStart
+        phase = 'ready'
+        onPhase?.({ event: 'fetch', count: events.length, req_ms })
+        return events
+      } catch (error) {
+        const req_ms = Date.now() - opStart
+        error.buzzMeta = { op: 'fetch', req_ms, close_code: closeCode, close_reason: closeReason, phase, ...phases }
+        onPhase?.({ event: 'fetch_error', req_ms, close_code: closeCode, close_reason: closeReason, error: error.message })
+        throw error
+      } finally { if (!closedWith) try { send(['CLOSE', id]) } catch { /* closing anyway */ } }
     },
     // A subscription that stays open past EOSE. Events arrive unverified: the caller decides what
     // an event means (nativeMention verifies it) — this only routes frames.
@@ -282,6 +400,261 @@ export async function openBuzzSession({ relay, signer, timeoutMs = 10000, pingMs
       send(['REQ', id, ...filters])
       return () => { if (live.delete(id) && !closedWith) try { send(['CLOSE', id]) } catch { /* closing anyway */ } }
     },
+  })
+}
+
+// --- Broker-shared Buzz session (q-150). --------------------------------------------------------
+// Short-lived broker children (reply, post, rooms, native delivery, profile, status) run every
+// second to five minutes. Opening a fresh Buzz WebSocket per child costs a get_public_key and a
+// kind 22242 AUTH signature every time. The broker instead keeps one authenticated Buzz session in
+// its private stateDir (mode 0600, broker-only) and multiplexes fetch and publishSigned over it.
+const MAX_CLIENT_BYTES = 256 * 1024
+const MAX_SERVER_BYTES = 4 * 1024 * 1024
+
+export function formatBuzzPhase(id, p) {
+  const code = p.close_code !== null && p.close_code !== undefined ? p.close_code : 'none'
+  const reason = p.close_reason ? ` close_reason=${JSON.stringify(p.close_reason)}` : ''
+  if (p.event === 'auth_ok')
+    return `session#${id} ready pubkey_ms=${p.pubkey_ms ?? -1} ws_open_ms=${p.ws_open_ms ?? -1} challenge_ms=${p.challenge_ms ?? -1} auth_sign_ms=${p.auth_sign_ms ?? -1} auth_ok_ms=${p.auth_ok_ms ?? -1} total_auth_ms=${p.total_auth_ms ?? -1}`
+  if (p.event === 'auth_error')
+    return `session#${id} auth_error phase=${p.phase} pubkey_ms=${p.pubkey_ms ?? -1} ws_open_ms=${p.ws_open_ms ?? -1} challenge_ms=${p.challenge_ms ?? -1} auth_sign_ms=${p.auth_sign_ms ?? -1} auth_ok_ms=${p.auth_ok_ms ?? -1} close_code=${code}${reason} error=${JSON.stringify(cleanCloseReason(p.error))}`
+  if (p.event === 'close')
+    return `session#${id} closed phase=${p.phase} age_ms=${p.elapsed_ms ?? -1} close_code=${code}${reason}`
+  if (p.event === 'fetch_error')
+    return `session#${id} fetch_error req_ms=${p.req_ms ?? -1} close_code=${code}${reason} error=${JSON.stringify(cleanCloseReason(p.error))}`
+  if (p.event === 'publish_error')
+    return `session#${id} publish_error kind=${p.kind} sent=${Boolean(p.sent)} publish_ms=${p.publish_ms ?? -1} close_code=${code}${reason} error=${JSON.stringify(cleanCloseReason(p.error))}`
+  return null
+}
+
+export function serveBuzzSession({
+  socketPath, relay, signer, pubkey, timeoutMs = 10000, authTimeoutMs = BUZZ_AUTH_TIMEOUT_MS,
+  pingMs = 25000, WS = WebSocket, log = null,
+}) {
+  const want = normalizeBuzzRelay(relay)
+  const me = String(pubkey || '').toLowerCase()
+  if (!HEX64.test(me)) throw new Error('Buzz session server needs the manifest pubkey')
+  let current = null, currentId = 0, opening = null, nextId = 0, stopped = false
+  const emit = (id, p) => { const line = formatBuzzPhase(id, p); if (line) log?.(line) }
+  const drop = s => { if (current === s) current = null; try { s?.close() } catch { /* gone */ } }
+
+  async function acquire() {
+    if (stopped) throw new Error('shared Buzz session server stopped')
+    if (current) return { session: current, reused: true, sessionId: currentId }
+    if (opening) {
+      const s = await opening
+      return { session: s, reused: true, sessionId: currentId }
+    }
+    const id = ++nextId
+    const p = (async () => {
+      const s = await openBuzzSession({
+        relay: want, signer, timeoutMs, authTimeoutMs, pingMs, WS, socketPath: '',
+        onPhase: info => emit(id, info),
+      })
+      if (s.pubkey !== me) { s.close(); throw new Error('signer does not match manifest pubkey') }
+      if (stopped) { s.close(); throw new Error('shared Buzz session server stopped') }
+      current = s; currentId = id
+      s.closed.then(() => { if (current === s) current = null })
+      return s
+    })()
+    opening = p
+    try {
+      const s = await p
+      return { session: s, reused: false, sessionId: id }
+    } finally {
+      if (opening === p) opening = null
+    }
+  }
+
+  const server = net.createServer(socket => {
+    let buffer = ''
+    socket.setEncoding('utf8')
+    socket.setTimeout(Math.max(120000, timeoutMs * 3), () => socket.destroy())
+    socket.on('error', () => {})
+    const answer = obj => { if (!socket.destroyed) try { socket.write(JSON.stringify(obj) + '\n') } catch { /* peer gone */ } }
+    const handle = async msg => {
+      const id = msg?.id
+      if (!Number.isSafeInteger(id)) return socket.destroy()
+      try {
+        if (msg.op === 'hello') {
+          if (normalizeBuzzRelay(msg.relay) !== want) return answer({ id, ok: false, error: 'Buzz relay does not match this broker session' })
+          const { reused, sessionId } = await acquire()
+          return answer({ id, ok: true, pubkey: me, relay: want, reused, sessionId })
+        }
+        if (msg.op === 'fetch') {
+          if (buzzFiltersNeedChannels(msg.filters, me))
+            return answer({ id, ok: false, error: 'every Buzz filter needs #h channel UUIDs — without it the relay returns nothing' })
+          let { session, reused, sessionId } = await acquire()
+          try {
+            return answer({ id, ok: true, events: await session.fetch(...msg.filters), meta: { reused, sessionId } })
+          } catch (err) {
+            if (isTransientBuzzError(err)) drop(session)
+            if (reused && isTransientBuzzError(err)) {
+              log?.(`session#${sessionId} closed on reused fetch; reconnecting once`)
+              ;({ session, sessionId } = await acquire())
+              return answer({ id, ok: true, events: await session.fetch(...msg.filters), meta: { reused: false, reconnected: true, sessionId } })
+            }
+            return answer({ id, ok: false, error: err.message, meta: { ...(err.buzzMeta || {}), reused, sessionId } })
+          }
+        }
+        if (msg.op === 'publishSigned') {
+          const ev = msg.event
+          if (ev?.pubkey !== me || !verified(ev)) return answer({ id, ok: false, error: 'refusing to publish an event that is not ours' })
+          if (CHANNEL_KINDS.includes(ev.kind) && tagValues(ev, 'h').length !== 1) return answer({ id, ok: false, error: 'channel event needs exactly one h tag' })
+          let { session, reused, sessionId } = await acquire()
+          try {
+            const res = await session.publishSigned(ev)
+            return answer({ id, ok: true, accepted: res.accepted, message: res.message, meta: { publish_ms: res.publish_ms, reused, sessionId } })
+          } catch (err) {
+            if (isTransientBuzzError(err)) drop(session)
+            if (reused && err?.buzzMeta?.sent === false && isTransientBuzzError(err)) {
+              log?.(`session#${sessionId} closed before publish write; reconnecting once`)
+              ;({ session, sessionId } = await acquire())
+              const res = await session.publishSigned(ev)
+              return answer({ id, ok: true, accepted: res.accepted, message: res.message, meta: { publish_ms: res.publish_ms, reused: false, reconnected: true, sessionId } })
+            }
+            return answer({ id, ok: false, error: err.message, meta: { ...(err.buzzMeta || {}), reused, sessionId } })
+          }
+        }
+        return answer({ id, ok: false, error: 'unknown Buzz session op' })
+      } catch (err) {
+        return answer({ id, ok: false, error: err.message, meta: err.buzzMeta || null })
+      }
+    }
+    socket.on('data', chunk => {
+      buffer += chunk
+      if (buffer.length > MAX_CLIENT_BYTES) return socket.destroy()
+      let nl
+      while ((nl = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, nl)
+        buffer = buffer.slice(nl + 1)
+        if (!line.trim()) continue
+        let msg
+        try { msg = JSON.parse(line) } catch { return socket.destroy() }
+        handle(msg)
+      }
+    })
+  })
+  server.on('close', () => {
+    stopped = true
+    drop(current)
+    try { unlinkSync(socketPath) } catch { /* gone */ }
+  })
+  try { unlinkSync(socketPath) } catch { /* no stale socket */ }
+  return new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(socketPath, () => {
+      try { chmodSync(socketPath, 0o600) } catch (e) { server.close(); return reject(e) }
+      resolve(server)
+    })
+  })
+}
+
+async function connectUnixWithRetry(socketPath, waitMs) {
+  const deadline = Date.now() + waitMs
+  for (;;) {
+    try {
+      return await new Promise((resolve, reject) => {
+        const s = net.createConnection(socketPath)
+        const onErr = e => { s.destroy(); reject(e) }
+        s.once('error', onErr)
+        s.once('connect', () => { s.removeListener('error', onErr); resolve(s) })
+      })
+    } catch (e) {
+      if (!['ENOENT', 'ECONNREFUSED', 'EAGAIN'].includes(e?.code) || Date.now() + 40 > deadline) {
+        const err = new Error(`shared Buzz session unavailable: ${e?.code || e?.message || e}`)
+        err.unavailable = true
+        throw err
+      }
+      await new Promise(r => setTimeout(r, 40))
+    }
+  }
+}
+
+export async function openSharedBuzzClient({ socketPath, relay, signer = null, timeoutMs = 10000, onPhase = null }) {
+  const url = normalizeBuzzRelay(relay)
+  const socket = await connectUnixWithRetry(socketPath, Math.min(600, timeoutMs))
+  socket.setEncoding('utf8')
+  let buffer = '', nextId = 0, closedWith = null, resolveClosed
+  const closed = new Promise(resolve => { resolveClosed = resolve })
+  const waiters = new Map()
+  const failAll = reason => {
+    closedWith ??= reason
+    for (const w of waiters.values()) { clearTimeout(w.timer); w.reject(new Error(closedWith)) }
+    waiters.clear()
+    resolveClosed(closedWith)
+  }
+  socket.on('close', () => failAll('shared Buzz session closed'))
+  socket.on('error', e => failAll(`shared Buzz session error: ${e.message}`))
+  socket.on('data', chunk => {
+    buffer += chunk
+    if (buffer.length > MAX_SERVER_BYTES) { socket.destroy(); return failAll('shared Buzz session frame exceeded limit') }
+    let nl
+    while ((nl = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, nl)
+      buffer = buffer.slice(nl + 1)
+      if (!line.trim()) continue
+      let msg
+      try { msg = JSON.parse(line) } catch { socket.destroy(); return failAll('shared Buzz session reply is malformed') }
+      const w = waiters.get(msg.id)
+      if (!w) continue
+      waiters.delete(msg.id)
+      clearTimeout(w.timer)
+      if (msg.ok) w.resolve(msg)
+      else {
+        const err = new Error(String(msg.error || 'shared Buzz session failed'))
+        if (msg.meta) err.buzzMeta = msg.meta
+        w.reject(err)
+      }
+    }
+  })
+  const rpc = payload => {
+    if (closedWith) return Promise.reject(new Error(closedWith))
+    const id = ++nextId
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        waiters.delete(id)
+        reject(new Error(`${payload.op} timed out`))
+      }, timeoutMs + 2500)
+      waiters.set(id, { resolve, reject, timer })
+      try { socket.write(JSON.stringify({ id, ...payload }) + '\n') }
+      catch (e) { waiters.delete(id); clearTimeout(timer); reject(e) }
+    })
+  }
+  const close = () => {
+    closedWith ??= 'session closed'
+    try { socket.end(); socket.destroy() } catch { /* gone */ }
+    failAll(closedWith)
+  }
+  let hello
+  try {
+    hello = await rpc({ op: 'hello', relay: url })
+  } catch (e) {
+    close()
+    throw e
+  }
+  const me = String(hello.pubkey || '').toLowerCase()
+  if (!HEX64.test(me)) { close(); throw new Error('shared Buzz session returned no usable pubkey') }
+  onPhase?.({ event: 'shared_hello', reused: Boolean(hello.reused), session_id: hello.sessionId })
+  const publishSigned = async ev => {
+    if (ev?.pubkey !== me || !verified(ev)) throw new Error('refusing to publish an event that is not ours')
+    if (CHANNEL_KINDS.includes(ev.kind) && tagValues(ev, 'h').length !== 1) throw new Error('channel event needs exactly one h tag')
+    const res = await rpc({ op: 'publishSigned', event: ev })
+    return { event: ev, accepted: res.accepted === true, message: String(res.message || ''), ...(res.meta || {}) }
+  }
+  return Object.freeze({
+    pubkey: me, relay: url, close, closed,
+    publishSigned,
+    async publish(template) {
+      if (!signer) throw new Error('shared Buzz client requires a signer for publish()')
+      return publishSigned(await signer.signEvent(template))
+    },
+    async fetch(...filters) {
+      if (buzzFiltersNeedChannels(filters, me)) throw new Error('every Buzz filter needs #h channel UUIDs — without it the relay returns nothing')
+      const res = await rpc({ op: 'fetch', filters })
+      return res.events
+    },
+    subscribe() { throw new Error('long-lived subscriptions must open a dedicated Buzz WebSocket') },
   })
 }
 

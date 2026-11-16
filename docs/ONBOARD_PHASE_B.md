@@ -138,6 +138,67 @@ Today the step is a fixed pending line. With nave.pub #157 it is:
 The page signs that list; the runner only reads it. An operator's `run` reads it the same way, from
 relay.nave.pub or `--writer-relay`.
 
+## Delegate grants (discovery only)
+
+An owner may grant a delegate key the right to ask for new agents, with one kind 440 `da-cap onboard`
+(scoped to the owner's own key) and revoke it with one 441 (waggle `docs/DESIGN_ONBOARDING_DELEGATE.md`).
+`onboard_delegate.mjs` reads those grants cold from the grant relays at every tick and at every `run`:
+- A 441 from the grant's own grantor revokes it whatever either `created_at` says.
+- Fewer than a quorum of complete relay reads is "grant state unknown". It reads no delegate, and the
+  tick logs it.
+- Grants count only from complete reads; a 441 from any relay that answered still revokes.
+- Live delegates are added to the authors both fetch paths read setup requests from.
+
+A delegate's request is accepted only within the owner's limits (`parseSetupRequest`, `delegation`):
+- It must hold a live grant from a grantor of the template. It is recorded with that grantor as `owner`
+  and itself as `signer`, and receipts stay sealed to the owner.
+- `like` must be in the runner config's `onboard_templates`. Absent or empty means none, so every
+  delegate request is refused.
+- `consent` must name that grant. The request carries no `policy` or `age` of its own; they come from
+  the grant, which must carry both.
+- The grant's `policy` must equal the terms the hive serves now, read fresh from the template's hive
+  relay. Unreadable terms are `ONBOARD_TERMS_UNKNOWN`, which the watcher retries.
+- It names no `giver`.
+- The delegate adds at most 1 new name in any 24 hours, counted from the ledger's `signer`.
+- A delegate's `bind_runtime` seats nothing unless the staged key from the agent's box exists and
+  matches it.
+- The hive step opens a delegate's sealed invite as sealed by the delegate.
+- **Before every step**, a delegate's request re-reads the grants fresh (the stop bound):
+  - "unknown" does nothing that step, and the run stops and waits;
+  - a grant that is no longer live refuses the step before any effect, and the run stops;
+  - before the apply, the staged manifest is moved aside (`<name>.json.revoked-<request>`), so nothing is seated.
+  The grant checked is the one the request names in `consent`.
+- The watch seals a second receipt copy to the delegate (`d = nvoy-onboard:<request>:delegate`) without
+  `pairing`. The pairing link is the owner's Bunker approval.
+
+## The acceptance proof
+
+For a delegate's `add_agent` that passes every parse check, the watch publishes a public proof signed by the
+runner, before any effect (before `staged`):
+- kind 30078, empty content, tags exactly `d = nvoy-onboard:<request>:accepted`, `e = <request>`,
+  `p = <target>` and `consent = <grant id>`;
+- nave.pub's delegate writer gate needs it, with no terminal marker and a live grant, before it admits a new writer.
+
+It must be taken by a relay and read back (verified) before the run continues. Otherwise nothing is done that run,
+not even a ledger entry, and the next tick tries again. It goes out once per request (`<request>.accepted.json`)
+and is never withdrawn; a later refusal or revocation is the terminal marker's to say. An owner's own request
+and a request refused at parse get none.
+
+A caller that cannot publish the proof never acts on a delegate's request. That covers the operator's `run`, and a
+watch with no relay readback. Such a request is refused `ONBOARD_DELEGATE_NEEDS_PROOF` before the ledger or any
+effect, and the watch retries it rather than setting it aside.
+
+## The terminal marker
+
+When a request ends, finished or refused, the watch publishes a public marker signed by the runner:
+- kind 30078, empty content, tags exactly `d = nvoy-onboard:<request>:terminal` and `e = <request>`;
+- it means this request can no longer authorize anything; nave.pub's delegate writer gate reads it.
+
+It must be taken by a relay and read back (verified) before the ledger says `finished`, or before a
+refused request is set aside. Otherwise the request stays open and the next tick tries again. A request
+refused in an earlier tick, within the request window, gets its missing marker retried. Each marker goes
+out once (`<request>.terminal.json`).
+
 ## Failure and replay
 
 - A request id is run once to completion. The ledger's `finished` row stops every later tick. It is
