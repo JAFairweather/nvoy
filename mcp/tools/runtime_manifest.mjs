@@ -85,7 +85,11 @@ export function readManifest(root, requestedId) {
       try { relaySigner = toHex(raw.buzz.relay_signer) } catch { relaySigner = '' }
       if (!valid(relaySigner)) die('buzz.relay_signer must be a pubkey')
     }
-    buzz = Object.freeze({ relay, channels: Object.freeze(channels), statusReactions, relaySigner })
+    // q-198 layer 2: a content-free notice to the seat when a mention is refused. Off until the seat's queue
+    // readers run a release that knows the notice; an older reader rejects it and stops reading its queue.
+    const unadmittedNotice = raw.buzz?.unadmitted_notice ?? false
+    if (typeof unadmittedNotice !== 'boolean') die('buzz.unadmitted_notice must be true or false')
+    buzz = Object.freeze({ relay, channels: Object.freeze(channels), statusReactions, relaySigner, unadmittedNotice })
   }
   if (!valid(pubkey) || !grantors.length || !grantors.every(valid) || !relays.length) die('manifest requires pubkey, grantors, and wss relays')
   if (new Set(carriers.map(entry => entry.pubkey)).size !== carriers.length) die('task_carrier pubkeys must be distinct')

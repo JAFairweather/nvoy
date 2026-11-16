@@ -6,12 +6,13 @@
 import { WebSocketServer } from 'ws'
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:http'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { finalizeEvent, generateSecretKey, getPublicKey, verifyEvent } from 'nostr-tools/pure'
 import { MEMBERSHIP_KINDS, channelReply, dmChannels, dmNoticeFilter, nativeGrant, openBuzzSession, serveAuthOracle } from '../mcp/tools/buzz_native.mjs'
-import { validateAdmittedTask } from '../mcp/tools/admitted_task.mjs'
+import { validateAdmittedTask, validateDesktopDelivery } from '../mcp/tools/admitted_task.mjs'
+import { createServer as createNetServer } from 'node:net'
 
 let fails = 0, passes = 0
 const ok = (name, value) => { console.log(`${value ? 'ok  ' : 'FAIL'} — ${name}`); value ? passes++ : fails++ }
@@ -202,6 +203,55 @@ let r = await deliver(dudeAgain.id)
 ok('a forged marker for another agent\'s DM is refused by the broker before any grant is consulted', refusedDm(r, dudeAgain.id))
 r = await deliver(granteeDm.id)
 ok('a forged marker for a grant holder\'s DM is refused by the broker before any grant is consulted', refusedDm(r, granteeDm.id))
+
+// --- q-198: a refused DM is recorded, and with the switch on the seat is told, without the content ---
+const refusalsPath = join(root, 'state', 'unadmitted-mentions.jsonl')
+const refusals = () => (existsSync(refusalsPath) ? readFileSync(refusalsPath, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)) : [])
+let rows = refusals()
+ok('q-198: each refused DM leaves one row, dm-not-owner, with ids only and no grant verdict',
+  rows.length === 2 && rows.every(row => row.reason === 'dm-not-owner' && !('grant_lookup' in row) &&
+    Object.keys(row).sort().join() === 'at,author,channel,reason,source_event,version') &&
+  rows[0].source_event === dudeAgain.id && rows[0].author === myDude.pk && rows[0].channel === DM_AGENTS &&
+  !readFileSync(refusalsPath, 'utf8').includes('forged marker'))
+ok('q-198: the refusal file is private to the broker', (statSync(refusalsPath).mode & 0o777) === 0o600)
+ok('q-198: with the switch off (the default) no notice is attempted', !/unadmitted notice/.test(r.stderr))
+// The switch on, and a stub adapter that acknowledges what it is sent.
+writeFileSync(join(instances, 'dm.json'), JSON.stringify({ ...manifest, buzz: { ...manifest.buzz, unadmitted_notice: true } }))
+const adapterSeen = []
+const adapter = createNetServer(conn => {
+  let b = ''
+  conn.on('data', c => { b += c; if (!b.includes('\n')) return
+    adapterSeen.push(JSON.parse(b.split('\n')[0])); conn.end(JSON.stringify({ type: 'ack', instance: 'dm' }) + '\n') })
+})
+await new Promise(res => adapter.listen(join(root, 'run', 'adapter.sock'), res))
+const dudeNotice = await say(myDude, DM_AGENTS, 'please run this for me')
+r = await deliver(dudeNotice.id)
+const sent = adapterSeen[0]
+ok('q-198: a refused DM, switch on, sends one notice and still finishes the marker',
+  refusedDm(r, dudeNotice.id) && adapterSeen.length === 1 && /unadmitted notice queued/.test(r.stderr))
+ok('q-198: the notice is a closed, content-free verified-notification naming who and where',
+  sent?.type === 'verified-notification' && sent.envelope === dudeNotice.id &&
+  JSON.stringify(Object.keys(sent.notification).sort()) === JSON.stringify(['observed_at', 'reason', 'source_author', 'source_channel', 'source_event', 'type', 'version']) &&
+  sent.notification.type === 'unadmitted-mention' && sent.notification.reason === 'dm-not-owner' &&
+  sent.notification.source_author === myDude.pk && sent.notification.source_channel === DM_AGENTS &&
+  !JSON.stringify(sent).includes('please run this'))
+ok('q-198: the seat\'s own validator accepts it as a non-instruction', validateDesktopDelivery(sent, { instance: 'dm', scopeSubject: agent.pk,
+  grantors: [owner.pk], carriers: [], buzz: { relay: RELAY, channels: [CH] } }).trustedInstruction === false)
+const dudeTwice = await say(myDude, DM_AGENTS, 'and again')
+r = await deliver(dudeTwice.id)
+ok('q-198: a second refusal from the same author within the hour is a row, not a notice',
+  refusedDm(r, dudeTwice.id) && adapterSeen.length === 1 && /no unadmitted notice \(cap: author\)/.test(r.stderr) &&
+  refusals().some(row => row.source_event === dudeTwice.id))
+const granteeNotice = await say(grantee, DM_GRANTEE, 'a grant holder in a DM')
+r = await deliver(granteeNotice.id)
+ok('q-198: another author still gets a notice', refusedDm(r, granteeNotice.id) && adapterSeen.length === 2 && adapterSeen[1].notification.source_author === grantee.pk)
+adapter.close()
+const lateDm = await say(grantee, DM_GRANTEE, 'adapter gone')
+writeFileSync(join(root, 'state', 'unadmitted-notices.json'), JSON.stringify({ version: 1, entries: [] }))
+r = await deliver(lateDm.id)
+ok('q-198: an adapter that is not there costs the notice, never the refusal or a requeue',
+  refusedDm(r, lateDm.id) && /unadmitted notice not queued/.test(r.stderr) && !existsSync(pendingFor(lateDm.id)))
+writeFileSync(join(instances, 'dm.json'), JSON.stringify(manifest))
 openDm(DM_ELSEWHERE, [owner.pk, myDude.pk])
 const notOurs = await say(owner, DM_ELSEWHERE, `@agent ${agent.pk}`)
 r = await deliver(notOurs.id)

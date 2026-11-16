@@ -82,7 +82,7 @@ wss.close(); http.close()
 // --- wiring: both brokers log the no-grant verdict, with the sender prefix ---
 const nativeSrc = readFileSync('mcp/tools/instance-broker-native.mjs', 'utf8'), carrySrc = readFileSync('mcp/tools/instance-broker.mjs', 'utf8')
 ok('the native broker consults the relay evidence on every policy answer', /grantLookup\(resolve\(manifest\.stateDir, 'grant-relays\.json'\), policy\.relays\)/.test(nativeSrc))
-ok('the native no-grant verdict names the author prefix and the relays', /finish\(`author \$\{mention\.author\.slice\(0, 8\)\} holds no live task grant; heard as data only \[\$\{noGrantVerdict\(lookup\)\}\]`\)/.test(nativeSrc))
+ok('the native no-grant verdict names the author prefix and the relays', /refuse\(`author \$\{mention\.author\.slice\(0, 8\)\} holds no live task grant; heard as data only \[\$\{noGrantVerdict\(lookup\)\}\]`/.test(nativeSrc))
 ok('the wrapped-mail broker does the same for data-only mail', /grantLookup\(resolve\(manifest\.stateDir, 'grant-relays\.json'\), report\.relays\)/.test(carrySrc) && /heard as data only \[\$\{noGrantVerdict\(lookup\)\}\]/.test(carrySrc))
 ok('attention --json carries the per-relay report too', /relaysAnswered, relays: relayAnswers, policyUsable/.test(readFileSync('mcp/tools/attention.mjs', 'utf8')))
 
