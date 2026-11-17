@@ -5,8 +5,8 @@
 // supervisor-owned directory.  Tests may supply a different root, but every caller still gets
 // the same structural validation and duplicate-identity check.
 
-import { lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs'
-import { resolve, dirname, isAbsolute, relative, sep } from 'node:path'
+import { lstatSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { resolve, basename, dirname, isAbsolute, relative, sep } from 'node:path'
 import { decode } from 'nostr-tools/nip19'
 import { codexThreadId as validCodexThreadId, localControlSocket } from './codex_app_server.mjs'
 import { normalizeBuzzRelay } from './buzz_native.mjs'
@@ -336,19 +336,79 @@ export function readManifest(root, requestedId) {
 
 // Supervisor preflight: a second identity must never accidentally share a state or runtime
 // root. This is intentionally fail-closed rather than silently picking one manifest.
+// Every credential path one manifest names: the Nostr signer, the model worker, the harness, the wake
+// webhook, the channel door and the SSH identity. assertNoCollisions refuses any of them shared across
+// instances, whichever field each instance names it in (My Dude, PR 366 review).
+export function credentialRefs(m) {
+  return [m.keyRef, m.bunkerUriRef, m.bunkerClientRef, m.workerCredentialRef, m.harness?.credentialRef,
+    m.wakeWebhook?.urlRef, m.wakeWebhook?.headersRef, m.channelDoor?.tokenHashRef, m.sshIdentityFile].filter(Boolean)
+}
+
+// A path names one file however it is spelled: `/a/../a/x`, `//a/x` and `/a/x/` are `/a/x` to the kernel and to
+// a compose mount, so the cross-instance comparison uses the lexically normal form (My Dude, PR 366 reread).
+const normalPath = p => resolve('/', String(p))
+// And a file reached through a symlink or a hard link is the same file under another name. Where this process can
+// stat it, its device and inode are compared too. This only adds collisions: a path it cannot stat (another
+// broker's credential directory, a host path absent in a container) is still compared by its normal form.
+function fileIdentity(p) {
+  try { const st = statSync(p); return st.isFile() ? `${st.dev}:${st.ino}` : '' } catch { return '' }
+}
+// safeDirectory refuses a symlinked root itself, but a symlink in a parent still moves the root: with
+// `/x/bravo-parent -> /x/alpha-state`, bravo's `/x/bravo-parent/inner` lives in alpha's tree (Murphy, PR 366
+// reread). The effective path resolves the deepest ancestor that exists and keeps the rest as written, so a root
+// not yet created is still placed where it will be. A part this process cannot resolve stays lexical; like
+// fileIdentity, this only adds collisions.
+function effectivePath(p) {
+  const lexical = normalPath(p)
+  const tail = []
+  for (let head = lexical; ; head = dirname(head)) {
+    try { return resolve(realpathSync(head), ...tail) } catch {}
+    if (head === '/') return lexical
+    tail.unshift(basename(head))
+  }
+}
+
 export function assertNoCollisions(root, candidate) {
   const canonicalRoot = realpathSync(root)
   const seen = new Map()
+  const roots = []
   for (const name of readdirSync(canonicalRoot)) {
     if (!name.endsWith('.json')) continue
     const id = name.slice(0, -5)
     let m
     try { m = readManifest(canonicalRoot, id) } catch (e) { die(`invalid manifest ${name}: ${e.message}`) }
-    for (const [field, value] of [['pubkey', m.pubkey], ['stateDir', m.stateDir], ['runtimeDir', m.runtimeDir], ['spoolDir', m.spoolDir],
-      ...(m.mayRecall?.gatewayGid ? [['recallGatewayGid', m.mayRecall.gatewayGid]] : [])]) {
-      const key = `${field}:${value}`
-      if (seen.has(key)) die(`${field} collision between ${seen.get(key)} and ${m.id}`)
+    // Isolation is by resource class, not by field name. A second instance cannot use the first
+    // instance's watcher UID as its broker UID, its state root as a runtime root, or its Bunker
+    // URI as a client credential. Any of those aliases crosses the instance boundary. Every
+    // credential path a manifest can name is one class, whichever field names it.
+    const resources = [
+      ['pubkey', 'pubkey', m.pubkey], ['service user', 'service-user', m.serviceUser],
+      ...[m.stateDir, m.runtimeDir, m.spoolDir].flatMap(dir => [['filesystem root', 'path', dir && normalPath(dir)],
+        ['filesystem root', 'path-effective', dir && effectivePath(dir)]]),
+      ['service UID', 'uid', m.watcherUid], ['service UID', 'uid', m.brokerUid], ['service UID', 'uid', m.adapterUid], ['service UID', 'uid', m.workerUid],
+      ['service GID', 'gid', m.brokerAdapterGid], ['service GID', 'gid', m.workerHandoffGid], ['service GID', 'gid', m.mayRecall?.gatewayGid],
+      ...credentialRefs(m).flatMap(ref => [['credential reference', 'credential', normalPath(ref)], ['credential reference', 'credential-file', fileIdentity(ref)]]),
+    ]
+    for (const [label, kind, value] of resources) {
+      if (value === '' || value == null) continue
+      const key = `${kind}:${value}`
+      // Only a value shared with another instance crosses the boundary. One instance may name the same value in
+      // two of its own fields, as it could before PR 366 (GrokDoggyDog's read); readManifest already requires its
+      // UIDs and GIDs to be distinct, so this skip opens nothing there.
+      if (seen.has(key) && seen.get(key) !== m.id) die(`${label} collision between ${seen.get(key)} and ${m.id}`)
       seen.set(key, m.id)
+    }
+    for (const dir of [m.stateDir, m.runtimeDir, m.spoolDir]) if (dir) roots.push([m.id, normalPath(dir)], [m.id, effectivePath(dir)])
+  }
+  // Equal roots are caught above. A root inside another instance's root crosses the boundary too: the outer
+  // instance owns the inner one's parent directory and can replace or hide it (docs/RUNTIME_SUPERVISOR.md: each
+  // instance has its own runtime tree). Roots of one instance may nest; that stays inside one boundary. Both the
+  // lexical and the effective form count: a root lexically inside another tree is controlled by that tree's owner
+  // even while a symlink sends it elsewhere, since the owner can replace the symlink.
+  const within = (inner, outer) => inner.startsWith(outer === '/' ? '/' : `${outer}/`)
+  for (const [outerId, outer] of roots) {
+    for (const [innerId, inner] of roots) {
+      if (outerId !== innerId && inner !== outer && within(inner, outer)) die(`filesystem root nesting between ${outerId} and ${innerId}: ${inner} is inside ${outer}`)
     }
   }
   if (!candidate || !contained(canonicalRoot, candidate.path)) return

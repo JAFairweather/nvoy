@@ -1,8 +1,8 @@
 // Multi-instance runtime contract (#44): a public manifest names exactly one identity and
 // isolated state. This drives the real CLI, rather than duplicating its validation in a unit.
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlinkSync, unlinkSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlinkSync, unlinkSync, linkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { spawn } from 'node:child_process'
 import net from 'node:net'
@@ -23,11 +23,32 @@ if (!Number.isInteger(workerHandoffGid)) throw new Error('test runner needs a se
 const manifestRoot = join(root, 'instances')
 mkdirSync(manifestRoot)
 const manifestFile = join(manifestRoot, 'codex-test.json')
-const manifest = { version: 1, id: 'codex-test', pubkey: nip19.npubEncode(pubkey),
+const manifest = { version: 1, id: 'codex-test', pubkey: nip19.npubEncode(pubkey), service_user: 'nvoy-codex-test',
   state_dir: join(root, 'state-codex'), runtime_dir: join(root, 'run-codex'), spool_dir: join(root, 'spool-codex'), key_ref: '/etc/nvoy/credentials/codex-test.nsec', bunker_uri_ref: '/etc/nvoy/credentials/codex-test.bunker', bunker_client_ref: '/etc/nvoy/credentials/codex-test.client', worker_image: 'registry.example/codex-worker@sha256:' + 'd'.repeat(64), worker_runner: 'codex', worker_credential_ref: '/etc/nvoy/credentials/codex-test.provider', broker_adapter_gid: brokerAdapterGid, worker_handoff_gid: workerHandoffGid, watcher_uid: 41011, broker_uid: 41012, adapter_uid: 41013, worker_uid: 41014,
   grantors: ['4010ac438206dc10018b814be3ea01ca6c92bcc22e9719e841d2413b287ea84d'],
   task_carriers: [{ pubkey: '7'.repeat(64), channels: ['a8186b53-537d-46ad-a7e7-b6486c58970e'] }],
   relays: ['wss://nos.lol', 'wss://relay.primal.net'] }
+let isolationSequence = 0
+const isolatedManifest = (base, id, overrides = {}) => {
+  const n = ++isolationSequence
+  const credential = (value, suffix) => value ? `/etc/nvoy/credentials/${id}.${suffix}` : ''
+  return { ...base, id, service_user: `nvoy-${id}`,
+    state_dir: join(root, `state-${id}`), runtime_dir: join(root, `run-${id}`), spool_dir: join(root, `spool-${id}`),
+    watcher_uid: 44000 + n * 10 + 1, broker_uid: 44000 + n * 10 + 2,
+    adapter_uid: 44000 + n * 10 + 3, worker_uid: 44000 + n * 10 + 4,
+    broker_adapter_gid: 45000 + n * 2, worker_handoff_gid: 45000 + n * 2 + 1,
+    key_ref: credential(base.key_ref, 'nsec'), bunker_uri_ref: credential(base.bunker_uri_ref, 'bunker-uri'),
+    bunker_client_ref: credential(base.bunker_client_ref, 'nip46-client'),
+    worker_credential_ref: credential(base.worker_credential_ref, 'provider'),
+    // The SSH identity is a credential too (assertNoCollisions refuses one shared across instances), and the
+    // runtime checks it is a real 0600 file, so each sibling gets its own copy.
+    ...(base.ssh_identity_file ? { ssh_identity_file: ownCopy(base.ssh_identity_file, `ssh-${id}`) } : {}),
+    ...(base.harness?.credential_ref ? { harness: { ...base.harness, credential_ref: credential(base.harness.credential_ref, 'harness') } } : {}),
+    ...(base.wake_webhook ? { wake_webhook: { ...base.wake_webhook, url_ref: credential(base.wake_webhook.url_ref, 'wake-url'), headers_ref: credential(base.wake_webhook.headers_ref, 'wake-headers') } } : {}),
+    ...(base.channel_door?.token_hash_ref ? { channel_door: { ...base.channel_door, token_hash_ref: credential(base.channel_door.token_hash_ref, 'door-token') } } : {}),
+    ...overrides }
+}
+const ownCopy = (from, name) => { const to = join(root, name); writeFileSync(to, readFileSync(from), { mode: 0o600 }); return to }
 writeFileSync(manifestFile, JSON.stringify(manifest))
 const cli = (...args) => spawnSync(process.execPath, ['mcp/tools/instance-runtime.mjs', ...args], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
 
@@ -41,30 +62,31 @@ const desktopManifestFile = join(manifestRoot, 'codex-desktop.json')
 const desktopSshKey = join(root, 'desktop-ssh-key'), desktopKnownHosts = join(root, 'desktop-known-hosts')
 writeFileSync(desktopSshKey, 'private-test-placeholder\n', { mode: 0o600 })
 writeFileSync(desktopKnownHosts, 'nave.pub ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestOnly\n', { mode: 0o600 })
-const desktopManifest = { ...manifest, id: 'codex-desktop', pubkey: '3'.repeat(64), state_dir: join(root, 'state-desktop'), runtime_dir: join(root, 'run-desktop'), spool_dir: join(root, 'spool-desktop'),
+const desktopManifest = isolatedManifest(manifest, 'codex-desktop', { pubkey: '3'.repeat(64),
+  state_dir: join(root, 'state-desktop'), runtime_dir: join(root, 'run-desktop'), spool_dir: join(root, 'spool-desktop'),
   broker_mode: 'remote', key_ref: '', bunker_uri_ref: '', bunker_client_ref: '', worker_image: '', worker_runner: '', worker_credential_ref: '',
   delivery_mode: 'codex_app_server', codex_thread_id: '019fc80b-78a6-7b72-b3d2-eced37f55da7', codex_transport: 'local_control_socket', codex_app_server_socket: '/tmp/codex-app-server.sock',
   ssh_target: 'nvoy-sync@nave.pub', ssh_identity_file: desktopSshKey, ssh_known_hosts_file: desktopKnownHosts,
-  ssh_known_hosts_sha256: createHash('sha256').update(readFileSync(desktopKnownHosts)).digest('hex') }
+  ssh_known_hosts_sha256: createHash('sha256').update(readFileSync(desktopKnownHosts)).digest('hex') })
 writeFileSync(desktopManifestFile, JSON.stringify(desktopManifest))
 const desktop = cli('describe', '--instance', 'codex-desktop')
 ok('a remote-broker Codex desktop binding is keyless and names one explicit local thread', desktop.status === 0 && JSON.parse(desktop.stdout).brokerMode === 'remote' && !/credential|bunker|nsec/i.test(desktop.stdout))
 const macDriver = join(root, 'codex-macos-ui'); writeFileSync(macDriver, '#!/bin/sh\n', { mode: 0o700 })
-const macManifest = { ...desktopManifest, id: 'codex-macos', pubkey: '2'.repeat(64), state_dir: join(root, 'state-macos'), runtime_dir: join(root, 'run-macos'), spool_dir: join(root, 'spool-macos'),
-  delivery_mode: 'macos_desktop', codex_app_bundle_id: 'com.openai.codex', codex_project_label: 'connect', codex_chat_label: 'Waggle V1', codex_ui_driver: macDriver }
+const macManifest = isolatedManifest(desktopManifest, 'codex-macos', { pubkey: '2'.repeat(64),
+  delivery_mode: 'macos_desktop', codex_app_bundle_id: 'com.openai.codex', codex_project_label: 'connect', codex_chat_label: 'Waggle V1', codex_ui_driver: macDriver })
 writeFileSync(join(manifestRoot, 'codex-macos.json'), JSON.stringify(macManifest))
 const macDesktop = cli('describe', '--instance', 'codex-macos'), macDescription = JSON.parse(macDesktop.stdout || '{}')
 ok('macOS V1 binds one keyless identity to the fixed app, project, chat, and durable thread', macDesktop.status === 0 &&
   macDescription.deliveryMode === 'macos_desktop' && macDescription.desktopBinding?.appBundleId === 'com.openai.codex' &&
   macDescription.desktopBinding?.projectLabel === 'connect' && macDescription.desktopBinding?.chatLabel === 'Waggle V1' &&
   macDescription.desktopBinding?.threadId === desktopManifest.codex_thread_id)
-writeFileSync(join(manifestRoot, 'bad-macos.json'), JSON.stringify({ ...macManifest, id: 'bad-macos', pubkey: '1'.repeat(64), state_dir: join(root, 'state-bad-macos'), runtime_dir: join(root, 'run-bad-macos'), spool_dir: join(root, 'spool-bad-macos'), codex_app_bundle_id: 'com.apple.TextEdit' }))
+writeFileSync(join(manifestRoot, 'bad-macos.json'), JSON.stringify(isolatedManifest(macManifest, 'bad-macos', { pubkey: '1'.repeat(64), codex_app_bundle_id: 'com.apple.TextEdit' })))
 const badMac = cli('describe', '--instance', 'bad-macos')
 ok('macOS V1 refuses a manifest-selected foreign application', badMac.status !== 0 && /fixed Codex bundle/.test(badMac.stderr))
 unlinkSync(join(manifestRoot, 'bad-macos.json'))
 const duplicateDesktopWatcher = cli('watch', '--instance', 'codex-desktop')
 ok('a remote-broker Desktop manifest cannot start a second watcher', duplicateDesktopWatcher.status !== 0 && /cannot start a second watcher/.test(duplicateDesktopWatcher.stderr))
-writeFileSync(join(manifestRoot, 'remote-with-worker.json'), JSON.stringify({ ...desktopManifest, id: 'remote-with-worker', pubkey: 'e'.repeat(64), state_dir: join(root, 'state-remote-worker'), runtime_dir: join(root, 'run-remote-worker'), spool_dir: join(root, 'spool-remote-worker'), worker_image: manifest.worker_image, worker_runner: manifest.worker_runner, worker_credential_ref: manifest.worker_credential_ref }))
+writeFileSync(join(manifestRoot, 'remote-with-worker.json'), JSON.stringify(isolatedManifest(desktopManifest, 'remote-with-worker', { pubkey: 'e'.repeat(64), worker_image: manifest.worker_image, worker_runner: manifest.worker_runner, worker_credential_ref: '/etc/nvoy/credentials/remote-with-worker.provider' })))
 const remoteWithWorker = cli('describe', '--instance', 'remote-with-worker')
 ok('a remote-broker Desktop manifest rejects every model-worker/provider credential reference', remoteWithWorker.status !== 0 && /worker-disabled manifest cannot carry/.test(remoteWithWorker.stderr))
 unlinkSync(join(manifestRoot, 'remote-with-worker.json'))
@@ -106,8 +128,8 @@ ok('a verified activity notification cannot acquire a reply capability at the ke
   notificationReply.status !== 0 && /not a single-sender admitted notification/.test(notificationReply.stderr))
 
 const syncUid = process.getuid(), syncRuntime = join(root, 'run-sync'), syncEnvelope = '6'.repeat(64)
-const syncManifest = { ...manifest, id: 'sync-test', pubkey: '5'.repeat(64), state_dir: join(root, 'state-sync'), runtime_dir: syncRuntime, spool_dir: join(root, 'spool-sync'),
-  watcher_uid: syncUid === 41021 ? 41024 : 41021, broker_uid: syncUid === 41022 ? 41025 : 41022, adapter_uid: syncUid, worker_uid: syncUid === 41014 ? 41027 : 41014 }
+const syncManifest = isolatedManifest(manifest, 'sync-test', { pubkey: '5'.repeat(64), runtime_dir: syncRuntime,
+  watcher_uid: syncUid === 47011 ? 47015 : 47011, broker_uid: syncUid === 47012 ? 47016 : 47012, adapter_uid: syncUid, worker_uid: syncUid === 47014 ? 47017 : 47014 })
 writeFileSync(join(manifestRoot, 'sync-test.json'), JSON.stringify(syncManifest)); mkdirSync(syncRuntime, { recursive: true })
 writeFileSync(join(syncRuntime, 'admitted-tasks.jsonl'), JSON.stringify({ type: 'admitted-task', instance: 'sync-test', envelope: syncEnvelope, messages: [{ from: 'a'.repeat(64), at: 1, content: 'sync me' }] }) + '\n')
 writeFileSync(join(syncRuntime, 'desktop-reply-requests.jsonl'), '')
@@ -122,8 +144,8 @@ ok('the restricted server sync imports a bounded admitted-envelope reply exactly
 // after Codex persisted the turn but before Nvoy wrote its delivery journal; thread/read must
 // recover the envelope marker without starting another turn.
 const spawnRuntime = join(root, 'run-spawn'), spawnThread = '019fc80b-78a6-7b72-b3d2-eced37f55da8', spawnEnvelope = '4'.repeat(64)
-const spawnManifest = { ...manifest, id: 'spawn-test', pubkey: 'd'.repeat(64), state_dir: join(root, 'state-spawn'), runtime_dir: spawnRuntime, spool_dir: join(root, 'spool-spawn'),
-  worker_image: '', worker_runner: '', worker_credential_ref: '', delivery_mode: 'codex_app_server', codex_thread_id: spawnThread, codex_transport: 'spawn' }
+const spawnManifest = isolatedManifest(manifest, 'spawn-test', { pubkey: 'd'.repeat(64), runtime_dir: spawnRuntime,
+  worker_image: '', worker_runner: '', worker_credential_ref: '', worker_enabled: false, delivery_mode: 'codex_app_server', codex_thread_id: spawnThread, codex_transport: 'spawn' })
 writeFileSync(join(manifestRoot, 'spawn-test.json'), JSON.stringify(spawnManifest)); mkdirSync(spawnRuntime, { recursive: true })
 writeFileSync(join(spawnRuntime, 'admitted-tasks.jsonl'), JSON.stringify({ type: 'admitted-task', instance: 'spawn-test', envelope: spawnEnvelope, messages: [{ from: 'a'.repeat(64), at: 1, content: 'fake lifecycle' }] }) + '\n')
 const appServerFakeBin = join(root, 'fake-app-server-bin'), fakeCodex = join(appServerFakeBin, 'codex'), lifecycleLog = join(root, 'app-server-lifecycle.log')
@@ -151,14 +173,14 @@ const forcedKey = spawnSync(process.execPath, ['mcp/tools/instance-desktop-autho
 ok('the installer renders an exact restrict+forced-command SSH capability for only one instance', forcedKey.status === 0 && forcedKey.stdout.startsWith('restrict,command="/usr/bin/env NVOY_INSTANCE_ROOT=/etc/nvoy/instances /usr/bin/node /opt/nvoy/mcp/tools/instance-desktop-sync.mjs --instance codex-test" ssh-ed25519 ') && !/permitopen|environment=|pty/.test(forcedKey.stdout))
 const forcedDockerKey = spawnSync(process.execPath, ['mcp/tools/instance-desktop-authorized-key.mjs', '--instance', 'codex-test', '--public-key-file', desktopPublicKey, '--container', 'nvoy-codex-jaf-adapter-1'], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
 ok('the Docker installer stanza fixes container, non-root adapter UID/GID, executable, and instance without a shell', forcedDockerKey.status === 0 && forcedDockerKey.stdout.startsWith(`restrict,command="/usr/bin/docker exec -i --user ${manifest.adapter_uid}:${manifest.broker_adapter_gid} nvoy-codex-jaf-adapter-1 /usr/local/bin/node /srv/nvoy/mcp/tools/instance-desktop-sync.mjs --instance codex-test" ssh-ed25519 `))
-const claudeManifest = { ...manifest, id: 'claude-channel', pubkey: 'c'.repeat(64), state_dir: join(root, 'state-claude-channel'), runtime_dir: join(root, 'run-claude-channel'), spool_dir: join(root, 'spool-claude-channel'),
-  worker_image: '', worker_runner: '', worker_credential_ref: '', worker_enabled: false, delivery_mode: 'notify_only' }
+const claudeManifest = isolatedManifest(manifest, 'claude-channel', { pubkey: 'c'.repeat(64),
+  worker_image: '', worker_runner: '', worker_credential_ref: '', worker_enabled: false, delivery_mode: 'notify_only' })
 writeFileSync(join(manifestRoot, 'claude-channel.json'), JSON.stringify(claudeManifest))
 const forcedClaudeKey = spawnSync(process.execPath, ['mcp/tools/instance-claude-channel-authorized-key.mjs', '--instance', 'claude-channel', '--public-key-file', desktopPublicKey, '--container', 'nvoy-claude-channel-adapter-1'], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
 ok('the Claude channel installer fixes a restricted worker-UID/GID MCP command distinct from the adapter', forcedClaudeKey.status === 0 &&
-  forcedClaudeKey.stdout.startsWith(`restrict,command="/usr/bin/docker exec -i --user ${manifest.worker_uid}:${manifest.worker_handoff_gid} nvoy-claude-channel-adapter-1 /usr/local/bin/node /srv/nvoy/mcp/tools/claude-channel.mjs --instance claude-channel --key-fp SHA256:`) &&
-  !forcedClaudeKey.stdout.includes(`--user ${manifest.adapter_uid}:`) && !/permitopen|environment=|pty/.test(forcedClaudeKey.stdout))
-writeFileSync(join(manifestRoot, 'bad-desktop.json'), JSON.stringify({ ...manifest, id: 'bad-desktop', pubkey: '4'.repeat(64), state_dir: join(root, 'state-bad-desktop'), runtime_dir: join(root, 'run-bad-desktop'), spool_dir: join(root, 'spool-bad-desktop'), worker_image: '', worker_runner: '', worker_credential_ref: '', delivery_mode: 'codex_app_server' }))
+  forcedClaudeKey.stdout.startsWith(`restrict,command="/usr/bin/docker exec -i --user ${claudeManifest.worker_uid}:${claudeManifest.worker_handoff_gid} nvoy-claude-channel-adapter-1 /usr/local/bin/node /srv/nvoy/mcp/tools/claude-channel.mjs --instance claude-channel --key-fp SHA256:`) &&
+  !forcedClaudeKey.stdout.includes(`--user ${claudeManifest.adapter_uid}:`) && !/permitopen|environment=|pty/.test(forcedClaudeKey.stdout))
+writeFileSync(join(manifestRoot, 'bad-desktop.json'), JSON.stringify(isolatedManifest(manifest, 'bad-desktop', { pubkey: '4'.repeat(64), worker_image: '', worker_runner: '', worker_credential_ref: '', worker_enabled: false, delivery_mode: 'codex_app_server' })))
 const badDesktop = cli('describe', '--instance', 'bad-desktop')
 ok('an inbound event cannot silently select or create a Codex desktop thread', badDesktop.status !== 0 && /explicit codex_thread_id/.test(badDesktop.stderr))
 // Invalid manifests must not remain in this fixture: every production command preflights the
@@ -172,8 +194,8 @@ ok('Compose includes a keyless digest-pinned Codex/Claude worker for each instan
 const releaseWorkerImage = 'registry.example/codex-worker@sha256:' + 'a'.repeat(64)
 const renderedRelease = spawnSync(process.execPath, ['mcp/tools/render-instance-compose.mjs', '--instance', 'codex-test', '--image', image, '--worker-image', releaseWorkerImage], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
 ok('the release reconciler can override only the worker image with another immutable digest', renderedRelease.status === 0 && renderedRelease.stdout.includes(releaseWorkerImage) && !renderedRelease.stdout.includes(manifest.worker_image))
-const desktopComposeManifest = { ...manifest, id: 'desktop-compose', pubkey: 'b'.repeat(64), state_dir: join(root, 'state-desktop-compose'), runtime_dir: join(root, 'run-desktop-compose'), spool_dir: join(root, 'spool-desktop-compose'),
-  worker_image: '', worker_runner: '', worker_credential_ref: '', delivery_mode: 'codex_app_server', codex_thread_id: spawnThread, codex_transport: 'spawn' }
+const desktopComposeManifest = isolatedManifest(manifest, 'desktop-compose', { pubkey: 'b'.repeat(64),
+  worker_image: '', worker_runner: '', worker_credential_ref: '', worker_enabled: false, delivery_mode: 'codex_app_server', codex_thread_id: spawnThread, codex_transport: 'spawn' })
 writeFileSync(join(manifestRoot, 'desktop-compose.json'), JSON.stringify(desktopComposeManifest))
 const renderedDesktop = spawnSync(process.execPath, ['mcp/tools/render-instance-compose.mjs', '--instance', 'desktop-compose', '--image', image], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: manifestRoot } })
 ok('Desktop Compose omits the independent model worker and every provider-secret provisioning path', renderedDesktop.status === 0 && !/\n  worker:/.test(renderedDesktop.stdout) && !/worker-provider|worker_credentials|nvoy_worker_provider|WORKER_CREDENTIAL|WORKER_IMAGE|WORKER_RUNNER/.test(renderedDesktop.stdout))
@@ -441,8 +463,125 @@ ok('...and it is refused by present-tense policy rather than by an expiry clock'
 writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...manifest, id: 'collision', runtime_dir: join(root, 'run-other') }))
 const collision = cli('describe', '--instance', 'codex-test')
 ok('duplicate participant pubkeys are refused before a runtime starts', collision.status !== 0 && /collision/.test(collision.stderr))
+const isolated = { ...manifest, id: 'collision', pubkey: '0'.repeat(64), service_user: 'nvoy-collision',
+  state_dir: join(root, 'state-collision'), runtime_dir: join(root, 'run-collision'), spool_dir: join(root, 'spool-collision'),
+  watcher_uid: 42011, broker_uid: 42012, adapter_uid: 42013, worker_uid: 42014,
+  broker_adapter_gid: brokerAdapterGid + 100, worker_handoff_gid: workerHandoffGid + 100,
+  key_ref: '/etc/nvoy/credentials/collision.nsec', bunker_uri_ref: '/etc/nvoy/credentials/collision.bunker',
+  bunker_client_ref: '/etc/nvoy/credentials/collision.client', worker_credential_ref: '/etc/nvoy/credentials/collision.provider' }
+
+writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolated, broker_uid: manifest.watcher_uid }))
+const uidCollision = cli('describe', '--instance', 'codex-test')
+ok('a service UID cannot be reused by another role in another instance', uidCollision.status !== 0 && /service UID collision/.test(uidCollision.stderr))
+writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolated, worker_handoff_gid: manifest.broker_adapter_gid }))
+const gidCollision = cli('describe', '--instance', 'codex-test')
+ok('a service GID cannot be reused by another group in another instance', gidCollision.status !== 0 && /service GID collision/.test(gidCollision.stderr))
+writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolated, bunker_client_ref: manifest.bunker_uri_ref }))
+const credentialCollision = cli('describe', '--instance', 'codex-test')
+ok('a credential path cannot be reused under another credential role', credentialCollision.status !== 0 && /credential reference collision/.test(credentialCollision.stderr))
+writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolated, state_dir: manifest.runtime_dir }))
+const pathCollision = cli('describe', '--instance', 'codex-test')
+ok('a filesystem root cannot be reused under another runtime role', pathCollision.status !== 0 && /filesystem root collision/.test(pathCollision.stderr))
+writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolated, service_user: manifest.service_user }))
+const userCollision = cli('describe', '--instance', 'codex-test')
+ok('a named service user cannot be shared by two participant instances', userCollision.status !== 0 && /service user collision/.test(userCollision.stderr))
+// Every credential path a manifest can name is one class across instances, not only the Nostr and provider
+// refs (My Dude, PR 366 review): the harness credential, the wake webhook pair, the channel door token and the
+// SSH identity. Each case names another instance's credential under a field that instance does not use for it.
+const notifyOnly = { ...isolated, worker_enabled: false, worker_image: '', worker_runner: '', worker_credential_ref: '', delivery_mode: 'notify_only' }
+const own = ref => `/etc/nvoy/credentials/collision.${ref}`
+const notifyCases = [
+  ['the harness credential', { harness: { runner: 'claude', credential_ref: manifest.worker_credential_ref } }],
+  ['a wake webhook reference', { wake_webhook: { url_ref: manifest.key_ref, headers_ref: own('wake-headers') } }],
+  ['the channel door token', { channel_door: { token_hash_ref: manifest.bunker_client_ref, network: 'proxy' } }],
+]
+writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...notifyOnly, harness: { runner: 'claude', credential_ref: own('harness') },
+  wake_webhook: { url_ref: own('wake-url'), headers_ref: own('wake-headers') }, channel_door: { token_hash_ref: own('door'), network: 'proxy' } }))
+const notifyOwn = cli('describe', '--instance', 'codex-test')
+ok('NEGATIVE CONTROL: a notify-only sibling with its own harness, webhook and door credentials is accepted', notifyOwn.status === 0)
+for (const [what, fields] of notifyCases) {
+  writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...notifyOnly, ...fields }))
+  const r = cli('describe', '--instance', 'codex-test')
+  ok(`${what} cannot name another instance's credential`, r.status !== 0 && /credential reference collision/.test(r.stderr))
+}
+writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolatedManifest(desktopManifest, 'collision', { pubkey: '0'.repeat(64) }),
+  ssh_identity_file: desktopManifest.ssh_identity_file }))
+const sshShared = cli('describe', '--instance', 'codex-test')
+ok('an SSH identity file cannot be shared by two instances', sshShared.status !== 0 && /credential reference collision/.test(sshShared.stderr))
+// The same file under another spelling is the same credential (My Dude, PR 366 reread): a lexical alias across two
+// manifests, and a symlink or hard link to another instance's file where the broker can stat it.
+const [kDir, kFile] = [dirname(manifest.key_ref), basename(manifest.key_ref)]
+for (const [what, alias] of [['a `..` alias', `${kDir}/../${basename(kDir)}/${kFile}`], ['a `//` alias', `/${manifest.key_ref}`],
+  ['a `.` alias', `${kDir}/./${kFile}`], ['a trailing-slash alias', `${manifest.key_ref}/`]]) {
+  writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolated, key_ref: alias }))
+  const r = cli('describe', '--instance', 'codex-test')
+  ok(`${what} of another instance's key_ref is a credential collision`, r.status !== 0 && /credential reference collision/.test(r.stderr))
+}
+writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolated, state_dir: `${manifest.runtime_dir}/../${basename(manifest.runtime_dir)}` }))
+const pathAlias = cli('describe', '--instance', 'codex-test')
+ok('a `..` alias of another instance\'s filesystem root is a collision', pathAlias.status !== 0 && /filesystem root collision/.test(pathAlias.stderr))
+// One instance's root inside another's: the outer instance owns the inner one's parent directory (PR 366 lead read).
+for (const [what, fields] of [
+  ['a runtime root inside another instance\'s state root', { runtime_dir: join(manifest.state_dir, 'b') }],
+  ['a state root inside another instance\'s spool root', { state_dir: join(manifest.spool_dir, 'nested', 'state') }],
+  ['a spool root that contains another instance\'s runtime root', { spool_dir: dirname(manifest.runtime_dir) }],
+  ['a `..` alias that lands inside another instance\'s state root', { runtime_dir: `${manifest.state_dir}/x/../inner` }],
+]) {
+  writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolated, ...fields }))
+  const r = cli('describe', '--instance', 'codex-test')
+  ok(`${what} is refused as nesting`, r.status !== 0 && /filesystem root nesting/.test(r.stderr))
+}
+// A symlink in a parent moves a root into another instance's tree even though the root itself is no symlink
+// (Murphy's PR 366 reproduction: bravo-parent -> alpha's state, bravo state at bravo-parent/inner).
+mkdirSync(manifest.state_dir, { recursive: true })
+const bravoParent = join(root, 'bravo-parent')
+symlinkSync(manifest.state_dir, bravoParent)
+writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolated, state_dir: join(bravoParent, 'inner') }))
+const ancestorLink = cli('describe', '--instance', 'codex-test')
+ok('a root under a symlinked parent that points into another instance\'s root is refused as nesting',
+  ancestorLink.status !== 0 && /filesystem root nesting/.test(ancestorLink.stderr))
+const stateParentLink = join(root, 'state-parent-link')
+symlinkSync(dirname(manifest.state_dir), stateParentLink)
+writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolated, runtime_dir: join(stateParentLink, basename(manifest.state_dir)) }))
+const ancestorEqual = cli('describe', '--instance', 'codex-test')
+ok('another instance\'s root reached through a symlinked parent is a collision',
+  ancestorEqual.status !== 0 && /filesystem root collision/.test(ancestorEqual.stderr))
+mkdirSync(join(root, 'elsewhere'))
+symlinkSync(join(root, 'elsewhere'), join(root, 'elsewhere-link'))
+writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolated, state_dir: join(root, 'elsewhere-link', 'state') }))
+const disjointLink = cli('describe', '--instance', 'codex-test')
+ok('NEGATIVE CONTROL: a symlinked parent that points somewhere disjoint is accepted', disjointLink.status === 0)
+// Disjoint control: a sibling whose root shares only a name prefix (state vs state-other) is not nested.
+writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolated, state_dir: `${manifest.state_dir}-other` }))
+const prefixOnly = cli('describe', '--instance', 'codex-test')
+ok('NEGATIVE CONTROL: a sibling root that only shares a name prefix is accepted', prefixOnly.status === 0)
+writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify(isolated))
+const disjoint = cli('describe', '--instance', 'codex-test')
+ok('NEGATIVE CONTROL: disjoint sibling roots are accepted', disjoint.status === 0)
+// One instance reusing a value across its own fields stays inside its boundary and was accepted before PR 366
+// (GrokDoggyDog's PR 366 read). Only another instance's value is a collision.
+for (const [what, fields] of [
+  ['its runtime root equal to its own state root', { runtime_dir: isolated.state_dir }],
+  ['its spool root equal to its own state root', { spool_dir: isolated.state_dir }],
+  ['one of its own credential files under two fields', { worker_credential_ref: isolated.key_ref }],
+]) {
+  writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolated, ...fields }))
+  const r = cli('describe', '--instance', 'codex-test')
+  ok(`NEGATIVE CONTROL: an instance with ${what} is accepted`, r.status === 0)
+}
+const sshLink = join(root, 'ssh-identity-link'), sshHard = join(root, 'ssh-identity-hard')
+symlinkSync(desktopManifest.ssh_identity_file, sshLink); linkSync(desktopManifest.ssh_identity_file, sshHard)
+for (const [what, path] of [['a symlink to', sshLink], ['a hard link to', sshHard]]) {
+  writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolatedManifest(desktopManifest, 'collision', { pubkey: '0'.repeat(64) }),
+    ssh_identity_file: path }))
+  const r = cli('describe', '--instance', 'codex-test')
+  ok(`${what} another instance's SSH identity is a credential collision`, r.status !== 0 && /credential reference collision/.test(r.stderr))
+}
+writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...isolatedManifest(desktopManifest, 'collision', { pubkey: '0'.repeat(64) }) }))
+const sshOwn = cli('describe', '--instance', 'codex-test')
+ok('NEGATIVE CONTROL: a sibling with its own copy of an SSH identity is accepted', sshOwn.status === 0)
 // Keep the manifest set valid for the independent spool-root collision case below.
-writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify({ ...manifest, id: 'collision', pubkey: '0'.repeat(64), state_dir: join(root, 'state-collision'), runtime_dir: join(root, 'run-collision'), spool_dir: join(root, 'spool-collision') }))
+writeFileSync(join(manifestRoot, 'collision.json'), JSON.stringify(isolated))
 
 const symlinkRoot = join(root, 'symlink-instances')
 mkdirSync(symlinkRoot)
@@ -452,9 +591,13 @@ writeFileSync(join(symlinkRoot, 'symlink-test.json'), JSON.stringify({ ...manife
 const symlinked = spawnSync(process.execPath, ['mcp/tools/instance-runtime.mjs', 'describe', '--instance', 'symlink-test'], { cwd: resolve('.'), encoding: 'utf8', env: { ...process.env, NVOY_INSTANCE_ROOT: symlinkRoot } })
 ok('symlinked state roots are refused before a runtime starts', symlinked.status !== 0 && /never a symlink/.test(symlinked.stderr))
 
-writeFileSync(join(manifestRoot, 'spool-collision.json'), JSON.stringify({ ...manifest, id: 'spool-collision', pubkey: '1'.repeat(64), state_dir: join(root, 'state-other'), runtime_dir: join(root, 'run-other'), spool_dir: manifest.spool_dir }))
+writeFileSync(join(manifestRoot, 'spool-collision.json'), JSON.stringify({ ...isolated, id: 'spool-collision', pubkey: '1'.repeat(64), service_user: 'nvoy-spool-collision', state_dir: join(root, 'state-other'), runtime_dir: join(root, 'run-other'), spool_dir: manifest.spool_dir,
+  watcher_uid: 43011, broker_uid: 43012, adapter_uid: 43013, worker_uid: 43014,
+  broker_adapter_gid: brokerAdapterGid + 200, worker_handoff_gid: workerHandoffGid + 200,
+  key_ref: '/etc/nvoy/credentials/spool.nsec', bunker_uri_ref: '/etc/nvoy/credentials/spool.bunker',
+  bunker_client_ref: '/etc/nvoy/credentials/spool.client', worker_credential_ref: '/etc/nvoy/credentials/spool.provider' }))
 const spoolCollision = cli('describe', '--instance', 'codex-test')
-ok('shared watcher spool roots are refused before a runtime starts', spoolCollision.status !== 0 && /spoolDir collision/.test(spoolCollision.stderr))
+ok('shared watcher spool roots are refused before a runtime starts', spoolCollision.status !== 0 && /filesystem root collision/.test(spoolCollision.stderr))
 
 console.log(fails ? `\n${fails} FAILED` : '\nall passed')
 process.exit(fails ? 1 : 0)

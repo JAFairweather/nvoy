@@ -23,6 +23,10 @@ const manifest = {
   grantors: ['2'.repeat(64)], relays: ['wss://nos.lol'],
 }
 writeFileSync(join(manifests, 'claude-test.json'), JSON.stringify(manifest))
+// The channel must run as its manifest's worker uid, so every instance here shares this process's uid; the
+// runtime refuses two instances sharing a uid in one instance root (#130). Each sibling therefore gets an
+// instance root of its own, holding only its manifest.
+const aloneRoot = id => { const dir = join(root, `instances-${id}`); mkdirSync(dir); return dir }
 const envelope = '3'.repeat(64)
 const task = { type: 'admitted-task', instance: manifest.id, envelope,
   authority: { version: 1, type: 'scoped-instruction', sender: '4'.repeat(64), grant_id: '5'.repeat(64),
@@ -219,7 +223,8 @@ const listManifest = { ...manifest, id: listId, pubkey: listPubkey, runtime_dir:
 // Each instance is a distinct identity and the tool refuses a shared pubkey, so the task authority
 // is re-scoped to the new subject rather than copied wholesale.
 const listTask = { ...task, instance: listId, authority: { ...task.authority, scope_subject: listPubkey } }
-writeFileSync(join(manifests, `${listId}.json`), JSON.stringify(listManifest))
+const listRoot = aloneRoot(listId)
+writeFileSync(join(listRoot, `${listId}.json`), JSON.stringify(listManifest))
 const seeded = 'b'.repeat(64), unlisted = 'c'.repeat(64)
 writeFileSync(join(listRuntime, 'admitted-tasks.jsonl'),
   JSON.stringify({ ...listTask, envelope: seeded }) + '\n', { mode: 0o600 })
@@ -230,7 +235,7 @@ writeFileSync(join(listRuntime, 'reply-requests.jsonl'), '', { mode: 0o640 })
 // disclosure arm: without it the read below would pass on the notification path and prove nothing.
 const discoverTransport = new StdioClientTransport({ command: process.execPath,
   args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', listId, '--poll-ms', '60000'],
-  env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stderr: 'pipe' })
+  env: { ...process.env, NVOY_INSTANCE_ROOT: listRoot }, stderr: 'pipe' })
 const discoverClient = new Client({ name: 'claude-channel-list', version: '0.1.0' })
 // `connect()` resolves on the initialize RESPONSE, but the server's first poll is driven by the
 // client's `initialized` NOTIFICATION, which lands a moment later. Appending before that poll has
@@ -277,14 +282,15 @@ const throttleRuntime = join(root, 'throttle-runtime')
 const throttleId = 'claude-throttle-test'
 const throttlePubkey = 'e'.repeat(64)
 mkdirSync(throttleRuntime); mkdirSync(join(throttleRuntime, 'claude-channel-state'))
-writeFileSync(join(manifests, `${throttleId}.json`), JSON.stringify({ ...manifest, id: throttleId, pubkey: throttlePubkey, runtime_dir: throttleRuntime,
+const throttleRoot = aloneRoot(throttleId)
+writeFileSync(join(throttleRoot, `${throttleId}.json`), JSON.stringify({ ...manifest, id: throttleId, pubkey: throttlePubkey, runtime_dir: throttleRuntime,
   state_dir: join(root, 'throttle-state'), spool_dir: join(root, 'throttle-spool') }))
 const throttleTask = { ...task, instance: throttleId, authority: { ...task.authority, scope_subject: throttlePubkey } }
 writeFileSync(join(throttleRuntime, 'admitted-tasks.jsonl'), '', { mode: 0o600 })
 writeFileSync(join(throttleRuntime, 'reply-requests.jsonl'), '', { mode: 0o640 })
 const throttleTransport = new StdioClientTransport({ command: process.execPath,
   args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', throttleId, '--poll-ms', '250', '--renotify-ms', '600000'],
-  env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stderr: 'pipe' })
+  env: { ...process.env, NVOY_INSTANCE_ROOT: throttleRoot }, stderr: 'pipe' })
 const throttleClient = new Client({ name: 'claude-channel-throttle', version: '0.1.0' })
 const announced = new Set()
 throttleClient.setNotificationHandler(Channel, note => { announced.add(note.params?.meta?.envelope) })
@@ -316,7 +322,8 @@ try {
 // answered envelope was re-announced every renotifyMs for good (mc-claude, 47c7ab2f, 11 Nov).
 const repliedRuntime = join(root, 'replied-runtime'), repliedId = 'claude-replied-test', repliedPubkey = randomBytes(32).toString('hex')
 mkdirSync(repliedRuntime); mkdirSync(join(repliedRuntime, 'claude-channel-state'))
-writeFileSync(join(manifests, `${repliedId}.json`), JSON.stringify({ ...manifest, id: repliedId, pubkey: repliedPubkey, runtime_dir: repliedRuntime,
+const repliedRoot = aloneRoot(repliedId)
+writeFileSync(join(repliedRoot, `${repliedId}.json`), JSON.stringify({ ...manifest, id: repliedId, pubkey: repliedPubkey, runtime_dir: repliedRuntime,
   state_dir: join(root, 'replied-state'), spool_dir: join(root, 'replied-spool') }))
 const repliedEnvelope = 'c'.repeat(64)
 writeFileSync(join(repliedRuntime, 'admitted-tasks.jsonl'), JSON.stringify({ ...task, instance: repliedId, envelope: repliedEnvelope,
@@ -328,7 +335,7 @@ repliedClient.setNotificationHandler(Channel, note => { if (note.params?.meta?.e
 try {
   const repliedTransport = new StdioClientTransport({ command: process.execPath,
     args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', repliedId, '--poll-ms', '250', '--renotify-ms', '1000'],
-    env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stderr: 'pipe' })
+    env: { ...process.env, NVOY_INSTANCE_ROOT: repliedRoot }, stderr: 'pipe' })
   let repliedStderr = ''
   repliedTransport.stderr?.on('data', d => { repliedStderr += d })
   globalThis.repliedStderr = () => repliedStderr
@@ -350,7 +357,8 @@ try {
 // it is announced for good and nothing the agent does clears it (mc-claude, 13 Nov).
 const againRuntime = join(root, 'again-runtime'), againId = 'claude-again-test', againPubkey = randomBytes(32).toString('hex')
 mkdirSync(againRuntime); mkdirSync(join(againRuntime, 'claude-channel-state'))
-writeFileSync(join(manifests, `${againId}.json`), JSON.stringify({ ...manifest, id: againId, pubkey: againPubkey, runtime_dir: againRuntime,
+const againRoot = aloneRoot(againId)
+writeFileSync(join(againRoot, `${againId}.json`), JSON.stringify({ ...manifest, id: againId, pubkey: againPubkey, runtime_dir: againRuntime,
   state_dir: join(root, 'again-state'), spool_dir: join(root, 'again-spool') }))
 const againEnvelope = 'd'.repeat(64)
 writeFileSync(join(againRuntime, 'admitted-tasks.jsonl'), JSON.stringify({ ...task, instance: againId, envelope: againEnvelope,
@@ -363,7 +371,7 @@ againClient.setNotificationHandler(Channel, note => { if (note.params?.meta?.env
 try {
   await againClient.connect(new StdioClientTransport({ command: process.execPath,
     args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', againId, '--poll-ms', '250', '--renotify-ms', '1000'],
-    env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stderr: 'pipe' }))
+    env: { ...process.env, NVOY_INSTANCE_ROOT: againRoot }, stderr: 'pipe' }))
   const until = async (test, ms) => { const end = Date.now() + ms; while (!test() && Date.now() < end) await new Promise(done => setTimeout(done, 50)); return test() }
   ok('an answered but unread envelope is still announced on the interval', await until(() => againWakes.length >= 2, 5000))
   const again = await againClient.callTool({ name: 'nvoy_channel_reply', arguments: { envelope: againEnvelope, text: 'clearing a repeat' } })
@@ -382,7 +390,8 @@ try {
 // being announced for hours with nothing pointing at the cause.
 const lockedRuntime = join(root, 'locked-runtime'), lockedId = 'claude-locked-test', lockedPubkey = randomBytes(32).toString('hex')
 mkdirSync(lockedRuntime); mkdirSync(join(lockedRuntime, 'claude-channel-state'))
-writeFileSync(join(manifests, `${lockedId}.json`), JSON.stringify({ ...manifest, id: lockedId, pubkey: lockedPubkey, runtime_dir: lockedRuntime,
+const lockedRoot = aloneRoot(lockedId)
+writeFileSync(join(lockedRoot, `${lockedId}.json`), JSON.stringify({ ...manifest, id: lockedId, pubkey: lockedPubkey, runtime_dir: lockedRuntime,
   state_dir: join(root, 'locked-state'), spool_dir: join(root, 'locked-spool') }))
 const lockedEnvelope = '7'.repeat(64)
 writeFileSync(join(lockedRuntime, 'admitted-tasks.jsonl'), JSON.stringify({ ...task, instance: lockedId, envelope: lockedEnvelope,
@@ -393,7 +402,7 @@ const lockedState = join(lockedRuntime, 'claude-channel-state')
 try {
   await lockedClient.connect(new StdioClientTransport({ command: process.execPath,
     args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', lockedId, '--poll-ms', '250', '--renotify-ms', '1000'],
-    env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stderr: 'pipe' }))
+    env: { ...process.env, NVOY_INSTANCE_ROOT: lockedRoot }, stderr: 'pipe' }))
   await lockedClient.callTool({ name: 'nvoy_channel_list', arguments: {} })
   chmodSync(lockedState, 0o500)   // the channel holds its lock; now no new file can be made in its state dir
   const answered = JSON.parse((await lockedClient.callTool({ name: 'nvoy_channel_reply', arguments: { envelope: lockedEnvelope, text: 'handled' } })).content[0].text)
@@ -418,7 +427,8 @@ const trimId = 'claude-trim-test'
 const trimRuntime = join(root, 'trim-runtime')
 const trimPubkey = 'f'.repeat(64)
 mkdirSync(trimRuntime); mkdirSync(join(trimRuntime, 'claude-channel-state'))
-writeFileSync(join(manifests, `${trimId}.json`), JSON.stringify({ ...manifest, id: trimId, pubkey: trimPubkey,
+const trimRoot = aloneRoot(trimId)
+writeFileSync(join(trimRoot, `${trimId}.json`), JSON.stringify({ ...manifest, id: trimId, pubkey: trimPubkey,
   runtime_dir: trimRuntime, state_dir: join(root, 'trim-state'), spool_dir: join(root, 'trim-spool') }))
 const trimmed = '1'.repeat(63) + '2'
 writeFileSync(join(trimRuntime, 'admitted-tasks.jsonl'), '', { mode: 0o600 })
@@ -427,7 +437,7 @@ writeFileSync(join(trimRuntime, 'claude-channel-state', 'read.jsonl'),
   JSON.stringify({ version: 1, instance: trimId, envelope: trimmed, read_at: Date.now() }) + '\n', { mode: 0o600 })
 const trimTransport = new StdioClientTransport({ command: process.execPath,
   args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', trimId, '--poll-ms', '60000'],
-  env: { ...process.env, NVOY_INSTANCE_ROOT: manifests }, stderr: 'pipe' })
+  env: { ...process.env, NVOY_INSTANCE_ROOT: trimRoot }, stderr: 'pipe' })
 const trimClient = new Client({ name: 'claude-channel-trim', version: '0.1.0' })
 try {
   await trimClient.connect(trimTransport)
@@ -460,7 +470,8 @@ try {
 const curatorRuntime = join(root, 'curator-runtime')
 const curatorPackets = join(root, 'curator-packets')
 mkdirSync(curatorRuntime); mkdirSync(join(curatorRuntime, 'claude-channel-state')); mkdirSync(curatorPackets)
-writeFileSync(join(manifests, 'curator.json'), JSON.stringify({
+const curatorRoot = aloneRoot('curator')
+writeFileSync(join(curatorRoot, 'curator.json'), JSON.stringify({
   ...manifest,
   id: 'curator',
   pubkey: 'a'.repeat(64),
@@ -487,7 +498,7 @@ writeFileSync(packetFile, JSON.stringify({
 const curatorTransport = new StdioClientTransport({
   command: process.execPath,
   args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', 'curator', '--poll-ms', '60000'],
-  env: { ...process.env, NVOY_INSTANCE_ROOT: manifests, HIVE_MEMORY_CURATOR_PACKET_DIR: curatorPackets },
+  env: { ...process.env, NVOY_INSTANCE_ROOT: curatorRoot, HIVE_MEMORY_CURATOR_PACKET_DIR: curatorPackets },
   stderr: 'pipe',
 })
 const curatorClient = new Client({ name: 'claude-channel-curator', version: '0.1.0' })
@@ -538,7 +549,7 @@ try {
 const remoteCuratorTransport = new StdioClientTransport({
   command: process.execPath,
   args: [resolve('mcp/tools/claude-channel.mjs'), '--instance', 'curator', '--poll-ms', '60000'],
-  env: { ...process.env, NVOY_INSTANCE_ROOT: manifests, HIVE_MEMORY_CURATOR_PACKET_DIR: join(root, 'missing-packets') },
+  env: { ...process.env, NVOY_INSTANCE_ROOT: curatorRoot, HIVE_MEMORY_CURATOR_PACKET_DIR: join(root, 'missing-packets') },
   stderr: 'pipe',
 })
 const remoteCuratorClient = new Client({ name: 'claude-channel-curator-remote', version: '0.1.0' })
