@@ -1,0 +1,51 @@
+{
+  "state": "SOURCE_CANDIDATE_NOT_RUN",
+  "source_commit": "6d4fb38d26a90eb509854c018a800bfc87b14b0a",
+  "protocol_commit": "55b96e39fd55eca257a59a552c11e84d0f94ab2a",
+  "source_review": "PENDING_AT_THIS_SOURCE",
+  "execution_consent": "NOT_ESTABLISHED; existing snapshot no-retry hold remains binding",
+  "real_measurements": null,
+  "files": {
+    "mcp/tools/memory-recall-benchmark.mjs": "b2f61b7b44aa323675c9158824caaa89afbfec35ef2f7834664689bb6f086e43",
+    "test/memory-recall-benchmark.mjs": "42da29b17f4c20f6d43177d66caafeb494b8bcf46b48bb82ab4a472685455333",
+    "docs/B4_RECALL_PROTOCOL_V3_1.md": "ddf45d7f0d0a37622688f7da18af57cf4a6e0e211c825c53e0d426ab0f25db5f",
+    "docs/B4_RECALL_V31_API.md": "46864f6d599c08350b6b7d68ae7793bec4ca24403f7147aec2eab2a99a06be68"
+  },
+  "denominator_rules": {
+    "original_base_questions": 100,
+    "variants": [
+      "original",
+      "paraphrase"
+    ],
+    "retain": "exact category AND gold-ID-set agreement; entire pair",
+    "min_agreement_pairs": 80,
+    "category_minima": {
+      "answerable": 20,
+      "unanswerable": 10,
+      "ambiguous": 5
+    },
+    "coverage_failure": "STOP before retrieval; overall INCONCLUSIVE",
+    "hit_and_mrr": "surviving answerable per variant",
+    "abstention_and_false_positive": "surviving unanswerable per variant",
+    "ambiguous": "reported separately, no correctness metric",
+    "empty_or_unmeasured": "null",
+    "cutoff": 10,
+    "quality_floors_per_variant": {
+      "hit_at_1": 0.5,
+      "mrr_at_10": 0.5
+    }
+  },
+  "synthetic_checks": {
+    "focused_pass": 25,
+    "focused_fail": 0,
+    "suites_reachable_pass": 4,
+    "suites_reachable_fail": 0,
+    "preliminary_review": "same-model diff-only, no blockers; not different-model or lead approval"
+  },
+  "required_disclosures": {
+    "result_label": "agreement-filtered; floors not comparable to v3",
+    "paraphrase_gold_limitation": "paraphrase gold inherited from the base question; equivalence unverified",
+    "author_exposure": "author exposure: self-reported, not log-verified"
+  },
+  "provenance_limit": "Scorer schema/digests do not prove author blindness, sealed independent voting, authentic gold or private-input audit."
+}

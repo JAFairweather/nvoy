@@ -1,0 +1,277 @@
+{
+  "corpus_kind": "synthetic-not-recall-accuracy",
+  "fixture_version": 1,
+  "fixture_text_sha256": "e3fd6e38307c76a98b9c91869dc99462952fb621a3dd1542dc638a0a010101ea",
+  "rows": 50000,
+  "fts_rows": 50000,
+  "probe_matched": 50000,
+  "reconciled_ready": true,
+  "samples": 30,
+  "warmups": 2,
+  "limit": 10,
+  "setup_ms": 909230.591369,
+  "first_query_ms": 4303.900125000044,
+  "timings_ms": [
+    3295.4282949999906,
+    3506.6554829999804,
+    3323.410213999916,
+    3754.101778000011,
+    3056.4851219999837,
+    3583.9063959999476,
+    3359.9768720000284,
+    3470.209422999993,
+    3425.069543000078,
+    5425.294401000021,
+    3868.4506820000242,
+    3395.963569000014,
+    3319.6717000000644,
+    3419.1988980000606,
+    3081.821285000071,
+    3468.7079549999908,
+    3364.5201700000325,
+    3519.952093000058,
+    3274.9573549999623,
+    3101.4098620000295,
+    3335.419324999908,
+    3162.4728390000528,
+    3529.7662319999654,
+    3332.1688469999935,
+    3368.7786949999863,
+    4417.585896000033,
+    5253.448459999985,
+    3995.2499939999543,
+    3747.9576100000413,
+    3688.651135000051
+  ],
+  "queries": [
+    {
+      "text": "telescope",
+      "answer": "found",
+      "total_matched": 12500,
+      "returned": 10,
+      "ms": 3295.4282949999906
+    },
+    {
+      "text": "battery maintenance",
+      "answer": "found",
+      "total_matched": 12500,
+      "returned": 10,
+      "ms": 3506.6554829999804
+    },
+    {
+      "text": "lens alignment",
+      "answer": "found",
+      "total_matched": 12500,
+      "returned": 10,
+      "ms": 3323.410213999916
+    },
+    {
+      "text": "garden weather",
+      "answer": "found",
+      "total_matched": 12500,
+      "returned": 10,
+      "ms": 3754.101778000011
+    },
+    {
+      "text": "absenttokenxyz",
+      "answer": "none",
+      "total_matched": 0,
+      "returned": 0,
+      "ms": 3056.4851219999837
+    },
+    {
+      "text": "telescope",
+      "answer": "found",
+      "total_matched": 12500,
+      "returned": 10,
+      "ms": 3583.9063959999476
+    },
+    {
+      "text": "battery maintenance",
+      "answer": "found",
+      "total_matched": 12500,
+      "returned": 10,
+      "ms": 3359.9768720000284
+    },
+    {
+      "text": "lens alignment",
+      "answer": "found",
+      "total_matched": 12500,
+      "returned": 10,
+      "ms": 3470.209422999993
+    },
+    {
+      "text": "garden weather",
+      "answer": "found",
+      "total_matched": 12500,
+      "returned": 10,
+      "ms": 3425.069543000078
+    },
+    {
+      "text": "absenttokenxyz",
+      "answer": "none",
+      "total_matched": 0,
+      "returned": 0,
+      "ms": 5425.294401000021
+    },
+    {
+      "text": "telescope",
+      "answer": "found",
+      "total_matched": 12500,
+      "returned": 10,
+      "ms": 3868.4506820000242
+    },
+    {
+      "text": "battery maintenance",
+      "answer": "found",
+      "total_matched": 12500,
+      "returned": 10,
+      "ms": 3395.963569000014
+    },
+    {
+      "text": "lens alignment",
+      "answer": "found",
+      "total_matched": 12500,
+      "returned": 10,
+      "ms": 3319.6717000000644
+    },
+    {
+      "text": "garden weather",
+      "answer": "found",
+      "total_matched": 12500,
+      "returned": 10,
+      "ms": 3419.1988980000606
+    },
+    {
+      "text": "absenttokenxyz",
+      "answer": "none",
+      "total_matched": 0,
+      "returned": 0,
+      "ms": 3081.821285000071
+    },
+    {
+      "text": "telescope",
+      "answer": "found",
+      "total_matched": 12500,
+      "returned": 10,
+      "ms": 3468.7079549999908
+    },
+    {
+      "text": "battery maintenance",
+      "answer": "found",
+      "total_matched": 12500,
+      "returned": 10,
+      "ms": 3364.5201700000325
+    },
+    {
+      "text": "lens alignment",
+      "answer": "found",
+      "total_matched": 12500,
+      "returned": 10,
+      "ms": 3519.952093000058
+    },
+    {
+      "text": "garden weather",
+      "answer": "found",
+      "total_matched": 12500,
+      "returned": 10,
+      "ms": 3274.9573549999623
+    },
+    {
+      "text": "absenttokenxyz",
+      "answer": "none",
+      "total_matched": 0,
+      "returned": 0,
+      "ms": 3101.4098620000295
+    },
+    {
+      "text": "telescope",
+      "answer": "found",
+      "total_matched": 12500,
+      "returned": 10,
+      "ms": 3335.419324999908
+    },
+    {
+      "text": "battery maintenance",
+      "answer": "found",
+      "total_matched": 12500,
+      "returned": 10,
+      "ms": 3162.4728390000528
+    },
+    {
+      "text": "lens alignment",
+      "answer": "found",
+      "total_matched": 12500,
+      "returned": 10,
+      "ms": 3529.7662319999654
+    },
+    {
+      "text": "garden weather",
+      "answer": "found",
+      "total_matched": 12500,
+      "returned": 10,
+      "ms": 3332.1688469999935
+    },
+    {
+      "text": "absenttokenxyz",
+      "answer": "none",
+      "total_matched": 0,
+      "returned": 0,
+      "ms": 3368.7786949999863
+    },
+    {
+      "text": "telescope",
+      "answer": "found",
+      "total_matched": 12500,
+      "returned": 10,
+      "ms": 4417.585896000033
+    },
+    {
+      "text": "battery maintenance",
+      "answer": "found",
+      "total_matched": 12500,
+      "returned": 10,
+      "ms": 5253.448459999985
+    },
+    {
+      "text": "lens alignment",
+      "answer": "found",
+      "total_matched": 12500,
+      "returned": 10,
+      "ms": 3995.2499939999543
+    },
+    {
+      "text": "garden weather",
+      "answer": "found",
+      "total_matched": 12500,
+      "returned": 10,
+      "ms": 3747.9576100000413
+    },
+    {
+      "text": "absenttokenxyz",
+      "answer": "none",
+      "total_matched": 0,
+      "returned": 0,
+      "ms": 3688.651135000051
+    }
+  ],
+  "p50_ms": 3419.1988980000606,
+  "p95_ms": 5253.448459999985,
+  "max_ms": 5425.294401000021,
+  "percentile_method": "nearest-rank ceil(p*n)",
+  "timing_scope": "synchronous HiveMemoryStore.query including row reads, ACL, parsing, ranking and response projection; no socket/RPC",
+  "cache_treatment": "first query after migration/startup, then explicit warmups; not OS-cold; shared host, no affinity or cache flush",
+  "fixture_limits": "deterministic text, ephemeral random signer/event IDs; all current, accepted, one writer and one public ops scope; not a representative private/history/ACL corpus",
+  "runtime": {
+    "node": "v22.22.1",
+    "platform": "linux",
+    "arch": "x64",
+    "cpu": "AMD EPYC 9354P 32-Core Processor"
+  },
+  "git_revision": "b5ffcbf0657b495329b4da7eaac94a5dd86f97b0",
+  "source_sha256": {
+    "memory-load-benchmark.mjs": "cecfdb0cbaf6fab4b8c50587376baa2a773fd97c94cb78501b37cbc3fb587593",
+    "hive_memory_store.mjs": "0231a645838c5d104bd3a13c1c597cdc8bb0a5c703dbd3c458ecaa827df1cc59",
+    "memory.mjs": "88ed28ff8628ec1e66502c329258d3fc6d8c5f6b4ac88b0627cfa3136556dbab"
+  }
+}
