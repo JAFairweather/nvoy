@@ -15,8 +15,9 @@
 import assert from 'node:assert'
 import {
   REGISTRY_SCOPE, REGISTRY_VERSION, REGISTRY_PROJECTION_FIELD, buildProjection, projectionChanged,
-  planProjectionPublish, granteesOf, diffRosters, divergenceNote, enrol, ENROL_REASONS,
+  planProjectionPublish, granteesOf, diffRosters, divergenceNote, enrol, ENROL_REASONS, delegateTarget, delegateRetargets,
 } from '../console/registry.mjs'
+import { readFileSync } from 'node:fs'
 
 let pass = 0, fail = 0
 const t = (name, fn) => {
@@ -330,6 +331,47 @@ t('ACCEPTANCE: a key granted from the composer reaches the projection Nact reads
         `${file} appends to nvoy_agents directly again, bypassing the one rule`)
     })
   }
+}
+
+// ── the New delegation form never addresses a grant by browser default ───────────────────────
+{
+  const A = 'a'.repeat(64), B = 'b'.repeat(64), C = 'c'.repeat(64)
+  const roster = [{ pub: A }, { pub: B }]
+  t('opened from an agent\'s page, the form is for that agent, not the first in the roster', () => {
+    assert.equal(delegateTarget(roster, '', B), B)
+    assert.equal(delegateTarget(roster, A, B), B, 'the page it was opened from outranks a stale draft')
+  })
+  t('with no choice made, there is no target: never the first agent', () => {
+    assert.equal(delegateTarget(roster, ''), '')
+    assert.equal(delegateTarget(roster, '', null), '')
+    assert.equal(delegateTarget(roster, undefined, undefined), '')
+  })
+  t('the draft\'s own choice survives a re-render', () => {
+    assert.equal(delegateTarget(roster, B), B)
+    assert.equal(delegateTarget(roster, B, null), B)
+  })
+  t('a key that is not enrolled is never the target', () => {
+    assert.equal(delegateTarget(roster, '', C), '')
+    assert.equal(delegateTarget(roster, C), '')
+    assert.equal(delegateTarget(roster, A, C), A, 'an unknown page key falls back to the draft')
+    assert.equal(delegateTarget([], A, A), '')
+    assert.equal(delegateTarget(null, A, A), '')
+  })
+  t('a draft begun for one agent is dropped when the form is opened for another', () => {
+    assert.equal(delegateRetargets(roster, A, B), true)
+    assert.equal(delegateRetargets(roster, A, A), false, 'same agent: the draft is kept (request approve flow)')
+    assert.equal(delegateRetargets(roster, '', B), false, 'no draft agent yet: nothing to drop')
+    assert.equal(delegateRetargets(roster, A, null), false, 're-render inside the form keeps the draft')
+    assert.equal(delegateRetargets(roster, A, C), false, 'an unknown page key changes nothing')
+    const src = readFileSync(new URL('../console/delegate.mjs', import.meta.url), 'utf8')
+    assert.match(src, /if \(delegateRetargets\(agents, draft\.agent, agentPub\)\) draft = emptyDraft\(\)\n  draft\.agent = delegateTarget\(/)
+  })
+  t('the form uses it, and holds an unissuable placeholder until an agent is chosen', () => {
+    const src = readFileSync(new URL('../console/delegate.mjs', import.meta.url), 'utf8')
+    assert.match(src, /draft\.agent = delegateTarget\(agents, draft\.agent, agentPub\)/)
+    assert.match(src, /draft\.agent \? '' : '<option value="" selected disabled>choose an agent…<\/option>'/)
+    assert.match(src, /if \(!agent\) \{ msg\.textContent = 'pick an agent'; return \}/)
+  })
 }
 
 console.log(`\n${pass}/${pass + fail} passed`)
