@@ -15,7 +15,7 @@
 import assert from 'node:assert'
 import {
   REGISTRY_SCOPE, REGISTRY_VERSION, REGISTRY_PROJECTION_FIELD, buildProjection, projectionChanged,
-  planProjectionPublish, granteesOf, diffRosters, divergenceNote, enrol, ENROL_REASONS, delegateTarget,
+  planProjectionPublish, granteesOf, diffRosters, divergenceNote, enrol, ENROL_REASONS, delegateTarget, delegateRetargets,
 } from '../console/registry.mjs'
 import { readFileSync } from 'node:fs'
 
@@ -356,6 +356,15 @@ t('ACCEPTANCE: a key granted from the composer reaches the projection Nact reads
     assert.equal(delegateTarget(roster, A, C), A, 'an unknown page key falls back to the draft')
     assert.equal(delegateTarget([], A, A), '')
     assert.equal(delegateTarget(null, A, A), '')
+  })
+  t('a draft begun for one agent is dropped when the form is opened for another', () => {
+    assert.equal(delegateRetargets(roster, A, B), true)
+    assert.equal(delegateRetargets(roster, A, A), false, 'same agent: the draft is kept (request approve flow)')
+    assert.equal(delegateRetargets(roster, '', B), false, 'no draft agent yet: nothing to drop')
+    assert.equal(delegateRetargets(roster, A, null), false, 're-render inside the form keeps the draft')
+    assert.equal(delegateRetargets(roster, A, C), false, 'an unknown page key changes nothing')
+    const src = readFileSync(new URL('../console/delegate.mjs', import.meta.url), 'utf8')
+    assert.match(src, /if \(delegateRetargets\(agents, draft\.agent, agentPub\)\) draft = emptyDraft\(\)\n  draft\.agent = delegateTarget\(/)
   })
   t('the form uses it, and holds an unissuable placeholder until an agent is chosen', () => {
     const src = readFileSync(new URL('../console/delegate.mjs', import.meta.url), 'utf8')

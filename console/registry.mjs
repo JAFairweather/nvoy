@@ -290,3 +290,13 @@ export function delegateTarget(agents, draftAgent, openedFor = null) {
   if (has(openedFor)) return openedFor
   return has(draftAgent) ? draftAgent : ''
 }
+
+/**
+ * True when the form is being opened for an enrolled agent while the draft was begun for a
+ * different one. The caller starts a clean draft then, so a value typed for one agent (a
+ * credential, most of all) is never carried into a form that now addresses another.
+ */
+export function delegateRetargets(agents, draftAgent, openedFor = null) {
+  return typeof draftAgent === 'string' && draftAgent !== '' &&
+    delegateTarget(agents, '', openedFor) !== '' && openedFor !== draftAgent
+}
