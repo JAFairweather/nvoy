@@ -273,3 +273,20 @@ export function enrol(index, pub, { me = null, now = 0 } = {}) {
     return unchanged('duplicate')
   return { agents: [...agents, { pub: key, added_at: now || 0 }], added: true, reason: '' }
 }
+
+/**
+ * Which agent the New delegation form is for, or '' when none has been chosen.
+ *
+ * A `<select>` with nothing marked selected shows its FIRST option, so a form that renders the
+ * roster without a choice silently addresses the grant to whoever is listed first. On 25 Nov 2026
+ * that sent a credential to the wrong agent: "＋ Grant data…" on one agent's page opened a form
+ * that ignored the page it came from. So: the agent whose page opened the form wins; otherwise the
+ * draft's own choice; otherwise nothing, and the caller renders a placeholder that cannot be issued.
+ * A key that is not in the roster is never returned: the form can only address an enrolled Agent.
+ */
+export function delegateTarget(agents, draftAgent, openedFor = null) {
+  const list = Array.isArray(agents) ? agents : []
+  const has = (p) => typeof p === 'string' && p !== '' && list.some(a => a?.pub === p)
+  if (has(openedFor)) return openedFor
+  return has(draftAgent) ? draftAgent : ''
+}

@@ -8,7 +8,7 @@ import { nip19 } from 'nostr-tools'
 import { newScopeKey, publishScope, saveGrantIndex, toIssuedEntry } from '../lib/nipxx.mjs'
 import { grantWithTerms, opaqueScopeId, TEMPLATES } from './nvoygrant.mjs'
 import { appendLedger, grantedEvent } from './ledgerlog.mjs'
-import { enrol } from './registry.mjs'
+import { enrol, delegateTarget } from './registry.mjs'
 import { closeDrawer } from './main.mjs'
 import { openDelegationInLedger } from './ledger.mjs'
 import { state, $, esc, agentsOf, agentName, load, RELAYS } from './main.mjs'
@@ -47,8 +47,12 @@ export function prefillDelegate({ agent, purpose, name, payload }) {
 
 export function renderDelegate(agentPub = null) {
   const agents = agentsOf()
+  // Opened from an agent's page: the form is for THAT agent. With no choice yet, a placeholder
+  // holds the select, because a select with nothing selected shows the first agent and would
+  // issue to it (registry.mjs delegateTarget).
+  draft.agent = delegateTarget(agents, draft.agent, agentPub)
   const isCred = isCredName(draft.name)
-  const options = agents.map(a =>
+  const options = (draft.agent ? '' : '<option value="" selected disabled>choose an agent…</option>') + agents.map(a =>
     `<option value="${a.pub}"${a.pub === draft.agent ? ' selected' : ''}>${esc(agentName(a.pub))} — ${esc(nip19.npubEncode(a.pub).slice(0, 16))}…</option>`).join('')
   $('delegate').innerHTML = `
     <div class="card">
